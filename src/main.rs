@@ -1,14 +1,20 @@
-use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
+use std::{
+    net::{Ipv4Addr, SocketAddrV4, TcpListener},
+    path::Path,
+};
 
 use actix_web::{App, HttpServer};
 use clap::Parser;
 use simple_logger::SimpleLogger;
 
+mod config;
 mod route;
 
 #[derive(clap::Parser, Debug)]
 #[command(version)]
 struct Args {
+    #[arg(short, long, help = "Path of config file")]
+    config: String,
     #[arg(long, default_value_t = false, help = "enable verbose")]
     verbose: bool,
 }
@@ -18,8 +24,9 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::try_parse()?;
 
     init_logger(args.verbose)?;
+    let config = config::Config::try_from(Path::new(&args.config))?;
 
-    let listen_addr = SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 3000);
+    let listen_addr = SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), config.listen_port);
     let listener = TcpListener::bind(listen_addr)?;
 
     HttpServer::new(move || App::new().configure(route::config))
