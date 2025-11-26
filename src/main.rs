@@ -9,6 +9,7 @@ use clap::Parser;
 use simple_logger::SimpleLogger;
 
 mod config;
+mod middleware;
 mod route;
 
 #[derive(clap::Parser, Debug)]
@@ -31,10 +32,14 @@ async fn main() -> anyhow::Result<()> {
     let listener =
         TcpListener::bind(listen_addr).context(format!("Failed to bind at {:?}", listen_addr))?;
 
-    HttpServer::new(move || App::new().configure(route::config))
-        .listen(listener)?
-        .run()
-        .await?;
+    HttpServer::new(move || {
+        App::new()
+            .wrap(middleware::bearer_token::BearerTokenMiddleware)
+            .configure(route::config)
+    })
+    .listen(listener)?
+    .run()
+    .await?;
 
     Ok(())
 }
