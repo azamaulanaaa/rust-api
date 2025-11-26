@@ -1,5 +1,9 @@
+use simple_logger::SimpleLogger;
+
 fn main() -> anyhow::Result<()> {
-    println!("Hello, world!");
+    SimpleLogger::new().init()?;
+
+    log::info!("Hello, world!");
 
     Ok(())
 }

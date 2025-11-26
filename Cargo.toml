@@ -5,6 +5,8 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.100"
+log = "0.4.28"
+simple_logger = "5.1.0"
 
 # The profile that 'dist' will build with
 [profile.dist]
