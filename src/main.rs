@@ -32,8 +32,15 @@ async fn main() -> anyhow::Result<()> {
     let listener =
         TcpListener::bind(listen_addr).context(format!("Failed to bind at {:?}", listen_addr))?;
 
+    let key = middleware::jwt::DecodingKey::from_secret("secret".as_ref());
+    let validation = middleware::jwt::Validation::default();
+
     HttpServer::new(move || {
         App::new()
+            .wrap(middleware::jwt::JwtClaimsMiddleware::new(
+                key.clone(),
+                validation.clone(),
+            ))
             .wrap(middleware::bearer_token::BearerTokenMiddleware)
             .configure(route::config)
     })
