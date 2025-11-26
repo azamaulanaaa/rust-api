@@ -4,6 +4,7 @@ use std::{
 };
 
 use actix_web::{App, HttpServer};
+use anyhow::Context;
 use clap::Parser;
 use simple_logger::SimpleLogger;
 
@@ -27,7 +28,8 @@ async fn main() -> anyhow::Result<()> {
     let config = config::Config::try_from(Path::new(&args.config))?;
 
     let listen_addr = SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), config.listen_port);
-    let listener = TcpListener::bind(listen_addr)?;
+    let listener =
+        TcpListener::bind(listen_addr).context(format!("Failed to bind at {:?}", listen_addr))?;
 
     HttpServer::new(move || App::new().configure(route::config))
         .listen(listener)?
