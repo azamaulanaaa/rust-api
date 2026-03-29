@@ -14,10 +14,32 @@ use actix_web::{
 use futures_util::future::LocalBoxFuture;
 use jsonwebtoken::decode;
 pub use jsonwebtoken::{Algorithm, DecodingKey, Validation, jwk::JwkSet};
-use serde::de::DeserializeOwned;
+use serde::{Deserialize, de::DeserializeOwned};
 
 use super::bearer_token::BearerToken;
 
+#[allow(dead_code)]
+#[derive(Debug, Deserialize, Clone)]
+#[serde(untagged)]
+pub enum Audience {
+    Single(String),
+    Multi(Vec<String>),
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Deserialize, Clone)]
+pub struct Claims {
+    pub iss: String,           // Issuer
+    pub sub: String,           // Subject (User ID)
+    pub aud: Audience,         // Handle both String and [String]
+    pub exp: u64,              // Expiration (u64 for 2038+ safety)
+    pub nbf: Option<u64>,      // Not Before
+    pub iat: Option<u64>,      // Issued At
+    pub nonce: Option<String>, // Required for OIDC flow verification
+    pub jti: Option<String>,   // JWT ID (Good for revocation)
+}
+
+#[derive(Clone)]
 pub struct JwtClaimsMiddleware<C>
 where
     C: DeserializeOwned,
@@ -37,6 +59,39 @@ where
             validation,
             _claims: PhantomData,
         }
+    }
+
+    pub async fn new_with_jks(
+        jwks_url: &str,
+        audience: &str,
+        issuer: &str,
+    ) -> anyhow::Result<Self> {
+        let jwks: JwkSet = reqwest::get(jwks_url).await?.json().await?;
+        let keys = jwks
+            .keys
+            .iter()
+            .map(|jwk| {
+                let kid = jwk
+                    .common
+                    .key_id
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("JWK missing key_id"))?;
+
+                let decoding_key = DecodingKey::from_jwk(jwk)?;
+
+                Ok((kid, decoding_key))
+            })
+            .collect::<anyhow::Result<HashMap<_, _>>>()?;
+
+        if keys.is_empty() {
+            anyhow::bail!("No valid keys found in JWKS at {}", jwks_url);
+        }
+
+        let mut validation = Validation::new(Algorithm::RS256);
+        validation.set_audience(&[audience]);
+        validation.set_issuer(&[issuer]);
+
+        Ok(Self::new(keys, validation))
     }
 }
 

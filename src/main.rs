@@ -1,5 +1,4 @@
 use std::{
-    collections::HashMap,
     net::{Ipv4Addr, SocketAddrV4, TcpListener},
     path::Path,
 };
@@ -7,7 +6,6 @@ use std::{
 use actix_web::{App, HttpServer, web};
 use anyhow::Context;
 use clap::Parser;
-use serde::Deserialize;
 use simple_logger::SimpleLogger;
 use url::Url;
 
@@ -49,24 +47,20 @@ async fn main() -> anyhow::Result<()> {
     })
     .await?;
 
-    let (keys, validation) = {
-        prep_jwt_middleware(
+    let jwt_middleware =
+        middleware::jwt::JwtClaimsMiddleware::<middleware::jwt::Claims>::new_with_jks(
             &oidc_client.jwks_uri().to_string(),
             &oidc_client.issuer().to_string(),
             &config.authorization.client_id,
         )
-        .await?
-    };
+        .await?;
 
     let oidc_data = web::Data::new(oidc_client);
 
     HttpServer::new(move || {
         App::new()
             .app_data(oidc_data.clone())
-            .wrap(middleware::jwt::JwtClaimsMiddleware::<Claims>::new(
-                keys.clone(),
-                validation.clone(),
-            ))
+            .wrap(jwt_middleware.clone())
             .wrap(middleware::bearer_token::BearerTokenMiddleware)
             .configure(route::config)
     })
@@ -87,60 +81,4 @@ fn init_logger(verbose: bool) -> anyhow::Result<()> {
     SimpleLogger::new().with_level(log_level).init()?;
 
     Ok(())
-}
-
-#[derive(Debug, Deserialize, Clone)]
-#[serde(untagged)]
-pub enum Audience {
-    Single(String),
-    Multi(Vec<String>),
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Deserialize, Clone)]
-pub struct Claims {
-    pub iss: String,           // Issuer
-    pub sub: String,           // Subject (User ID)
-    pub aud: Audience,         // Handle both String and [String]
-    pub exp: u64,              // Expiration (u64 for 2038+ safety)
-    pub nbf: Option<u64>,      // Not Before
-    pub iat: Option<u64>,      // Issued At
-    pub nonce: Option<String>, // Required for OIDC flow verification
-    pub jti: Option<String>,   // JWT ID (Good for revocation)
-}
-
-pub async fn prep_jwt_middleware(
-    jwks_url: &str,
-    audience: &str,
-    issuer: &str,
-) -> anyhow::Result<(
-    HashMap<String, middleware::jwt::DecodingKey>,
-    middleware::jwt::Validation,
-)> {
-    let jwks: middleware::jwt::JwkSet = reqwest::get(jwks_url).await?.json().await?;
-    let keys = jwks
-        .keys
-        .iter()
-        .map(|jwk| {
-            let kid = jwk
-                .common
-                .key_id
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("JWK missing key_id"))?;
-
-            let decoding_key = middleware::jwt::DecodingKey::from_jwk(jwk)?;
-
-            Ok((kid, decoding_key))
-        })
-        .collect::<anyhow::Result<HashMap<_, _>>>()?;
-
-    if keys.is_empty() {
-        anyhow::bail!("No valid keys found in JWKS at {}", jwks_url);
-    }
-
-    let mut validation = middleware::jwt::Validation::new(middleware::jwt::Algorithm::RS256);
-    validation.set_audience(&[audience]);
-    validation.set_issuer(&[issuer]);
-
-    Ok((keys, validation))
 }
