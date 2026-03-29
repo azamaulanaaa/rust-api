@@ -22,11 +22,23 @@ struct Args {
     verbose: bool,
 }
 
+#[derive(Debug, Deserialize, Clone)]
+#[serde(untagged)]
+pub enum Audience {
+    Single(String),
+    Multi(Vec<String>),
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Deserialize, Clone)]
 pub struct Claims {
-    pub sub: String,
-    pub exp: usize,
+    pub iss: String,         // Issuer
+    pub sub: String,         // Subject (User ID)
+    pub aud: Audience,       // Handle both String and [String]
+    pub exp: u64,            // Expiration (u64 for 2038+ safety)
+    pub nbf: Option<u64>,    // Not Before
+    pub iat: Option<u64>,    // Issued At
+    pub jti: Option<String>, // JWT ID (Good for revocation)
 }
 
 #[tokio::main]
