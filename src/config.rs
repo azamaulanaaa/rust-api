@@ -5,6 +5,7 @@ use serde::Deserialize;
 
 #[derive(Deserialize, Debug)]
 pub struct Config {
+    pub public_address: String,
     pub listen_port: u16,
     pub authorization: ConfigAuthorization,
 }
@@ -29,7 +30,7 @@ impl TryFrom<&Path> for Config {
 
 #[derive(Deserialize, Debug)]
 pub struct ConfigAuthorization {
-    pub jwks_url: String,
-    pub issuer: String,
-    pub audience: String,
+    pub client_id: String,
+    pub client_secret: String,
+    pub issuer_url: String,
 }
