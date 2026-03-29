@@ -12,6 +12,7 @@ use simple_logger::SimpleLogger;
 
 mod config;
 mod middleware;
+mod oidc;
 mod route;
 
 #[derive(clap::Parser, Debug)]
