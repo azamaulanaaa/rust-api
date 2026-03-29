@@ -13,7 +13,7 @@ use actix_web::{
 };
 use futures_util::future::LocalBoxFuture;
 use jsonwebtoken::decode;
-pub use jsonwebtoken::{DecodingKey, Validation};
+pub use jsonwebtoken::{Algorithm, DecodingKey, Validation, jwk::JwkSet};
 use serde::de::DeserializeOwned;
 
 use super::bearer_token::BearerToken;
