@@ -6,6 +6,7 @@ use std::{
 use actix_web::{App, HttpServer};
 use anyhow::Context;
 use clap::Parser;
+use serde::Deserialize;
 use simple_logger::SimpleLogger;
 
 mod config;
@@ -19,6 +20,13 @@ struct Args {
     config: String,
     #[arg(long, default_value_t = false, help = "enable verbose")]
     verbose: bool,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Deserialize, Clone)]
+pub struct Claims {
+    pub sub: String,
+    pub exp: usize,
 }
 
 #[tokio::main]
@@ -37,7 +45,7 @@ async fn main() -> anyhow::Result<()> {
 
     HttpServer::new(move || {
         App::new()
-            .wrap(middleware::jwt::JwtClaimsMiddleware::new(
+            .wrap(middleware::jwt::JwtClaimsMiddleware::<Claims>::new(
                 key.clone(),
                 validation.clone(),
             ))
