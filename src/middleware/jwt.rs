@@ -88,10 +88,16 @@ where
         let keys = self.keys.clone();
         let validation = self.validation.clone();
 
-        let token_wrapper = req.extensions().get::<BearerToken>().cloned();
+        let token = [
+            req.cookie("auth_token").map(|c| c.value().to_string()),
+            req.extensions().get::<BearerToken>().cloned().map(|v| v.0),
+        ]
+        .into_iter()
+        .flatten()
+        .next();
 
-        if let Some(bearer_token) = token_wrapper {
-            let header = match jsonwebtoken::decode_header(&bearer_token.0) {
+        if let Some(token) = token {
+            let header = match jsonwebtoken::decode_header(&token) {
                 Ok(h) => h,
                 Err(e) => return Box::pin(async move { Err(ErrorUnauthorized(e)) }),
             };
@@ -102,7 +108,7 @@ where
                 .or_else(|| keys.values().next());
 
             if let Some(key) = decoding_key {
-                match decode::<C>(&bearer_token.0, key, &validation) {
+                match decode::<C>(&token, key, &validation) {
                     Ok(token_data) => {
                         req.extensions_mut().insert(token_data.claims);
                     }
