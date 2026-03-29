@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     future::{Ready, ready},
     marker::PhantomData,
     rc::Rc,
@@ -21,7 +22,7 @@ pub struct JwtClaimsMiddleware<C>
 where
     C: DeserializeOwned,
 {
-    key: Arc<DecodingKey>,
+    keys: Arc<HashMap<String, DecodingKey>>,
     validation: Validation,
     _claims: PhantomData<C>,
 }
@@ -30,9 +31,9 @@ impl<C> JwtClaimsMiddleware<C>
 where
     C: DeserializeOwned,
 {
-    pub fn new(key: DecodingKey, validation: Validation) -> Self {
+    pub fn new(keys: HashMap<String, DecodingKey>, validation: Validation) -> Self {
         Self {
-            key: Arc::new(key),
+            keys: Arc::new(keys),
             validation,
             _claims: PhantomData,
         }
@@ -55,7 +56,7 @@ where
     fn new_transform(&self, service: S) -> Self::Future {
         ready(Ok(JwtClaimsMiddlewareService {
             service: Rc::new(service),
-            key: self.key.clone(),
+            keys: self.keys.clone(),
             validation: self.validation.clone(),
             _claims: PhantomData,
         }))
@@ -64,7 +65,7 @@ where
 
 pub struct JwtClaimsMiddlewareService<S, C> {
     service: Rc<S>,
-    key: Arc<DecodingKey>,
+    keys: Arc<HashMap<String, DecodingKey>>,
     validation: Validation,
     _claims: PhantomData<C>,
 }
@@ -84,23 +85,40 @@ where
 
     fn call(&self, req: ServiceRequest) -> Self::Future {
         let svc = self.service.clone();
-        let key = self.key.clone();
+        let keys = self.keys.clone();
         let validation = self.validation.clone();
 
         let token_wrapper = req.extensions().get::<BearerToken>().cloned();
 
         if let Some(bearer_token) = token_wrapper {
-            match decode::<C>(&bearer_token.0, &key, &validation) {
-                Ok(token_data) => {
-                    req.extensions_mut().insert(token_data.claims);
+            let header = match jsonwebtoken::decode_header(&bearer_token.0) {
+                Ok(h) => h,
+                Err(e) => return Box::pin(async move { Err(ErrorUnauthorized(e)) }),
+            };
+
+            let decoding_key = header
+                .kid
+                .and_then(|id| keys.get(&id))
+                .or_else(|| keys.values().next());
+
+            if let Some(key) = decoding_key {
+                match decode::<C>(&bearer_token.0, key, &validation) {
+                    Ok(token_data) => {
+                        req.extensions_mut().insert(token_data.claims);
+                    }
+                    Err(e) => {
+                        return Box::pin(async move {
+                            Err(ErrorUnauthorized(format!("Invalid Token: {}", e)))
+                        });
+                    }
                 }
-                Err(e) => {
-                    return Box::pin(async move {
-                        Err(ErrorUnauthorized(format!("Invalid Token: {}", e)))
-                    });
-                }
+            } else {
+                return Box::pin(async move {
+                    Err(ErrorUnauthorized("No matching key found for token"))
+                });
             }
         }
+
         return Box::pin(async move { svc.call(req).await });
     }
 }
