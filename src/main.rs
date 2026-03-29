@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     net::{Ipv4Addr, SocketAddrV4, TcpListener},
     path::Path,
 };
@@ -52,13 +53,22 @@ async fn main() -> anyhow::Result<()> {
     let listener =
         TcpListener::bind(listen_addr).context(format!("Failed to bind at {:?}", listen_addr))?;
 
-    let key = middleware::jwt::DecodingKey::from_secret(config.jwt_secret.as_bytes());
+    let keys = {
+        let mut keys = HashMap::new();
+
+        keys.insert(
+            String::from("default"),
+            middleware::jwt::DecodingKey::from_secret(config.jwt_secret.as_bytes()),
+        );
+
+        keys
+    };
     let validation = middleware::jwt::Validation::default();
 
     HttpServer::new(move || {
         App::new()
             .wrap(middleware::jwt::JwtClaimsMiddleware::<Claims>::new(
-                key.clone(),
+                keys.clone(),
                 validation.clone(),
             ))
             .wrap(middleware::bearer_token::BearerTokenMiddleware)
