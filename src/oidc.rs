@@ -48,6 +48,7 @@ pub struct OidcClient {
         EndpointMaybeSet,
     >,
     http_client: reqwest::Client,
+    provider_metadata: CoreProviderMetadata,
 }
 
 pub struct AuthUrlResponse {
@@ -69,7 +70,7 @@ impl OidcClient {
                 .map_err(|e| OidcError::Discovery(e.to_string()))?;
 
         let client = CoreClient::from_provider_metadata(
-            provider_metadata,
+            provider_metadata.clone(),
             ClientId::new(config.client_id),
             Some(ClientSecret::new(config.client_secret)),
         )
@@ -78,6 +79,7 @@ impl OidcClient {
         Ok(Self {
             client,
             http_client,
+            provider_metadata,
         })
     }
 
@@ -127,5 +129,13 @@ impl OidcClient {
             .map_err(|e| OidcError::InvalidToken(e.to_string()))?;
 
         Ok(id_token.to_string())
+    }
+
+    pub fn issuer(&self) -> &IssuerUrl {
+        self.provider_metadata.issuer()
+    }
+
+    pub fn jwks_uri(&self) -> &url::Url {
+        self.provider_metadata.jwks_uri().url()
     }
 }
