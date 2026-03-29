@@ -1,5 +1,6 @@
 use std::{
     future::{Ready, ready},
+    marker::PhantomData,
     rc::Rc,
     sync::Arc,
 };
@@ -12,33 +13,42 @@ use actix_web::{
 use futures_util::future::LocalBoxFuture;
 use jsonwebtoken::decode;
 pub use jsonwebtoken::{DecodingKey, Validation};
-use serde::Deserialize;
+use serde::de::DeserializeOwned;
 
 use super::bearer_token::BearerToken;
 
-pub struct JwtClaimsMiddleware {
+pub struct JwtClaimsMiddleware<C>
+where
+    C: DeserializeOwned,
+{
     key: Arc<DecodingKey>,
     validation: Validation,
+    _claims: PhantomData<C>,
 }
 
-impl JwtClaimsMiddleware {
+impl<C> JwtClaimsMiddleware<C>
+where
+    C: DeserializeOwned,
+{
     pub fn new(key: DecodingKey, validation: Validation) -> Self {
         Self {
             key: Arc::new(key),
             validation,
+            _claims: PhantomData,
         }
     }
 }
 
-impl<S, B> Transform<S, ServiceRequest> for JwtClaimsMiddleware
+impl<S, B, C> Transform<S, ServiceRequest> for JwtClaimsMiddleware<C>
 where
     S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = Error> + 'static,
     S::Future: 'static,
     B: 'static,
+    C: DeserializeOwned + Clone + 'static,
 {
     type Response = ServiceResponse<B>;
     type Error = Error;
-    type Transform = JwtClaimsMiddlewareService<S>;
+    type Transform = JwtClaimsMiddlewareService<S, C>;
     type InitError = ();
     type Future = Ready<Result<Self::Transform, Self::InitError>>;
 
@@ -47,27 +57,24 @@ where
             service: Rc::new(service),
             key: self.key.clone(),
             validation: self.validation.clone(),
+            _claims: PhantomData,
         }))
     }
 }
 
-#[derive(Debug, Deserialize, Clone)]
-pub struct Claims {
-    pub sub: String,
-    pub exp: usize,
-}
-
-pub struct JwtClaimsMiddlewareService<S> {
+pub struct JwtClaimsMiddlewareService<S, C> {
     service: Rc<S>,
     key: Arc<DecodingKey>,
     validation: Validation,
+    _claims: PhantomData<C>,
 }
 
-impl<S, B> Service<ServiceRequest> for JwtClaimsMiddlewareService<S>
+impl<S, B, C> Service<ServiceRequest> for JwtClaimsMiddlewareService<S, C>
 where
     S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = Error> + 'static,
     S::Future: 'static,
     B: 'static,
+    C: DeserializeOwned + 'static,
 {
     type Response = ServiceResponse<B>;
     type Error = Error;
@@ -83,7 +90,7 @@ where
         let token_wrapper = req.extensions().get::<BearerToken>().cloned();
 
         if let Some(bearer_token) = token_wrapper {
-            match decode::<Claims>(&bearer_token.0, &key, &validation) {
+            match decode::<C>(&bearer_token.0, &key, &validation) {
                 Ok(token_data) => {
                     req.extensions_mut().insert(token_data.claims);
                 }
