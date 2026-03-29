@@ -6,6 +6,7 @@ use serde::Deserialize;
 #[derive(Deserialize, Debug)]
 pub struct Config {
     pub listen_port: u16,
+    pub jwt_secret: String,
 }
 
 impl TryFrom<&Path> for Config {
