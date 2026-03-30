@@ -135,6 +135,10 @@ impl OidcClient {
         self.provider_metadata.issuer()
     }
 
+    pub fn client_id(&self) -> &ClientId {
+        self.client.client_id()
+    }
+
     pub fn jwks_uri(&self) -> &url::Url {
         self.provider_metadata.jwks_uri().url()
     }
