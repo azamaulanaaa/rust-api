@@ -143,3 +143,67 @@ impl OidcClient {
         self.provider_metadata.jwks_uri().url()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use serde_json::json;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    async fn setup_mock_oidc_server() -> MockServer {
+        let server = MockServer::start().await;
+
+        {
+            let discovery_body = json!({
+                "issuer": server.uri(),
+                "authorization_endpoint": format!("{}/auth", server.uri()),
+                "token_endpoint": format!("{}/token", server.uri()),
+                "jwks_uri": format!("{}/jwks", server.uri()),
+                "response_types_supported": ["code"],
+                "subject_types_supported": ["public"],
+                "id_token_signing_alg_values_supported": ["RS256"]
+            });
+
+            Mock::given(method("GET"))
+                .and(path("/.well-known/openid-configuration"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(discovery_body))
+                .mount(&server)
+                .await;
+        };
+
+        {
+            let jwks_body = json!({ "keys": [] });
+
+            Mock::given(method("GET"))
+                .and(path("/jwks"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(jwks_body))
+                .mount(&server)
+                .await;
+        }
+
+        server
+    }
+
+    #[tokio::test]
+    async fn test_oidc_client_initialization() -> anyhow::Result<()> {
+        let server = setup_mock_oidc_server().await;
+
+        let config = OidcConfig {
+            client_id: "test-client".to_string(),
+            client_secret: "test-secret".to_string(),
+            issuer_url: server.uri(),
+            redirect_url: "http://localhost/callback".to_string(),
+        };
+
+        let client = OidcClient::new(config).await?;
+        let auth_data = client.get_auth_url();
+
+        assert!(auth_data.url.contains("/auth"));
+        assert!(auth_data.url.contains("client_id=test-client"));
+        assert!(auth_data.url.contains("scope=openid"));
+
+        Ok(())
+    }
+}
