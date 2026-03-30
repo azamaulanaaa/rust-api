@@ -8,9 +8,12 @@ use clap::Parser;
 use simple_logger::SimpleLogger;
 use url::Url;
 
+use rust_api::{
+    endpoint::ApiService,
+    oidc::{OidcClient, OidcConfig},
+};
+
 mod config;
-mod endpoint;
-mod oidc;
 
 #[derive(clap::Parser, Debug)]
 #[command(version)]
@@ -30,7 +33,7 @@ async fn main() -> anyhow::Result<()> {
 
     let base = Url::parse(&config.public_address).context("Invalid public_address in config")?;
 
-    let oidc_client = oidc::OidcClient::new(oidc::OidcConfig {
+    let oidc_client = OidcClient::new(OidcConfig {
         client_id: config.authorization.client_id.clone(),
         client_secret: config.authorization.client_secret,
         issuer_url: config.authorization.issuer_url,
@@ -43,7 +46,7 @@ async fn main() -> anyhow::Result<()> {
 
     let listen_addr = SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), config.listen_port);
 
-    let api = endpoint::ApiService::init(oidc_client).await?;
+    let api = ApiService::init(oidc_client).await?;
     api.start(listen_addr.into()).await?;
 
     Ok(())
