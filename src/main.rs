@@ -9,8 +9,8 @@ use simple_logger::SimpleLogger;
 use url::Url;
 
 use rust_api::{
-    endpoint::ApiService,
-    oidc::{OidcClient, OidcConfig},
+    endpoint::{ApiService, middleware::jwt::Claims},
+    oidc::{OidcClient, OidcConfig, route::OidcApiModule},
 };
 
 mod config;
@@ -46,8 +46,12 @@ async fn main() -> anyhow::Result<()> {
 
     let listen_addr = SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), config.listen_port);
 
-    let api = ApiService::init(oidc_client).await?;
-    api.start(listen_addr.into()).await?;
+    let oidc_api_module = OidcApiModule::<Claims>::init(oidc_client).await?;
+
+    ApiService::new()
+        .register_module(Box::new(oidc_api_module))
+        .start(listen_addr.into())
+        .await?;
 
     Ok(())
 }
