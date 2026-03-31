@@ -113,4 +113,37 @@ impl PolicyEngine {
         // RbacApi provides `get_roles_for_user` to fetch all 'groups' for a given 'sub'
         ef.get_roles_for_user(user_id, None)
     }
+
+    /// Returns a safe, read-only client that can be passed to other services
+    pub fn authorizer(&self) -> Authorizer {
+        Authorizer {
+            enforcer: self.enforcer.clone(),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct Authorizer {
+    // Private! Consumers cannot access the RwLock or call write().
+    enforcer: Arc<RwLock<Enforcer>>,
+}
+
+impl Authorizer {
+    /// Primary Authorization method.
+    pub async fn authorize(&self, sub: &str, obj: &str, act: &str) -> Result<bool, PolicyError> {
+        let ef = self.enforcer.read().await;
+        Ok(ef.enforce((sub, obj, act))?)
+    }
+
+    /// Read-only method: Get users in a group
+    pub async fn get_users_in_group(&self, group: &str) -> Vec<String> {
+        let ef = self.enforcer.read().await;
+        ef.get_users_for_role(group, None)
+    }
+
+    /// Read-only method: Get groups of a user
+    pub async fn get_groups_of_user(&self, user_id: &str) -> Vec<String> {
+        let ef = self.enforcer.read().await;
+        ef.get_roles_for_user(user_id, None)
+    }
 }
