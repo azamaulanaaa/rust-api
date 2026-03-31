@@ -1,14 +1,64 @@
-use crate::oidc::OidcClient;
+use std::sync::Arc;
+
 use actix_web::{
     HttpRequest, HttpResponse, Responder,
     cookie::{Cookie, SameSite, time::Duration},
     get, web,
 };
 use openidconnect::{Nonce, PkceCodeVerifier};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-pub fn config(cfg: &mut web::ServiceConfig) {
-    cfg.service(login).service(callback);
+use super::OidcClient;
+use crate::endpoint::{ApiModule, middleware};
+
+pub struct OidcApiModule<C>
+where
+    C: DeserializeOwned,
+{
+    oidc_client: Arc<OidcClient>,
+    jwt_middleware: middleware::jwt::JwtClaimsMiddleware<C>,
+}
+
+impl<C> OidcApiModule<C>
+where
+    C: DeserializeOwned,
+{
+    pub async fn init(oidc_client: OidcClient) -> anyhow::Result<Self> {
+        let jwt_middleware = middleware::jwt::JwtClaimsMiddleware::new_with_jks(
+            oidc_client.jwks_uri().as_str(),
+            oidc_client.issuer().as_str(),
+            oidc_client.client_id().as_str(),
+        )
+        .await?;
+
+        Ok(Self {
+            oidc_client: Arc::new(oidc_client),
+            jwt_middleware,
+        })
+    }
+
+    pub fn middleware(&self) -> middleware::jwt::JwtClaimsMiddleware<C>
+    where
+        C: Clone,
+    {
+        return self.jwt_middleware.clone();
+    }
+}
+
+impl<C> ApiModule for OidcApiModule<C>
+where
+    C: DeserializeOwned + Send + Sync + 'static,
+{
+    fn configure(&self, cfg: &mut web::ServiceConfig) {
+        let oidc_client = web::Data::from(self.oidc_client.clone());
+
+        let scope = web::scope("/auth")
+            .app_data(oidc_client)
+            .service(login)
+            .service(callback);
+
+        cfg.service(scope);
+    }
 }
 
 #[get("/login")]

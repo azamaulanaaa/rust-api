@@ -6,6 +6,8 @@ use openidconnect::{
 };
 use thiserror::Error;
 
+pub mod route;
+
 #[derive(Debug, Clone)]
 pub struct OidcConfig {
     pub client_id: String,
