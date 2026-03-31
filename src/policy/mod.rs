@@ -1,9 +1,45 @@
+use std::sync::Arc;
+use std::{fmt, str::FromStr};
+
 use casbin::{CoreApi, DefaultModel, Enforcer, MgmtApi, RbacApi};
 use sqlx::PgPool;
 use sqlx_adapter::SqlxAdapter;
-use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::RwLock;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Action {
+    Read,
+    Write,
+    Delete,
+    Execute,
+}
+
+impl fmt::Display for Action {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let act = match self {
+            Action::Read => "read",
+            Action::Write => "write",
+            Action::Delete => "delete",
+            Action::Execute => "execute",
+        };
+        write!(f, "{}", act)
+    }
+}
+
+impl FromStr for Action {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "read" => Ok(Action::Read),
+            "write" => Ok(Action::Write),
+            "delete" => Ok(Action::Delete),
+            "execute" => Ok(Action::Execute),
+            _ => Err(format!("Unknown action: {}", s)),
+        }
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum PolicyError {
@@ -54,48 +90,60 @@ impl PolicyEngine {
 }
 
 impl PolicyEngine {
+    /// Returns all granular permissions (p-rules)
+    pub async fn get_all_rules(&self) -> Vec<Vec<String>> {
+        let ef = self.enforcer.read().await;
+        ef.get_policy()
+    }
+
     /// Adds a granular permission (e.g., user_1, table_a.col_1, read)
-    pub async fn add_rule(&self, sub: &str, obj: &str, act: &str) -> Result<bool, PolicyError> {
+    pub async fn add_rule(
+        &self,
+        sub: String,
+        obj: String,
+        act: Action,
+    ) -> Result<bool, PolicyError> {
         let mut ef = self.enforcer.write().await;
-        let success = ef
-            .add_policy(vec![sub.to_string(), obj.to_string(), act.to_string()])
-            .await?;
+        let success = ef.add_policy(vec![sub, obj, act.to_string()]).await?;
         Ok(success)
     }
 
     /// Removes a granular permission
-    pub async fn remove_rule(&self, sub: &str, obj: &str, act: &str) -> Result<bool, PolicyError> {
+    pub async fn remove_rule(
+        &self,
+        sub: String,
+        obj: String,
+        act: Action,
+    ) -> Result<bool, PolicyError> {
         let mut ef = self.enforcer.write().await;
-        let success = ef
-            .remove_policy(vec![sub.to_string(), obj.to_string(), act.to_string()])
-            .await?;
+        let success = ef.remove_policy(vec![sub, obj, act.to_string()]).await?;
         Ok(success)
     }
 
     /// Assigns a user to a group (e.g., user_id, superuser)
-    pub async fn assign_group(&self, user_id: &str, group: &str) -> Result<bool, PolicyError> {
+    pub async fn assign_group(&self, user_id: String, group: String) -> Result<bool, PolicyError> {
         let mut ef = self.enforcer.write().await;
-        let success = ef
-            .add_grouping_policy(vec![user_id.to_string(), group.to_string()])
-            .await?;
+        let success = ef.add_grouping_policy(vec![user_id, group]).await?;
         Ok(success)
     }
 
     /// Removes a user from a group
-    pub async fn remove_from_group(&self, user_id: &str, group: &str) -> Result<bool, PolicyError> {
+    pub async fn remove_from_group(
+        &self,
+        user_id: String,
+        group: String,
+    ) -> Result<bool, PolicyError> {
         let mut ef = self.enforcer.write().await;
-        let success = ef
-            .remove_grouping_policy(vec![user_id.to_string(), group.to_string()])
-            .await?;
+        let success = ef.remove_grouping_policy(vec![user_id, group]).await?;
         Ok(success)
     }
 
     /// Primary Authorization method.
-    pub async fn authorize(&self, sub: &str, obj: &str, act: &str) -> Result<bool, PolicyError> {
+    pub async fn authorize(&self, sub: &str, obj: &str, act: Action) -> Result<bool, PolicyError> {
         let ef = self.enforcer.read().await;
 
         // Casbin check
-        let allowed = ef.enforce((sub, obj, act))?;
+        let allowed = ef.enforce((sub, obj, &act.to_string()))?;
 
         Ok(allowed)
     }
@@ -130,9 +178,9 @@ pub struct Authorizer {
 
 impl Authorizer {
     /// Primary Authorization method.
-    pub async fn authorize(&self, sub: &str, obj: &str, act: &str) -> Result<bool, PolicyError> {
+    pub async fn authorize(&self, sub: &str, obj: &str, act: Action) -> Result<bool, PolicyError> {
         let ef = self.enforcer.read().await;
-        Ok(ef.enforce((sub, obj, act))?)
+        Ok(ef.enforce((sub, obj, &act.to_string()))?)
     }
 
     /// Read-only method: Get users in a group
