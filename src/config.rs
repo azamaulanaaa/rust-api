@@ -8,6 +8,7 @@ pub struct Config {
     pub public_address: String,
     pub listen_port: u16,
     pub authorization: ConfigAuthorization,
+    pub database_url: String,
 }
 
 impl TryFrom<&Path> for Config {

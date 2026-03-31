@@ -2,12 +2,15 @@ use std::sync::Arc;
 use std::{fmt, str::FromStr};
 
 use casbin::{CoreApi, DefaultModel, Enforcer, MgmtApi, RbacApi};
+use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use sqlx_adapter::SqlxAdapter;
 use thiserror::Error;
 use tokio::sync::RwLock;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub mod route;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Action {
     Read,
     Write,
@@ -48,6 +51,9 @@ pub enum PolicyError {
 
     #[error("Casbin authorization engine error: {0}")]
     Casbin(#[from] casbin::Error),
+
+    #[error("Access Denied")]
+    AccessDenied,
 }
 
 pub struct PolicyEngine {
@@ -148,6 +154,17 @@ impl PolicyEngine {
         Ok(allowed)
     }
 
+    pub async fn require(&self, sub: &str, obj: &str, act: Action) -> Result<(), PolicyError> {
+        let ef = self.enforcer.read().await;
+        let allowed = ef.enforce((sub, obj, &act.to_string()))?;
+
+        if allowed {
+            Ok(())
+        } else {
+            Err(PolicyError::AccessDenied)
+        }
+    }
+
     /// Returns a list of all users that belong to a specific group
     pub async fn get_users_in_group(&self, group: &str) -> Vec<String> {
         let ef = self.enforcer.read().await;
@@ -181,6 +198,17 @@ impl Authorizer {
     pub async fn authorize(&self, sub: &str, obj: &str, act: Action) -> Result<bool, PolicyError> {
         let ef = self.enforcer.read().await;
         Ok(ef.enforce((sub, obj, &act.to_string()))?)
+    }
+
+    pub async fn require(&self, sub: &str, obj: &str, act: Action) -> Result<(), PolicyError> {
+        let ef = self.enforcer.read().await;
+        let allowed = ef.enforce((sub, obj, &act.to_string()))?;
+
+        if allowed {
+            Ok(())
+        } else {
+            Err(PolicyError::AccessDenied)
+        }
     }
 
     /// Read-only method: Get users in a group
