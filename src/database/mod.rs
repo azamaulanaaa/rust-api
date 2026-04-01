@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use sea_orm::sea_query::{Alias, Asterisk, ColumnDef, ColumnType, Query, Table};
@@ -116,18 +117,33 @@ impl<'a> DynamicTableEditor<'a> {
         Ok(())
     }
 
-    pub async fn select_rows(
+    pub async fn select_rows<'b, C>(
         &self,
-        table_name: &str,
+        table_name: &'b str,
+        columns: Option<C>,
         condition: Condition,
-    ) -> Result<Vec<JsonValue>, DbErr> {
+    ) -> Result<Vec<JsonValue>, DbErr>
+    where
+        C: IntoIterator,
+        C::Item: Into<Cow<'b, str>>,
+    {
         let db_backend = self.db.get_database_backend();
 
-        let statement = Query::select()
-            .column(Asterisk)
-            .from(Alias::new(table_name))
-            .cond_where(condition)
-            .to_owned();
+        let statement = {
+            let mut statement = Query::select();
+
+            match columns {
+                Some(columns) => {
+                    statement.columns(columns.into_iter().map(|v| Alias::new(v.into())))
+                }
+                None => statement.column(Asterisk),
+            };
+
+            statement
+                .from(Alias::new(table_name))
+                .cond_where(condition)
+                .to_owned()
+        };
 
         let rows = self.db.query_all_raw(db_backend.build(&statement)).await?;
 
@@ -405,7 +421,9 @@ mod tests {
         db.execute_raw(db_backend.build(&statement)).await?;
 
         let condition = Condition::all().add(Expr::col(Alias::new("name")).eq("Charlie"));
-        let results = editor.select_rows("users", condition).await?;
+        let results = editor
+            .select_rows("users", Some(["name", "age"]), condition)
+            .await?;
 
         assert_eq!(results.len(), 1, "Should only return Charlie");
         assert_eq!(results[0]["name"], "Charlie");
