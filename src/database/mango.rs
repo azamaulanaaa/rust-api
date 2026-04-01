@@ -5,6 +5,7 @@ use sea_orm::{
     sea_query::{Alias, Condition, Expr, IntoCondition},
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -20,8 +21,8 @@ pub enum MangoError {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum MangoFilter {
-    Operators(HashMap<String, serde_json::Value>),
-    Scalar(serde_json::Value),
+    Operators(HashMap<String, JsonValue>),
+    Scalar(JsonValue),
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -51,10 +52,9 @@ impl TryFrom<MangoSelector> for Condition {
 
             match filter {
                 MangoFilter::Scalar(val) => {
-                    let condition = if serde_json::Value::is_null(&val) {
+                    let condition = if JsonValue::is_null(&val) {
                         Expr::is_null(col)
                     } else {
-                        // Using ? here because json_to_sea_val is now fallible
                         col.eq(json_to_sea_val(&val)?)
                     };
                     main_condition = main_condition.add(condition);
@@ -112,13 +112,13 @@ impl TryFrom<MangoSelector> for Condition {
     }
 }
 
-fn map_op_to_cond(field: &str, op: &str, val: serde_json::Value) -> Result<Condition, MangoError> {
+fn map_op_to_cond(field: &str, op: &str, val: JsonValue) -> Result<Condition, MangoError> {
     let col = Expr::col(Alias::new(field));
 
     // Handle Array-based operators ($in, $nin)
     match op {
         "$in" | "$nin" => {
-            if let serde_json::Value::Array(arr) = val {
+            if let JsonValue::Array(arr) = val {
                 // Safely attempt to convert all JSON elements to SeaValues
                 let sea_vals = arr
                     .iter()
@@ -140,7 +140,7 @@ fn map_op_to_cond(field: &str, op: &str, val: serde_json::Value) -> Result<Condi
     }
 
     // Handle Null comparisons idiomatically
-    if serde_json::Value::is_null(&val) {
+    if JsonValue::is_null(&val) {
         return match op {
             "$eq" => Ok(col.is_null().into_condition()),
             "$ne" => Ok(col.is_not_null().into_condition()),
@@ -167,10 +167,10 @@ fn map_op_to_cond(field: &str, op: &str, val: serde_json::Value) -> Result<Condi
     }
 }
 
-fn json_to_sea_val(val: &serde_json::Value) -> Result<SeaValue, MangoError> {
+fn json_to_sea_val(val: &JsonValue) -> Result<SeaValue, MangoError> {
     match val {
-        serde_json::Value::Bool(b) => Ok((*b).into()),
-        serde_json::Value::Number(n) => {
+        JsonValue::Bool(b) => Ok((*b).into()),
+        JsonValue::Number(n) => {
             // Attempt lossless conversion in order of preference
             if let Some(i) = n.as_i64() {
                 Ok(i.into())
@@ -185,7 +185,7 @@ fn json_to_sea_val(val: &serde_json::Value) -> Result<SeaValue, MangoError> {
                 )))
             }
         }
-        serde_json::Value::String(s) => Ok(s.as_str().into()),
+        JsonValue::String(s) => Ok(s.as_str().into()),
         // Bubble up an error instead of panicking on Objects/Arrays passed where a scalar is expected
         _ => Err(MangoError::UnsupportedValue(format!(
             "Cannot convert nested JSON object/array to SeaValue: {}",
