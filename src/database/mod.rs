@@ -3,7 +3,8 @@ use std::collections::HashMap;
 
 use sea_orm::sea_query::{Alias, Asterisk, ColumnDef, ColumnType, Query, Table};
 use sea_orm::{
-    Condition, ConnectionTrait, DbConn, DbErr, FromQueryResult, JsonValue, Value as SeaValue,
+    Condition, ConnectionTrait, DbConn, DbErr, FromQueryResult, JsonValue, Order,
+    Value as SeaValue,
     prelude::{Expr, StringLen},
 };
 
@@ -21,6 +22,20 @@ impl From<ColumnDataType> for ColumnType {
             ColumnDataType::Bool => ColumnType::Boolean,
             ColumnDataType::Number => ColumnType::Integer,
             ColumnDataType::String => ColumnType::String(StringLen::None),
+        }
+    }
+}
+
+pub enum OrderType {
+    Asc,
+    Desc,
+}
+
+impl From<OrderType> for Order {
+    fn from(value: OrderType) -> Self {
+        match value {
+            OrderType::Asc => Order::Asc,
+            OrderType::Desc => Order::Desc,
         }
     }
 }
@@ -117,16 +132,19 @@ impl<'a> DynamicTableEditor<'a> {
         Ok(())
     }
 
-    pub async fn select_rows<'b, C, CC>(
+    pub async fn select_rows<'b, C, CC, OC, O>(
         &self,
         table_name: &'b str,
         columns: Option<C>,
         condition: Option<CC>,
+        order_by: Option<O>,
     ) -> Result<Vec<JsonValue>, DbErr>
     where
         C: IntoIterator,
         C::Item: Into<Cow<'b, str>>,
         CC: Into<Condition>,
+        OC: Into<Cow<'b, str>>,
+        O: IntoIterator<Item = (OC, OrderType)>,
     {
         let db_backend = self.db.get_database_backend();
 
@@ -150,6 +168,12 @@ impl<'a> DynamicTableEditor<'a> {
                 }
                 None => (),
             };
+
+            if let Some(orders) = order_by {
+                for (col, order) in orders {
+                    statement.order_by(Alias::new(col.into()), order.into());
+                }
+            }
 
             statement.to_owned()
         };
@@ -462,7 +486,12 @@ mod tests {
 
         let condition = Condition::all().add(Expr::col(Alias::new("name")).eq("Charlie"));
         let results = editor
-            .select_rows("users", Some(["name", "age"]), Some(condition))
+            .select_rows(
+                "users",
+                Some(["name", "age"]),
+                Some(condition),
+                None::<Vec<(&str, _)>>,
+            )
             .await?;
 
         assert_eq!(results.len(), 1, "Should only return Charlie");
