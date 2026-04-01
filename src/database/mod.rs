@@ -117,15 +117,16 @@ impl<'a> DynamicTableEditor<'a> {
         Ok(())
     }
 
-    pub async fn select_rows<'b, C>(
+    pub async fn select_rows<'b, C, CC>(
         &self,
         table_name: &'b str,
         columns: Option<C>,
-        condition: Condition,
+        condition: Option<CC>,
     ) -> Result<Vec<JsonValue>, DbErr>
     where
         C: IntoIterator,
         C::Item: Into<Cow<'b, str>>,
+        CC: Into<Condition>,
     {
         let db_backend = self.db.get_database_backend();
 
@@ -134,15 +135,23 @@ impl<'a> DynamicTableEditor<'a> {
 
             match columns {
                 Some(columns) => {
-                    statement.columns(columns.into_iter().map(|v| Alias::new(v.into())))
+                    statement.columns(columns.into_iter().map(|v| Alias::new(v.into())));
                 }
-                None => statement.column(Asterisk),
+                None => {
+                    statement.column(Asterisk);
+                }
             };
 
-            statement
-                .from(Alias::new(table_name))
-                .cond_where(condition)
-                .to_owned()
+            statement.from(Alias::new(table_name));
+
+            match condition {
+                Some(condition) => {
+                    statement.cond_where(condition);
+                }
+                None => (),
+            };
+
+            statement.to_owned()
         };
 
         let rows = self.db.query_all_raw(db_backend.build(&statement)).await?;
@@ -155,12 +164,15 @@ impl<'a> DynamicTableEditor<'a> {
         Ok(results)
     }
 
-    pub async fn update_rows(
+    pub async fn update_rows<CC>(
         &self,
         table_name: &str,
-        condition: Condition,
+        condition: Option<CC>,
         updates: HashMap<String, SeaValue>,
-    ) -> Result<u64, DbErr> {
+    ) -> Result<u64, DbErr>
+    where
+        CC: Into<Condition>,
+    {
         if updates.is_empty() {
             return Ok(0);
         }
@@ -172,24 +184,52 @@ impl<'a> DynamicTableEditor<'a> {
             .map(|(col, val)| (Alias::new(col), Expr::val(val)))
             .collect::<Vec<_>>();
 
-        let statement = Query::update()
-            .table(Alias::new(table_name))
-            .cond_where(condition)
-            .values(values)
-            .to_owned();
+        let statement = {
+            let mut statement = Query::update();
+
+            statement.table(Alias::new(table_name));
+
+            match condition {
+                Some(condition) => {
+                    statement.cond_where(condition);
+                }
+                None => (),
+            };
+
+            statement.values(values);
+
+            statement.to_owned()
+        };
 
         let result = self.db.execute_raw(db_backend.build(&statement)).await?;
 
         Ok(result.rows_affected())
     }
 
-    pub async fn delete_rows(&self, table_name: &str, condition: Condition) -> Result<u64, DbErr> {
+    pub async fn delete_rows<CC>(
+        &self,
+        table_name: &str,
+        condition: Option<CC>,
+    ) -> Result<u64, DbErr>
+    where
+        CC: Into<Condition>,
+    {
         let db_backend = self.db.get_database_backend();
 
-        let statement = Query::delete()
-            .from_table(Alias::new(table_name))
-            .cond_where(condition)
-            .to_owned();
+        let statement = {
+            let mut statement = Query::delete();
+
+            statement.from_table(Alias::new(table_name));
+
+            match condition {
+                Some(condition) => {
+                    statement.cond_where(condition);
+                }
+                None => (),
+            };
+
+            statement.to_owned()
+        };
 
         let result = self.db.execute_raw(db_backend.build(&statement)).await?;
 
@@ -422,7 +462,7 @@ mod tests {
 
         let condition = Condition::all().add(Expr::col(Alias::new("name")).eq("Charlie"));
         let results = editor
-            .select_rows("users", Some(["name", "age"]), condition)
+            .select_rows("users", Some(["name", "age"]), Some(condition))
             .await?;
 
         assert_eq!(results.len(), 1, "Should only return Charlie");
@@ -452,7 +492,7 @@ mod tests {
         let condition = Condition::all().add(Expr::col(Alias::new("name")).eq("Diana"));
         let updates = HashMap::from([("age".to_string(), SeaValue::from(29))]);
         editor
-            .update_rows("users", condition.clone(), updates)
+            .update_rows("users", Some(condition.clone()), updates)
             .await?;
 
         let statement = Query::select()
@@ -489,7 +529,7 @@ mod tests {
         db.execute_raw(db_backend.build(&statement)).await?;
 
         let condition = Condition::all().add(Expr::col(Alias::new("name")).eq("Evan"));
-        editor.delete_rows("users", condition.clone()).await?;
+        editor.delete_rows("users", Some(condition.clone())).await?;
 
         let statement = Query::select()
             .expr_as(Func::count(Expr::col(Asterisk)), Alias::new("count"))
