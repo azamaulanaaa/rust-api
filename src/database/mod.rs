@@ -20,7 +20,7 @@ impl From<ColumnDataType> for ColumnType {
     fn from(data_type: ColumnDataType) -> Self {
         match data_type {
             ColumnDataType::Bool => ColumnType::Boolean,
-            ColumnDataType::Number => ColumnType::Integer,
+            ColumnDataType::Number => ColumnType::Float,
             ColumnDataType::String => ColumnType::String(StringLen::None),
         }
     }
