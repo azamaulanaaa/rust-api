@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 actix-web = "4.12.0"
 anyhow = "1.0.100"
+base32ct = { version = "0.3.1", features = ["alloc"] }
 casbin = "2.20.0"
 clap = { version = "4.5.53", features = ["derive"] }
 futures-util = "0.3.31"
@@ -20,7 +21,7 @@ jsonwebtoken = { version = "10.2.0", features = ["rust_crypto"] }
 log = "0.4.28"
 openidconnect = "4.0.1"
 reqwest = { version = "0.12", features = [ "json"] }
-sea-orm = { version = "2.0.0-rc", features = ["runtime-tokio-rustls", "sqlx-postgres", "sqlx-sqlite", "with-json"] }
+sea-orm = { version = "2.0.0-rc", features = ["runtime-tokio-rustls", "sqlx-postgres", "sqlx-sqlite", "with-json", "entity-registry", "schema-sync"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.149"
 simple_logger = "5.1.0"
@@ -30,6 +31,7 @@ thiserror = "2.0.18"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 toml = "0.9.8"
 url = "2.5.8"
+uuid = { version = "1.23.0", features = ["v7"] }
 
 [dev-dependencies]
 base64 = "0.22.1"
