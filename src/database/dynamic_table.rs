@@ -3,8 +3,7 @@ use std::collections::HashMap;
 
 use sea_orm::sea_query::{Alias, Asterisk, ColumnDef, ColumnType, Query, Table};
 use sea_orm::{
-    Condition, ConnectionTrait, DbConn, DbErr, FromQueryResult, JsonValue, Order,
-    Value as SeaValue,
+    Condition, ConnectionTrait, DbErr, FromQueryResult, JsonValue, Order, Value as SeaValue,
     prelude::{Expr, StringLen},
 };
 
@@ -38,13 +37,16 @@ impl From<OrderType> for Order {
     }
 }
 
-pub struct DynamicTableEditor<'a> {
-    db: &'a DbConn,
+pub struct DynamicTableEditor<'a, D> {
+    db: &'a D,
 }
 
-impl<'a> DynamicTableEditor<'a> {
-    pub fn new(db: &'a DbConn) -> Self {
-        Self { db }
+impl<'a, D> DynamicTableEditor<'a, D>
+where
+    D: ConnectionTrait,
+{
+    pub fn new(c: &'a D) -> Self {
+        Self { db: c }
     }
 
     pub async fn create_table(&self, table_name: &str) -> Result<(), DbErr> {
@@ -107,9 +109,7 @@ impl<'a> DynamicTableEditor<'a> {
 
         Ok(())
     }
-}
 
-impl<'a> DynamicTableEditor<'a> {
     pub async fn insert_row(
         &self,
         table_name: &str,
