@@ -44,9 +44,8 @@ impl Database {
         let txn = self.db.begin().await?;
 
         entity::meta_table::ActiveModel {
-            id: ActiveValue::NotSet,
+            id: ActiveValue::Set(actual_name.clone()),
             display_name: ActiveValue::Set(name.clone()),
-            physical_name: ActiveValue::Set(actual_name.clone()),
         }
         .insert(&txn)
         .await
@@ -82,12 +81,12 @@ impl Database {
             None => return Err(DatabaseError::NameNotExists(name)),
         };
 
-        entity::meta_table::Entity::delete_by_id(meta_table.id)
+        entity::meta_table::Entity::delete_by_id(&meta_table.id)
             .exec(&txn)
             .await?;
 
         DynamicTableEditor::new(&txn)
-            .drop_table(&meta_table.physical_name)
+            .drop_table(&meta_table.id)
             .await?;
 
         txn.commit().await?;
