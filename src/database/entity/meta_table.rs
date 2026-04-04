@@ -8,6 +8,8 @@ pub struct Model {
     pub id: String,
     #[sea_orm(unique, indexed)]
     pub display_name: String,
+    #[sea_orm(has_many)]
+    pub columns: HasMany<super::meta_column::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}
