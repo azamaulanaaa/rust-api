@@ -193,3 +193,57 @@ fn json_to_sea_val(val: &JsonValue) -> Result<SeaValue, MangoError> {
         ))),
     }
 }
+
+pub trait MangoSelectorExt<S>
+where
+    S: Sized,
+{
+    fn alias(self, col_map: &HashMap<String, String>) -> Result<S, MangoError>;
+}
+
+impl MangoSelectorExt<MangoSelector> for MangoSelector {
+    fn alias(self, col_map: &HashMap<String, String>) -> Result<Self, MangoError> {
+        let mut physical_fields = HashMap::new();
+
+        for (field, filter) in self.fields {
+            let physical_name = col_map.get(&field).cloned().ok_or_else(|| {
+                MangoError::OperatorMapping(format!("Field '{}' not found", field))
+            })?;
+            physical_fields.insert(physical_name, filter);
+        }
+
+        let physical_and = self
+            .and
+            .map(|subs| {
+                subs.into_iter()
+                    .map(|s| s.alias(col_map))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .transpose()?;
+
+        let physical_or = self
+            .or
+            .map(|subs| {
+                subs.into_iter()
+                    .map(|s| s.alias(col_map))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .transpose()?;
+
+        let physical_nor = self
+            .nor
+            .map(|subs| {
+                subs.into_iter()
+                    .map(|s| s.alias(col_map))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .transpose()?;
+
+        Ok(MangoSelector {
+            fields: physical_fields,
+            and: physical_and,
+            or: physical_or,
+            nor: physical_nor,
+        })
+    }
+}
