@@ -1,0 +1,10 @@
+[tools]
+"cargo:cargo-binstall" = "latest"
+"cargo:cargo-zigbuild" = "latest"
+rust = "latest"
+zig = "latest"
+
+[tasks]
+build = { run = "cargo-zigbuild build" }
+run = { run = "cargo-zigbuild run" }
+test = { run = "cargo-zigbuild test" }
