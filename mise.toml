@@ -1,7 +1,7 @@
 [tools]
 "cargo:cargo-binstall" = "latest"
 "cargo:cargo-zigbuild" = "latest"
-rust = "latest"
+rust = { version = "latest", components = "rust-analyzer" }
 zig = "latest"
 
 [tasks]
