@@ -4,6 +4,10 @@
 rust = { version = "latest", components = "rust-analyzer" }
 zig = "latest"
 
+[env]
+RUSTUP_TOOLCHAIN = "{% if os() == 'windows' %}stable-x86_64-pc-windows-gnu{% endif %}"
+CARGO_BUILD_TARGET = "{% if os() == 'windows' %}x86_64-pc-windows-gnu{% endif %}"
+
 [tasks]
 build = { run = "cargo-zigbuild build" }
 run = { run = "cargo-zigbuild run" }
