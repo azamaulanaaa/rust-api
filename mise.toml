@@ -1,8 +1,7 @@
 [tools]
-"cargo:cargo-binstall" = "latest"
-"cargo:cargo-zigbuild" = "latest"
 rust = { version = "latest", components = "rust-analyzer" }
 zig = "latest"
+"cargo:cargo-zigbuild" = "latest"
 
 [env]
 RUSTUP_TOOLCHAIN = "{% if os() == 'windows' %}stable-x86_64-pc-windows-gnu{% endif %}"
