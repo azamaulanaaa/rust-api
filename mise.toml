@@ -1,5 +1,5 @@
 [tools]
-rust = { version = "latest", components = "rust-analyzer" }
+rust = { version = "stable", components = "rust-analyzer" }
 zig = "latest"
 "cargo:cargo-zigbuild" = "latest"
 
