@@ -176,16 +176,30 @@ pub async fn callback(
                 })
         }
         Err(e) => {
-            let status = match e {
+            // Full detail goes to server logs; clients only ever see a
+            // stable, non-sensitive message.
+            let (status, message) = match &e {
                 OidcError::ExchangeFailure(_)
                 | OidcError::MissingIdToken
-                | OidcError::InvalidToken(_) => actix_web::http::StatusCode::UNAUTHORIZED,
-                _ => actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+                | OidcError::InvalidToken(_) => {
+                    log::warn!("OIDC code exchange rejected: {e}");
+                    (
+                        actix_web::http::StatusCode::UNAUTHORIZED,
+                        "authentication failed",
+                    )
+                }
+                other => {
+                    log::error!("OIDC callback failed unexpectedly: {other:?}");
+                    (
+                        actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        "internal server error",
+                    )
+                }
             };
             HttpResponse::build(status).json(AuthResponse {
                 success: false,
                 token: None,
-                error: Some(e.to_string()),
+                error: Some(message.to_string()),
             })
         }
     }
