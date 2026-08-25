@@ -9,8 +9,8 @@ use std::{
 };
 
 use actix_web::{
-    Error, HttpMessage,
-    dev::{Service, ServiceRequest, ServiceResponse, Transform, forward_ready},
+    Error, FromRequest, HttpMessage, HttpRequest,
+    dev::{Payload, Service, ServiceRequest, ServiceResponse, Transform, forward_ready},
     error::ErrorUnauthorized,
 };
 use futures_util::future::LocalBoxFuture;
@@ -220,8 +220,9 @@ fn to_signing_key(jwk: &Jwk) -> Option<(String, SigningKey)> {
 
 /// Actix middleware validating JWTs against a [`JwksKeys`] store before the
 /// request reaches the wrapped service. Validated claims (generic over `C`)
-/// are inserted into request extensions; requests without any token pass
-/// through unmodified so routes decide their own auth requirements.
+/// are inserted into request extensions — consume them with [`Validated`] —
+/// and requests without any token pass through unmodified so routes decide
+/// their own auth requirements.
 #[derive(Clone)]
 pub struct JwtClaimsMiddleware<C>
 where
@@ -292,6 +293,43 @@ where
 /// The per-worker instantiated middleware produced by
 /// [`JwtClaimsMiddleware::new_transform`](JwtClaimsMiddleware). Not
 /// constructed directly.
+/// Extractor for claims validated by [`JwtClaimsMiddleware`].
+///
+/// Unlike `web::ReqData`, which fails extraction with a 500 when the
+/// middleware did not run or no token was presented, this resolves to a
+/// **401 Unauthorized** — anonymous hits on protected routes must not look
+/// like server faults.
+#[derive(Debug)]
+pub struct Validated<C>(pub C);
+
+impl<C> std::ops::Deref for Validated<C> {
+    type Target = C;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<C> FromRequest for Validated<C>
+where
+    C: DeserializeOwned + Clone + 'static,
+{
+    type Error = Error;
+    type Future = Ready<Result<Self, Self::Error>>;
+
+    fn from_request(req: &HttpRequest, _: &mut Payload) -> Self::Future {
+        ready(
+            req.extensions()
+                .get::<C>()
+                .cloned()
+                .map(Self)
+                .ok_or_else(|| ErrorUnauthorized("authentication required")),
+        )
+    }
+}
+
+/// The per-worker instantiated middleware produced by
+/// [`JwtClaimsMiddleware::new_transform`]. Not constructed directly.
 pub struct JwtClaimsMiddlewareService<S, C> {
     service: Rc<S>,
     keys: JwksKeys,
@@ -574,5 +612,41 @@ mod tests {
         .unwrap();
 
         assert!(to_signing_key(&jwk).is_none());
+    }
+
+    fn sample_claims() -> Claims {
+        Claims {
+            iss: "https://idp.test".to_string(),
+            sub: "u1".to_string(),
+            aud: Audience::Single("client".to_string()),
+            exp: 2000000000,
+            nbf: None,
+            iat: Some(1000000000),
+            nonce: None,
+            jti: None,
+        }
+    }
+
+    #[actix_web::test]
+    async fn validated_extractor_resolves_inserted_claims() {
+        use actix_web::test::TestRequest;
+
+        let (req, mut payload) = TestRequest::default().to_http_parts();
+        req.extensions_mut().insert(sample_claims());
+
+        let extracted = Validated::<Claims>::from_request(&req, &mut payload)
+            .await
+            .expect("claims present");
+        assert_eq!(extracted.sub, "u1"); // Deref to the inner claims
+    }
+
+    #[actix_web::test]
+    async fn validated_extractor_is_unauthorized_when_missing() {
+        use actix_web::test::TestRequest;
+
+        let (req, mut payload) = TestRequest::default().to_http_parts();
+
+        let result = Validated::<Claims>::from_request(&req, &mut payload).await;
+        assert_eq!(result.unwrap_err().as_response_error().status_code(), 401);
     }
 }
