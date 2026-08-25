@@ -13,6 +13,12 @@ pub struct ApiService {
     modules: Vec<Box<dyn ApiModule>>,
 }
 
+impl Default for ApiService {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ApiService {
     pub fn new() -> Self {
         Self {
