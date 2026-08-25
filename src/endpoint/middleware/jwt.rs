@@ -317,9 +317,11 @@ where
         let keys = self.keys.clone();
         let validation = self.validation.clone();
 
+        // Bearer header wins over the auth cookie: a stale/expired browser
+        // session cookie must not shadow an explicitly presented header.
         let token = [
-            req.cookie("auth_token").map(|c| c.value().to_string()),
             req.extensions().get::<BearerToken>().cloned().map(|v| v.0),
+            req.cookie("auth_token").map(|c| c.value().to_string()),
         ]
         .into_iter()
         .flatten()
