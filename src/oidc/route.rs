@@ -8,7 +8,7 @@ use actix_web::{
 use openidconnect::{Nonce, PkceCodeVerifier};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-use super::OidcClient;
+use super::{OidcClient, OidcError};
 use crate::endpoint::{ApiModule, middleware};
 
 pub struct OidcApiModule<C>
@@ -161,17 +161,28 @@ pub async fn callback(
                     error: None,
                 })
         }
-        Err(e) => HttpResponse::InternalServerError().json(AuthResponse {
-            success: false,
-            token: None,
-            error: Some(e.to_string()),
-        }),
+        Err(e) => {
+            let status = match e {
+                OidcError::ExchangeFailure(_)
+                | OidcError::MissingIdToken
+                | OidcError::InvalidToken(_) => actix_web::http::StatusCode::UNAUTHORIZED,
+                _ => actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            HttpResponse::build(status).json(AuthResponse {
+                success: false,
+                token: None,
+                error: Some(e.to_string()),
+            })
+        }
     }
 }
 
 fn clear_cookie(name: String) -> Cookie<'static> {
     Cookie::build(name, "")
         .path("/")
+        .http_only(true)
+        .secure(true)
+        .same_site(SameSite::Lax)
         .max_age(Duration::ZERO)
         .finish()
 }
