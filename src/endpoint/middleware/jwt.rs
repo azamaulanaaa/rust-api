@@ -180,6 +180,6 @@ where
             }
         }
 
-        return Box::pin(async move { svc.call(req).await });
+        Box::pin(async move { svc.call(req).await })
     }
 }
