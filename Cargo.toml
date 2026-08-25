@@ -36,6 +36,10 @@ rsa = "0.9.10"
 serde_json = "1.0.149"
 wiremock = "0.6.5"
 
+# Enforce rustdoc on every public item across all targets (lib + bin).
+[lints.rust]
+missing_docs = "deny"
+
 # The profile that 'dist' will build with
 [profile.dist]
 inherits = "release"

@@ -6,8 +6,8 @@
 //! [`endpoint::ApiModule`] implementations onto an [`endpoint::ApiService`]
 //! to build their own API surface on top of the shared auth/policy plumbing.
 
-// Require rustdoc comments on every public item of the library API.
-#![deny(missing_docs)]
+// Public items must carry rustdoc comments; the lint is enforced
+// package-wide via [lints.rust] in Cargo.toml.
 
 /// HTTP server scaffolding: modular service registry plus request
 /// middleware (bearer-token extraction, JWKS-backed JWT validation).
