@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use super::{Action, PolicyEngine, PolicyError};
 use crate::endpoint::{
     ApiModule,
-    middleware::jwt::{Claims, JwtClaimsMiddleware},
+    middleware::jwt::{Claims, JwtClaimsMiddleware, Validated},
 };
 
 /// API module exposing `/policy` management routes (rules and group
@@ -125,7 +125,7 @@ impl ResponseError for PolicyError {
 #[get("/rules")]
 async fn get_rules(
     policy_engine: web::Data<PolicyEngine>,
-    auth_claims: web::ReqData<Claims>,
+    auth_claims: Validated<Claims>,
 ) -> Result<impl Responder, PolicyError> {
     policy_engine
         .require(&auth_claims.sub, Resource::Rules.as_str(), Action::Read)
@@ -138,7 +138,7 @@ async fn get_rules(
 #[post("/rules")]
 async fn add_rule(
     policy_engine: web::Data<PolicyEngine>,
-    auth_claims: web::ReqData<Claims>,
+    auth_claims: Validated<Claims>,
     req: web::Json<PolicyRequest>,
 ) -> Result<impl Responder, PolicyError> {
     policy_engine
@@ -154,7 +154,7 @@ async fn add_rule(
 #[delete("/rules")]
 async fn remove_rule(
     policy_engine: web::Data<PolicyEngine>,
-    auth_claims: web::ReqData<Claims>,
+    auth_claims: Validated<Claims>,
     req: web::Json<PolicyRequest>,
 ) -> Result<impl Responder, PolicyError> {
     policy_engine
@@ -170,7 +170,7 @@ async fn remove_rule(
 #[get("/groups/{user_id}")]
 async fn get_user_groups(
     policy_engine: web::Data<PolicyEngine>,
-    auth_claims: web::ReqData<Claims>,
+    auth_claims: Validated<Claims>,
     path: web::Path<String>,
 ) -> Result<impl Responder, PolicyError> {
     policy_engine
@@ -190,7 +190,7 @@ async fn get_user_groups(
 #[get("/groups/{group_name}/users")]
 async fn get_group_users(
     policy_engine: web::Data<PolicyEngine>,
-    auth_claims: web::ReqData<Claims>,
+    auth_claims: Validated<Claims>,
     path: web::Path<String>,
 ) -> Result<impl Responder, PolicyError> {
     policy_engine
@@ -210,7 +210,7 @@ async fn get_group_users(
 #[post("/groups")]
 async fn assign_group(
     policy_engine: web::Data<PolicyEngine>,
-    auth_claims: web::ReqData<Claims>,
+    auth_claims: Validated<Claims>,
     req: web::Json<GroupRequest>,
 ) -> Result<impl Responder, PolicyError> {
     policy_engine
@@ -230,7 +230,7 @@ async fn assign_group(
 #[delete("/groups/{group_name}/users/{user_id}")]
 async fn remove_user_from_group(
     policy_engine: web::Data<PolicyEngine>,
-    auth_claims: web::ReqData<Claims>,
+    auth_claims: Validated<Claims>,
     path: web::Path<(String, String)>,
 ) -> Result<impl Responder, PolicyError> {
     policy_engine
