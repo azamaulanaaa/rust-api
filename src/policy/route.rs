@@ -9,12 +9,16 @@ use crate::endpoint::{
     middleware::jwt::{Claims, JwtClaimsMiddleware},
 };
 
+/// API module exposing `/policy` management routes (rules and group
+/// membership), protected by JWT validation and self-authorizing checks.
 pub struct PolicyApiModule {
     policy_engine: Arc<PolicyEngine>,
     jwt_middleware: JwtClaimsMiddleware<Claims>,
 }
 
 impl PolicyApiModule {
+    /// Wraps a [`PolicyEngine`] with the given JWT middleware; every route
+    /// in this module requires validated claims before enforcing policies.
     pub fn new(policy_engine: PolicyEngine, jwt_middleware: JwtClaimsMiddleware<Claims>) -> Self {
         Self {
             policy_engine: Arc::new(policy_engine),
@@ -43,14 +47,19 @@ impl ApiModule for PolicyApiModule {
     }
 }
 
+/// The policy-managed objects routes operate on; used as the Casbin
+/// object (`obj`) value when authorizing management operations.
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Resource {
+    /// Group-membership assignments (`g` rules).
     UserGroups,
+    /// Permission rules (`p` rules).
     Rules,
 }
 
 impl Resource {
+    /// The canonical wire/Casbin string for this resource.
     pub fn as_str(&self) -> &'static str {
         match self {
             Resource::UserGroups => "user_groups",
@@ -59,31 +68,44 @@ impl Resource {
     }
 }
 
+/// Body for creating/removing a permission rule.
 #[derive(Deserialize)]
 pub struct PolicyRequest {
+    /// Subject (user or group) the rule applies to.
     pub sub: String,
+    /// Object being acted upon.
     pub obj: String,
+    /// Operation granted by the rule.
     pub act: Action,
 }
 
+/// Body for assigning/unassigning group membership.
 #[derive(Deserialize)]
 pub struct GroupRequest {
+    /// Subject to add to/remove from the group.
     pub user_id: String,
+    /// Target group name.
     pub group: String,
 }
 
+/// Generic success indicator returned by mutating endpoints.
 #[derive(Serialize)]
 pub struct ActionResponse {
+    /// Whether the mutation was applied.
     pub success: bool,
 }
 
+/// A flat list of string identifiers.
 #[derive(Serialize)]
 pub struct ListResponse {
+    /// The listed items (users or groups).
     pub items: Vec<String>,
 }
 
+/// All stored permission rules as raw Casbin triples.
 #[derive(Serialize)]
 pub struct RuleListResponse {
+    /// Each rule as `[sub, obj, act]`.
     pub rules: Vec<Vec<String>>,
 }
 

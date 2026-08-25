@@ -6,40 +6,57 @@ use openidconnect::{
 };
 use thiserror::Error;
 
+/// HTTP routes for the OIDC login and callback endpoints.
 pub mod route;
 
+/// Provider and client settings required to bootstrap [`OidcClient`].
 #[derive(Debug, Clone)]
 pub struct OidcConfig {
+    /// OAuth2 client identifier registered at the provider.
     pub client_id: String,
+    /// OAuth2 client secret registered at the provider.
     pub client_secret: String,
+    /// Base URL of the provider's OIDC discovery document.
     pub issuer_url: String,
+    /// Absolute URL the provider redirects back to after login.
     pub redirect_url: String,
 }
 
+/// Errors raised by [`OidcClient`] during discovery and token exchange.
 #[derive(Error, Debug)]
 pub enum OidcError {
+    /// Client configuration could not be applied.
     #[error("Configuration error: {0}")]
     Configuration(String),
 
+    /// A provider or redirect URL failed to parse.
     #[error("Invalid URL format: {0}")]
     UrlParse(#[from] url::ParseError),
 
+    /// The outbound HTTP request to the provider failed.
     #[error("HTTP client error: {0}")]
     HttpClient(#[from] reqwest::Error),
 
+    /// The provider's discovery document was missing or malformed.
     #[error("Failed to discover OIDC provider: {0}")]
     Discovery(String),
 
+    /// The authorization-code exchange was rejected by the provider.
     #[error("Failed to exchange authorization code: {0}")]
     ExchangeFailure(String),
 
+    /// The provider's token response contained no ID token.
     #[error("Provider did not return an ID token")]
     MissingIdToken,
 
+    /// The ID token failed signature, nonce, or claims validation.
     #[error("ID token validation failed: {0}")]
     InvalidToken(String),
 }
 
+/// OpenID Connect client wrapping the discovered provider metadata:
+/// builds authorization URLs with PKCE/CSRF/nonce and exchanges
+/// authorization codes for validated ID tokens.
 pub struct OidcClient {
     client: CoreClient<
         EndpointSet,
@@ -53,14 +70,23 @@ pub struct OidcClient {
     provider_metadata: CoreProviderMetadata,
 }
 
+/// Everything a caller needs to start the authorization-code flow: the
+/// provider URL to redirect the user agent to, plus the CSRF/nonce/PKCE
+/// values that must round-trip through temporary cookies.
 pub struct AuthUrlResponse {
+    /// The provider's authorization endpoint URL including query params.
     pub url: String,
+    /// CSRF value; also carried as the OAuth2 `state` parameter.
     pub csrf_token: CsrfToken,
+    /// Nonce bound into the returned ID token.
     pub nonce: Nonce,
+    /// PKCE verifier kept server-side to complete the exchange.
     pub pkce_verifier: PkceCodeVerifier,
 }
 
 impl OidcClient {
+    /// Performs provider discovery and builds the client. Fails if the
+    /// issuer URL is malformed or the discovery document is unreachable.
     pub async fn new(config: OidcConfig) -> Result<Self, OidcError> {
         let http_client = reqwest::ClientBuilder::new()
             .redirect(reqwest::redirect::Policy::none())
@@ -85,6 +111,9 @@ impl OidcClient {
         })
     }
 
+    /// Generates a fresh authorization URL with a new PKCE challenge,
+    /// CSRF token, and nonce. The returned secrets must be stored in
+    /// temporary cookies and passed back to [`OidcClient::exchange_code`].
     pub fn get_auth_url(&self) -> AuthUrlResponse {
         let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
 
@@ -107,6 +136,9 @@ impl OidcClient {
         }
     }
 
+    /// Exchanges an authorization code for an ID token, verifying its
+    /// signature against the provider's keys and binding it to `nonce`.
+    /// Returns the raw serialized ID token on success.
     pub async fn exchange_code(
         &self,
         code: String,
@@ -133,14 +165,17 @@ impl OidcClient {
         Ok(id_token.to_string())
     }
 
+    /// The provider's discovered issuer URL.
     pub fn issuer(&self) -> &IssuerUrl {
         self.provider_metadata.issuer()
     }
 
+    /// The OAuth2 client ID used for token requests.
     pub fn client_id(&self) -> &ClientId {
         self.client.client_id()
     }
 
+    /// The provider's JWKS endpoint hosting its public signing keys.
     pub fn jwks_uri(&self) -> &url::Url {
         self.provider_metadata.jwks_uri().url()
     }

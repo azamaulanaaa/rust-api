@@ -10,6 +10,9 @@ use actix_web::{
 };
 use futures_util::future::LocalBoxFuture;
 
+/// Actix transform that extracts a Bearer token from the
+/// `Authorization: Bearer <token>` header and stores it in request
+/// extensions for downstream services to consume.
 pub struct BearerTokenMiddleware;
 
 impl<S, B> Transform<S, ServiceRequest> for BearerTokenMiddleware
@@ -24,6 +27,8 @@ where
     type InitError = ();
     type Future = Ready<Result<Self::Transform, Self::InitError>>;
 
+    /// Wraps `service` so every request passing through it gets its Bearer
+    /// token extracted into extensions.
     fn new_transform(&self, service: S) -> Self::Future {
         ready(Ok(BearerTokenMiddlewareService {
             service: Rc::new(service),
@@ -31,9 +36,13 @@ where
     }
 }
 
+/// Newtype around the raw Bearer token string, inserted into request
+/// extensions by [`BearerTokenMiddleware`].
 #[derive(Debug, Clone)]
 pub struct BearerToken(pub String);
 
+/// The instantiated per-worker middleware service produced by
+/// [`BearerTokenMiddleware`].
 pub struct BearerTokenMiddlewareService<S> {
     service: Rc<S>,
 }
