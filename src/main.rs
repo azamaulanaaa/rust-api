@@ -1,3 +1,9 @@
+//! Executable entry point for the rust-api starter-kit server.
+//!
+//! Loads TOML configuration, initializes the OIDC client and Casbin policy
+//! engine, registers their API modules onto an [`rust_api::endpoint::ApiService`],
+//! and starts the HTTP listener.
+
 use std::{
     net::{Ipv4Addr, SocketAddrV4},
     path::Path,
@@ -16,15 +22,20 @@ use rust_api::{
 
 mod config;
 
+/// Command-line interface for the server binary.
 #[derive(clap::Parser, Debug)]
 #[command(version)]
 struct Args {
+    /// Path of the TOML configuration file to load at startup.
     #[arg(short, long, help = "Path of config file")]
     config: String,
+    /// Enable debug-level logging.
     #[arg(long, default_value_t = false, help = "enable verbose")]
     verbose: bool,
 }
 
+/// Bootstraps the server: loads configuration, initializes the OIDC client
+/// and policy engine, registers their API modules, and starts listening.
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::try_parse()?;
@@ -59,6 +70,8 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Initializes the simple logger at debug level when `verbose`, otherwise
+/// info level.
 fn init_logger(verbose: bool) -> anyhow::Result<()> {
     let log_level = if verbose {
         log::LevelFilter::Debug
