@@ -8,13 +8,19 @@ use sqlx_adapter::SqlxAdapter;
 use thiserror::Error;
 use tokio::sync::RwLock;
 
+/// HTTP routes for managing policy rules and group membership.
 pub mod route;
 
+/// The operation a policy rule grants on an object.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Action {
+    /// Permission to view the object.
     Read,
+    /// Permission to modify the object.
     Write,
+    /// Permission to remove the object.
     Delete,
+    /// Permission to invoke/run the object.
     Execute,
 }
 
@@ -44,23 +50,32 @@ impl FromStr for Action {
     }
 }
 
+/// Errors raised by [`PolicyEngine`] and [`Authorizer`].
 #[derive(Debug, Error)]
 pub enum PolicyError {
+    /// A Postgres operation failed.
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),
 
+    /// The Casbin engine rejected an operation or failed enforcement.
     #[error("Casbin authorization engine error: {0}")]
     Casbin(#[from] casbin::Error),
 
+    /// The subject does not hold the required permission.
     #[error("Access Denied")]
     AccessDenied,
 }
 
+/// Central authorization engine: a Casbin RBAC enforcer persisted to
+/// Postgres, plus management helpers for rules and group membership.
 pub struct PolicyEngine {
+    /// The underlying Casbin enforcer shared across workers.
     pub enforcer: Arc<RwLock<Enforcer>>,
 }
 
 impl PolicyEngine {
+    /// Connects to Postgres at `database_url`, loads the RBAC model and
+    /// stored policies via the sqlx adapter, and returns the engine.
     pub async fn init(database_url: &str) -> Result<Self, PolicyError> {
         let pool = PgPool::connect(database_url).await?;
 
@@ -154,6 +169,9 @@ impl PolicyEngine {
         Ok(allowed)
     }
 
+    /// Like [`PolicyEngine::authorize`], but returns
+    /// [`PolicyError::AccessDenied`] instead of a boolean when the subject
+    /// lacks the permission.
     pub async fn require(&self, sub: &str, obj: &str, act: Action) -> Result<(), PolicyError> {
         let ef = self.enforcer.read().await;
         let allowed = ef.enforce((sub, obj, &act.to_string()))?;
@@ -187,6 +205,9 @@ impl PolicyEngine {
     }
 }
 
+/// A capability-limited handle to the policy engine exposing only read and
+/// enforcement operations; safe to share with modules that must never mutate
+/// policies.
 #[derive(Clone)]
 pub struct Authorizer {
     // Private! Consumers cannot access the RwLock or call write().
@@ -200,6 +221,9 @@ impl Authorizer {
         Ok(ef.enforce((sub, obj, &act.to_string()))?)
     }
 
+    /// Like [`Authorizer::authorize`], but returns
+    /// [`PolicyError::AccessDenied`] instead of a boolean when the subject
+    /// lacks the permission.
     pub async fn require(&self, sub: &str, obj: &str, act: Action) -> Result<(), PolicyError> {
         let ef = self.enforcer.read().await;
         let allowed = ef.enforce((sub, obj, &act.to_string()))?;

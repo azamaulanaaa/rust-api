@@ -25,28 +25,45 @@ use super::bearer_token::BearerToken;
 const JWKS_REFRESH_DEBOUNCE: Duration = Duration::from_secs(5);
 
 #[allow(dead_code)]
+/// Audience (`aud`) claim values: providers emit either a single string or
+/// an array of strings, both of which deserialize into this enum.
 #[derive(Debug, Deserialize, Clone)]
 #[serde(untagged)]
 pub enum Audience {
+    /// A single audience value.
     Single(String),
+    /// Multiple audience values.
     Multi(Vec<String>),
 }
 
+/// Standard ID-token claims extracted from a validated JWT and inserted
+/// into request extensions.
 #[allow(dead_code)]
 #[derive(Debug, Deserialize, Clone)]
 pub struct Claims {
-    pub iss: String,           // Issuer
-    pub sub: String,           // Subject (User ID)
-    pub aud: Audience,         // Handle both String and [String]
-    pub exp: u64,              // Expiration (u64 for 2038+ safety)
-    pub nbf: Option<u64>,      // Not Before
-    pub iat: Option<u64>,      // Issued At
-    pub nonce: Option<String>, // Required for OIDC flow verification
-    pub jti: Option<String>,   // JWT ID (Good for revocation)
+    /// Issuer: the identity provider that issued the token.
+    pub iss: String,
+    /// Subject: the stable user identifier.
+    pub sub: String,
+    /// Audience(s) the token was issued for.
+    pub aud: Audience,
+    /// Expiration time (unix seconds); validated on every request.
+    pub exp: u64,
+    /// Not-before time (unix seconds), when present.
+    pub nbf: Option<u64>,
+    /// Issued-at time (unix seconds), when present.
+    pub iat: Option<u64>,
+    /// Nonce echoed back by the provider during the OIDC flow.
+    pub nonce: Option<String>,
+    /// Unique token identifier; usable as a revocation key.
+    pub jti: Option<String>,
 }
 
+/// A single verification key resolved from the provider's JWKS, paired
+/// with the algorithm tokens signed by it must use.
 #[derive(Debug, Clone)]
 pub struct SigningKey {
+    /// The raw key material used to verify token signatures.
     decoding_key: DecodingKey,
     /// Verification algorithm derived from this key's own `alg` (or the OIDC
     /// default RS256 when the JWK omits it). Tokens are validated against
@@ -201,6 +218,10 @@ fn to_signing_key(jwk: &Jwk) -> Option<(String, SigningKey)> {
     ))
 }
 
+/// Actix middleware validating JWTs against a [`JwksKeys`] store before the
+/// request reaches the wrapped service. Validated claims (generic over `C`)
+/// are inserted into request extensions; requests without any token pass
+/// through unmodified so routes decide their own auth requirements.
 #[derive(Clone)]
 pub struct JwtClaimsMiddleware<C>
 where
@@ -215,6 +236,8 @@ impl<C> JwtClaimsMiddleware<C>
 where
     C: DeserializeOwned,
 {
+    /// Assembles the middleware from an existing key store and base
+    /// validation config (audience/issuer/leeway).
     pub fn new(keys: JwksKeys, validation: Validation) -> Self {
         Self {
             keys,
@@ -223,6 +246,9 @@ where
         }
     }
 
+    /// Fetches the JWKS document from `jwks_url` and builds the middleware,
+    /// pinning `audience` and `issuer` validation. See [`JwksKeys`] for the
+    /// refresh behavior.
     pub async fn new_with_jks(
         jwks_url: &str,
         audience: &str,
@@ -263,6 +289,9 @@ where
     }
 }
 
+/// The per-worker instantiated middleware produced by
+/// [`JwtClaimsMiddleware::new_transform`](JwtClaimsMiddleware). Not
+/// constructed directly.
 pub struct JwtClaimsMiddlewareService<S, C> {
     service: Rc<S>,
     keys: JwksKeys,

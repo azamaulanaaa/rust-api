@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use super::{OidcClient, OidcError};
 use crate::endpoint::{ApiModule, middleware};
 
+/// API module exposing `/auth/login` and `/auth/callback`, and owning the
+/// JWT validation middleware configured from the discovered provider.
 pub struct OidcApiModule<C>
 where
     C: DeserializeOwned,
@@ -23,6 +25,8 @@ impl<C> OidcApiModule<C>
 where
     C: DeserializeOwned,
 {
+    /// Builds the module: loads the provider's JWKS once to seed the JWT
+    /// validation middleware (audience = client ID, issuer = provider).
     pub async fn init(oidc_client: OidcClient) -> anyhow::Result<Self> {
         let jwt_middleware = middleware::jwt::JwtClaimsMiddleware::new_with_jks(
             oidc_client.jwks_uri().as_str(),
@@ -37,6 +41,8 @@ where
         })
     }
 
+    /// Returns a clone of this module's JWT validation middleware so other
+    /// modules can protect their routes with the same provider keys.
     pub fn middleware(&self) -> middleware::jwt::JwtClaimsMiddleware<C>
     where
         C: Clone,
@@ -93,16 +99,24 @@ pub async fn login(oidc_client: web::Data<OidcClient>) -> impl Responder {
         .finish()
 }
 
+/// Query parameters the OIDC provider appends when redirecting back to
+/// `/auth/callback`.
 #[derive(Deserialize)]
 pub struct AuthCallbackQuery {
-    code: String,
-    state: String,
+    /// Authorization code issued by the provider.
+    pub code: String,
+    /// OAuth2 `state` value; must match the CSRF cookie.
+    pub state: String,
 }
 
+/// JSON body returned by `/auth/callback` describing the login outcome.
 #[derive(Serialize)]
 pub struct AuthResponse {
+    /// Whether authentication completed successfully.
     pub success: bool,
+    /// The validated ID token on success (also set as a cookie).
     pub token: Option<String>,
+    /// Human-readable failure reason on error.
     pub error: Option<String>,
 }
 
