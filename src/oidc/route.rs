@@ -26,8 +26,8 @@ where
     pub async fn init(oidc_client: OidcClient) -> anyhow::Result<Self> {
         let jwt_middleware = middleware::jwt::JwtClaimsMiddleware::new_with_jks(
             oidc_client.jwks_uri().as_str(),
-            oidc_client.issuer().as_str(),
             oidc_client.client_id().as_str(),
+            oidc_client.issuer().as_str(),
         )
         .await?;
 
@@ -41,7 +41,7 @@ where
     where
         C: Clone,
     {
-        return self.jwt_middleware.clone();
+        self.jwt_middleware.clone()
     }
 }
 
