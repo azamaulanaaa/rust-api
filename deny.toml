@@ -1,0 +1,45 @@
+# cargo-deny configuration: https://embarkstudios.github.io/cargo-deny/
+#
+# `cargo deny check licenses` verifies every locked dependency's license is
+# compatible with this project's MIT OR Apache-2.0 licensing.
+
+[graph]
+all-features = true
+
+[licenses]
+version = 2
+# Permissive licenses observed across the dependency graph. Anything not on
+# this list (copyleft, proprietary, unknown) fails the check and must be
+# reviewed before being added.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-1-Clause",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unlicense",
+    "CC0-1.0",
+    "Unicode-3.0",
+    "BSL-1.0",
+    "CDLA-Permissive-2.0",
+    # Weak/file-level copyleft compatible with redistribution under
+    # MIT OR Apache-2.0 (source stays available; see README License section).
+    "MPL-2.0",
+]
+# Some crates ship license text without an SPDX expression.
+confidence-threshold = 0.8
+
+[bans]
+# Warn when multiple versions of the same crate end up in the tree.
+multiple-versions = "warn"
+wildcards = "deny"
+
+[advisories]
+version = 2
+yanked = "warn"
+
+[sources]
+unknown-registry = "warn"
+unknown-git = "warn"
