@@ -90,7 +90,7 @@ otlp_endpoint = "http://localhost:4317"     # OTLP/gRPC collector endpoint
 # install toolchain (Rust stable via mise)
 mise install
 
-cargo run -- --config config.toml
+cargo run -- serve --config config.toml
 ```
 
 ### Logging & tracing
@@ -98,7 +98,7 @@ cargo run -- --config config.toml
 Console output is always enabled. Log level follows `RUST_LOG` when set, otherwise derives from `--verbose` (debug) vs default (info):
 
 ```bash
-RUST_LOG="debug" cargo run -- --config config.toml
+RUST_LOG="debug" cargo run -- serve --config config.toml
 ```
 
 When `observability.otlp_endpoint` is configured, one span is emitted per request (method, route template, status code, latency; 5xx marked as error) and batch-exported to any OTLP/gRPC collector. Inbound `traceparent` headers are extracted through the globally registered W3C Trace Context propagator, so requests from upstream instrumented services continue the same distributed trace. For example, with the Grafana LGTM stack:
@@ -106,6 +106,17 @@ When `observability.otlp_endpoint` is configured, one span is emitted per reques
 ```bash
 docker run -p 4317:4317 grafana/otel-lgtm
 ```
+
+## Policy data management
+
+Policies can be exported to JSON for backups and re-imported into a fresh store (e.g. when moving hosts):
+
+```bash
+rust-api policy export --store data/rust-api.redb --out backup.json
+rust-api policy import --store data/rust-api.redb --in backup.json
+```
+
+Imports are idempotent — already-present rules are skipped — and every entry passes the same validation hook as live API writes.
 
 ## Extending the API
 

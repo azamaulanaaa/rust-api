@@ -12,6 +12,9 @@ pub mod route;
 /// Casbin storage adapter persisting policies to an embedded oxkv store.
 pub mod adapter;
 
+/// JSON export/import of policy data for backups and migrations.
+pub mod admin;
+
 /// The operation a policy rule grants on an object.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Action {
@@ -75,6 +78,21 @@ pub struct PolicyEngine {
     pub enforcer: Arc<RwLock<Enforcer>>,
 }
 
+/// The Casbin RBAC model used by [`PolicyEngine`]: group-based
+/// permissions where a subject authorizes through its group memberships.
+pub(crate) const RBAC_MODEL: &str = r#"
+    [request_definition]
+    r = sub, obj, act
+    [policy_definition]
+    p = sub, obj, act
+    [role_definition]
+    g = _, _
+    [policy_effect]
+    e = some(where (p.eft == allow))
+    [matchers]
+    m = g(r.sub, p.sub) && r.obj == p.obj && r.act == p.act
+"#;
+
 impl PolicyEngine {
     /// Opens the embedded oxkv database at `store_path`, loads the RBAC
     /// model and stored policies via the [`adapter::OxkvAdapter`], and
@@ -94,21 +112,7 @@ impl PolicyEngine {
             .with_validator(adapter::PolicyRuleValidator);
             let adapter = adapter::OxkvAdapter::new(store);
 
-            let model = DefaultModel::from_str(
-                r#"
-                    [request_definition]
-                    r = sub, obj, act
-                    [policy_definition]
-                    p = sub, obj, act
-                    [role_definition]
-                    g = _, _
-                    [policy_effect]
-                    e = some(where (p.eft == allow))
-                    [matchers]
-                    m = g(r.sub, p.sub) && r.obj == p.obj && r.act == p.act
-                "#,
-            )
-            .await?;
+            let model = DefaultModel::from_str(RBAC_MODEL).await?;
 
             let mut enforcer = Enforcer::new(model, adapter).await?;
             enforcer.enable_auto_save(true);
