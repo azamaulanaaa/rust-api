@@ -8,7 +8,7 @@ The crate is intentionally business-logic free: applications compose `ApiModule`
 
 - **OIDC authentication** — authorization-code flow with PKCE, CSRF state, and nonce validation against any spec-compliant identity provider (Keycloak, Entra ID, Auth0, …)
 - **JWT validation via JWKS** — refreshable multi-algorithm key store with rotation support; unknown `kid` triggers a debounced re-fetch of the provider's keys
-- **Casbin RBAC on an embedded oxkv database** — permission rules and group membership management backed by a transactional key-value store persisted to a single file; no external database server required
+- **Casbin RBAC on an embedded oxkv database** — permission rules and group membership management backed by a transactional key-value store persisted to a single file; no external database server required. Store writes pass through an oxkv validation hook that rejects malformed or wrong-arity rules at write time instead of poisoning startup
 - **Modular composition** — implement the `ApiModule` trait and register onto `ApiService`; auth middleware is applied per module scope
 - **Observability** — structured console logging through the `tracing` facade (`RUST_LOG` syntax), plus optional OpenTelemetry span export over OTLP/gRPC with W3C Trace Context propagation
 

@@ -15,7 +15,7 @@ use casbin::{
     Model,
     error::{AdapterError, Error as CasbinError},
 };
-use oxkv::{Direction, GetSet, Store, Transaction as _};
+use oxkv::{Direction, GetSet, Store, StoreView, Transaction as _, Validator};
 
 /// Key prefix separator; keys are `{sec}:{ptype}:{rule-hash}`.
 const SEP: char = ':';
@@ -34,6 +34,69 @@ fn rule_key(sec: &str, ptype: &str, rule: &[String]) -> String {
 /// Maps an [`oxkv::StoreError`] into casbin's adapter error type.
 fn store_err(e: oxkv::StoreError) -> CasbinError {
     CasbinError::AdapterError(AdapterError(Box::new(e)))
+}
+
+/// Validates every write into the policy store before it becomes durable.
+///
+/// Enforces the adapter's storage contract at the storage layer so a bug in
+/// the adapter itself (or any future tooling touching the same file) is
+/// rejected at write time instead of poisoning [`OxkvAdapter`]'s startup
+/// load:
+///
+/// - keys must be `{sec}:{ptype}:{hex-hash}` with a known section (`p`/`g`)
+/// - values must decode as a JSON string array
+/// - rules must match the RBAC model's field count (3 for `p`, 2 for `g`)
+pub struct PolicyRuleValidator;
+
+impl PolicyRuleValidator {
+    /// Expected rule field count for a section of the RBAC model defined
+    /// in [`PolicyEngine`](super::PolicyEngine). Coupled to that model on
+    /// purpose: changing the model requires revisiting this validator.
+    fn expected_arity(sec: &str) -> usize {
+        match sec {
+            "p" => 3, // sub, obj, act
+            "g" => 2, // user, group
+            _ => unreachable!("section validated before arity check"),
+        }
+    }
+}
+
+#[async_trait]
+impl Validator for PolicyRuleValidator {
+    async fn validate(
+        &self,
+        _ctx: &dyn StoreView,
+        key: &str,
+        value: &[u8],
+    ) -> Result<(), oxkv::StoreError> {
+        let mut parts = key.splitn(3, SEP);
+        let (Some(sec), Some(ptype), Some(hash)) =
+            (parts.next(), parts.next(), parts.next())
+        else {
+            return Err(format!("policy keys must be '{{sec}}:{SEP}{{hash}}', got '{key}'").into());
+        };
+        if sec != "p" && sec != "g" {
+            return Err(format!("unknown policy section '{sec}' in key '{key}'").into());
+        }
+        if ptype.is_empty() {
+            return Err(format!("empty policy type segment in key '{key}'").into());
+        }
+        if hash.is_empty() || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(format!("non-hex rule hash segment in key '{key}'").into());
+        }
+
+        let rule: Vec<String> = serde_json::from_slice(value)
+            .map_err(|e| format!("policy rule must be a JSON string array: {e}"))?;
+        let expected = Self::expected_arity(sec);
+        if rule.len() != expected {
+            return Err(format!(
+                "'{sec}' rules need {expected} fields, got {}",
+                rule.len()
+            )
+            .into());
+        }
+        Ok(())
+    }
 }
 
 /// A Casbin [`Adapter`] persisting policies to any [`oxkv::Store`].
@@ -307,7 +370,8 @@ mod tests {
 
         {
             let adapter = OxkvAdapter::new(
-                RedbStore::new_file(&path).unwrap(),
+                oxkv::HookStore::new(RedbStore::new_file(&path).unwrap())
+                    .with_validator(PolicyRuleValidator),
             );
             let mut enforcer = Enforcer::new(model, adapter).await.unwrap();
             enforcer
@@ -332,7 +396,8 @@ mod tests {
         {
             let model = DefaultModel::from_str(MODEL).await.unwrap();
             let adapter = OxkvAdapter::new(
-                RedbStore::new_file(&path).unwrap(),
+                oxkv::HookStore::new(RedbStore::new_file(&path).unwrap())
+                    .with_validator(PolicyRuleValidator),
             );
             let enforcer = Enforcer::new(model, adapter).await.unwrap();
             assert!(
@@ -392,5 +457,37 @@ mod tests {
         let remaining = adapter.load_all().await.unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].2[0], "bob");
+    }
+
+    #[tokio::test]
+    async fn validator_rejects_malformed_writes() {
+        use oxkv::Store as _;
+
+        let mut store =
+            oxkv::HookStore::new(BTreeStore::default())
+                .with_validator(PolicyRuleValidator);
+
+        // Valid p-rule passes.
+        store
+            .set_bytes(
+                "p:p:ab01",
+                br#"["alice","doc_a","read"]"#,
+            )
+            .await
+            .unwrap();
+
+        // Non-JSON value rejected.
+        let mut tx = store.begin_tx().unwrap();
+        assert!(tx.set_bytes("p:p:cd02", b"not json").await.is_err());
+
+        // Wrong arity for section rejected at staging (g needs 2 fields).
+        let mut tx = store.begin_tx().unwrap();
+        assert!(tx.set_bytes("g:g:ef03", br#"["user"]"#).await.is_err());
+
+
+        // Unknown section rejected at staging.
+        let mut tx = store.begin_tx().unwrap();
+        assert!(tx.set_bytes("x:m:ff04", br#"["a","b"]"#).await.is_err());
+
     }
 }

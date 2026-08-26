@@ -88,10 +88,11 @@ impl PolicyEngine {
             }
 
         let enforcer = {
-            let adapter = adapter::OxkvAdapter::new(
-                oxkv::RedbStore::new_file(store_path)
-                    .map_err(PolicyError::Store)?,
-            );
+            let store = oxkv::HookStore::new(
+                oxkv::RedbStore::new_file(store_path).map_err(PolicyError::Store)?,
+            )
+            .with_validator(adapter::PolicyRuleValidator);
+            let adapter = adapter::OxkvAdapter::new(store);
 
             let model = DefaultModel::from_str(
                 r#"
