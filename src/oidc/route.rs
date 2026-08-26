@@ -110,7 +110,7 @@ pub struct AuthCallbackQuery {
 }
 
 /// JSON body returned by `/auth/callback` describing the login outcome.
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct AuthResponse {
     /// Whether authentication completed successfully.
     pub success: bool,
@@ -213,4 +213,321 @@ fn clear_cookie(name: String) -> Cookie<'static> {
         .same_site(SameSite::Lax)
         .max_age(Duration::ZERO)
         .finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::oidc::OidcConfig;
+    use actix_web::{dev::ServiceResponse, http::header::LOCATION, test};
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    use jsonwebtoken::{EncodingKey, Header, encode};
+    use rsa::{RsaPrivateKey, RsaPublicKey, pkcs1::EncodeRsaPrivateKey, traits::PublicKeyParts};
+    use serde_json::json;
+    use url::Url;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const CLIENT_ID: &str = "test-client";
+
+    /// A mock OIDC provider plus the fully-initialized API module wired to
+    /// it, and the RSA signing key matching the served JWKS.
+    struct Fixture {
+        server: MockServer,
+        module: OidcApiModule<serde_json::Value>,
+        encoding_key: EncodingKey,
+    }
+
+    impl Fixture {
+        async fn new() -> anyhow::Result<Self> {
+            let server = MockServer::start().await;
+
+            let mut rng = rand::thread_rng();
+            let private_key = RsaPrivateKey::new(&mut rng, 2048)?;
+            let public_key = RsaPublicKey::from(&private_key);
+
+            Mock::given(method("GET"))
+                .and(path("/jwks"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "keys": [{
+                        "kty": "RSA",
+                        "use": "sig",
+                        "kid": "test-key-id",
+                        "alg": "RS256",
+                        "n": URL_SAFE_NO_PAD.encode(public_key.n().to_bytes_be()),
+                        "e": URL_SAFE_NO_PAD.encode(public_key.e().to_bytes_be()),
+                    }]
+                })))
+                .mount(&server)
+                .await;
+
+            Mock::given(method("GET"))
+                .and(path("/.well-known/openid-configuration"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "issuer": server.uri(),
+                    "authorization_endpoint": format!("{}/auth", server.uri()),
+                    "token_endpoint": format!("{}/token", server.uri()),
+                    "jwks_uri": format!("{}/jwks", server.uri()),
+                    "response_types_supported": ["code"],
+                    "subject_types_supported": ["public"],
+                    "id_token_signing_alg_values_supported": ["RS256"],
+                })))
+                .mount(&server)
+                .await;
+
+            let oidc_client = OidcClient::new(OidcConfig {
+                client_id: CLIENT_ID.to_string(),
+                client_secret: "test-secret".to_string(),
+                issuer_url: server.uri(),
+                redirect_url: "http://localhost/callback".to_string(),
+            })
+            .await?;
+
+            Ok(Self {
+                module: OidcApiModule::init(oidc_client).await?,
+                server,
+                encoding_key: EncodingKey::from_rsa_der(private_key.to_pkcs1_der()?.as_bytes()),
+            })
+        }
+    }
+
+    /// Builds a test app exposing the module's routes. Kept inline per test
+    /// so actix's service type is always concretely inferred.
+    macro_rules! test_app {
+        ($fixture:expr) => {
+            test::init_service(actix_web::App::new().configure(|cfg| {
+                ApiModule::configure(&$fixture.module, cfg);
+            }))
+            .await
+        };
+    }
+
+    /// Extracts the CSRF/nonce/PKCE cookie values plus the authorization
+    /// code and state parameters from a completed GET /auth/login response.
+    fn login_parts(res: &ServiceResponse) -> anyhow::Result<(String, String, String, String)> {
+        assert_eq!(res.status(), 302);
+
+        let location = Url::parse(
+            res.response()
+                .headers()
+                .get(LOCATION)
+                .expect("redirect Location header")
+                .to_str()
+                .unwrap(),
+        )?;
+        let query: std::collections::HashMap<String, String> =
+            location.query_pairs().into_owned().collect();
+
+        let cookie_value = |name: &str| {
+            res.response()
+                .cookies()
+                .find(|c| c.name() == name)
+                .map(|c| c.value().to_string())
+                .expect("login must set security cookies")
+        };
+
+        Ok((
+            cookie_value("oidc_csrf"),
+            cookie_value("oidc_nonce"),
+            cookie_value("oidc_pkce"),
+            query["state"].clone(),
+        ))
+    }
+
+    /// Builds the Cookie header value carrying the three security cookies.
+    fn cookie_header(csrf: &str, nonce: &str, pkce: &str) -> String {
+        format!("oidc_csrf={csrf}; oidc_nonce={nonce}; oidc_pkce={pkce}")
+    }
+
+    #[tokio::test]
+    async fn login_redirects_to_provider_with_security_cookies() {
+        let fx = Fixture::new().await.unwrap();
+        let svc = test_app!(fx);
+
+        let res = test::call_service(
+            &svc,
+            test::TestRequest::get().uri("/auth/login").to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), 302);
+
+        let location = Url::parse(
+            res.response()
+                .headers()
+                .get(LOCATION)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(location.host_str().unwrap(), "127.0.0.1"); // mock provider
+        let query: std::collections::HashMap<String, String> =
+            location.query_pairs().into_owned().collect();
+        assert_eq!(query["client_id"], CLIENT_ID);
+        assert_eq!(query["response_type"], "code");
+        assert!(
+            query.get("code_challenge").is_some_and(|c| !c.is_empty()),
+            "PKCE challenge must be present"
+        );
+
+        for name in ["oidc_csrf", "oidc_nonce", "oidc_pkce"] {
+            let cookie = res
+                .response()
+                .cookies()
+                .find(|c| c.name() == name)
+                .unwrap_or_else(|| panic!("missing {name} cookie"));
+            assert_eq!(cookie.http_only(), Some(true), "{name} must be HttpOnly");
+            assert_eq!(cookie.secure(), Some(true), "{name} must be Secure");
+            assert_eq!(cookie.same_site(), Some(SameSite::Lax));
+        }
+    }
+
+    #[tokio::test]
+    async fn callback_without_cookies_is_400() {
+        let fx = Fixture::new().await.unwrap();
+        let svc = test_app!(fx);
+
+        let req = test::TestRequest::get()
+            .uri("/auth/callback?code=x&state=y")
+            .to_request();
+        let res = test::call_service(&svc, req).await;
+
+        assert_eq!(res.status(), 400);
+        let body: AuthResponse = serde_json::from_slice(&test::read_body(res).await).unwrap();
+        assert!(!body.success);
+        assert!(
+            body.error
+                .as_deref()
+                .is_some_and(|e| e.contains("cookies missing"))
+        );
+    }
+
+    #[tokio::test]
+    async fn callback_with_tampered_state_is_401() {
+        let fx = Fixture::new().await.unwrap();
+        let svc = test_app!(fx);
+        let login_res = test::call_service(
+            &svc,
+            test::TestRequest::get().uri("/auth/login").to_request(),
+        )
+        .await;
+        let (csrf, nonce, pkce, _state) = login_parts(&login_res).unwrap();
+
+        let req = test::TestRequest::get()
+            .uri("/auth/callback?code=abc&state=tampered")
+            .insert_header(("Cookie", cookie_header(&csrf, &nonce, &pkce)))
+            .to_request();
+        let res = test::call_service(&svc, req).await;
+
+        assert_eq!(res.status(), 401);
+        let body: AuthResponse = serde_json::from_slice(&test::read_body(res).await).unwrap();
+        assert_eq!(body.error.as_deref(), Some("Invalid state parameter"));
+    }
+
+    #[tokio::test]
+    async fn callback_happy_path_returns_token_and_clears_cookies() -> anyhow::Result<()> {
+        let fx = Fixture::new().await?;
+        let svc = test_app!(fx);
+        let login_res = test::call_service(
+            &svc,
+            test::TestRequest::get().uri("/auth/login").to_request(),
+        )
+        .await;
+        let (csrf, nonce, pkce, state) = login_parts(&login_res)?;
+        let code = "test-code";
+
+        // Mint an ID token whose nonce matches the login-issued cookie so
+        // the mocked token response passes full provider-side validation.
+        let header = {
+            let mut h = Header::new(jsonwebtoken::Algorithm::RS256);
+            h.kid = Some("test-key-id".to_string());
+            h
+        };
+        let claims = json!({
+            "iss": fx.server.uri(),
+            "sub": "user-123",
+            "aud": CLIENT_ID,
+            "exp": 2_000_000_000i64,
+            "iat": 1_000_000_000i64,
+            "nonce": nonce,
+        });
+        let id_token = encode(&header, &claims, &fx.encoding_key)?;
+
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "mock-access",
+                "token_type": "Bearer",
+                "id_token": id_token,
+            })))
+            .mount(&fx.server)
+            .await;
+
+        let req = test::TestRequest::get()
+            .uri(&format!("/auth/callback?code={code}&state={state}"))
+            .insert_header(("Cookie", cookie_header(&csrf, &nonce, &pkce)))
+            .to_request();
+        let res = test::call_service(&svc, req).await;
+
+        assert_eq!(res.status(), 200);
+        // Cookies must be extracted before read_body consumes the response.
+        let auth_cookie = res
+            .response()
+            .cookies()
+            .find(|c| c.name() == "auth_token")
+            .expect("auth_token cookie must be set")
+            .value()
+            .to_string();
+        for name in ["oidc_csrf", "oidc_nonce", "oidc_pkce"] {
+            let cookie = res
+                .response()
+                .cookies()
+                .find(|c| c.name() == name)
+                .unwrap_or_else(|| panic!("{name} must be cleared"));
+            assert_eq!(
+                cookie.max_age(),
+                Some(Duration::ZERO),
+                "{name} must be cleared"
+            );
+        }
+
+        let body: AuthResponse = serde_json::from_slice(&test::read_body(res).await)?;
+        assert!(body.success);
+        assert!(body.error.is_none());
+
+        assert_eq!(auth_cookie, body.token.as_deref().unwrap_or_default());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn callback_with_failing_exchange_is_401_without_leaking_details() {
+        let fx = Fixture::new().await.unwrap();
+        let svc = test_app!(fx);
+        let login_res = test::call_service(
+            &svc,
+            test::TestRequest::get().uri("/auth/login").to_request(),
+        )
+        .await;
+        let (csrf, nonce, pkce, state) = login_parts(&login_res).unwrap();
+        let code = "test-code";
+
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(400))
+            .mount(&fx.server)
+            .await;
+
+        let req = test::TestRequest::get()
+            .uri(&format!("/auth/callback?code={code}&state={state}"))
+            .insert_header(("Cookie", cookie_header(&csrf, &nonce, &pkce)))
+            .to_request();
+        let res = test::call_service(&svc, req).await;
+
+        assert_eq!(res.status(), 401);
+        let body: AuthResponse = serde_json::from_slice(&test::read_body(res).await).unwrap();
+        assert!(!body.success);
+        // Provider failure details must never reach the client.
+        assert_eq!(body.error.as_deref(), Some("authentication failed"));
+    }
 }
