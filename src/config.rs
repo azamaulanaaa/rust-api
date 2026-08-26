@@ -61,6 +61,11 @@ pub struct ObservabilityConfig {
     /// Span export is disabled when absent.
     #[serde(default)]
     pub otlp_endpoint: Option<String>,
+    /// Fraction of traces sampled, between 0.0 and 1.0 (default 1.0 = all).
+    /// Root spans decide via trace-ID ratio; child spans follow their
+    /// parent's decision.
+    #[serde(default = "default_sample_ratio")]
+    pub sample_ratio: f64,
 }
 
 impl Default for ObservabilityConfig {
@@ -68,8 +73,13 @@ impl Default for ObservabilityConfig {
         Self {
             service_name: default_service_name(),
             otlp_endpoint: None,
+            sample_ratio: default_sample_ratio(),
         }
     }
+}
+
+fn default_sample_ratio() -> f64 {
+    1.0
 }
 
 fn default_service_name() -> String {

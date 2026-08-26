@@ -14,8 +14,10 @@ use opentelemetry::{
 };
 use opentelemetry_otlp::{MetricExporter, SpanExporter, WithExportConfig};
 use opentelemetry_sdk::{
-    Resource, metrics::SdkMeterProvider, propagation::TraceContextPropagator,
-    trace::SdkTracerProvider,
+    Resource,
+    metrics::SdkMeterProvider,
+    propagation::TraceContextPropagator,
+    trace::{Sampler, SdkTracerProvider},
 };
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -32,6 +34,41 @@ pub struct Telemetry {
 
 impl Drop for Telemetry {
     fn drop(&mut self) {
+        // Safety net for early-error paths; the normal shutdown path is the
+        // explicit [`Telemetry::shutdown`], which reports failures.
+        self.shutdown_inner();
+    }
+}
+
+impl Telemetry {
+    /// Flushes and releases telemetry resources, returning an error if any
+    /// pending spans or metric points could not be delivered. Call once at
+    /// process exit; dropping without this still flushes best-effort.
+    pub fn shutdown(mut self) -> anyhow::Result<()> {
+        let mut errors = Vec::new();
+        if let Some(provider) = self.tracer_provider.take() {
+            if let Err(e) = provider.shutdown() {
+                errors.push(format!("tracer provider: {e:?}"));
+            }
+        }
+        if let Some(provider) = self.meter_provider.take() {
+            // Final periodic-reader collection: flushes pending metric
+            // points to the collector.
+            if let Err(e) = provider.shutdown() {
+                errors.push(format!("meter provider: {e:?}"));
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!(
+                "telemetry shutdown failed: {}",
+                errors.join("; ")
+            ))
+        }
+    }
+
+    fn shutdown_inner(&mut self) {
         if let Some(provider) = self.tracer_provider.take()
             && let Err(e) = provider.shutdown()
         {
@@ -58,6 +95,7 @@ pub fn init(
     verbose: bool,
     service_name: &str,
     otlp_endpoint: Option<&str>,
+    sample_ratio: f64,
 ) -> anyhow::Result<Telemetry> {
     let default_filter = if verbose { "debug" } else { "info" };
     let env_filter =
@@ -85,6 +123,11 @@ pub fn init(
             let provider = SdkTracerProvider::builder()
                 .with_resource(resource.clone())
                 .with_batch_exporter(exporter)
+                // Root spans sample by trace-ID ratio; child spans follow
+                // their parent's decision.
+                .with_sampler(Sampler::ParentBased(Box::new(Sampler::TraceIdRatioBased(
+                    sample_ratio.clamp(0.0, 1.0),
+                ))))
                 .build();
 
             // Metrics share the OTLP endpoint; the periodic reader collects

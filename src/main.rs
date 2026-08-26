@@ -121,10 +121,11 @@ async fn main() -> anyhow::Result<()> {
 async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
     let config = config::Config::try_from(config_path)?;
 
-    let _telemetry = telemetry::init(
+    let telemetry = telemetry::init(
         verbose,
         &config.observability.service_name,
         config.observability.otlp_endpoint.as_deref(),
+        config.observability.sample_ratio,
     )?;
 
     let base = Url::parse(&config.public_address).context("Invalid public_address in config")?;
@@ -150,6 +151,11 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
         .register_module(Box::new(policy_api_module))
         .start(listen_addr.into())
         .await?;
+
+    // Explicit flush on the normal exit path: pending spans and metric
+    // points are delivered, and failures are surfaced instead of silently
+    // dropped (the Drop fallback remains for early-error paths).
+    telemetry.shutdown()?;
 
     Ok(())
 }
