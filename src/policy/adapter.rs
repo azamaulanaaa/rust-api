@@ -10,9 +10,7 @@
 
 use async_trait::async_trait;
 use casbin::{
-    Adapter,
-    Filter,
-    Model,
+    Adapter, Filter, Model,
     error::{AdapterError, Error as CasbinError},
 };
 use oxkv::{Direction, GetSet, Store, StoreView, Transaction as _, Validator};
@@ -70,8 +68,7 @@ impl Validator for PolicyRuleValidator {
         value: &[u8],
     ) -> Result<(), oxkv::StoreError> {
         let mut parts = key.splitn(3, SEP);
-        let (Some(sec), Some(ptype), Some(hash)) =
-            (parts.next(), parts.next(), parts.next())
+        let (Some(sec), Some(ptype), Some(hash)) = (parts.next(), parts.next(), parts.next())
         else {
             return Err(format!("policy keys must be '{{sec}}:{SEP}{{hash}}', got '{key}'").into());
         };
@@ -89,11 +86,7 @@ impl Validator for PolicyRuleValidator {
             .map_err(|e| format!("policy rule must be a JSON string array: {e}"))?;
         let expected = Self::expected_arity(sec);
         if rule.len() != expected {
-            return Err(format!(
-                "'{sec}' rules need {expected} fields, got {}",
-                rule.len()
-            )
-            .into());
+            return Err(format!("'{sec}' rules need {expected} fields, got {}", rule.len()).into());
         }
         Ok(())
     }
@@ -123,8 +116,7 @@ impl<S: Store> OxkvAdapter<S> {
             .await?
         {
             let mut parts = kv.key.splitn(3, SEP);
-            let (Some(sec), Some(ptype), Some(_)) =
-                (parts.next(), parts.next(), parts.next())
+            let (Some(sec), Some(ptype), Some(_)) = (parts.next(), parts.next(), parts.next())
             else {
                 // Foreign or corrupt entry: skip rather than poison startup.
                 continue;
@@ -154,11 +146,7 @@ impl<S: Store> OxkvAdapter<S> {
 
     /// True when `rule[field_index + i] == field_values[i]` for all i;
     /// implements casbin's filtered-policy matching semantics.
-    fn rule_matches(
-        rule: &[String],
-        field_index: usize,
-        field_values: &[String],
-    ) -> bool {
+    fn rule_matches(rule: &[String], field_index: usize, field_values: &[String]) -> bool {
         field_values
             .iter()
             .enumerate()
@@ -193,10 +181,14 @@ where
                 && !Self::rule_matches(
                     &rule,
                     0,
-                    &field_values.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
-                ) {
-                    continue;
-                }
+                    &field_values
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect::<Vec<_>>(),
+                )
+            {
+                continue;
+            }
             m.add_policy(&sec, &ptype, rule);
         }
         Ok(())
@@ -223,7 +215,9 @@ where
         for (sec, ptype, rule) in entries {
             // StoreError: From<serde_json::Error> — convert before crossing
             // into casbin's error domain.
-            let value = serde_json::to_vec(&rule).map_err(oxkv::StoreError::from).map_err(store_err)?;
+            let value = serde_json::to_vec(&rule)
+                .map_err(oxkv::StoreError::from)
+                .map_err(store_err)?;
             tx.set_bytes(&rule_key(&sec, &ptype, &rule), &value)
                 .await
                 .map_err(store_err)?;
@@ -255,8 +249,7 @@ where
         ptype: &str,
         rules: Vec<Vec<String>>,
     ) -> casbin::Result<bool> {
-        let keys: Vec<String> =
-            rules.iter().map(|r| rule_key(sec, ptype, r)).collect();
+        let keys: Vec<String> = rules.iter().map(|r| rule_key(sec, ptype, r)).collect();
         let values: Vec<Vec<u8>> = rules
             .iter()
             .map(|r| serde_json::to_vec(r).map_err(oxkv::StoreError::from))
@@ -290,8 +283,7 @@ where
         ptype: &str,
         rules: Vec<Vec<String>>,
     ) -> casbin::Result<bool> {
-        let keys: Vec<String> =
-            rules.iter().map(|r| rule_key(sec, ptype, r)).collect();
+        let keys: Vec<String> = rules.iter().map(|r| rule_key(sec, ptype, r)).collect();
 
         let mut tx = self.store.begin_tx().map_err(store_err)?;
         for key in &keys {
@@ -362,10 +354,7 @@ mod tests {
 
     #[tokio::test]
     async fn persists_rules_across_reopen() {
-        let path = std::env::temp_dir().join(format!(
-            "oxkv-adapter-test-{}",
-            std::process::id()
-        ));
+        let path = std::env::temp_dir().join(format!("oxkv-adapter-test-{}", std::process::id()));
         let model = DefaultModel::from_str(MODEL).await.unwrap();
 
         {
@@ -386,11 +375,7 @@ mod tests {
                 ])
                 .await
                 .unwrap();
-            assert!(
-                enforcer
-                    .enforce(("user_1", "data_1", "read"))
-                    .unwrap()
-            );
+            assert!(enforcer.enforce(("user_1", "data_1", "read")).unwrap());
         }
 
         {
@@ -400,16 +385,8 @@ mod tests {
                     .with_validator(PolicyRuleValidator),
             );
             let enforcer = Enforcer::new(model, adapter).await.unwrap();
-            assert!(
-                enforcer
-                    .enforce(("user_1", "data_1", "read"))
-                    .unwrap()
-            );
-            assert!(
-                !enforcer
-                    .enforce(("user_1", "data_1", "write"))
-                    .unwrap()
-            );
+            assert!(enforcer.enforce(("user_1", "data_1", "read")).unwrap());
+            assert!(!enforcer.enforce(("user_1", "data_1", "write")).unwrap());
         }
 
         std::fs::remove_file(path).ok();
@@ -464,15 +441,11 @@ mod tests {
         use oxkv::Store as _;
 
         let mut store =
-            oxkv::HookStore::new(BTreeStore::default())
-                .with_validator(PolicyRuleValidator);
+            oxkv::HookStore::new(BTreeStore::default()).with_validator(PolicyRuleValidator);
 
         // Valid p-rule passes.
         store
-            .set_bytes(
-                "p:p:ab01",
-                br#"["alice","doc_a","read"]"#,
-            )
+            .set_bytes("p:p:ab01", br#"["alice","doc_a","read"]"#)
             .await
             .unwrap();
 
@@ -484,10 +457,8 @@ mod tests {
         let mut tx = store.begin_tx().unwrap();
         assert!(tx.set_bytes("g:g:ef03", br#"["user"]"#).await.is_err());
 
-
         // Unknown section rejected at staging.
         let mut tx = store.begin_tx().unwrap();
         assert!(tx.set_bytes("x:m:ff04", br#"["a","b"]"#).await.is_err());
-
     }
 }

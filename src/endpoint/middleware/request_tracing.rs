@@ -44,8 +44,7 @@ pub struct RequestTracingMiddleware;
 
 impl<S, B> actix_web::dev::Transform<S, ServiceRequest> for RequestTracingMiddleware
 where
-    S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = actix_web::Error>
-        + 'static,
+    S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = actix_web::Error> + 'static,
     S::Future: 'static,
     B: 'static,
 {
@@ -70,8 +69,7 @@ pub struct RequestTracingMiddlewareService<S> {
 
 impl<S, B> Service<ServiceRequest> for RequestTracingMiddlewareService<S>
 where
-    S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = actix_web::Error>
-        + 'static,
+    S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = actix_web::Error> + 'static,
     S::Future: 'static,
     B: 'static,
 {

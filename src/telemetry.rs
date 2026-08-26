@@ -13,16 +13,8 @@ use opentelemetry::{
     trace::TracerProvider as _, // trait method: provider.tracer(name)
 };
 use opentelemetry_otlp::{SpanExporter, WithExportConfig};
-use opentelemetry_sdk::{
-    Resource,
-    propagation::TraceContextPropagator,
-    trace::SdkTracerProvider,
-};
-use tracing_subscriber::{
-    EnvFilter,
-    layer::SubscriberExt,
-    util::SubscriberInitExt,
-};
+use opentelemetry_sdk::{Resource, propagation::TraceContextPropagator, trace::SdkTracerProvider};
+use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 /// Handle for telemetry resources that must live for the process duration.
 ///
@@ -36,9 +28,10 @@ pub struct Telemetry {
 impl Drop for Telemetry {
     fn drop(&mut self) {
         if let Some(provider) = self.tracer_provider.take()
-            && let Err(e) = provider.shutdown() {
-                eprintln!("failed to shut down tracer provider: {e:?}");
-            }
+            && let Err(e) = provider.shutdown()
+        {
+            eprintln!("failed to shut down tracer provider: {e:?}");
+        }
     }
 }
 
@@ -54,8 +47,8 @@ pub fn init(
     otlp_endpoint: Option<&str>,
 ) -> anyhow::Result<Telemetry> {
     let default_filter = if verbose { "debug" } else { "info" };
-    let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(default_filter));
+    let env_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter));
 
     // Register before any request can be served so inbound traceparent
     // headers link remote parents to our server spans (see request tracing).

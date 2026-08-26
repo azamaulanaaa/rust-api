@@ -14,7 +14,10 @@ use actix_web::{
 };
 use futures_util::future::LocalBoxFuture;
 pub use jsonwebtoken::{Algorithm, DecodingKey, Validation, jwk::JwkSet};
-use jsonwebtoken::{decode, jwk::{AlgorithmParameters, Jwk, KeyAlgorithm}};
+use jsonwebtoken::{
+    decode,
+    jwk::{AlgorithmParameters, Jwk, KeyAlgorithm},
+};
 use serde::{Deserialize, de::DeserializeOwned};
 
 use super::bearer_token::BearerToken;
@@ -443,7 +446,11 @@ mod tests {
         Ok((entry, EncodingKey::from_rsa_der(der.as_bytes())))
     }
 
-    fn sign_rs256(claims: &serde_json::Value, kid: &str, key: &EncodingKey) -> anyhow::Result<String> {
+    fn sign_rs256(
+        claims: &serde_json::Value,
+        kid: &str,
+        key: &EncodingKey,
+    ) -> anyhow::Result<String> {
         let mut header = Header::new(Algorithm::RS256);
         header.kid = Some(kid.to_string());
         Ok(encode(&header, claims, key)?)
@@ -494,11 +501,9 @@ mod tests {
         serve_jwks(json!({ "keys": [key_a] })).await;
 
         // Zero debounce so the on-miss refresh fires immediately.
-        let keys = JwksKeys::with_refresh_debounce(
-            format!("{}/jwks", server.uri()),
-            Duration::ZERO,
-        )
-        .await?;
+        let keys =
+            JwksKeys::with_refresh_debounce(format!("{}/jwks", server.uri()), Duration::ZERO)
+                .await?;
         assert!(keys.get(Some("kid-a")).await.is_some());
         assert!(keys.get(Some("kid-b")).await.is_none()); // miss → debounced refresh
 
@@ -506,8 +511,14 @@ mod tests {
         serve_jwks(json!({ "keys": [key_b] })).await;
 
         let refreshed = keys.get(Some("kid-b")).await;
-        assert!(refreshed.is_some(), "rotation should be picked up after refresh");
-        assert!(keys.get(Some("kid-a")).await.is_none(), "retired kid must be dropped");
+        assert!(
+            refreshed.is_some(),
+            "rotation should be picked up after refresh"
+        );
+        assert!(
+            keys.get(Some("kid-a")).await.is_none(),
+            "retired kid must be dropped"
+        );
 
         // The refreshed key must actually verify a token signed with kid-b.
         let token = sign_rs256(
@@ -544,8 +555,10 @@ mod tests {
 
         assert!(decode::<TestClaims>(&forged, &signing_key.decoding_key, &validation).is_err());
         validation.algorithms = vec![Algorithm::HS256];
-        assert!(decode::<TestClaims>(&forged, &signing_key.decoding_key, &validation).is_err(),
-            "HMAC family can never verify against an RSA decoding key");
+        assert!(
+            decode::<TestClaims>(&forged, &signing_key.decoding_key, &validation).is_err(),
+            "HMAC family can never verify against an RSA decoding key"
+        );
 
         Ok(())
     }
@@ -561,7 +574,10 @@ mod tests {
         let server = spawn_jwks(json!({ "keys": [oct_key] })).await;
 
         let result = JwksKeys::new(format!("{}/jwks", server.uri())).await;
-        assert!(result.is_err(), "a JWKS containing only oct keys must fail construction");
+        assert!(
+            result.is_err(),
+            "a JWKS containing only oct keys must fail construction"
+        );
 
         Ok(())
     }

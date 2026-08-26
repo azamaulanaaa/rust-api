@@ -107,9 +107,7 @@ mod tests {
         assert_eq!(res.status(), 401);
 
         // Re-render through a full request cycle to exercise serialization.
-        let body = actix_web::body::to_bytes(res.into_body())
-            .await
-            .unwrap();
+        let body = actix_web::body::to_bytes(res.into_body()).await.unwrap();
         assert_eq!(&body[..], br#"{"error":"authentication required"}"#);
     }
 }
