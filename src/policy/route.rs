@@ -303,7 +303,8 @@ mod tests {
         let rules: Vec<Vec<String>> = (0..10).map(|i| rule(&format!("u{i}"))).collect();
 
         // Default limit applies when unset.
-        assert_eq!(paginate(&rules, None, 0), rules[..100.min(10)].to_vec());
+        // Default limit (100) exceeds this list, so the whole set returns.
+        assert_eq!(paginate(&rules, None, 0), rules);
 
         // Offset slices from the right position.
         let page = paginate(&rules, Some(3), 4);
