@@ -35,11 +35,10 @@ pub struct Telemetry {
 
 impl Drop for Telemetry {
     fn drop(&mut self) {
-        if let Some(provider) = self.tracer_provider.take() {
-            if let Err(e) = provider.shutdown() {
+        if let Some(provider) = self.tracer_provider.take()
+            && let Err(e) = provider.shutdown() {
                 eprintln!("failed to shut down tracer provider: {e:?}");
             }
-        }
     }
 }
 

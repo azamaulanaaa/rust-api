@@ -52,6 +52,7 @@ impl ApiService {
 
         HttpServer::new(move || {
             let mut app = App::new()
+                .wrap(middleware::request_tracing::RequestTracingMiddleware)
                 .wrap(middleware::bearer_token::BearerTokenMiddleware)
                 .configure(route::config);
 
