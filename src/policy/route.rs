@@ -103,12 +103,44 @@ pub struct ListResponse {
     pub items: Vec<String>,
 }
 
-/// All stored permission rules as raw Casbin triples.
+/// Permission rules with pagination metadata.
 #[derive(Serialize)]
 pub struct RuleListResponse {
-    /// Each rule as `[sub, obj, act]`.
+    /// One page of rules, each as `[sub, obj, act]`.
     pub rules: Vec<Vec<String>>,
+    /// Total number of stored rules (independent of paging).
+    pub total: usize,
+    /// The page size applied to this response.
+    pub limit: usize,
+    /// The offset this page starts at.
+    pub offset: usize,
 }
+
+/// Query parameters for `GET /policy/rules`.
+#[derive(Debug, Deserialize)]
+pub struct RulesQuery {
+    /// Page size; defaults to 100 and is capped at 1000.
+    pub limit: Option<usize>,
+    /// Number of rules to skip; defaults to 0.
+    pub offset: Option<usize>,
+}
+
+/// Applies `offset`/`limit` to a full rule list. Kept pure for unit testing;
+/// `limit` is capped at [`MAX_PAGE_SIZE`](const@MAX_PAGE_SIZE).
+fn paginate(rules: &[Vec<String>], limit: Option<usize>, offset: usize) -> Vec<Vec<String>> {
+    let start = offset.min(rules.len());
+    let end = start
+        .saturating_add(limit.unwrap_or(MAX_PAGE_SIZE).min(MAX_PAGE_SIZE))
+        .min(rules.len());
+    rules[start..end].to_vec()
+}
+
+/// Maximum number of rules returned in one page.
+/// Page size used when the client does not specify one.
+pub(crate) const DEFAULT_PAGE_SIZE: usize = 100;
+
+/// Maximum number of rules returned in one page.
+pub(crate) const MAX_PAGE_SIZE: usize = 1000;
 
 /// Maps domain policy failures onto the uniform API error envelope:
 /// `AccessDenied` becomes 403 Forbidden; store/engine failures become 500
@@ -127,13 +159,23 @@ impl From<PolicyError> for ApiError {
 async fn get_rules(
     policy_engine: web::Data<PolicyEngine>,
     auth_claims: Validated<Claims>,
+    query: web::Query<RulesQuery>,
 ) -> Result<impl Responder, ApiError> {
     policy_engine
         .require(&auth_claims.sub, Resource::Rules.as_str(), Action::Read)
         .await?;
 
-    let rules = policy_engine.get_all_rules().await;
-    Ok(HttpResponse::Ok().json(RuleListResponse { rules }))
+    let all_rules = policy_engine.get_all_rules().await;
+    let total = all_rules.len();
+    let limit = query.limit.unwrap_or(DEFAULT_PAGE_SIZE);
+    let offset = query.offset.unwrap_or(0);
+    let rules = paginate(&all_rules, Some(limit), offset);
+    Ok(HttpResponse::Ok().json(RuleListResponse {
+        rules,
+        total,
+        limit: limit.min(MAX_PAGE_SIZE),
+        offset,
+    }))
 }
 
 #[post("/rules")]
@@ -246,4 +288,35 @@ async fn remove_user_from_group(
     let success = policy_engine.remove_from_group(user_id, group_name).await?;
 
     Ok(HttpResponse::Ok().json(ActionResponse { success }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rule(sub: &str) -> Vec<String> {
+        vec![sub.to_string(), "obj".to_string(), "read".to_string()]
+    }
+
+    #[test]
+    fn paginate_slices_and_caps_limit() {
+        let rules: Vec<Vec<String>> = (0..10).map(|i| rule(&format!("u{i}"))).collect();
+
+        // Default limit applies when unset.
+        assert_eq!(paginate(&rules, None, 0), rules[..100.min(10)].to_vec());
+
+        // Offset slices from the right position.
+        let page = paginate(&rules, Some(3), 4);
+        assert_eq!(page, rules[4..7].to_vec());
+
+        // Limit above MAX_PAGE_SIZE gets capped.
+        let big: Vec<Vec<String>> = (0..(MAX_PAGE_SIZE + 50)).map(|_| rule("x")).collect();
+        assert_eq!(
+            paginate(&big, Some(MAX_PAGE_SIZE * 2), 0).len(),
+            MAX_PAGE_SIZE
+        );
+
+        // Offset past the end yields an empty page, not a panic.
+        assert!(paginate(&rules, Some(3), 99).is_empty());
+    }
 }
