@@ -1,5 +1,5 @@
-use std::{path::Path, sync::Arc};
 use std::{fmt, str::FromStr};
+use std::{path::Path, sync::Arc};
 
 use casbin::{CoreApi, DefaultModel, Enforcer, MgmtApi, RbacApi};
 use serde::{Deserialize, Serialize};
@@ -82,10 +82,10 @@ impl PolicyEngine {
     /// needed.
     pub async fn init(store_path: &Path) -> Result<Self, PolicyError> {
         if let Some(parent) = store_path.parent()
-            && !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| oxkv::StoreError::Other(e.to_string()))?;
-            }
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent).map_err(|e| oxkv::StoreError::Other(e.to_string()))?;
+        }
 
         let enforcer = {
             let store = oxkv::HookStore::new(
