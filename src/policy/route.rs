@@ -1,11 +1,12 @@
 use std::sync::Arc;
 
-use actix_web::{HttpResponse, Responder, ResponseError, delete, get, post, web};
+use actix_web::{HttpResponse, Responder, delete, get, post, web};
 use serde::{Deserialize, Serialize};
 
 use super::{Action, PolicyEngine, PolicyError};
 use crate::endpoint::{
     ApiModule,
+    error::ApiError,
     middleware::jwt::{Claims, JwtClaimsMiddleware, Validated},
 };
 
@@ -109,15 +110,15 @@ pub struct RuleListResponse {
     pub rules: Vec<Vec<String>>,
 }
 
-// Implement ResponseError so we can return PolicyError directly from handlers
-impl ResponseError for PolicyError {
-    fn error_response(&self) -> HttpResponse {
-        match self {
-            PolicyError::AccessDenied => HttpResponse::Forbidden().json("Access Denied"),
-            PolicyError::Database(_) => HttpResponse::InternalServerError().json("Database error"),
-            PolicyError::Casbin(_) => {
-                HttpResponse::InternalServerError().json("Policy engine error")
-            }
+/// Maps domain policy failures onto the uniform API error envelope:
+/// `AccessDenied` becomes 403 Forbidden; store/engine failures become 500
+/// with their cause attached for server-side logging.
+impl From<PolicyError> for ApiError {
+    fn from(value: PolicyError) -> Self {
+        match value {
+            PolicyError::AccessDenied => ApiError::Forbidden,
+            PolicyError::Database(e) => ApiError::Internal(Box::new(e)),
+            PolicyError::Casbin(e) => ApiError::Internal(Box::new(e)),
         }
     }
 }
@@ -126,7 +127,7 @@ impl ResponseError for PolicyError {
 async fn get_rules(
     policy_engine: web::Data<PolicyEngine>,
     auth_claims: Validated<Claims>,
-) -> Result<impl Responder, PolicyError> {
+) -> Result<impl Responder, ApiError> {
     policy_engine
         .require(&auth_claims.sub, Resource::Rules.as_str(), Action::Read)
         .await?;
@@ -140,7 +141,7 @@ async fn add_rule(
     policy_engine: web::Data<PolicyEngine>,
     auth_claims: Validated<Claims>,
     req: web::Json<PolicyRequest>,
-) -> Result<impl Responder, PolicyError> {
+) -> Result<impl Responder, ApiError> {
     policy_engine
         .require(&auth_claims.sub, Resource::Rules.as_str(), Action::Write)
         .await?;
@@ -156,7 +157,7 @@ async fn remove_rule(
     policy_engine: web::Data<PolicyEngine>,
     auth_claims: Validated<Claims>,
     req: web::Json<PolicyRequest>,
-) -> Result<impl Responder, PolicyError> {
+) -> Result<impl Responder, ApiError> {
     policy_engine
         .require(&auth_claims.sub, Resource::Rules.as_str(), Action::Write)
         .await?;
@@ -172,7 +173,7 @@ async fn get_user_groups(
     policy_engine: web::Data<PolicyEngine>,
     auth_claims: Validated<Claims>,
     path: web::Path<String>,
-) -> Result<impl Responder, PolicyError> {
+) -> Result<impl Responder, ApiError> {
     policy_engine
         .require(
             &auth_claims.sub,
@@ -192,7 +193,7 @@ async fn get_group_users(
     policy_engine: web::Data<PolicyEngine>,
     auth_claims: Validated<Claims>,
     path: web::Path<String>,
-) -> Result<impl Responder, PolicyError> {
+) -> Result<impl Responder, ApiError> {
     policy_engine
         .require(
             &auth_claims.sub,
@@ -212,7 +213,7 @@ async fn assign_group(
     policy_engine: web::Data<PolicyEngine>,
     auth_claims: Validated<Claims>,
     req: web::Json<GroupRequest>,
-) -> Result<impl Responder, PolicyError> {
+) -> Result<impl Responder, ApiError> {
     policy_engine
         .require(
             &auth_claims.sub,
@@ -232,7 +233,7 @@ async fn remove_user_from_group(
     policy_engine: web::Data<PolicyEngine>,
     auth_claims: Validated<Claims>,
     path: web::Path<(String, String)>,
-) -> Result<impl Responder, PolicyError> {
+) -> Result<impl Responder, ApiError> {
     policy_engine
         .require(
             &auth_claims.sub,

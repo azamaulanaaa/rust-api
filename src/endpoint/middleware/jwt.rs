@@ -11,7 +11,6 @@ use std::{
 use actix_web::{
     Error, FromRequest, HttpMessage, HttpRequest,
     dev::{Payload, Service, ServiceRequest, ServiceResponse, Transform, forward_ready},
-    error::ErrorUnauthorized,
 };
 use futures_util::future::LocalBoxFuture;
 pub use jsonwebtoken::{Algorithm, DecodingKey, Validation, jwk::JwkSet};
@@ -19,6 +18,7 @@ use jsonwebtoken::{decode, jwk::{AlgorithmParameters, Jwk, KeyAlgorithm}};
 use serde::{Deserialize, de::DeserializeOwned};
 
 use super::bearer_token::BearerToken;
+use crate::endpoint::error::ApiError;
 
 /// Minimum interval between two JWKS fetches triggered by unknown-key misses.
 /// Prevents a flood of junk tokens from hammering the identity provider.
@@ -323,7 +323,7 @@ where
                 .get::<C>()
                 .cloned()
                 .map(Self)
-                .ok_or_else(|| ErrorUnauthorized("authentication required")),
+                .ok_or_else(|| ApiError::MissingCredentials.into()),
         )
     }
 }
@@ -369,11 +369,14 @@ where
             if let Some(token) = token {
                 let header = match jsonwebtoken::decode_header(&token) {
                     Ok(h) => h,
-                    Err(e) => return Err(ErrorUnauthorized(e)),
+                    Err(e) => {
+                        return Err(ApiError::InvalidCredentials(Box::new(e)).into());
+                    }
                 };
 
                 let Some(signing_key) = keys.get(header.kid.as_deref()).await else {
-                    return Err(ErrorUnauthorized("No matching signing key found for token"));
+                    let cause = format!("no signing key matches kid {:?}", header.kid);
+                    return Err(ApiError::InvalidCredentials(cause.into()).into());
                 };
 
                 // Pin validation to the selected key's own algorithm so a
@@ -383,7 +386,7 @@ where
 
                 match decode::<C>(&token, &signing_key.decoding_key, &validation) {
                     Ok(token_data) => req.extensions_mut().insert(token_data.claims),
-                    Err(e) => return Err(ErrorUnauthorized(format!("Invalid Token: {}", e))),
+                    Err(e) => return Err(ApiError::InvalidCredentials(Box::new(e)).into()),
                 };
             }
 
