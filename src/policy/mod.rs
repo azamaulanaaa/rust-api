@@ -8,6 +8,7 @@ use tokio::sync::RwLock;
 
 /// HTTP routes for managing policy rules and group membership.
 pub mod route;
+pub mod setup;
 
 /// Casbin storage adapter persisting policies to an embedded oxkv store.
 pub mod adapter;
@@ -73,10 +74,18 @@ pub enum PolicyError {
 /// Central authorization engine: a Casbin RBAC enforcer persisted to an
 /// embedded oxkv (Redb) database file, plus management helpers for rules
 /// and group membership.
+///
+/// Cloning is cheap: the enforcer lives behind an `Arc`, so clones share
+/// one policy state (used to hand the same store to several API modules).
+#[derive(Clone)]
 pub struct PolicyEngine {
     /// The underlying Casbin enforcer shared across workers.
     pub enforcer: Arc<RwLock<Enforcer>>,
 }
+
+/// The built-in role granted by the one-time bootstrap endpoint; holders
+/// may manage every policy rule and group assignment.
+pub const SUPERADMIN_ROLE: &str = "superadmin";
 
 /// The Casbin RBAC model used by [`PolicyEngine`]: group-based
 /// permissions where a subject authorizes through its group memberships.
@@ -162,6 +171,20 @@ impl PolicyEngine {
         let mut ef = self.enforcer.write().await;
         let success = ef.add_grouping_policy(vec![user_id, group]).await?;
         Ok(success)
+    }
+
+    /// Atomically grants `user_id` the [`SUPERADMIN_ROLE`] provided no
+    /// user holds that role yet. Returns `false` when the bootstrap was
+    /// already completed (the check and the write share one lock, so two
+    /// concurrent first-time claims cannot both succeed).
+    pub async fn claim_superadmin(&self, user_id: &str) -> Result<bool, PolicyError> {
+        let mut ef = self.enforcer.write().await;
+        if !ef.get_users_for_role(SUPERADMIN_ROLE, None).is_empty() {
+            return Ok(false);
+        }
+        ef.add_grouping_policy(vec![user_id.to_string(), SUPERADMIN_ROLE.to_string()])
+            .await?;
+        Ok(true)
     }
 
     /// Removes a user from a group
