@@ -40,8 +40,13 @@ struct Args {
 async fn main() -> anyhow::Result<()> {
     let args = Args::try_parse()?;
 
-    let _telemetry = telemetry::init(args.verbose)?;
     let config = config::Config::try_from(Path::new(&args.config))?;
+
+    let _telemetry = telemetry::init(
+        args.verbose,
+        &config.observability.service_name,
+        config.observability.otlp_endpoint.as_deref(),
+    )?;
 
     let base = Url::parse(&config.public_address).context("Invalid public_address in config")?;
 

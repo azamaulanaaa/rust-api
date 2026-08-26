@@ -16,6 +16,9 @@ pub struct Config {
     pub authorization: ConfigAuthorization,
     /// Postgres connection string for the policy store.
     pub database_url: String,
+    /// Telemetry settings; defaults apply when the section is omitted.
+    #[serde(default)]
+    pub observability: ObservabilityConfig,
 }
 
 impl TryFrom<&Path> for Config {
@@ -46,4 +49,29 @@ pub struct ConfigAuthorization {
     pub client_secret: String,
     /// Base URL of the provider's OIDC discovery document.
     pub issuer_url: String,
+}
+
+/// Telemetry/observability settings.
+#[derive(Debug, Deserialize, Clone)]
+pub struct ObservabilityConfig {
+    /// Service name attached to every exported telemetry resource.
+    #[serde(default = "default_service_name")]
+    pub service_name: String,
+    /// OTLP/gRPC collector endpoint (e.g. `http://localhost:4317`).
+    /// Span export is disabled when absent.
+    #[serde(default)]
+    pub otlp_endpoint: Option<String>,
+}
+
+impl Default for ObservabilityConfig {
+    fn default() -> Self {
+        Self {
+            service_name: default_service_name(),
+            otlp_endpoint: None,
+        }
+    }
+}
+
+fn default_service_name() -> String {
+    "rust-api".to_string()
 }
