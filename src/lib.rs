@@ -20,3 +20,7 @@ pub mod oidc;
 /// Casbin RBAC policy engine backed by Postgres, with management routes
 /// for permission rules and group membership.
 pub mod policy;
+
+/// Telemetry bootstrap: global [`tracing`] subscriber installation and
+/// OpenTelemetry wiring.
+pub mod telemetry;

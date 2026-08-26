@@ -59,7 +59,7 @@ impl ResponseError for ApiError {
         // Causes carry sensitive internals (DB errors, provider responses):
         // log them here so call sites can't forget, never serialize them.
         if let Some(cause) = std::error::Error::source(self) {
-            log::warn!("API {} {}: {cause}", self.status(), self);
+            tracing::warn!("API {} {}: {cause}", self.status(), self);
         }
 
         HttpResponse::build(self.status()).json(ErrorBody {

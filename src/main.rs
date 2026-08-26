@@ -11,13 +11,13 @@ use std::{
 
 use anyhow::Context;
 use clap::Parser;
-use simple_logger::SimpleLogger;
 use url::Url;
 
 use rust_api::{
     endpoint::{ApiService, middleware::jwt::Claims},
     oidc::{OidcClient, OidcConfig, route::OidcApiModule},
     policy::{PolicyEngine, route::PolicyApiModule},
+    telemetry,
 };
 
 mod config;
@@ -40,7 +40,7 @@ struct Args {
 async fn main() -> anyhow::Result<()> {
     let args = Args::try_parse()?;
 
-    init_logger(args.verbose)?;
+    let _telemetry = telemetry::init(args.verbose)?;
     let config = config::Config::try_from(Path::new(&args.config))?;
 
     let base = Url::parse(&config.public_address).context("Invalid public_address in config")?;
@@ -66,20 +66,6 @@ async fn main() -> anyhow::Result<()> {
         .register_module(Box::new(policy_api_module))
         .start(listen_addr.into())
         .await?;
-
-    Ok(())
-}
-
-/// Initializes the simple logger at debug level when `verbose`, otherwise
-/// info level.
-fn init_logger(verbose: bool) -> anyhow::Result<()> {
-    let log_level = if verbose {
-        log::LevelFilter::Debug
-    } else {
-        log::LevelFilter::Info
-    };
-
-    SimpleLogger::new().with_level(log_level).init()?;
 
     Ok(())
 }
