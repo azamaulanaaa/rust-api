@@ -8,7 +8,7 @@ The crate is intentionally business-logic free: applications compose `ApiModule`
 
 - **OIDC authentication** — authorization-code flow with PKCE, CSRF state, and nonce validation against any spec-compliant identity provider (Keycloak, Entra ID, Auth0, …)
 - **JWT validation via JWKS** — refreshable multi-algorithm key store with rotation support; unknown `kid` triggers a debounced re-fetch of the provider's keys
-- **Casbin RBAC on an embedded oxkv database** — permission rules and group membership management backed by a transactional key-value store persisted to a single file; no external database server required. Store writes pass through an oxkv validation hook that rejects malformed or wrong-arity rules at write time instead of poisoning startup
+- **Casbin RBAC on an embedded oxkv database** — permission rules and group membership management backed by a transactional key-value store persisted to a single file; no external database server required
 - **Modular composition** — implement the `ApiModule` trait and register onto `ApiService`; auth middleware is applied per module scope
 - **Observability** — structured console logging through the `tracing` facade (`RUST_LOG` syntax), plus optional OpenTelemetry span export over OTLP/gRPC with W3C Trace Context propagation
 
@@ -28,6 +28,39 @@ The crate is intentionally business-logic free: applications compose `ApiModule`
 | DELETE | `/policy/groups/{group_name}/users/{user_id}` | Remove a user from a group | Bearer token |
 
 Protected routes accept either an explicit `Authorization: Bearer <token>` header (preferred) or the session cookie set by `/auth/callback`. Requests without valid credentials get `401`; insufficient permissions get `403`. All errors use a uniform JSON envelope: `{"error": "<message>"}`.
+
+## Architecture
+
+```
+src/
+├── main.rs              binary entry point: config → telemetry → OIDC/policy wiring → listener
+├── lib.rs               crate root and documentation
+├── config.rs            TOML configuration model
+├── telemetry.rs         tracing subscriber + OTLP span export bootstrap
+├── endpoint/            HTTP scaffolding shared by all modules
+│   ├── mod.rs           ApiService registry + ApiModule trait
+│   ├── error.rs         ApiError enum and uniform JSON error envelope
+│   ├── middleware/      bearer_token, jwt (JWKS-backed claims), request_tracing
+│   └── route/           /health
+├── oidc/                OIDC client: /auth/login + /auth/callback (code flow, PKCE)
+└── policy/              Casbin engine, oxkv adapter + validator, management routes
+```
+
+Modules implement [`ApiModule`](src/endpoint/mod.rs) and are registered onto `ApiService`; each module brings its own middleware stack (e.g. `/policy/*` requires validated JWT claims).
+
+## How authorization works
+
+The Casbin RBAC model is:
+
+```ini
+p = sub, obj, act        # permission rule: subject may act on object
+g = _, _                 # group membership: user belongs to group
+m = g(r.sub, p.sub) && r.obj == p.obj && r.act == p.act
+```
+
+A request is authorized when its subject either holds a matching `p`-rule directly or belongs to a group (`g`-link) that does. Typical setup: grant permissions to *groups* via `POST /policy/rules`, then manage membership via the `/policy/groups` endpoints.
+
+Rules persist to the embedded [oxkv](https://docs.rs/oxkv) store (`[database].path`) as one key-value pair per rule, written transactionally. An oxkv validation hook rejects malformed writes at the API boundary — wrong-arity rules, non-JSON payloads, or unknown sections fail immediately instead of sitting in storage until they poison startup.
 
 ## Configuration
 
