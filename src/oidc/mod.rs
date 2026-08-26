@@ -1,10 +1,13 @@
 use openidconnect::core::{CoreClient, CoreProviderMetadata, CoreResponseType};
 use openidconnect::{
     AuthenticationFlow, AuthorizationCode, ClientId, ClientSecret, CsrfToken, EndpointMaybeSet,
-    EndpointNotSet, EndpointSet, IssuerUrl, Nonce, PkceCodeChallenge, PkceCodeVerifier,
+    EndpointNotSet, EndpointSet, JsonWebKeySet, Nonce, PkceCodeChallenge, PkceCodeVerifier,
     RedirectUrl, Scope, TokenResponse,
 };
+
 use thiserror::Error;
+
+use crate::endpoint::middleware::jwt::{IssuerTemplate, extract_unverified_claim};
 
 /// HTTP routes for the OIDC login and callback endpoints.
 pub mod route;
@@ -68,6 +71,11 @@ pub struct OidcClient {
     >,
     http_client: reqwest::Client,
     provider_metadata: CoreProviderMetadata,
+    /// Original discovered issuer; may contain a `{tenantid}` placeholder
+    /// for multi-tenant providers (Azure AD).
+    issuer: String,
+    /// Parsed template when [`OidcClient::issuer`] is templated.
+    issuer_template: Option<IssuerTemplate>,
 }
 
 /// Everything a caller needs to start the authorization-code flow: the
@@ -92,10 +100,51 @@ impl OidcClient {
             .redirect(reqwest::redirect::Policy::none())
             .build()?;
 
-        let provider_metadata =
-            CoreProviderMetadata::discover_async(IssuerUrl::new(config.issuer_url)?, &http_client)
-                .await
-                .map_err(|e| OidcError::Discovery(e.to_string()))?;
+        // Discovery is fetched manually: multi-tenant providers publish an
+        // issuer containing a literal {tenantid} placeholder that can never
+        // equal the requested URL, and openidconnect rejects such metadata.
+        // A sentinel tenant is substituted before parsing; real issuer
+        // enforcement happens per token against the parsed template (see
+        // `exchange_code` and `JwtClaimsMiddleware`).
+        let discovery_url = format!(
+            "{}/.well-known/openid-configuration",
+            config.issuer_url.trim_end_matches('/')
+        );
+        let body = http_client
+            .get(&discovery_url)
+            .send()
+            .await
+            .map_err(OidcError::HttpClient)?
+            .error_for_status()
+            .map_err(|e| OidcError::Discovery(e.to_string()))?
+            .text()
+            .await
+            .map_err(OidcError::HttpClient)?;
+
+        let raw_issuer = serde_json::from_str::<serde_json::Value>(&body)
+            .map_err(|e| OidcError::Discovery(e.to_string()))?
+            .get("issuer")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| OidcError::Discovery("metadata missing issuer".to_string()))?
+            .to_string();
+        let issuer_template = IssuerTemplate::parse(&raw_issuer);
+
+        let body = if issuer_template.is_some() {
+            body.replace("{tenantid}", &format!("{:032x}", 0))
+        } else {
+            body
+        };
+
+        let provider_metadata: CoreProviderMetadata =
+            serde_json::from_str(&body).map_err(|e| OidcError::Discovery(e.to_string()))?;
+
+        // from_provider_metadata seeds the ID-token verifier's keys from the
+        // metadata's embedded JWKS; discover_async normally fetches that
+        // document, so replicate the step for manually parsed metadata.
+        let jwks = JsonWebKeySet::fetch_async(provider_metadata.jwks_uri(), &http_client)
+            .await
+            .map_err(|e| OidcError::Discovery(e.to_string()))?;
+        let provider_metadata = provider_metadata.set_jwks(jwks);
 
         let client = CoreClient::from_provider_metadata(
             provider_metadata.clone(),
@@ -108,6 +157,8 @@ impl OidcClient {
             client,
             http_client,
             provider_metadata,
+            issuer: raw_issuer,
+            issuer_template,
         })
     }
 
@@ -158,16 +209,45 @@ impl OidcClient {
 
         let id_token = token_response.id_token().ok_or(OidcError::MissingIdToken)?;
 
-        let _claims = id_token
-            .claims(&self.client.id_token_verifier(), &nonce)
-            .map_err(|e| OidcError::InvalidToken(e.to_string()))?;
+        if let Some(template) = &self.issuer_template {
+            // Multi-tenant provider: the published issuer carries a
+            // {tenantid} placeholder that no real token can match, so the
+            // static issuer check is disabled and the template is enforced
+            // against the token's own tenant identifier instead. Signature,
+            // nonce, audience, and expiry validation are unchanged.
+            let verifier = self.client.id_token_verifier().require_issuer_match(false);
+            let _verified_claims = id_token
+                .claims(&verifier, &nonce)
+                .map_err(|e| OidcError::InvalidToken(e.to_string()))?;
+
+            // Signature verification above authenticates this payload.
+            let raw = id_token.to_string();
+            let Some(tenant_id) = extract_unverified_claim(&raw, "tid").filter(|t| !t.is_empty())
+            else {
+                return Err(OidcError::InvalidToken(
+                    "token missing tenant identifier".to_string(),
+                ));
+            };
+            let expected = template.resolve(&tenant_id);
+            let actual_iss = extract_unverified_claim(&raw, "iss");
+            if actual_iss.as_deref() != Some(expected.as_str()) {
+                return Err(OidcError::InvalidToken(format!(
+                    "token issuer does not match tenant `{tenant_id}`"
+                )));
+            }
+        } else {
+            id_token
+                .claims(&self.client.id_token_verifier(), &nonce)
+                .map_err(|e| OidcError::InvalidToken(e.to_string()))?;
+        }
 
         Ok(id_token.to_string())
     }
 
-    /// The provider's discovered issuer URL.
-    pub fn issuer(&self) -> &IssuerUrl {
-        self.provider_metadata.issuer()
+    /// The provider's discovered issuer URL; may contain a `{tenantid}`
+    /// placeholder for multi-tenant providers.
+    pub fn issuer(&self) -> &str {
+        &self.issuer
     }
 
     /// The OAuth2 client ID used for token requests.

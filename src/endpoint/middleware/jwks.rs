@@ -370,7 +370,7 @@ pub(crate) mod test_support {
     use wiremock::MockServer;
 
     /// Minimal claims shape used by decode assertions.
-    #[derive(Debug, Deserialize)]
+    #[derive(Debug, Clone, Deserialize)]
     pub(crate) struct TestClaims {
         pub sub: String,
     }
