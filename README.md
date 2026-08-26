@@ -98,9 +98,11 @@ Handlers can extract validated JWT claims via the `Validated<C>` extractor (retu
 mise exec -- cargo test                 # run tests (wiremock-based integration tests included)
 mise exec -- cargo clippy --all-targets # lint
 mise exec -- cargo doc --no-deps        # generate docs
+mise exec -- cargo deny check licenses  # verify dependency licenses stay compatible
 ```
 
 Every public item must carry rustdoc — enforced at compile time via `[lints.rust] missing_docs = "deny"` in `Cargo.toml`.
+Dependency license compatibility is enforced via [`cargo-deny`](https://embarkstudios.github.io/cargo-deny/) (`deny.toml`): any new dependency whose license is not permissive fails the check.
 
 Commit messages follow the [Conventional Commits](https://www.conventionalcommits.org/) style without scopes (e.g. `feat:`, `fix:`, `docs:`).
 
