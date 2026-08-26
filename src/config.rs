@@ -14,8 +14,8 @@ pub struct Config {
     pub listen_port: u16,
     /// Identity-provider connection settings.
     pub authorization: ConfigAuthorization,
-    /// Postgres connection string for the policy store.
-    pub database_url: String,
+    /// Embedded policy-database settings.
+    pub database: DatabaseConfig,
     /// Telemetry settings; defaults apply when the section is omitted.
     #[serde(default)]
     pub observability: ObservabilityConfig,
@@ -74,4 +74,11 @@ impl Default for ObservabilityConfig {
 
 fn default_service_name() -> String {
     "rust-api".to_string()
+}
+
+/// Embedded policy-database settings.
+#[derive(Deserialize, Debug)]
+pub struct DatabaseConfig {
+    /// File path of the embedded oxkv (Redb) database backing policies.
+    pub path: String,
 }

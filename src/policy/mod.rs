@@ -1,15 +1,16 @@
-use std::sync::Arc;
+use std::{path::Path, sync::Arc};
 use std::{fmt, str::FromStr};
 
 use casbin::{CoreApi, DefaultModel, Enforcer, MgmtApi, RbacApi};
 use serde::{Deserialize, Serialize};
-use sqlx::PgPool;
-use sqlx_adapter::SqlxAdapter;
 use thiserror::Error;
 use tokio::sync::RwLock;
 
 /// HTTP routes for managing policy rules and group membership.
 pub mod route;
+
+/// Casbin storage adapter persisting policies to an embedded oxkv store.
+pub mod adapter;
 
 /// The operation a policy rule grants on an object.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,9 +54,9 @@ impl FromStr for Action {
 /// Errors raised by [`PolicyEngine`] and [`Authorizer`].
 #[derive(Debug, Error)]
 pub enum PolicyError {
-    /// A Postgres operation failed.
-    #[error("Database error: {0}")]
-    Database(#[from] sqlx::Error),
+    /// An operation on the embedded policy store failed.
+    #[error("Policy store error: {0}")]
+    Store(#[from] oxkv::StoreError),
 
     /// The Casbin engine rejected an operation or failed enforcement.
     #[error("Casbin authorization engine error: {0}")]
@@ -66,21 +67,31 @@ pub enum PolicyError {
     AccessDenied,
 }
 
-/// Central authorization engine: a Casbin RBAC enforcer persisted to
-/// Postgres, plus management helpers for rules and group membership.
+/// Central authorization engine: a Casbin RBAC enforcer persisted to an
+/// embedded oxkv (Redb) database file, plus management helpers for rules
+/// and group membership.
 pub struct PolicyEngine {
     /// The underlying Casbin enforcer shared across workers.
     pub enforcer: Arc<RwLock<Enforcer>>,
 }
 
 impl PolicyEngine {
-    /// Connects to Postgres at `database_url`, loads the RBAC model and
-    /// stored policies via the sqlx adapter, and returns the engine.
-    pub async fn init(database_url: &str) -> Result<Self, PolicyError> {
-        let pool = PgPool::connect(database_url).await?;
+    /// Opens the embedded oxkv database at `store_path`, loads the RBAC
+    /// model and stored policies via the [`adapter::OxkvAdapter`], and
+    /// returns the engine. Parent directories of the file are created as
+    /// needed.
+    pub async fn init(store_path: &Path) -> Result<Self, PolicyError> {
+        if let Some(parent) = store_path.parent()
+            && !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| oxkv::StoreError::Other(e.to_string()))?;
+            }
 
         let enforcer = {
-            let adapter = SqlxAdapter::new_with_pool(pool.clone()).await?;
+            let adapter = adapter::OxkvAdapter::new(
+                oxkv::RedbStore::new_file(store_path)
+                    .map_err(PolicyError::Store)?,
+            );
 
             let model = DefaultModel::from_str(
                 r#"

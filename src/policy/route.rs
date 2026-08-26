@@ -117,7 +117,7 @@ impl From<PolicyError> for ApiError {
     fn from(value: PolicyError) -> Self {
         match value {
             PolicyError::AccessDenied => ApiError::Forbidden,
-            PolicyError::Database(e) => ApiError::Internal(Box::new(e)),
+            PolicyError::Store(e) => ApiError::Internal(Box::new(e)),
             PolicyError::Casbin(e) => ApiError::Internal(Box::new(e)),
         }
     }

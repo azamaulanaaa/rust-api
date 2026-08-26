@@ -62,7 +62,7 @@ async fn main() -> anyhow::Result<()> {
     .await?;
     let oidc_api_module = OidcApiModule::<Claims>::init(oidc_client).await?;
 
-    let policy_engine = PolicyEngine::init(&config.database_url).await?;
+    let policy_engine = PolicyEngine::init(Path::new(&config.database.path)).await?;
     let policy_api_module = PolicyApiModule::new(policy_engine, oidc_api_module.middleware());
 
     let listen_addr = SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), config.listen_port);
