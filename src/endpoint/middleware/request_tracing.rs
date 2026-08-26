@@ -18,9 +18,32 @@ use actix_web::{
     http::header::HeaderMap,
 };
 use futures_util::future::LocalBoxFuture;
-use opentelemetry::global;
+use opentelemetry::{
+    KeyValue, global,
+    metrics::{Counter, Histogram},
+};
+use std::sync::LazyLock;
 use tracing::{Instrument, field::Empty};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
+
+/// Server-side HTTP metrics exported through the global meter provider
+/// (OTLP when an endpoint is configured). Instrument names follow the
+/// OTel HTTP semantic conventions.
+struct HttpMetrics {
+    requests: Counter<u64>,
+    duration: Histogram<f64>,
+}
+
+static HTTP_METRICS: LazyLock<HttpMetrics> = LazyLock::new(|| {
+    let meter = global::meter("rust-api");
+    HttpMetrics {
+        requests: meter.u64_counter("http.server.request.count").build(),
+        duration: meter
+            .f64_histogram("http.server.request.duration")
+            .with_unit("s")
+            .build(),
+    }
+});
 
 /// Adapter exposing Actix headers to the OpenTelemetry propagator API.
 struct HeaderExtractor<'a>(&'a HeaderMap);
@@ -111,11 +134,22 @@ where
 
             let status = res.status();
             span.record("http.response.status_code", status.as_u16());
-            span.record("latency.ms", start.elapsed().as_millis() as u64);
+            let elapsed_ms = start.elapsed().as_millis() as u64;
+            span.record("latency.ms", elapsed_ms);
             if status.is_server_error() {
                 // Surface 5xx as error-status spans in trace backends.
                 span.record("otel.status_code", "ERROR");
             }
+
+            let attrs = [
+                KeyValue::new("http.request.method", method.clone()),
+                KeyValue::new("url.route", route.clone()),
+                KeyValue::new("http.response.status_code", i64::from(status.as_u16())),
+            ];
+            HTTP_METRICS.requests.add(1, &attrs);
+            HTTP_METRICS
+                .duration
+                .record(elapsed_ms as f64 / 1000.0, &attrs);
 
             Ok(res)
         })

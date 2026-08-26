@@ -12,17 +12,22 @@ use opentelemetry::{
     global,
     trace::TracerProvider as _, // trait method: provider.tracer(name)
 };
-use opentelemetry_otlp::{SpanExporter, WithExportConfig};
-use opentelemetry_sdk::{Resource, propagation::TraceContextPropagator, trace::SdkTracerProvider};
+use opentelemetry_otlp::{MetricExporter, SpanExporter, WithExportConfig};
+use opentelemetry_sdk::{
+    Resource, metrics::SdkMeterProvider, propagation::TraceContextPropagator,
+    trace::SdkTracerProvider,
+};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 /// Handle for telemetry resources that must live for the process duration.
 ///
-/// Dropping it shuts down any installed tracer provider, flushing pending
-/// spans (best effort). Keep it alive until shutdown.
+/// Dropping it shuts down the installed tracer and meter providers,
+/// flushing pending spans and metric points (best effort). Keep it alive
+/// until shutdown.
 #[derive(Debug)]
 pub struct Telemetry {
     tracer_provider: Option<SdkTracerProvider>,
+    meter_provider: Option<SdkMeterProvider>,
 }
 
 impl Drop for Telemetry {
@@ -32,6 +37,13 @@ impl Drop for Telemetry {
         {
             eprintln!("failed to shut down tracer provider: {e:?}");
         }
+        if let Some(provider) = self.meter_provider.take() {
+            // Final periodic-reader collection: flushes pending metric
+            // points to the collector.
+            if let Err(e) = provider.shutdown() {
+                eprintln!("failed to shut down meter provider: {e:?}");
+            }
+        }
     }
 }
 
@@ -40,7 +52,8 @@ impl Drop for Telemetry {
 /// Log filtering uses `RUST_LOG` syntax; when the environment variable is
 /// unset, `verbose` selects between `debug` and `info` levels. When
 /// `otlp_endpoint` is `Some`, spans are exported via OTLP/gRPC and the W3C
-/// Trace Context propagator is registered globally.
+/// Trace Context propagator is registered globally; request metrics are
+/// exported through a second OTLP/gRPC pipeline on the same endpoint.
 pub fn init(
     verbose: bool,
     service_name: &str,
@@ -65,15 +78,30 @@ pub fn init(
                 .map_err(|e| anyhow::anyhow!("OTLP span exporter build failed: {e}"))
                 .context("telemetry initialization")?;
 
+            let resource = Resource::builder()
+                .with_service_name(service_name.to_string())
+                .build();
+
             let provider = SdkTracerProvider::builder()
-                // Value: From<String> only — no borrowed-string conversion.
-                .with_resource(
-                    Resource::builder()
-                        .with_service_name(service_name.to_string())
-                        .build(),
-                )
+                .with_resource(resource.clone())
                 .with_batch_exporter(exporter)
                 .build();
+
+            // Metrics share the OTLP endpoint; the periodic reader collects
+            // every 60s by default and on shutdown.
+            let metric_exporter = MetricExporter::builder()
+                .with_tonic()
+                .with_endpoint(endpoint)
+                .build()
+                .map_err(|e| anyhow::anyhow!("OTLP metric exporter build failed: {e}"))
+                .context("telemetry initialization")?;
+            let reader =
+                opentelemetry_sdk::metrics::PeriodicReader::builder(metric_exporter).build();
+            let meter_provider = SdkMeterProvider::builder()
+                .with_resource(resource)
+                .with_reader(reader)
+                .build();
+            global::set_meter_provider(meter_provider.clone());
 
             let tracer = provider.tracer("rust-api");
 
@@ -87,6 +115,7 @@ pub fn init(
 
             Ok(Telemetry {
                 tracer_provider: Some(provider),
+                meter_provider: Some(meter_provider),
             })
         }
         None => {
@@ -99,6 +128,7 @@ pub fn init(
 
             Ok(Telemetry {
                 tracer_provider: None,
+                meter_provider: None,
             })
         }
     }
