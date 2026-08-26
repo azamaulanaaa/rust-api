@@ -21,12 +21,13 @@ jsonwebtoken = { version = "10.2.0", features = ["rust_crypto"] }
 openidconnect = "4.0.1"
 reqwest = { version = "0.12", features = [ "json"] }
 serde = { version = "1.0", features = ["derive"] }
-sqlx = "0.8.6"
-sqlx-adapter = { version = "1.8.0", features = ["postgres", "runtime-tokio-rustls"], default-features = false }
 thiserror = "2.0.18"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 toml = "0.9.8"
 opentelemetry = "0.32.0"
+oxkv = "0.2.0"
+async-trait = "0.1"
+serde_json = "1.0"
 opentelemetry-otlp = { version = "0.32.0", default-features = false, features = ["grpc-tonic", "trace", "internal-logs"] }
 opentelemetry_sdk = "0.32.1"
 tracing = "0.1.44"
