@@ -19,6 +19,7 @@ The crate is intentionally business-logic free: applications compose `ApiModule`
 | GET | `/health` | Liveness probe | none |
 | GET | `/auth/login` | Start OIDC login (redirects to provider) | none |
 | GET | `/auth/callback` | OIDC authorization-code callback | none |
+| POST | `/setup/admin` | One-time bootstrap: assign caller the `superadmin` role | Bearer token |
 | GET | `/policy/rules` | List policy rules | Bearer token |
 | POST | `/policy/rules` | Add a policy rule | Bearer token |
 | DELETE | `/policy/rules` | Remove a policy rule | Bearer token |
@@ -28,6 +29,10 @@ The crate is intentionally business-logic free: applications compose `ApiModule`
 | DELETE | `/policy/groups/{group_name}/users/{user_id}` | Remove a user from a group | Bearer token |
 
 Protected routes accept either an explicit `Authorization: Bearer <token>` header (preferred) or the session cookie set by `/auth/callback`. Requests without valid credentials get `401`; insufficient permissions get `403`. All errors use a uniform JSON envelope: `{"error": "<message>"}`.
+
+### First-run bootstrap
+
+A fresh deployment boots with an empty policy store, so nobody can pass the self-authorization checks on `/policy` routes yet. Log in through `/auth/login`, then call `POST /setup/admin` **once** with your token: the first authenticated subject to do so becomes `superadmin` (`201`); every later call returns `409`, including after restarts. From there, grant permissions to groups and manage membership via the normal policy endpoints.
 
 ## Architecture
 

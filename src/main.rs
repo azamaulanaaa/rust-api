@@ -18,7 +18,7 @@ use url::Url;
 use rust_api::{
     endpoint::{ApiService, middleware::jwt::Claims},
     oidc::{OidcClient, OidcConfig, route::OidcApiModule},
-    policy::{PolicyEngine, admin, route::PolicyApiModule},
+    policy::{PolicyEngine, admin, route::PolicyApiModule, setup::SetupApiModule},
     telemetry,
 };
 
@@ -143,11 +143,13 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
     let oidc_api_module = OidcApiModule::<Claims>::init(oidc_client).await?;
 
     let policy_engine = PolicyEngine::init(Path::new(&config.database.path)).await?;
+    let setup_api_module = SetupApiModule::new(policy_engine.clone(), oidc_api_module.middleware());
     let policy_api_module = PolicyApiModule::new(policy_engine, oidc_api_module.middleware());
 
     let listen_addr = SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), config.listen_port);
     ApiService::new()
         .register_module(Box::new(oidc_api_module))
+        .register_module(Box::new(setup_api_module))
         .register_module(Box::new(policy_api_module))
         .start(listen_addr.into())
         .await?;

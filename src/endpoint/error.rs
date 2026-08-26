@@ -38,6 +38,11 @@ pub enum ApiError {
     /// Unexpected failure; the source is logged server-side only. HTTP 500.
     #[error("internal server error")]
     Internal(#[source] Box<dyn std::error::Error + Send + Sync>),
+
+    /// The request conflicts with already-established state; used by the
+    /// one-time bootstrap route once setup has been completed. HTTP 409.
+    #[error("conflict: {0}")]
+    Conflict(String),
 }
 
 impl ApiError {
@@ -46,6 +51,7 @@ impl ApiError {
             Self::MissingCredentials | Self::InvalidCredentials(_) => StatusCode::UNAUTHORIZED,
             Self::Forbidden => StatusCode::FORBIDDEN,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::Conflict(_) => StatusCode::CONFLICT,
         }
     }
 }
@@ -81,6 +87,7 @@ mod tests {
         );
         assert_eq!(ApiError::Forbidden.status(), 403);
         assert_eq!(ApiError::Internal("db down".into()).status(), 500);
+        assert_eq!(ApiError::Conflict("done".into()).status(), 409);
     }
 
     #[test]
