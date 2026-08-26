@@ -182,14 +182,14 @@ pub async fn callback(
                 OidcError::ExchangeFailure(_)
                 | OidcError::MissingIdToken
                 | OidcError::InvalidToken(_) => {
-                    log::warn!("OIDC code exchange rejected: {e}");
+                    tracing::warn!("OIDC code exchange rejected: {e}");
                     (
                         actix_web::http::StatusCode::UNAUTHORIZED,
                         "authentication failed",
                     )
                 }
                 other => {
-                    log::error!("OIDC callback failed unexpectedly: {other:?}");
+                    tracing::error!("OIDC callback failed unexpectedly: {other:?}");
                     (
                         actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
                         "internal server error",

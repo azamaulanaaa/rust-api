@@ -167,11 +167,11 @@ impl JwksKeys {
                 *last_refresh = Instant::now();
                 *self.inner.keys.write().await = Arc::new(keys);
             }
-            Ok(_) => log::warn!(
+            Ok(_) => tracing::warn!(
                 "Refreshed JWKS at {} but it contains no usable signing keys; keeping previous keys",
                 self.inner.url
             ),
-            Err(e) => log::warn!(
+            Err(e) => tracing::warn!(
                 "Failed to refresh JWKS from {}: {}; keeping previous keys",
                 self.inner.url,
                 e
