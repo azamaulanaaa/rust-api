@@ -46,10 +46,10 @@ impl Telemetry {
     /// process exit; dropping without this still flushes best-effort.
     pub fn shutdown(mut self) -> anyhow::Result<()> {
         let mut errors = Vec::new();
-        if let Some(provider) = self.tracer_provider.take() {
-            if let Err(e) = provider.shutdown() {
-                errors.push(format!("tracer provider: {e:?}"));
-            }
+        if let Some(provider) = self.tracer_provider.take()
+            && let Err(e) = provider.shutdown()
+        {
+            errors.push(format!("tracer provider: {e:?}"));
         }
         if let Some(provider) = self.meter_provider.take() {
             // Final periodic-reader collection: flushes pending metric

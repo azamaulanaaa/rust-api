@@ -26,6 +26,57 @@ use crate::endpoint::error::ApiError;
 // Preserve the public API surface for consumers of this module.
 pub use super::jwks::SigningKey;
 
+/// Literal segment marking a multi-tenant issuer template (Azure AD style:
+/// `https://login.microsoftonline.com/{tenantid}/v2.0`).
+const TENANT_PLACEHOLDER: &str = "{tenantid}";
+
+/// A multi-tenant issuer template: the provider's discovery document
+/// publishes an issuer containing a literal `{tenantid}` placeholder that
+/// each token resolves to its issuing tenant.
+///
+/// Tokens are validated by deriving the expected issuer from the token's own
+/// `tid` claim; signature, audience, and nonce validation are unchanged. The
+/// audience remains the real multi-tenancy gate — it is scoped to our client
+/// registration regardless of issuing tenant.
+#[derive(Debug, Clone)]
+pub struct IssuerTemplate {
+    /// Issuer portion before the `{tenantid}` placeholder.
+    prefix: String,
+    /// Issuer portion after the `{tenantid}` placeholder.
+    suffix: String,
+}
+
+impl IssuerTemplate {
+    /// Parses a template from a discovered issuer; `None` when the issuer is
+    /// not templated (the common single-tenant case).
+    pub fn parse(issuer: &str) -> Option<Self> {
+        let (prefix, suffix) = issuer.split_once(TENANT_PLACEHOLDER)?;
+        Some(Self {
+            prefix: prefix.to_string(),
+            suffix: suffix.to_string(),
+        })
+    }
+
+    /// Resolves the template for a tenant identifier.
+    pub fn resolve(&self, tenant_id: &str) -> String {
+        format!("{}{}{}", self.prefix, tenant_id, self.suffix)
+    }
+}
+
+/// Extracts a top-level string field from an unverified JWT payload.
+///
+/// Used only to *derive validation inputs* (e.g. the expected issuer from
+/// `tid`) before the verified decode; every security decision still goes
+/// through the signature-checked decode afterwards.
+pub(crate) fn extract_unverified_claim(token: &str, field: &str) -> Option<String> {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+
+    let payload_b64 = token.split('.').nth(1)?;
+    let payload = URL_SAFE_NO_PAD.decode(payload_b64).ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&payload).ok()?;
+    value.get(field)?.as_str().map(str::to_string)
+}
+
 /// Audience (`aud`) claim values: providers emit either a single string or
 /// an array of strings, both of which deserialize into this enum.
 #[derive(Debug, Deserialize, Clone)]
@@ -72,6 +123,7 @@ where
 {
     keys: JwksKeys,
     validation: Validation,
+    issuer_template: Option<IssuerTemplate>,
     _claims: PhantomData<C>,
 }
 
@@ -85,6 +137,7 @@ where
         Self {
             keys,
             validation,
+            issuer_template: None,
             _claims: PhantomData,
         }
     }
@@ -101,11 +154,21 @@ where
 
         // Base validation carries the audience/issuer checks; the expected
         // algorithm is re-pinned per request from the selected signing key.
+        // A templated issuer ({tenantid}) cannot be pinned statically — the
+        // middleware resolves it per request from the token's tid claim.
+        let issuer_template = IssuerTemplate::parse(issuer);
         let mut validation = Validation::new(Algorithm::RS256);
         validation.set_audience(&[audience]);
-        validation.set_issuer(&[issuer]);
+        if issuer_template.is_none() {
+            validation.set_issuer(&[issuer]);
+        }
 
-        Ok(Self::new(keys, validation))
+        Ok(Self {
+            keys,
+            validation,
+            issuer_template,
+            _claims: PhantomData,
+        })
     }
 }
 
@@ -127,6 +190,7 @@ where
             service: Rc::new(service),
             keys: self.keys.clone(),
             validation: self.validation.clone(),
+            issuer_template: self.issuer_template.clone(),
             _claims: PhantomData,
         }))
     }
@@ -173,6 +237,7 @@ pub struct JwtClaimsMiddlewareService<S, C> {
     service: Rc<S>,
     keys: JwksKeys,
     validation: Validation,
+    issuer_template: Option<IssuerTemplate>,
     _claims: PhantomData<C>,
 }
 
@@ -193,16 +258,16 @@ where
         let svc = self.service.clone();
         let keys = self.keys.clone();
         let validation = self.validation.clone();
+        let issuer_template = self.issuer_template.clone();
 
         // Bearer header wins over the auth cookie: a stale/expired browser
         // session cookie must not shadow an explicitly presented header.
-        let token = [
-            req.extensions().get::<BearerToken>().cloned().map(|v| v.0),
-            req.cookie("auth_token").map(|c| c.value().to_string()),
-        ]
-        .into_iter()
-        .flatten()
-        .next();
+        // NOTE: these must be separate statements — `cookie()` mutates the
+        // request's extension-based parse cache, which would collide with a
+        // live extensions() borrow held across an array literal.
+        let bearer = req.extensions().get::<BearerToken>().cloned().map(|v| v.0);
+        let cookie_token = req.cookie("auth_token").map(|c| c.value().to_string());
+        let token = bearer.or(cookie_token);
 
         Box::pin(async move {
             if let Some(token) = token {
@@ -219,9 +284,22 @@ where
                 };
 
                 // Pin validation to the selected key's own algorithm so a
-                // token cannot downgrade to an unexpected algorithm.
+                // token cannot downgrade to an unexpected algorithm. For
+                // multi-tenant providers, derive the exact expected issuer
+                // from the token's tid claim first.
                 let mut validation = validation.clone();
                 validation.algorithms = vec![signing_key.algorithm];
+                if let Some(template) = &issuer_template {
+                    let Some(tenant_id) =
+                        extract_unverified_claim(&token, "tid").filter(|t| !t.is_empty())
+                    else {
+                        return Err(ApiError::InvalidCredentials(
+                            "missing tenant identifier".into(),
+                        )
+                        .into());
+                    };
+                    validation.set_issuer(&[template.resolve(&tenant_id)]);
+                }
 
                 match decode::<C>(&token, &signing_key.decoding_key, &validation) {
                     Ok(token_data) => req.extensions_mut().insert(token_data.claims),
@@ -296,5 +374,103 @@ mod tests {
 
         let result = Validated::<Claims>::from_request(&req, &mut payload).await;
         assert_eq!(result.unwrap_err().as_response_error().status_code(), 401);
+    }
+    #[test]
+    fn issuer_template_parses_and_resolves() {
+        let tpl = IssuerTemplate::parse("https://login.test/{tenantid}/v2.0")
+            .expect("templated issuer should parse");
+        assert_eq!(tpl.resolve("abc-123"), "https://login.test/abc-123/v2.0");
+        assert!(IssuerTemplate::parse("https://plain.test/v2.0").is_none());
+    }
+
+    #[tokio::test]
+    async fn templated_issuer_resolves_from_tid_claim() -> anyhow::Result<()> {
+        let (key, enc) = rsa_key("kid-t")?;
+        let server = spawn_jwks(json!({ "keys": [key] })).await;
+        let tenant_guid = "11111111-2222-3333-4444-555555555555";
+
+        let mw = JwtClaimsMiddleware::<TestClaims>::new_with_jks(
+            &format!("{}/jwks", server.uri()),
+            "test-aud",
+            &format!("{}/{{tenantid}}/v2.0", server.uri()),
+        )
+        .await?;
+
+        let svc = actix_web::test::init_service(
+            actix_web::App::new()
+                .wrap(mw)
+                .service(actix_web::web::resource("/protected").to(|| async { "ok" })),
+        )
+        .await;
+
+        let sign_for = |iss: String, tid: &str| {
+            sign_rs256(
+                &json!({
+                    "sub": "u9",
+                    "aud": "test-aud",
+                    "exp": 2000000000u64,
+                    "iss": iss,
+                    "tid": tid,
+                }),
+                "kid-t",
+                &enc,
+            )
+        };
+
+        // Matching tid/iss pair resolves through the template.
+        let good = sign_for(
+            format!("{}/{}/v2.0", server.uri(), tenant_guid),
+            tenant_guid,
+        )?;
+        let res = actix_web::test::call_service(
+            &svc,
+            actix_web::test::TestRequest::get()
+                .uri("/protected")
+                .insert_header(("Cookie", format!("auth_token={good}")))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), 200);
+
+        // tid pointing at another tenant while iss names ours must bind them
+        // together and fail.
+        let forged = sign_for(
+            format!("{}/{}/v2.0", server.uri(), tenant_guid),
+            "99999999-9999-9999-9999-999999999999",
+        )?;
+        let res = actix_web::test::try_call_service(
+            &svc,
+            actix_web::test::TestRequest::get()
+                .uri("/protected")
+                .insert_header(("Cookie", format!("auth_token={forged}")))
+                .to_request(),
+        )
+        .await;
+        let err = res.expect_err("forged tenant binding must be rejected");
+        assert_eq!(err.as_response_error().status_code(), 401);
+
+        // A token without a tenant claim cannot resolve the template.
+        let no_tid = sign_rs256(
+            &json!({
+                "sub": "u9",
+                "aud": "test-aud",
+                "exp": 2000000000u64,
+                "iss": format!("{}/{}/v2.0", server.uri(), tenant_guid),
+            }),
+            "kid-t",
+            &enc,
+        )?;
+        let res = actix_web::test::try_call_service(
+            &svc,
+            actix_web::test::TestRequest::get()
+                .uri("/protected")
+                .insert_header(("Cookie", format!("auth_token={no_tid}")))
+                .to_request(),
+        )
+        .await;
+        let err = res.expect_err("missing tid must be rejected");
+        assert_eq!(err.as_response_error().status_code(), 401);
+
+        Ok(())
     }
 }

@@ -31,7 +31,7 @@ where
         let jwt_middleware = middleware::jwt::JwtClaimsMiddleware::new_with_jks(
             oidc_client.jwks_uri().as_str(),
             oidc_client.client_id().as_str(),
-            oidc_client.issuer().as_str(),
+            oidc_client.issuer(),
         )
         .await?;
 
