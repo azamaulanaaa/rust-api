@@ -1,4 +1,4 @@
-use std::{fmt, str::FromStr};
+use std::{collections::HashMap, fmt, str::FromStr};
 use std::{path::Path, sync::Arc};
 
 use casbin::{CoreApi, DefaultModel, Enforcer, MgmtApi, RbacApi};
@@ -86,6 +86,24 @@ pub struct PolicyEngine {
 /// The built-in role granted by the one-time bootstrap endpoint; holders
 /// may manage every policy rule and group assignment.
 pub const SUPERADMIN_ROLE: &str = "superadmin";
+
+/// One group and how many subjects belong to it.
+#[derive(Debug, Serialize)]
+pub struct GroupSummary {
+    /// Group (role) name.
+    pub name: String,
+    /// Number of subjects linked to the group.
+    pub members: usize,
+}
+
+/// One subject's group memberships.
+#[derive(Debug, Serialize)]
+pub struct UserAssignment {
+    /// Subject identifier.
+    pub sub: String,
+    /// Groups the subject belongs to, sorted.
+    pub groups: Vec<String>,
+}
 
 /// The Casbin RBAC model used by [`PolicyEngine`]: group-based
 /// permissions where a subject authorizes through its group memberships.
@@ -198,6 +216,54 @@ impl PolicyEngine {
         Ok(success)
     }
 
+    /// Lists every group known to the store with its member count,
+    /// sorted by name. Groups vanish from this view once they hold no
+    /// members (Casbin only materializes roles referenced by a link).
+    pub async fn list_groups(&self) -> Vec<GroupSummary> {
+        let ef = self.enforcer.read().await;
+        let mut groups: Vec<GroupSummary> = ef
+            .get_all_roles()
+            .into_iter()
+            .map(|name| GroupSummary {
+                members: ef.get_users_for_role(&name, None).len(),
+                name,
+            })
+            .collect();
+        groups.sort_by(|a, b| a.name.cmp(&b.name));
+        groups
+    }
+
+    /// Lists every subject holding at least one group membership with
+    /// its groups, sorted by subject then group.
+    pub async fn list_user_assignments(&self) -> Vec<UserAssignment> {
+        let ef = self.enforcer.read().await;
+        let mut by_user: HashMap<String, Vec<String>> = HashMap::new();
+        for link in ef.get_grouping_policy() {
+            by_user
+                .entry(link[0].clone())
+                .or_default()
+                .push(link[1].clone());
+        }
+        let mut users: Vec<UserAssignment> = by_user
+            .into_iter()
+            .map(|(sub, mut groups)| {
+                groups.sort();
+                UserAssignment { groups, sub }
+            })
+            .collect();
+        users.sort_by(|a, b| a.sub.cmp(&b.sub));
+        users
+    }
+
+    /// Removes every membership link pointing at `group`, effectively
+    /// deleting it. Returns `false` when the group holds no members.
+    pub async fn delete_group(&self, group: &str) -> Result<bool, PolicyError> {
+        let mut ef = self.enforcer.write().await;
+        Ok(ef
+            .remove_filtered_grouping_policy(1, vec![group.to_string()])
+            .await?)
+    }
+
     /// Primary Authorization method.
     pub async fn authorize(&self, sub: &str, obj: &str, act: Action) -> Result<bool, PolicyError> {
         let ef = self.enforcer.read().await;
@@ -284,5 +350,71 @@ impl Authorizer {
     pub async fn get_groups_of_user(&self, user_id: &str) -> Vec<String> {
         let ef = self.enforcer.read().await;
         ef.get_roles_for_user(user_id, None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn engine() -> (PolicyEngine, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!(
+            "rust-api-policy-mod-test-{}-{}.redb",
+            std::process::id(),
+            uuid_like()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let engine = PolicyEngine::init(&path).await.unwrap();
+        (engine, path)
+    }
+
+    fn uuid_like() -> String {
+        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+        URL_SAFE_NO_PAD.encode(rand::random::<[u8; 8]>())
+    }
+
+    #[tokio::test]
+    async fn groups_list_assignments_and_delete_round_trip() {
+        let (engine, path) = engine().await;
+
+        engine
+            .assign_group("alice".into(), "admins".into())
+            .await
+            .unwrap();
+        engine
+            .assign_group("bob".into(), "viewers".into())
+            .await
+            .unwrap();
+        engine
+            .assign_group("carol".into(), "admins".into())
+            .await
+            .unwrap();
+
+        // Groups are listed sorted with member counts.
+        let groups = engine.list_groups().await;
+        let names: Vec<&str> = groups.iter().map(|g| g.name.as_str()).collect();
+        assert_eq!(names, vec!["admins", "viewers"]);
+        assert_eq!(groups[0].members, 2);
+        assert_eq!(groups[1].members, 1);
+
+        // User assignments aggregate every link per subject.
+        let users = engine.list_user_assignments().await;
+        assert_eq!(users.len(), 3);
+        assert_eq!(users[0].sub, "alice");
+        assert_eq!(users[0].groups, vec!["admins".to_string()]);
+        assert_eq!(users[2].sub, "carol");
+
+        // Deleting a group removes every link to it at once.
+        assert!(engine.delete_group("admins").await.unwrap());
+        let groups = engine.list_groups().await;
+        let names: Vec<&str> = groups.iter().map(|g| g.name.as_str()).collect();
+        assert_eq!(names, vec!["viewers"]);
+        assert!(engine.get_groups_of_user("alice").await.is_empty());
+        assert!(engine.get_groups_of_user("carol").await.is_empty());
+
+        // Deleting an unknown group reports no-op rather than failing.
+        assert!(!engine.delete_group("admins").await.unwrap());
+
+        let _ = std::fs::remove_file(&path);
     }
 }

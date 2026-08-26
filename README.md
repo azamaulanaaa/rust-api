@@ -23,10 +23,13 @@ The crate is intentionally business-logic free: applications compose `ApiModule`
 | GET | `/policy/rules` | List policy rules | Bearer token |
 | POST | `/policy/rules` | Add a policy rule | Bearer token |
 | DELETE | `/policy/rules` | Remove a policy rule | Bearer token |
+| GET | `/policy/groups` | List all groups with member counts | Bearer token |
+| DELETE | `/policy/groups/{group_name}` | Delete a group and all its memberships | Bearer token |
 | GET | `/policy/groups/{user_id}` | List groups of a user | Bearer token |
 | GET | `/policy/groups/{group_name}/users` | List users of a group | Bearer token |
 | POST | `/policy/groups` | Assign a user to a group | Bearer token |
 | DELETE | `/policy/groups/{group_name}/users/{user_id}` | Remove a user from a group | Bearer token |
+| GET | `/policy/users` | List all subjects with their groups | Bearer token |
 
 Protected routes accept either an explicit `Authorization: Bearer <token>` header (preferred) or the session cookie set by `/auth/callback`. Requests without valid credentials get `401`; insufficient permissions get `403`. All errors use a uniform JSON envelope: `{"error": "<message>"}`.
 

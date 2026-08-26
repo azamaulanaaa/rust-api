@@ -3,7 +3,7 @@ use std::sync::Arc;
 use actix_web::{HttpResponse, Responder, delete, get, post, web};
 use serde::{Deserialize, Serialize};
 
-use super::{Action, PolicyEngine, PolicyError};
+use super::{Action, GroupSummary, PolicyEngine, PolicyError, UserAssignment};
 use crate::endpoint::{
     ApiModule,
     error::ApiError,
@@ -42,7 +42,10 @@ impl ApiModule for PolicyApiModule {
             .service(assign_group)
             .service(get_user_groups)
             .service(get_group_users)
-            .service(remove_user_from_group);
+            .service(remove_user_from_group)
+            .service(list_groups)
+            .service(list_users)
+            .service(delete_group);
 
         cfg.service(scope);
     }
@@ -286,6 +289,111 @@ async fn remove_user_from_group(
 
     let (group_name, user_id) = path.into_inner();
     let success = policy_engine.remove_from_group(user_id, group_name).await?;
+
+    Ok(HttpResponse::Ok().json(ActionResponse { success }))
+}
+
+/// Paginated group listing.
+#[derive(Serialize)]
+pub struct GroupsResponse {
+    /// Page of groups with member counts.
+    pub groups: Vec<GroupSummary>,
+    /// Total number of known groups.
+    pub total: usize,
+    /// Effective page size after capping.
+    pub limit: usize,
+    /// Offset this page starts at.
+    pub offset: usize,
+}
+
+/// Paginated user-assignment listing.
+#[derive(Serialize)]
+pub struct UsersResponse {
+    /// Page of subjects with their groups.
+    pub users: Vec<UserAssignment>,
+    /// Total number of subjects holding memberships.
+    pub total: usize,
+    /// Effective page size after capping.
+    pub limit: usize,
+    /// Offset this page starts at.
+    pub offset: usize,
+}
+
+/// Lists every known group with member counts.
+#[get("/groups")]
+async fn list_groups(
+    policy_engine: web::Data<PolicyEngine>,
+    auth_claims: Validated<Claims>,
+    query: web::Query<RulesQuery>,
+) -> Result<impl Responder, ApiError> {
+    policy_engine
+        .require(
+            &auth_claims.sub,
+            Resource::UserGroups.as_str(),
+            Action::Read,
+        )
+        .await?;
+
+    let all = policy_engine.list_groups().await;
+    let total = all.len();
+    let limit = query.limit.unwrap_or(DEFAULT_PAGE_SIZE).min(MAX_PAGE_SIZE);
+    let offset = query.offset.unwrap_or(0);
+    let groups = all.into_iter().skip(offset).take(limit).collect();
+
+    Ok(HttpResponse::Ok().json(GroupsResponse {
+        groups,
+        total,
+        limit,
+        offset,
+    }))
+}
+
+/// Lists every subject holding group memberships.
+#[get("/users")]
+async fn list_users(
+    policy_engine: web::Data<PolicyEngine>,
+    auth_claims: Validated<Claims>,
+    query: web::Query<RulesQuery>,
+) -> Result<impl Responder, ApiError> {
+    policy_engine
+        .require(
+            &auth_claims.sub,
+            Resource::UserGroups.as_str(),
+            Action::Read,
+        )
+        .await?;
+
+    let all = policy_engine.list_user_assignments().await;
+    let total = all.len();
+    let limit = query.limit.unwrap_or(DEFAULT_PAGE_SIZE).min(MAX_PAGE_SIZE);
+    let offset = query.offset.unwrap_or(0);
+    let users = all.into_iter().skip(offset).take(limit).collect();
+
+    Ok(HttpResponse::Ok().json(UsersResponse {
+        users,
+        total,
+        limit,
+        offset,
+    }))
+}
+
+/// Deletes a group together with every membership link to it.
+#[delete("/groups/{group_name}")]
+async fn delete_group(
+    policy_engine: web::Data<PolicyEngine>,
+    auth_claims: Validated<Claims>,
+    path: web::Path<String>,
+) -> Result<impl Responder, ApiError> {
+    policy_engine
+        .require(
+            &auth_claims.sub,
+            Resource::UserGroups.as_str(),
+            Action::Write,
+        )
+        .await?;
+
+    let group_name = path.into_inner();
+    let success = policy_engine.delete_group(&group_name).await?;
 
     Ok(HttpResponse::Ok().json(ActionResponse { success }))
 }
