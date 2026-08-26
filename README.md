@@ -82,6 +82,7 @@ path = "data/rust-api.redb"                 # embedded oxkv policy store (create
 [observability]
 service_name = "rust-api"                   # resource attribute on exported telemetry
 otlp_endpoint = "http://localhost:4317"     # OTLP/gRPC collector endpoint
+sample_ratio = 1.0                          # fraction of traces sampled (0.0–1.0, default 1.0)
 ```
 
 ## Running
