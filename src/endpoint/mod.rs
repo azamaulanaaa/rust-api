@@ -2,6 +2,8 @@ use std::{net::SocketAddr, sync::Arc};
 
 use actix_web::{App, HttpServer, web};
 
+/// Shared error type rendering a uniform JSON error envelope.
+pub mod error;
 /// Request middleware for token extraction and validation.
 pub mod middleware;
 /// Built-in routes shared by every deployment (health checks).
