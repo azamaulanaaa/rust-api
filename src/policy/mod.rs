@@ -265,11 +265,20 @@ impl PolicyEngine {
     }
 
     /// Primary Authorization method.
-    pub async fn authorize(&self, sub: &str, obj: &str, act: Action) -> Result<bool, PolicyError> {
+    ///
+    /// The object accepts anything string-like (`&str`, `String`, or your
+    /// own typed enum implementing `AsRef<str>`), so business modules can
+    /// pass IDE-completable variants without `.into()` ceremony.
+    pub async fn authorize<S: AsRef<str>>(
+        &self,
+        sub: &str,
+        obj: S,
+        act: Action,
+    ) -> Result<bool, PolicyError> {
         let ef = self.enforcer.read().await;
 
         // Casbin check
-        let allowed = ef.enforce((sub, obj, &act.to_string()))?;
+        let allowed = ef.enforce((sub, obj.as_ref(), &act.to_string()))?;
 
         Ok(allowed)
     }
@@ -277,9 +286,13 @@ impl PolicyEngine {
     /// Like [`PolicyEngine::authorize`], but returns
     /// [`PolicyError::AccessDenied`] instead of a boolean when the subject
     /// lacks the permission.
-    pub async fn require(&self, sub: &str, obj: &str, act: Action) -> Result<(), PolicyError> {
-        let ef = self.enforcer.read().await;
-        let allowed = ef.enforce((sub, obj, &act.to_string()))?;
+    pub async fn require<S: AsRef<str>>(
+        &self,
+        sub: &str,
+        obj: S,
+        act: Action,
+    ) -> Result<(), PolicyError> {
+        let allowed = self.authorize(sub, obj, act).await?;
 
         if allowed {
             Ok(())
@@ -320,18 +333,28 @@ pub struct Authorizer {
 }
 
 impl Authorizer {
-    /// Primary Authorization method.
-    pub async fn authorize(&self, sub: &str, obj: &str, act: Action) -> Result<bool, PolicyError> {
+    /// Primary Authorization method. Accepts any string-like object; see
+    /// [`PolicyEngine::authorize`].
+    pub async fn authorize<S: AsRef<str>>(
+        &self,
+        sub: &str,
+        obj: S,
+        act: Action,
+    ) -> Result<bool, PolicyError> {
         let ef = self.enforcer.read().await;
-        Ok(ef.enforce((sub, obj, &act.to_string()))?)
+        Ok(ef.enforce((sub, obj.as_ref(), &act.to_string()))?)
     }
 
     /// Like [`Authorizer::authorize`], but returns
     /// [`PolicyError::AccessDenied`] instead of a boolean when the subject
     /// lacks the permission.
-    pub async fn require(&self, sub: &str, obj: &str, act: Action) -> Result<(), PolicyError> {
-        let ef = self.enforcer.read().await;
-        let allowed = ef.enforce((sub, obj, &act.to_string()))?;
+    pub async fn require<S: AsRef<str>>(
+        &self,
+        sub: &str,
+        obj: S,
+        act: Action,
+    ) -> Result<(), PolicyError> {
+        let allowed = self.authorize(sub, obj, act).await?;
 
         if allowed {
             Ok(())
@@ -414,6 +437,52 @@ mod tests {
 
         // Deleting an unknown group reports no-op rather than failing.
         assert!(!engine.delete_group("admins").await.unwrap());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn require_accepts_strings_and_typed_objects() {
+        let (engine, path) = engine().await;
+
+        engine
+            .assign_group("alice".into(), "editors".into())
+            .await
+            .unwrap();
+        engine
+            .add_rule("editors".into(), "invoices".into(), Action::Write)
+            .await
+            .unwrap();
+
+        // Plain string object.
+        engine
+            .require("alice", "invoices", Action::Write)
+            .await
+            .unwrap();
+
+        // Business modules may define their own IDE-completable object
+        // enums; anything AsRef<str> drops straight into require().
+        #[derive(Clone, Copy)]
+        enum BizObject {
+            Invoices,
+        }
+        impl AsRef<str> for BizObject {
+            fn as_ref(&self) -> &str {
+                match self {
+                    Self::Invoices => "invoices",
+                }
+            }
+        }
+        engine
+            .require("alice", BizObject::Invoices, Action::Write)
+            .await
+            .unwrap();
+        assert!(
+            engine
+                .require("alice", BizObject::Invoices, Action::Read)
+                .await
+                .is_err()
+        );
 
         let _ = std::fs::remove_file(&path);
     }
