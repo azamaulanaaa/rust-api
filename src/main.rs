@@ -2,7 +2,7 @@
 //!
 //! `serve` loads TOML configuration, initializes the OIDC client and Casbin
 //! policy engine, registers their API modules onto an
-//! [`rust_api::endpoint::ApiService`], and starts the HTTP listener. The
+//! [`rust_api::http::ApiService`], and starts the HTTP listener. The
 //! `policy export/import` subcommands manage policy data as JSON for
 //! backups and migrations.
 
@@ -16,8 +16,8 @@ use clap::{Parser, Subcommand};
 use url::Url;
 
 use rust_api::{
-    endpoint::{ApiService, middleware::jwt::Claims},
     fs::{FsEngine, route::FsApiModule, s3::S3ClientConfig},
+    http::{ApiService, middleware::jwt::Claims},
     oidc::{OidcClient, OidcConfig, route::OidcApiModule},
     policy::{PolicyEngine, admin, route::PolicyApiModule, setup::SetupApiModule},
     telemetry,

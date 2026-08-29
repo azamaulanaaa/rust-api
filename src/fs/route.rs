@@ -5,10 +5,10 @@ use std::sync::Arc;
 use actix_web::{HttpResponse, delete, get, post, put, web};
 use bytes::Bytes;
 
-use crate::endpoint::ApiModule;
-use crate::endpoint::middleware::jwt::{Claims, JwtClaimsMiddleware, Validated};
 use crate::fs::FsEngine;
 use crate::fs::model::{CompleteRequest, InitRequest, InitResponse};
+use crate::http::ApiModule;
+use crate::http::middleware::jwt::{Claims, JwtClaimsMiddleware, Validated};
 
 /// API module exposing `/fs` routes, protected by JWT validation.
 pub struct FsApiModule {
@@ -45,7 +45,7 @@ impl ApiModule for FsApiModule {
     }
 }
 
-#[utoipa::path(post, path = "/fs/uploads", tag = "fs", request_body = InitRequest, responses((status=201, body=InitResponse), (status=401, body=crate::endpoint::error::ErrorBody)))]
+#[utoipa::path(post, path = "/fs/uploads", tag = "fs", request_body = InitRequest, responses((status=201, body=InitResponse), (status=401, body=crate::http::error::ErrorBody)))]
 #[post("/uploads")]
 async fn init_upload(
     engine: web::Data<FsEngine>,
@@ -56,7 +56,7 @@ async fn init_upload(
     Ok(HttpResponse::Created().json(serde_json::json!({ "file_id": file_id })))
 }
 
-#[utoipa::path(put, path = "/fs/uploads/{id}/parts/{idx}", tag = "fs", params(("id" = String, Path), ("idx" = u64, Path)), request_body(content = Vec<u8>, content_type = "application/octet-stream"), responses((status=204, description="part stored"), (status=401, body=crate::endpoint::error::ErrorBody)))]
+#[utoipa::path(put, path = "/fs/uploads/{id}/parts/{idx}", tag = "fs", params(("id" = String, Path), ("idx" = u64, Path)), request_body(content = Vec<u8>, content_type = "application/octet-stream"), responses((status=204, description="part stored"), (status=401, body=crate::http::error::ErrorBody)))]
 #[put("/uploads/{id}/parts/{idx}")]
 async fn upload_part(
     engine: web::Data<FsEngine>,
@@ -84,7 +84,7 @@ async fn upload_part(
     Ok(HttpResponse::NoContent().finish())
 }
 
-#[utoipa::path(post, path = "/fs/uploads/{id}/complete", tag = "fs", params(("id" = String, Path)), request_body = CompleteRequest, responses((status=200, body=InitResponse), (status=401, body=crate::endpoint::error::ErrorBody)))]
+#[utoipa::path(post, path = "/fs/uploads/{id}/complete", tag = "fs", params(("id" = String, Path)), request_body = CompleteRequest, responses((status=200, body=InitResponse), (status=401, body=crate::http::error::ErrorBody)))]
 #[post("/uploads/{id}/complete")]
 async fn complete_upload(
     engine: web::Data<FsEngine>,

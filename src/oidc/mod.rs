@@ -7,7 +7,7 @@ use openidconnect::{
 
 use thiserror::Error;
 
-use crate::endpoint::middleware::jwt::{IssuerTemplate, extract_unverified_claim};
+use crate::http::middleware::jwt::{IssuerTemplate, extract_unverified_claim};
 
 /// HTTP routes for the OIDC login and callback endpoints.
 pub mod route;

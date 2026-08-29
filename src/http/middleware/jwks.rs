@@ -183,7 +183,7 @@ fn to_signing_key(jwk: &Jwk) -> Option<(String, SigningKey)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::endpoint::middleware::jwks::test_support::*;
+    use crate::http::middleware::jwks::test_support::*;
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use jsonwebtoken::{EncodingKey, Header, Validation, decode, encode};
     use serde_json::json;

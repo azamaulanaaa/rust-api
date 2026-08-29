@@ -7,7 +7,7 @@ use utoipa::OpenApi;
 #[openapi(
     info(title = "rust-api", version = "0.1.0", description = "S3 proxy FS + Casbin RBAC + OIDC"),
     paths(
-        crate::endpoint::route::health::health,
+        crate::http::health::health,
         crate::fs::route::init_upload,
         crate::fs::route::upload_part,
         crate::fs::route::complete_upload,
@@ -26,7 +26,7 @@ use utoipa::OpenApi;
         crate::fs::model::FileMetadata,
         crate::fs::model::InitResponse,
         crate::fs::model::ProgressResponse,
-        crate::endpoint::error::ErrorBody,
+        crate::http::error::ErrorBody,
         crate::policy::route::PolicyRequest,
         crate::policy::route::GroupRequest,
         crate::policy::route::ActionResponse,
