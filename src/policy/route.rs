@@ -4,7 +4,7 @@ use actix_web::{HttpResponse, Responder, delete, get, post, web};
 use serde::{Deserialize, Serialize};
 
 use super::{Action, GroupSummary, PolicyEngine, PolicyError, UserAssignment};
-use crate::endpoint::{
+use crate::http::{
     ApiModule,
     error::ApiError,
     middleware::jwt::{Claims, JwtClaimsMiddleware, Validated},
@@ -158,7 +158,7 @@ impl From<PolicyError> for ApiError {
     }
 }
 
-#[utoipa::path(get, path = "/policy/rules", tag = "policy", params(("limit" = Option<usize>, Query), ("offset" = Option<usize>, Query)), responses((status=200, body=RuleListResponse), (status=401, body=crate::endpoint::error::ErrorBody)))]
+#[utoipa::path(get, path = "/policy/rules", tag = "policy", params(("limit" = Option<usize>, Query), ("offset" = Option<usize>, Query)), responses((status=200, body=RuleListResponse), (status=401, body=crate::http::error::ErrorBody)))]
 #[get("/rules")]
 async fn get_rules(
     policy_engine: web::Data<PolicyEngine>,
@@ -182,7 +182,7 @@ async fn get_rules(
     }))
 }
 
-#[utoipa::path(post, path = "/policy/rules", tag = "policy", request_body = PolicyRequest, responses((status=200, body=ActionResponse), (status=401, body=crate::endpoint::error::ErrorBody)))]
+#[utoipa::path(post, path = "/policy/rules", tag = "policy", request_body = PolicyRequest, responses((status=200, body=ActionResponse), (status=401, body=crate::http::error::ErrorBody)))]
 #[post("/rules")]
 async fn add_rule(
     policy_engine: web::Data<PolicyEngine>,
@@ -199,7 +199,7 @@ async fn add_rule(
     Ok(HttpResponse::Ok().json(ActionResponse { success }))
 }
 
-#[utoipa::path(delete, path = "/policy/rules", tag = "policy", request_body = PolicyRequest, responses((status=200, body=ActionResponse), (status=401, body=crate::endpoint::error::ErrorBody)))]
+#[utoipa::path(delete, path = "/policy/rules", tag = "policy", request_body = PolicyRequest, responses((status=200, body=ActionResponse), (status=401, body=crate::http::error::ErrorBody)))]
 #[delete("/rules")]
 async fn remove_rule(
     policy_engine: web::Data<PolicyEngine>,

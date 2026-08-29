@@ -21,7 +21,7 @@ use serde::{Deserialize, de::DeserializeOwned};
 
 use super::bearer_token::BearerToken;
 use super::jwks::JwksKeys;
-use crate::endpoint::error::ApiError;
+use crate::http::error::ApiError;
 
 // Preserve the public API surface for consumers of this module.
 pub use super::jwks::SigningKey;
@@ -315,7 +315,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::endpoint::middleware::jwks::test_support::*;
+    use crate::http::middleware::jwks::test_support::*;
     use serde_json::json;
 
     #[tokio::test]

@@ -3,7 +3,7 @@
 //! authorization, built on Actix Web.
 //!
 //! The crate is intentionally business-logic free: applications compose
-//! [`endpoint::ApiModule`] implementations onto an [`endpoint::ApiService`]
+//! [`http::ApiModule`] implementations onto an [`http::ApiService`]
 //! to build their own API surface on top of the shared auth/policy plumbing.
 
 // Public items must carry rustdoc comments; the lint is enforced
@@ -11,7 +11,7 @@
 
 /// HTTP server scaffolding: modular service registry plus request
 /// middleware (bearer-token extraction, JWKS-backed JWT validation).
-pub mod endpoint;
+pub mod http;
 
 /// OpenID Connect client and login/callback routes implementing the
 /// authorization-code flow with PKCE, CSRF state, and nonce validation.

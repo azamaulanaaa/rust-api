@@ -9,7 +9,7 @@ use openidconnect::{Nonce, PkceCodeVerifier};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use super::{OidcClient, OidcError};
-use crate::endpoint::{ApiModule, middleware};
+use crate::http::{ApiModule, middleware};
 
 /// API module exposing `/auth/login` and `/auth/callback`, and owning the
 /// JWT validation middleware configured from the discovered provider.

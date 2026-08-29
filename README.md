@@ -30,6 +30,14 @@ The crate is intentionally business-logic free: applications compose `ApiModule`
 | POST | `/policy/groups` | Assign a user to a group | Bearer token |
 | DELETE | `/policy/groups/{group_name}/users/{user_id}` | Remove a user from a group | Bearer token |
 | GET | `/policy/users` | List all subjects with their groups | Bearer token |
+| POST | `/fs/uploads` | Start a multipart upload | Bearer token |
+| PUT | `/fs/uploads/{id}/parts/{idx}` | Upload one part (raw bytes) | Bearer token |
+| POST | `/fs/uploads/{id}/complete` | Complete the upload (assembles parts in S3) | Bearer token |
+| DELETE | `/fs/uploads/{id}` | Cancel an in-progress upload | Bearer token |
+| GET | `/fs/uploads/{id}` | Upload progress | Bearer token |
+| GET | `/fs/files/{id}/meta` | File metadata | Bearer token |
+| GET | `/fs/files/{id}` | Download file content | Bearer token |
+| DELETE | `/fs/files/{id}` | Delete file | Bearer token |
 
 Protected routes accept either an explicit `Authorization: Bearer <token>` header (preferred) or the session cookie set by `/auth/callback`. Requests without valid credentials get `401`; insufficient permissions get `403`. All errors use a uniform JSON envelope: `{"error": "<message>"}`.
 
@@ -45,16 +53,17 @@ src/
 ├── lib.rs               crate root and documentation
 ├── config.rs            TOML configuration model
 ├── telemetry.rs         tracing subscriber + OTLP span export bootstrap
-├── endpoint/            HTTP scaffolding shared by all modules
+├── http/                HTTP scaffolding shared by all modules
 │   ├── mod.rs           ApiService registry + ApiModule trait
 │   ├── error.rs         ApiError enum and uniform JSON error envelope
-│   ├── middleware/      bearer_token, jwt (JWKS-backed claims), request_tracing
-│   └── route/           /health
+│   ├── health.rs        /health
+│   └── middleware/      bearer_token, jwt (JWKS-backed claims), request_tracing
 ├── oidc/                OIDC client: /auth/login + /auth/callback (code flow, PKCE)
-└── policy/              Casbin engine, oxkv adapter + validator, management routes
+├── policy/              Casbin engine, oxkv adapter + validator, management routes
+└── fs/                  S3-backed file storage: /fs/uploads/* and /fs/files/*
 ```
 
-Modules implement [`ApiModule`](src/endpoint/mod.rs) and are registered onto `ApiService`; each module brings its own middleware stack (e.g. `/policy/*` requires validated JWT claims).
+Modules implement [`ApiModule`](src/http/mod.rs) and are registered onto `ApiService`; each module brings its own middleware stack (e.g. `/policy/*` requires validated JWT claims).
 
 ## How authorization works
 
@@ -132,7 +141,7 @@ Imports are idempotent — already-present rules are skipped — and every entry
 Implement `ApiModule` and register it on the service:
 
 ```rust
-use rust_api::endpoint::ApiModule;
+use rust_api::http::ApiModule;
 
 struct MyModule;
 

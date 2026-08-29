@@ -6,10 +6,15 @@ use actix_web::{App, HttpServer, web};
 pub mod docs;
 /// Shared error type rendering a uniform JSON error envelope.
 pub mod error;
+/// Built-in liveness probe shared by every deployment.
+pub mod health;
 /// Request middleware for token extraction and validation.
 pub mod middleware;
-/// Built-in routes shared by every deployment (health checks).
-pub mod route;
+
+/// Registers the built-in routes shared by every deployment.
+fn config(cfg: &mut web::ServiceConfig) {
+    cfg.service(health::health);
+}
 
 /// A self-contained unit of the API surface: a set of routes plus its own
 /// app data and middleware. Implement this to plug business functionality
@@ -56,7 +61,7 @@ impl ApiService {
             let mut app = App::new()
                 .wrap(middleware::request_tracing::RequestTracingMiddleware)
                 .wrap(middleware::bearer_token::BearerTokenMiddleware)
-                .configure(route::config)
+                .configure(config)
                 .configure(docs::config);
 
             for module in modules.iter() {

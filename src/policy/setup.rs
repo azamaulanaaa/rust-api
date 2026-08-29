@@ -14,7 +14,7 @@ use actix_web::{HttpResponse, Responder, post, web};
 use serde::Serialize;
 
 use super::{PolicyEngine, SUPERADMIN_ROLE};
-use crate::endpoint::{
+use crate::http::{
     ApiModule,
     error::ApiError,
     middleware::jwt::{Claims, JwtClaimsMiddleware, Validated},
@@ -91,7 +91,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::endpoint::middleware::jwks::test_support::{rsa_key, sign_rs256, spawn_jwks};
+    use crate::http::middleware::jwks::test_support::{rsa_key, sign_rs256, spawn_jwks};
 
     const KID: &str = "setup-test-key";
     const AUDIENCE: &str = "test-aud";
