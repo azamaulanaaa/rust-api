@@ -73,7 +73,7 @@ impl Resource {
 }
 
 /// Body for creating/removing a permission rule.
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct PolicyRequest {
     /// Subject (user or group) the rule applies to.
     pub sub: String,
@@ -84,7 +84,7 @@ pub struct PolicyRequest {
 }
 
 /// Body for assigning/unassigning group membership.
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct GroupRequest {
     /// Subject to add to/remove from the group.
     pub user_id: String,
@@ -93,21 +93,21 @@ pub struct GroupRequest {
 }
 
 /// Generic success indicator returned by mutating endpoints.
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct ActionResponse {
     /// Whether the mutation was applied.
     pub success: bool,
 }
 
 /// A flat list of string identifiers.
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct ListResponse {
     /// The listed items (users or groups).
     pub items: Vec<String>,
 }
 
 /// Permission rules with pagination metadata.
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct RuleListResponse {
     /// One page of rules, each as `[sub, obj, act]`.
     pub rules: Vec<Vec<String>>,
@@ -158,6 +158,7 @@ impl From<PolicyError> for ApiError {
     }
 }
 
+#[utoipa::path(get, path = "/policy/rules", tag = "policy", params(("limit" = Option<usize>, Query), ("offset" = Option<usize>, Query)), responses((status=200, body=RuleListResponse), (status=401, body=crate::endpoint::error::ErrorBody)))]
 #[get("/rules")]
 async fn get_rules(
     policy_engine: web::Data<PolicyEngine>,
@@ -181,6 +182,7 @@ async fn get_rules(
     }))
 }
 
+#[utoipa::path(post, path = "/policy/rules", tag = "policy", request_body = PolicyRequest, responses((status=200, body=ActionResponse), (status=401, body=crate::endpoint::error::ErrorBody)))]
 #[post("/rules")]
 async fn add_rule(
     policy_engine: web::Data<PolicyEngine>,
@@ -197,6 +199,7 @@ async fn add_rule(
     Ok(HttpResponse::Ok().json(ActionResponse { success }))
 }
 
+#[utoipa::path(delete, path = "/policy/rules", tag = "policy", request_body = PolicyRequest, responses((status=200, body=ActionResponse), (status=401, body=crate::endpoint::error::ErrorBody)))]
 #[delete("/rules")]
 async fn remove_rule(
     policy_engine: web::Data<PolicyEngine>,

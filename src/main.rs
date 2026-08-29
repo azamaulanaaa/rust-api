@@ -162,7 +162,7 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
     };
     let fs_engine = FsEngine::init(&fs_store_path, &s3_client_config, policy_engine).await?;
     // GC: expire abandoned multipart uploads every hour (24h TTL)
-    crate::fs::gc::spawn(std::sync::Arc::new(fs_engine.clone()));
+    rust_api::fs::gc::spawn(std::sync::Arc::new(fs_engine.clone()));
     let fs_api_module = FsApiModule::new(fs_engine, oidc_api_module.middleware());
 
     let listen_addr = SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), config.listen_port);

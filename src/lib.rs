@@ -25,6 +25,9 @@ pub mod policy;
 /// IndexedDB worker FS API (`src/worker/fs/index.ts`) over REST.
 pub mod fs;
 
+/// OpenAPI specification composed from all `utoipa::path` modules.
+pub mod docs;
+
 /// Telemetry bootstrap: global [`tracing`] subscriber installation and
 /// OpenTelemetry wiring.
 pub mod telemetry;

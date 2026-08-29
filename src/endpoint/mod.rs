@@ -2,6 +2,8 @@ use std::{net::SocketAddr, sync::Arc};
 
 use actix_web::{App, HttpServer, web};
 
+/// OpenAPI JSON + Swagger UI.
+pub mod docs;
 /// Shared error type rendering a uniform JSON error envelope.
 pub mod error;
 /// Request middleware for token extraction and validation.
@@ -54,7 +56,8 @@ impl ApiService {
             let mut app = App::new()
                 .wrap(middleware::request_tracing::RequestTracingMiddleware)
                 .wrap(middleware::bearer_token::BearerTokenMiddleware)
-                .configure(route::config);
+                .configure(route::config)
+                .configure(docs::config);
 
             for module in modules.iter() {
                 app = app.configure(move |cfg| module.configure(cfg));

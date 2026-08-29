@@ -10,7 +10,7 @@ use serde::Serialize;
 use thiserror::Error;
 
 /// Wire format for every API error: `{"error": "<message>"}`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct ErrorBody {
     /// Stable, non-sensitive description of the failure.
     pub error: String,
