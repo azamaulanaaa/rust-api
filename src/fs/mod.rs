@@ -68,6 +68,7 @@ impl FsEngine {
 
     /// Validates `req` (mirrors `MetadataUploadSchema.filter`) and creates a new upload session.
     /// Returns the generated `file_id` (`uuidv7`).
+    #[tracing::instrument(skip(self, req), fields(file_size = req.file_size, part_size = req.part_size, total_parts = req.file_total_parts, owner_sub = %owner_sub), err)]
     pub async fn init_upload(&self, req: InitRequest, owner_sub: &str) -> Result<String, FsError> {
         req.validate()?;
         // coarse gate: need `fs` write to create new files
@@ -112,6 +113,7 @@ impl FsEngine {
 
     /// Validates and stores a single chunk. `body` is the raw bytes for `part_index`.
     /// `checksum_sha256` is base64-encoded SHA256, forwarded to S3 for validation.
+    #[tracing::instrument(skip(self, body, checksum_sha256), fields(file_id = %file_id, part_index, body_len = body.len(), caller_sub = %caller_sub), err)]
     pub async fn upload_part(
         &self,
         file_id: &str,
@@ -201,6 +203,7 @@ impl FsEngine {
     }
 
     /// Completes an upload session: verifies all parts, finalizes S3, persists file metadata.
+    #[tracing::instrument(skip(self, req), fields(file_id = %file_id, caller_sub = %caller_sub), err)]
     pub async fn complete_upload(
         &self,
         file_id: &str,
@@ -268,6 +271,7 @@ impl FsEngine {
     }
 
     /// Aborts a multipart upload and removes session state.
+    #[tracing::instrument(skip(self), fields(file_id = %file_id, caller_sub = %caller_sub), err)]
     pub async fn cancel_upload(&self, file_id: &str, caller_sub: &str) -> Result<(), FsError> {
         let session = self
             .store
@@ -294,6 +298,7 @@ impl FsEngine {
     }
 
     /// Returns file metadata (no body).
+    #[tracing::instrument(skip(self), fields(file_id = %file_id, caller_sub = %caller_sub), err)]
     pub async fn get_metadata(
         &self,
         file_id: &str,
@@ -320,6 +325,7 @@ impl FsEngine {
     }
 
     /// Deletes a finalized file from S3 and metadata store.
+    #[tracing::instrument(skip(self), fields(file_id = %file_id, caller_sub = %caller_sub), err)]
     pub async fn delete_file(&self, file_id: &str, caller_sub: &str) -> Result<(), FsError> {
         self.policy
             .require(caller_sub, "fs", Action::Delete)
@@ -339,6 +345,7 @@ impl FsEngine {
     }
 
     /// Streams a file body from S3 as bytes.
+    #[tracing::instrument(skip(self), fields(file_id = %file_id, caller_sub = %caller_sub), err)]
     pub async fn get_object(
         &self,
         file_id: &str,
@@ -361,6 +368,7 @@ impl FsEngine {
     }
 
     /// Returns upload progress for client-driven polling.
+    #[tracing::instrument(skip(self), fields(file_id = %file_id, caller_sub = %caller_sub), err)]
     pub async fn get_progress(
         &self,
         file_id: &str,

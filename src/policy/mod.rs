@@ -269,6 +269,7 @@ impl PolicyEngine {
     /// The object accepts anything string-like (`&str`, `String`, or your
     /// own typed enum implementing `AsRef<str>`), so business modules can
     /// pass IDE-completable variants without `.into()` ceremony.
+    #[tracing::instrument(skip(self, obj), fields(sub = %sub, obj = %obj.as_ref(), act = %act), err)]
     pub async fn authorize<S: AsRef<str>>(
         &self,
         sub: &str,
@@ -286,6 +287,7 @@ impl PolicyEngine {
     /// Like [`PolicyEngine::authorize`], but returns
     /// [`PolicyError::AccessDenied`] instead of a boolean when the subject
     /// lacks the permission.
+    #[tracing::instrument(skip(self, obj), fields(sub = %sub, obj = %obj.as_ref(), act = %act), err)]
     pub async fn require<S: AsRef<str>>(
         &self,
         sub: &str,
@@ -335,6 +337,7 @@ pub struct Authorizer {
 impl Authorizer {
     /// Primary Authorization method. Accepts any string-like object; see
     /// [`PolicyEngine::authorize`].
+    #[tracing::instrument(skip(self, obj), fields(sub = %sub, obj = %obj.as_ref(), act = %act), err)]
     pub async fn authorize<S: AsRef<str>>(
         &self,
         sub: &str,
@@ -348,6 +351,7 @@ impl Authorizer {
     /// Like [`Authorizer::authorize`], but returns
     /// [`PolicyError::AccessDenied`] instead of a boolean when the subject
     /// lacks the permission.
+    #[tracing::instrument(skip(self, obj), fields(sub = %sub, obj = %obj.as_ref(), act = %act), err)]
     pub async fn require<S: AsRef<str>>(
         &self,
         sub: &str,
