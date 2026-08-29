@@ -25,6 +25,7 @@ pub fn spawn(engine: Arc<FsEngine>) {
 }
 
 /// Single sweep: abort expired sessions.
+#[tracing::instrument(skip(engine), fields(cleaned), err)]
 pub async fn sweep_once(engine: &FsEngine) -> Result<usize, crate::fs::error::FsError> {
     let now = chrono::Utc::now().timestamp();
     let sessions = engine.store.list_sessions().await?;
