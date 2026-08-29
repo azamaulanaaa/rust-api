@@ -126,3 +126,147 @@ pub struct ProgressResponse {
     /// Percentage completed (0-100).
     pub percent: u64,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_bad(req: InitRequest, contains: &str) {
+        let err = req.validate().unwrap_err().to_string();
+        assert!(
+            err.contains(contains),
+            "expected '{contains}' in '{err}' for {req:?}"
+        );
+    }
+
+    #[test]
+    fn init_request_rejects_zero_fields() {
+        assert_bad(
+            InitRequest {
+                file_size: 0,
+                part_size: 1024,
+                file_total_parts: 1,
+            },
+            "file_size",
+        );
+        assert_bad(
+            InitRequest {
+                file_size: 1024,
+                part_size: 0,
+                file_total_parts: 1,
+            },
+            "part_size",
+        );
+        assert_bad(
+            InitRequest {
+                file_size: 1024,
+                part_size: 1024,
+                file_total_parts: 0,
+            },
+            "total_parts",
+        );
+    }
+
+    #[test]
+    fn init_request_single_part_copy_paste_guards() {
+        // Copy-paste risk: single-part branch must check part_size == file_size
+        // and 10 MB cap — swapping into multi-part logic would silently pass.
+        assert_bad(
+            InitRequest {
+                file_size: 1024,
+                part_size: 512,
+                file_total_parts: 1,
+            },
+            "must be equal",
+        );
+        assert_bad(
+            InitRequest {
+                file_size: 11 * 1024 * 1024,
+                part_size: 11 * 1024 * 1024,
+                file_total_parts: 1,
+            },
+            "10 MB",
+        );
+        // Valid single-part (boundary 10 MB)
+        InitRequest {
+            file_size: 10 * 1024 * 1024,
+            part_size: 10 * 1024 * 1024,
+            file_total_parts: 1,
+        }
+        .validate()
+        .unwrap();
+    }
+
+    #[test]
+    fn init_request_multi_part_copy_paste_guards() {
+        // part_size must be 1KB multiple and <=512KB — easy to copy wrong bound.
+        assert_bad(
+            InitRequest {
+                file_size: 2048,
+                part_size: 1500,
+                file_total_parts: 2,
+            },
+            "part_size",
+        );
+        assert_bad(
+            InitRequest {
+                file_size: 1024 * 1024,
+                part_size: 600 * 1024,
+                file_total_parts: 2,
+            },
+            "part_size",
+        );
+        // file_total_parts must equal ceil(file_size/part_size)
+        assert_bad(
+            InitRequest {
+                file_size: 1024 * 1024,
+                part_size: 262144,
+                file_total_parts: 5,
+            },
+            "must be exactly",
+        );
+        // product must equal file_size (exact division required)
+        assert_bad(
+            InitRequest {
+                file_size: 300 * 1024,
+                part_size: 131072,
+                file_total_parts: 3,
+            },
+            "must equal",
+        );
+        // Valid multi-part: 1 MB split by 256KB = 4 parts
+        InitRequest {
+            file_size: 1024 * 1024,
+            part_size: 262144,
+            file_total_parts: 4,
+        }
+        .validate()
+        .unwrap();
+    }
+
+    #[test]
+    fn complete_request_rejects_empty_fields() {
+        assert!(
+            CompleteRequest {
+                name: "   ".into(),
+                mimetype: "text/plain".into()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            CompleteRequest {
+                name: "file.bin".into(),
+                mimetype: "  ".into()
+            }
+            .validate()
+            .is_err()
+        );
+        CompleteRequest {
+            name: "file.bin".into(),
+            mimetype: "application/octet-stream".into(),
+        }
+        .validate()
+        .unwrap();
+    }
+}
