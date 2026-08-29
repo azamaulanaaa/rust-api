@@ -21,6 +21,10 @@ pub mod oidc;
 /// for permission rules and group membership.
 pub mod policy;
 
+/// S3-backed file storage with chunked upload support, mirroring the
+/// IndexedDB worker FS API (`src/worker/fs/index.ts`) over REST.
+pub mod fs;
+
 /// Telemetry bootstrap: global [`tracing`] subscriber installation and
 /// OpenTelemetry wiring.
 pub mod telemetry;

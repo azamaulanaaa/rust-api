@@ -17,6 +17,7 @@ use url::Url;
 
 use rust_api::{
     endpoint::{ApiService, middleware::jwt::Claims},
+    fs::{FsEngine, route::FsApiModule, s3::S3ClientConfig},
     oidc::{OidcClient, OidcConfig, route::OidcApiModule},
     policy::{PolicyEngine, admin, route::PolicyApiModule, setup::SetupApiModule},
     telemetry,
@@ -144,13 +145,32 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
 
     let policy_engine = PolicyEngine::init(Path::new(&config.database.path)).await?;
     let setup_api_module = SetupApiModule::new(policy_engine.clone(), oidc_api_module.middleware());
-    let policy_api_module = PolicyApiModule::new(policy_engine, oidc_api_module.middleware());
+    let policy_api_module =
+        PolicyApiModule::new(policy_engine.clone(), oidc_api_module.middleware());
+
+    // FS module: reuse policy engine for per-file `fs:{id}` checks; store lives
+    // in a sibling redb file (`{database.path}.fs`) to avoid redb file-lock
+    // contention while keeping key prefixes isolated (`fs:` vs `p:`/`g:`).
+    let fs_store_path = PathBuf::from(format!("{}.fs", config.database.path));
+    let s3_client_config = S3ClientConfig {
+        bucket: config.s3.bucket.clone(),
+        region: config.s3.region.clone(),
+        endpoint_url: config.s3.endpoint_url.clone(),
+        force_path_style: config.s3.force_path_style,
+        access_key_id: config.s3.access_key_id.clone(),
+        secret_access_key: config.s3.secret_access_key.clone(),
+    };
+    let fs_engine = FsEngine::init(&fs_store_path, &s3_client_config, policy_engine).await?;
+    // GC: expire abandoned multipart uploads every hour (24h TTL)
+    crate::fs::gc::spawn(std::sync::Arc::new(fs_engine.clone()));
+    let fs_api_module = FsApiModule::new(fs_engine, oidc_api_module.middleware());
 
     let listen_addr = SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), config.listen_port);
     ApiService::new()
         .register_module(Box::new(oidc_api_module))
         .register_module(Box::new(setup_api_module))
         .register_module(Box::new(policy_api_module))
+        .register_module(Box::new(fs_api_module))
         .start(listen_addr.into())
         .await?;
 
