@@ -16,6 +16,8 @@ pub struct Config {
     pub authorization: ConfigAuthorization,
     /// Embedded policy-database settings.
     pub database: DatabaseConfig,
+    /// S3-compatible object storage settings for file uploads.
+    pub s3: S3Config,
     /// Telemetry settings; defaults apply when the section is omitted.
     #[serde(default)]
     pub observability: ObservabilityConfig,
@@ -91,4 +93,25 @@ fn default_service_name() -> String {
 pub struct DatabaseConfig {
     /// File path of the embedded oxkv (Redb) database backing policies.
     pub path: String,
+}
+
+/// S3-compatible object storage settings.
+#[derive(Deserialize, Debug, Clone)]
+pub struct S3Config {
+    /// S3 bucket name.
+    pub bucket: String,
+    /// AWS region (e.g. `us-east-1`).
+    pub region: String,
+    /// Custom endpoint URL for S3-compatible providers (MinIO, R2). Omit for AWS.
+    #[serde(default)]
+    pub endpoint_url: Option<String>,
+    /// Whether to use path-style addressing (required for MinIO).
+    #[serde(default)]
+    pub force_path_style: bool,
+    /// Access key ID (falls back to env/instance profile when absent).
+    #[serde(default)]
+    pub access_key_id: Option<String>,
+    /// Secret access key.
+    #[serde(default)]
+    pub secret_access_key: Option<String>,
 }
