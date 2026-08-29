@@ -17,7 +17,7 @@ pub mod adapter;
 pub mod admin;
 
 /// The operation a policy rule grants on an object.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub enum Action {
     /// Permission to view the object.
     Read,

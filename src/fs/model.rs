@@ -1,9 +1,10 @@
 //! Request/response DTOs and validation mirroring `MetadataUploadSchema.filter`.
 
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 /// Mirrors `MetadataUploadSchema` from `src/worker/fs/index.ts`.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
 pub struct InitRequest {
     /// Total file size in bytes.
     pub file_size: u64,
@@ -67,7 +68,7 @@ impl InitRequest {
 }
 
 /// Mirrors `FileMetadataSchema`.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
 pub struct CompleteRequest {
     /// Human filename.
     pub name: String,
@@ -90,7 +91,7 @@ impl CompleteRequest {
 }
 
 /// Public file metadata (no S3 internals).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct FileMetadata {
     /// File identifier (uuidv7).
     pub id: String,
@@ -103,14 +104,14 @@ pub struct FileMetadata {
 }
 
 /// Response for `POST /fs/uploads` (init).
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct InitResponse {
     /// Generated file identifier.
     pub file_id: String,
 }
 
 /// Progress response for client-driven polling: `GET /fs/uploads/{id}`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ProgressResponse {
     /// File identifier.
     pub file_id: String,

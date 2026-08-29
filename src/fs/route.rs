@@ -8,7 +8,7 @@ use bytes::Bytes;
 use crate::endpoint::ApiModule;
 use crate::endpoint::middleware::jwt::{Claims, JwtClaimsMiddleware, Validated};
 use crate::fs::FsEngine;
-use crate::fs::model::{CompleteRequest, InitRequest};
+use crate::fs::model::{CompleteRequest, InitRequest, InitResponse};
 
 /// API module exposing `/fs` routes, protected by JWT validation.
 pub struct FsApiModule {
@@ -45,6 +45,7 @@ impl ApiModule for FsApiModule {
     }
 }
 
+#[utoipa::path(post, path = "/fs/uploads", tag = "fs", request_body = InitRequest, responses((status=201, body=InitResponse), (status=401, body=crate::endpoint::error::ErrorBody)))]
 #[post("/uploads")]
 async fn init_upload(
     engine: web::Data<FsEngine>,
@@ -55,6 +56,7 @@ async fn init_upload(
     Ok(HttpResponse::Created().json(serde_json::json!({ "file_id": file_id })))
 }
 
+#[utoipa::path(put, path = "/fs/uploads/{id}/parts/{idx}", tag = "fs", params(("id" = String, Path), ("idx" = u64, Path)), request_body(content = Vec<u8>, content_type = "application/octet-stream"), responses((status=204, description="part stored"), (status=401, body=crate::endpoint::error::ErrorBody)))]
 #[put("/uploads/{id}/parts/{idx}")]
 async fn upload_part(
     engine: web::Data<FsEngine>,
@@ -82,6 +84,7 @@ async fn upload_part(
     Ok(HttpResponse::NoContent().finish())
 }
 
+#[utoipa::path(post, path = "/fs/uploads/{id}/complete", tag = "fs", params(("id" = String, Path)), request_body = CompleteRequest, responses((status=200, body=InitResponse), (status=401, body=crate::endpoint::error::ErrorBody)))]
 #[post("/uploads/{id}/complete")]
 async fn complete_upload(
     engine: web::Data<FsEngine>,
@@ -97,6 +100,7 @@ async fn complete_upload(
     Ok(HttpResponse::Ok().json(serde_json::json!({ "file_id": id })))
 }
 
+#[utoipa::path(delete, path = "/fs/uploads/{id}", tag = "fs", params(("id" = String, Path)), responses((status=204, description="cancelled")))]
 #[delete("/uploads/{id}")]
 async fn cancel_upload(
     engine: web::Data<FsEngine>,
@@ -108,6 +112,7 @@ async fn cancel_upload(
     Ok(HttpResponse::NoContent().finish())
 }
 
+#[utoipa::path(get, path = "/fs/uploads/{id}", tag = "fs", params(("id" = String, Path)), responses((status=200, body=crate::fs::model::ProgressResponse)))]
 #[get("/uploads/{id}")]
 async fn get_progress(
     engine: web::Data<FsEngine>,
@@ -119,6 +124,7 @@ async fn get_progress(
     Ok(HttpResponse::Ok().json(prog))
 }
 
+#[utoipa::path(get, path = "/fs/files/{id}/meta", tag = "fs", params(("id" = String, Path)), responses((status=200, body=crate::fs::model::FileMetadata)))]
 #[get("/files/{id}/meta")]
 async fn get_metadata(
     engine: web::Data<FsEngine>,
@@ -130,6 +136,7 @@ async fn get_metadata(
     Ok(HttpResponse::Ok().json(meta))
 }
 
+#[utoipa::path(get, path = "/fs/files/{id}", tag = "fs", params(("id" = String, Path)), responses((status=200, description="binary")))]
 #[get("/files/{id}")]
 async fn get_file(
     engine: web::Data<FsEngine>,
@@ -147,6 +154,7 @@ async fn get_file(
         .body(body))
 }
 
+#[utoipa::path(delete, path = "/fs/files/{id}", tag = "fs", params(("id" = String, Path)), responses((status=204, description="deleted")))]
 #[delete("/files/{id}")]
 async fn delete_file(
     engine: web::Data<FsEngine>,

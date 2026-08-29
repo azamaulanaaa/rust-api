@@ -201,10 +201,11 @@ impl FsStore {
             .map_err(|e| FsError::Store(e.to_string()))?;
         let mut out = Vec::new();
         for kv in kvs {
-            if kv.key.starts_with("fs:uploads:") && kv.key.ends_with(":meta") {
-                if let Ok(s) = serde_json::from_slice::<UploadSession>(&kv.value) {
-                    out.push(s);
-                }
+            if kv.key.starts_with("fs:uploads:")
+                && kv.key.ends_with(":meta")
+                && let Ok(s) = serde_json::from_slice::<UploadSession>(&kv.value)
+            {
+                out.push(s);
             }
         }
         Ok(out)
