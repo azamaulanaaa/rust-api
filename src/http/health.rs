@@ -6,3 +6,17 @@ use actix_web::{HttpResponse, Responder, get};
 pub async fn health() -> impl Responder {
     HttpResponse::Ok().finish()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use actix_web::{App, test};
+
+    #[actix_web::test]
+    async fn health_returns_200() {
+        let app = test::init_service(App::new().service(health)).await;
+        let req = test::TestRequest::get().uri("/health").to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 200);
+    }
+}

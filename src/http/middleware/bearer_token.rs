@@ -75,17 +75,50 @@ fn extract_bearer_token(req: &ServiceRequest) -> Option<BearerToken> {
         .get(header::AUTHORIZATION)?
         .to_str()
         .ok()
-        .and_then(|auth_str| {
-            let mut parts = auth_str.splitn(2, ' ');
-            match (parts.next(), parts.next()) {
-                (Some(scheme), Some(token)) if scheme.eq_ignore_ascii_case("Bearer") => {
-                    if token.trim().is_empty() {
-                        None
-                    } else {
-                        Some(BearerToken(token.to_string()))
-                    }
-                }
-                _ => None,
+        .and_then(parse_bearer_token)
+}
+
+fn parse_bearer_token(auth_str: &str) -> Option<BearerToken> {
+    let mut parts = auth_str.splitn(2, ' ');
+    match (parts.next(), parts.next()) {
+        (Some(scheme), Some(token)) if scheme.eq_ignore_ascii_case("Bearer") => {
+            if token.trim().is_empty() {
+                None
+            } else {
+                Some(BearerToken(token.to_string()))
             }
-        })
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_bearer_token_accepts_valid() {
+        assert_eq!(parse_bearer_token("Bearer abc123").unwrap().0, "abc123");
+        assert_eq!(parse_bearer_token("bearer XYZ").unwrap().0, "XYZ");
+        assert_eq!(
+            parse_bearer_token("BEARER token-with-dash_123").unwrap().0,
+            "token-with-dash_123"
+        );
+    }
+
+    #[test]
+    fn parse_bearer_token_rejects_invalid() {
+        assert!(parse_bearer_token("Basic abc123").is_none());
+        assert!(parse_bearer_token("Bearer").is_none());
+        assert!(parse_bearer_token("Bearer ").is_none());
+        assert!(parse_bearer_token("Bearer   ").is_none());
+        assert!(parse_bearer_token("").is_none());
+        assert!(parse_bearer_token("   ").is_none());
+    }
+
+    #[test]
+    fn parse_bearer_token_preserves_raw_token() {
+        // Token is stored verbatim (no trim) — downstream validation decides.
+        assert_eq!(parse_bearer_token("Bearer  abc").unwrap().0, " abc");
+    }
 }
