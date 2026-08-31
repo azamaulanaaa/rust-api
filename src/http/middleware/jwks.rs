@@ -12,10 +12,23 @@ use std::{
     time::{Duration, Instant},
 };
 
+use std::sync::LazyLock;
+
 use jsonwebtoken::{
     Algorithm, DecodingKey,
     jwk::{AlgorithmParameters, Jwk, JwkSet, KeyAlgorithm},
 };
+
+/// Shared `reqwest` client for JWKS fetches — reuses the same connection
+/// pool and avoids constructing a new client per refresh (previously
+/// `reqwest::get` did that). The client is `rustls`-only to match the
+/// workspace-wide `reqwest` feature set and save `native-tls` compile time.
+static JWKS_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("failed to build JWKS reqwest client")
+});
 
 /// Minimum interval between two JWKS fetches triggered by unknown-key misses.
 /// Prevents a flood of junk tokens from hammering the identity provider.
@@ -143,7 +156,7 @@ impl JwksKeys {
 }
 
 async fn fetch_keys(url: &str) -> anyhow::Result<HashMap<String, SigningKey>> {
-    let jwks: JwkSet = reqwest::get(url).await?.json().await?;
+    let jwks: JwkSet = JWKS_CLIENT.get(url).send().await?.json().await?;
 
     Ok(jwks.keys.iter().filter_map(to_signing_key).collect())
 }

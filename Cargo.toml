@@ -11,11 +11,16 @@ path = "src/lib.rs"
 name = "rust-api"
 path = "src/main.rs"
 
+[features]
+default = ["otlp-http"]
+otlp-grpc = ["dep:opentelemetry-otlp", "opentelemetry-otlp/grpc-tonic", "opentelemetry-otlp/trace", "opentelemetry-otlp/metrics", "opentelemetry-otlp/internal-logs"]
+otlp-http = ["dep:opentelemetry-otlp", "opentelemetry-otlp/http-proto", "opentelemetry-otlp/trace", "opentelemetry-otlp/metrics", "opentelemetry-otlp/internal-logs"]
+
 [dependencies]
 actix-web = "4.12.0"
 bytes = "1.11"
 futures-util = "0.3.31"
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 url = "2.5.8"
 
 async-trait = "0.1"
@@ -28,14 +33,14 @@ toml = "0.9.8"
 base64 = "0.22.1"
 casbin = "2.20.0"
 jsonwebtoken = { version = "10.2.0", features = ["rust_crypto"] }
-openidconnect = "4.0.1"
+openidconnect = { version = "4.0.1", default-features = false, features = ["reqwest", "rustls-tls"] }
 
-aws-config = "1.8"
-aws-sdk-s3 = "1.117"
+aws-config = { version = "1.8", default-features = false, features = ["rt-tokio", "rustls", "credentials-process", "sso"] }
+aws-sdk-s3 = { version = "1.117", default-features = false, features = ["rt-tokio", "rustls", "http-1x", "default-https-client"] }
 oxkv = "0.2.0"
 
 opentelemetry = "0.32.0"
-opentelemetry-otlp = { version = "0.32.0", default-features = false, features = ["grpc-tonic", "trace", "metrics", "internal-logs"] }
+opentelemetry-otlp = { version = "0.32.0", optional = true, default-features = false }
 opentelemetry_sdk = "0.32.1"
 tracing = "0.1.44"
 tracing-opentelemetry = "0.33.0"
