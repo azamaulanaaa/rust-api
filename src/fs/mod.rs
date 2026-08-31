@@ -408,3 +408,600 @@ impl FsEngine {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    use crate::fs::s3::S3Client;
+    use crate::policy::{Action, PolicyEngine};
+    use bytes::Bytes;
+
+    // Minimal in-memory S3 mock for engine tests (duplicated from s3::tests to avoid pub leakage).
+    struct TestS3 {
+        objects: Mutex<HashMap<(String, String), Bytes>>,
+        multiparts: Mutex<HashMap<String, TestMultipart>>,
+        counter: std::sync::atomic::AtomicU64,
+    }
+    struct TestMultipart {
+        bucket: String,
+        key: String,
+        parts: HashMap<i32, Bytes>,
+    }
+    impl TestS3 {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                objects: Mutex::new(HashMap::new()),
+                multiparts: Mutex::new(HashMap::new()),
+                counter: std::sync::atomic::AtomicU64::new(1),
+            })
+        }
+    }
+    #[async_trait::async_trait]
+    impl S3Client for TestS3 {
+        async fn create_multipart_upload(
+            &self,
+            bucket: &str,
+            key: &str,
+            _ct: Option<String>,
+        ) -> Result<String, FsError> {
+            let id = format!(
+                "upload-{}",
+                self.counter
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            );
+            self.multiparts.lock().await.insert(
+                id.clone(),
+                TestMultipart {
+                    bucket: bucket.to_string(),
+                    key: key.to_string(),
+                    parts: HashMap::new(),
+                },
+            );
+            Ok(id)
+        }
+        async fn upload_part(
+            &self,
+            bucket: &str,
+            key: &str,
+            upload_id: &str,
+            part_number: i32,
+            body: Bytes,
+            _cs: Option<String>,
+        ) -> Result<String, FsError> {
+            if part_number < 1 {
+                return Err(FsError::BadRequest("part_number must be >= 1".into()));
+            }
+            let mut mp = self.multiparts.lock().await;
+            let m = mp
+                .get_mut(upload_id)
+                .ok_or_else(|| FsError::Internal(format!("unknown upload_id {upload_id}")))?;
+            if m.bucket != bucket || m.key != key {
+                return Err(FsError::Internal("bucket/key mismatch".into()));
+            }
+            let etag = format!("etag-{upload_id}-{part_number}-{}", body.len());
+            m.parts.insert(part_number, body);
+            Ok(etag)
+        }
+        async fn complete_multipart_upload(
+            &self,
+            bucket: &str,
+            key: &str,
+            upload_id: &str,
+            etags: Vec<String>,
+        ) -> Result<(), FsError> {
+            let mut mp = self.multiparts.lock().await;
+            let m = mp
+                .remove(upload_id)
+                .ok_or_else(|| FsError::Internal(format!("unknown upload_id {upload_id}")))?;
+            if m.bucket != bucket || m.key != key {
+                return Err(FsError::Internal("bucket/key mismatch".into()));
+            }
+            if etags.len() != m.parts.len() {
+                return Err(FsError::Internal("etag count mismatch".into()));
+            }
+            for (i, etag) in etags.iter().enumerate() {
+                let pn = (i + 1) as i32;
+                let body = m
+                    .parts
+                    .get(&pn)
+                    .ok_or_else(|| FsError::Internal(format!("missing part {pn}")))?;
+                let expected = format!("etag-{upload_id}-{pn}-{}", body.len());
+                if etag != &expected {
+                    return Err(FsError::Internal(format!("etag mismatch for part {pn}")));
+                }
+            }
+            let mut assembled = Vec::new();
+            let mut sorted: Vec<_> = m.parts.into_iter().collect();
+            sorted.sort_by_key(|(k, _)| *k);
+            for (_, b) in sorted {
+                assembled.extend_from_slice(&b);
+            }
+            self.objects.lock().await.insert(
+                (bucket.to_string(), key.to_string()),
+                Bytes::from(assembled),
+            );
+            Ok(())
+        }
+        async fn abort_multipart_upload(
+            &self,
+            bucket: &str,
+            key: &str,
+            upload_id: &str,
+        ) -> Result<(), FsError> {
+            let mut mp = self.multiparts.lock().await;
+            if let Some(m) = mp.get(upload_id)
+                && (m.bucket != bucket || m.key != key)
+            {
+                return Err(FsError::Internal("bucket/key mismatch".into()));
+            }
+            mp.remove(upload_id);
+            Ok(())
+        }
+        async fn put_object(
+            &self,
+            bucket: &str,
+            key: &str,
+            body: Bytes,
+            _ct: Option<String>,
+            _cs: Option<String>,
+        ) -> Result<(), FsError> {
+            self.objects
+                .lock()
+                .await
+                .insert((bucket.to_string(), key.to_string()), body);
+            Ok(())
+        }
+        async fn get_object(&self, bucket: &str, key: &str) -> Result<Bytes, FsError> {
+            self.objects
+                .lock()
+                .await
+                .get(&(bucket.to_string(), key.to_string()))
+                .cloned()
+                .ok_or_else(|| FsError::NotFound(format!("object not found: {bucket}/{key}")))
+        }
+        async fn delete_object(&self, bucket: &str, key: &str) -> Result<(), FsError> {
+            self.objects
+                .lock()
+                .await
+                .remove(&(bucket.to_string(), key.to_string()));
+            Ok(())
+        }
+    }
+
+    fn tmp_path(label: &str) -> std::path::PathBuf {
+        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+        std::env::temp_dir().join(format!(
+            "rust-api-fs-engine-{}-{}-{}.redb",
+            std::process::id(),
+            URL_SAFE_NO_PAD.encode(rand::random::<[u8; 8]>()),
+            label
+        ))
+    }
+
+    async fn make_engine(sub: &str, grant: bool) -> (FsEngine, std::path::PathBuf, Arc<TestS3>) {
+        let path = tmp_path(sub);
+        let _ = std::fs::remove_file(&path);
+        let store = FsStore::open(&path).await.unwrap();
+        let policy_path = tmp_path(&format!("{sub}-policy"));
+        let _ = std::fs::remove_file(&policy_path);
+        let policy = PolicyEngine::init(&policy_path).await.unwrap();
+        if grant {
+            policy
+                .assign_group(sub.to_string(), "writers".to_string())
+                .await
+                .unwrap();
+            policy
+                .add_rule("writers".to_string(), "fs".to_string(), Action::Write)
+                .await
+                .unwrap();
+            policy
+                .add_rule("writers".to_string(), "fs".to_string(), Action::Read)
+                .await
+                .unwrap();
+            policy
+                .add_rule("writers".to_string(), "fs".to_string(), Action::Delete)
+                .await
+                .unwrap();
+        }
+        let s3 = TestS3::new();
+        let engine = FsEngine::from_parts(store, s3.clone(), "test-bucket".to_string(), policy);
+        (engine, path, s3)
+    }
+
+    fn valid_single() -> InitRequest {
+        InitRequest {
+            file_size: 1024,
+            part_size: 1024,
+            file_total_parts: 1,
+        }
+    }
+    fn valid_multi() -> InitRequest {
+        InitRequest {
+            file_size: 524288,
+            part_size: 262144,
+            file_total_parts: 2,
+        }
+    }
+
+    #[tokio::test]
+    async fn init_upload_validates_and_checks_policy() -> anyhow::Result<()> {
+        let (engine, _p, _) = make_engine("alice", true).await;
+        let id = engine.init_upload(valid_single(), "alice").await?;
+        assert!(!id.is_empty());
+        // invalid request bubbles BadRequest
+        let err = engine
+            .init_upload(
+                InitRequest {
+                    file_size: 0,
+                    part_size: 1024,
+                    file_total_parts: 1,
+                },
+                "alice",
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, FsError::BadRequest(_)));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn init_upload_forbidden_without_policy() {
+        let (engine, _p, _) = make_engine("bob", false).await;
+        let err = engine.init_upload(valid_single(), "bob").await.unwrap_err();
+        assert!(matches!(err, FsError::Forbidden));
+    }
+
+    #[tokio::test]
+    async fn init_creates_single_vs_multipart_session() -> anyhow::Result<()> {
+        let (engine, _p, s3) = make_engine("alice", true).await;
+        let id1 = engine.init_upload(valid_single(), "alice").await?;
+        let sess1 = engine.store.get_session(&id1).await?.unwrap();
+        assert!(sess1.s3_upload_id.is_none());
+        assert_eq!(sess1.s3_key, format!("files/{id1}"));
+        let id2 = engine.init_upload(valid_multi(), "alice").await?;
+        let sess2 = engine.store.get_session(&id2).await?.unwrap();
+        assert!(sess2.s3_upload_id.is_some());
+        assert_eq!(s3.multiparts.lock().await.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn upload_part_single_and_multipart_paths() -> anyhow::Result<()> {
+        let (engine, _p, _) = make_engine("alice", true).await;
+        // single-part
+        let id = engine.init_upload(valid_single(), "alice").await?;
+        engine
+            .upload_part(
+                &id,
+                0,
+                Bytes::from(vec![1u8; 1024]),
+                Some("cs".into()),
+                "alice",
+            )
+            .await?;
+        let sess = engine.store.get_session(&id).await?.unwrap();
+        assert_eq!(sess.etags[0], Some("put".into()));
+        assert_eq!(sess.checksums[0], Some("cs".into()));
+        // multipart
+        let id2 = engine.init_upload(valid_multi(), "alice").await?;
+        engine
+            .upload_part(&id2, 0, Bytes::from(vec![2u8; 262144]), None, "alice")
+            .await?;
+        engine
+            .upload_part(&id2, 1, Bytes::from(vec![3u8; 262144]), None, "alice")
+            .await?;
+        let sess2 = engine.store.get_session(&id2).await?.unwrap();
+        assert!(sess2.etags[0].is_some() && sess2.etags[1].is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn upload_part_rejects_out_of_bounds_and_size_mismatch() -> anyhow::Result<()> {
+        let (engine, _p, _) = make_engine("alice", true).await;
+        let id = engine.init_upload(valid_multi(), "alice").await?;
+        let err = engine
+            .upload_part(&id, 5, Bytes::from(vec![0u8; 100]), None, "alice")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, FsError::BadRequest(_)));
+        assert!(err.to_string().contains("out of bounds"));
+        // wrong body size for part 0 (expected 262144)
+        let err = engine
+            .upload_part(&id, 0, Bytes::from(vec![0u8; 10]), None, "alice")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("blob size mismatch"));
+        // last part size check (also 262144 here because file_size exactly divisible)
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn upload_part_not_found_and_forbidden() {
+        let (engine, _p, _) = make_engine("alice", true).await;
+        let err = engine
+            .upload_part("ghost", 0, Bytes::from(vec![0u8; 1024]), None, "alice")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, FsError::NotFound(_)));
+        let (engine2, _p2, _) = make_engine("alice", true).await;
+        let id = engine2.init_upload(valid_single(), "alice").await.unwrap();
+        let err = engine2
+            .upload_part(&id, 0, Bytes::from(vec![1u8; 1024]), None, "eve")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, FsError::Forbidden));
+    }
+
+    #[tokio::test]
+    async fn complete_upload_requires_all_parts_and_policy() -> anyhow::Result<()> {
+        let (engine, _p, _) = make_engine("alice", true).await;
+        let id = engine.init_upload(valid_multi(), "alice").await?;
+        // not all parts uploaded
+        let err = engine
+            .complete_upload(
+                &id,
+                CompleteRequest {
+                    name: "f".into(),
+                    mimetype: "text/plain".into(),
+                },
+                "alice",
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not all parts"));
+        // upload one part still incomplete
+        engine
+            .upload_part(&id, 0, Bytes::from(vec![0u8; 262144]), None, "alice")
+            .await?;
+        let err = engine
+            .complete_upload(
+                &id,
+                CompleteRequest {
+                    name: "f".into(),
+                    mimetype: "text/plain".into(),
+                },
+                "alice",
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not all parts"));
+        // forbidden caller
+        let err = engine
+            .complete_upload(
+                &id,
+                CompleteRequest {
+                    name: "f".into(),
+                    mimetype: "x".into(),
+                },
+                "eve",
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, FsError::Forbidden));
+        // not found session
+        let err = engine
+            .complete_upload(
+                "ghost",
+                CompleteRequest {
+                    name: "f".into(),
+                    mimetype: "x".into(),
+                },
+                "alice",
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, FsError::NotFound(_)));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn complete_upload_single_and_multi_succeeds() -> anyhow::Result<()> {
+        let (engine, _p, s3) = make_engine("alice", true).await;
+        let id = engine.init_upload(valid_single(), "alice").await?;
+        engine
+            .upload_part(&id, 0, Bytes::from(vec![9u8; 1024]), None, "alice")
+            .await?;
+        engine
+            .complete_upload(
+                &id,
+                CompleteRequest {
+                    name: "a.txt".into(),
+                    mimetype: "text/plain".into(),
+                },
+                "alice",
+            )
+            .await?;
+        assert!(engine.store.get_session(&id).await?.is_none());
+        let rec = engine.store.get_file(&id).await?.unwrap();
+        assert_eq!(rec.name, "a.txt");
+        assert_eq!(rec.size, 1024);
+        // multipart
+        let id2 = engine.init_upload(valid_multi(), "alice").await?;
+        engine
+            .upload_part(&id2, 0, Bytes::from(vec![1u8; 262144]), None, "alice")
+            .await?;
+        engine
+            .upload_part(&id2, 1, Bytes::from(vec![2u8; 262144]), None, "alice")
+            .await?;
+        engine
+            .complete_upload(
+                &id2,
+                CompleteRequest {
+                    name: "b.bin".into(),
+                    mimetype: "application/octet-stream".into(),
+                },
+                "alice",
+            )
+            .await?;
+        assert!(engine.store.get_file(&id2).await?.is_some());
+        // S3 object assembled
+        assert!(
+            s3.objects
+                .lock()
+                .await
+                .contains_key(&("test-bucket".to_string(), format!("files/{id2}")))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancel_upload_cleans_s3_and_session() -> anyhow::Result<()> {
+        let (engine, _p, s3) = make_engine("alice", true).await;
+        let id = engine.init_upload(valid_multi(), "alice").await?;
+        engine
+            .upload_part(&id, 0, Bytes::from(vec![0u8; 262144]), None, "alice")
+            .await?;
+        engine.cancel_upload(&id, "alice").await?;
+        assert!(engine.store.get_session(&id).await?.is_none());
+        assert!(s3.multiparts.lock().await.is_empty());
+        // single-part cancel (delete_object path)
+        let id2 = engine.init_upload(valid_single(), "alice").await?;
+        engine
+            .upload_part(&id2, 0, Bytes::from(vec![5u8; 1024]), None, "alice")
+            .await?;
+        engine.cancel_upload(&id2, "alice").await?;
+        assert!(engine.store.get_session(&id2).await?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancel_not_found_and_forbidden() {
+        let (engine, _p, _) = make_engine("alice", true).await;
+        assert!(matches!(
+            engine.cancel_upload("ghost", "alice").await.unwrap_err(),
+            FsError::NotFound(_)
+        ));
+        let id = engine.init_upload(valid_single(), "alice").await.unwrap();
+        assert!(matches!(
+            engine.cancel_upload(&id, "eve").await.unwrap_err(),
+            FsError::Forbidden
+        ));
+    }
+
+    #[tokio::test]
+    async fn get_metadata_and_object_flow() -> anyhow::Result<()> {
+        let (engine, _p, _) = make_engine("alice", true).await;
+        let id = engine.init_upload(valid_single(), "alice").await?;
+        engine
+            .upload_part(&id, 0, Bytes::from(vec![7u8; 1024]), None, "alice")
+            .await?;
+        engine
+            .complete_upload(
+                &id,
+                CompleteRequest {
+                    name: "doc.txt".into(),
+                    mimetype: "text/plain".into(),
+                },
+                "alice",
+            )
+            .await?;
+        let meta = engine.get_metadata(&id, "alice").await?;
+        assert_eq!(meta.name, "doc.txt");
+        assert_eq!(meta.size, 1024);
+        let (rec, body) = engine.get_object(&id, "alice").await?;
+        assert_eq!(rec.mimetype, "text/plain");
+        assert_eq!(body.len(), 1024);
+        // forbidden
+        assert!(matches!(
+            engine.get_metadata(&id, "eve").await.unwrap_err(),
+            FsError::Forbidden
+        ));
+        assert!(matches!(
+            engine.get_object(&id, "eve").await.unwrap_err(),
+            FsError::Forbidden
+        ));
+        // not found
+        assert!(matches!(
+            engine.get_metadata("ghost", "alice").await.unwrap_err(),
+            FsError::NotFound(_)
+        ));
+        assert!(matches!(
+            engine.get_object("ghost", "alice").await.unwrap_err(),
+            FsError::NotFound(_)
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delete_file_flow() -> anyhow::Result<()> {
+        let (engine, _p, s3) = make_engine("alice", true).await;
+        let id = engine.init_upload(valid_single(), "alice").await?;
+        engine
+            .upload_part(&id, 0, Bytes::from(vec![1u8; 1024]), None, "alice")
+            .await?;
+        engine
+            .complete_upload(
+                &id,
+                CompleteRequest {
+                    name: "x".into(),
+                    mimetype: "text/plain".into(),
+                },
+                "alice",
+            )
+            .await?;
+        assert!(matches!(
+            engine.delete_file(&id, "eve").await.unwrap_err(),
+            FsError::Forbidden
+        ));
+        assert!(matches!(
+            engine.delete_file("ghost", "alice").await.unwrap_err(),
+            FsError::NotFound(_)
+        ));
+        engine.delete_file(&id, "alice").await?;
+        assert!(engine.store.get_file(&id).await?.is_none());
+        assert!(
+            !s3.objects
+                .lock()
+                .await
+                .contains_key(&("test-bucket".to_string(), format!("files/{id}")))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_progress_reports_uploaded_parts() -> anyhow::Result<()> {
+        let (engine, _p, _) = make_engine("alice", true).await;
+        let id = engine.init_upload(valid_multi(), "alice").await?;
+        let prog = engine.get_progress(&id, "alice").await?;
+        assert_eq!(prog.percent, 0);
+        assert!(prog.uploaded_parts.is_empty());
+        engine
+            .upload_part(&id, 0, Bytes::from(vec![0u8; 262144]), None, "alice")
+            .await?;
+        let prog = engine.get_progress(&id, "alice").await?;
+        assert_eq!(prog.percent, 50);
+        assert_eq!(prog.uploaded_parts, vec![0]);
+        // forbidden / not-found
+        assert!(matches!(
+            engine.get_progress(&id, "eve").await.unwrap_err(),
+            FsError::Forbidden
+        ));
+        assert!(matches!(
+            engine.get_progress("ghost", "alice").await.unwrap_err(),
+            FsError::NotFound(_)
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn from_parts_and_init_smoke() -> anyhow::Result<()> {
+        let path = tmp_path("from_parts");
+        let _ = std::fs::remove_file(&path);
+        let store = FsStore::open(&path).await?;
+        let policy_path = tmp_path("from_parts_policy");
+        let _ = std::fs::remove_file(&policy_path);
+        let policy = PolicyEngine::init(&policy_path).await?;
+        policy.assign_group("u".into(), "g".into()).await?;
+        policy
+            .add_rule("g".into(), "fs".into(), Action::Write)
+            .await?;
+        let s3 = TestS3::new();
+        let engine = FsEngine::from_parts(store.clone(), s3, "b".into(), policy);
+        assert_eq!(engine.bucket, "b");
+        Ok(())
+    }
+}
