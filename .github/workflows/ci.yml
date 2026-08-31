@@ -33,7 +33,7 @@ jobs:
         run: cargo test --all-targets
 
   licenses:
-    name: Dependency license check
+    name: Licenses (cargo deny)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -46,3 +46,24 @@ jobs:
 
       - name: Check dependency licenses
         uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          args: licenses
+
+  advisories:
+    name: Advisories (cargo deny)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check advisories (vulns / yanks)
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          args: advisories
