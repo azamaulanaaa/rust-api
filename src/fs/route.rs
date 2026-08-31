@@ -165,3 +165,570 @@ async fn delete_file(
     engine.delete_file(&id, &claims.sub).await?;
     Ok(HttpResponse::NoContent().finish())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    use actix_web::{App, http, test};
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use bytes::Bytes;
+    use jsonwebtoken::EncodingKey;
+    use serde_json::json;
+
+    use crate::fs::error::FsError;
+    use crate::fs::s3::S3Client;
+    use crate::fs::store::FsStore;
+    use crate::http::middleware::jwks::test_support::{rsa_key, sign_rs256, spawn_jwks};
+    use crate::policy::{Action, PolicyEngine};
+
+    const KID: &str = "fs-route-test-kid";
+    const AUD: &str = "test-aud";
+
+    struct TestS3 {
+        objects: Mutex<HashMap<(String, String), Bytes>>,
+        multiparts: Mutex<HashMap<String, Multipart>>,
+        counter: std::sync::atomic::AtomicU64,
+        last_checksum: Mutex<Option<String>>,
+    }
+    struct Multipart {
+        bucket: String,
+        key: String,
+        parts: HashMap<i32, Bytes>,
+    }
+    impl TestS3 {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                objects: Mutex::new(HashMap::new()),
+                multiparts: Mutex::new(HashMap::new()),
+                counter: std::sync::atomic::AtomicU64::new(1),
+                last_checksum: Mutex::new(None),
+            })
+        }
+    }
+    #[async_trait::async_trait]
+    impl S3Client for TestS3 {
+        async fn create_multipart_upload(
+            &self,
+            b: &str,
+            k: &str,
+            _ct: Option<String>,
+        ) -> Result<String, FsError> {
+            let id = format!(
+                "upload-{}",
+                self.counter
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            );
+            self.multiparts.lock().await.insert(
+                id.clone(),
+                Multipart {
+                    bucket: b.to_string(),
+                    key: k.to_string(),
+                    parts: HashMap::new(),
+                },
+            );
+            Ok(id)
+        }
+        async fn upload_part(
+            &self,
+            b: &str,
+            k: &str,
+            upload_id: &str,
+            pn: i32,
+            body: Bytes,
+            cs: Option<String>,
+        ) -> Result<String, FsError> {
+            if pn < 1 {
+                return Err(FsError::BadRequest("part_number must be >= 1".into()));
+            }
+            *self.last_checksum.lock().await = cs.clone();
+            let mut mp = self.multiparts.lock().await;
+            let m = mp
+                .get_mut(upload_id)
+                .ok_or_else(|| FsError::Internal(format!("unknown upload_id {upload_id}")))?;
+            if m.bucket != b || m.key != k {
+                return Err(FsError::Internal("bucket/key mismatch".into()));
+            }
+            let etag = format!("etag-{upload_id}-{pn}-{}", body.len());
+            m.parts.insert(pn, body);
+            Ok(etag)
+        }
+        async fn complete_multipart_upload(
+            &self,
+            b: &str,
+            k: &str,
+            upload_id: &str,
+            etags: Vec<String>,
+        ) -> Result<(), FsError> {
+            let mut mp = self.multiparts.lock().await;
+            let m = mp
+                .remove(upload_id)
+                .ok_or_else(|| FsError::Internal(format!("unknown upload_id {upload_id}")))?;
+            if m.bucket != b || m.key != k {
+                return Err(FsError::Internal("bucket/key mismatch".into()));
+            }
+            if etags.len() != m.parts.len() {
+                return Err(FsError::Internal("etag count mismatch".into()));
+            }
+            let mut assembled = Vec::new();
+            let mut sorted: Vec<_> = m.parts.into_iter().collect();
+            sorted.sort_by_key(|(x, _)| *x);
+            for (_, v) in sorted {
+                assembled.extend_from_slice(&v);
+            }
+            self.objects
+                .lock()
+                .await
+                .insert((b.to_string(), k.to_string()), Bytes::from(assembled));
+            Ok(())
+        }
+        async fn abort_multipart_upload(
+            &self,
+            _: &str,
+            _: &str,
+            upload_id: &str,
+        ) -> Result<(), FsError> {
+            self.multiparts.lock().await.remove(upload_id);
+            Ok(())
+        }
+        async fn put_object(
+            &self,
+            b: &str,
+            k: &str,
+            body: Bytes,
+            _ct: Option<String>,
+            cs: Option<String>,
+        ) -> Result<(), FsError> {
+            *self.last_checksum.lock().await = cs;
+            self.objects
+                .lock()
+                .await
+                .insert((b.to_string(), k.to_string()), body);
+            Ok(())
+        }
+        async fn get_object(&self, b: &str, k: &str) -> Result<Bytes, FsError> {
+            self.objects
+                .lock()
+                .await
+                .get(&(b.to_string(), k.to_string()))
+                .cloned()
+                .ok_or_else(|| FsError::NotFound(format!("object not found: {b}/{k}")))
+        }
+        async fn delete_object(&self, b: &str, k: &str) -> Result<(), FsError> {
+            self.objects
+                .lock()
+                .await
+                .remove(&(b.to_string(), k.to_string()));
+            Ok(())
+        }
+    }
+
+    struct Fixture {
+        server: wiremock::MockServer,
+        enc: EncodingKey,
+        engine: FsEngine,
+        s3: Arc<TestS3>,
+    }
+    impl Fixture {
+        fn issuer(&self) -> String {
+            self.server.uri()
+        }
+        fn token(&self, sub: &str) -> anyhow::Result<String> {
+            sign_rs256(
+                &json!({"sub": sub, "iss": self.issuer(), "aud": AUD, "exp": 2000000000u64}),
+                KID,
+                &self.enc,
+            )
+        }
+    }
+    async fn fixture(grant_alice: bool) -> anyhow::Result<Fixture> {
+        let (key, enc) = rsa_key(KID)?;
+        let jwks = json!({"keys": [key]});
+        let server = spawn_jwks(jwks).await;
+        let policy_path = std::env::temp_dir().join(format!(
+            "fs-route-policy-{}-{}.redb",
+            std::process::id(),
+            URL_SAFE_NO_PAD.encode(rand::random::<[u8; 8]>())
+        ));
+        let _ = std::fs::remove_file(&policy_path);
+        let policy = PolicyEngine::init(&policy_path).await?;
+        if grant_alice {
+            policy
+                .assign_group("alice".into(), "writers".into())
+                .await?;
+            policy
+                .add_rule("writers".into(), "fs".into(), Action::Write)
+                .await?;
+            policy
+                .add_rule("writers".into(), "fs".into(), Action::Read)
+                .await?;
+            policy
+                .add_rule("writers".into(), "fs".into(), Action::Delete)
+                .await?;
+        }
+        let fs_path = std::env::temp_dir().join(format!(
+            "fs-route-store-{}-{}.redb",
+            std::process::id(),
+            URL_SAFE_NO_PAD.encode(rand::random::<[u8; 8]>())
+        ));
+        let _ = std::fs::remove_file(&fs_path);
+        let store = FsStore::open(&fs_path).await?;
+        let s3 = TestS3::new();
+        let engine = FsEngine::from_parts(store, s3.clone(), "test-bucket".into(), policy);
+        Ok(Fixture {
+            server,
+            enc,
+            engine,
+            s3,
+        })
+    }
+    #[actix_web::test]
+    async fn unauthenticated_is_401() -> anyhow::Result<()> {
+        let fx = fixture(true).await?;
+        let mw = JwtClaimsMiddleware::<Claims>::new_with_jks(
+            &format!("{}/jwks", fx.server.uri()),
+            AUD,
+            &fx.issuer(),
+        )
+        .await?;
+        let module = FsApiModule::new(fx.engine.clone(), mw);
+        let app = test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let res = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/fs/uploads")
+                .set_json(json!({"file_size": 1024, "part_size": 1024, "file_total_parts": 1}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::UNAUTHORIZED);
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn forbidden_without_policy() -> anyhow::Result<()> {
+        let fx = fixture(false).await?; // alice has no grant
+        let mw = JwtClaimsMiddleware::<Claims>::new_with_jks(
+            &format!("{}/jwks", fx.server.uri()),
+            AUD,
+            &fx.issuer(),
+        )
+        .await?;
+        let module = FsApiModule::new(fx.engine.clone(), mw);
+        let app = test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let res = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/fs/uploads")
+                .insert_header(("Cookie", format!("auth_token={}", fx.token("alice")?)))
+                .set_json(json!({"file_size": 1024, "part_size": 1024, "file_total_parts": 1}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::FORBIDDEN);
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn init_upload_validation_rejects_bad_body() -> anyhow::Result<()> {
+        let fx = fixture(true).await?;
+        let mw = JwtClaimsMiddleware::<Claims>::new_with_jks(
+            &format!("{}/jwks", fx.server.uri()),
+            AUD,
+            &fx.issuer(),
+        )
+        .await?;
+        let module = FsApiModule::new(fx.engine.clone(), mw);
+        let app = test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let res = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/fs/uploads")
+                .insert_header(("Cookie", format!("auth_token={}", fx.token("alice")?)))
+                .set_json(json!({"file_size": 0, "part_size": 1024, "file_total_parts": 1}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::BAD_REQUEST);
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn full_single_part_flow_via_http() -> anyhow::Result<()> {
+        let fx = fixture(true).await?;
+        let mw = JwtClaimsMiddleware::<Claims>::new_with_jks(
+            &format!("{}/jwks", fx.server.uri()),
+            AUD,
+            &fx.issuer(),
+        )
+        .await?;
+        let module = FsApiModule::new(fx.engine.clone(), mw);
+        let app = test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+        // init
+        let res = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/fs/uploads")
+                .insert_header(("Cookie", format!("auth_token={token}")))
+                .set_json(json!({"file_size": 1024, "part_size": 1024, "file_total_parts": 1}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::CREATED);
+        let body: serde_json::Value = test::read_body_json(res).await;
+        let file_id = body["file_id"].as_str().unwrap().to_string();
+        // upload part with x-checksum-sha256 header
+        let res = test::call_service(
+            &app,
+            test::TestRequest::put()
+                .uri(&format!("/fs/uploads/{file_id}/parts/0"))
+                .insert_header(("Cookie", format!("auth_token={token}")))
+                .insert_header(("x-checksum-sha256", "abc123="))
+                .set_payload(vec![1u8; 1024])
+                .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::NO_CONTENT);
+        assert_eq!(fx.s3.last_checksum.lock().await.as_deref(), Some("abc123="));
+        // progress
+        let res = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri(&format!("/fs/uploads/{file_id}"))
+                .insert_header(("Cookie", format!("auth_token={token}")))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let prog: serde_json::Value = test::read_body_json(res).await;
+        assert_eq!(prog["uploaded_parts"], json!([0]));
+        // complete
+        let res = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!("/fs/uploads/{file_id}/complete"))
+                .insert_header(("Cookie", format!("auth_token={token}")))
+                .set_json(json!({"name":"hello.txt","mimetype":"text/plain"}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        // get metadata
+        let res = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri(&format!("/fs/files/{file_id}/meta"))
+                .insert_header(("Cookie", format!("auth_token={token}")))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let meta: serde_json::Value = test::read_body_json(res).await;
+        assert_eq!(meta["name"], "hello.txt");
+        // get file body + headers
+        let res = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri(&format!("/fs/files/{file_id}"))
+                .insert_header(("Cookie", format!("auth_token={token}")))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        assert_eq!(res.headers().get("content-type").unwrap(), "text/plain");
+        assert!(
+            res.headers()
+                .get("content-disposition")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("hello.txt")
+        );
+        let body = test::read_body(res).await;
+        assert_eq!(body.len(), 1024);
+        // delete file
+        let res = test::call_service(
+            &app,
+            test::TestRequest::delete()
+                .uri(&format!("/fs/files/{file_id}"))
+                .insert_header(("Cookie", format!("auth_token={token}")))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::NO_CONTENT);
+        // multi-part cancel path also
+        let res = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/fs/uploads")
+                .insert_header(("Cookie", format!("auth_token={token}")))
+                .set_json(json!({"file_size": 524288, "part_size": 262144, "file_total_parts": 2}))
+                .to_request(),
+        )
+        .await;
+        let body: serde_json::Value = test::read_body_json(res).await;
+        let file_id2 = body["file_id"].as_str().unwrap().to_string();
+        let res = test::call_service(
+            &app,
+            test::TestRequest::delete()
+                .uri(&format!("/fs/uploads/{file_id2}"))
+                .insert_header(("Cookie", format!("auth_token={token}")))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::NO_CONTENT);
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn checksum_alias_header_forwarded() -> anyhow::Result<()> {
+        let fx = fixture(true).await?;
+        let mw = JwtClaimsMiddleware::<Claims>::new_with_jks(
+            &format!("{}/jwks", fx.server.uri()),
+            AUD,
+            &fx.issuer(),
+        )
+        .await?;
+        let module = FsApiModule::new(fx.engine.clone(), mw);
+        let app = test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+        let res = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/fs/uploads")
+                .insert_header(("Cookie", format!("auth_token={token}")))
+                .set_json(json!({"file_size": 1024, "part_size": 1024, "file_total_parts": 1}))
+                .to_request(),
+        )
+        .await;
+        let body: serde_json::Value = test::read_body_json(res).await;
+        let file_id = body["file_id"].as_str().unwrap();
+        // use legacy alias checksum-sha256
+        let res = test::call_service(
+            &app,
+            test::TestRequest::put()
+                .uri(&format!("/fs/uploads/{file_id}/parts/0"))
+                .insert_header(("Cookie", format!("auth_token={token}")))
+                .insert_header(("checksum-sha256", "alias123="))
+                .set_payload(vec![2u8; 1024])
+                .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::NO_CONTENT);
+        assert_eq!(
+            fx.s3.last_checksum.lock().await.as_deref(),
+            Some("alias123=")
+        );
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn complete_validates_body_and_requires_all_parts() -> anyhow::Result<()> {
+        let fx = fixture(true).await?;
+        let mw = JwtClaimsMiddleware::<Claims>::new_with_jks(
+            &format!("{}/jwks", fx.server.uri()),
+            AUD,
+            &fx.issuer(),
+        )
+        .await?;
+        let module = FsApiModule::new(fx.engine.clone(), mw);
+        let app = test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+        let res = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/fs/uploads")
+                .insert_header(("Cookie", format!("auth_token={token}")))
+                .set_json(json!({"file_size": 524288, "part_size": 262144, "file_total_parts": 2}))
+                .to_request(),
+        )
+        .await;
+        let body: serde_json::Value = test::read_body_json(res).await;
+        let file_id = body["file_id"].as_str().unwrap();
+        // empty name -> 400
+        let res = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!("/fs/uploads/{file_id}/complete"))
+                .insert_header(("Cookie", format!("auth_token={token}")))
+                .set_json(json!({"name":"","mimetype":"text/plain"}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::BAD_REQUEST);
+        // not all parts uploaded -> 400
+        let res = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!("/fs/uploads/{file_id}/complete"))
+                .insert_header(("Cookie", format!("auth_token={token}")))
+                .set_json(json!({"name":"f","mimetype":"text/plain"}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::BAD_REQUEST);
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn multipart_http_flow_with_two_parts() -> anyhow::Result<()> {
+        let fx = fixture(true).await?;
+        let mw = JwtClaimsMiddleware::<Claims>::new_with_jks(
+            &format!("{}/jwks", fx.server.uri()),
+            AUD,
+            &fx.issuer(),
+        )
+        .await?;
+        let module = FsApiModule::new(fx.engine.clone(), mw);
+        let app = test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+        let res = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/fs/uploads")
+                .insert_header(("Cookie", format!("auth_token={token}")))
+                .set_json(json!({"file_size": 524288, "part_size": 262144, "file_total_parts": 2}))
+                .to_request(),
+        )
+        .await;
+        let body: serde_json::Value = test::read_body_json(res).await;
+        let file_id = body["file_id"].as_str().unwrap();
+        for idx in 0..2 {
+            let res = test::call_service(
+                &app,
+                test::TestRequest::put()
+                    .uri(&format!("/fs/uploads/{file_id}/parts/{idx}"))
+                    .insert_header(("Cookie", format!("auth_token={token}")))
+                    .set_payload(vec![9u8; 262144])
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(res.status(), http::StatusCode::NO_CONTENT);
+        }
+        let res = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!("/fs/uploads/{file_id}/complete"))
+                .insert_header(("Cookie", format!("auth_token={token}")))
+                .set_json(json!({"name":"big.bin","mimetype":"application/octet-stream"}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let res = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri(&format!("/fs/files/{file_id}"))
+                .insert_header(("Cookie", format!("auth_token={token}")))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        assert_eq!(test::read_body(res).await.len(), 524288);
+        Ok(())
+    }
+}
