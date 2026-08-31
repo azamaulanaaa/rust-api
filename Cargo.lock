@@ -2794,14 +2794,13 @@ checksum = "1a80800c0488c3a21695ea981a54918fbb37abf04f4d0720c453632255e2ff0e"
 
 [[package]]
 name = "oxkv"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0c3ea6a68ed3e0ac07880dc913b6a5c81e401eae0d1e60b156ec3888de3a5c10"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "console_error_panic_hook",
  "futures",
  "js-sys",
+ "opentelemetry",
  "pest",
  "pest_derive",
  "redb",
@@ -2813,6 +2812,8 @@ dependencies = [
  "thiserror 2.0.20",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "wasm-streams",
+ "web-sys",
 ]
 
 [[package]]
@@ -4766,6 +4767,19 @@ name = "wasm-bindgen-test-shared"
 version = "0.2.127"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "33ff1c1b360982e93b6d8ea9c04836f71dba0817a16f91e229cf3a51bdd9d987"
+
+[[package]]
+name = "wasm-streams"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e7d3be8814f5ba5f074491a469eed3d73c273ffad955f25ed1635efac4b0d269"
+dependencies = [
+ "futures-util",
+ "js-sys",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+]
 
 [[package]]
 name = "web-sys"
