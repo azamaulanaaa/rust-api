@@ -107,6 +107,9 @@ impl S3Client for RealS3Client {
         body: Bytes,
         checksum_sha256: Option<String>,
     ) -> Result<String, FsError> {
+        if part_number < 1 {
+            return Err(FsError::BadRequest("part_number must be >= 1".into()));
+        }
         let mut req = self
             .client
             .upload_part()
@@ -114,7 +117,7 @@ impl S3Client for RealS3Client {
             .key(key)
             .upload_id(upload_id)
             .part_number(part_number)
-            .body(ByteStream::from(body.to_vec()));
+            .body(ByteStream::from(body));
         if let Some(cs) = checksum_sha256 {
             req = req.checksum_sha256(cs);
         }
@@ -134,6 +137,9 @@ impl S3Client for RealS3Client {
         upload_id: &str,
         etags: Vec<String>,
     ) -> Result<(), FsError> {
+        if etags.is_empty() {
+            return Err(FsError::BadRequest("etags cannot be empty".into()));
+        }
         let parts = etags
             .into_iter()
             .enumerate()
@@ -189,7 +195,7 @@ impl S3Client for RealS3Client {
             .put_object()
             .bucket(bucket)
             .key(key)
-            .body(ByteStream::from(body.to_vec()));
+            .body(ByteStream::from(body));
         if let Some(ct) = content_type {
             req = req.content_type(ct);
         }
@@ -210,7 +216,17 @@ impl S3Client for RealS3Client {
             .key(key)
             .send()
             .await
-            .map_err(|e| FsError::Internal(format!("get_object: {e}")))?;
+            .map_err(|e| {
+                let msg = e.to_string();
+                if msg.contains("NoSuchKey")
+                    || msg.contains("NoSuchBucket")
+                    || msg.contains("NotFound")
+                {
+                    FsError::NotFound(format!("object not found: {bucket}/{key}"))
+                } else {
+                    FsError::Internal(format!("get_object: {e}"))
+                }
+            })?;
         let data = out
             .body
             .collect()
@@ -258,30 +274,24 @@ pub async fn build_s3_client(config: &S3ClientConfig) -> Arc<dyn S3Client> {
         loader = loader.endpoint_url(endpoint);
     }
     let sdk_config = loader.load().await;
-    // inject static credentials when provided (otherwise use env/instance chain)
+    let has_custom_s3_config = config.access_key_id.is_some() || config.force_path_style;
+    let mut s3_builder = aws_sdk_s3::config::Builder::from(&sdk_config);
     if let (Some(ak), Some(sk)) = (
         config.access_key_id.clone(),
         config.secret_access_key.clone(),
     ) {
         let creds = aws_sdk_s3::config::Credentials::new(ak, sk, None, None, "static");
-        let mut s3_conf =
-            aws_sdk_s3::config::Builder::from(&sdk_config).credentials_provider(creds);
-        if config.force_path_style {
-            s3_conf = s3_conf.force_path_style(true);
-        }
-        let s3_config = s3_conf.build();
-        let client = aws_sdk_s3::Client::from_conf(s3_config);
-        return Arc::new(RealS3Client { client });
+        s3_builder = s3_builder.credentials_provider(creds);
     }
-    // path-style without static creds
     if config.force_path_style {
-        let s3_conf = aws_sdk_s3::config::Builder::from(&sdk_config)
-            .force_path_style(true)
-            .build();
-        let client = aws_sdk_s3::Client::from_conf(s3_conf);
-        return Arc::new(RealS3Client { client });
+        s3_builder = s3_builder.force_path_style(true);
     }
-    let client = aws_sdk_s3::Client::new(&sdk_config);
+    let client = if has_custom_s3_config {
+        let s3_config = s3_builder.build();
+        aws_sdk_s3::Client::from_conf(s3_config)
+    } else {
+        aws_sdk_s3::Client::new(&sdk_config)
+    };
     Arc::new(RealS3Client { client })
 }
 
