@@ -8,10 +8,10 @@
 //! traces can be continued across service boundaries.
 
 use anyhow::Context;
-use opentelemetry::{
-    global,
-    trace::TracerProvider as _, // trait method: provider.tracer(name)
-};
+use opentelemetry::global;
+#[cfg(any(feature = "otlp-grpc", feature = "otlp-http"))]
+use opentelemetry::trace::TracerProvider as _; // trait method: provider.tracer(name)
+#[cfg(any(feature = "otlp-grpc", feature = "otlp-http"))]
 use opentelemetry_otlp::{MetricExporter, SpanExporter, WithExportConfig};
 use opentelemetry_sdk::{
     Resource,
@@ -109,57 +109,88 @@ pub fn init(
 
     match otlp_endpoint {
         Some(endpoint) => {
-            let exporter = SpanExporter::builder()
-                .with_tonic()
-                .with_endpoint(endpoint)
-                .build()
-                .map_err(|e| anyhow::anyhow!("OTLP span exporter build failed: {e}"))
-                .context("telemetry initialization")?;
+            #[cfg(not(any(feature = "otlp-grpc", feature = "otlp-http")))]
+            {
+                tracing::warn!(
+                    "OTLP endpoint {endpoint} configured but no otlp-* feature enabled; tracing without export"
+                );
+                tracing_subscriber::registry()
+                    .with(env_filter)
+                    .with(fmt_layer)
+                    .try_init()
+                    .map_err(|e| anyhow::anyhow!("failed to install tracing subscriber: {e}"))
+                    .context("telemetry initialization")?;
+                return Ok(Telemetry {
+                    tracer_provider: None,
+                    meter_provider: None,
+                });
+            }
+            #[cfg(any(feature = "otlp-grpc", feature = "otlp-http"))]
+            {
+                #[cfg(feature = "otlp-grpc")]
+                let exporter = SpanExporter::builder()
+                    .with_tonic()
+                    .with_endpoint(endpoint)
+                    .build()
+                    .map_err(|e| anyhow::anyhow!("OTLP span exporter build failed: {e}"))
+                    .context("telemetry initialization")?;
+                #[cfg(all(feature = "otlp-http", not(feature = "otlp-grpc")))]
+                let exporter = SpanExporter::builder()
+                    .with_http()
+                    .with_endpoint(endpoint)
+                    .build()
+                    .map_err(|e| anyhow::anyhow!("OTLP span exporter build failed: {e}"))
+                    .context("telemetry initialization")?;
 
-            let resource = Resource::builder()
-                .with_service_name(service_name.to_string())
-                .build();
+                let resource = Resource::builder()
+                    .with_service_name(service_name.to_string())
+                    .build();
 
-            let provider = SdkTracerProvider::builder()
-                .with_resource(resource.clone())
-                .with_batch_exporter(exporter)
-                // Root spans sample by trace-ID ratio; child spans follow
-                // their parent's decision.
-                .with_sampler(Sampler::ParentBased(Box::new(Sampler::TraceIdRatioBased(
-                    sample_ratio.clamp(0.0, 1.0),
-                ))))
-                .build();
+                let provider = SdkTracerProvider::builder()
+                    .with_resource(resource.clone())
+                    .with_batch_exporter(exporter)
+                    .with_sampler(Sampler::ParentBased(Box::new(Sampler::TraceIdRatioBased(
+                        sample_ratio.clamp(0.0, 1.0),
+                    ))))
+                    .build();
 
-            // Metrics share the OTLP endpoint; the periodic reader collects
-            // every 60s by default and on shutdown.
-            let metric_exporter = MetricExporter::builder()
-                .with_tonic()
-                .with_endpoint(endpoint)
-                .build()
-                .map_err(|e| anyhow::anyhow!("OTLP metric exporter build failed: {e}"))
-                .context("telemetry initialization")?;
-            let reader =
-                opentelemetry_sdk::metrics::PeriodicReader::builder(metric_exporter).build();
-            let meter_provider = SdkMeterProvider::builder()
-                .with_resource(resource)
-                .with_reader(reader)
-                .build();
-            global::set_meter_provider(meter_provider.clone());
+                #[cfg(feature = "otlp-grpc")]
+                let metric_exporter = MetricExporter::builder()
+                    .with_tonic()
+                    .with_endpoint(endpoint)
+                    .build()
+                    .map_err(|e| anyhow::anyhow!("OTLP metric exporter build failed: {e}"))
+                    .context("telemetry initialization")?;
+                #[cfg(all(feature = "otlp-http", not(feature = "otlp-grpc")))]
+                let metric_exporter = MetricExporter::builder()
+                    .with_http()
+                    .with_endpoint(endpoint)
+                    .build()
+                    .map_err(|e| anyhow::anyhow!("OTLP metric exporter build failed: {e}"))
+                    .context("telemetry initialization")?;
+                let reader =
+                    opentelemetry_sdk::metrics::PeriodicReader::builder(metric_exporter).build();
+                let meter_provider = SdkMeterProvider::builder()
+                    .with_resource(resource)
+                    .with_reader(reader)
+                    .build();
+                global::set_meter_provider(meter_provider.clone());
 
-            let tracer = provider.tracer("rust-api");
+                let tracer = provider.tracer("rust-api");
 
-            tracing_subscriber::registry()
-                .with(env_filter)
-                .with(fmt_layer)
-                .with(tracing_opentelemetry::layer().with_tracer(tracer))
-                .try_init()
-                .map_err(|e| anyhow::anyhow!("failed to install tracing subscriber: {e}"))
-                .context("telemetry initialization")?;
+                tracing_subscriber::registry()
+                    .with(env_filter)
+                    .with(fmt_layer)
+                    .with(tracing_opentelemetry::layer().with_tracer(tracer))
+                    .try_init()
+                    .map_err(|e| anyhow::anyhow!("failed to install tracing subscriber: {e}"))
+                    .context("telemetry initialization")?;
 
-            Ok(Telemetry {
-                tracer_provider: Some(provider),
-                meter_provider: Some(meter_provider),
-            })
+                Ok(Telemetry {
+                    tracer_provider: Some(provider),
+                    meter_provider: Some(meter_provider),
+                })
+            }
         }
         None => {
             tracing_subscriber::registry()
