@@ -9,6 +9,10 @@ The crate is intentionally business-logic free: applications compose `ApiModule`
 - **OIDC authentication** — authorization-code flow with PKCE, CSRF state, and nonce validation against any spec-compliant identity provider (Keycloak, Entra ID, Auth0, …)
 - **JWT validation via JWKS** — refreshable multi-algorithm key store with rotation support; unknown `kid` triggers a debounced re-fetch of the provider's keys
 - **Casbin RBAC on an embedded oxkv database** — permission rules and group membership management backed by a transactional key-value store persisted to a single file; no external database server required
+- **Modular row-level authorization** — business rows authorize as `{type}:{id}` objects via `policy::row::RowAuthorizer`; files delegate to owning rows instead of a coarse `fs` gate
+- **Temp per-user file scope with refcount relations** — uploads start as temp owned by `owner_sub` (`refs==0`), `attach`/`detach` to rows via `fs:rel:{type}:{id}:{file}` increments/decrements refcount; editing a row swaps relations, never deletes the underlying S3 object immediately
+- **Capability tokens** — short-lived HMAC JWT (`fs/token.rs`, 5m) minted after row authorization, verified on file ops without extra policy hits
+- **GC for orphans** — hourly sweeper removes abandoned upload sessions and temp/orphaned files (`refs==0` and `age>24h` or `orphan_since>24h`)
 - **Modular composition** — implement the `ApiModule` trait and register onto `ApiService`; auth middleware is applied per module scope
 - **Observability** — structured console logging through the `tracing` facade (`RUST_LOG` syntax), plus optional OpenTelemetry span export over OTLP/gRPC with W3C Trace Context propagation
 
@@ -30,14 +34,14 @@ The crate is intentionally business-logic free: applications compose `ApiModule`
 | POST | `/policy/groups` | Assign a user to a group | Bearer token |
 | DELETE | `/policy/groups/{group_name}/users/{user_id}` | Remove a user from a group | Bearer token |
 | GET | `/policy/users` | List all subjects with their groups | Bearer token |
-| POST | `/fs/uploads` | Start a multipart upload | Bearer token |
-| PUT | `/fs/uploads/{id}/parts/{idx}` | Upload one part (raw bytes) | Bearer token |
+| POST | `/fs/uploads` | Start a multipart upload (temp, owned by caller) | Bearer token |
+| PUT | `/fs/uploads/{id}/parts/{idx}` | Upload one part (raw bytes, owner only) | Bearer token |
 | POST | `/fs/uploads/{id}/complete` | Complete the upload (assembles parts in S3) | Bearer token |
-| DELETE | `/fs/uploads/{id}` | Cancel an in-progress upload | Bearer token |
-| GET | `/fs/uploads/{id}` | Upload progress | Bearer token |
-| GET | `/fs/files/{id}/meta` | File metadata | Bearer token |
-| GET | `/fs/files/{id}` | Download file content | Bearer token |
-| DELETE | `/fs/files/{id}` | Delete file | Bearer token |
+| DELETE | `/fs/uploads/{id}` | Cancel an in-progress upload (owner only) | Bearer token |
+| GET | `/fs/uploads/{id}` | Upload progress (owner only) | Bearer token |
+| GET | `/fs/files/{id}/meta` | File metadata (owner or row Read) | Bearer token |
+| GET | `/fs/files/{id}` | Download file content (owner or row Read) | Bearer token |
+| DELETE | `/fs/files/{id}` | Delete file (owner when temp, or row Delete) | Bearer token |
 
 Protected routes accept either an explicit `Authorization: Bearer <token>` header (preferred) or the session cookie set by `/auth/callback`. Requests without valid credentials get `401`; insufficient permissions get `403`. All errors use a uniform JSON envelope: `{"error": "<message>"}`.
 
@@ -60,7 +64,16 @@ src/
 │   └── middleware/      bearer_token, jwt (JWKS-backed claims), request_tracing
 ├── oidc/                OIDC client: /auth/login + /auth/callback (code flow, PKCE)
 ├── policy/              Casbin engine, oxkv adapter + validator, management routes
-└── fs/                  Object-store file storage (AmazonS3/MinIO/R2 via object_store, InMemory for tests): /fs/uploads/* and /fs/files/*
+│   ├── row.rs           RowAuthorizer trait for {type}:{id} objects
+│   └── ...              adapter, admin, route, setup
+└── fs/                  Object-store file storage (AmazonS3/MinIO/R2 via object_store, InMemory for tests)
+    ├── mod.rs           FsEngine (temp per-user, row delegation, token mint/verify)
+    ├── relation.rs      RefInfo + fs:rel:{type}:{id}:{file} + fs:files:{id}:refs
+    ├── token.rs         FsClaims HMAC JWT (5m)
+    ├── store.rs         oxkv persistence for sessions/files/relations
+    ├── gc.rs            hourly sweep for sessions + orphaned files (refs==0, 24h TTL)
+    ├── s3.rs            S3 client
+    └── route.rs         /fs/uploads/* and /fs/files/* handlers
 ```
 
 Modules implement [`ApiModule`](src/http/mod.rs) and are registered onto `ApiService`; each module brings its own middleware stack (e.g. `/policy/*` requires validated JWT claims).
@@ -78,6 +91,16 @@ m = g(r.sub, p.sub) && r.obj == p.obj && r.act == p.act
 A request is authorized when its subject either holds a matching `p`-rule directly or belongs to a group (`g`-link) that does. Typical setup: grant permissions to *groups* via `POST /policy/rules`, then manage membership via the `/policy/groups` endpoints.
 
 Rules persist to the embedded [oxkv](https://docs.rs/oxkv) store (`[database].path`) as one key-value pair per rule, written transactionally. An oxkv validation hook rejects malformed writes at the API boundary — wrong-arity rules, non-JSON payloads, or unknown sections fail immediately instead of sitting in storage until they poison startup.
+
+### Row-level and file delegation
+
+Business rows authorize as `{row_type}:{row_id}` via `RowAuthorizer` (`policy/row.rs`). Files are not gated by a coarse `fs` object; instead:
+
+- `POST /fs/uploads` creates a temp file owned by `owner_sub` (`refs==0`).
+- `FsEngine::attach(row_type,row_id,file_id,caller)` requires `Write` on `{row_type}:{row_id}` and increments `fs:files:{id}:refs`.
+- `FsEngine::detach` decrements and sets `orphan_since` when `refs==0`.
+- Reads/deletes check `owner_sub == caller` (temp) or any owning row grants `Read`/`Delete`. Editing a row is `detach(old)+create new+attach(new)` — the old S3 object becomes orphan and is removed by GC after 24h.
+- After row authorization, a short-lived HMAC token (`fs/token.rs`) can be minted for direct `PUT`/`GET` without extra policy hits.
 
 ## Configuration
 
@@ -167,7 +190,7 @@ Handlers can extract validated JWT claims via the `Validated<C>` extractor (retu
 
 ```bash
 mise exec -- cargo test                 # run tests (wiremock-based integration tests included)
-mise exec -- cargo clippy --all-targets # lint
+mise exec -- cargo clippy --all-targets # lint (all targets, -D warnings)
 mise exec -- cargo doc --no-deps        # generate docs
 mise exec -- cargo deny check licenses  # verify dependency licenses stay compatible
 ```
