@@ -3,9 +3,12 @@ rust = { version = "stable", components = "rust-analyzer" }
 zig = "latest"
 "cargo:cargo-zigbuild" = "latest"
 "cargo:cargo-llvm-cov" = "latest"
+"cargo:cargo-deny" = "latest"
 
 [tasks]
 build = { run = "cargo-zigbuild build" }
 run = { run = "cargo-zigbuild run" }
 test = { run = "cargo-zigbuild test" }
 cov = { run = "cargo-zigbuild llvm-cov" }
+licenses = { run = "cargo-zigbuild deny check licenses" }
+advisories = { run = "cargo-zigbuild deny check advisories" }
