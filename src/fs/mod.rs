@@ -413,7 +413,6 @@ impl FsEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
 
     use crate::fs::object_store::ObjectStoreClient;
     use crate::policy::{Action, PolicyEngine};
