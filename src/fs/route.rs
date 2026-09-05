@@ -261,8 +261,8 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn forbidden_without_policy() -> anyhow::Result<()> {
-        let fx = fixture(false).await?; // alice has no grant
+    async fn temp_upload_allowed_without_policy() -> anyhow::Result<()> {
+        let fx = fixture(false).await?; // no fs policy needed for temp uploads
         let mw = JwtClaimsMiddleware::<Claims>::new_with_jks(
             &format!("{}/jwks", fx.server.uri()),
             AUD,
@@ -280,7 +280,7 @@ mod tests {
                 .to_request(),
         )
         .await;
-        assert_eq!(res.status(), http::StatusCode::FORBIDDEN);
+        assert_eq!(res.status(), http::StatusCode::CREATED);
         Ok(())
     }
 
