@@ -95,7 +95,10 @@ pub struct DatabaseConfig {
     pub path: String,
 }
 
-/// S3-compatible object storage settings.
+/// Object-store settings (AmazonS3 via object_store; InMemory for tests).
+///
+/// Backed by `object_store::aws::AmazonS3` for S3-compatible providers
+/// (AWS, MinIO, R2) and `object_store::memory::InMemory` in tests.
 #[derive(Deserialize, Debug, Clone)]
 pub struct S3Config {
     /// S3 bucket name.

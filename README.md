@@ -60,7 +60,7 @@ src/
 │   └── middleware/      bearer_token, jwt (JWKS-backed claims), request_tracing
 ├── oidc/                OIDC client: /auth/login + /auth/callback (code flow, PKCE)
 ├── policy/              Casbin engine, oxkv adapter + validator, management routes
-└── fs/                  S3-backed file storage: /fs/uploads/* and /fs/files/*
+└── fs/                  Object-store file storage (AmazonS3/MinIO/R2 via object_store, InMemory for tests): /fs/uploads/* and /fs/files/*
 ```
 
 Modules implement [`ApiModule`](src/http/mod.rs) and are registered onto `ApiService`; each module brings its own middleware stack (e.g. `/policy/*` requires validated JWT claims).
@@ -94,6 +94,14 @@ issuer_url = "https://idp.example.com"      # base URL of the OIDC discovery doc
 
 [database]
 path = "data/rust-api.redb"                 # embedded oxkv policy store (created if missing)
+
+[s3]
+bucket = "my-bucket"                          # S3 bucket (AmazonS3 via object_store; InMemory for tests)
+region = "us-east-1"
+# endpoint_url = "http://localhost:9000"      # MinIO/R2 endpoint; omit for AWS
+# force_path_style = true                       # required for MinIO
+# access_key_id = "minioadmin"
+# secret_access_key = "minioadmin"
 
 # Optional — omit the whole section to disable span export.
 [observability]

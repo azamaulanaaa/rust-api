@@ -21,8 +21,9 @@ pub mod oidc;
 /// for permission rules and group membership.
 pub mod policy;
 
-/// S3-backed file storage with chunked upload support, mirroring the
-/// IndexedDB worker FS API (`src/worker/fs/index.ts`) over REST.
+/// Object-store file storage via `object_store` (AmazonS3 for S3/MinIO/R2,
+/// InMemory for tests) with chunked upload, mirroring the IndexedDB
+/// worker FS API (`src/worker/fs/index.ts`) over REST.
 pub mod fs;
 
 /// OpenAPI specification composed from all `utoipa::path` modules.
