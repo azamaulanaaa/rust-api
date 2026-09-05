@@ -37,6 +37,7 @@ openidconnect = { version = "4.0.1", default-features = false, features = ["reqw
 
 aws-config = { version = "1.8", default-features = false, features = ["rt-tokio", "rustls", "credentials-process", "sso"] }
 aws-sdk-s3 = { version = "1.117", default-features = false, features = ["rt-tokio", "rustls", "http-1x", "default-https-client"] }
+object_store = { version = "0.14", default-features = false, features = ["aws"] }
 oxkv = { version = "0.3", features = ["otel"] }
 
 opentelemetry = "0.32.0"
