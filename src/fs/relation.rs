@@ -39,7 +39,10 @@ mod tests {
 
     #[test]
     fn keys_are_distinct() {
-        assert_eq!(rel_key("invoice", "123", "file1"), "fs:rel:invoice:123:file1");
+        assert_eq!(
+            rel_key("invoice", "123", "file1"),
+            "fs:rel:invoice:123:file1"
+        );
         assert_eq!(refs_key("file1"), "fs:files:file1:refs");
         assert_eq!(rel_prefix_for_row("invoice", "123"), "fs:rel:invoice:123:");
         assert_ne!(rel_key("a", "b", "c"), refs_key("c"));

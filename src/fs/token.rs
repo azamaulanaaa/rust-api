@@ -3,7 +3,7 @@
 //! Minted after row authorization; verified on `PUT`/`GET` without
 //! additional policy checks. Short-lived (5m) HMAC.
 
-use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
+use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
 
 use crate::fs::error::FsError;
