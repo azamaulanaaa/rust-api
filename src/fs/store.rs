@@ -182,13 +182,15 @@ impl FsStore {
         Ok(Some(r))
     }
 
-    /// Deletes a finalized file record.
+    /// Deletes a finalized file record and its ref-count entry.
     pub async fn delete_file(&self, id: &str) -> Result<(), FsError> {
         let key = Self::file_key(id);
+        let refs = refs_key(id);
         let mut g = self.inner.write().await;
         g.delete(&key)
             .await
             .map_err(|e| FsError::Store(e.to_string()))?;
+        let _ = g.delete(&refs).await;
         Ok(())
     }
 

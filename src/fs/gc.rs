@@ -1,17 +1,18 @@
-//! GC/TTL sweeper for abandoned multipart uploads.
-//! Expires sessions older than 24h, aborts S3 multipart and cleans oxkv.
+//! GC for abandoned uploads and orphaned files.
+//!
+//! Sessions and temp/orphaned files older than 24h are removed.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::time::interval;
 
-use crate::fs::{FsEngine, store::UploadSession};
+use crate::fs::FsEngine;
 
-/// TTL for abandoned upload sessions.
+/// TTL for abandoned sessions and orphaned files.
 pub const TTL_SECS: i64 = 24 * 3600;
 
-/// Spawn background sweeper that runs every hour.
+/// Spawn sweeper that runs every hour.
 pub fn spawn(engine: Arc<FsEngine>) {
     tokio::spawn(async move {
         let mut ticker = interval(Duration::from_secs(3600));
@@ -24,54 +25,65 @@ pub fn spawn(engine: Arc<FsEngine>) {
     });
 }
 
-/// Single sweep: abort expired sessions.
-#[tracing::instrument(skip(engine), fields(cleaned), err)]
+/// Single sweep: sessions and orphaned files.
+#[tracing::instrument(skip(engine), err)]
 pub async fn sweep_once(engine: &FsEngine) -> Result<usize, crate::fs::error::FsError> {
     let now = chrono::Utc::now().timestamp();
-    let sessions = engine.store.list_sessions().await?;
-    let mut expired = Vec::new();
-    for s in sessions {
-        if now - s.created_at > TTL_SECS {
-            expired.push(s);
-        }
-    }
     let mut cleaned = 0;
-    for s in expired {
-        tracing::info!(
-            "fs gc expiring upload {} (age {}s)",
-            s.id,
-            now - s.created_at
-        );
-        // abort S3 side (no-op for single-part Put without uploadId)
+
+    // sessions
+    for s in engine.store.list_sessions().await? {
+        if now - s.created_at <= TTL_SECS {
+            continue;
+        }
+        tracing::info!("fs gc expiring upload {} (age {}s)", s.id, now - s.created_at);
         if let Some(upload_id) = s.s3_upload_id.as_deref() {
-            let res = engine
+            let _ = engine
                 .s3
                 .abort_multipart_upload(&engine.bucket, &s.s3_key, upload_id)
-                .await;
-            if let Err(e) = res {
-                tracing::warn!("gc abort {} failed: {e}", s.id);
-            }
+                .await
+                .map_err(|e| {
+                    tracing::warn!("gc abort {} failed: {e}", s.id);
+                    e
+                });
         } else {
-            // single-part PutObject was already done; best-effort delete orphan object
             let _ = engine.s3.delete_object(&engine.bucket, &s.s3_key).await;
         }
         engine.store.delete_session(&s.id).await?;
         cleaned += 1;
     }
+
+    // orphaned / temp files
+    for f in engine.store.list_files().await? {
+        let info = engine.store.get_ref_info(&f.id).await?;
+        if info.count != 0 {
+            continue;
+        }
+        let age = info.orphan_since.unwrap_or(f.created_at);
+        if now - age <= TTL_SECS {
+            continue;
+        }
+        tracing::info!("fs gc expiring file {} (age {}s)", f.id, now - age);
+        let _ = engine.s3.delete_object(&engine.bucket, &f.s3_key).await;
+        engine.store.delete_file(&f.id).await?;
+        cleaned += 1;
+    }
+
     if cleaned > 0 {
-        tracing::info!("fs gc cleaned {cleaned} expired uploads");
+        tracing::info!("fs gc cleaned {cleaned} items");
     }
     Ok(cleaned)
 }
 
-impl UploadSession {
-    /// For testing: check if expired.
+impl crate::fs::store::UploadSession {
+    /// Check if expired at `now`.
     pub fn is_expired(&self, now: i64) -> bool {
         now - self.created_at > TTL_SECS
     }
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use std::sync::Arc;
@@ -80,8 +92,8 @@ mod tests {
     use crate::fs::error::FsError;
     use crate::fs::object_store::ObjectStoreClient;
     use crate::fs::s3::S3Client;
-    use crate::fs::store::{FsStore, UploadSession};
-    use crate::policy::{Action, PolicyEngine};
+    use crate::fs::store::{FileRecord, FsStore, UploadSession};
+    use crate::policy::PolicyEngine;
     use bytes::Bytes;
 
     fn tmp_path(label: &str) -> std::path::PathBuf {
@@ -101,15 +113,6 @@ mod tests {
         let policy_path = tmp_path("policy");
         let _ = std::fs::remove_file(&policy_path);
         let policy = PolicyEngine::init(&policy_path).await.unwrap();
-        // grant so engine can be used if needed, though gc does not check policy
-        policy
-            .assign_group("alice".into(), "writers".into())
-            .await
-            .unwrap();
-        policy
-            .add_rule("writers".into(), "fs".into(), Action::Write)
-            .await
-            .unwrap();
         let s3 = ObjectStoreClient::in_memory();
         FsEngine::from_parts(store, s3, "test-bucket".into(), policy)
     }
@@ -148,24 +151,21 @@ mod tests {
             etags: vec![None],
             checksums: vec![None],
         };
-        assert!(!s.is_expired(now)); // exactly TTL not expired
+        assert!(!s.is_expired(now));
         assert!(s.is_expired(now + 1));
     }
 
     #[tokio::test]
     async fn sweep_cleans_only_expired() -> anyhow::Result<()> {
         let engine = make_engine().await;
-        // fresh (1h old) should stay
         engine
             .store
             .save_session(&session_with_age("fresh", 3600, true))
             .await?;
-        // expired multipart (25h)
         engine
             .store
             .save_session(&session_with_age("old-mp", TTL_SECS + 3600, true))
             .await?;
-        // expired single-part (no upload_id)
         engine
             .store
             .save_session(&session_with_age("old-single", TTL_SECS + 3600, false))
@@ -175,8 +175,40 @@ mod tests {
         assert!(engine.store.get_session("fresh").await?.is_some());
         assert!(engine.store.get_session("old-mp").await?.is_none());
         assert!(engine.store.get_session("old-single").await?.is_none());
-        // second sweep is idempotent
         assert_eq!(sweep_once(&engine).await?, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sweep_cleans_orphaned_files() -> anyhow::Result<()> {
+        let engine = make_engine().await;
+        // fresh temp file stays
+        let fresh = FileRecord {
+            id: "fresh-file".into(),
+            name: "a.txt".into(),
+            mimetype: "text/plain".into(),
+            size: 10,
+            s3_key: "files/fresh-file".into(),
+            owner_sub: "alice".into(),
+            created_at: chrono::Utc::now().timestamp() - 3600,
+        };
+        engine.store.save_file(&fresh).await?;
+        // old temp (never attached, refs 0, age > TTL)
+        let old = FileRecord {
+            id: "old-file".into(),
+            name: "b.txt".into(),
+            mimetype: "text/plain".into(),
+            size: 10,
+            s3_key: "files/old-file".into(),
+            owner_sub: "alice".into(),
+            created_at: chrono::Utc::now().timestamp() - TTL_SECS - 3600,
+        };
+        engine.store.save_file(&old).await?;
+        engine.s3.put_object("test-bucket", &old.s3_key, Bytes::from_static(b"data"), None, None).await?;
+        let cleaned = sweep_once(&engine).await?;
+        assert_eq!(cleaned, 1);
+        assert!(engine.store.get_file("fresh-file").await?.is_some());
+        assert!(engine.store.get_file("old-file").await?.is_none());
         Ok(())
     }
 
@@ -189,62 +221,16 @@ mod tests {
 
     #[tokio::test]
     async fn sweep_abort_failure_is_swallowed() -> anyhow::Result<()> {
-        // S3 that fails abort but sweep should still clean session and return count
         struct FailS3;
         #[async_trait::async_trait]
         impl S3Client for FailS3 {
-            async fn create_multipart_upload(
-                &self,
-                _: &str,
-                _: &str,
-                _: Option<String>,
-            ) -> Result<String, FsError> {
-                Ok("u".into())
-            }
-            async fn upload_part(
-                &self,
-                _: &str,
-                _: &str,
-                _: &str,
-                _: i32,
-                _: Bytes,
-                _: Option<String>,
-            ) -> Result<String, FsError> {
-                Ok("e".into())
-            }
-            async fn complete_multipart_upload(
-                &self,
-                _: &str,
-                _: &str,
-                _: &str,
-                _: Vec<String>,
-            ) -> Result<(), FsError> {
-                Ok(())
-            }
-            async fn abort_multipart_upload(
-                &self,
-                _: &str,
-                _: &str,
-                _: &str,
-            ) -> Result<(), FsError> {
-                Err(FsError::Internal("abort failed".into()))
-            }
-            async fn put_object(
-                &self,
-                _: &str,
-                _: &str,
-                _: Bytes,
-                _: Option<String>,
-                _: Option<String>,
-            ) -> Result<(), FsError> {
-                Ok(())
-            }
-            async fn get_object(&self, _: &str, _: &str) -> Result<Bytes, FsError> {
-                Err(FsError::NotFound("no".into()))
-            }
-            async fn delete_object(&self, _: &str, _: &str) -> Result<(), FsError> {
-                Ok(())
-            }
+            async fn create_multipart_upload(&self, _: &str, _: &str, _: Option<String>) -> Result<String, FsError> { Ok("u".into()) }
+            async fn upload_part(&self, _: &str, _: &str, _: &str, _: i32, _: Bytes, _: Option<String>) -> Result<String, FsError> { Ok("e".into()) }
+            async fn complete_multipart_upload(&self, _: &str, _: &str, _: &str, _: Vec<String>) -> Result<(), FsError> { Ok(()) }
+            async fn abort_multipart_upload(&self, _: &str, _: &str, _: &str) -> Result<(), FsError> { Err(FsError::Internal("abort failed".into())) }
+            async fn put_object(&self, _: &str, _: &str, _: Bytes, _: Option<String>, _: Option<String>) -> Result<(), FsError> { Ok(()) }
+            async fn get_object(&self, _: &str, _: &str) -> Result<Bytes, FsError> { Err(FsError::NotFound("no".into())) }
+            async fn delete_object(&self, _: &str, _: &str) -> Result<(), FsError> { Ok(()) }
         }
         let path = tmp_path("fail");
         let _ = std::fs::remove_file(&path);
@@ -253,10 +239,7 @@ mod tests {
         let _ = std::fs::remove_file(&policy_path);
         let policy = PolicyEngine::init(&policy_path).await?;
         let engine = FsEngine::from_parts(store, Arc::new(FailS3), "b".into(), policy);
-        engine
-            .store
-            .save_session(&session_with_age("old-fail", TTL_SECS + 10, true))
-            .await?;
+        engine.store.save_session(&session_with_age("old-fail", TTL_SECS + 10, true)).await?;
         let cleaned = sweep_once(&engine).await?;
         assert_eq!(cleaned, 1);
         assert!(engine.store.get_session("old-fail").await?.is_none());
