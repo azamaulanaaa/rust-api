@@ -29,11 +29,13 @@ struct MultipartState {
 
 /// Object-store backed [`S3Client`].
 ///
-/// `bucket` is retained for API compatibility but the path is just `key`;
-/// the underlying store is already scoped to a bucket via [`AmazonS3Builder`].
+/// `bucket` is retained for API compatibility. For `AmazonS3` the store
+/// is already scoped to a bucket so `key` alone is the path; for
+/// `InMemory` the bucket is prefixed to simulate isolation.
 pub struct ObjectStoreClient {
     store: Arc<dyn ObjectStore>,
     multiparts: Mutex<HashMap<String, MultipartState>>,
+    is_memory: bool,
 }
 
 impl ObjectStoreClient {
@@ -42,16 +44,25 @@ impl ObjectStoreClient {
         Self {
             store,
             multiparts: Mutex::new(HashMap::new()),
+            is_memory: false,
         }
     }
 
     /// Creates an in-memory client for unit tests.
     pub fn in_memory() -> Arc<dyn S3Client> {
-        Arc::new(Self::new(Arc::new(InMemory::new())))
+        Arc::new(Self {
+            store: Arc::new(InMemory::new()),
+            multiparts: Mutex::new(HashMap::new()),
+            is_memory: true,
+        })
     }
 
-    fn path(key: &str) -> ObjectPath {
-        ObjectPath::from(key)
+    fn path(&self, bucket: &str, key: &str) -> ObjectPath {
+        if self.is_memory {
+            ObjectPath::from(format!("{bucket}/{key}"))
+        } else {
+            ObjectPath::from(key)
+        }
     }
 
     fn map_err(e: object_store::Error) -> FsError {
@@ -145,7 +156,7 @@ impl S3Client for ObjectStoreClient {
         for (_, b) in state.parts {
             assembled.extend_from_slice(&b);
         }
-        let path = Self::path(key);
+        let path = self.path(bucket, key);
         let payload = object_store::PutPayload::from_bytes(Bytes::from(assembled));
         self.store
             .put(&path, payload)
@@ -172,13 +183,13 @@ impl S3Client for ObjectStoreClient {
 
     async fn put_object(
         &self,
-        _bucket: &str,
+        bucket: &str,
         key: &str,
         body: Bytes,
         _content_type: Option<String>,
         _checksum_sha256: Option<String>,
     ) -> Result<(), FsError> {
-        let path = Self::path(key);
+        let path = self.path(bucket, key);
         let payload = object_store::PutPayload::from_bytes(body);
         self.store
             .put(&path, payload)
@@ -187,8 +198,8 @@ impl S3Client for ObjectStoreClient {
         Ok(())
     }
 
-    async fn get_object(&self, _bucket: &str, key: &str) -> Result<Bytes, FsError> {
-        let path = Self::path(key);
+    async fn get_object(&self, bucket: &str, key: &str) -> Result<Bytes, FsError> {
+        let path = self.path(bucket, key);
         let res = self
             .store
             .get(&path)
@@ -198,8 +209,8 @@ impl S3Client for ObjectStoreClient {
         Ok(bytes)
     }
 
-    async fn delete_object(&self, _bucket: &str, key: &str) -> Result<(), FsError> {
-        let path = Self::path(key);
+    async fn delete_object(&self, bucket: &str, key: &str) -> Result<(), FsError> {
+        let path = self.path(bucket, key);
         match self.store.delete(&path).await {
             Ok(()) => Ok(()),
             Err(object_store::Error::NotFound { .. }) => Ok(()),
