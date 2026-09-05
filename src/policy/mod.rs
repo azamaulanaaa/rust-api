@@ -16,6 +16,9 @@ pub mod adapter;
 /// JSON export/import of policy data for backups and migrations.
 pub mod admin;
 
+/// Modular row-level authorization.
+pub mod row;
+
 /// The operation a policy rule grants on an object.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub enum Action {
