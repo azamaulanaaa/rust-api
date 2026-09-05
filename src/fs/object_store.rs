@@ -17,7 +17,9 @@ use object_store::ObjectStoreExt;
 use object_store::memory::InMemory;
 use object_store::multipart::{MultipartStore, PartId};
 use object_store::path::Path as ObjectPath;
-use object_store::{Attribute, Attributes, MultipartId, PutMultipartOptions, PutOptions, PutPayload};
+use object_store::{
+    Attribute, Attributes, MultipartId, PutMultipartOptions, PutOptions, PutPayload,
+};
 use tokio::sync::Mutex;
 
 use crate::fs::error::FsError;
@@ -99,10 +101,7 @@ impl ObjectStoreClient {
         }
     }
 
-    fn put_attrs(
-        content_type: Option<&str>,
-        checksum_sha256: Option<&str>,
-    ) -> Attributes {
+    fn put_attrs(content_type: Option<&str>, checksum_sha256: Option<&str>) -> Attributes {
         let mut attrs = Attributes::new();
         if let Some(ct) = content_type {
             attrs.insert(Attribute::ContentType, ct.to_string().into());
@@ -246,10 +245,7 @@ impl S3Client for ObjectStoreClient {
                 return Err(FsError::Internal("bucket/key mismatch".into()));
             }
             let state = states.remove(upload_id).unwrap();
-            let _ = self
-                .multipart
-                .abort_multipart(&state.path, &state.id)
-                .await;
+            let _ = self.multipart.abort_multipart(&state.path, &state.id).await;
         }
         Ok(())
     }
@@ -289,7 +285,10 @@ impl S3Client for ObjectStoreClient {
     async fn get_object(&self, bucket: &str, key: &str) -> Result<Bytes, FsError> {
         let path = self.path(bucket, key);
         let res = self.store.get(&path).await.map_err(Self::map_err)?;
-        let bytes = res.bytes().await.map_err(|e| FsError::Internal(e.to_string()))?;
+        let bytes = res
+            .bytes()
+            .await
+            .map_err(|e| FsError::Internal(e.to_string()))?;
         Ok(bytes)
     }
 
@@ -321,11 +320,11 @@ pub fn build_object_store(config: &S3ClientConfig) -> Arc<dyn S3Client> {
         }
     }
 
-    if let (Some(ak), Some(sk)) = (config.access_key_id.clone(), config.secret_access_key.clone())
-    {
-        builder = builder
-            .with_access_key_id(ak)
-            .with_secret_access_key(sk);
+    if let (Some(ak), Some(sk)) = (
+        config.access_key_id.clone(),
+        config.secret_access_key.clone(),
+    ) {
+        builder = builder.with_access_key_id(ak).with_secret_access_key(sk);
     }
 
     if config.force_path_style {
@@ -370,10 +369,24 @@ mod tests {
             .create_multipart_upload("b", "files/abc", None)
             .await?;
         let e1 = client
-            .upload_part("b", "files/abc", &upload_id, 1, Bytes::from_static(b"hello "), None)
+            .upload_part(
+                "b",
+                "files/abc",
+                &upload_id,
+                1,
+                Bytes::from_static(b"hello "),
+                None,
+            )
             .await?;
         let e2 = client
-            .upload_part("b", "files/abc", &upload_id, 2, Bytes::from_static(b"world"), None)
+            .upload_part(
+                "b",
+                "files/abc",
+                &upload_id,
+                2,
+                Bytes::from_static(b"world"),
+                None,
+            )
             .await?;
         client
             .complete_multipart_upload("b", "files/abc", &upload_id, vec![e1, e2])
@@ -394,7 +407,10 @@ mod tests {
         client
             .put_object("b", "k", Bytes::from_static(b"v2"), None, None)
             .await?;
-        assert_eq!(client.get_object("b", "k").await?, Bytes::from_static(b"v2"));
+        assert_eq!(
+            client.get_object("b", "k").await?,
+            Bytes::from_static(b"v2")
+        );
         client.delete_object("b", "k").await?;
         assert!(matches!(
             client.get_object("b", "k").await.unwrap_err(),

@@ -235,7 +235,11 @@ mod tests {
         let store = FsStore::open(&fs_path).await?;
         let s3 = ObjectStoreClient::in_memory();
         let engine = FsEngine::from_parts(store, s3, "test-bucket".into(), policy);
-        Ok(Fixture { server, enc, engine })
+        Ok(Fixture {
+            server,
+            enc,
+            engine,
+        })
     }
     #[actix_web::test]
     async fn unauthenticated_is_401() -> anyhow::Result<()> {

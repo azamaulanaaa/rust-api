@@ -210,12 +210,16 @@ impl FsStore {
     }
 
     /// Attaches a file to a row; idempotent.
-    pub async fn attach(&self, row_type: &str, row_id: &str, file_id: &str) -> Result<u32, FsError> {
+    pub async fn attach(
+        &self,
+        row_type: &str,
+        row_id: &str,
+        file_id: &str,
+    ) -> Result<u32, FsError> {
         let rel = rel_key(row_type, row_id, file_id);
         let refs = refs_key(file_id);
         let mut g = self.inner.write().await;
-        if g
-            .get_bytes(&rel)
+        if g.get_bytes(&rel)
             .await
             .map_err(|e| FsError::Store(e.to_string()))?
             .is_some()
@@ -237,12 +241,16 @@ impl FsStore {
     }
 
     /// Detaches a file from a row; idempotent.
-    pub async fn detach(&self, row_type: &str, row_id: &str, file_id: &str) -> Result<u32, FsError> {
+    pub async fn detach(
+        &self,
+        row_type: &str,
+        row_id: &str,
+        file_id: &str,
+    ) -> Result<u32, FsError> {
         let rel = rel_key(row_type, row_id, file_id);
         let refs = refs_key(file_id);
         let mut g = self.inner.write().await;
-        if g
-            .get_bytes(&rel)
+        if g.get_bytes(&rel)
             .await
             .map_err(|e| FsError::Store(e.to_string()))?
             .is_none()

@@ -36,7 +36,11 @@ pub async fn sweep_once(engine: &FsEngine) -> Result<usize, crate::fs::error::Fs
         if now - s.created_at <= TTL_SECS {
             continue;
         }
-        tracing::info!("fs gc expiring upload {} (age {}s)", s.id, now - s.created_at);
+        tracing::info!(
+            "fs gc expiring upload {} (age {}s)",
+            s.id,
+            now - s.created_at
+        );
         if let Some(upload_id) = s.s3_upload_id.as_deref() {
             let _ = engine
                 .s3
@@ -204,7 +208,16 @@ mod tests {
             created_at: chrono::Utc::now().timestamp() - TTL_SECS - 3600,
         };
         engine.store.save_file(&old).await?;
-        engine.s3.put_object("test-bucket", &old.s3_key, Bytes::from_static(b"data"), None, None).await?;
+        engine
+            .s3
+            .put_object(
+                "test-bucket",
+                &old.s3_key,
+                Bytes::from_static(b"data"),
+                None,
+                None,
+            )
+            .await?;
         let cleaned = sweep_once(&engine).await?;
         assert_eq!(cleaned, 1);
         assert!(engine.store.get_file("fresh-file").await?.is_some());
@@ -224,13 +237,58 @@ mod tests {
         struct FailS3;
         #[async_trait::async_trait]
         impl S3Client for FailS3 {
-            async fn create_multipart_upload(&self, _: &str, _: &str, _: Option<String>) -> Result<String, FsError> { Ok("u".into()) }
-            async fn upload_part(&self, _: &str, _: &str, _: &str, _: i32, _: Bytes, _: Option<String>) -> Result<String, FsError> { Ok("e".into()) }
-            async fn complete_multipart_upload(&self, _: &str, _: &str, _: &str, _: Vec<String>) -> Result<(), FsError> { Ok(()) }
-            async fn abort_multipart_upload(&self, _: &str, _: &str, _: &str) -> Result<(), FsError> { Err(FsError::Internal("abort failed".into())) }
-            async fn put_object(&self, _: &str, _: &str, _: Bytes, _: Option<String>, _: Option<String>) -> Result<(), FsError> { Ok(()) }
-            async fn get_object(&self, _: &str, _: &str) -> Result<Bytes, FsError> { Err(FsError::NotFound("no".into())) }
-            async fn delete_object(&self, _: &str, _: &str) -> Result<(), FsError> { Ok(()) }
+            async fn create_multipart_upload(
+                &self,
+                _: &str,
+                _: &str,
+                _: Option<String>,
+            ) -> Result<String, FsError> {
+                Ok("u".into())
+            }
+            async fn upload_part(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+                _: i32,
+                _: Bytes,
+                _: Option<String>,
+            ) -> Result<String, FsError> {
+                Ok("e".into())
+            }
+            async fn complete_multipart_upload(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+                _: Vec<String>,
+            ) -> Result<(), FsError> {
+                Ok(())
+            }
+            async fn abort_multipart_upload(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+            ) -> Result<(), FsError> {
+                Err(FsError::Internal("abort failed".into()))
+            }
+            async fn put_object(
+                &self,
+                _: &str,
+                _: &str,
+                _: Bytes,
+                _: Option<String>,
+                _: Option<String>,
+            ) -> Result<(), FsError> {
+                Ok(())
+            }
+            async fn get_object(&self, _: &str, _: &str) -> Result<Bytes, FsError> {
+                Err(FsError::NotFound("no".into()))
+            }
+            async fn delete_object(&self, _: &str, _: &str) -> Result<(), FsError> {
+                Ok(())
+            }
         }
         let path = tmp_path("fail");
         let _ = std::fs::remove_file(&path);
@@ -239,7 +297,10 @@ mod tests {
         let _ = std::fs::remove_file(&policy_path);
         let policy = PolicyEngine::init(&policy_path).await?;
         let engine = FsEngine::from_parts(store, Arc::new(FailS3), "b".into(), policy);
-        engine.store.save_session(&session_with_age("old-fail", TTL_SECS + 10, true)).await?;
+        engine
+            .store
+            .save_session(&session_with_age("old-fail", TTL_SECS + 10, true))
+            .await?;
         let cleaned = sweep_once(&engine).await?;
         assert_eq!(cleaned, 1);
         assert!(engine.store.get_session("old-fail").await?.is_none());

@@ -2,7 +2,10 @@
 
 use actix_web::{HttpResponse, Responder, get, web};
 
-use crate::http::{ApiModule, middleware::jwt::{Claims, JwtClaimsMiddleware, Validated}};
+use crate::http::{
+    ApiModule,
+    middleware::jwt::{Claims, JwtClaimsMiddleware, Validated},
+};
 use crate::sync::snapshot::SnapshotManager;
 
 /// Module exposing `GET /sync/clone`.
@@ -69,5 +72,7 @@ async fn replay(
     _sub: &str,
 ) -> Result<crate::sync::snapshot::SnapshotMeta, crate::fs::error::FsError> {
     // TODO: download snapshot, apply wal range filtered, re-upload
-    Err(crate::fs::error::FsError::Internal("not implemented".into()))
+    Err(crate::fs::error::FsError::Internal(
+        "not implemented".into(),
+    ))
 }
