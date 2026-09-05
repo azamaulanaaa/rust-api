@@ -125,7 +125,7 @@ mod tests {
     use std::io::Write;
 
     fn tmp_toml(content: &str) -> std::path::PathBuf {
-        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
         let path = std::env::temp_dir().join(format!(
             "rust-api-config-{}-{}.toml",
             std::process::id(),

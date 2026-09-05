@@ -67,11 +67,11 @@ pub trait S3Client: Send + Sync {
     async fn delete_object(&self, bucket: &str, key: &str) -> Result<(), FsError>;
 }
 
-/// Configuration for the S3 client, mirroring `config::S3Config` but
-/// defined in the library crate so `fs` does not depend on the binary config.
+/// Configuration for the object-store client, mirroring `config::S3Config`
+/// but decoupled from the binary config crate.
 #[derive(Debug, Clone)]
 pub struct S3ClientConfig {
-    /// S3 bucket name.
+    /// Bucket name — used as `AmazonS3` bucket, prefixed to the path for `InMemory`.
     pub bucket: String,
     /// AWS region.
     pub region: String,
