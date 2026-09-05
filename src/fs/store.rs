@@ -279,6 +279,30 @@ impl FsStore {
         serde_json::from_slice(&bytes).map_err(|e| FsError::Internal(e.to_string()))
     }
 
+    /// Lists rows referencing a file.
+    pub async fn rows_for_file(&self, file_id: &str) -> Result<Vec<(String, String)>, FsError> {
+        use oxkv::Direction;
+        let suffix = format!(":{file_id}");
+        let g = self.inner.read().await;
+        let kvs = g
+            .gets_bytes(None, Direction::Next, (None, None))
+            .await
+            .map_err(|e| FsError::Store(e.to_string()))?;
+        let mut out = Vec::new();
+        for kv in kvs {
+            if kv.key.starts_with(crate::fs::relation::REL_PREFIX) && kv.key.ends_with(&suffix) {
+                // key = fs:rel:{type}:{id}:{file}
+                let rest = &kv.key[crate::fs::relation::REL_PREFIX.len()..];
+                if let Some((ty, rem)) = rest.split_once(':')
+                    && let Some((rid, _)) = rem.split_once(':')
+                {
+                    out.push((ty.to_string(), rid.to_string()));
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Lists all finalized file records.
     pub async fn list_files(&self) -> Result<Vec<FileRecord>, FsError> {
         use oxkv::Direction;
