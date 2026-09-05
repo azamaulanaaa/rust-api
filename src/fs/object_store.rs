@@ -13,51 +13,71 @@ use bytes::Bytes;
 use object_store::ObjectStore;
 use object_store::ObjectStoreExt;
 use object_store::memory::InMemory;
+use object_store::multipart::{MultipartStore, PartId};
 use object_store::path::Path as ObjectPath;
+use object_store::{MultipartId, PutPayload};
 use tokio::sync::Mutex;
 
 use crate::fs::error::FsError;
 use crate::fs::s3::{S3Client, S3ClientConfig};
 
-/// Buffered multipart state staged in memory until `complete`.
-///
-/// Parts are held in `BTreeMap` to enforce part-number ordering; on
-/// `complete` they are concatenated and written as a single `put`. This
-/// matches `S3Client` semantics while using `object_store::ObjectStore`
-/// and keeps `InMemory` tests without external S3.
-#[derive(Debug, Default)]
+/// Native multipart state streamed via [`MultipartStore`].
+#[derive(Debug)]
 struct MultipartState {
     bucket: String,
     key: String,
-    parts: BTreeMap<i32, Bytes>,
+    path: ObjectPath,
+    id: MultipartId,
+    /// Part index (0-based) -> `PartId` returned by `put_part`.
+    parts: BTreeMap<usize, PartId>,
 }
 
-/// Object-store backed [`S3Client`].
+/// Object-store backed [`S3Client`] with true streaming multipart.
 ///
-/// `bucket` is retained for API compatibility. For `AmazonS3` the store
-/// is already scoped to a bucket so `key` alone is the path; for
-/// `InMemory` the bucket is prefixed to simulate isolation.
+/// For `AmazonS3` the store is bucket-scoped so `key` alone is the path;
+/// for `InMemory` the bucket is prefixed to simulate isolation. Multipart
+/// uploads are streamed via [`MultipartStore::put_part`] per part and
+/// completed via [`MultipartStore::complete_multipart`], avoiding
+/// buffering the entire object in memory.
 pub struct ObjectStoreClient {
     store: Arc<dyn ObjectStore>,
-    multiparts: Mutex<HashMap<String, MultipartState>>,
+    multipart: Arc<dyn MultipartStore>,
+    states: Mutex<HashMap<String, MultipartState>>,
     is_memory: bool,
 }
 
 impl ObjectStoreClient {
-    /// Creates a client wrapping an arbitrary [`ObjectStore`].
-    pub fn new(store: Arc<dyn ObjectStore>) -> Self {
+    /// Creates a client wrapping an arbitrary [`ObjectStore`] that also
+    /// implements [`MultipartStore`].
+    pub fn new(store: Arc<dyn ObjectStore>, multipart: Arc<dyn MultipartStore>) -> Self {
         Self {
             store,
-            multiparts: Mutex::new(HashMap::new()),
+            multipart,
+            states: Mutex::new(HashMap::new()),
+            is_memory: false,
+        }
+    }
+
+    /// Creates a client from a single `Arc` that implements both traits.
+    pub fn new_combined<T>(inner: Arc<T>) -> Self
+    where
+        T: ObjectStore + MultipartStore + 'static,
+    {
+        Self {
+            store: inner.clone() as Arc<dyn ObjectStore>,
+            multipart: inner as Arc<dyn MultipartStore>,
+            states: Mutex::new(HashMap::new()),
             is_memory: false,
         }
     }
 
     /// Creates an in-memory client for unit tests.
     pub fn in_memory() -> Arc<dyn S3Client> {
+        let inner = Arc::new(InMemory::new());
         Arc::new(Self {
-            store: Arc::new(InMemory::new()),
-            multiparts: Mutex::new(HashMap::new()),
+            store: inner.clone() as Arc<dyn ObjectStore>,
+            multipart: inner as Arc<dyn MultipartStore>,
+            states: Mutex::new(HashMap::new()),
             is_memory: true,
         })
     }
@@ -86,17 +106,25 @@ impl S3Client for ObjectStoreClient {
         key: &str,
         _content_type: Option<String>,
     ) -> Result<String, FsError> {
-        let id = format!("ostore-{}", uuid::Uuid::now_v7());
-        let mut mp = self.multiparts.lock().await;
-        mp.insert(
-            id.clone(),
+        let path = self.path(bucket, key);
+        let id = self
+            .multipart
+            .create_multipart(&path)
+            .await
+            .map_err(Self::map_err)?;
+        let upload_id = format!("ostore-{}", uuid::Uuid::now_v7());
+        let mut states = self.states.lock().await;
+        states.insert(
+            upload_id.clone(),
             MultipartState {
                 bucket: bucket.to_string(),
                 key: key.to_string(),
+                path,
+                id,
                 parts: BTreeMap::new(),
             },
         );
-        Ok(id)
+        Ok(upload_id)
     }
 
     async fn upload_part(
@@ -111,15 +139,22 @@ impl S3Client for ObjectStoreClient {
         if part_number < 1 {
             return Err(FsError::BadRequest("part_number must be >= 1".into()));
         }
-        let mut mp = self.multiparts.lock().await;
-        let state = mp
+        let part_idx = (part_number - 1) as usize;
+        let mut states = self.states.lock().await;
+        let state = states
             .get_mut(upload_id)
             .ok_or_else(|| FsError::Internal(format!("unknown upload_id {upload_id}")))?;
         if state.bucket != bucket || state.key != key {
             return Err(FsError::Internal("bucket/key mismatch".into()));
         }
-        let etag = format!("etag-{upload_id}-{part_number}-{}", body.len());
-        state.parts.insert(part_number, body);
+        let payload = PutPayload::from_bytes(body);
+        let part_id = self
+            .multipart
+            .put_part(&state.path, &state.id, part_idx, payload)
+            .await
+            .map_err(Self::map_err)?;
+        let etag = part_id.content_id.clone();
+        state.parts.insert(part_idx, part_id);
         Ok(etag)
     }
 
@@ -130,8 +165,8 @@ impl S3Client for ObjectStoreClient {
         upload_id: &str,
         etags: Vec<String>,
     ) -> Result<(), FsError> {
-        let mut mp = self.multiparts.lock().await;
-        let state = mp
+        let mut states = self.states.lock().await;
+        let state = states
             .remove(upload_id)
             .ok_or_else(|| FsError::Internal(format!("unknown upload_id {upload_id}")))?;
         if state.bucket != bucket || state.key != key {
@@ -144,27 +179,24 @@ impl S3Client for ObjectStoreClient {
                 state.parts.len()
             )));
         }
+        // Verify etags match stored PartIds in order and collect ordered PartIds.
+        let mut ordered = Vec::with_capacity(etags.len());
         for (i, etag) in etags.iter().enumerate() {
-            let pn = (i + 1) as i32;
-            let body = state
+            let part = state
                 .parts
-                .get(&pn)
-                .ok_or_else(|| FsError::Internal(format!("missing part {pn}")))?;
-            let expected = format!("etag-{upload_id}-{pn}-{}", body.len());
-            if etag != &expected {
+                .get(&i)
+                .ok_or_else(|| FsError::Internal(format!("missing part {}", i + 1)))?;
+            if &part.content_id != etag {
                 return Err(FsError::Internal(format!(
-                    "etag mismatch for part {pn}: expected {expected}, got {etag}"
+                    "etag mismatch for part {}: expected {}, got {etag}",
+                    i + 1,
+                    part.content_id
                 )));
             }
+            ordered.push(part.clone());
         }
-        let mut assembled = Vec::new();
-        for (_, b) in state.parts {
-            assembled.extend_from_slice(&b);
-        }
-        let path = self.path(bucket, key);
-        let payload = object_store::PutPayload::from_bytes(Bytes::from(assembled));
-        self.store
-            .put(&path, payload)
+        self.multipart
+            .complete_multipart(&state.path, &state.id, ordered)
             .await
             .map_err(Self::map_err)?;
         Ok(())
@@ -176,13 +208,17 @@ impl S3Client for ObjectStoreClient {
         key: &str,
         upload_id: &str,
     ) -> Result<(), FsError> {
-        let mut mp = self.multiparts.lock().await;
-        if let Some(state) = mp.get(upload_id)
-            && (state.bucket != bucket || state.key != key)
-        {
-            return Err(FsError::Internal("bucket/key mismatch".into()));
+        let mut states = self.states.lock().await;
+        if let Some(state) = states.get(upload_id) {
+            if state.bucket != bucket || state.key != key {
+                return Err(FsError::Internal("bucket/key mismatch".into()));
+            }
+            let state = states.remove(upload_id).unwrap();
+            let _ = self
+                .multipart
+                .abort_multipart(&state.path, &state.id)
+                .await;
         }
-        mp.remove(upload_id);
         Ok(())
     }
 
@@ -195,7 +231,7 @@ impl S3Client for ObjectStoreClient {
         _checksum_sha256: Option<String>,
     ) -> Result<(), FsError> {
         let path = self.path(bucket, key);
-        let payload = object_store::PutPayload::from_bytes(body);
+        let payload = PutPayload::from_bytes(body);
         self.store
             .put(&path, payload)
             .await
@@ -205,11 +241,7 @@ impl S3Client for ObjectStoreClient {
 
     async fn get_object(&self, bucket: &str, key: &str) -> Result<Bytes, FsError> {
         let path = self.path(bucket, key);
-        let res = self
-            .store
-            .get(&path)
-            .await
-            .map_err(Self::map_err)?;
+        let res = self.store.get(&path).await.map_err(Self::map_err)?;
         let bytes = res.bytes().await.map_err(|e| FsError::Internal(e.to_string()))?;
         Ok(bytes)
     }
@@ -257,7 +289,8 @@ pub fn build_object_store(config: &S3ClientConfig) -> Arc<dyn S3Client> {
         Ok(s) => s,
         Err(e) => panic!("failed to build object_store AmazonS3: {e}"),
     };
-    Arc::new(ObjectStoreClient::new(Arc::new(store)))
+    let inner = Arc::new(store);
+    Arc::new(ObjectStoreClient::new_combined(inner))
 }
 
 /// Builds an [`S3Client`] using the object-store stack.
