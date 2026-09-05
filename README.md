@@ -13,6 +13,7 @@ The crate is intentionally business-logic free: applications compose `ApiModule`
 - **Temp per-user file scope with refcount relations** — uploads start as temp owned by `owner_sub` (`refs==0`), `attach`/`detach` to rows via `fs:rel:{type}:{id}:{file}` increments/decrements refcount; editing a row swaps relations, never deletes the underlying S3 object immediately
 - **Capability tokens** — short-lived HMAC JWT (`fs/token.rs`, 5m) minted after row authorization, verified on file ops without extra policy hits
 - **GC for orphans** — hourly sweeper removes abandoned upload sessions and temp/orphaned files (`refs==0` and `age>24h` or `orphan_since>24h`)
+- **Per-user filtered clones with WAL** — file-based `wal:{seq}` in master `Redb`, per-user `Redb` snapshots cached as `S3` objects (`snapshots/{sub}/{seq}.redb`), on-demand `WAL` replay or full recalc when far behind; stays file-based so `oxkv` `S3` backend needs only master store swap
 - **Modular composition** — implement the `ApiModule` trait and register onto `ApiService`; auth middleware is applied per module scope
 - **Observability** — structured console logging through the `tracing` facade (`RUST_LOG` syntax), plus optional OpenTelemetry span export over OTLP/gRPC with W3C Trace Context propagation
 
@@ -42,6 +43,7 @@ The crate is intentionally business-logic free: applications compose `ApiModule`
 | GET | `/fs/files/{id}/meta` | File metadata (owner or row Read) | Bearer token |
 | GET | `/fs/files/{id}` | Download file content (owner or row Read) | Bearer token |
 | DELETE | `/fs/files/{id}` | Delete file (owner when temp, or row Delete) | Bearer token |
+| GET | `/sync/clone` | Per-user filtered `Redb` snapshot (on-demand WAL replay or full recalc) | Bearer token |
 
 Protected routes accept either an explicit `Authorization: Bearer <token>` header (preferred) or the session cookie set by `/auth/callback`. Requests without valid credentials get `401`; insufficient permissions get `403`. All errors use a uniform JSON envelope: `{"error": "<message>"}`.
 
@@ -66,6 +68,10 @@ src/
 ├── policy/              Casbin engine, oxkv adapter + validator, management routes
 │   ├── row.rs           RowAuthorizer trait for {type}:{id} objects
 │   └── ...              adapter, admin, route, setup
+├── sync/                Per-user clones (file-based, S3-cached)
+│   ├── wal.rs           File-based `wal:{seq}` in master `Redb` (migratable to oxkv S3)
+│   ├── snapshot.rs      `SnapshotManager` — filtered `Redb` file on `S3` (`snapshots/{sub}/{seq}.redb`)
+│   └── route.rs         `GET /sync/clone` — on-demand replay or full recalc
 └── fs/                  Object-store file storage (AmazonS3/MinIO/R2 via object_store, InMemory for tests)
     ├── mod.rs           FsEngine (temp per-user, row delegation, token mint/verify)
     ├── relation.rs      RefInfo + fs:rel:{type}:{id}:{file} + fs:files:{id}:refs
@@ -101,6 +107,10 @@ Business rows authorize as `{row_type}:{row_id}` via `RowAuthorizer` (`policy/ro
 - `FsEngine::detach` decrements and sets `orphan_since` when `refs==0`.
 - Reads/deletes check `owner_sub == caller` (temp) or any owning row grants `Read`/`Delete`. Editing a row is `detach(old)+create new+attach(new)` — the old S3 object becomes orphan and is removed by GC after 24h.
 - After row authorization, a short-lived HMAC token (`fs/token.rs`) can be minted for direct `PUT`/`GET` without extra policy hits.
+
+### Per-user clones (WAL)
+
+Master stays `Redb` file; per-user clones are `Redb` files cached as `S3` objects (`snapshots/{sub}/{seq}.redb`). `HookStore` appends `wal:{seq}` on master writes. `GET /sync/clone` loads `snapshots/{sub}/meta.json` (`applied_seq`), replays `wal[applied+1..head]` filtered via `RowAuthorizer`/`owner==sub` when `delta <= 1000`, otherwise full filtered recalc from zero. User `Write` lack does not block master replication — clone is read-filtered replica.
 
 ## Configuration
 
