@@ -96,8 +96,7 @@ impl SnapshotManager {
             applied_seq: seq,
             version: seq,
         };
-        let meta_bytes =
-            serde_json::to_vec(&meta).map_err(|e| FsError::Internal(e.to_string()))?;
+        let meta_bytes = serde_json::to_vec(&meta).map_err(|e| FsError::Internal(e.to_string()))?;
         self.s3
             .put_object(
                 &self.bucket,
@@ -121,7 +120,12 @@ impl SnapshotManager {
             if info.count > 0 {
                 // copy relations where row readable
                 for (ty, rid) in self.store.rows_for_file(&rec.id).await? {
-                    if self.policy.authorize_row(sub, &ty, &rid, Action::Read).await.unwrap_or(false) {
+                    if self
+                        .policy
+                        .authorize_row(sub, &ty, &rid, Action::Read)
+                        .await
+                        .unwrap_or(false)
+                    {
                         dst.attach(&ty, &rid, &rec.id).await?;
                     }
                 }
@@ -138,7 +142,12 @@ impl SnapshotManager {
             return Ok(true);
         }
         for (ty, rid) in self.store.rows_for_file(file_id).await? {
-            if self.policy.authorize_row(sub, &ty, &rid, Action::Read).await.unwrap_or(false) {
+            if self
+                .policy
+                .authorize_row(sub, &ty, &rid, Action::Read)
+                .await
+                .unwrap_or(false)
+            {
                 return Ok(true);
             }
         }
@@ -180,7 +189,9 @@ mod tests {
         let policy_path = tmp_path("policy");
         let _ = std::fs::remove_file(&policy_path);
         let policy = PolicyEngine::init(&policy_path).await?;
-        policy.add_rule("alice".into(), "invoice:1".into(), Action::Read).await?;
+        policy
+            .add_rule("alice".into(), "invoice:1".into(), Action::Read)
+            .await?;
         let rec = FileRecord {
             id: "f1".into(),
             name: "a".into(),

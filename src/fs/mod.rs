@@ -9,11 +9,11 @@ pub mod model;
 pub mod object_store;
 /// File-to-row relation with reference counting.
 pub mod relation;
-/// Capability token for scoped file access.
-pub mod token;
 pub mod route;
 pub mod s3;
 pub mod store;
+/// Capability token for scoped file access.
+pub mod token;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -131,7 +131,12 @@ impl FsEngine {
         self.store.detach(row_type, row_id, file_id).await
     }
 
-    async fn can_access(&self, caller_sub: &str, file_id: &str, act: Action) -> Result<bool, FsError> {
+    async fn can_access(
+        &self,
+        caller_sub: &str,
+        file_id: &str,
+        act: Action,
+    ) -> Result<bool, FsError> {
         let Some(rec) = self.store.get_file(file_id).await? else {
             return Err(FsError::NotFound("file not found".into()));
         };
@@ -538,10 +543,7 @@ mod tests {
             )
             .await?;
         // no row permission -> forbidden
-        assert!(engine
-            .attach("invoice", "123", &id, "alice")
-            .await
-            .is_err());
+        assert!(engine.attach("invoice", "123", &id, "alice").await.is_err());
         // grant alice write on invoice:123
         engine
             .policy

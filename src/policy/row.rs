@@ -5,7 +5,7 @@
 
 use async_trait::async_trait;
 
-use super::{Action, Authorizer, PolicyError, PolicyEngine};
+use super::{Action, Authorizer, PolicyEngine, PolicyError};
 
 /// Row-level authorizer for business entities.
 ///
@@ -137,7 +137,11 @@ mod tests {
         );
 
         let auth = engine.authorizer();
-        assert!(auth.authorize_row("alice", "invoice", "123", Action::Write).await.unwrap());
+        assert!(
+            auth.authorize_row("alice", "invoice", "123", Action::Write)
+                .await
+                .unwrap()
+        );
 
         let _ = std::fs::remove_file(&path);
     }
