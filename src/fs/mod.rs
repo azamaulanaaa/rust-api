@@ -9,6 +9,7 @@
 pub mod error;
 pub mod gc;
 pub mod model;
+pub mod object_store;
 pub mod route;
 pub mod s3;
 pub mod store;
