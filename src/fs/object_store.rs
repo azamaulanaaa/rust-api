@@ -10,12 +10,14 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use std::borrow::Cow;
+
 use object_store::ObjectStore;
 use object_store::ObjectStoreExt;
 use object_store::memory::InMemory;
 use object_store::multipart::{MultipartStore, PartId};
 use object_store::path::Path as ObjectPath;
-use object_store::{MultipartId, PutPayload};
+use object_store::{Attribute, Attributes, MultipartId, PutMultipartOptions, PutOptions, PutPayload};
 use tokio::sync::Mutex;
 
 use crate::fs::error::FsError;
@@ -96,6 +98,23 @@ impl ObjectStoreClient {
             _ => FsError::Internal(e.to_string()),
         }
     }
+
+    fn put_attrs(
+        content_type: Option<&str>,
+        checksum_sha256: Option<&str>,
+    ) -> Attributes {
+        let mut attrs = Attributes::new();
+        if let Some(ct) = content_type {
+            attrs.insert(Attribute::ContentType, ct.to_string().into());
+        }
+        if let Some(cs) = checksum_sha256 {
+            attrs.insert(
+                Attribute::Metadata(Cow::Borrowed("checksum_sha256")),
+                cs.to_string().into(),
+            );
+        }
+        attrs
+    }
 }
 
 #[async_trait]
@@ -104,14 +123,27 @@ impl S3Client for ObjectStoreClient {
         &self,
         bucket: &str,
         key: &str,
-        _content_type: Option<String>,
+        content_type: Option<String>,
     ) -> Result<String, FsError> {
         let path = self.path(bucket, key);
-        let id = self
-            .multipart
-            .create_multipart(&path)
-            .await
-            .map_err(Self::map_err)?;
+        let attrs = Self::put_attrs(content_type.as_deref(), None);
+        let id = if attrs.is_empty() {
+            self.multipart
+                .create_multipart(&path)
+                .await
+                .map_err(Self::map_err)?
+        } else {
+            self.multipart
+                .create_multipart_opts(
+                    &path,
+                    PutMultipartOptions {
+                        attributes: attrs,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map_err(Self::map_err)?
+        };
         let upload_id = format!("ostore-{}", uuid::Uuid::now_v7());
         let mut states = self.states.lock().await;
         states.insert(
@@ -227,15 +259,30 @@ impl S3Client for ObjectStoreClient {
         bucket: &str,
         key: &str,
         body: Bytes,
-        _content_type: Option<String>,
-        _checksum_sha256: Option<String>,
+        content_type: Option<String>,
+        checksum_sha256: Option<String>,
     ) -> Result<(), FsError> {
         let path = self.path(bucket, key);
         let payload = PutPayload::from_bytes(body);
-        self.store
-            .put(&path, payload)
-            .await
-            .map_err(Self::map_err)?;
+        let attrs = Self::put_attrs(content_type.as_deref(), checksum_sha256.as_deref());
+        if attrs.is_empty() {
+            self.store
+                .put(&path, payload)
+                .await
+                .map_err(Self::map_err)?;
+        } else {
+            self.store
+                .put_opts(
+                    &path,
+                    payload,
+                    PutOptions {
+                        attributes: attrs,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map_err(Self::map_err)?;
+        }
         Ok(())
     }
 
@@ -354,6 +401,60 @@ mod tests {
             FsError::NotFound(_)
         ));
         client.delete_object("b", "k").await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn put_with_content_type_and_checksum_forwarded() -> anyhow::Result<()> {
+        let inner = Arc::new(InMemory::new());
+        let client = Arc::new(ObjectStoreClient {
+            store: inner.clone() as Arc<dyn ObjectStore>,
+            multipart: inner.clone() as Arc<dyn MultipartStore>,
+            states: Mutex::new(HashMap::new()),
+            is_memory: true,
+        });
+        client
+            .put_object(
+                "b",
+                "k-ct",
+                Bytes::from_static(b"data"),
+                Some("text/plain".into()),
+                Some("abc123".into()),
+            )
+            .await?;
+        // Verify attributes are persisted in the underlying store.
+        let path = ObjectPath::from("b/k-ct");
+        let res = inner.get(&path).await?;
+        assert_eq!(
+            res.attributes
+                .get(&Attribute::ContentType)
+                .map(|v| v.as_ref()),
+            Some("text/plain")
+        );
+        assert_eq!(
+            res.attributes
+                .get(&Attribute::Metadata(Cow::Borrowed("checksum_sha256")))
+                .map(|v| v.as_ref()),
+            Some("abc123")
+        );
+        // Multipart creation also forwards content_type.
+        let up = client
+            .create_multipart_upload("b", "k-mp", Some("application/octet-stream".into()))
+            .await?;
+        let e = client
+            .upload_part("b", "k-mp", &up, 1, Bytes::from_static(b"hello"), None)
+            .await?;
+        client
+            .complete_multipart_upload("b", "k-mp", &up, vec![e])
+            .await?;
+        let mp_res = inner.get(&ObjectPath::from("b/k-mp")).await?;
+        assert_eq!(
+            mp_res
+                .attributes
+                .get(&Attribute::ContentType)
+                .map(|v| v.as_ref()),
+            Some("application/octet-stream")
+        );
         Ok(())
     }
 }
