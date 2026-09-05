@@ -12,6 +12,8 @@ pub mod model;
 pub mod object_store;
 /// File-to-row relation with reference counting.
 pub mod relation;
+/// Capability token for scoped file access.
+pub mod token;
 pub mod route;
 pub mod s3;
 pub mod store;
