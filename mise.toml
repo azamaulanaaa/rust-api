@@ -12,3 +12,4 @@ test = { run = "cargo-zigbuild test" }
 cov = { run = "cargo-zigbuild llvm-cov" }
 licenses = { run = "cargo-zigbuild deny check licenses" }
 advisories = { run = "cargo-zigbuild deny check advisories" }
+bans = { run = "cargo-zigbuild deny check bans" }
