@@ -20,6 +20,11 @@ use crate::fs::error::FsError;
 use crate::fs::s3::{S3Client, S3ClientConfig};
 
 /// Buffered multipart state staged in memory until `complete`.
+///
+/// Parts are held in `BTreeMap` to enforce part-number ordering; on
+/// `complete` they are concatenated and written as a single `put`. This
+/// matches `S3Client` semantics while using `object_store::ObjectStore`
+/// and keeps `InMemory` tests without external S3.
 #[derive(Debug, Default)]
 struct MultipartState {
     bucket: String,
