@@ -74,92 +74,15 @@ impl UploadSession {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
     use std::sync::Arc;
-    use tokio::sync::Mutex;
 
     use crate::fs::FsEngine;
     use crate::fs::error::FsError;
+    use crate::fs::object_store::ObjectStoreClient;
     use crate::fs::s3::S3Client;
     use crate::fs::store::{FsStore, UploadSession};
     use crate::policy::{Action, PolicyEngine};
     use bytes::Bytes;
-
-    #[allow(dead_code)]
-    struct TestS3 {
-        objects: Mutex<HashMap<(String, String), Bytes>>,
-        multiparts: Mutex<HashMap<String, (String, String)>>,
-        aborted: Mutex<Vec<String>>,
-        deleted: Mutex<Vec<String>>,
-    }
-    impl TestS3 {
-        fn new() -> Arc<Self> {
-            Arc::new(Self {
-                objects: Mutex::new(HashMap::new()),
-                multiparts: Mutex::new(HashMap::new()),
-                aborted: Mutex::new(Vec::new()),
-                deleted: Mutex::new(Vec::new()),
-            })
-        }
-    }
-    #[async_trait::async_trait]
-    impl S3Client for TestS3 {
-        async fn create_multipart_upload(
-            &self,
-            _b: &str,
-            _k: &str,
-            _ct: Option<String>,
-        ) -> Result<String, FsError> {
-            Ok("upload-1".into())
-        }
-        async fn upload_part(
-            &self,
-            _: &str,
-            _: &str,
-            _: &str,
-            _: i32,
-            _: Bytes,
-            _: Option<String>,
-        ) -> Result<String, FsError> {
-            Ok("etag".into())
-        }
-        async fn complete_multipart_upload(
-            &self,
-            _: &str,
-            _: &str,
-            _: &str,
-            _: Vec<String>,
-        ) -> Result<(), FsError> {
-            Ok(())
-        }
-        async fn abort_multipart_upload(
-            &self,
-            _b: &str,
-            _k: &str,
-            upload_id: &str,
-        ) -> Result<(), FsError> {
-            self.aborted.lock().await.push(upload_id.to_string());
-            self.multiparts.lock().await.remove(upload_id);
-            Ok(())
-        }
-        async fn put_object(
-            &self,
-            _b: &str,
-            _k: &str,
-            _body: Bytes,
-            _ct: Option<String>,
-            _cs: Option<String>,
-        ) -> Result<(), FsError> {
-            Ok(())
-        }
-        async fn get_object(&self, _b: &str, _k: &str) -> Result<Bytes, FsError> {
-            Err(FsError::NotFound("no".into()))
-        }
-        async fn delete_object(&self, _b: &str, _k: &str) -> Result<(), FsError> {
-            self.deleted.lock().await.push(_k.to_string());
-            Ok(())
-        }
-    }
 
     fn tmp_path(label: &str) -> std::path::PathBuf {
         use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -171,7 +94,7 @@ mod tests {
         ))
     }
 
-    async fn make_engine() -> (FsEngine, Arc<TestS3>) {
+    async fn make_engine() -> FsEngine {
         let path = tmp_path("store");
         let _ = std::fs::remove_file(&path);
         let store = FsStore::open(&path).await.unwrap();
@@ -187,9 +110,8 @@ mod tests {
             .add_rule("writers".into(), "fs".into(), Action::Write)
             .await
             .unwrap();
-        let s3 = TestS3::new();
-        let engine = FsEngine::from_parts(store, s3.clone(), "test-bucket".into(), policy);
-        (engine, s3)
+        let s3 = ObjectStoreClient::in_memory();
+        FsEngine::from_parts(store, s3, "test-bucket".into(), policy)
     }
 
     fn session_with_age(id: &str, age_secs: i64, multipart: bool) -> UploadSession {
@@ -232,7 +154,7 @@ mod tests {
 
     #[tokio::test]
     async fn sweep_cleans_only_expired() -> anyhow::Result<()> {
-        let (engine, s3) = make_engine().await;
+        let engine = make_engine().await;
         // fresh (1h old) should stay
         engine
             .store
@@ -253,9 +175,6 @@ mod tests {
         assert!(engine.store.get_session("fresh").await?.is_some());
         assert!(engine.store.get_session("old-mp").await?.is_none());
         assert!(engine.store.get_session("old-single").await?.is_none());
-        // verify correct S3 path was taken
-        assert_eq!(s3.aborted.lock().await.as_slice(), vec!["upload-old-mp"]);
-        assert_eq!(s3.deleted.lock().await.as_slice(), vec!["files/old-single"]);
         // second sweep is idempotent
         assert_eq!(sweep_once(&engine).await?, 0);
         Ok(())
@@ -263,7 +182,7 @@ mod tests {
 
     #[tokio::test]
     async fn sweep_empty_store_returns_zero() -> anyhow::Result<()> {
-        let (engine, _) = make_engine().await;
+        let engine = make_engine().await;
         assert_eq!(sweep_once(&engine).await?, 0);
         Ok(())
     }

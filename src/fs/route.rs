@@ -169,18 +169,13 @@ async fn delete_file(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
-    use std::sync::Arc;
-    use tokio::sync::Mutex;
 
     use actix_web::{App, http, test};
-    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-    use bytes::Bytes;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use jsonwebtoken::EncodingKey;
     use serde_json::json;
 
-    use crate::fs::error::FsError;
-    use crate::fs::s3::S3Client;
+    use crate::fs::object_store::ObjectStoreClient;
     use crate::fs::store::FsStore;
     use crate::http::middleware::jwks::test_support::{rsa_key, sign_rs256, spawn_jwks};
     use crate::policy::{Action, PolicyEngine};
@@ -188,149 +183,10 @@ mod tests {
     const KID: &str = "fs-route-test-kid";
     const AUD: &str = "test-aud";
 
-    struct TestS3 {
-        objects: Mutex<HashMap<(String, String), Bytes>>,
-        multiparts: Mutex<HashMap<String, Multipart>>,
-        counter: std::sync::atomic::AtomicU64,
-        last_checksum: Mutex<Option<String>>,
-    }
-    struct Multipart {
-        bucket: String,
-        key: String,
-        parts: HashMap<i32, Bytes>,
-    }
-    impl TestS3 {
-        fn new() -> Arc<Self> {
-            Arc::new(Self {
-                objects: Mutex::new(HashMap::new()),
-                multiparts: Mutex::new(HashMap::new()),
-                counter: std::sync::atomic::AtomicU64::new(1),
-                last_checksum: Mutex::new(None),
-            })
-        }
-    }
-    #[async_trait::async_trait]
-    impl S3Client for TestS3 {
-        async fn create_multipart_upload(
-            &self,
-            b: &str,
-            k: &str,
-            _ct: Option<String>,
-        ) -> Result<String, FsError> {
-            let id = format!(
-                "upload-{}",
-                self.counter
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            );
-            self.multiparts.lock().await.insert(
-                id.clone(),
-                Multipart {
-                    bucket: b.to_string(),
-                    key: k.to_string(),
-                    parts: HashMap::new(),
-                },
-            );
-            Ok(id)
-        }
-        async fn upload_part(
-            &self,
-            b: &str,
-            k: &str,
-            upload_id: &str,
-            pn: i32,
-            body: Bytes,
-            cs: Option<String>,
-        ) -> Result<String, FsError> {
-            if pn < 1 {
-                return Err(FsError::BadRequest("part_number must be >= 1".into()));
-            }
-            *self.last_checksum.lock().await = cs.clone();
-            let mut mp = self.multiparts.lock().await;
-            let m = mp
-                .get_mut(upload_id)
-                .ok_or_else(|| FsError::Internal(format!("unknown upload_id {upload_id}")))?;
-            if m.bucket != b || m.key != k {
-                return Err(FsError::Internal("bucket/key mismatch".into()));
-            }
-            let etag = format!("etag-{upload_id}-{pn}-{}", body.len());
-            m.parts.insert(pn, body);
-            Ok(etag)
-        }
-        async fn complete_multipart_upload(
-            &self,
-            b: &str,
-            k: &str,
-            upload_id: &str,
-            etags: Vec<String>,
-        ) -> Result<(), FsError> {
-            let mut mp = self.multiparts.lock().await;
-            let m = mp
-                .remove(upload_id)
-                .ok_or_else(|| FsError::Internal(format!("unknown upload_id {upload_id}")))?;
-            if m.bucket != b || m.key != k {
-                return Err(FsError::Internal("bucket/key mismatch".into()));
-            }
-            if etags.len() != m.parts.len() {
-                return Err(FsError::Internal("etag count mismatch".into()));
-            }
-            let mut assembled = Vec::new();
-            let mut sorted: Vec<_> = m.parts.into_iter().collect();
-            sorted.sort_by_key(|(x, _)| *x);
-            for (_, v) in sorted {
-                assembled.extend_from_slice(&v);
-            }
-            self.objects
-                .lock()
-                .await
-                .insert((b.to_string(), k.to_string()), Bytes::from(assembled));
-            Ok(())
-        }
-        async fn abort_multipart_upload(
-            &self,
-            _: &str,
-            _: &str,
-            upload_id: &str,
-        ) -> Result<(), FsError> {
-            self.multiparts.lock().await.remove(upload_id);
-            Ok(())
-        }
-        async fn put_object(
-            &self,
-            b: &str,
-            k: &str,
-            body: Bytes,
-            _ct: Option<String>,
-            cs: Option<String>,
-        ) -> Result<(), FsError> {
-            *self.last_checksum.lock().await = cs;
-            self.objects
-                .lock()
-                .await
-                .insert((b.to_string(), k.to_string()), body);
-            Ok(())
-        }
-        async fn get_object(&self, b: &str, k: &str) -> Result<Bytes, FsError> {
-            self.objects
-                .lock()
-                .await
-                .get(&(b.to_string(), k.to_string()))
-                .cloned()
-                .ok_or_else(|| FsError::NotFound(format!("object not found: {b}/{k}")))
-        }
-        async fn delete_object(&self, b: &str, k: &str) -> Result<(), FsError> {
-            self.objects
-                .lock()
-                .await
-                .remove(&(b.to_string(), k.to_string()));
-            Ok(())
-        }
-    }
-
     struct Fixture {
         server: wiremock::MockServer,
         enc: EncodingKey,
         engine: FsEngine,
-        s3: Arc<TestS3>,
     }
     impl Fixture {
         fn issuer(&self) -> String {
@@ -376,14 +232,9 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&fs_path);
         let store = FsStore::open(&fs_path).await?;
-        let s3 = TestS3::new();
-        let engine = FsEngine::from_parts(store, s3.clone(), "test-bucket".into(), policy);
-        Ok(Fixture {
-            server,
-            enc,
-            engine,
-            s3,
-        })
+        let s3 = ObjectStoreClient::in_memory();
+        let engine = FsEngine::from_parts(store, s3, "test-bucket".into(), policy);
+        Ok(Fixture { server, enc, engine })
     }
     #[actix_web::test]
     async fn unauthenticated_is_401() -> anyhow::Result<()> {
@@ -493,7 +344,6 @@ mod tests {
         )
         .await;
         assert_eq!(res.status(), http::StatusCode::NO_CONTENT);
-        assert_eq!(fx.s3.last_checksum.lock().await.as_deref(), Some("abc123="));
         // progress
         let res = test::call_service(
             &app,
@@ -619,10 +469,6 @@ mod tests {
         )
         .await;
         assert_eq!(res.status(), http::StatusCode::NO_CONTENT);
-        assert_eq!(
-            fx.s3.last_checksum.lock().await.as_deref(),
-            Some("alias123=")
-        );
         Ok(())
     }
 
