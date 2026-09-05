@@ -8,3 +8,4 @@ zig = "latest"
 build = { run = "cargo-zigbuild build" }
 run = { run = "cargo-zigbuild run" }
 test = { run = "cargo-zigbuild test" }
+cov = { run = "cargo-zigbuild llvm-cov" }
