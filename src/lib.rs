@@ -29,6 +29,9 @@ pub mod fs;
 /// OpenAPI specification composed from all `utoipa::path` modules.
 pub mod docs;
 
+/// Per-user filtered clones with WAL replay.
+pub mod sync;
+
 /// Telemetry bootstrap: global [`tracing`] subscriber installation and
 /// OpenTelemetry wiring.
 pub mod telemetry;
