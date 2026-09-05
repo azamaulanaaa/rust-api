@@ -10,6 +10,8 @@ pub mod error;
 pub mod gc;
 pub mod model;
 pub mod object_store;
+/// File-to-row relation with reference counting.
+pub mod relation;
 pub mod route;
 pub mod s3;
 pub mod store;

@@ -1,5 +1,5 @@
-//! `oxkv` persistence for upload sessions and file records.
-//! Keys: `fs:uploads:{id}:meta`, `fs:uploads:{id}:part:{idx}`, `fs:files:{id}:meta`
+//! `oxkv` persistence for upload sessions, file records, and relations.
+//! Keys: `fs:uploads:{id}:meta`, `fs:files:{id}:meta`, `fs:rel:{type}:{id}:{file}`, `fs:files:{id}:refs`
 
 use std::sync::Arc;
 
@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
 use crate::fs::error::FsError;
+use crate::fs::relation::{RefInfo, refs_key, rel_key};
 
 /// In-flight multipart session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -189,6 +190,113 @@ impl FsStore {
             .await
             .map_err(|e| FsError::Store(e.to_string()))?;
         Ok(())
+    }
+
+    /// Returns ref-count info for a file (0 if never attached).
+    pub async fn get_ref_info(&self, file_id: &str) -> Result<RefInfo, FsError> {
+        let key = refs_key(file_id);
+        let g = self.inner.read().await;
+        let Some(bytes) = g
+            .get_bytes(&key)
+            .await
+            .map_err(|e| FsError::Store(e.to_string()))?
+        else {
+            return Ok(RefInfo::default());
+        };
+        let info = serde_json::from_slice(&bytes).map_err(|e| FsError::Internal(e.to_string()))?;
+        Ok(info)
+    }
+
+    /// Attaches a file to a row; idempotent.
+    pub async fn attach(&self, row_type: &str, row_id: &str, file_id: &str) -> Result<u32, FsError> {
+        let rel = rel_key(row_type, row_id, file_id);
+        let refs = refs_key(file_id);
+        let mut g = self.inner.write().await;
+        if g
+            .get_bytes(&rel)
+            .await
+            .map_err(|e| FsError::Store(e.to_string()))?
+            .is_some()
+        {
+            let info = self.get_ref_info_inner(&g, file_id).await?;
+            return Ok(info.count);
+        }
+        let mut info = self.get_ref_info_inner(&g, file_id).await?;
+        info.count = info.count.saturating_add(1);
+        info.orphan_since = None;
+        g.set_bytes(&rel, b"1")
+            .await
+            .map_err(|e| FsError::Store(e.to_string()))?;
+        let val = serde_json::to_vec(&info).map_err(|e| FsError::Internal(e.to_string()))?;
+        g.set_bytes(&refs, &val)
+            .await
+            .map_err(|e| FsError::Store(e.to_string()))?;
+        Ok(info.count)
+    }
+
+    /// Detaches a file from a row; idempotent.
+    pub async fn detach(&self, row_type: &str, row_id: &str, file_id: &str) -> Result<u32, FsError> {
+        let rel = rel_key(row_type, row_id, file_id);
+        let refs = refs_key(file_id);
+        let mut g = self.inner.write().await;
+        if g
+            .get_bytes(&rel)
+            .await
+            .map_err(|e| FsError::Store(e.to_string()))?
+            .is_none()
+        {
+            let info = self.get_ref_info_inner(&g, file_id).await?;
+            return Ok(info.count);
+        }
+        let mut info = self.get_ref_info_inner(&g, file_id).await?;
+        g.delete(&rel)
+            .await
+            .map_err(|e| FsError::Store(e.to_string()))?;
+        info.count = info.count.saturating_sub(1);
+        if info.count == 0 {
+            info.orphan_since = Some(chrono::Utc::now().timestamp());
+        }
+        let val = serde_json::to_vec(&info).map_err(|e| FsError::Internal(e.to_string()))?;
+        g.set_bytes(&refs, &val)
+            .await
+            .map_err(|e| FsError::Store(e.to_string()))?;
+        Ok(info.count)
+    }
+
+    async fn get_ref_info_inner(
+        &self,
+        g: &oxkv::RedbStore,
+        file_id: &str,
+    ) -> Result<RefInfo, FsError> {
+        let key = refs_key(file_id);
+        let Some(bytes) = g
+            .get_bytes(&key)
+            .await
+            .map_err(|e| FsError::Store(e.to_string()))?
+        else {
+            return Ok(RefInfo::default());
+        };
+        serde_json::from_slice(&bytes).map_err(|e| FsError::Internal(e.to_string()))
+    }
+
+    /// Lists all finalized file records.
+    pub async fn list_files(&self) -> Result<Vec<FileRecord>, FsError> {
+        use oxkv::Direction;
+        let g = self.inner.read().await;
+        let kvs = g
+            .gets_bytes(None, Direction::Next, (None, None))
+            .await
+            .map_err(|e| FsError::Store(e.to_string()))?;
+        let mut out = Vec::new();
+        for kv in kvs {
+            if kv.key.starts_with("fs:files:")
+                && kv.key.ends_with(":meta")
+                && let Ok(r) = serde_json::from_slice::<FileRecord>(&kv.value)
+            {
+                out.push(r);
+            }
+        }
+        Ok(out)
     }
 
     /// Lists all upload sessions (scans `fs:uploads:*:meta`).
