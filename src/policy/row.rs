@@ -86,7 +86,6 @@ impl RowAuthorizer for Authorizer {
 
 #[cfg(test)]
 mod tests {
-    use crate::unwrap_ext::{UnwrapExt, UnwrapErrExt};
     use super::*;
     use crate::policy::{Action, PolicyEngine};
 
@@ -102,27 +101,27 @@ mod tests {
             URL_SAFE_NO_PAD.encode(rand::random::<[u8; 6]>())
         });
         let s3 = crate::db::build_test_store(&prefix).await;
-        let engine = PolicyEngine::init_s3(s3).await.unwrap_or_panic();
+        let engine = PolicyEngine::init_s3(s3).await.unwrap();
         engine
             .assign_group("alice".into(), "editors".into())
             .await
-            .unwrap_or_panic();
+            .unwrap();
         engine
             .add_rule("editors".into(), "invoice:123".into(), Action::Write)
             .await
-            .unwrap_or_panic();
+            .unwrap();
 
         assert!(
             engine
                 .authorize_row("alice", "invoice", "123", Action::Write)
                 .await
-                .unwrap_or_panic()
+                .unwrap()
         );
         assert!(
             !engine
                 .authorize_row("alice", "invoice", "123", Action::Read)
                 .await
-                .unwrap_or_panic()
+                .unwrap()
         );
         assert!(
             engine
@@ -135,7 +134,7 @@ mod tests {
         assert!(
             auth.authorize_row("alice", "invoice", "123", Action::Write)
                 .await
-                .unwrap_or_panic()
+                .unwrap()
         );
     }
 }

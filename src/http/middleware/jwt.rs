@@ -316,7 +316,6 @@ where
 mod tests {
     use super::*;
     use crate::http::middleware::jwks::test_support::*;
-    use crate::unwrap_ext::UnwrapErrExt;
     use serde_json::json;
 
     #[tokio::test]
@@ -374,7 +373,7 @@ mod tests {
         let (req, mut payload) = TestRequest::default().to_http_parts();
 
         let result = Validated::<Claims>::from_request(&req, &mut payload).await;
-        assert_eq!(result.unwrap_err_or_panic().as_response_error().status_code(), 401);
+        assert_eq!(result.unwrap_err().as_response_error().status_code(), 401);
     }
     #[test]
     fn issuer_template_parses_and_resolves() {

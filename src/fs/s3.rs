@@ -86,7 +86,9 @@ pub struct S3ClientConfig {
 }
 
 /// Builds an `Arc<dyn S3Client>` from [`S3ClientConfig`] via `object_store`.
-pub async fn build_s3_client(config: &S3ClientConfig) -> Result<Arc<dyn S3Client>, object_store::Error> {
+pub async fn build_s3_client(
+    config: &S3ClientConfig,
+) -> Result<Arc<dyn S3Client>, object_store::Error> {
     crate::fs::object_store::build_object_store(config)
 }
 

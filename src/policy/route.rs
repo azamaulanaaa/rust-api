@@ -403,7 +403,6 @@ async fn delete_group(
 
 #[cfg(test)]
 mod tests {
-    use crate::unwrap_ext::{UnwrapExt, UnwrapErrExt};
     use super::*;
     use actix_web::{App, http};
     use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -645,7 +644,7 @@ mod tests {
         assert!(
             body["items"]
                 .as_array()
-                .unwrap_or_panic()
+                .unwrap()
                 .iter()
                 .any(|v| v == "editors")
         );
@@ -663,7 +662,7 @@ mod tests {
         assert!(
             body["items"]
                 .as_array()
-                .unwrap_or_panic()
+                .unwrap()
                 .iter()
                 .any(|v| v == "carol")
         );

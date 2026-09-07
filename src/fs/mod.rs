@@ -449,7 +449,6 @@ impl FsEngine {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use crate::unwrap_ext::{UnwrapExt, UnwrapErrExt};
     use super::*;
 
     use crate::fs::object_store::ObjectStoreClient;
@@ -466,7 +465,7 @@ mod tests {
         let store = FsStore::new(s3_store);
         let policy_prefix = format!("{prefix}-policy");
         let policy_store = build_test_store(&policy_prefix).await;
-        let policy = PolicyEngine::init_s3(policy_store).await.unwrap_or_panic();
+        let policy = PolicyEngine::init_s3(policy_store).await.unwrap();
         let s3 = ObjectStoreClient::in_memory();
         FsEngine::from_parts(store, s3, "test-bucket".to_string(), policy)
     }
@@ -502,7 +501,7 @@ mod tests {
                 "alice",
             )
             .await
-            .unwrap_err_or_panic();
+            .unwrap_err();
         assert!(matches!(err, FsError::BadRequest(_)));
         Ok(())
     }
@@ -515,7 +514,7 @@ mod tests {
         let err = engine
             .upload_part(&id, 0, Bytes::from(vec![1u8; 1024]), None, "bob")
             .await
-            .unwrap_err_or_panic();
+            .unwrap_err();
         assert!(matches!(err, FsError::Forbidden));
         Ok(())
     }
@@ -544,7 +543,7 @@ mod tests {
             .policy
             .add_rule("alice".into(), "invoice:123".into(), Action::Write)
             .await
-            .unwrap_or_panic();
+            .unwrap();
         assert_eq!(engine.attach("invoice", "123", &id, "alice").await?, 1);
         // idempotent
         assert_eq!(engine.attach("invoice", "123", &id, "alice").await?, 1);
@@ -575,13 +574,13 @@ mod tests {
             .policy
             .add_rule("alice".into(), "invoice:123".into(), Action::Write)
             .await
-            .unwrap_or_panic();
+            .unwrap();
         engine.attach("invoice", "123", &id, "alice").await?;
         engine
             .policy
             .add_rule("bob".into(), "invoice:123".into(), Action::Read)
             .await
-            .unwrap_or_panic();
+            .unwrap();
         let meta = engine.get_metadata(&id, "bob").await?;
         assert_eq!(meta.name, "doc.txt");
         Ok(())

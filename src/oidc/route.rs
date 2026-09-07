@@ -217,7 +217,6 @@ fn clear_cookie(name: String) -> Cookie<'static> {
 
 #[cfg(test)]
 mod tests {
-    use crate::unwrap_ext::{UnwrapExt, UnwrapErrExt};
     use super::*;
 
     use crate::oidc::OidcConfig;
@@ -313,9 +312,9 @@ mod tests {
             res.response()
                 .headers()
                 .get(LOCATION)
-                .expect_or_panic("redirect Location header")
+                .expect("redirect Location header")
                 .to_str()
-                .unwrap_or_panic(),
+                .unwrap(),
         )?;
         let query: std::collections::HashMap<String, String> =
             location.query_pairs().into_owned().collect();
@@ -325,7 +324,7 @@ mod tests {
                 .cookies()
                 .find(|c| c.name() == name)
                 .map(|c| c.value().to_string())
-                .expect_or_panic("login must set security cookies")
+                .expect("login must set security cookies")
         };
 
         Ok((
@@ -343,7 +342,7 @@ mod tests {
 
     #[tokio::test]
     async fn login_redirects_to_provider_with_security_cookies() {
-        let fx = Fixture::new().await.unwrap_or_panic();
+        let fx = Fixture::new().await.unwrap();
         let svc = test_app!(fx);
 
         let res = test::call_service(
@@ -357,12 +356,12 @@ mod tests {
             res.response()
                 .headers()
                 .get(LOCATION)
-                .unwrap_or_panic()
+                .unwrap()
                 .to_str()
-                .unwrap_or_panic(),
+                .unwrap(),
         )
-        .unwrap_or_panic();
-        assert_eq!(location.host_str().unwrap_or_panic(), "127.0.0.1"); // mock provider
+        .unwrap();
+        assert_eq!(location.host_str().unwrap(), "127.0.0.1"); // mock provider
         let query: std::collections::HashMap<String, String> =
             location.query_pairs().into_owned().collect();
         assert_eq!(query["client_id"], CLIENT_ID);
@@ -386,7 +385,7 @@ mod tests {
 
     #[tokio::test]
     async fn callback_without_cookies_is_400() {
-        let fx = Fixture::new().await.unwrap_or_panic();
+        let fx = Fixture::new().await.unwrap();
         let svc = test_app!(fx);
 
         let req = test::TestRequest::get()
@@ -395,7 +394,7 @@ mod tests {
         let res = test::call_service(&svc, req).await;
 
         assert_eq!(res.status(), 400);
-        let body: AuthResponse = serde_json::from_slice(&test::read_body(res).await).unwrap_or_panic();
+        let body: AuthResponse = serde_json::from_slice(&test::read_body(res).await).unwrap();
         assert!(!body.success);
         assert!(
             body.error
@@ -406,14 +405,14 @@ mod tests {
 
     #[tokio::test]
     async fn callback_with_tampered_state_is_401() {
-        let fx = Fixture::new().await.unwrap_or_panic();
+        let fx = Fixture::new().await.unwrap();
         let svc = test_app!(fx);
         let login_res = test::call_service(
             &svc,
             test::TestRequest::get().uri("/auth/login").to_request(),
         )
         .await;
-        let (csrf, nonce, pkce, _state) = login_parts(&login_res).unwrap_or_panic();
+        let (csrf, nonce, pkce, _state) = login_parts(&login_res).unwrap();
 
         let req = test::TestRequest::get()
             .uri("/auth/callback?code=abc&state=tampered")
@@ -422,7 +421,7 @@ mod tests {
         let res = test::call_service(&svc, req).await;
 
         assert_eq!(res.status(), 401);
-        let body: AuthResponse = serde_json::from_slice(&test::read_body(res).await).unwrap_or_panic();
+        let body: AuthResponse = serde_json::from_slice(&test::read_body(res).await).unwrap();
         assert_eq!(body.error.as_deref(), Some("Invalid state parameter"));
     }
 
@@ -477,7 +476,7 @@ mod tests {
             .response()
             .cookies()
             .find(|c| c.name() == "auth_token")
-            .expect_or_panic("auth_token cookie must be set")
+            .expect("auth_token cookie must be set")
             .value()
             .to_string();
         for name in ["oidc_csrf", "oidc_nonce", "oidc_pkce"] {
@@ -503,14 +502,14 @@ mod tests {
 
     #[tokio::test]
     async fn callback_with_failing_exchange_is_401_without_leaking_details() {
-        let fx = Fixture::new().await.unwrap_or_panic();
+        let fx = Fixture::new().await.unwrap();
         let svc = test_app!(fx);
         let login_res = test::call_service(
             &svc,
             test::TestRequest::get().uri("/auth/login").to_request(),
         )
         .await;
-        let (csrf, nonce, pkce, state) = login_parts(&login_res).unwrap_or_panic();
+        let (csrf, nonce, pkce, state) = login_parts(&login_res).unwrap();
         let code = "test-code";
 
         Mock::given(method("POST"))
@@ -526,7 +525,7 @@ mod tests {
         let res = test::call_service(&svc, req).await;
 
         assert_eq!(res.status(), 401);
-        let body: AuthResponse = serde_json::from_slice(&test::read_body(res).await).unwrap_or_panic();
+        let body: AuthResponse = serde_json::from_slice(&test::read_body(res).await).unwrap();
         assert!(!body.success);
         // Provider failure details must never reach the client.
         assert_eq!(body.error.as_deref(), Some("authentication failed"));
