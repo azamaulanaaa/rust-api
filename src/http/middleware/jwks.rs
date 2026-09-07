@@ -27,7 +27,7 @@ static JWKS_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
-        .expect("failed to build JWKS reqwest client")
+        .unwrap_or_else(|e| panic!("failed to build JWKS reqwest client: {e}"))
 });
 
 /// Minimum interval between two JWKS fetches triggered by unknown-key misses.

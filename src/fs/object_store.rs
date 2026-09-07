@@ -224,11 +224,12 @@ impl S3Client for ObjectStoreClient {
         upload_id: &str,
     ) -> Result<(), FsError> {
         let mut states = self.states.lock().await;
-        if let Some(state) = states.get(upload_id) {
-            if state.bucket != bucket || state.key != key {
-                return Err(FsError::Internal("bucket/key mismatch".into()));
-            }
-            let state = states.remove(upload_id).unwrap();
+        if let Some(state) = states.get(upload_id)
+            && (state.bucket != bucket || state.key != key)
+        {
+            return Err(FsError::Internal("bucket/key mismatch".into()));
+        }
+        if let Some(state) = states.remove(upload_id) {
             let _ = self.multipart.abort_multipart(&state.path, &state.id).await;
         }
         Ok(())

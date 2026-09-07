@@ -64,6 +64,10 @@ wiremock = "0.6.5"
 [lints.rust]
 missing_docs = "deny"
 
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+
 # The profile that 'dist' will build with
 [profile.dist]
 inherits = "release"
