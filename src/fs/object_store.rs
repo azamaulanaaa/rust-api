@@ -332,6 +332,7 @@ pub async fn build_s3_client(config: &S3ClientConfig) -> Result<Arc<dyn S3Client
 mod tests {
     use super::*;
     use bytes::Bytes;
+    use crate::unwrap_ext::UnwrapErrExt;
 
     #[tokio::test]
     async fn put_get_roundtrip() -> anyhow::Result<()> {
@@ -395,7 +396,7 @@ mod tests {
         );
         client.delete_object("b", "k").await?;
         assert!(matches!(
-            client.get_object("b", "k").await.unwrap_err(),
+            client.get_object("b", "k").await.unwrap_err_or_panic(),
             FsError::NotFound(_)
         ));
         client.delete_object("b", "k").await?;
