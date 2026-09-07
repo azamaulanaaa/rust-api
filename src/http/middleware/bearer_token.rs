@@ -94,14 +94,15 @@ fn parse_bearer_token(auth_str: &str) -> Option<BearerToken> {
 
 #[cfg(test)]
 mod tests {
+    use crate::unwrap_ext::{UnwrapExt, UnwrapErrExt};
     use super::*;
 
     #[test]
     fn parse_bearer_token_accepts_valid() {
-        assert_eq!(parse_bearer_token("Bearer abc123").unwrap().0, "abc123");
-        assert_eq!(parse_bearer_token("bearer XYZ").unwrap().0, "XYZ");
+        assert_eq!(parse_bearer_token("Bearer abc123").unwrap_or_panic().0, "abc123");
+        assert_eq!(parse_bearer_token("bearer XYZ").unwrap_or_panic().0, "XYZ");
         assert_eq!(
-            parse_bearer_token("BEARER token-with-dash_123").unwrap().0,
+            parse_bearer_token("BEARER token-with-dash_123").unwrap_or_panic().0,
             "token-with-dash_123"
         );
     }
@@ -119,6 +120,6 @@ mod tests {
     #[test]
     fn parse_bearer_token_preserves_raw_token() {
         // Token is stored verbatim (no trim) — downstream validation decides.
-        assert_eq!(parse_bearer_token("Bearer  abc").unwrap().0, " abc");
+        assert_eq!(parse_bearer_token("Bearer  abc").unwrap_or_panic().0, " abc");
     }
 }

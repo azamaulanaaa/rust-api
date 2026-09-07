@@ -486,13 +486,9 @@ mod key_tests {
 
     #[test]
     fn keys_are_namespaced_and_distinct() {
-        // Copy-paste guard: three helpers look identical except prefix/suffix.
-        // Swapping "uploads" <-> "files" would silently corrupt GC and reads.
         assert_eq!(FsStore::session_key("abc"), "fs:uploads:abc:meta");
         assert_eq!(FsStore::staged_key("abc", 2), "fs:uploads:abc:part:2");
         assert_eq!(FsStore::file_key("abc"), "fs:files:abc:meta");
-
-        // Distinct namespaces even with same id
         assert_ne!(FsStore::session_key("x"), FsStore::file_key("x"));
         assert_ne!(FsStore::session_key("x"), FsStore::staged_key("x", 0));
         assert!(FsStore::staged_key("x", 0).contains(":part:"));

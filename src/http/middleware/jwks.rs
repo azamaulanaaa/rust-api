@@ -195,6 +195,7 @@ fn to_signing_key(jwk: &Jwk) -> Option<(String, SigningKey)> {
 
 #[cfg(test)]
 mod tests {
+    use crate::unwrap_ext::{UnwrapExt, UnwrapErrExt};
     use super::*;
     use crate::http::middleware::jwks::test_support::*;
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -209,7 +210,7 @@ mod tests {
         let server = spawn_jwks(json!({ "keys": [key_a] })).await;
 
         let keys = JwksKeys::new(format!("{}/jwks", server.uri())).await?;
-        let signing_key = keys.get(Some("kid-a")).await.expect("kid-a should resolve");
+        let signing_key = keys.get(Some("kid-a")).await.expect_or_panic("kid-a should resolve");
         assert_eq!(signing_key.algorithm, Algorithm::RS256);
 
         Ok(())
@@ -263,7 +264,7 @@ mod tests {
             "kid-b",
             &enc_b,
         )?;
-        let signing_key = keys.get(Some("kid-b")).await.unwrap();
+        let signing_key = keys.get(Some("kid-b")).await.unwrap_or_panic();
         let validation = Validation::new(signing_key.algorithm);
         let decoded = decode::<TestClaims>(&token, &signing_key.decoding_key, &validation)?;
         assert_eq!(decoded.claims.sub, "u2");
@@ -279,7 +280,7 @@ mod tests {
         let server = spawn_jwks(json!({ "keys": [key_a] })).await;
         let keys = JwksKeys::new(format!("{}/jwks", server.uri())).await?;
 
-        let signing_key = keys.get(Some("kid-a")).await.expect("kid-a should resolve");
+        let signing_key = keys.get(Some("kid-a")).await.expect_or_panic("kid-a should resolve");
         let mut validation = Validation::new(signing_key.algorithm);
         assert_eq!(validation.algorithms.as_slice(), &[Algorithm::RS256]);
 
@@ -336,7 +337,7 @@ mod tests {
         let server = spawn_jwks(json!({ "keys": [ec_entry] })).await;
 
         let keys = JwksKeys::new(format!("{}/jwks", server.uri())).await?;
-        let signing_key = keys.get(Some("ec-1")).await.expect("ec-1 should resolve");
+        let signing_key = keys.get(Some("ec-1")).await.expect_or_panic("ec-1 should resolve");
         assert_eq!(signing_key.algorithm, Algorithm::ES256);
 
         Ok(())
@@ -344,12 +345,12 @@ mod tests {
 
     #[test]
     fn omits_alg_falls_back_to_rs256() {
-        let (key_a, _) = rsa_key("kid-legacy").unwrap();
+        let (key_a, _) = rsa_key("kid-legacy").unwrap_or_panic();
         let mut legacy = key_a.clone();
         legacy["alg"] = serde_json::Value::Null;
 
-        let jwk: Jwk = serde_json::from_value(legacy).unwrap();
-        let parsed = to_signing_key(&jwk).expect("legacy key without alg should load");
+        let jwk: Jwk = serde_json::from_value(legacy).unwrap_or_panic();
+        let parsed = to_signing_key(&jwk).expect_or_panic("legacy key without alg should load");
         assert_eq!(parsed.0, "kid-legacy");
         assert_eq!(parsed.1.algorithm, Algorithm::RS256);
 
@@ -365,7 +366,7 @@ mod tests {
             "n": URL_SAFE_NO_PAD.encode([1u8; 16]),
             "e": URL_SAFE_NO_PAD.encode([1u8; 3]),
         }))
-        .unwrap();
+        .unwrap_or_panic();
 
         assert!(to_signing_key(&jwk).is_none());
     }

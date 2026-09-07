@@ -76,6 +76,7 @@ impl ResponseError for ApiError {
 
 #[cfg(test)]
 mod tests {
+    use crate::unwrap_ext::{UnwrapExt, UnwrapErrExt};
     use super::*;
 
     #[test]
@@ -101,7 +102,7 @@ mod tests {
         // Source chain still exposes the cause for logging.
         assert_eq!(
             std::error::Error::source(&invalid)
-                .expect("cause retained")
+                .expect_or_panic("cause retained")
                 .to_string(),
             "raw jwks dump"
         );
@@ -114,7 +115,7 @@ mod tests {
         assert_eq!(res.status(), 401);
 
         // Re-render through a full request cycle to exercise serialization.
-        let body = actix_web::body::to_bytes(res.into_body()).await.unwrap();
+        let body = actix_web::body::to_bytes(res.into_body()).await.unwrap_or_panic();
         assert_eq!(&body[..], br#"{"error":"authentication required"}"#);
     }
 }

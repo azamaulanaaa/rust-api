@@ -130,9 +130,10 @@ pub struct ProgressResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::unwrap_ext::{UnwrapErrExt, UnwrapExt};
 
     fn assert_bad(req: InitRequest, contains: &str) {
-        let err = req.validate().unwrap_err().to_string();
+        let err = req.validate().unwrap_err_or_panic().to_string();
         assert!(
             err.contains(contains),
             "expected '{contains}' in '{err}' for {req:?}"
@@ -194,7 +195,7 @@ mod tests {
             file_total_parts: 1,
         }
         .validate()
-        .unwrap();
+        .unwrap_or_panic();
     }
 
     #[test]
@@ -241,32 +242,28 @@ mod tests {
             file_total_parts: 4,
         }
         .validate()
-        .unwrap();
+        .unwrap_or_panic();
     }
 
     #[test]
     fn complete_request_rejects_empty_fields() {
-        assert!(
-            CompleteRequest {
-                name: "   ".into(),
-                mimetype: "text/plain".into()
-            }
-            .validate()
-            .is_err()
-        );
-        assert!(
-            CompleteRequest {
-                name: "file.bin".into(),
-                mimetype: "  ".into()
-            }
-            .validate()
-            .is_err()
-        );
+        assert!(CompleteRequest {
+            name: "   ".into(),
+            mimetype: "text/plain".into()
+        }
+        .validate()
+        .is_err());
+        assert!(CompleteRequest {
+            name: "file.bin".into(),
+            mimetype: "  ".into()
+        }
+        .validate()
+        .is_err());
         CompleteRequest {
             name: "file.bin".into(),
             mimetype: "application/octet-stream".into(),
         }
         .validate()
-        .unwrap();
+        .unwrap_or_panic();
     }
 }
