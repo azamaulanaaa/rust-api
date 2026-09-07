@@ -377,13 +377,12 @@ impl Authorizer {
 
 #[cfg(test)]
 mod tests {
-    use crate::unwrap_ext::{UnwrapExt, UnwrapErrExt};
     use super::*;
 
     async fn engine() -> PolicyEngine {
         let prefix = format!("test-policy-mod-{}-{}", std::process::id(), uuid_like());
         let s3 = crate::db::build_test_store(&prefix).await;
-        PolicyEngine::init_s3(s3).await.unwrap_or_panic()
+        PolicyEngine::init_s3(s3).await.unwrap()
     }
 
     fn uuid_like() -> String {
@@ -398,15 +397,15 @@ mod tests {
         engine
             .assign_group("alice".into(), "admins".into())
             .await
-            .unwrap_or_panic();
+            .unwrap();
         engine
             .assign_group("bob".into(), "viewers".into())
             .await
-            .unwrap_or_panic();
+            .unwrap();
         engine
             .assign_group("carol".into(), "admins".into())
             .await
-            .unwrap_or_panic();
+            .unwrap();
 
         // Groups are listed sorted with member counts.
         let groups = engine.list_groups().await;
@@ -423,7 +422,7 @@ mod tests {
         assert_eq!(users[2].sub, "carol");
 
         // Deleting a group removes every link to it at once.
-        assert!(engine.delete_group("admins").await.unwrap_or_panic());
+        assert!(engine.delete_group("admins").await.unwrap());
         let groups = engine.list_groups().await;
         let names: Vec<&str> = groups.iter().map(|g| g.name.as_str()).collect();
         assert_eq!(names, vec!["viewers"]);
@@ -431,7 +430,7 @@ mod tests {
         assert!(engine.get_groups_of_user("carol").await.is_empty());
 
         // Deleting an unknown group reports no-op rather than failing.
-        assert!(!engine.delete_group("admins").await.unwrap_or_panic());
+        assert!(!engine.delete_group("admins").await.unwrap());
     }
 
     #[tokio::test]
@@ -441,17 +440,17 @@ mod tests {
         engine
             .assign_group("alice".into(), "editors".into())
             .await
-            .unwrap_or_panic();
+            .unwrap();
         engine
             .add_rule("editors".into(), "invoices".into(), Action::Write)
             .await
-            .unwrap_or_panic();
+            .unwrap();
 
         // Plain string object.
         engine
             .require("alice", "invoices", Action::Write)
             .await
-            .unwrap_or_panic();
+            .unwrap();
 
         // Business modules may define their own IDE-completable object
         // enums; anything AsRef<str> drops straight into require().
@@ -469,7 +468,7 @@ mod tests {
         engine
             .require("alice", BizObject::Invoices, Action::Write)
             .await
-            .unwrap_or_panic();
+            .unwrap();
         assert!(
             engine
                 .require("alice", BizObject::Invoices, Action::Read)

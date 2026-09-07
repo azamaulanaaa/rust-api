@@ -28,10 +28,6 @@ use rust_api::{
 
 mod config;
 
-/// Test-only helper to replace `unwrap`/`expect` (shared with lib tests).
-#[cfg(test)]
-mod unwrap_ext;
-
 /// Command-line interface for the rust-api server binary.
 #[derive(Parser, Debug)]
 #[command(version)]

@@ -128,40 +128,34 @@ pub struct S3Config {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::unwrap_ext::{UnwrapErrExt, UnwrapExt};
     use std::io::Write;
 
     fn tmp_toml(content: &str) -> std::path::PathBuf {
-        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
         let path = std::env::temp_dir().join(format!(
             "rust-api-config-{}-{}.toml",
             std::process::id(),
             URL_SAFE_NO_PAD.encode(rand::random::<[u8; 8]>())
         ));
-        let mut f = std::fs::File::create(&path).expect_or_panic("create temp toml");
-        f.write_all(content.as_bytes())
-            .expect_or_panic("write toml");
+        let mut f = std::fs::File::create(&path).expect("create temp toml");
+        f.write_all(content.as_bytes()).expect("write toml");
         path
     }
 
     #[test]
     fn try_from_rejects_not_a_file() {
         let dir = std::env::temp_dir();
-        let err = Config::try_from(dir.as_path())
-            .unwrap_err_or_panic()
-            .to_string();
+        let err = Config::try_from(dir.as_path()).unwrap_err().to_string();
         assert!(err.contains("is not a file"));
         let ghost = std::path::Path::new("/tmp/rust-api-ghost-config-xyz-999.toml");
-        let err = Config::try_from(ghost).unwrap_err_or_panic().to_string();
+        let err = Config::try_from(ghost).unwrap_err().to_string();
         assert!(err.contains("is not a file"));
     }
 
     #[test]
     fn try_from_fails_on_invalid_toml() {
         let path = tmp_toml("not = toml [[[ ");
-        let err = Config::try_from(path.as_path())
-            .unwrap_err_or_panic()
-            .to_string();
+        let err = Config::try_from(path.as_path()).unwrap_err().to_string();
         assert!(err.contains("Failed to parse config file"));
         let _ = std::fs::remove_file(&path);
     }
@@ -182,7 +176,7 @@ mod tests {
             region = "us-east-1"
         "#;
         let path = tmp_toml(toml);
-        let cfg = Config::try_from(path.as_path()).expect_or_panic("should parse");
+        let cfg = Config::try_from(path.as_path()).expect("should parse");
         assert_eq!(cfg.public_address, "https://example.test");
         assert_eq!(cfg.listen_port, 8080);
         assert_eq!(cfg.authorization.client_id, "cid");
@@ -224,7 +218,7 @@ mod tests {
             sample_ratio = 0.5
         "#;
         let path = tmp_toml(toml);
-        let cfg = Config::try_from(path.as_path()).unwrap_or_panic();
+        let cfg = Config::try_from(path.as_path()).unwrap();
         assert_eq!(
             cfg.s3.endpoint_url.as_deref(),
             Some("http://localhost:9000")
@@ -257,7 +251,7 @@ mod tests {
             region = "us-east-1"
         "#;
         let path = tmp_toml(toml);
-        let cfg = Config::try_from(path.as_path()).unwrap_or_panic();
+        let cfg = Config::try_from(path.as_path()).unwrap();
         assert_eq!(cfg.database.prefix, "custom/prefix");
         let _ = std::fs::remove_file(&path);
     }

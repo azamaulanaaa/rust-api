@@ -160,7 +160,6 @@ impl SnapshotManager {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use crate::unwrap_ext::{UnwrapExt, UnwrapErrExt};
     use super::*;
     use crate::fs::object_store::ObjectStoreClient;
     use crate::fs::store::{FileRecord, FsStore};
@@ -200,7 +199,7 @@ mod tests {
         let mgr = SnapshotManager::new(wal, store, policy, s3, "b".into());
         let meta = mgr.build_full("alice").await?;
         assert_eq!(meta.applied_seq, 0);
-        let loaded = mgr.load_meta("alice").await?.unwrap_or_panic();
+        let loaded = mgr.load_meta("alice").await?.unwrap();
         assert_eq!(loaded.version, 0);
 
         // The snapshot object holds exactly the files alice may read.

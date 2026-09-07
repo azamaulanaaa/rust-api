@@ -89,7 +89,6 @@ impl crate::fs::store::UploadSession {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use crate::unwrap_ext::{UnwrapExt, UnwrapErrExt};
     use super::*;
     use std::sync::Arc;
 
@@ -114,7 +113,7 @@ mod tests {
         };
         let store = FsStore::new(build_test_store(&prefix).await);
         let policy_store = build_test_store(&format!("{prefix}-policy")).await;
-        let policy = PolicyEngine::init_s3(policy_store).await.unwrap_or_panic();
+        let policy = PolicyEngine::init_s3(policy_store).await.unwrap();
         let s3 = ObjectStoreClient::in_memory();
         FsEngine::from_parts(store, s3, "test-bucket".into(), policy)
     }

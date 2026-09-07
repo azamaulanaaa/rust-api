@@ -3,7 +3,7 @@
 //! Minted after row authorization; verified on `PUT`/`GET` without
 //! additional policy checks. Short-lived (5m) HMAC.
 
-use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
+use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use serde::{Deserialize, Serialize};
 
 use crate::fs::error::FsError;
@@ -66,13 +66,12 @@ pub fn verify(token: &str, file_id: &str, act: Action, secret: &[u8]) -> Result<
 mod tests {
     use super::*;
     use crate::policy::Action;
-    use crate::unwrap_ext::{UnwrapErrExt, UnwrapExt};
 
     #[test]
     fn round_trip() {
         let secret = b"test-secret-32-bytes-long-xxxxxx";
-        let token = mint("alice", "file1", Action::Read, secret, Some(60)).unwrap_or_panic();
-        let claims = verify(&token, "file1", Action::Read, secret).unwrap_or_panic();
+        let token = mint("alice", "file1", Action::Read, secret, Some(60)).unwrap();
+        let claims = verify(&token, "file1", Action::Read, secret).unwrap();
         assert_eq!(claims.sub, "alice");
         assert_eq!(claims.file_id, "file1");
         assert_eq!(claims.act, "read");
@@ -81,7 +80,7 @@ mod tests {
     #[test]
     fn rejects_wrong_file_or_act() {
         let secret = b"test-secret-32-bytes-long-xxxxxx";
-        let token = mint("alice", "file1", Action::Read, secret, Some(60)).unwrap_or_panic();
+        let token = mint("alice", "file1", Action::Read, secret, Some(60)).unwrap();
         assert!(verify(&token, "file2", Action::Read, secret).is_err());
         assert!(verify(&token, "file1", Action::Write, secret).is_err());
     }
@@ -100,7 +99,7 @@ mod tests {
             &past,
             &EncodingKey::from_secret(secret),
         )
-        .unwrap_or_panic();
+        .unwrap();
         assert!(verify(&token, "file1", Action::Read, secret).is_err());
     }
 }

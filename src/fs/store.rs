@@ -346,7 +346,6 @@ impl FsStore {
 mod store_tests {
     use super::{FileRecord, FsStore, UploadSession};
     use crate::db::build_test_store;
-    use crate::unwrap_ext::UnwrapExt;
 
     async fn test_store() -> FsStore {
         let prefix = {
@@ -381,7 +380,7 @@ mod store_tests {
         let store = test_store().await;
         let sess = sample_session("sess-1");
         store.save_session(&sess).await?;
-        let loaded = store.get_session("sess-1").await?.expect_or_panic("should exist");
+        let loaded = store.get_session("sess-1").await?.expect("should exist");
         assert_eq!(loaded.id, "sess-1");
         assert_eq!(loaded.s3_key, "files/sess-1");
         store.delete_session("sess-1").await?;
@@ -405,11 +404,11 @@ mod store_tests {
             .save_staged_part("sess-2", 1, b"chunk1".to_vec())
             .await?;
         assert_eq!(
-            store.get_staged_part("sess-2", 0).await?.unwrap_or_panic(),
+            store.get_staged_part("sess-2", 0).await?.unwrap(),
             b"chunk0"
         );
         assert_eq!(
-            store.get_staged_part("sess-2", 1).await?.unwrap_or_panic(),
+            store.get_staged_part("sess-2", 1).await?.unwrap(),
             b"chunk1"
         );
         store.delete_session("sess-2").await?;
@@ -433,7 +432,7 @@ mod store_tests {
             created_at: chrono::Utc::now().timestamp(),
         };
         store.save_file(&rec).await?;
-        let loaded = store.get_file("file-1").await?.unwrap_or_panic();
+        let loaded = store.get_file("file-1").await?.unwrap();
         assert_eq!(loaded.name, "hello.txt");
         assert_eq!(loaded.mimetype, "text/plain");
         store.delete_file("file-1").await?;

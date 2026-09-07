@@ -110,7 +110,8 @@ mod tests {
         let server = spawn_jwks(jwks).await;
 
         let store_prefix = format!("rust-api-setup-test-{}-{}", std::process::id(), uuid_like());
-        let shared_store = std::sync::Arc::new(object_store::memory::InMemory::new()) as std::sync::Arc<dyn object_store::ObjectStore>;
+        let shared_store = std::sync::Arc::new(object_store::memory::InMemory::new())
+            as std::sync::Arc<dyn object_store::ObjectStore>;
         let s3 = crate::db::build_test_store_with_inner(shared_store.clone(), &store_prefix).await;
         let engine = PolicyEngine::init_s3(s3).await?;
         Ok(Fixture {

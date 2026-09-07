@@ -17,7 +17,9 @@ use crate::fs::s3::S3ClientConfig;
 /// Delegates to [`s3_builder`](crate::fs::object_store::s3_builder) so the
 /// file-byte client and the OxKV stores share one `AmazonS3Builder` setup;
 /// returns the raw store so `S3StoreBuilder` can wrap it.
-pub fn build_object_store(cfg: &S3ClientConfig) -> Result<Arc<dyn ObjectStore>, object_store::Error> {
+pub fn build_object_store(
+    cfg: &S3ClientConfig,
+) -> Result<Arc<dyn ObjectStore>, object_store::Error> {
     let store = crate::fs::object_store::s3_builder(cfg).build()?;
     Ok(Arc::new(store))
 }

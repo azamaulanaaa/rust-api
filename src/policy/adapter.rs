@@ -366,7 +366,6 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crate::unwrap_ext::{UnwrapExt, UnwrapErrExt};
     use super::*;
     use casbin::{CoreApi, DefaultModel, Enforcer, MgmtApi};
     use oxkv::{BTreeStore, RedbStore};
@@ -387,18 +386,18 @@ mod tests {
     #[tokio::test]
     async fn persists_rules_across_reopen() {
         let path = std::env::temp_dir().join(format!("oxkv-adapter-test-{}", std::process::id()));
-        let model = DefaultModel::from_str(MODEL).await.unwrap_or_panic();
+        let model = DefaultModel::from_str(MODEL).await.unwrap();
 
         {
             let adapter = OxkvAdapter::new(
-                oxkv::HookStore::new(RedbStore::new_file(&path).unwrap_or_panic())
+                oxkv::HookStore::new(RedbStore::new_file(&path).unwrap())
                     .with_validator(PolicyRuleValidator),
             );
-            let mut enforcer = Enforcer::new(model, adapter).await.unwrap_or_panic();
+            let mut enforcer = Enforcer::new(model, adapter).await.unwrap();
             enforcer
                 .add_grouping_policy(vec!["user_1".to_string(), "admin".to_string()])
                 .await
-                .unwrap_or_panic();
+                .unwrap();
             enforcer
                 .add_policy(vec![
                     "admin".to_string(),
@@ -406,19 +405,19 @@ mod tests {
                     "read".to_string(),
                 ])
                 .await
-                .unwrap_or_panic();
-            assert!(enforcer.enforce(("user_1", "data_1", "read")).unwrap_or_panic());
+                .unwrap();
+            assert!(enforcer.enforce(("user_1", "data_1", "read")).unwrap());
         }
 
         {
-            let model = DefaultModel::from_str(MODEL).await.unwrap_or_panic();
+            let model = DefaultModel::from_str(MODEL).await.unwrap();
             let adapter = OxkvAdapter::new(
-                oxkv::HookStore::new(RedbStore::new_file(&path).unwrap_or_panic())
+                oxkv::HookStore::new(RedbStore::new_file(&path).unwrap())
                     .with_validator(PolicyRuleValidator),
             );
-            let enforcer = Enforcer::new(model, adapter).await.unwrap_or_panic();
-            assert!(enforcer.enforce(("user_1", "data_1", "read")).unwrap_or_panic());
-            assert!(!enforcer.enforce(("user_1", "data_1", "write")).unwrap_or_panic());
+            let enforcer = Enforcer::new(model, adapter).await.unwrap();
+            assert!(enforcer.enforce(("user_1", "data_1", "read")).unwrap());
+            assert!(!enforcer.enforce(("user_1", "data_1", "write")).unwrap());
         }
 
         std::fs::remove_file(path).ok();
@@ -431,13 +430,13 @@ mod tests {
             adapter
                 .add_policy("p", "p", vec!["u".into(), "o".into(), "read".into()])
                 .await
-                .unwrap_or_panic()
+                .unwrap()
         );
         assert!(
             !adapter
                 .add_policy("p", "p", vec!["u".into(), "o".into(), "read".into()])
                 .await
-                .unwrap_or_panic()
+                .unwrap()
         );
     }
 
@@ -455,15 +454,15 @@ mod tests {
                 ],
             )
             .await
-            .unwrap_or_panic();
+            .unwrap();
 
         let removed = adapter
             .remove_filtered_policy("p", "p", 0, vec!["alice".into()])
             .await
-            .unwrap_or_panic();
+            .unwrap();
         assert!(removed);
 
-        let remaining = adapter.load_all().await.unwrap_or_panic();
+        let remaining = adapter.load_all().await.unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].2[0], "bob");
     }
@@ -479,18 +478,18 @@ mod tests {
         store
             .set_bytes("p:p:ab01", br#"["alice","doc_a","read"]"#)
             .await
-            .unwrap_or_panic();
+            .unwrap();
 
         // Non-JSON value rejected.
-        let mut tx = store.begin_tx().unwrap_or_panic();
+        let mut tx = store.begin_tx().unwrap();
         assert!(tx.set_bytes("p:p:cd02", b"not json").await.is_err());
 
         // Wrong arity for section rejected at staging (g needs 2 fields).
-        let mut tx = store.begin_tx().unwrap_or_panic();
+        let mut tx = store.begin_tx().unwrap();
         assert!(tx.set_bytes("g:g:ef03", br#"["user"]"#).await.is_err());
 
         // Unknown section rejected at staging.
-        let mut tx = store.begin_tx().unwrap_or_panic();
+        let mut tx = store.begin_tx().unwrap();
         assert!(tx.set_bytes("x:m:ff04", br#"["a","b"]"#).await.is_err());
     }
 
@@ -508,14 +507,14 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert!(adapter.load_all().await.unwrap_or_panic().is_empty());
+        assert!(adapter.load_all().await.unwrap().is_empty());
 
         // A valid rule still writes.
         assert!(
             adapter
                 .add_policy("p", "p", vec!["u".into(), "o".into(), "read".into()])
                 .await
-                .unwrap_or_panic()
+                .unwrap()
         );
     }
 }
