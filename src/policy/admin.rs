@@ -93,7 +93,7 @@ pub async fn import(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{build_test_store, build_test_store_with_inner};
+    use crate::db::{build_test_store, build_test_store_new_session};
     use std::sync::Arc;
 
     #[tokio::test]
@@ -105,8 +105,8 @@ mod tests {
             URL_SAFE_NO_PAD.encode(rand::random::<[u8; 6]>())
         });
         let dst_prefix = format!("{src_prefix}-dst");
-        let src_store = build_test_store_with_inner(shared.clone(), &src_prefix).await;
-        let _dst_store = build_test_store_with_inner(shared.clone(), &dst_prefix).await;
+        let src_store = build_test_store_new_session(shared.clone(), &src_prefix).await;
+        let _dst_store = build_test_store_new_session(shared.clone(), &dst_prefix).await;
 
         let dump = PolicyDump {
             p: vec![vec!["admin".into(), "doc".into(), "read".into()]],
@@ -114,19 +114,20 @@ mod tests {
         };
         import_s3(src_store, &dump).await?;
 
-        // Need fresh store handle for export (S3Store not Clone, so rebuild with same inner+prefix)
-        let src_store2 = build_test_store_with_inner(shared.clone(), &src_prefix).await;
+        // Fresh handle, hence a new fencing session over the same prefix
+        // (S3Store is not Clone); the previous handle is dead by now.
+        let src_store2 = build_test_store_new_session(shared.clone(), &src_prefix).await;
         let dump = export_s3(src_store2).await?;
         let dump_bytes = serde_json::to_vec_pretty(&dump)?;
 
         let dump: PolicyDump = serde_json::from_slice(&dump_bytes)?;
-        let dst_store2 = build_test_store_with_inner(shared.clone(), &dst_prefix).await;
+        let dst_store2 = build_test_store_new_session(shared.clone(), &dst_prefix).await;
         let report = import_s3(dst_store2, &dump).await?;
         assert_eq!(report.rules_added, 1);
         assert_eq!(report.groups_added, 1);
 
         let dump: PolicyDump = serde_json::from_slice(&dump_bytes)?;
-        let dst_store3 = build_test_store_with_inner(shared, &dst_prefix).await;
+        let dst_store3 = build_test_store_new_session(shared, &dst_prefix).await;
         let again = import_s3(dst_store3, &dump).await?;
         assert_eq!(again.rules_added, 0);
         assert_eq!(again.groups_added, 0);

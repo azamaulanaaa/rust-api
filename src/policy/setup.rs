@@ -112,7 +112,7 @@ mod tests {
         let store_prefix = format!("rust-api-setup-test-{}-{}", std::process::id(), uuid_like());
         let shared_store = std::sync::Arc::new(object_store::memory::InMemory::new())
             as std::sync::Arc<dyn object_store::ObjectStore>;
-        let s3 = crate::db::build_test_store_with_inner(shared_store.clone(), &store_prefix).await;
+        let s3 = crate::db::build_test_store_new_session(shared_store.clone(), &store_prefix).await;
         let engine = PolicyEngine::init_s3(s3).await?;
         Ok(Fixture {
             server,
@@ -260,7 +260,7 @@ mod tests {
         let prefix = fx.store_prefix.clone();
         let shared = fx.shared_store.clone();
         drop(fx.engine);
-        let s3_reopened = crate::db::build_test_store_with_inner(shared.clone(), &prefix).await;
+        let s3_reopened = crate::db::build_test_store_new_session(shared.clone(), &prefix).await;
         let reopened = PolicyEngine::init_s3(s3_reopened).await?;
         let engine_clone = PolicyEngine {
             enforcer: reopened.enforcer.clone(),
