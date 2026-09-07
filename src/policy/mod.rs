@@ -61,7 +61,7 @@ impl FromStr for Action {
 /// Errors raised by [`PolicyEngine`] and [`Authorizer`].
 #[derive(Debug, Error)]
 pub enum PolicyError {
-    /// An operation on the embedded policy store failed.
+    /// An operation on the policy store failed.
     #[error("Policy store error: {0}")]
     Store(#[from] oxkv::StoreError),
 
@@ -74,8 +74,8 @@ pub enum PolicyError {
     AccessDenied,
 }
 
-/// Central authorization engine: a Casbin RBAC enforcer persisted to an
-/// embedded oxkv (Redb) database file, plus management helpers for rules
+/// Central authorization engine: a Casbin RBAC enforcer persisted to a
+/// prefix-scoped `S3Store`, plus management helpers for rules
 /// and group membership.
 ///
 /// Cloning is cheap: the enforcer lives behind an `Arc`, so clones share
@@ -129,7 +129,11 @@ impl PolicyEngine {
         Self::init_with_store(s3_store).await
     }
 
-    /// Generic initializer over any [`oxkv::Store`] (e.g. `S3Store`+`InMemory` for tests).
+    /// Generic initializer over any [`oxkv::Store`] (e.g. `S3Store` in
+    /// production, `InMemory`-backed `S3Store` or `BTreeStore` in tests).
+    ///
+    /// Writes are validated through [`PolicyRuleValidator`](adapter::PolicyRuleValidator)
+    /// by the adapter (see [`adapter::encode_rule`]).
     pub async fn init_with_store<S>(store: S) -> Result<Self, PolicyError>
     where
         S: oxkv::Store + Send + Sync + 'static,

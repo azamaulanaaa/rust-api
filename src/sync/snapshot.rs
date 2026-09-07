@@ -1,9 +1,8 @@
-//! Per-user filtered snapshots as `Redb` files on `S3`.
+//! Per-user filtered snapshots stored as JSON objects on `S3`.
 //!
-//! Master stays `Redb` file; snapshots are `Redb` files cached as `S3` objects.
-//! Full recalc when far behind; WAL replay later via `wal` range.
-
-use std::path::Path;
+//! The master [`FsStore`] lives on a prefix-scoped `S3Store`; snapshots are
+//! the per-user filtered file list serialized as JSON and cached as `S3`
+//! objects. Full recalc when far behind; WAL replay later via `wal` range.
 
 use serde::{Deserialize, Serialize};
 
@@ -57,9 +56,9 @@ impl SnapshotManager {
         }
     }
 
-    /// `S3` key for a snapshot.
+    /// `S3` key for a snapshot (JSON payload).
     pub fn snapshot_key(sub: &str, seq: u64) -> String {
-        format!("snapshots/{sub}/{seq:020}.redb")
+        format!("snapshots/{sub}/{seq:020}.json")
     }
 
     /// `S3` key for metadata.
@@ -77,7 +76,10 @@ impl SnapshotManager {
         }
     }
 
-    /// Build a full filtered snapshot for `sub` at current `wal` head (S3-only, no local file).
+    /// Build a full filtered snapshot for `sub` at current `wal` head.
+    ///
+    /// Files are filtered into an ephemeral scratch store, serialized as
+    /// JSON, and uploaded as one S3 object; no local files are involved.
     pub async fn build_full(&self, sub: &str) -> Result<SnapshotMeta, FsError> {
         let seq = self.wal.head().await?;
         let snap_prefix = format!(
@@ -85,7 +87,7 @@ impl SnapshotManager {
             sub.replace(['/', ':'], "_"),
             &uuid::Uuid::now_v7().to_string()[..8]
         );
-        let snap_store = FsStore::new(crate::db::build_test_store(&snap_prefix).await);
+        let snap_store = FsStore::new(crate::db::build_scratch_store(&snap_prefix).await);
         self.copy_filtered(sub, &snap_store).await?;
         let files = snap_store.list_files().await?;
         let data = serde_json::to_vec(&files).map_err(|e| FsError::Internal(e.to_string()))?;
@@ -153,11 +155,6 @@ impl SnapshotManager {
         }
         Ok(false)
     }
-
-    /// Remove temp file helper.
-    pub fn _tmp_path(_sub: &str) -> std::path::PathBuf {
-        Path::new("").to_path_buf()
-    }
 }
 
 #[cfg(test)]
@@ -169,19 +166,7 @@ mod tests {
     use crate::fs::store::{FileRecord, FsStore};
     use crate::policy::{Action, PolicyEngine};
 
-    #[allow(dead_code)]
-    fn tmp_path(label: &str) -> std::path::PathBuf {
-        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-        std::env::temp_dir().join(format!(
-            "snap-test-{}-{}-{}.redb",
-            std::process::id(),
-            URL_SAFE_NO_PAD.encode(rand::random::<[u8; 8]>()),
-            label
-        ))
-    }
-
     #[tokio::test]
-    #[ignore = "flaky on Windows redb file lock; will be migrated to S3Store"]
     async fn build_full_filters() -> anyhow::Result<()> {
         let wal = Wal::new(crate::db::build_test_store("snap-test-wal").await);
         let store = FsStore::new(crate::db::build_test_store("snap-test-store").await);
@@ -218,6 +203,15 @@ mod tests {
         let loaded = mgr.load_meta("alice").await?.unwrap_or_panic();
         assert_eq!(loaded.version, 0);
 
+        // The snapshot object holds exactly the files alice may read.
+        let key = SnapshotManager::snapshot_key("alice", 0);
+        assert!(key.ends_with(".json"));
+        let bytes = mgr.s3.get_object("b", &key).await?;
+        let files: Vec<FileRecord> = serde_json::from_slice(&bytes)?;
+        assert_eq!(
+            files.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(),
+            ["f1"]
+        );
         Ok(())
     }
 }

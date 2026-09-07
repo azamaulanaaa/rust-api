@@ -136,13 +136,14 @@ mod tests {
 
     #[tokio::test]
     async fn import_rejects_invalid_entries_via_validation_hook() {
-        // S3 path skips HookStore validator (S3Store not Clone), so invalid is currently accepted.
-        // Keep test as smoke — when HookStore<S3Store> Clone lands, re-enable strict check.
+        // The adapter enforces PolicyRuleValidator on every write path
+        // (HookStore cannot wrap the non-Clone S3Store), so an invalid dump
+        // fails the import instead of being persisted.
         let store = build_test_store("admin-test-invalid").await;
         let dump = PolicyDump {
             p: vec![vec!["only-one-field".to_string()]],
             g: vec![],
         };
-        let _ = import_s3(store, &dump).await;
+        assert!(import_s3(store, &dump).await.is_err());
     }
 }

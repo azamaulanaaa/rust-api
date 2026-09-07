@@ -58,7 +58,7 @@ pub async fn build_s3_store(cfg: &S3ClientConfig, prefix: &str) -> Result<S3Stor
 /// Builds an in-memory [`S3Store`] for tests (uses `skip_probe(true)` so
 /// `InMemory`'s missing conditional-write probe does not fail). Each prefix gets a
 /// fresh `InMemory` so tests are isolated; for sharing across clones within one test
-/// use `build_test_store_shared`.
+/// use `build_test_store_with_inner`.
 #[allow(clippy::expect_used)]
 pub async fn build_test_store(prefix: &str) -> S3Store {
     let inner = Arc::new(object_store::memory::InMemory::new()) as Arc<dyn ObjectStore>;
@@ -81,6 +81,25 @@ pub async fn build_test_store_with_inner(inner: Arc<dyn ObjectStore>, prefix: &s
         .build()
         .await
         .expect("test S3Store must build")
+}
+
+/// Builds an ephemeral [`S3Store`] over a fresh in-memory object store.
+///
+/// Production serialization buffer (e.g. assembling a snapshot before
+/// uploading it as one S3 object): nothing is durable here, the caller owns
+/// persistence. Uses `skip_probe(true)` since `InMemory` has no
+/// conditional-write probe. Callers must pass a unique `prefix` per buffer;
+/// sharing one prefix across buffers is a bug.
+#[allow(clippy::expect_used)]
+pub async fn build_scratch_store(prefix: &str) -> S3Store {
+    let inner = Arc::new(object_store::memory::InMemory::new()) as Arc<dyn ObjectStore>;
+    S3Store::builder()
+        .with_store(inner)
+        .with_prefix(ObjectPath::from(prefix))
+        .skip_probe(true)
+        .build()
+        .await
+        .expect("scratch S3Store must build")
 }
 
 #[cfg(test)]
