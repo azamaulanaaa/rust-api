@@ -6,6 +6,9 @@
 //! [`http::ApiModule`] implementations onto an [`http::ApiService`]
 //! to build their own API surface on top of the shared auth/policy plumbing.
 
+#![deny(clippy::unwrap_used, clippy::expect_used)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
 // Public items must carry rustdoc comments; the lint is enforced
 
 /// Test-only helper to replace `unwrap`/`expect` without triggering lints.

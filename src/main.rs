@@ -6,6 +6,9 @@
 //! `policy export/import` subcommands manage policy data as JSON for
 //! backups and migrations.
 
+#![deny(clippy::unwrap_used, clippy::expect_used)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
 use std::{
     net::{Ipv4Addr, SocketAddrV4},
     path::{Path, PathBuf},
