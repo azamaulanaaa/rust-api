@@ -45,6 +45,11 @@ pub fn build_object_store(cfg: &S3ClientConfig) -> Result<Arc<dyn ObjectStore>, 
 ///
 /// `prefix` is the object prefix (e.g. `"oxkv"` -> keys live under
 /// `oxkv/ownership.json`, `oxkv/e000000/wal/...`).
+///
+/// Contract: keep exactly one live handle per prefix. Each built store owns
+/// a fresh session (memtable/WAL buffer); two live handles on the same
+/// prefix can fence each other or diverge on real S3. Share the handle with
+/// `Arc` instead of building a second one.
 pub async fn build_s3_store(cfg: &S3ClientConfig, prefix: &str) -> Result<S3Store, StoreError> {
     let inner = build_object_store(cfg).map_err(|e| StoreError::Other(e.to_string()))?;
     let object_prefix = ObjectPath::from(prefix.trim_matches('/'));
@@ -72,6 +77,10 @@ pub async fn build_test_store(prefix: &str) -> S3Store {
 }
 
 /// Builds an in-memory [`S3Store`] sharing `inner` (for tests that need `clone`-like sharing).
+///
+/// Note: this creates a NEW session over the same prefix (separate
+/// memtable/WAL buffer), not a shared handle — adequate for single-threaded
+/// test reopen flows, not a model for production sharing.
 #[allow(clippy::expect_used)]
 pub async fn build_test_store_with_inner(inner: Arc<dyn ObjectStore>, prefix: &str) -> S3Store {
     S3Store::builder()
