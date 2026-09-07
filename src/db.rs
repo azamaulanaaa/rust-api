@@ -45,8 +45,8 @@ pub async fn build_s3_store(cfg: &S3ClientConfig, prefix: &str) -> Result<S3Stor
 
 /// Builds an in-memory [`S3Store`] for tests (uses `skip_probe(true)` so
 /// `InMemory`'s missing conditional-write probe does not fail). Each prefix gets a
-/// fresh `InMemory` so tests are isolated; for sharing across clones within one test
-/// use `build_test_store_with_inner`.
+/// fresh `InMemory` so tests are isolated; for reopening the same prefix
+/// within one test use [`build_test_store_new_session`].
 #[allow(clippy::expect_used)]
 pub async fn build_test_store(prefix: &str) -> S3Store {
     let inner = Arc::new(object_store::memory::InMemory::new()) as Arc<dyn ObjectStore>;
@@ -59,13 +59,14 @@ pub async fn build_test_store(prefix: &str) -> S3Store {
         .expect("test S3Store must build")
 }
 
-/// Builds an in-memory [`S3Store`] sharing `inner` (for tests that need `clone`-like sharing).
+/// Builds an in-memory [`S3Store`] over the shared `inner` backend at `prefix`.
 ///
-/// Note: this creates a NEW session over the same prefix (separate
-/// memtable/WAL buffer), not a shared handle — adequate for single-threaded
-/// test reopen flows, not a model for production sharing.
+/// This creates a NEW fencing session over the same prefix (separate
+/// memtable/WAL buffer superseding the previous session), not a shared
+/// handle — adequate for single-threaded test reopen flows where the old
+/// handle is dropped first, not a model for production sharing.
 #[allow(clippy::expect_used)]
-pub async fn build_test_store_with_inner(inner: Arc<dyn ObjectStore>, prefix: &str) -> S3Store {
+pub async fn build_test_store_new_session(inner: Arc<dyn ObjectStore>, prefix: &str) -> S3Store {
     S3Store::builder()
         .with_store(inner)
         .with_prefix(ObjectPath::from(prefix))
