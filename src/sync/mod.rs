@@ -1,7 +1,8 @@
 //! Per-user filtered clones with on-demand WAL replay.
 //!
-//! Master stays `Redb` file; per-user clones are `Redb` files cached as `S3` objects.
-//! When `oxkv` ships `S3` backend, only `Store` open changes.
+//! The master [`FsStore`](crate::fs::store::FsStore) lives on a prefix-scoped
+//! `S3Store`; per-user clones are the filtered file list serialized as JSON
+//! objects on `S3`.
 
 pub mod route;
 pub mod snapshot;

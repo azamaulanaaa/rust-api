@@ -34,6 +34,35 @@ fn store_err(e: oxkv::StoreError) -> CasbinError {
     CasbinError::AdapterError(AdapterError(Box::new(e)))
 }
 
+/// Encodes one rule as a validated `(key, value)` pair.
+///
+/// [`oxkv::HookStore`] cannot wrap [`oxkv::S3Store`] (`HookStore`'s `Store`
+/// impl requires the inner store to be `Clone`, which `S3Store` is not), so
+/// the adapter enforces [`PolicyRuleValidator`] directly on every write path
+/// instead of at the storage layer. Validation runs before any transaction
+/// opens, so rejected writes fail without touching the store.
+async fn encode_rule<S>(
+    store: &S,
+    sec: &str,
+    ptype: &str,
+    rule: &[String],
+) -> Result<(String, Vec<u8>), CasbinError>
+where
+    S: Store + Send + Sync,
+{
+    let key = rule_key(sec, ptype, rule);
+    // StoreError: From<serde_json::Error> — convert before crossing
+    // into casbin's error domain.
+    let value = serde_json::to_vec(rule)
+        .map_err(oxkv::StoreError::from)
+        .map_err(store_err)?;
+    PolicyRuleValidator
+        .validate(store, &key, &value)
+        .await
+        .map_err(store_err)?;
+    Ok((key, value))
+}
+
 /// Validates every write into the policy store before it becomes durable.
 ///
 /// Enforces the adapter's storage contract at the storage layer so a bug in
@@ -94,9 +123,10 @@ impl Validator for PolicyRuleValidator {
 
 /// A Casbin [`Adapter`] persisting policies to any [`oxkv::Store`].
 ///
-/// Generic over the backend so production can use the persistent
-/// [`oxkv::RedbStore`](https://docs.rs/oxkv) while tests use the in-memory
-/// B-tree store.
+/// Generic over the backend so production can use a prefix-scoped `S3Store`
+/// while tests use the in-memory B-tree store or an `InMemory`-backed `S3Store`.
+/// Every write path validates rules through [`PolicyRuleValidator`] (see
+/// [`encode_rule`]) before staging them.
 pub struct OxkvAdapter<S: Store> {
     store: S,
 }
@@ -211,16 +241,16 @@ where
             })
             .collect();
 
+        // Validate (and encode) every entry before opening the transaction
+        // so a malformed rule fails without touching the store.
+        let mut encoded = Vec::with_capacity(entries.len());
+        for (sec, ptype, rule) in &entries {
+            encoded.push(encode_rule(&self.store, sec, ptype, rule).await?);
+        }
+
         let mut tx = self.store.begin_tx().map_err(store_err)?;
-        for (sec, ptype, rule) in entries {
-            // StoreError: From<serde_json::Error> — convert before crossing
-            // into casbin's error domain.
-            let value = serde_json::to_vec(&rule)
-                .map_err(oxkv::StoreError::from)
-                .map_err(store_err)?;
-            tx.set_bytes(&rule_key(&sec, &ptype, &rule), &value)
-                .await
-                .map_err(store_err)?;
+        for (key, value) in &encoded {
+            tx.set_bytes(key, value).await.map_err(store_err)?;
         }
         tx.commit().await.map_err(store_err)?;
         Ok(())
@@ -249,20 +279,21 @@ where
         ptype: &str,
         rules: Vec<Vec<String>>,
     ) -> casbin::Result<bool> {
-        let keys: Vec<String> = rules.iter().map(|r| rule_key(sec, ptype, r)).collect();
-        let values: Vec<Vec<u8>> = rules
-            .iter()
-            .map(|r| serde_json::to_vec(r).map_err(oxkv::StoreError::from))
-            .collect::<Result<_, _>>()
-            .map_err(store_err)?;
+        // Validate (and encode) every rule before opening the transaction so
+        // a malformed rule fails without staging partial state; duplicate
+        // handling below is unchanged.
+        let mut encoded = Vec::with_capacity(rules.len());
+        for rule in &rules {
+            encoded.push(encode_rule(&self.store, sec, ptype, rule).await?);
+        }
 
         let mut tx = self.store.begin_tx().map_err(store_err)?;
-        for (key, value) in keys.iter().zip(values) {
+        for (key, value) in &encoded {
             if tx.has(key).await.map_err(store_err)? {
                 tx.rollback().await.map_err(store_err)?;
                 return Ok(false);
             }
-            tx.set_bytes(key, &value).await.map_err(store_err)?;
+            tx.set_bytes(key, value).await.map_err(store_err)?;
         }
         tx.commit().await.map_err(store_err)?;
         Ok(true)
@@ -461,5 +492,30 @@ mod tests {
         // Unknown section rejected at staging.
         let mut tx = store.begin_tx().unwrap_or_panic();
         assert!(tx.set_bytes("x:m:ff04", br#"["a","b"]"#).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn adapter_validates_writes_on_s3_store() {
+        // S3Store is not Clone, so HookStore cannot wrap it; the adapter
+        // enforces PolicyRuleValidator itself (see encode_rule).
+        let s3 = crate::db::build_test_store("adapter-s3-validate").await;
+        let mut adapter = OxkvAdapter::new(s3);
+
+        // Wrong arity rejected without touching the store.
+        assert!(
+            adapter
+                .add_policy("p", "p", vec!["only-one-field".into()])
+                .await
+                .is_err()
+        );
+        assert!(adapter.load_all().await.unwrap_or_panic().is_empty());
+
+        // A valid rule still writes.
+        assert!(
+            adapter
+                .add_policy("p", "p", vec!["u".into(), "o".into(), "read".into()])
+                .await
+                .unwrap_or_panic()
+        );
     }
 }

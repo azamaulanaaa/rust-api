@@ -34,7 +34,7 @@ impl ApiModule for SyncApiModule {
     }
 }
 
-/// Returns presigned `S3` URL or builds snapshot on demand.
+/// Returns the snapshot object key, building a fresh snapshot on demand.
 /// Falls back to full recalc when far behind or `WAL` missing.
 #[get("/clone")]
 async fn clone_handler(
