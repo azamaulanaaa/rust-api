@@ -1,10 +1,10 @@
-//! File-based WAL for master changes.
-//!
-//! Stored in same `Redb` file under `wal:{seq}` with `wal:seq` head.
-//! Migratable to `S3` backend when `oxkv` ships it.
+//! WAL for master changes on S3.
 
-use oxkv::GetSet;
+use std::sync::Arc;
+
+use oxkv::{GetSet, S3Store};
 use serde::{Deserialize, Serialize};
+use tokio::sync::RwLock;
 
 use crate::fs::error::FsError;
 
@@ -52,24 +52,18 @@ pub struct WalEntry {
     pub ts: i64,
 }
 
-/// File-based WAL stored in a `Redb` file.
+/// WAL stored in an [`S3Store`] (per-user S3, scalable).
 #[derive(Clone)]
 pub struct Wal {
-    store: std::sync::Arc<tokio::sync::RwLock<oxkv::RedbStore>>,
+    store: Arc<RwLock<S3Store>>,
 }
 
 impl Wal {
-    /// Open or create WAL file at `path`.
-    pub async fn open(path: &std::path::Path) -> Result<Self, FsError> {
-        if let Some(p) = path.parent()
-            && !p.as_os_str().is_empty()
-        {
-            std::fs::create_dir_all(p).map_err(|e| FsError::Internal(e.to_string()))?;
+    /// Creates a WAL from an [`S3Store`].
+    pub fn new(s3_store: S3Store) -> Self {
+        Self {
+            store: Arc::new(RwLock::new(s3_store)),
         }
-        let store = oxkv::RedbStore::new_file(path).map_err(|e| FsError::Store(e.to_string()))?;
-        Ok(Self {
-            store: std::sync::Arc::new(tokio::sync::RwLock::new(store)),
-        })
     }
 
     fn seq_key() -> &'static str {
@@ -141,24 +135,26 @@ impl Wal {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::db::build_test_store;
 
-    fn tmp_path() -> std::path::PathBuf {
-        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-        std::env::temp_dir().join(format!(
-            "wal-test-{}-{}.redb",
-            std::process::id(),
-            URL_SAFE_NO_PAD.encode(rand::random::<[u8; 8]>()),
-        ))
+    async fn test_wal() -> Wal {
+        let prefix = {
+            use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+            format!(
+                "test-wal-{}-{}",
+                std::process::id(),
+                URL_SAFE_NO_PAD.encode(rand::random::<[u8; 6]>())
+            )
+        };
+        let s3 = build_test_store(&prefix).await;
+        Wal::new(s3)
     }
 
     #[tokio::test]
     async fn append_and_range() -> anyhow::Result<()> {
-        let path = tmp_path();
-        let _ = std::fs::remove_file(&path);
-        let wal = Wal::open(&path).await?;
+        let wal = test_wal().await;
         assert_eq!(wal.head().await?, 0);
         wal.append(WalOp::Attach {
             row_type: "invoice".into(),
@@ -176,7 +172,6 @@ mod tests {
         let r = wal.range(1, 2).await?;
         assert_eq!(r.len(), 2);
         assert_eq!(r[0].seq, 1);
-        let _ = std::fs::remove_file(&path);
         Ok(())
     }
 }

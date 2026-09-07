@@ -91,8 +91,14 @@ fn default_service_name() -> String {
 /// Embedded policy-database settings.
 #[derive(Deserialize, Debug)]
 pub struct DatabaseConfig {
-    /// File path of the embedded oxkv (Redb) database backing policies.
-    pub path: String,
+    /// Object prefix inside the S3 bucket for OxKV keys (e.g. `"oxkv"`).
+    /// Defaults to `"oxkv"`.
+    #[serde(default = "default_db_prefix")]
+    pub prefix: String,
+}
+
+fn default_db_prefix() -> String {
+    "oxkv".to_string()
 }
 
 /// Object-store settings (AmazonS3 via object_store; InMemory for tests).
@@ -122,34 +128,40 @@ pub struct S3Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::unwrap_ext::{UnwrapErrExt, UnwrapExt};
     use std::io::Write;
 
     fn tmp_toml(content: &str) -> std::path::PathBuf {
-        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
         let path = std::env::temp_dir().join(format!(
             "rust-api-config-{}-{}.toml",
             std::process::id(),
             URL_SAFE_NO_PAD.encode(rand::random::<[u8; 8]>())
         ));
-        let mut f = std::fs::File::create(&path).expect("create temp toml");
-        f.write_all(content.as_bytes()).expect("write toml");
+        let mut f = std::fs::File::create(&path).expect_or_panic("create temp toml");
+        f.write_all(content.as_bytes())
+            .expect_or_panic("write toml");
         path
     }
 
     #[test]
     fn try_from_rejects_not_a_file() {
         let dir = std::env::temp_dir();
-        let err = Config::try_from(dir.as_path()).unwrap_err().to_string();
+        let err = Config::try_from(dir.as_path())
+            .unwrap_err_or_panic()
+            .to_string();
         assert!(err.contains("is not a file"));
         let ghost = std::path::Path::new("/tmp/rust-api-ghost-config-xyz-999.toml");
-        let err = Config::try_from(ghost).unwrap_err().to_string();
+        let err = Config::try_from(ghost).unwrap_err_or_panic().to_string();
         assert!(err.contains("is not a file"));
     }
 
     #[test]
     fn try_from_fails_on_invalid_toml() {
         let path = tmp_toml("not = toml [[[ ");
-        let err = Config::try_from(path.as_path()).unwrap_err().to_string();
+        let err = Config::try_from(path.as_path())
+            .unwrap_err_or_panic()
+            .to_string();
         assert!(err.contains("Failed to parse config file"));
         let _ = std::fs::remove_file(&path);
     }
@@ -164,13 +176,13 @@ mod tests {
             client_secret = "csecret"
             issuer_url = "https://idp.test"
             [database]
-            path = "/tmp/db.redb"
+            prefix = "oxkv"
             [s3]
             bucket = "my-bucket"
             region = "us-east-1"
         "#;
         let path = tmp_toml(toml);
-        let cfg = Config::try_from(path.as_path()).expect("should parse");
+        let cfg = Config::try_from(path.as_path()).expect_or_panic("should parse");
         assert_eq!(cfg.public_address, "https://example.test");
         assert_eq!(cfg.listen_port, 8080);
         assert_eq!(cfg.authorization.client_id, "cid");
@@ -179,6 +191,8 @@ mod tests {
         assert!(cfg.s3.endpoint_url.is_none());
         assert!(!cfg.s3.force_path_style);
         assert!(cfg.s3.access_key_id.is_none());
+        // new prefix defaults to "oxkv" when omitted
+        assert_eq!(cfg.database.prefix, "oxkv");
         // observability defaults when omitted
         assert_eq!(cfg.observability.service_name, "rust-api");
         assert!(cfg.observability.otlp_endpoint.is_none());
@@ -196,7 +210,7 @@ mod tests {
             client_secret = "s2"
             issuer_url = "https://idp.test"
             [database]
-            path = "/tmp/db2.redb"
+            prefix = "oxkv"
             [s3]
             bucket = "b2"
             region = "eu-west-1"
@@ -210,19 +224,41 @@ mod tests {
             sample_ratio = 0.5
         "#;
         let path = tmp_toml(toml);
-        let cfg = Config::try_from(path.as_path()).unwrap();
+        let cfg = Config::try_from(path.as_path()).unwrap_or_panic();
         assert_eq!(
             cfg.s3.endpoint_url.as_deref(),
             Some("http://localhost:9000")
         );
         assert!(cfg.s3.force_path_style);
         assert_eq!(cfg.s3.access_key_id.as_deref(), Some("ak"));
+        assert_eq!(cfg.database.prefix, "oxkv");
         assert_eq!(cfg.observability.service_name, "my-service");
         assert_eq!(cfg.observability.sample_ratio, 0.5);
         assert_eq!(
             cfg.observability.otlp_endpoint.as_deref(),
             Some("http://localhost:4317")
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn parses_database_prefix_override() {
+        let toml = r#"
+            public_address = "https://example.test"
+            listen_port = 8080
+            [authorization]
+            client_id = "cid"
+            client_secret = "s"
+            issuer_url = "https://idp.test"
+            [database]
+            prefix = "custom/prefix"
+            [s3]
+            bucket = "b"
+            region = "us-east-1"
+        "#;
+        let path = tmp_toml(toml);
+        let cfg = Config::try_from(path.as_path()).unwrap_or_panic();
+        assert_eq!(cfg.database.prefix, "custom/prefix");
         let _ = std::fs::remove_file(&path);
     }
 

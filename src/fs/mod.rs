@@ -15,7 +15,6 @@ pub mod store;
 /// Capability token for scoped file access.
 pub mod token;
 
-use std::path::Path;
 use std::sync::Arc;
 
 use crate::policy::row::RowAuthorizer;
@@ -37,14 +36,16 @@ pub struct FsEngine {
 }
 
 impl FsEngine {
-    /// Opens the `oxkv` store and builds the S3 client.
+    /// Creates the engine from an `S3Store` (per-user S3, scalable).
     pub async fn init(
-        store_path: &Path,
+        s3_store: oxkv::S3Store,
         s3_config: &s3::S3ClientConfig,
         policy: PolicyEngine,
     ) -> Result<Self, FsError> {
-        let store = FsStore::open(store_path).await?;
-        let s3 = s3::build_s3_client(s3_config).await;
+        let store = FsStore::new(s3_store);
+        let s3 = s3::build_s3_client(s3_config)
+            .await
+            .map_err(|e| FsError::Internal(format!("failed to build S3 client: {e}")))?;
         let secret = Self::gen_secret();
         Ok(Self {
             store,
@@ -448,32 +449,26 @@ impl FsEngine {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use crate::unwrap_ext::{UnwrapExt, UnwrapErrExt};
     use super::*;
 
     use crate::fs::object_store::ObjectStoreClient;
     use crate::policy::{Action, PolicyEngine};
     use bytes::Bytes;
 
-    fn tmp_path(label: &str) -> std::path::PathBuf {
-        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-        std::env::temp_dir().join(format!(
-            "rust-api-fs-engine-{}-{}-{}.redb",
-            std::process::id(),
-            URL_SAFE_NO_PAD.encode(rand::random::<[u8; 8]>()),
-            label
-        ))
-    }
-
-    async fn make_engine(sub: &str, _grant: bool) -> (FsEngine, std::path::PathBuf) {
-        let path = tmp_path(sub);
-        let _ = std::fs::remove_file(&path);
-        let store = FsStore::open(&path).await.unwrap();
-        let policy_path = tmp_path(&format!("{sub}-policy"));
-        let _ = std::fs::remove_file(&policy_path);
-        let policy = PolicyEngine::init(&policy_path).await.unwrap();
+    async fn make_engine(sub: &str, _grant: bool) -> FsEngine {
+        use crate::db::build_test_store;
+        let prefix = format!("test-fs-engine-{}-{sub}", {
+            use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+            URL_SAFE_NO_PAD.encode(rand::random::<[u8; 6]>())
+        });
+        let s3_store = build_test_store(&prefix).await;
+        let store = FsStore::new(s3_store);
+        let policy_prefix = format!("{prefix}-policy");
+        let policy_store = build_test_store(&policy_prefix).await;
+        let policy = PolicyEngine::init_s3(policy_store).await.unwrap_or_panic();
         let s3 = ObjectStoreClient::in_memory();
-        let engine = FsEngine::from_parts(store, s3, "test-bucket".to_string(), policy);
-        (engine, path)
+        FsEngine::from_parts(store, s3, "test-bucket".to_string(), policy)
     }
 
     fn valid_single() -> InitRequest {
@@ -494,7 +489,7 @@ mod tests {
 
     #[tokio::test]
     async fn init_upload_validates() -> anyhow::Result<()> {
-        let (engine, _p) = make_engine("alice", false).await;
+        let engine = make_engine("alice", false).await;
         let id = engine.init_upload(valid_single(), "alice").await?;
         assert!(!id.is_empty());
         let err = engine
@@ -507,27 +502,27 @@ mod tests {
                 "alice",
             )
             .await
-            .unwrap_err();
+            .unwrap_err_or_panic();
         assert!(matches!(err, FsError::BadRequest(_)));
         Ok(())
     }
 
     #[tokio::test]
     async fn temp_upload_owned_by_caller() -> anyhow::Result<()> {
-        let (engine, _p) = make_engine("alice", false).await;
+        let engine = make_engine("alice", false).await;
         let id = engine.init_upload(valid_single(), "alice").await?;
         // bob cannot write alice's session
         let err = engine
             .upload_part(&id, 0, Bytes::from(vec![1u8; 1024]), None, "bob")
             .await
-            .unwrap_err();
+            .unwrap_err_or_panic();
         assert!(matches!(err, FsError::Forbidden));
         Ok(())
     }
 
     #[tokio::test]
     async fn attach_requires_row_write() -> anyhow::Result<()> {
-        let (engine, _p) = make_engine("alice", false).await;
+        let engine = make_engine("alice", false).await;
         let id = engine.init_upload(valid_single(), "alice").await?;
         engine
             .upload_part(&id, 0, Bytes::from(vec![1u8; 1024]), None, "alice")
@@ -549,7 +544,7 @@ mod tests {
             .policy
             .add_rule("alice".into(), "invoice:123".into(), Action::Write)
             .await
-            .unwrap();
+            .unwrap_or_panic();
         assert_eq!(engine.attach("invoice", "123", &id, "alice").await?, 1);
         // idempotent
         assert_eq!(engine.attach("invoice", "123", &id, "alice").await?, 1);
@@ -558,7 +553,7 @@ mod tests {
 
     #[tokio::test]
     async fn row_access_grants_file_read() -> anyhow::Result<()> {
-        let (engine, _p) = make_engine("alice", false).await;
+        let engine = make_engine("alice", false).await;
         let id = engine.init_upload(valid_single(), "alice").await?;
         engine
             .upload_part(&id, 0, Bytes::from(vec![7u8; 1024]), None, "alice")
@@ -580,13 +575,13 @@ mod tests {
             .policy
             .add_rule("alice".into(), "invoice:123".into(), Action::Write)
             .await
-            .unwrap();
+            .unwrap_or_panic();
         engine.attach("invoice", "123", &id, "alice").await?;
         engine
             .policy
             .add_rule("bob".into(), "invoice:123".into(), Action::Read)
             .await
-            .unwrap();
+            .unwrap_or_panic();
         let meta = engine.get_metadata(&id, "bob").await?;
         assert_eq!(meta.name, "doc.txt");
         Ok(())
@@ -594,7 +589,7 @@ mod tests {
 
     #[tokio::test]
     async fn token_mint_verify() -> anyhow::Result<()> {
-        let (engine, _p) = make_engine("alice", false).await;
+        let engine = make_engine("alice", false).await;
         let tok = engine.mint_token("alice", "file1", Action::Read)?;
         engine.verify_token(&tok, "file1", Action::Read)?;
         assert!(engine.verify_token(&tok, "file1", Action::Write).is_err());

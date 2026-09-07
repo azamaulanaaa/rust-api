@@ -290,7 +290,7 @@ impl S3Client for ObjectStoreClient {
 ///
 /// Supports S3-compatible endpoints (MinIO, R2) via `endpoint_url` and
 /// `force_path_style`. For `http` endpoints `allow_http` is enabled.
-pub fn build_object_store(config: &S3ClientConfig) -> Arc<dyn S3Client> {
+pub fn build_object_store(config: &S3ClientConfig) -> Result<Arc<dyn S3Client>, object_store::Error> {
     use object_store::aws::AmazonS3Builder;
 
     let mut builder = AmazonS3Builder::new()
@@ -315,18 +315,15 @@ pub fn build_object_store(config: &S3ClientConfig) -> Arc<dyn S3Client> {
         builder = builder.with_virtual_hosted_style_request(false);
     }
 
-    let store = match builder.build() {
-        Ok(s) => s,
-        Err(e) => panic!("failed to build object_store AmazonS3: {e}"),
-    };
+    let store = builder.build()?;
     let inner = Arc::new(store);
-    Arc::new(ObjectStoreClient::new_combined(inner))
+    Ok(Arc::new(ObjectStoreClient::new_combined(inner)))
 }
 
 /// Builds an [`S3Client`] using the object-store stack.
 ///
 /// This is the object-store replacement for [`crate::fs::s3::build_s3_client`].
-pub async fn build_s3_client(config: &S3ClientConfig) -> Arc<dyn S3Client> {
+pub async fn build_s3_client(config: &S3ClientConfig) -> Result<Arc<dyn S3Client>, object_store::Error> {
     build_object_store(config)
 }
 

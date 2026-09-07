@@ -1,9 +1,10 @@
 //! `oxkv` persistence for upload sessions, file records, and relations.
-//! Keys: `fs:uploads:{id}:meta`, `fs:files:{id}:meta`, `fs:rel:{type}:{id}:{file}`, `fs:files:{id}:refs`
+//! Backed by [`oxkv::S3Store`] (LSM on S3). Keys: `fs:uploads:{id}:meta`, `fs:files:{id}:meta`, `fs:rel:{type}:{id}:{file}`, `fs:files:{id}:refs`.
+//! Scales per-user: each S3Store is prefix-scoped (e.g. `oxkv/fs`) on the shared `ObjectStore`; no per-user Redb file.
 
 use std::sync::Arc;
 
-use oxkv::GetSet;
+use oxkv::{GetSet, S3Store};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
@@ -32,8 +33,6 @@ pub struct UploadSession {
     /// Per-part ETags (None = not yet uploaded).
     pub etags: Vec<Option<String>>,
     /// Per-part SHA256 checksums (base64, None = not provided).
-    /// Added for direct S3 checksum passthrough; `#[serde(default)]` keeps old
-    /// 2-field sessions readable.
     #[serde(default)]
     pub checksums: Vec<Option<String>>,
 }
@@ -57,24 +56,18 @@ pub struct FileRecord {
     pub created_at: i64,
 }
 
-/// Thin wrapper around an `oxkv` Redb store for FS keys.
+/// Thin wrapper around an `oxkv` S3 store for FS keys.
 #[derive(Clone)]
 pub struct FsStore {
-    inner: Arc<RwLock<oxkv::RedbStore>>,
+    inner: Arc<RwLock<S3Store>>,
 }
 
 impl FsStore {
-    /// Opens (or creates) the Redb file at `path`. Parent dirs are created as needed.
-    pub async fn open(path: &std::path::Path) -> Result<Self, FsError> {
-        if let Some(parent) = path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            std::fs::create_dir_all(parent).map_err(|e| FsError::Internal(e.to_string()))?;
+    /// Creates an FS store from an [`S3Store`] (per-user S3, scalable).
+    pub fn new(s3_store: S3Store) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(s3_store)),
         }
-        let inner = oxkv::RedbStore::new_file(path).map_err(|e| FsError::Store(e.to_string()))?;
-        Ok(Self {
-            inner: Arc::new(RwLock::new(inner)),
-        })
     }
 
     fn session_key(id: &str) -> String {
@@ -273,11 +266,7 @@ impl FsStore {
         Ok(info.count)
     }
 
-    async fn get_ref_info_inner(
-        &self,
-        g: &oxkv::RedbStore,
-        file_id: &str,
-    ) -> Result<RefInfo, FsError> {
+    async fn get_ref_info_inner(&self, g: &S3Store, file_id: &str) -> Result<RefInfo, FsError> {
         let key = refs_key(file_id);
         let Some(bytes) = g
             .get_bytes(&key)
@@ -301,7 +290,6 @@ impl FsStore {
         let mut out = Vec::new();
         for kv in kvs {
             if kv.key.starts_with(crate::fs::relation::REL_PREFIX) && kv.key.ends_with(&suffix) {
-                // key = fs:rel:{type}:{id}:{file}
                 let rest = &kv.key[crate::fs::relation::REL_PREFIX.len()..];
                 if let Some((ty, rem)) = rest.split_once(':')
                     && let Some((rid, _)) = rem.split_once(':')
@@ -356,18 +344,21 @@ impl FsStore {
 
 #[cfg(test)]
 mod store_tests {
-    use std::path::PathBuf;
-
     use super::{FileRecord, FsStore, UploadSession};
-    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    use crate::db::build_test_store;
+    use crate::unwrap_ext::UnwrapExt;
 
-    fn tmp_path(suffix: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "rust-api-fs-store-{}-{}-{}.redb",
-            std::process::id(),
-            URL_SAFE_NO_PAD.encode(rand::random::<[u8; 8]>()),
-            suffix
-        ))
+    async fn test_store() -> FsStore {
+        let prefix = {
+            use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+            format!(
+                "test-fs-{}-{}",
+                std::process::id(),
+                URL_SAFE_NO_PAD.encode(rand::random::<[u8; 6]>())
+            )
+        };
+        let s3 = build_test_store(&prefix).await;
+        FsStore::new(s3)
     }
 
     fn sample_session(id: &str) -> UploadSession {
@@ -386,40 +377,22 @@ mod store_tests {
     }
 
     #[tokio::test]
-    async fn open_creates_parent_dirs() -> anyhow::Result<()> {
-        let dir = tmp_path("parent");
-        let nested = dir.join("a/b/c/store.redb");
-        let _ = std::fs::remove_file(&nested);
-        let store = FsStore::open(&nested).await?;
-        assert!(nested.exists() || store.get_session("nonexistent").await?.is_none());
-        let _ = std::fs::remove_file(&nested);
-        let _ = std::fs::remove_dir_all(dir);
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn session_save_get_delete_roundtrip() -> anyhow::Result<()> {
-        let path = tmp_path("sess");
-        let _ = std::fs::remove_file(&path);
-        let store = FsStore::open(&path).await?;
+        let store = test_store().await;
         let sess = sample_session("sess-1");
         store.save_session(&sess).await?;
-        let loaded = store.get_session("sess-1").await?.expect("should exist");
+        let loaded = store.get_session("sess-1").await?.expect_or_panic("should exist");
         assert_eq!(loaded.id, "sess-1");
         assert_eq!(loaded.s3_key, "files/sess-1");
         store.delete_session("sess-1").await?;
         assert!(store.get_session("sess-1").await?.is_none());
-        // deleting again is idempotent (covers None branch in delete_session)
         store.delete_session("sess-1").await?;
-        let _ = std::fs::remove_file(&path);
         Ok(())
     }
 
     #[tokio::test]
     async fn delete_session_cleans_staged_parts() -> anyhow::Result<()> {
-        let path = tmp_path("staged-clean");
-        let _ = std::fs::remove_file(&path);
-        let store = FsStore::open(&path).await?;
+        let store = test_store().await;
         let mut sess = sample_session("sess-2");
         sess.file_total_parts = 2;
         sess.etags = vec![None, None];
@@ -432,28 +405,24 @@ mod store_tests {
             .save_staged_part("sess-2", 1, b"chunk1".to_vec())
             .await?;
         assert_eq!(
-            store.get_staged_part("sess-2", 0).await?.unwrap(),
+            store.get_staged_part("sess-2", 0).await?.unwrap_or_panic(),
             b"chunk0"
         );
         assert_eq!(
-            store.get_staged_part("sess-2", 1).await?.unwrap(),
+            store.get_staged_part("sess-2", 1).await?.unwrap_or_panic(),
             b"chunk1"
         );
         store.delete_session("sess-2").await?;
         assert!(store.get_session("sess-2").await?.is_none());
-        // staged keys should be cleaned - direct check via prefix scan
         assert!(store.get_staged_part("sess-2", 0).await?.is_none());
         assert!(store.get_staged_part("sess-2", 1).await?.is_none());
         assert!(store.get_staged_part("sess-2", 99).await?.is_none());
-        let _ = std::fs::remove_file(&path);
         Ok(())
     }
 
     #[tokio::test]
     async fn file_save_get_delete_roundtrip() -> anyhow::Result<()> {
-        let path = tmp_path("file");
-        let _ = std::fs::remove_file(&path);
-        let store = FsStore::open(&path).await?;
+        let store = test_store().await;
         let rec = FileRecord {
             id: "file-1".to_string(),
             name: "hello.txt".to_string(),
@@ -464,22 +433,18 @@ mod store_tests {
             created_at: chrono::Utc::now().timestamp(),
         };
         store.save_file(&rec).await?;
-        let loaded = store.get_file("file-1").await?.unwrap();
+        let loaded = store.get_file("file-1").await?.unwrap_or_panic();
         assert_eq!(loaded.name, "hello.txt");
         assert_eq!(loaded.mimetype, "text/plain");
         store.delete_file("file-1").await?;
         assert!(store.get_file("file-1").await?.is_none());
         assert!(store.get_file("nonexistent").await?.is_none());
-        let _ = std::fs::remove_file(&path);
         Ok(())
     }
 
     #[tokio::test]
     async fn list_sessions_filters_and_deserializes() -> anyhow::Result<()> {
-        let path = tmp_path("list");
-        let _ = std::fs::remove_file(&path);
-        let store = FsStore::open(&path).await?;
-        // initially empty
+        let store = test_store().await;
         assert!(store.list_sessions().await?.is_empty());
         let s1 = sample_session("list-a");
         let mut s2 = sample_session("list-b");
@@ -488,7 +453,6 @@ mod store_tests {
         s2.checksums = vec![None, None];
         store.save_session(&s1).await?;
         store.save_session(&s2).await?;
-        // also save a file record to ensure filter excludes it
         let rec = FileRecord {
             id: "file-x".to_string(),
             name: "x".into(),
@@ -504,18 +468,14 @@ mod store_tests {
         assert_eq!(sessions.len(), 2);
         assert_eq!(sessions[0].id, "list-a");
         assert_eq!(sessions[1].id, "list-b");
-        let _ = std::fs::remove_file(&path);
         Ok(())
     }
 
     #[tokio::test]
     async fn get_session_returns_none_when_missing() -> anyhow::Result<()> {
-        let path = tmp_path("missing");
-        let _ = std::fs::remove_file(&path);
-        let store = FsStore::open(&path).await?;
+        let store = test_store().await;
         assert!(store.get_session("ghost").await?.is_none());
         assert!(store.get_staged_part("ghost", 0).await?.is_none());
-        let _ = std::fs::remove_file(&path);
         Ok(())
     }
 }

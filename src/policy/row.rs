@@ -86,17 +86,9 @@ impl RowAuthorizer for Authorizer {
 
 #[cfg(test)]
 mod tests {
+    use crate::unwrap_ext::{UnwrapExt, UnwrapErrExt};
     use super::*;
     use crate::policy::{Action, PolicyEngine};
-
-    fn tmp_path() -> std::path::PathBuf {
-        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-        std::env::temp_dir().join(format!(
-            "row-test-{}-{}.redb",
-            std::process::id(),
-            URL_SAFE_NO_PAD.encode(rand::random::<[u8; 8]>())
-        ))
-    }
 
     #[tokio::test]
     async fn row_object_formatting() {
@@ -105,29 +97,32 @@ mod tests {
 
     #[tokio::test]
     async fn authorize_row_via_policy() {
-        let path = tmp_path();
-        let _ = std::fs::remove_file(&path);
-        let engine = PolicyEngine::init(&path).await.unwrap();
+        let prefix = format!("test-row-{}-{}", std::process::id(), {
+            use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+            URL_SAFE_NO_PAD.encode(rand::random::<[u8; 6]>())
+        });
+        let s3 = crate::db::build_test_store(&prefix).await;
+        let engine = PolicyEngine::init_s3(s3).await.unwrap_or_panic();
         engine
             .assign_group("alice".into(), "editors".into())
             .await
-            .unwrap();
+            .unwrap_or_panic();
         engine
             .add_rule("editors".into(), "invoice:123".into(), Action::Write)
             .await
-            .unwrap();
+            .unwrap_or_panic();
 
         assert!(
             engine
                 .authorize_row("alice", "invoice", "123", Action::Write)
                 .await
-                .unwrap()
+                .unwrap_or_panic()
         );
         assert!(
             !engine
                 .authorize_row("alice", "invoice", "123", Action::Read)
                 .await
-                .unwrap()
+                .unwrap_or_panic()
         );
         assert!(
             engine
@@ -140,9 +135,7 @@ mod tests {
         assert!(
             auth.authorize_row("alice", "invoice", "123", Action::Write)
                 .await
-                .unwrap()
+                .unwrap_or_panic()
         );
-
-        let _ = std::fs::remove_file(&path);
     }
 }

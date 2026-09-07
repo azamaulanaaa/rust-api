@@ -168,6 +168,7 @@ async fn delete_file(
 
 #[cfg(test)]
 mod tests {
+    use crate::unwrap_ext::{UnwrapExt, UnwrapErrExt};
     use super::*;
 
     use actix_web::{App, http, test};
@@ -202,16 +203,17 @@ mod tests {
         }
     }
     async fn fixture(grant_alice: bool) -> anyhow::Result<Fixture> {
+        use crate::db::build_test_store;
         let (key, enc) = rsa_key(KID)?;
         let jwks = json!({"keys": [key]});
         let server = spawn_jwks(jwks).await;
-        let policy_path = std::env::temp_dir().join(format!(
-            "fs-route-policy-{}-{}.redb",
+        let policy_prefix = format!(
+            "fs-route-policy-{}-{}",
             std::process::id(),
             URL_SAFE_NO_PAD.encode(rand::random::<[u8; 8]>())
-        ));
-        let _ = std::fs::remove_file(&policy_path);
-        let policy = PolicyEngine::init(&policy_path).await?;
+        );
+        let policy_store = build_test_store(&policy_prefix).await;
+        let policy = PolicyEngine::init_s3(policy_store).await?;
         if grant_alice {
             policy
                 .assign_group("alice".into(), "writers".into())
@@ -226,13 +228,12 @@ mod tests {
                 .add_rule("writers".into(), "fs".into(), Action::Delete)
                 .await?;
         }
-        let fs_path = std::env::temp_dir().join(format!(
-            "fs-route-store-{}-{}.redb",
+        let fs_prefix = format!(
+            "fs-route-store-{}-{}",
             std::process::id(),
             URL_SAFE_NO_PAD.encode(rand::random::<[u8; 8]>())
-        ));
-        let _ = std::fs::remove_file(&fs_path);
-        let store = FsStore::open(&fs_path).await?;
+        );
+        let store = FsStore::new(build_test_store(&fs_prefix).await);
         let s3 = ObjectStoreClient::in_memory();
         let engine = FsEngine::from_parts(store, s3, "test-bucket".into(), policy);
         Ok(Fixture {
@@ -336,7 +337,7 @@ mod tests {
         .await;
         assert_eq!(res.status(), http::StatusCode::CREATED);
         let body: serde_json::Value = test::read_body_json(res).await;
-        let file_id = body["file_id"].as_str().unwrap().to_string();
+        let file_id = body["file_id"].as_str().unwrap_or_panic().to_string();
         // upload part with x-checksum-sha256 header
         let res = test::call_service(
             &app,
@@ -394,13 +395,13 @@ mod tests {
         )
         .await;
         assert_eq!(res.status(), http::StatusCode::OK);
-        assert_eq!(res.headers().get("content-type").unwrap(), "text/plain");
+        assert_eq!(res.headers().get("content-type").unwrap_or_panic(), "text/plain");
         assert!(
             res.headers()
                 .get("content-disposition")
-                .unwrap()
+                .unwrap_or_panic()
                 .to_str()
-                .unwrap()
+                .unwrap_or_panic()
                 .contains("hello.txt")
         );
         let body = test::read_body(res).await;
@@ -426,7 +427,7 @@ mod tests {
         )
         .await;
         let body: serde_json::Value = test::read_body_json(res).await;
-        let file_id2 = body["file_id"].as_str().unwrap().to_string();
+        let file_id2 = body["file_id"].as_str().unwrap_or_panic().to_string();
         let res = test::call_service(
             &app,
             test::TestRequest::delete()
@@ -461,7 +462,7 @@ mod tests {
         )
         .await;
         let body: serde_json::Value = test::read_body_json(res).await;
-        let file_id = body["file_id"].as_str().unwrap();
+        let file_id = body["file_id"].as_str().unwrap_or_panic();
         // use legacy alias checksum-sha256
         let res = test::call_service(
             &app,
@@ -499,7 +500,7 @@ mod tests {
         )
         .await;
         let body: serde_json::Value = test::read_body_json(res).await;
-        let file_id = body["file_id"].as_str().unwrap();
+        let file_id = body["file_id"].as_str().unwrap_or_panic();
         // empty name -> 400
         let res = test::call_service(
             &app,
@@ -547,7 +548,7 @@ mod tests {
         )
         .await;
         let body: serde_json::Value = test::read_body_json(res).await;
-        let file_id = body["file_id"].as_str().unwrap();
+        let file_id = body["file_id"].as_str().unwrap_or_panic();
         for idx in 0..2 {
             let res = test::call_service(
                 &app,

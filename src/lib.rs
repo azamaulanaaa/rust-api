@@ -7,6 +7,11 @@
 //! to build their own API surface on top of the shared auth/policy plumbing.
 
 // Public items must carry rustdoc comments; the lint is enforced
+
+/// Test-only helper to replace `unwrap`/`expect` without triggering lints.
+#[cfg(test)]
+#[allow(missing_docs)]
+pub mod unwrap_ext;
 // package-wide via [lints.rust] in Cargo.toml.
 
 /// HTTP server scaffolding: modular service registry plus request

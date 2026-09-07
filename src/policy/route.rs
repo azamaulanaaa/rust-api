@@ -403,6 +403,7 @@ async fn delete_group(
 
 #[cfg(test)]
 mod tests {
+    use crate::unwrap_ext::{UnwrapExt, UnwrapErrExt};
     use super::*;
     use actix_web::{App, http};
     use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -420,7 +421,6 @@ mod tests {
         server: wiremock::MockServer,
         enc: EncodingKey,
         engine: PolicyEngine,
-        _store_path: std::path::PathBuf,
     }
     impl Fixture {
         fn issuer(&self) -> String {
@@ -438,13 +438,13 @@ mod tests {
         let (key, enc) = rsa_key(KID)?;
         let jwks = json!({"keys": [key]});
         let server = spawn_jwks(jwks).await;
-        let store_path = std::env::temp_dir().join(format!(
-            "policy-route-{}-{}.redb",
+        let prefix = format!(
+            "test-policy-route-{}-{}",
             std::process::id(),
             URL_SAFE_NO_PAD.encode(rand::random::<[u8; 8]>())
-        ));
-        let _ = std::fs::remove_file(&store_path);
-        let engine = PolicyEngine::init(&store_path).await?;
+        );
+        let s3 = crate::db::build_test_store(&prefix).await;
+        let engine = PolicyEngine::init_s3(s3).await?;
         if grant_alice {
             engine
                 .add_rule("alice".into(), "rules".into(), Action::Read)
@@ -463,7 +463,6 @@ mod tests {
             server,
             enc,
             engine,
-            _store_path: store_path,
         })
     }
 
@@ -646,7 +645,7 @@ mod tests {
         assert!(
             body["items"]
                 .as_array()
-                .unwrap()
+                .unwrap_or_panic()
                 .iter()
                 .any(|v| v == "editors")
         );
@@ -664,7 +663,7 @@ mod tests {
         assert!(
             body["items"]
                 .as_array()
-                .unwrap()
+                .unwrap_or_panic()
                 .iter()
                 .any(|v| v == "carol")
         );

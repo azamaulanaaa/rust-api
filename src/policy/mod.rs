@@ -1,5 +1,5 @@
+use std::sync::Arc;
 use std::{collections::HashMap, fmt, str::FromStr};
-use std::{path::Path, sync::Arc};
 
 use casbin::{CoreApi, DefaultModel, Enforcer, MgmtApi, RbacApi};
 use serde::{Deserialize, Serialize};
@@ -124,32 +124,20 @@ pub(crate) const RBAC_MODEL: &str = r#"
 "#;
 
 impl PolicyEngine {
-    /// Opens the embedded oxkv database at `store_path`, loads the RBAC
-    /// model and stored policies via the [`adapter::OxkvAdapter`], and
-    /// returns the engine. Parent directories of the file are created as
-    /// needed.
-    pub async fn init(store_path: &Path) -> Result<Self, PolicyError> {
-        if let Some(parent) = store_path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            std::fs::create_dir_all(parent).map_err(|e| oxkv::StoreError::Other(e.to_string()))?;
-        }
+    /// Creates the engine from an [`oxkv::S3Store`] (OxKV S3 backend).
+    pub async fn init_s3(s3_store: oxkv::S3Store) -> Result<Self, PolicyError> {
+        Self::init_with_store(s3_store).await
+    }
 
-        let enforcer = {
-            let store = oxkv::HookStore::new(
-                oxkv::RedbStore::new_file(store_path).map_err(PolicyError::Store)?,
-            )
-            .with_validator(adapter::PolicyRuleValidator);
-            let adapter = adapter::OxkvAdapter::new(store);
-
-            let model = DefaultModel::from_str(RBAC_MODEL).await?;
-
-            let mut enforcer = Enforcer::new(model, adapter).await?;
-            enforcer.enable_auto_save(true);
-
-            enforcer
-        };
-
+    /// Generic initializer over any [`oxkv::Store`] (e.g. `S3Store`+`InMemory` for tests).
+    pub async fn init_with_store<S>(store: S) -> Result<Self, PolicyError>
+    where
+        S: oxkv::Store + Send + Sync + 'static,
+    {
+        let adapter = adapter::OxkvAdapter::new(store);
+        let model = DefaultModel::from_str(RBAC_MODEL).await?;
+        let mut enforcer = Enforcer::new(model, adapter).await?;
+        enforcer.enable_auto_save(true);
         Ok(Self {
             enforcer: Arc::new(RwLock::new(enforcer)),
         })
@@ -385,17 +373,13 @@ impl Authorizer {
 
 #[cfg(test)]
 mod tests {
+    use crate::unwrap_ext::{UnwrapExt, UnwrapErrExt};
     use super::*;
 
-    async fn engine() -> (PolicyEngine, std::path::PathBuf) {
-        let path = std::env::temp_dir().join(format!(
-            "rust-api-policy-mod-test-{}-{}.redb",
-            std::process::id(),
-            uuid_like()
-        ));
-        let _ = std::fs::remove_file(&path);
-        let engine = PolicyEngine::init(&path).await.unwrap();
-        (engine, path)
+    async fn engine() -> PolicyEngine {
+        let prefix = format!("test-policy-mod-{}-{}", std::process::id(), uuid_like());
+        let s3 = crate::db::build_test_store(&prefix).await;
+        PolicyEngine::init_s3(s3).await.unwrap_or_panic()
     }
 
     fn uuid_like() -> String {
@@ -405,20 +389,20 @@ mod tests {
 
     #[tokio::test]
     async fn groups_list_assignments_and_delete_round_trip() {
-        let (engine, path) = engine().await;
+        let engine = engine().await;
 
         engine
             .assign_group("alice".into(), "admins".into())
             .await
-            .unwrap();
+            .unwrap_or_panic();
         engine
             .assign_group("bob".into(), "viewers".into())
             .await
-            .unwrap();
+            .unwrap_or_panic();
         engine
             .assign_group("carol".into(), "admins".into())
             .await
-            .unwrap();
+            .unwrap_or_panic();
 
         // Groups are listed sorted with member counts.
         let groups = engine.list_groups().await;
@@ -435,7 +419,7 @@ mod tests {
         assert_eq!(users[2].sub, "carol");
 
         // Deleting a group removes every link to it at once.
-        assert!(engine.delete_group("admins").await.unwrap());
+        assert!(engine.delete_group("admins").await.unwrap_or_panic());
         let groups = engine.list_groups().await;
         let names: Vec<&str> = groups.iter().map(|g| g.name.as_str()).collect();
         assert_eq!(names, vec!["viewers"]);
@@ -443,29 +427,27 @@ mod tests {
         assert!(engine.get_groups_of_user("carol").await.is_empty());
 
         // Deleting an unknown group reports no-op rather than failing.
-        assert!(!engine.delete_group("admins").await.unwrap());
-
-        let _ = std::fs::remove_file(&path);
+        assert!(!engine.delete_group("admins").await.unwrap_or_panic());
     }
 
     #[tokio::test]
     async fn require_accepts_strings_and_typed_objects() {
-        let (engine, path) = engine().await;
+        let engine = engine().await;
 
         engine
             .assign_group("alice".into(), "editors".into())
             .await
-            .unwrap();
+            .unwrap_or_panic();
         engine
             .add_rule("editors".into(), "invoices".into(), Action::Write)
             .await
-            .unwrap();
+            .unwrap_or_panic();
 
         // Plain string object.
         engine
             .require("alice", "invoices", Action::Write)
             .await
-            .unwrap();
+            .unwrap_or_panic();
 
         // Business modules may define their own IDE-completable object
         // enums; anything AsRef<str> drops straight into require().
@@ -483,14 +465,12 @@ mod tests {
         engine
             .require("alice", BizObject::Invoices, Action::Write)
             .await
-            .unwrap();
+            .unwrap_or_panic();
         assert!(
             engine
                 .require("alice", BizObject::Invoices, Action::Read)
                 .await
                 .is_err()
         );
-
-        let _ = std::fs::remove_file(&path);
     }
 }

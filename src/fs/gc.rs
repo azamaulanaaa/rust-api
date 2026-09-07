@@ -89,9 +89,11 @@ impl crate::fs::store::UploadSession {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use crate::unwrap_ext::{UnwrapExt, UnwrapErrExt};
     use super::*;
     use std::sync::Arc;
 
+    use crate::db::build_test_store;
     use crate::fs::FsEngine;
     use crate::fs::error::FsError;
     use crate::fs::object_store::ObjectStoreClient;
@@ -100,23 +102,19 @@ mod tests {
     use crate::policy::PolicyEngine;
     use bytes::Bytes;
 
-    fn tmp_path(label: &str) -> std::path::PathBuf {
-        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-        std::env::temp_dir().join(format!(
-            "rust-api-gc-{}-{}-{}.redb",
-            std::process::id(),
-            URL_SAFE_NO_PAD.encode(rand::random::<[u8; 8]>()),
-            label
-        ))
-    }
-
     async fn make_engine() -> FsEngine {
-        let path = tmp_path("store");
-        let _ = std::fs::remove_file(&path);
-        let store = FsStore::open(&path).await.unwrap();
-        let policy_path = tmp_path("policy");
-        let _ = std::fs::remove_file(&policy_path);
-        let policy = PolicyEngine::init(&policy_path).await.unwrap();
+        use crate::db::build_test_store;
+        let prefix = {
+            use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+            format!(
+                "test-gc-{}-{}",
+                std::process::id(),
+                URL_SAFE_NO_PAD.encode(rand::random::<[u8; 6]>())
+            )
+        };
+        let store = FsStore::new(build_test_store(&prefix).await);
+        let policy_store = build_test_store(&format!("{prefix}-policy")).await;
+        let policy = PolicyEngine::init_s3(policy_store).await.unwrap_or_panic();
         let s3 = ObjectStoreClient::in_memory();
         FsEngine::from_parts(store, s3, "test-bucket".into(), policy)
     }
@@ -290,12 +288,17 @@ mod tests {
                 Ok(())
             }
         }
-        let path = tmp_path("fail");
-        let _ = std::fs::remove_file(&path);
-        let store = FsStore::open(&path).await?;
-        let policy_path = tmp_path("failp");
-        let _ = std::fs::remove_file(&policy_path);
-        let policy = PolicyEngine::init(&policy_path).await?;
+        let fail_prefix = {
+            use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+            format!(
+                "test-gc-fail-{}-{}",
+                std::process::id(),
+                URL_SAFE_NO_PAD.encode(rand::random::<[u8; 6]>())
+            )
+        };
+        let store = FsStore::new(build_test_store(&fail_prefix).await);
+        let policy =
+            PolicyEngine::init_s3(build_test_store(&format!("{fail_prefix}-p")).await).await?;
         let engine = FsEngine::from_parts(store, Arc::new(FailS3), "b".into(), policy);
         engine
             .store
