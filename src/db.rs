@@ -12,32 +12,13 @@ use oxkv::{S3Store, StoreError};
 
 use crate::fs::s3::S3ClientConfig;
 
-/// Builds an `Arc<dyn ObjectStore>` from [`S3ClientConfig`] (same logic as
-/// `fs::object_store::build_object_store` but returning the raw store so
-/// `S3StoreBuilder` can wrap it).
+/// Builds an `Arc<dyn ObjectStore>` from [`S3ClientConfig`].
+///
+/// Delegates to [`s3_builder`](crate::fs::object_store::s3_builder) so the
+/// file-byte client and the OxKV stores share one `AmazonS3Builder` setup;
+/// returns the raw store so `S3StoreBuilder` can wrap it.
 pub fn build_object_store(cfg: &S3ClientConfig) -> Result<Arc<dyn ObjectStore>, object_store::Error> {
-    use object_store::aws::AmazonS3Builder;
-
-    let mut builder = AmazonS3Builder::new()
-        .with_bucket_name(cfg.bucket.clone())
-        .with_region(cfg.region.clone());
-
-    if let Some(endpoint) = cfg.endpoint_url.clone() {
-        builder = builder.with_endpoint(endpoint.clone());
-        if endpoint.starts_with("http://") {
-            builder = builder.with_allow_http(true);
-        }
-    }
-
-    if let (Some(ak), Some(sk)) = (cfg.access_key_id.clone(), cfg.secret_access_key.clone()) {
-        builder = builder.with_access_key_id(ak).with_secret_access_key(sk);
-    }
-
-    if cfg.force_path_style {
-        builder = builder.with_virtual_hosted_style_request(false);
-    }
-
-    let store = builder.build()?;
+    let store = crate::fs::object_store::s3_builder(cfg).build()?;
     Ok(Arc::new(store))
 }
 

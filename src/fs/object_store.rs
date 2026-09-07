@@ -287,11 +287,17 @@ impl S3Client for ObjectStoreClient {
     }
 }
 
-/// Builds an [`ObjectStore`] from [`S3ClientConfig`] and wraps it as [`S3Client`].
+/// Builds the configured `AmazonS3Builder` from [`S3ClientConfig`].
+///
+/// Single construction site for the endpoint/region/credential setup:
+/// [`db`](crate::db) reuses this for OxKV `S3Store`s so the file-byte
+/// client and the transactional stores cannot drift apart. Each caller
+/// finishes the build itself because the `S3Client` wrapper needs the
+/// concrete `AmazonS3` type (`MultipartStore` is not object-safe).
 ///
 /// Supports S3-compatible endpoints (MinIO, R2) via `endpoint_url` and
 /// `force_path_style`. For `http` endpoints `allow_http` is enabled.
-pub fn build_object_store(config: &S3ClientConfig) -> Result<Arc<dyn S3Client>, object_store::Error> {
+pub fn s3_builder(config: &S3ClientConfig) -> object_store::aws::AmazonS3Builder {
     use object_store::aws::AmazonS3Builder;
 
     let mut builder = AmazonS3Builder::new()
@@ -316,9 +322,18 @@ pub fn build_object_store(config: &S3ClientConfig) -> Result<Arc<dyn S3Client>, 
         builder = builder.with_virtual_hosted_style_request(false);
     }
 
-    let store = builder.build()?;
-    let inner = Arc::new(store);
-    Ok(Arc::new(ObjectStoreClient::new_combined(inner)))
+    builder
+}
+
+/// Builds an [`ObjectStore`] from [`S3ClientConfig`] and wraps it as [`S3Client`].
+///
+/// Shares the [`s3_builder`] setup; only the `S3Client` adapter
+/// wrapping lives here.
+pub fn build_object_store(
+    config: &S3ClientConfig,
+) -> Result<Arc<dyn S3Client>, object_store::Error> {
+    let store = s3_builder(config).build()?;
+    Ok(Arc::new(ObjectStoreClient::new_combined(Arc::new(store))))
 }
 
 /// Builds an [`S3Client`] using the object-store stack.
