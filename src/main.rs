@@ -25,6 +25,10 @@ use rust_api::{
 
 mod config;
 
+/// Test-only helper to replace `unwrap`/`expect` (shared with lib tests).
+#[cfg(test)]
+mod unwrap_ext;
+
 /// Command-line interface for the rust-api server binary.
 #[derive(Parser, Debug)]
 #[command(version)]
@@ -52,23 +56,23 @@ enum Command {
     },
 }
 
-/// Policy-store management actions.
+/// Policy-store management actions (S3-only).
 #[derive(Subcommand, Debug)]
 enum PolicyAction {
-    /// Write every stored policy rule to a JSON file.
+    /// Write every stored policy rule to a JSON file (S3 prefix from --config).
     Export {
-        /// Path of the embedded policy store.
+        /// Path of the TOML config file (provides [s3] + [database].prefix).
         #[arg(long)]
-        store: PathBuf,
+        config: PathBuf,
         /// Output JSON file.
         #[arg(long)]
         out: PathBuf,
     },
-    /// Load policy rules from a JSON file into a store.
+    /// Load policy rules from a JSON file into a store (S3 prefix from --config).
     Import {
-        /// Path of the embedded policy store.
+        /// Path of the TOML config file (provides [s3] + [database].prefix).
         #[arg(long)]
-        store: PathBuf,
+        config: PathBuf,
         /// Input JSON file.
         #[arg(long)]
         input: PathBuf,
@@ -84,8 +88,22 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Serve { config, verbose } => serve(Path::new(&config), verbose).await,
         Command::Policy { action } => match action {
-            PolicyAction::Export { store, out } => {
-                let dump = admin::export(&store).await?;
+            PolicyAction::Export { config, out } => {
+                let cfg = config::Config::try_from(config.as_path())?;
+                let s3_cfg = S3ClientConfig {
+                    bucket: cfg.s3.bucket.clone(),
+                    region: cfg.s3.region.clone(),
+                    endpoint_url: cfg.s3.endpoint_url.clone(),
+                    force_path_style: cfg.s3.force_path_style,
+                    access_key_id: cfg.s3.access_key_id.clone(),
+                    secret_access_key: cfg.s3.secret_access_key.clone(),
+                };
+                let store = rust_api::db::build_s3_store(
+                    &s3_cfg,
+                    &format!("{}/policy", cfg.database.prefix.trim_matches('/')),
+                )
+                .await?;
+                let dump = admin::export_s3(store).await?;
                 std::fs::write(
                     &out,
                     serde_json::to_vec_pretty(&dump).context("serialize policy dump")?,
@@ -98,19 +116,30 @@ async fn main() -> anyhow::Result<()> {
                 );
                 Ok(())
             }
-            PolicyAction::Import { store, input } => {
+            PolicyAction::Import { config, input } => {
+                let cfg = config::Config::try_from(config.as_path())?;
+                let s3_cfg = S3ClientConfig {
+                    bucket: cfg.s3.bucket.clone(),
+                    region: cfg.s3.region.clone(),
+                    endpoint_url: cfg.s3.endpoint_url.clone(),
+                    force_path_style: cfg.s3.force_path_style,
+                    access_key_id: cfg.s3.access_key_id.clone(),
+                    secret_access_key: cfg.s3.secret_access_key.clone(),
+                };
+                let store = rust_api::db::build_s3_store(
+                    &s3_cfg,
+                    &format!("{}/policy", cfg.database.prefix.trim_matches('/')),
+                )
+                .await?;
                 let bytes =
                     std::fs::read(&input).with_context(|| format!("read {}", input.display()))?;
                 let dump: rust_api::policy::admin::PolicyDump =
                     serde_json::from_slice(&bytes).context("parse policy dump")?;
-                let report = admin::import(&store, &dump).await?;
+                let report = admin::import_s3(store, &dump).await?;
                 println!(
                     "imported {} rules and {} group memberships \
                      ({} duplicates skipped) into {}",
-                    report.rules_added,
-                    report.groups_added,
-                    report.duplicates,
-                    store.display()
+                    report.rules_added, report.groups_added, report.duplicates, cfg.database.prefix
                 );
                 Ok(())
             }
@@ -143,15 +172,6 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
     .await?;
     let oidc_api_module = OidcApiModule::<Claims>::init(oidc_client).await?;
 
-    let policy_engine = PolicyEngine::init(Path::new(&config.database.path)).await?;
-    let setup_api_module = SetupApiModule::new(policy_engine.clone(), oidc_api_module.middleware());
-    let policy_api_module =
-        PolicyApiModule::new(policy_engine.clone(), oidc_api_module.middleware());
-
-    // FS module: reuse policy engine for per-file `fs:{id}` checks; store lives
-    // in a sibling redb file (`{database.path}.fs`) to avoid redb file-lock
-    // contention while keeping key prefixes isolated (`fs:` vs `p:`/`g:`).
-    let fs_store_path = PathBuf::from(format!("{}.fs", config.database.path));
     let s3_client_config = S3ClientConfig {
         bucket: config.s3.bucket.clone(),
         region: config.s3.region.clone(),
@@ -160,7 +180,24 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
         access_key_id: config.s3.access_key_id.clone(),
         secret_access_key: config.s3.secret_access_key.clone(),
     };
-    let fs_engine = FsEngine::init(&fs_store_path, &s3_client_config, policy_engine).await?;
+    // Single bucket, prefix-scoped S3Stores per domain (scalable, no local files).
+    let policy_store = rust_api::db::build_s3_store(
+        &s3_client_config,
+        &format!("{}/policy", config.database.prefix.trim_matches('/')),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("build policy S3Store: {e}"))?;
+    let fs_s3_store = rust_api::db::build_s3_store(
+        &s3_client_config,
+        &format!("{}/fs", config.database.prefix.trim_matches('/')),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("build fs S3Store: {e}"))?;
+    let policy_engine = PolicyEngine::init_s3(policy_store).await?;
+    let setup_api_module = SetupApiModule::new(policy_engine.clone(), oidc_api_module.middleware());
+    let policy_api_module =
+        PolicyApiModule::new(policy_engine.clone(), oidc_api_module.middleware());
+    let fs_engine = FsEngine::init(fs_s3_store, &s3_client_config, policy_engine).await?;
     // GC: expire abandoned multipart uploads every hour (24h TTL)
     rust_api::fs::gc::spawn(std::sync::Arc::new(fs_engine.clone()));
     let fs_api_module = FsApiModule::new(fs_engine, oidc_api_module.middleware());

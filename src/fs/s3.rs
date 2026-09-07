@@ -86,7 +86,7 @@ pub struct S3ClientConfig {
 }
 
 /// Builds an `Arc<dyn S3Client>` from [`S3ClientConfig`] via `object_store`.
-pub async fn build_s3_client(config: &S3ClientConfig) -> Arc<dyn S3Client> {
+pub async fn build_s3_client(config: &S3ClientConfig) -> Result<Arc<dyn S3Client>, object_store::Error> {
     crate::fs::object_store::build_object_store(config)
 }
 
@@ -95,7 +95,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn build_s3_client_variants_do_not_panic() {
+    async fn build_s3_client_variants_do_not_panic() -> anyhow::Result<()> {
         let base = S3ClientConfig {
             bucket: "test-bucket".into(),
             region: "us-east-1".into(),
@@ -104,14 +104,14 @@ mod tests {
             access_key_id: None,
             secret_access_key: None,
         };
-        let _ = build_s3_client(&base).await;
+        let _ = build_s3_client(&base).await?;
 
         let with_endpoint = S3ClientConfig {
             endpoint_url: Some("http://localhost:9000".into()),
             force_path_style: true,
             ..base.clone()
         };
-        let _ = build_s3_client(&with_endpoint).await;
+        let _ = build_s3_client(&with_endpoint).await?;
 
         let with_creds = S3ClientConfig {
             access_key_id: Some("minioadmin".into()),
@@ -119,7 +119,7 @@ mod tests {
             force_path_style: true,
             ..base.clone()
         };
-        let _ = build_s3_client(&with_creds).await;
+        let _ = build_s3_client(&with_creds).await?;
 
         let with_all = S3ClientConfig {
             endpoint_url: Some("http://localhost:9000".into()),
@@ -128,12 +128,13 @@ mod tests {
             secret_access_key: Some("sk".into()),
             ..base
         };
-        let client = build_s3_client(&with_all).await;
+        let client = build_s3_client(&with_all).await?;
         assert!(std::sync::Arc::strong_count(&client) >= 1);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn build_s3_client_force_path_style_without_creds() {
+    async fn build_s3_client_force_path_style_without_creds() -> anyhow::Result<()> {
         let cfg = S3ClientConfig {
             bucket: "b".into(),
             region: "us-west-2".into(),
@@ -142,6 +143,7 @@ mod tests {
             access_key_id: None,
             secret_access_key: None,
         };
-        let _ = build_s3_client(&cfg).await;
+        let _ = build_s3_client(&cfg).await?;
+        Ok(())
     }
 }

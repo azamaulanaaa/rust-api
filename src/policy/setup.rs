@@ -99,7 +99,8 @@ mod tests {
     struct Fixture {
         server: wiremock::MockServer,
         encoding_key: EncodingKey,
-        store_path: std::path::PathBuf,
+        store_prefix: String,
+        shared_store: std::sync::Arc<dyn object_store::ObjectStore>,
         engine: PolicyEngine,
     }
 
@@ -108,18 +109,15 @@ mod tests {
         let jwks = json!({ "keys": [key] });
         let server = spawn_jwks(jwks).await;
 
-        let store_path = std::env::temp_dir().join(format!(
-            "rust-api-setup-test-{}-{}.redb",
-            std::process::id(),
-            uuid_like()
-        ));
-        let _ = std::fs::remove_file(&store_path);
-
-        let engine = PolicyEngine::init(&store_path).await?;
+        let store_prefix = format!("rust-api-setup-test-{}-{}", std::process::id(), uuid_like());
+        let shared_store = std::sync::Arc::new(object_store::memory::InMemory::new()) as std::sync::Arc<dyn object_store::ObjectStore>;
+        let s3 = crate::db::build_test_store_with_inner(shared_store.clone(), &store_prefix).await;
+        let engine = PolicyEngine::init_s3(s3).await?;
         Ok(Fixture {
             server,
             encoding_key,
-            store_path,
+            store_prefix,
+            shared_store,
             engine,
         })
     }
@@ -151,26 +149,25 @@ mod tests {
     /// Builds the API module against the fixture's JWKS server and shared
     /// engine state; each test wires it into an inline app so actix service
     /// types stay concretely inferred.
-    async fn setup_module(fx: &Fixture) -> SetupApiModule {
+    async fn setup_module(fx: &Fixture) -> anyhow::Result<SetupApiModule> {
         let middleware = JwtClaimsMiddleware::<Claims>::new_with_jks(
             &format!("{}/jwks", fx.server.uri()),
             AUDIENCE,
             &fx.issuer(),
         )
-        .await
-        .expect("test jwks middleware must initialize");
-        SetupApiModule::new(
+        .await?;
+        Ok(SetupApiModule::new(
             PolicyEngine {
                 enforcer: fx.engine.enforcer.clone(),
             },
             middleware,
-        )
+        ))
     }
 
     #[actix_web::test]
     async fn first_claim_succeeds_then_conflicts() -> anyhow::Result<()> {
         let fx = fixture().await?;
-        let module = setup_module(&fx).await;
+        let module = setup_module(&fx).await?;
         let app =
             test::init_service(App::new().configure(|cfg| ApiModule::configure(&module, cfg)))
                 .await;
@@ -206,7 +203,7 @@ mod tests {
     #[actix_web::test]
     async fn unauthenticated_call_is_unauthorized() -> anyhow::Result<()> {
         let fx = fixture().await?;
-        let module = setup_module(&fx).await;
+        let module = setup_module(&fx).await?;
         let app =
             test::init_service(App::new().configure(|cfg| ApiModule::configure(&module, cfg)))
                 .await;
@@ -237,7 +234,7 @@ mod tests {
         let fx = fixture().await?;
 
         {
-            let module = setup_module(&fx).await;
+            let module = setup_module(&fx).await?;
             let app =
                 test::init_service(App::new().configure(|cfg| ApiModule::configure(&module, cfg)))
                     .await;
@@ -258,10 +255,12 @@ mod tests {
         let issuer = fx.issuer();
         let jwks_url = format!("{}/jwks", issuer);
 
-        // Release the first engine's store lock, then reopen the same
-        // persisted state as a fresh engine.
+        // Release the first engine, then reopen the same persisted state as a fresh engine.
+        let prefix = fx.store_prefix.clone();
+        let shared = fx.shared_store.clone();
         drop(fx.engine);
-        let reopened = PolicyEngine::init(&fx.store_path).await?;
+        let s3_reopened = crate::db::build_test_store_with_inner(shared.clone(), &prefix).await;
+        let reopened = PolicyEngine::init_s3(s3_reopened).await?;
         let engine_clone = PolicyEngine {
             enforcer: reopened.enforcer.clone(),
         };
@@ -282,7 +281,6 @@ mod tests {
         .await;
         assert_eq!(res.status(), 409);
 
-        let _ = std::fs::remove_file(&fx.store_path);
         Ok(())
     }
 }
