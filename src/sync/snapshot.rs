@@ -1,8 +1,13 @@
-//! Per-user filtered snapshots stored as JSON objects on `S3`.
+//! Per-user filtered replicas on versioned `OxKvStore` prefixes.
 //!
-//! The master [`FsStore`] lives on a prefix-scoped `OxKvStore`; snapshots are
-//! the per-user filtered file list serialized as JSON and cached as `S3`
-//! objects. Full recalc when far behind; WAL replay later via `wal` range.
+//! The master [`FsStore`] remains the sole write path. Each snapshot version
+//! is a filtered copy under `{db_prefix}/u/{sub}/{seq:020}/` with its own
+//! oxkv `manifest.json` — the segment list. `snapshots/{sub}/meta.json`
+//! points at the latest version. Version prefixes are immutable after build,
+//! so readers always see a consistent view and old versions are cheap to GC.
+//!
+//! Served read-only via `/sync/db/`; wasm clients open an `OxKvReader` over
+//! the version prefix and follow it like any other oxkv store.
 
 use serde::{Deserialize, Serialize};
 
@@ -14,7 +19,7 @@ use crate::policy::{Action, PolicyEngine};
 
 use super::wal::Wal;
 
-/// Snapshot metadata.
+/// Snapshot metadata (pointer at the latest replica version for `sub`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SnapshotMeta {
     /// Master `wal` head at build time.
@@ -23,7 +28,7 @@ pub struct SnapshotMeta {
     pub version: u64,
 }
 
-/// Manager for per-user snapshots.
+/// Manager for per-user replicas.
 #[derive(Clone)]
 pub struct SnapshotManager {
     /// WAL for version tracking.
@@ -32,20 +37,30 @@ pub struct SnapshotManager {
     pub store: FsStore,
     /// Policy for filtering.
     pub policy: PolicyEngine,
-    /// `S3` client for snapshot objects.
+    /// `S3` client for `meta.json` pointers.
     pub s3: std::sync::Arc<dyn S3Client>,
-    /// Bucket for snapshots.
+    /// Bucket for `meta.json` pointers.
     pub bucket: String,
+    /// Shared object store backing every replica prefix.
+    pub(crate) object_store: std::sync::Arc<dyn object_store::ObjectStore>,
+    /// Root prefix for replica prefixes (e.g. `"oxkv"`).
+    pub(crate) db_prefix: String,
+    /// Skip the oxkv storage probe (tests on `InMemory`).
+    skip_probe: bool,
 }
 
 impl SnapshotManager {
     /// Create a manager.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         wal: Wal,
         store: FsStore,
         policy: PolicyEngine,
         s3: std::sync::Arc<dyn S3Client>,
         bucket: String,
+        object_store: std::sync::Arc<dyn object_store::ObjectStore>,
+        db_prefix: String,
+        skip_probe: bool,
     ) -> Self {
         Self {
             wal,
@@ -53,12 +68,30 @@ impl SnapshotManager {
             policy,
             s3,
             bucket,
+            object_store,
+            db_prefix,
+            skip_probe,
         }
     }
 
-    /// `S3` key for a snapshot (JSON payload).
-    pub fn snapshot_key(sub: &str, seq: u64) -> String {
-        format!("snapshots/{sub}/{seq:020}.json")
+    /// Replica prefix for one snapshot version (`{db}/u/{sub}/{seq:020}`).
+    pub fn user_prefix(&self, sub: &str, seq: u64) -> String {
+        format!(
+            "{}/u/{}/{seq:020}",
+            self.db_prefix.trim_matches('/'),
+            safe_sub(sub)
+        )
+    }
+
+    /// Full object key for `tail` inside a version replica.
+    ///
+    /// Rejects path traversal (`..`) so the gateway cannot escape the
+    /// version prefix.
+    pub fn resolve_object(&self, sub: &str, seq: u64, tail: &str) -> Result<String, FsError> {
+        if tail.is_empty() || tail.split('/').any(|seg| seg == "..") {
+            return Err(FsError::BadRequest("invalid object path".into()));
+        }
+        Ok(format!("{}/{tail}", self.user_prefix(sub, seq)))
     }
 
     /// `S3` key for metadata.
@@ -76,25 +109,23 @@ impl SnapshotManager {
         }
     }
 
-    /// Build a full filtered snapshot for `sub` at current `wal` head.
+    /// Build a full filtered replica for `sub` at current `wal` head.
     ///
-    /// Files are filtered into an ephemeral scratch store, serialized as
-    /// JSON, and uploaded as one S3 object; no local files are involved.
+    /// Files are filtered through the policy into a fresh version prefix;
+    /// the prefix is written once and never mutated afterwards, so readers
+    /// see an atomic snapshot. `meta.json` is written last so the pointer
+    /// cutover is atomic with the WAL head.
     pub async fn build_full(&self, sub: &str) -> Result<SnapshotMeta, FsError> {
         let seq = self.wal.head().await?;
-        let snap_prefix = format!(
-            "snap-{}-{seq}-{}",
-            sub.replace(['/', ':'], "_"),
-            &uuid::Uuid::now_v7().to_string()[..8]
-        );
-        let snap_store = FsStore::new(crate::db::build_scratch_store(&snap_prefix).await);
-        self.copy_filtered(sub, &snap_store).await?;
-        let files = snap_store.list_files().await?;
-        let data = serde_json::to_vec(&files).map_err(|e| FsError::Internal(e.to_string()))?;
-        let key = Self::snapshot_key(sub, seq);
-        self.s3
-            .put_object(&self.bucket, &key, data.into(), None, None)
-            .await?;
+        let prefix = self.user_prefix(sub, seq);
+        let replica = oxkv::OxKvStore::builder()
+            .with_object_store(self.object_store.clone())
+            .with_prefix(oxkv::ObjectPath::from(prefix.as_str()))
+            .skip_probe(self.skip_probe)
+            .build()
+            .await
+            .map_err(|e| FsError::Store(e.to_string()))?;
+        self.copy_filtered(sub, &FsStore::new(replica)).await?;
         let meta = SnapshotMeta {
             applied_seq: seq,
             version: seq,
@@ -157,60 +188,127 @@ impl SnapshotManager {
     }
 }
 
+/// Makes a subject safe for embedding in an object prefix.
+fn safe_sub(sub: &str) -> String {
+    sub.replace(['/', ':'], "_")
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use crate::fs::object_store::ObjectStoreClient;
-    use crate::fs::store::{FileRecord, FsStore};
-    use crate::policy::{Action, PolicyEngine};
+    use crate::fs::store::FileRecord;
+    use object_store::memory::InMemory;
+    use oxkv::{
+        Direction, GetSet as _, ObjectPath as OxPath, OxKvReader, Store as _, Transaction as _,
+    };
 
-    #[tokio::test]
-    async fn build_full_filters() -> anyhow::Result<()> {
+    async fn test_manager() -> (SnapshotManager, std::sync::Arc<InMemory>) {
+        let mem = std::sync::Arc::new(InMemory::new());
         let wal = Wal::new(crate::db::build_test_store("snap-test-wal").await);
         let store = FsStore::new(crate::db::build_test_store("snap-test-store").await);
-        let policy =
-            PolicyEngine::init_s3(crate::db::build_test_store("snap-test-policy").await).await?;
-        policy
+        let policy = PolicyEngine::init_s3(crate::db::build_test_store("snap-test-policy").await)
+            .await
+            .unwrap();
+        let s3 = ObjectStoreClient::in_memory();
+        let mgr = SnapshotManager::new(
+            wal,
+            store,
+            policy,
+            s3,
+            "b".into(),
+            mem.clone() as std::sync::Arc<dyn object_store::ObjectStore>,
+            "test-db".into(),
+            true,
+        );
+        (mgr, mem)
+    }
+
+    fn file_record(id: &str, owner: &str) -> FileRecord {
+        FileRecord {
+            id: id.into(),
+            name: format!("{id}.txt"),
+            mimetype: "text/plain".into(),
+            size: 1,
+            s3_key: format!("k/{id}"),
+            owner_sub: owner.into(),
+            created_at: 0,
+        }
+    }
+
+    async fn open_reader(mem: &std::sync::Arc<InMemory>, prefix: &str) -> OxKvReader {
+        // `Arc<InMemory>` coerces to the `Storage` blanket impl through
+        // `Arc<dyn ObjectStore>`; the reader never fences, so reopening the
+        // same prefix across test phases is safe.
+        let store: std::sync::Arc<dyn object_store::ObjectStore> = mem.clone();
+        let storage: std::sync::Arc<dyn oxkv::Storage> = std::sync::Arc::new(store);
+        OxKvReader::open(storage, OxPath::from(prefix))
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn build_full_filters_into_reader_visible_prefix() -> anyhow::Result<()> {
+        let (mgr, mem) = test_manager().await;
+        mgr.policy
             .add_rule("alice".into(), "invoice:1".into(), Action::Read)
             .await?;
-        let rec = FileRecord {
-            id: "f1".into(),
-            name: "a".into(),
-            mimetype: "x".into(),
-            size: 1,
-            s3_key: "k".into(),
-            owner_sub: "alice".into(),
-            created_at: 0,
-        };
-        store.save_file(&rec).await?;
-        store.attach("invoice", "1", "f1").await?;
-        let rec2 = FileRecord {
-            id: "f2".into(),
-            name: "b".into(),
-            mimetype: "x".into(),
-            size: 1,
-            s3_key: "k2".into(),
-            owner_sub: "bob".into(),
-            created_at: 0,
-        };
-        store.save_file(&rec2).await?;
-        let s3 = ObjectStoreClient::in_memory();
-        let mgr = SnapshotManager::new(wal, store, policy, s3, "b".into());
+        let rec = file_record("f1", "alice");
+        mgr.store.save_file(&rec).await?;
+        mgr.store.attach("invoice", "1", "f1").await?;
+        mgr.store.save_file(&file_record("f2", "bob")).await?;
+
         let meta = mgr.build_full("alice").await?;
         assert_eq!(meta.applied_seq, 0);
-        let loaded = mgr.load_meta("alice").await?.unwrap();
-        assert_eq!(loaded.version, 0);
+        assert_eq!(meta.version, 0);
+        assert_eq!(mgr.load_meta("alice").await?.unwrap(), meta);
 
-        // The snapshot object holds exactly the files alice may read.
-        let key = SnapshotManager::snapshot_key("alice", 0);
-        assert!(key.ends_with(".json"));
-        let bytes = mgr.s3.get_object("b", &key).await?;
-        let files: Vec<FileRecord> = serde_json::from_slice(&bytes)?;
-        assert_eq!(
-            files.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(),
-            ["f1"]
-        );
+        // A read-only follower over the version prefix sees exactly alice's files.
+        let prefix = mgr.user_prefix("alice", 0);
+        let reader = open_reader(&mem, &prefix).await;
+        let tx = reader.begin_tx().unwrap();
+        let f1 = tx.get_bytes("fs:files:f1:meta").await?;
+        assert!(f1.is_some(), "alice's file must be replicated");
+        let f2 = tx.get_bytes("fs:files:f2:meta").await?;
+        assert!(f2.is_none(), "bob's file must be filtered out");
+        let rel = tx.get_bytes("fs:rel:invoice:1:f1").await?;
+        assert!(rel.is_some(), "readable relations must be replicated");
+        tx.rollback().await.unwrap();
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn empty_replica_opens_cleanly() -> anyhow::Result<()> {
+        let (mgr, mem) = test_manager().await;
+        // Bob owns a file alice cannot read: her replica is valid but empty.
+        mgr.store.save_file(&file_record("f9", "bob")).await?;
+        let meta = mgr.build_full("alice").await?;
+        let reader = open_reader(&mem, &mgr.user_prefix("alice", meta.version)).await;
+        let tx = reader.begin_tx().unwrap();
+        let rows = tx
+            .gets_bytes(None, Direction::Next, (None, None))
+            .await
+            .unwrap();
+        assert!(rows.is_empty());
+        tx.rollback().await.unwrap();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn prefixes_are_stable_and_safe() {
+        let (mgr, _) = test_manager().await;
+        assert_eq!(
+            mgr.user_prefix("alice", 3),
+            "test-db/u/alice/00000000000000000003"
+        );
+        assert_eq!(
+            mgr.resolve_object("a/b:c", 3, "manifest.json").unwrap(),
+            "test-db/u/a_b_c/00000000000000000003/manifest.json"
+        );
+        assert!(mgr.resolve_object("alice", 3, "../escape").is_err());
+        assert!(mgr.resolve_object("alice", 3, "a/../../escape").is_err());
+        assert!(mgr.resolve_object("alice", 3, "").is_err());
+        assert_eq!(SnapshotManager::meta_key("alice"), "snapshots/alice/meta.json");
     }
 }
