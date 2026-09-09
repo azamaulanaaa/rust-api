@@ -1,10 +1,10 @@
 //! `oxkv` persistence for upload sessions, file records, and relations.
-//! Backed by [`oxkv::S3Store`] (LSM on S3). Keys: `fs:uploads:{id}:meta`, `fs:files:{id}:meta`, `fs:rel:{type}:{id}:{file}`, `fs:files:{id}:refs`.
-//! Scales per-user: each S3Store is prefix-scoped (e.g. `oxkv/fs`) on the shared `ObjectStore`; no per-user Redb file.
+//! Backed by [`oxkv::OxKvStore`] (LSM on S3). Keys: `fs:uploads:{id}:meta`, `fs:files:{id}:meta`, `fs:rel:{type}:{id}:{file}`, `fs:files:{id}:refs`.
+//! Scales per-user: each OxKvStore is prefix-scoped (e.g. `oxkv/fs`) on the shared `ObjectStore`.
 
 use std::sync::Arc;
 
-use oxkv::{GetSet, S3Store};
+use oxkv::{GetSet, OxKvStore};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
@@ -56,15 +56,15 @@ pub struct FileRecord {
     pub created_at: i64,
 }
 
-/// Thin wrapper around an `oxkv` S3 store for FS keys.
+/// Thin wrapper around an `oxkv` LSM store for FS keys.
 #[derive(Clone)]
 pub struct FsStore {
-    inner: Arc<RwLock<S3Store>>,
+    inner: Arc<RwLock<OxKvStore>>,
 }
 
 impl FsStore {
-    /// Creates an FS store from an [`S3Store`] (per-user S3, scalable).
-    pub fn new(s3_store: S3Store) -> Self {
+    /// Creates an FS store from an [`OxKvStore`] (per-user S3, scalable).
+    pub fn new(s3_store: OxKvStore) -> Self {
         Self {
             inner: Arc::new(RwLock::new(s3_store)),
         }
@@ -84,7 +84,7 @@ impl FsStore {
     pub async fn save_session(&self, s: &UploadSession) -> Result<(), FsError> {
         let key = Self::session_key(&s.id);
         let val = serde_json::to_vec(s).map_err(|e| FsError::Internal(e.to_string()))?;
-        let mut g = self.inner.write().await;
+        let g = self.inner.write().await;
         g.set_bytes(&key, &val)
             .await
             .map_err(|e| FsError::Store(e.to_string()))?;
@@ -111,7 +111,7 @@ impl FsStore {
         let session = self.get_session(id).await?;
         let key = Self::session_key(id);
         {
-            let mut g = self.inner.write().await;
+            let g = self.inner.write().await;
             g.delete(&key)
                 .await
                 .map_err(|e| FsError::Store(e.to_string()))?;
@@ -128,7 +128,7 @@ impl FsStore {
     /// Stages a single-part chunk in the store (only for `total_parts == 1`).
     pub async fn save_staged_part(&self, id: &str, idx: u64, data: Vec<u8>) -> Result<(), FsError> {
         let key = Self::staged_key(id, idx);
-        let mut g = self.inner.write().await;
+        let g = self.inner.write().await;
         g.set_bytes(&key, &data)
             .await
             .map_err(|e| FsError::Store(e.to_string()))?;
@@ -153,7 +153,7 @@ impl FsStore {
     pub async fn save_file(&self, rec: &FileRecord) -> Result<(), FsError> {
         let key = Self::file_key(&rec.id);
         let val = serde_json::to_vec(rec).map_err(|e| FsError::Internal(e.to_string()))?;
-        let mut g = self.inner.write().await;
+        let g = self.inner.write().await;
         g.set_bytes(&key, &val)
             .await
             .map_err(|e| FsError::Store(e.to_string()))?;
@@ -179,7 +179,7 @@ impl FsStore {
     pub async fn delete_file(&self, id: &str) -> Result<(), FsError> {
         let key = Self::file_key(id);
         let refs = refs_key(id);
-        let mut g = self.inner.write().await;
+        let g = self.inner.write().await;
         g.delete(&key)
             .await
             .map_err(|e| FsError::Store(e.to_string()))?;
@@ -211,7 +211,7 @@ impl FsStore {
     ) -> Result<u32, FsError> {
         let rel = rel_key(row_type, row_id, file_id);
         let refs = refs_key(file_id);
-        let mut g = self.inner.write().await;
+        let g = self.inner.write().await;
         if g.get_bytes(&rel)
             .await
             .map_err(|e| FsError::Store(e.to_string()))?
@@ -242,7 +242,7 @@ impl FsStore {
     ) -> Result<u32, FsError> {
         let rel = rel_key(row_type, row_id, file_id);
         let refs = refs_key(file_id);
-        let mut g = self.inner.write().await;
+        let g = self.inner.write().await;
         if g.get_bytes(&rel)
             .await
             .map_err(|e| FsError::Store(e.to_string()))?
@@ -266,7 +266,7 @@ impl FsStore {
         Ok(info.count)
     }
 
-    async fn get_ref_info_inner(&self, g: &S3Store, file_id: &str) -> Result<RefInfo, FsError> {
+    async fn get_ref_info_inner(&self, g: &OxKvStore, file_id: &str) -> Result<RefInfo, FsError> {
         let key = refs_key(file_id);
         let Some(bytes) = g
             .get_bytes(&key)

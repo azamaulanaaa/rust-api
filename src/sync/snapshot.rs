@@ -1,6 +1,6 @@
 //! Per-user filtered snapshots stored as JSON objects on `S3`.
 //!
-//! The master [`FsStore`] lives on a prefix-scoped `S3Store`; snapshots are
+//! The master [`FsStore`] lives on a prefix-scoped `OxKvStore`; snapshots are
 //! the per-user filtered file list serialized as JSON and cached as `S3`
 //! objects. Full recalc when far behind; WAL replay later via `wal` range.
 

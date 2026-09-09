@@ -26,8 +26,8 @@ pub struct ImportReport {
     pub duplicates: usize,
 }
 
-/// Reads every policy rule from an S3 store.
-pub async fn export_s3(s3_store: oxkv::S3Store) -> anyhow::Result<PolicyDump> {
+/// Reads every policy rule from an OxKV store.
+pub async fn export_s3(s3_store: oxkv::OxKvStore) -> anyhow::Result<PolicyDump> {
     use anyhow::Context as _;
     let model = DefaultModel::from_str(RBAC_MODEL)
         .await
@@ -42,7 +42,10 @@ pub async fn export_s3(s3_store: oxkv::S3Store) -> anyhow::Result<PolicyDump> {
 }
 
 /// Writes `dump`'s rules into an S3 store. Idempotent.
-pub async fn import_s3(s3_store: oxkv::S3Store, dump: &PolicyDump) -> anyhow::Result<ImportReport> {
+pub async fn import_s3(
+    s3_store: oxkv::OxKvStore,
+    dump: &PolicyDump,
+) -> anyhow::Result<ImportReport> {
     use anyhow::Context as _;
     let model = DefaultModel::from_str(RBAC_MODEL)
         .await
@@ -74,20 +77,20 @@ pub async fn import_s3(s3_store: oxkv::S3Store, dump: &PolicyDump) -> anyhow::Re
 }
 
 /// Deprecated file-based export shim — use [`export_s3`].
-#[deprecated(note = "Use export_s3/import_s3 with S3Store")]
+#[deprecated(note = "Use export_s3/import_s3 with OxKvStore")]
 #[allow(missing_docs)]
 pub async fn export(_store_path: &std::path::Path) -> anyhow::Result<PolicyDump> {
-    anyhow::bail!("export(Path) removed — use export_s3(S3Store) via --config")
+    anyhow::bail!("export(Path) removed — use export_s3(OxKvStore) via --config")
 }
 
 /// Deprecated file-based import shim — use [`import_s3`].
-#[deprecated(note = "Use export_s3/import_s3 with S3Store")]
+#[deprecated(note = "Use export_s3/import_s3 with OxKvStore")]
 #[allow(missing_docs)]
 pub async fn import(
     _store_path: &std::path::Path,
     _dump: &PolicyDump,
 ) -> anyhow::Result<ImportReport> {
-    anyhow::bail!("import(Path) removed — use import_s3(S3Store, dump) via --config")
+    anyhow::bail!("import(Path) removed — use import_s3(OxKvStore, dump) via --config")
 }
 
 #[cfg(test)]
@@ -115,7 +118,8 @@ mod tests {
         import_s3(src_store, &dump).await?;
 
         // Fresh handle, hence a new fencing session over the same prefix
-        // (S3Store is not Clone); the previous handle is dead by now.
+        // (superseding the previous session via epoch fencing); the previous
+        // handle is dead by now.
         let src_store2 = build_test_store_new_session(shared.clone(), &src_prefix).await;
         let dump = export_s3(src_store2).await?;
         let dump_bytes = serde_json::to_vec_pretty(&dump)?;
@@ -138,8 +142,8 @@ mod tests {
     #[tokio::test]
     async fn import_rejects_invalid_entries_via_validation_hook() {
         // The adapter enforces PolicyRuleValidator on every write path
-        // (HookStore cannot wrap the non-Clone S3Store), so an invalid dump
-        // fails the import instead of being persisted.
+        // itself (see encode_rule), so an invalid dump fails the import
+        // instead of being persisted.
         let store = build_test_store("admin-test-invalid").await;
         let dump = PolicyDump {
             p: vec![vec!["only-one-field".to_string()]],
