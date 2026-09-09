@@ -1,8 +1,8 @@
-//! Per-user filtered replicas with on-demand WAL replay.
+//! Per-user filtered replicas on stable prefixes with WAL replay.
 //!
 //! The master [`FsStore`](crate::fs::store::FsStore) remains the sole write
-//! path; per-user snapshot versions are filtered read replicas on
-//! versioned `OxKvStore` prefixes, served over `/sync/db/` for oxkv readers.
+//! path; each user owns one replica prefix holding their filtered file set,
+//! served over `/sync/db/` for oxkv readers.
 
 pub mod route;
 pub mod snapshot;
