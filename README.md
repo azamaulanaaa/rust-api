@@ -14,8 +14,10 @@ The crate is intentionally business-logic free: applications compose `ApiModule`
 - **Modular row-level authorization** — business rows authorize as `{type}:{id}` objects via `policy::row::RowAuthorizer`; files delegate to owning rows instead of a coarse `fs` gate
 - **Temp per-user file scope with refcount relations** — uploads start as temp owned by `owner_sub` (`refs==0`), `attach`/`detach` to rows via `fs:rel:{type}:{id}:{file}` increments/decrements `fs:files:{id}:refs` inside the `{prefix}/fs` `OxKvStore`; editing a row swaps relations, never deletes the underlying S3 object immediately
 - **Capability tokens** — short-lived HMAC JWT (`fs/token.rs`, 5m) minted after row authorization, verified on file ops without extra policy hits
-- **GC for orphans** — hourly sweeper removes abandoned upload sessions and temp/orphaned files (`refs==0` and `age>24h` or `orphan_since>24h`)
-- **Per-user filtered replicas with WAL (S3, oxkv manifest)** — WAL lives as `wal:{seq:020}` + `wal:seq` inside an `OxKvStore`; each snapshot version is a filtered replica under `{db}/u/{sub}/{seq:020}/` with its own oxkv `manifest.json` (the segment list) built via `SnapshotManager::build_full`; `GET /sync/clone` returns the replica pointer with an `ETag` (repeat polls get `304`), and every object inside the version prefix is individually cached at `GET /sync/db/{seq}/{object}` with backend `ETag` passthrough and `If-None-Match` support — DASH-style: manifest plus immutable segments
+- **GC for orphans** — hourly sweeper removes abandoned upload sessions and temp/orphaned files (`refs==0` and `age>24h` or `orphan_since>24h`). A second hourly sweeper drops superseded replica versions (`sync/gc.rs`, keeps the pointer version plus one predecessor).
+- **Per-user filtered replicas with WAL (S3, oxkv manifest)** — WAL lives as `wal:{seq:020}` + `wal:seq` inside an `OxKvStore`; each user owns one replica prefix (`{db}/u/{sub}/`) holding their filtered file set with its own oxkv `manifest.json` (the segment list); `GET /sync/clone` returns the replica pointer with an `ETag` (repeat polls get `304`), and every object inside the prefix is individually cached at `GET /sync/db/{object}` with backend `ETag` passthrough and `If-None-Match` support — DASH-style: manifest plus immutable segments. `clone` short-circuits when coverage already meets the WAL head; deltas of ≤1000 file/relation ops replay onto the live prefix, while policy changes, larger deltas, or fencing losses fall back to full recalc (or adopt the winner's coverage).
+- **WAL-instrumented mutations** — `FsEngine` (complete/attach/detach/delete) and `PolicyEngine` (rule/group changes, including `policy import`) append to one shared `Wal` after each mutation commits (fail-closed: a logging failure fails the whole operation, so the WAL never silently misses a write); concurrent appends serialize on a mutex shared by all handles. Engines without a wired WAL log nothing (tests).
+- **Transactional replica builds** — snapshots filter into a RAM scratch store, diff against the live replica, and commit the diff plus the coverage marker in one transaction: a crash before commit leaves the old state untouched (oxkv replays only listed WALs on open), and an empty diff commits nothing — mid-broken writes are handled by the engine, not app scaffolding.
 - **Modular composition** — implement the `ApiModule` trait and register onto `ApiService`; auth middleware is applied per module scope
 - **Observability** — structured console logging through the `tracing` facade (`RUST_LOG` syntax), plus optional OpenTelemetry span export over OTLP/gRPC with W3C Trace Context propagation
 
@@ -45,8 +47,8 @@ The crate is intentionally business-logic free: applications compose `ApiModule`
 | GET | `/fs/files/{id}/meta` | File metadata (owner or row Read) | Bearer token |
 | GET | `/fs/files/{id}` | Download file content (owner or row Read) | Bearer token |
 | DELETE | `/fs/files/{id}` | Delete file (owner when temp, or row Delete) | Bearer token |
-| GET | `/sync/clone` | Replica pointer + version ETag (on-demand WAL replay or full recalc) | Bearer token |
-| GET | `/sync/db/{seq}/{object}` | One replica object (manifest/SST/WAL/blob) with ETag + `If-None-Match` | Bearer token |
+| GET | `/sync/clone` | Replica pointer + coverage ETag (short-circuit, replay, or full recalc) | Bearer token |
+| GET | `/sync/db/{object}` | One replica object (manifest/SST/WAL/blob) with ETag + `If-None-Match` | Bearer token |
 
 Protected routes accept either an explicit `Authorization: Bearer <token>` header (preferred) or the session cookie set by `/auth/callback`. Requests without valid credentials get `401`; insufficient permissions get `403`. All errors use a uniform JSON envelope: `{"error": "<message>"}`.
 
@@ -58,7 +60,7 @@ A fresh deployment boots with an empty policy store, so nobody can pass the self
 
 ```
 src/
-├── main.rs              binary entry point: config → telemetry → OIDC/policy wiring → listener
+├── main.rs              binary entry point: config → telemetry → OIDC/policy/fs/sync wiring → listener
 ├── lib.rs               crate root and documentation
 ├── config.rs            TOML configuration model ([database].prefix, [s3] bucket/prefix)
 ├── db.rs                OxKV OxKvStore factory — one AmazonS3Builder for file bytes + OxKvStore; build_s3_store / build_test_store / build_test_store_new_session / build_scratch_store; single-live-handle-per-prefix contract
@@ -76,10 +78,10 @@ src/
 │   ├── row.rs           RowAuthorizer trait for {type}:{id} objects
 │   ├── route.rs         /policy/* handlers
 │   └── setup.rs         /setup/admin one-time superadmin claim
-├── sync/                Per-user replicas (versioned OxKvStore prefixes + manifest, WAL-backed)
-│   ├── wal.rs           Wal on OxKvStore — WalOp::{PolicyAdd,PolicyRemove,Attach,Detach}, wal:{seq:020} + wal:seq
-│   ├── snapshot.rs      SnapshotManager — filtered replicas ({db}/u/{sub}/{seq} + meta.json pointer)
-│   └── route.rs         GET /sync/clone (pointer + ETag) + GET /sync/db/{seq}/{object} (segments + ETags)
+├── sync/                Per-user replicas (stable OxKvStore prefixes + manifest, WAL-backed)
+│   ├── wal.rs           Wal on OxKvStore — WalOp::{PolicyAdd,PolicyRemove,Attach,Detach,FileCreate,FileDelete}, wal:{seq:020} + wal:seq, serialized appends
+│   ├── snapshot.rs      SnapshotManager — one filtered replica per user ({db}/u/{sub} + sync:applied marker), tx-atomic rebuilds, idempotent replay
+│   └── route.rs         GET /sync/clone (pointer + ETag) + GET /sync/db/{object} (segments + ETags)
 └── fs/                  Object-store file storage (AmazonS3/MinIO/R2 via object_store, InMemory for tests)
     ├── mod.rs           FsEngine (temp per-user, row delegation, token mint/verify)
     ├── relation.rs      RefInfo + fs:rel:{type}:{id}:{file} + fs:files:{id}:refs
@@ -119,9 +121,11 @@ Business rows authorize as `{row_type}:{row_id}` via `RowAuthorizer` (`policy/ro
 - Reads/deletes check `owner_sub == caller` (temp) or any owning row grants `Read`/`Delete`. Editing a row is `detach(old)+create new+attach(new)` — the old S3 object becomes orphan and is removed by GC after 24h.
 - After row authorization, a short-lived HMAC token (`fs/token.rs`) can be minted for direct `PUT`/`GET` without extra policy hits. File bytes live in S3 via `object_store` (`AmazonS3` in production, `InMemory` in tests).
 
-### Per-user clones (WAL)
+### Per-user replicas (WAL)
 
-The master `FsStore` and `Wal` both live on prefix-scoped `OxKvStore`s and remain the sole write path. `Wal` appends `wal:{seq:020}` entries plus `wal:seq` head (`sync/wal.rs`, `WalOp::{PolicyAdd,PolicyRemove,Attach,Detach}`). Each snapshot version is a filtered replica under `{db}/u/{sub}/{seq:020}/` with its own oxkv `manifest.json` (the segment list: WAL/SST/blob ids) built by `SnapshotManager::build_full` — files are filtered through `RowAuthorizer`/`owner==sub` and written once into a fresh version prefix that is never mutated afterwards, so readers always see a consistent view; `snapshots/{sub}/meta.json` (`applied_seq`/`version`) is written last so the pointer cutover is atomic. `GET /sync/clone` returns the replica pointer with a version `ETag` (repeat polls get `304`), and `GET /sync/db/{seq}/{object}` serves one replica object with backend `ETag` passthrough and `If-None-Match` support — version-scoped engine files are immutable (`Cache-Control: immutable`), only `manifest.json` is revalidated. Wasm clients open an `OxKvReader` over the version prefix and follow it like any other oxkv store.
+The master `FsStore` and `Wal` both live on prefix-scoped `OxKvStore`s and remain the sole write path. `Wal` appends `wal:{seq:020}` entries plus `wal:seq` head (`sync/wal.rs`, `WalOp::{PolicyAdd,PolicyRemove,Attach,Detach,FileCreate,FileDelete}`). Each user owns one replica prefix (`{db}/u/{sub}/`) holding their filtered file set with its own oxkv `manifest.json` (the segment list): builds filter through `RowAuthorizer`/`owner==sub` into a RAM scratch store, diff against the live replica, and commit the diff plus the `sync:applied` coverage marker in a single transaction — so a crash before commit leaves the old state untouched and an empty diff commits nothing at all. `GET /sync/clone` returns the replica pointer with a coverage `ETag` (repeat polls get `304` without touching storage beyond the marker read), and `GET /sync/db/{object}` serves one replica object with backend `ETag` passthrough and `If-None-Match` support — engine files are immutable by construction (`Cache-Control: immutable`), only `manifest.json` is revalidated. Wasm clients open an `OxKvReader` over the prefix and follow the live manifest.
+
+Every master mutation is also appended to the shared `Wal` (`{db}/wal`): file creates/deletes and attach/detach from `FsEngine`, rule/group changes from `PolicyEngine` (including `policy import`), each after the mutation commits — a logging failure fails the whole operation, and concurrent appends serialize on a mutex shared by all engine handles. `GET /sync/clone` short-circuits when coverage already meets the WAL head; otherwise deltas of ≤1000 file/relation ops replay onto the live prefix (ops re-applied with visibility re-checked, marker last — a crash heals on the next poll), while policy changes, larger deltas, or fencing losses fall back to full recalc — or adopt the winner's coverage on a lost build race. No version GC is needed: there is only ever one prefix per user, maintained by oxkv's own WAL GC and compaction.
 
 ## Configuration
 
@@ -138,7 +142,8 @@ issuer_url = "https://idp.example.com"      # base URL of the OIDC discovery doc
 
 [database]
 prefix = "oxkv"                             # object prefix inside the S3 bucket for OxKV keys (default "oxkv")
-                                            # policy → {prefix}/policy, fs → {prefix}/fs; no local file
+                                            # policy → {prefix}/policy, fs → {prefix}/fs, wal → {prefix}/wal,
+                                            # replicas → {prefix}/u/{sub}; no local file
 
 [s3]
 bucket = "my-bucket"                          # S3 bucket (AmazonS3 via object_store; InMemory for tests)
@@ -189,7 +194,7 @@ rust-api policy export --config config.toml --out backup.json
 rust-api policy import --config config.toml --input backup.json
 ```
 
-Under the hood these call `admin::export_s3` / `admin::import_s3` on the `{prefix}/policy` `OxKvStore`. Imports are idempotent — already-present rules are skipped — and every entry passes the same `PolicyRuleValidator` as live API writes.
+Under the hood these call `admin::export_s3` / `admin::import_s3` on the `{prefix}/policy` `OxKvStore`. Imports are idempotent — already-present rules are skipped — and every entry passes the same `PolicyRuleValidator` as live API writes. Added rules are also appended to the WAL (production wires it through), so replicas replay the import instead of only discovering it via full recalc.
 
 ## Extending the API
 

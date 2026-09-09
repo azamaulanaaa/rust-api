@@ -340,6 +340,19 @@ impl FsStore {
         }
         Ok(out)
     }
+
+    /// Dumps every raw key-value pair for verbatim replica copies.
+    ///
+    /// The caller owns filtering: everything present is returned as-is.
+    pub(crate) async fn dump_kvs(&self) -> Result<Vec<(String, Vec<u8>)>, FsError> {
+        use oxkv::Direction;
+        let g = self.inner.read().await;
+        let kvs = g
+            .gets_bytes(None, Direction::Next, (None, None))
+            .await
+            .map_err(|e| FsError::Store(e.to_string()))?;
+        Ok(kvs.into_iter().map(|kv| (kv.key, kv.value)).collect())
+    }
 }
 
 #[cfg(test)]

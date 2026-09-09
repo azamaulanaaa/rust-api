@@ -211,9 +211,13 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
     let setup_api_module = SetupApiModule::new(policy_engine.clone(), oidc_api_module.middleware());
     let policy_api_module =
         PolicyApiModule::new(policy_engine.clone(), oidc_api_module.middleware());
-    let fs_engine = FsEngine::init(fs_s3_store.clone(), &s3_client_config, policy_engine.clone())
-        .await?
-        .with_wal(wal.clone());
+    let fs_engine = FsEngine::init(
+        fs_s3_store.clone(),
+        &s3_client_config,
+        policy_engine.clone(),
+    )
+    .await?
+    .with_wal(wal.clone());
     // GC: expire abandoned multipart uploads every hour (24h TTL)
     rust_api::fs::gc::spawn(std::sync::Arc::new(fs_engine.clone()));
     let fs_api_module = FsApiModule::new(fs_engine, oidc_api_module.middleware());
@@ -226,20 +230,16 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
             .build()
             .context("build snapshot object store")?,
     );
-    let snapshot_s3 = rust_api::fs::s3::build_s3_client(&s3_client_config)
-        .await
-        .map_err(|e| anyhow::anyhow!("build snapshot S3 client: {e}"))?;
     let snapshot_manager = SnapshotManager::new(
         wal.clone(),
         FsStore::new(fs_s3_store.clone()),
         policy_engine.clone(),
-        snapshot_s3,
-        config.s3.bucket.clone(),
         replica_objects,
         db_prefix,
         false,
     );
-    let sync_api_module = SyncApiModule::new(snapshot_manager, oidc_api_module.middleware());
+    let sync_api_module =
+        SyncApiModule::new(snapshot_manager.clone(), oidc_api_module.middleware());
 
     let listen_addr = SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), config.listen_port);
     ApiService::new()

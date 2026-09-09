@@ -32,7 +32,7 @@ pub mod fs;
 /// OpenAPI specification composed from all `utoipa::path` modules.
 pub mod docs;
 
-/// Per-user filtered replicas with WAL replay.
+/// Per-user filtered replicas on stable OxKvStore prefixes.
 pub mod sync;
 
 /// OxKV store factory (prefix-scoped inside configured S3 bucket).
