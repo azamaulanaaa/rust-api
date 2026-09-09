@@ -1,8 +1,8 @@
-//! Per-user filtered clones with on-demand WAL replay.
+//! Per-user filtered replicas with on-demand WAL replay.
 //!
-//! The master [`FsStore`](crate::fs::store::FsStore) lives on a prefix-scoped
-//! `OxKvStore`; per-user clones are the filtered file list serialized as JSON
-//! objects on `S3`.
+//! The master [`FsStore`](crate::fs::store::FsStore) remains the sole write
+//! path; per-user snapshot versions are filtered read replicas on
+//! versioned `OxKvStore` prefixes, served over `/sync/db/` for oxkv readers.
 
 pub mod route;
 pub mod snapshot;

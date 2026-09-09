@@ -15,7 +15,7 @@ The crate is intentionally business-logic free: applications compose `ApiModule`
 - **Temp per-user file scope with refcount relations** — uploads start as temp owned by `owner_sub` (`refs==0`), `attach`/`detach` to rows via `fs:rel:{type}:{id}:{file}` increments/decrements `fs:files:{id}:refs` inside the `{prefix}/fs` `OxKvStore`; editing a row swaps relations, never deletes the underlying S3 object immediately
 - **Capability tokens** — short-lived HMAC JWT (`fs/token.rs`, 5m) minted after row authorization, verified on file ops without extra policy hits
 - **GC for orphans** — hourly sweeper removes abandoned upload sessions and temp/orphaned files (`refs==0` and `age>24h` or `orphan_since>24h`)
-- **Per-user filtered clones with WAL (S3, JSON)** — WAL lives as `wal:{seq:020}` + `wal:seq` inside an `OxKvStore`; per-user snapshots are JSON objects on S3 (`snapshots/{sub}/{seq:020}.json` + `snapshots/{sub}/meta.json`) built via an ephemeral scratch `OxKvStore` (`db::build_scratch_store`); `GET /sync/clone` does on-demand WAL replay when `delta <= 1000` else full filtered recalc
+- **Per-user filtered replicas with WAL (S3, oxkv manifest)** — WAL lives as `wal:{seq:020}` + `wal:seq` inside an `OxKvStore`; each snapshot version is a filtered replica under `{db}/u/{sub}/{seq:020}/` with its own oxkv `manifest.json` (the segment list) built via `SnapshotManager::build_full`; `GET /sync/clone` returns the replica pointer with an `ETag` (repeat polls get `304`), and every object inside the version prefix is individually cached at `GET /sync/db/{seq}/{object}` with backend `ETag` passthrough and `If-None-Match` support — DASH-style: manifest plus immutable segments
 - **Modular composition** — implement the `ApiModule` trait and register onto `ApiService`; auth middleware is applied per module scope
 - **Observability** — structured console logging through the `tracing` facade (`RUST_LOG` syntax), plus optional OpenTelemetry span export over OTLP/gRPC with W3C Trace Context propagation
 
@@ -45,7 +45,8 @@ The crate is intentionally business-logic free: applications compose `ApiModule`
 | GET | `/fs/files/{id}/meta` | File metadata (owner or row Read) | Bearer token |
 | GET | `/fs/files/{id}` | Download file content (owner or row Read) | Bearer token |
 | DELETE | `/fs/files/{id}` | Delete file (owner when temp, or row Delete) | Bearer token |
-| GET | `/sync/clone` | Per-user filtered snapshot key (on-demand WAL replay or full recalc) | Bearer token |
+| GET | `/sync/clone` | Replica pointer + version ETag (on-demand WAL replay or full recalc) | Bearer token |
+| GET | `/sync/db/{seq}/{object}` | One replica object (manifest/SST/WAL/blob) with ETag + `If-None-Match` | Bearer token |
 
 Protected routes accept either an explicit `Authorization: Bearer <token>` header (preferred) or the session cookie set by `/auth/callback`. Requests without valid credentials get `401`; insufficient permissions get `403`. All errors use a uniform JSON envelope: `{"error": "<message>"}`.
 
@@ -75,10 +76,10 @@ src/
 │   ├── row.rs           RowAuthorizer trait for {type}:{id} objects
 │   ├── route.rs         /policy/* handlers
 │   └── setup.rs         /setup/admin one-time superadmin claim
-├── sync/                Per-user clones (S3 + JSON, WAL-backed)
+├── sync/                Per-user replicas (versioned OxKvStore prefixes + manifest, WAL-backed)
 │   ├── wal.rs           Wal on OxKvStore — WalOp::{PolicyAdd,PolicyRemove,Attach,Detach}, wal:{seq:020} + wal:seq
-│   ├── snapshot.rs      SnapshotManager — filtered JSON on S3 (snapshots/{sub}/{seq}.json + meta.json) via ephemeral scratch OxKvStore
-│   └── route.rs         GET /sync/clone — on-demand WAL replay (≤1000) or full recalc
+│   ├── snapshot.rs      SnapshotManager — filtered replicas ({db}/u/{sub}/{seq} + meta.json pointer)
+│   └── route.rs         GET /sync/clone (pointer + ETag) + GET /sync/db/{seq}/{object} (segments + ETags)
 └── fs/                  Object-store file storage (AmazonS3/MinIO/R2 via object_store, InMemory for tests)
     ├── mod.rs           FsEngine (temp per-user, row delegation, token mint/verify)
     ├── relation.rs      RefInfo + fs:rel:{type}:{id}:{file} + fs:files:{id}:refs
@@ -120,7 +121,7 @@ Business rows authorize as `{row_type}:{row_id}` via `RowAuthorizer` (`policy/ro
 
 ### Per-user clones (WAL)
 
-The master `FsStore` and `Wal` both live on prefix-scoped `OxKvStore`s. `Wal` appends `wal:{seq:020}` entries plus `wal:seq` head (`sync/wal.rs`, `WalOp::{PolicyAdd,PolicyRemove,Attach,Detach}`). Per-user snapshots are JSON objects on S3 (`snapshots/{sub}/{seq:020}.json` + `snapshots/{sub}/meta.json` with `applied_seq`/`version`) built by `SnapshotManager::build_full` — files are filtered through `RowAuthorizer`/`owner==sub` into an ephemeral scratch `OxKvStore` (`db::build_scratch_store`), serialized as `Vec<FileRecord>` JSON, and uploaded as one S3 object; no local Redb files are involved. `GET /sync/clone` loads `meta.json`, replays `wal[applied+1..head]` filtered when `delta <= 1000`, otherwise full filtered recalc from zero. User `Write` lack does not block master replication — clone is a read-filtered replica.
+The master `FsStore` and `Wal` both live on prefix-scoped `OxKvStore`s and remain the sole write path. `Wal` appends `wal:{seq:020}` entries plus `wal:seq` head (`sync/wal.rs`, `WalOp::{PolicyAdd,PolicyRemove,Attach,Detach}`). Each snapshot version is a filtered replica under `{db}/u/{sub}/{seq:020}/` with its own oxkv `manifest.json` (the segment list: WAL/SST/blob ids) built by `SnapshotManager::build_full` — files are filtered through `RowAuthorizer`/`owner==sub` and written once into a fresh version prefix that is never mutated afterwards, so readers always see a consistent view; `snapshots/{sub}/meta.json` (`applied_seq`/`version`) is written last so the pointer cutover is atomic. `GET /sync/clone` returns the replica pointer with a version `ETag` (repeat polls get `304`), and `GET /sync/db/{seq}/{object}` serves one replica object with backend `ETag` passthrough and `If-None-Match` support — version-scoped engine files are immutable (`Cache-Control: immutable`), only `manifest.json` is revalidated. Wasm clients open an `OxKvReader` over the version prefix and follow it like any other oxkv store.
 
 ## Configuration
 
