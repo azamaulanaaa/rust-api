@@ -35,7 +35,7 @@ pub mod docs;
 /// Per-user filtered clones with WAL replay.
 pub mod sync;
 
-/// OxKV S3Store factory (prefix-scoped inside configured S3 bucket).
+/// OxKV store factory (prefix-scoped inside configured S3 bucket).
 pub mod db;
 
 /// Telemetry bootstrap: global [`tracing`] subscriber installation and

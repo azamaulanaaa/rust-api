@@ -75,7 +75,7 @@ pub enum PolicyError {
 }
 
 /// Central authorization engine: a Casbin RBAC enforcer persisted to a
-/// prefix-scoped `S3Store`, plus management helpers for rules
+/// prefix-scoped `OxKvStore`, plus management helpers for rules
 /// and group membership.
 ///
 /// Cloning is cheap: the enforcer lives behind an `Arc`, so clones share
@@ -124,13 +124,13 @@ pub(crate) const RBAC_MODEL: &str = r#"
 "#;
 
 impl PolicyEngine {
-    /// Creates the engine from an [`oxkv::S3Store`] (OxKV S3 backend).
-    pub async fn init_s3(s3_store: oxkv::S3Store) -> Result<Self, PolicyError> {
+    /// Creates the engine from an [`oxkv::OxKvStore`] (OxKV S3 backend).
+    pub async fn init_s3(s3_store: oxkv::OxKvStore) -> Result<Self, PolicyError> {
         Self::init_with_store(s3_store).await
     }
 
-    /// Generic initializer over any [`oxkv::Store`] (e.g. `S3Store` in
-    /// production, `InMemory`-backed `S3Store` or `BTreeStore` in tests).
+    /// Generic initializer over any [`oxkv::Store`] (e.g. `OxKvStore` in
+    /// production, `InMemory`-backed `OxKvStore` or `BTreeStore` in tests).
     ///
     /// Writes are validated through [`PolicyRuleValidator`](adapter::PolicyRuleValidator)
     /// by the adapter (see [`adapter::encode_rule`]).

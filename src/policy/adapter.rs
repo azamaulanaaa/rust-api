@@ -36,11 +36,10 @@ fn store_err(e: oxkv::StoreError) -> CasbinError {
 
 /// Encodes one rule as a validated `(key, value)` pair.
 ///
-/// [`oxkv::HookStore`] cannot wrap [`oxkv::S3Store`] (`HookStore`'s `Store`
-/// impl requires the inner store to be `Clone`, which `S3Store` is not), so
-/// the adapter enforces [`PolicyRuleValidator`] directly on every write path
-/// instead of at the storage layer. Validation runs before any transaction
-/// opens, so rejected writes fail without touching the store.
+/// The adapter enforces [`PolicyRuleValidator`] directly on every write path
+/// instead of requiring callers to wrap their store in an [`oxkv::HookStore`].
+/// Validation runs before any transaction opens, so rejected writes fail
+/// without touching the store.
 async fn encode_rule<S>(
     store: &S,
     sec: &str,
@@ -123,8 +122,8 @@ impl Validator for PolicyRuleValidator {
 
 /// A Casbin [`Adapter`] persisting policies to any [`oxkv::Store`].
 ///
-/// Generic over the backend so production can use a prefix-scoped `S3Store`
-/// while tests use the in-memory B-tree store or an `InMemory`-backed `S3Store`.
+/// Generic over the backend so production can use a prefix-scoped `OxKvStore`
+/// while tests use the in-memory B-tree store or an `InMemory`-backed `OxKvStore`.
 /// Every write path validates rules through [`PolicyRuleValidator`] (see
 /// [`encode_rule`]) before staging them.
 pub struct OxkvAdapter<S: Store> {
@@ -166,7 +165,7 @@ impl<S: Store> OxkvAdapter<S> {
             .into_iter()
             .map(|kv| kv.key)
             .collect();
-        let mut tx = self.store.begin_tx()?;
+        let tx = self.store.begin_tx()?;
         for key in &keys {
             tx.delete(key).await?;
         }
@@ -248,7 +247,7 @@ where
             encoded.push(encode_rule(&self.store, sec, ptype, rule).await?);
         }
 
-        let mut tx = self.store.begin_tx().map_err(store_err)?;
+        let tx = self.store.begin_tx().map_err(store_err)?;
         for (key, value) in &encoded {
             tx.set_bytes(key, value).await.map_err(store_err)?;
         }
@@ -287,7 +286,7 @@ where
             encoded.push(encode_rule(&self.store, sec, ptype, rule).await?);
         }
 
-        let mut tx = self.store.begin_tx().map_err(store_err)?;
+        let tx = self.store.begin_tx().map_err(store_err)?;
         for (key, value) in &encoded {
             if tx.has(key).await.map_err(store_err)? {
                 tx.rollback().await.map_err(store_err)?;
@@ -316,7 +315,7 @@ where
     ) -> casbin::Result<bool> {
         let keys: Vec<String> = rules.iter().map(|r| rule_key(sec, ptype, r)).collect();
 
-        let mut tx = self.store.begin_tx().map_err(store_err)?;
+        let tx = self.store.begin_tx().map_err(store_err)?;
         for key in &keys {
             if tx.has(key).await.map_err(store_err)? {
                 tx.delete(key).await.map_err(store_err)?;
@@ -355,7 +354,7 @@ where
             }
         }
 
-        let mut tx = self.store.begin_tx().map_err(store_err)?;
+        let tx = self.store.begin_tx().map_err(store_err)?;
         for key in &to_delete {
             tx.delete(key).await.map_err(store_err)?;
         }
@@ -368,7 +367,7 @@ where
 mod tests {
     use super::*;
     use casbin::{CoreApi, DefaultModel, Enforcer, MgmtApi};
-    use oxkv::{BTreeStore, RedbStore};
+    use oxkv::BTreeStore;
 
     const MODEL: &str = r#"
         [request_definition]
@@ -385,12 +384,25 @@ mod tests {
 
     #[tokio::test]
     async fn persists_rules_across_reopen() {
-        let path = std::env::temp_dir().join(format!("oxkv-adapter-test-{}", std::process::id()));
+        use std::sync::Arc;
+
+        // Shared in-memory LSM backend; reopening rebuilds from it (WAL
+        // replay) the way a second `OxKvStore` session would on real S3.
+        let backend = Arc::new(oxkv::MemStorage::new());
+        let open = |backend: Arc<oxkv::MemStorage>| async move {
+            oxkv::OxKvStore::builder()
+                .with_store(backend)
+                .with_prefix(oxkv::ObjectPath::from("adapter-test"))
+                .skip_probe(true)
+                .build()
+                .await
+                .unwrap()
+        };
         let model = DefaultModel::from_str(MODEL).await.unwrap();
 
         {
             let adapter = OxkvAdapter::new(
-                oxkv::HookStore::new(RedbStore::new_file(&path).unwrap())
+                oxkv::HookStore::new(open(backend.clone()).await)
                     .with_validator(PolicyRuleValidator),
             );
             let mut enforcer = Enforcer::new(model, adapter).await.unwrap();
@@ -412,15 +424,13 @@ mod tests {
         {
             let model = DefaultModel::from_str(MODEL).await.unwrap();
             let adapter = OxkvAdapter::new(
-                oxkv::HookStore::new(RedbStore::new_file(&path).unwrap())
+                oxkv::HookStore::new(open(backend.clone()).await)
                     .with_validator(PolicyRuleValidator),
             );
             let enforcer = Enforcer::new(model, adapter).await.unwrap();
             assert!(enforcer.enforce(("user_1", "data_1", "read")).unwrap());
             assert!(!enforcer.enforce(("user_1", "data_1", "write")).unwrap());
         }
-
-        std::fs::remove_file(path).ok();
     }
 
     #[tokio::test]
@@ -471,7 +481,7 @@ mod tests {
     async fn validator_rejects_malformed_writes() {
         use oxkv::Store as _;
 
-        let mut store =
+        let store =
             oxkv::HookStore::new(BTreeStore::default()).with_validator(PolicyRuleValidator);
 
         // Valid p-rule passes.
@@ -481,22 +491,22 @@ mod tests {
             .unwrap();
 
         // Non-JSON value rejected.
-        let mut tx = store.begin_tx().unwrap();
+        let tx = store.begin_tx().unwrap();
         assert!(tx.set_bytes("p:p:cd02", b"not json").await.is_err());
 
         // Wrong arity for section rejected at staging (g needs 2 fields).
-        let mut tx = store.begin_tx().unwrap();
+        let tx = store.begin_tx().unwrap();
         assert!(tx.set_bytes("g:g:ef03", br#"["user"]"#).await.is_err());
 
         // Unknown section rejected at staging.
-        let mut tx = store.begin_tx().unwrap();
+        let tx = store.begin_tx().unwrap();
         assert!(tx.set_bytes("x:m:ff04", br#"["a","b"]"#).await.is_err());
     }
 
     #[tokio::test]
-    async fn adapter_validates_writes_on_s3_store() {
-        // S3Store is not Clone, so HookStore cannot wrap it; the adapter
-        // enforces PolicyRuleValidator itself (see encode_rule).
+    async fn adapter_validates_writes_on_oxkv_store() {
+        // The adapter enforces PolicyRuleValidator itself (see encode_rule),
+        // so validation holds on the LSM backend without a HookStore wrap.
         let s3 = crate::db::build_test_store("adapter-s3-validate").await;
         let mut adapter = OxkvAdapter::new(s3);
 

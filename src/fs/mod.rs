@@ -36,9 +36,9 @@ pub struct FsEngine {
 }
 
 impl FsEngine {
-    /// Creates the engine from an `S3Store` (per-user S3, scalable).
+    /// Creates the engine from an `OxKvStore` (per-user S3, scalable).
     pub async fn init(
-        s3_store: oxkv::S3Store,
+        s3_store: oxkv::OxKvStore,
         s3_config: &s3::S3ClientConfig,
         policy: PolicyEngine,
     ) -> Result<Self, FsError> {

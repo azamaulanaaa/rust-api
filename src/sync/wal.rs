@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use oxkv::{GetSet, S3Store};
+use oxkv::{GetSet, OxKvStore};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
@@ -52,15 +52,15 @@ pub struct WalEntry {
     pub ts: i64,
 }
 
-/// WAL stored in an [`S3Store`] (per-user S3, scalable).
+/// WAL stored in an [`OxKvStore`] (per-user S3, scalable).
 #[derive(Clone)]
 pub struct Wal {
-    store: Arc<RwLock<S3Store>>,
+    store: Arc<RwLock<OxKvStore>>,
 }
 
 impl Wal {
-    /// Creates a WAL from an [`S3Store`].
-    pub fn new(s3_store: S3Store) -> Self {
+    /// Creates a WAL from an [`OxKvStore`].
+    pub fn new(s3_store: OxKvStore) -> Self {
         Self {
             store: Arc::new(RwLock::new(s3_store)),
         }
@@ -76,7 +76,7 @@ impl Wal {
 
     /// Append an operation, returns new seq.
     pub async fn append(&self, op: WalOp) -> Result<u64, FsError> {
-        let mut g = self.store.write().await;
+        let g = self.store.write().await;
         let cur = g
             .get_bytes(Self::seq_key())
             .await

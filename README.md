@@ -8,14 +8,14 @@ The crate is intentionally business-logic free: applications compose `ApiModule`
 
 - **OIDC authentication** — authorization-code flow with PKCE, CSRF state, and nonce validation against any spec-compliant identity provider (Keycloak, Entra ID, Auth0, …)
 - **JWT validation via JWKS** — refreshable multi-algorithm key store with rotation support; unknown `kid` triggers a debounced re-fetch of the provider's keys
-- **Casbin RBAC on OxKV S3Store** — permission rules and group membership backed by a prefix-scoped [`oxkv::S3Store`](https://docs.rs/oxkv) (`{prefix}/policy` inside the configured S3 bucket via `object_store::aws::AmazonS3`); one `S3Store` per domain sharing a single `AmazonS3Builder` setup (`db.rs`); no local Redb file required
+- **Casbin RBAC on OxKV OxKvStore** — permission rules and group membership backed by a prefix-scoped [`oxkv::OxKvStore`](https://docs.rs/oxkv) (`{prefix}/policy` inside the configured S3 bucket via `object_store::aws::AmazonS3`); one `OxKvStore` per domain sharing a single `AmazonS3Builder` setup (`db.rs`); no local Redb file required
 - **Validated persistence** — every rule write is validated through `policy::adapter::encode_rule` / `PolicyRuleValidator` (`{sec}:{ptype}:{hash}` key shape, JSON array value, arity 3 for `p` / 2 for `g`) before any transaction opens; malformed rules fail at the API boundary instead of poisoning startup
-- **Single-live-handle-per-prefix** — each `S3Store` owns a fencing session (memtable/WAL buffer); two live handles on the same prefix can fence/diverge on real S3 — share via `Arc` instead of building a second one (`db::build_s3_store` docs); tests use `InMemory`-backed `S3Store` with `skip_probe(true)` and `build_test_store_new_session` for single-threaded reopen
+- **Single-live-handle-per-prefix** — each `OxKvStore` owns a fencing session (memtable/WAL buffer); two live handles on the same prefix can fence/diverge on real S3 — share via `Arc` instead of building a second one (`db::build_s3_store` docs); tests use `InMemory`-backed `OxKvStore` with `skip_probe(true)` and `build_test_store_new_session` for single-threaded reopen
 - **Modular row-level authorization** — business rows authorize as `{type}:{id}` objects via `policy::row::RowAuthorizer`; files delegate to owning rows instead of a coarse `fs` gate
-- **Temp per-user file scope with refcount relations** — uploads start as temp owned by `owner_sub` (`refs==0`), `attach`/`detach` to rows via `fs:rel:{type}:{id}:{file}` increments/decrements `fs:files:{id}:refs` inside the `{prefix}/fs` `S3Store`; editing a row swaps relations, never deletes the underlying S3 object immediately
+- **Temp per-user file scope with refcount relations** — uploads start as temp owned by `owner_sub` (`refs==0`), `attach`/`detach` to rows via `fs:rel:{type}:{id}:{file}` increments/decrements `fs:files:{id}:refs` inside the `{prefix}/fs` `OxKvStore`; editing a row swaps relations, never deletes the underlying S3 object immediately
 - **Capability tokens** — short-lived HMAC JWT (`fs/token.rs`, 5m) minted after row authorization, verified on file ops without extra policy hits
 - **GC for orphans** — hourly sweeper removes abandoned upload sessions and temp/orphaned files (`refs==0` and `age>24h` or `orphan_since>24h`)
-- **Per-user filtered clones with WAL (S3, JSON)** — WAL lives as `wal:{seq:020}` + `wal:seq` inside an `S3Store`; per-user snapshots are JSON objects on S3 (`snapshots/{sub}/{seq:020}.json` + `snapshots/{sub}/meta.json`) built via an ephemeral scratch `S3Store` (`db::build_scratch_store`); `GET /sync/clone` does on-demand WAL replay when `delta <= 1000` else full filtered recalc
+- **Per-user filtered clones with WAL (S3, JSON)** — WAL lives as `wal:{seq:020}` + `wal:seq` inside an `OxKvStore`; per-user snapshots are JSON objects on S3 (`snapshots/{sub}/{seq:020}.json` + `snapshots/{sub}/meta.json`) built via an ephemeral scratch `OxKvStore` (`db::build_scratch_store`); `GET /sync/clone` does on-demand WAL replay when `delta <= 1000` else full filtered recalc
 - **Modular composition** — implement the `ApiModule` trait and register onto `ApiService`; auth middleware is applied per module scope
 - **Observability** — structured console logging through the `tracing` facade (`RUST_LOG` syntax), plus optional OpenTelemetry span export over OTLP/gRPC with W3C Trace Context propagation
 
@@ -60,7 +60,7 @@ src/
 ├── main.rs              binary entry point: config → telemetry → OIDC/policy wiring → listener
 ├── lib.rs               crate root and documentation
 ├── config.rs            TOML configuration model ([database].prefix, [s3] bucket/prefix)
-├── db.rs                OxKV S3Store factory — one AmazonS3Builder for file bytes + S3Store; build_s3_store / build_test_store / build_test_store_new_session / build_scratch_store; single-live-handle-per-prefix contract
+├── db.rs                OxKV OxKvStore factory — one AmazonS3Builder for file bytes + OxKvStore; build_s3_store / build_test_store / build_test_store_new_session / build_scratch_store; single-live-handle-per-prefix contract
 ├── telemetry.rs         tracing subscriber + OTLP span export bootstrap
 ├── http/                HTTP scaffolding shared by all modules
 │   ├── mod.rs           ApiService registry + ApiModule trait
@@ -69,24 +69,24 @@ src/
 │   └── middleware/      bearer_token, jwt (JWKS-backed claims), request_tracing
 ├── oidc/                OIDC client: /auth/login + /auth/callback (code flow, PKCE)
 ├── policy/              Casbin engine, oxkv adapter + validator, management routes
-│   ├── adapter.rs       OxkvAdapter<S: Store> + PolicyRuleValidator + encode_rule() (validates before tx; HookStore can't wrap S3Store)
-│   ├── admin.rs         export_s3 / import_s3 (S3Store, not file)
-│   ├── mod.rs           PolicyEngine::init_s3 / init_with_store (prefix-scoped S3Store)
+│   ├── adapter.rs       OxkvAdapter<S: Store> + PolicyRuleValidator + encode_rule() (validates before tx)
+│   ├── admin.rs         export_s3 / import_s3 (OxKvStore, not file)
+│   ├── mod.rs           PolicyEngine::init_s3 / init_with_store (prefix-scoped OxKvStore)
 │   ├── row.rs           RowAuthorizer trait for {type}:{id} objects
 │   ├── route.rs         /policy/* handlers
 │   └── setup.rs         /setup/admin one-time superadmin claim
 ├── sync/                Per-user clones (S3 + JSON, WAL-backed)
-│   ├── wal.rs           Wal on S3Store — WalOp::{PolicyAdd,PolicyRemove,Attach,Detach}, wal:{seq:020} + wal:seq
-│   ├── snapshot.rs      SnapshotManager — filtered JSON on S3 (snapshots/{sub}/{seq}.json + meta.json) via ephemeral scratch S3Store
+│   ├── wal.rs           Wal on OxKvStore — WalOp::{PolicyAdd,PolicyRemove,Attach,Detach}, wal:{seq:020} + wal:seq
+│   ├── snapshot.rs      SnapshotManager — filtered JSON on S3 (snapshots/{sub}/{seq}.json + meta.json) via ephemeral scratch OxKvStore
 │   └── route.rs         GET /sync/clone — on-demand WAL replay (≤1000) or full recalc
 └── fs/                  Object-store file storage (AmazonS3/MinIO/R2 via object_store, InMemory for tests)
     ├── mod.rs           FsEngine (temp per-user, row delegation, token mint/verify)
     ├── relation.rs      RefInfo + fs:rel:{type}:{id}:{file} + fs:files:{id}:refs
     ├── token.rs         FsClaims HMAC JWT (5m)
-    ├── store.rs         FsStore on S3Store (fs:uploads:{id}:meta, fs:files:{id}:meta, staged parts)
+    ├── store.rs         FsStore on OxKvStore (fs:uploads:{id}:meta, fs:files:{id}:meta, staged parts)
     ├── gc.rs            hourly sweep for sessions + orphaned files (refs==0, 24h TTL)
     ├── s3.rs            S3Client trait + S3ClientConfig
-    ├── object_store.rs  ObjectStoreClient + shared s3_builder() for S3Store + file bytes
+    ├── object_store.rs  ObjectStoreClient + shared s3_builder() for OxKvStore + file bytes
     └── route.rs         /fs/uploads/* and /fs/files/* handlers
 ```
 
@@ -104,15 +104,15 @@ m = g(r.sub, p.sub) && r.obj == p.obj && r.act == p.act
 
 A request is authorized when its subject either holds a matching `p`-rule directly or belongs to a group (`g`-link) that does. Typical setup: grant permissions to *groups* via `POST /policy/rules`, then manage membership via the `/policy/groups` endpoints.
 
-Rules persist to a prefix-scoped [`oxkv::S3Store`](https://docs.rs/oxkv) under `{database.prefix}/policy` inside the configured S3 bucket (one `ObjectStore` + one `AmazonS3Builder` shared with the file-byte store via `db::build_s3_store` / `fs::object_store::s3_builder`). Each rule is one key-value pair (`{sec}:{ptype}:{hash}` → JSON array) written transactionally. Validation is enforced on every write path through `adapter::encode_rule` / `PolicyRuleValidator` — wrong-arity rules, non-JSON payloads, or unknown sections fail before any transaction opens. `HookStore` cannot wrap `S3Store` (`S3Store` is not `Clone`), so the adapter validates directly instead of at the storage layer.
+Rules persist to a prefix-scoped [`oxkv::OxKvStore`](https://docs.rs/oxkv) under `{database.prefix}/policy` inside the configured S3 bucket (one `ObjectStore` + one `AmazonS3Builder` shared with the file-byte store via `db::build_s3_store` / `fs::object_store::s3_builder`). Each rule is one key-value pair (`{sec}:{ptype}:{hash}` → JSON array) written transactionally. Validation is enforced on every write path through `adapter::encode_rule` / `PolicyRuleValidator` — wrong-arity rules, non-JSON payloads, or unknown sections fail before any transaction opens. The adapter validates directly instead of requiring callers to wrap their store in a `HookStore`.
 
-> **Single-live-handle-per-prefix:** each `S3Store` owns a fresh fencing session (memtable/WAL buffer). Two live handles on the same prefix can fence each other or diverge on real S3. Share the handle via `Arc` — do not build a second one. Tests use `db::build_test_store` (fresh `InMemory` per prefix) and `build_test_store_new_session` for single-threaded reopen (new session superseding the previous one).
+> **Single-live-handle-per-prefix:** each `OxKvStore` owns a fresh fencing session (memtable/WAL buffer). Two live handles on the same prefix can fence each other or diverge on real S3. Share the handle via `Arc` — do not build a second one. Tests use `db::build_test_store` (fresh `InMemory` per prefix) and `build_test_store_new_session` for single-threaded reopen (new session superseding the previous one).
 
 ### Row-level and file delegation
 
 Business rows authorize as `{row_type}:{row_id}` via `RowAuthorizer` (`policy/row.rs`). Files are not gated by a coarse `fs` object; instead:
 
-- `POST /fs/uploads` creates a temp file owned by `owner_sub` (`refs==0`) in the `{prefix}/fs` `S3Store` (`fs:uploads:{id}:meta`, staged parts `fs:uploads:{id}:part:{idx}`).
+- `POST /fs/uploads` creates a temp file owned by `owner_sub` (`refs==0`) in the `{prefix}/fs` `OxKvStore` (`fs:uploads:{id}:meta`, staged parts `fs:uploads:{id}:part:{idx}`).
 - `FsEngine::attach(row_type,row_id,file_id,caller)` requires `Write` on `{row_type}:{row_id}` and increments `fs:files:{id}:refs` + writes `fs:rel:{type}:{id}:{file}`.
 - `FsEngine::detach` decrements and sets `orphan_since` when `refs==0`.
 - Reads/deletes check `owner_sub == caller` (temp) or any owning row grants `Read`/`Delete`. Editing a row is `detach(old)+create new+attach(new)` — the old S3 object becomes orphan and is removed by GC after 24h.
@@ -120,7 +120,7 @@ Business rows authorize as `{row_type}:{row_id}` via `RowAuthorizer` (`policy/ro
 
 ### Per-user clones (WAL)
 
-The master `FsStore` and `Wal` both live on prefix-scoped `S3Store`s. `Wal` appends `wal:{seq:020}` entries plus `wal:seq` head (`sync/wal.rs`, `WalOp::{PolicyAdd,PolicyRemove,Attach,Detach}`). Per-user snapshots are JSON objects on S3 (`snapshots/{sub}/{seq:020}.json` + `snapshots/{sub}/meta.json` with `applied_seq`/`version`) built by `SnapshotManager::build_full` — files are filtered through `RowAuthorizer`/`owner==sub` into an ephemeral scratch `S3Store` (`db::build_scratch_store`), serialized as `Vec<FileRecord>` JSON, and uploaded as one S3 object; no local Redb files are involved. `GET /sync/clone` loads `meta.json`, replays `wal[applied+1..head]` filtered when `delta <= 1000`, otherwise full filtered recalc from zero. User `Write` lack does not block master replication — clone is a read-filtered replica.
+The master `FsStore` and `Wal` both live on prefix-scoped `OxKvStore`s. `Wal` appends `wal:{seq:020}` entries plus `wal:seq` head (`sync/wal.rs`, `WalOp::{PolicyAdd,PolicyRemove,Attach,Detach}`). Per-user snapshots are JSON objects on S3 (`snapshots/{sub}/{seq:020}.json` + `snapshots/{sub}/meta.json` with `applied_seq`/`version`) built by `SnapshotManager::build_full` — files are filtered through `RowAuthorizer`/`owner==sub` into an ephemeral scratch `OxKvStore` (`db::build_scratch_store`), serialized as `Vec<FileRecord>` JSON, and uploaded as one S3 object; no local Redb files are involved. `GET /sync/clone` loads `meta.json`, replays `wal[applied+1..head]` filtered when `delta <= 1000`, otherwise full filtered recalc from zero. User `Write` lack does not block master replication — clone is a read-filtered replica.
 
 ## Configuration
 
@@ -154,7 +154,7 @@ otlp_endpoint = "http://localhost:4317"     # OTLP/gRPC collector endpoint
 sample_ratio = 1.0                          # fraction of traces sampled (0.0–1.0, default 1.0)
 ```
 
-Single bucket, prefix-scoped stores: `db::build_s3_store` builds one `AmazonS3` `ObjectStore` from `[s3]` and wraps it with `S3Store::builder().with_prefix("oxkv/policy")` etc. via the shared `fs::object_store::s3_builder`. Breaking change since `988873c`: `[database].path` (Redb file) is gone — use `[database].prefix`; old `*.redb` files are no longer read (no automatic migration).
+Single bucket, prefix-scoped stores: `db::build_s3_store` builds one `AmazonS3` `ObjectStore` from `[s3]` and wraps it with `OxKvStore::builder().with_object_store(...).with_prefix("oxkv/policy")` etc. via the shared `fs::object_store::s3_builder`. Breaking change since `988873c`: `[database].path` (Redb file) is gone — use `[database].prefix`; old `*.redb` files are no longer read (no automatic migration).
 
 ## Running
 
@@ -188,7 +188,7 @@ rust-api policy export --config config.toml --out backup.json
 rust-api policy import --config config.toml --input backup.json
 ```
 
-Under the hood these call `admin::export_s3` / `admin::import_s3` on the `{prefix}/policy` `S3Store`. Imports are idempotent — already-present rules are skipped — and every entry passes the same `PolicyRuleValidator` as live API writes.
+Under the hood these call `admin::export_s3` / `admin::import_s3` on the `{prefix}/policy` `OxKvStore`. Imports are idempotent — already-present rules are skipped — and every entry passes the same `PolicyRuleValidator` as live API writes.
 
 ## Extending the API
 
@@ -208,11 +208,10 @@ impl ApiModule for MyModule {
 ```
 
 Handlers can extract validated JWT claims via the `Validated<C>` extractor (returns 401 automatically when claims are absent). See the crate documentation (`cargo doc --no-deps --open`) for details.
-
 ## Development
 
 ```bash
-mise exec -- cargo test                 # run tests (wiremock-based integration tests included; FsStore/PolicyEngine use InMemory-backed S3Store)
+mise exec -- cargo test                 # run tests (wiremock-based integration tests included; FsStore/PolicyEngine use InMemory-backed OxKvStore)
 mise exec -- cargo clippy --all-targets # lint (all targets, -D warnings; unwrap/expect denied in non-test code)
 mise exec -- cargo doc --no-deps        # generate docs
 mise exec -- cargo deny check licenses  # verify dependency licenses stay compatible
@@ -223,7 +222,7 @@ mise run cov                            # coverage via cargo llvm-cov (mise task
 
 Every public item must carry rustdoc — enforced at compile time via `[lints.rust] missing_docs = "deny"` in `Cargo.toml`.
 Dependency licensing is enforced via [`cargo-deny`](https://embarkstudios.github.io/cargo-deny/) (`deny.toml`: `licenses` + `advisories` + `bans`); any new dependency whose license is not permissive fails the check.
-`oxkv` 0.4 + `object_store` 0.12 (shared `AmazonS3Builder` for file bytes and `S3Store`).
+`oxkv` 0.7 (`oxkv` + `oxkv-s3` features) + `object_store` 0.12 (shared `AmazonS3Builder` for file bytes and `OxKvStore`).
 
 Commit messages follow the [Conventional Commits](https://www.conventionalcommits.org/) style without scopes (e.g. `feat:`, `fix:`, `docs:`).
 

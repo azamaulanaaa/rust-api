@@ -290,7 +290,7 @@ impl S3Client for ObjectStoreClient {
 /// Builds the configured `AmazonS3Builder` from [`S3ClientConfig`].
 ///
 /// Single construction site for the endpoint/region/credential setup:
-/// [`db`](crate::db) reuses this for OxKV `S3Store`s so the file-byte
+/// [`db`](crate::db) reuses this for OxKV `OxKvStore`s so the file-byte
 /// client and the transactional stores cannot drift apart. Each caller
 /// finishes the build itself because the `S3Client` wrapper needs the
 /// concrete `AmazonS3` type (`MultipartStore` is not object-safe).

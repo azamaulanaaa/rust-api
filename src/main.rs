@@ -179,19 +179,19 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
         access_key_id: config.s3.access_key_id.clone(),
         secret_access_key: config.s3.secret_access_key.clone(),
     };
-    // Single bucket, prefix-scoped S3Stores per domain (scalable, no local files).
+    // Single bucket, prefix-scoped OxKvStores per domain (scalable, no local files).
     let policy_store = rust_api::db::build_s3_store(
         &s3_client_config,
         &format!("{}/policy", config.database.prefix.trim_matches('/')),
     )
     .await
-    .map_err(|e| anyhow::anyhow!("build policy S3Store: {e}"))?;
+    .map_err(|e| anyhow::anyhow!("build policy OxKvStore: {e}"))?;
     let fs_s3_store = rust_api::db::build_s3_store(
         &s3_client_config,
         &format!("{}/fs", config.database.prefix.trim_matches('/')),
     )
     .await
-    .map_err(|e| anyhow::anyhow!("build fs S3Store: {e}"))?;
+    .map_err(|e| anyhow::anyhow!("build fs OxKvStore: {e}"))?;
     let policy_engine = PolicyEngine::init_s3(policy_store).await?;
     let setup_api_module = SetupApiModule::new(policy_engine.clone(), oidc_api_module.middleware());
     let policy_api_module =
