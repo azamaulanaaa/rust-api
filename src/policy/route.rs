@@ -154,6 +154,7 @@ impl From<PolicyError> for ApiError {
             PolicyError::AccessDenied => ApiError::Forbidden,
             PolicyError::Store(e) => ApiError::Internal(Box::new(e)),
             PolicyError::Casbin(e) => ApiError::Internal(Box::new(e)),
+            PolicyError::Wal(msg) => ApiError::Internal(msg.into()),
         }
     }
 }
