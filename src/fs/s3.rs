@@ -17,10 +17,13 @@ use crate::fs::error::FsError;
 pub type ByteStream =
     Pin<Box<dyn futures_util::Stream<Item = Result<Bytes, FsError>> + Send>>;
 
-/// A streaming object body with its total length.
+/// A streaming object body with its lengths.
 pub struct ObjectStream {
-    /// Total body length in bytes, for `Content-Length`.
+    /// Bytes carried by [`ObjectStream::stream`] (range length, or full
+    /// size for whole-object downloads), for `Content-Length`.
     pub size: u64,
+    /// Total object length in bytes, for `Content-Range`.
+    pub total: u64,
     /// Byte chunks in order; a mid-stream failure ends the download.
     pub stream: ByteStream,
 }
@@ -88,7 +91,33 @@ pub trait S3Client: Send + Sync {
         let stream = futures_util::stream::once(async move { Ok(body) });
         Ok(ObjectStream {
             size,
+            total: size,
             stream: Box::pin(stream),
+        })
+    }
+
+    /// Streams one absolute byte range (`end` exclusive) with the total
+    /// object length.
+    ///
+    /// Callers validate against metadata size first (unsatisfiable ranges
+    /// are a 416 decided without touching S3); backends clamp defensively.
+    /// The default impl slices through [`S3Client::get_object`] for test
+    /// doubles, production streams the range from the object store.
+    async fn get_object_range(
+        &self,
+        bucket: &str,
+        key: &str,
+        range: std::ops::Range<u64>,
+    ) -> Result<ObjectStream, FsError> {
+        let body = self.get_object(bucket, key).await?;
+        let total = body.len() as u64;
+        let start = range.start.min(total) as usize;
+        let end = range.end.min(total).max(start as u64) as usize;
+        let slice = body.slice(start..end);
+        Ok(ObjectStream {
+            size: slice.len() as u64,
+            total,
+            stream: Box::pin(futures_util::stream::once(async move { Ok(slice) })),
         })
     }
 
