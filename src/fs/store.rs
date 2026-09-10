@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
 use crate::fs::error::FsError;
-use crate::fs::relation::{RefInfo, refs_key, rel_key};
+use crate::fs::relation::{REL_PREFIX, RefInfo, refs_key, rel_key};
 
 /// In-flight multipart session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -238,12 +238,28 @@ impl FsStore {
         Ok(Some(r))
     }
 
-    /// Deletes a finalized file record and its ref-count entry atomically.
+    /// Deletes a finalized file record, its ref-count entry, and every
+    /// relation marker pointing at it, atomically. Markers left behind
+    /// would otherwise accumulate as garbage once the record is gone.
     pub async fn delete_file(&self, id: &str) -> Result<(), FsError> {
         let key = Self::file_key(id);
         let refs = refs_key(id);
         let g = self.inner.write().await;
         let tx = g.begin_tx().map_err(store_err)?;
+        let suffix = format!(":{id}");
+        let cursor = (
+            Some(REL_PREFIX.to_string()),
+            Some(prefix_scan_end(REL_PREFIX)),
+        );
+        let kvs = tx
+            .gets_bytes(None, Direction::Next, cursor)
+            .await
+            .map_err(store_err)?;
+        for kv in &kvs {
+            if kv.key.starts_with(REL_PREFIX) && kv.key.ends_with(&suffix) {
+                tx.delete(&kv.key).await.map_err(store_err)?;
+            }
+        }
         tx.delete(&key).await.map_err(store_err)?;
         let _ = tx.delete(&refs).await;
         tx.commit().await.map_err(store_err)?;
@@ -515,6 +531,31 @@ mod store_tests {
         store.delete_file("file-1").await?;
         assert!(store.get_file("file-1").await?.is_none());
         assert!(store.get_file("nonexistent").await?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delete_file_cleans_relations() -> anyhow::Result<()> {
+        let store = test_store().await;
+        let rec = FileRecord {
+            id: "rel-file".to_string(),
+            name: "r.txt".to_string(),
+            mimetype: "text/plain".to_string(),
+            size: 1,
+            s3_key: "files/rel-file".to_string(),
+            owner_sub: "bob".to_string(),
+            created_at: 0,
+        };
+        store.save_file(&rec).await?;
+        store.attach("invoice", "7", "rel-file").await?;
+        store.attach("receipt", "9", "rel-file").await?;
+        assert_eq!(store.rows_for_file("rel-file").await?.len(), 2);
+
+        store.delete_file("rel-file").await?;
+        assert!(store.get_file("rel-file").await?.is_none());
+        // No dangling markers or ref-count left behind.
+        assert!(store.rows_for_file("rel-file").await?.is_empty());
+        assert_eq!(store.get_ref_info("rel-file").await?.count, 0);
         Ok(())
     }
 
