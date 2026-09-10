@@ -76,6 +76,9 @@ pub struct OidcClient {
     issuer: String,
     /// Parsed template when [`OidcClient::issuer`] is templated.
     issuer_template: Option<IssuerTemplate>,
+    /// Absolute login-callback URL; its scheme decides the `Secure` flag
+    /// on auth cookies (plain-http deployments must still receive them).
+    redirect_url: String,
 }
 
 /// Everything a caller needs to start the authorization-code flow: the
@@ -151,7 +154,7 @@ impl OidcClient {
             ClientId::new(config.client_id),
             Some(ClientSecret::new(config.client_secret)),
         )
-        .set_redirect_uri(RedirectUrl::new(config.redirect_url)?);
+        .set_redirect_uri(RedirectUrl::new(config.redirect_url.clone())?);
 
         Ok(Self {
             client,
@@ -159,6 +162,7 @@ impl OidcClient {
             provider_metadata,
             issuer: raw_issuer,
             issuer_template,
+            redirect_url: config.redirect_url,
         })
     }
 
@@ -244,10 +248,24 @@ impl OidcClient {
         Ok(id_token.to_string())
     }
 
+    /// Whether auth cookies must carry the `Secure` flag.
+    ///
+    /// True for `https://` callbacks; plain-http deployments (local dev)
+    /// opt out so browsers accept the cookies at all. Unparseable URLs
+    /// fail closed to `true`.
+    pub fn secure_cookies(&self) -> bool {
+        secure_scheme(&self.redirect_url)
+    }
+
     /// The provider's discovered issuer URL; may contain a `{tenantid}`
     /// placeholder for multi-tenant providers.
     pub fn issuer(&self) -> &str {
         &self.issuer
+    }
+
+    /// The absolute login-callback URL this client redirects to.
+    pub fn redirect_url(&self) -> &str {
+        &self.redirect_url
     }
 
     /// The OAuth2 client ID used for token requests.
@@ -261,6 +279,17 @@ impl OidcClient {
     }
 }
 
+/// Reports whether `callback_url` uses `https`.
+///
+/// Drives the `Secure` flag on auth cookies. Unparseable input fails
+/// closed to `true` so a misconfigured URL can only make cookies
+/// stricter, never leak them over plaintext.
+fn secure_scheme(callback_url: &str) -> bool {
+    url::Url::parse(callback_url)
+        .map(|u| u.scheme() == "https")
+        .unwrap_or(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -271,6 +300,15 @@ mod tests {
     use serde_json::json;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn secure_scheme_https_only() {
+        assert!(secure_scheme("https://app.example.com/auth/callback"));
+        assert!(!secure_scheme("http://localhost:8080/auth/callback"));
+        // Fail closed: garbage can only make cookies stricter.
+        assert!(secure_scheme("not a url"));
+        assert!(secure_scheme(""));
+    }
 
     #[tokio::test]
     async fn oidc_end_to_end() -> anyhow::Result<()> {

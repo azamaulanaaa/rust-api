@@ -71,11 +71,12 @@ where
 pub async fn login(oidc_client: web::Data<OidcClient>) -> impl Responder {
     let auth_data = oidc_client.get_auth_url();
     let cookie_duration = Duration::minutes(5);
+    let secure = oidc_client.secure_cookies();
 
     let base_cookie = |name: &'static str, value: String| {
         Cookie::build(name, value)
             .http_only(true)
-            .secure(true)
+            .secure(secure)
             .same_site(SameSite::Lax)
             .max_age(cookie_duration)
             .path("/")
@@ -156,18 +157,19 @@ pub async fn callback(
         .await
     {
         Ok(token_string) => {
+            let secure = oidc_client.secure_cookies();
             let auth_cookie = Cookie::build("auth_token", token_string.clone())
                 .path("/")
                 .http_only(true)
-                .secure(true)
+                .secure(secure)
                 .same_site(SameSite::Lax)
                 .max_age(Duration::days(7))
                 .finish();
 
             HttpResponse::Ok()
-                .cookie(clear_cookie("oidc_csrf".to_string()))
-                .cookie(clear_cookie("oidc_nonce".to_string()))
-                .cookie(clear_cookie("oidc_pkce".to_string()))
+                .cookie(clear_cookie("oidc_csrf".to_string(), secure))
+                .cookie(clear_cookie("oidc_nonce".to_string(), secure))
+                .cookie(clear_cookie("oidc_pkce".to_string(), secure))
                 .cookie(auth_cookie)
                 .json(AuthResponse {
                     success: true,
@@ -205,11 +207,11 @@ pub async fn callback(
     }
 }
 
-fn clear_cookie(name: String) -> Cookie<'static> {
+fn clear_cookie(name: String, secure: bool) -> Cookie<'static> {
     Cookie::build(name, "")
         .path("/")
         .http_only(true)
-        .secure(true)
+        .secure(secure)
         .same_site(SameSite::Lax)
         .max_age(Duration::ZERO)
         .finish()
@@ -378,7 +380,11 @@ mod tests {
                 .find(|c| c.name() == name)
                 .unwrap_or_else(|| panic!("missing {name} cookie"));
             assert_eq!(cookie.http_only(), Some(true), "{name} must be HttpOnly");
-            assert_eq!(cookie.secure(), Some(true), "{name} must be Secure");
+            // Fixture callback is plain http, so the Secure flag is
+            // omitted entirely (the cookie crate reports that as None;
+            // https behavior is pinned by `secure_scheme_https_only` in
+            // `oidc::tests`); HttpOnly + SameSite still hold.
+            assert_eq!(cookie.secure(), None, "{name} omits Secure on http");
             assert_eq!(cookie.same_site(), Some(SameSite::Lax));
         }
     }
