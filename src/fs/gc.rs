@@ -1,6 +1,8 @@
 //! GC for abandoned uploads and orphaned files.
 //!
 //! Sessions and temp/orphaned files older than 24h are removed.
+//! Expired files are logged to the WAL (when the engine has one wired)
+//! so replicas replay the deletion instead of keeping stale copies.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -70,6 +72,11 @@ pub async fn sweep_once(engine: &FsEngine) -> Result<usize, crate::fs::error::Fs
         tracing::info!("fs gc expiring file {} (age {}s)", f.id, now - age);
         let _ = engine.s3.delete_object(&engine.bucket, &f.s3_key).await;
         engine.store.delete_file(&f.id).await?;
+        engine
+            .append_wal(crate::sync::wal::WalOp::FileDelete {
+                file_id: f.id.clone(),
+            })
+            .await?;
         cleaned += 1;
     }
 
@@ -219,6 +226,38 @@ mod tests {
         assert_eq!(cleaned, 1);
         assert!(engine.store.get_file("fresh-file").await?.is_some());
         assert!(engine.store.get_file("old-file").await?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sweep_logs_orphan_deletes_to_wal() -> anyhow::Result<()> {
+        use crate::sync::wal::{Wal, WalOp};
+
+        let wal_prefix = format!("test-gc-wal-{}-{}", std::process::id(), {
+            use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+            URL_SAFE_NO_PAD.encode(rand::random::<[u8; 6]>())
+        });
+        let wal = Wal::new(build_test_store(&wal_prefix).await);
+        let engine = make_engine().await.with_wal(wal.clone());
+        let old = FileRecord {
+            id: "gc-wal-file".into(),
+            name: "b.txt".into(),
+            mimetype: "text/plain".into(),
+            size: 10,
+            s3_key: "files/gc-wal-file".into(),
+            owner_sub: "alice".into(),
+            created_at: chrono::Utc::now().timestamp() - TTL_SECS - 3600,
+        };
+        engine.store.save_file(&old).await?;
+        assert_eq!(sweep_once(&engine).await?, 1);
+        assert_eq!(wal.head().await?, 1);
+        let entries = wal.range(1, 1).await?;
+        assert!(
+            matches!(&entries[0].op, WalOp::FileDelete { file_id } if file_id == "gc-wal-file")
+        );
+        // Second sweep finds nothing and logs nothing.
+        assert_eq!(sweep_once(&engine).await?, 0);
+        assert_eq!(wal.head().await?, 1);
         Ok(())
     }
 
