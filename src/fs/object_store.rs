@@ -277,6 +277,23 @@ impl S3Client for ObjectStoreClient {
         Ok(bytes)
     }
 
+    async fn get_object_stream(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<crate::fs::s3::ObjectStream, FsError> {
+        use futures_util::TryStreamExt as _;
+
+        let path = self.path(bucket, key);
+        let res = self.store.get(&path).await.map_err(Self::map_err)?;
+        let size = res.meta.size;
+        let stream = res.into_stream().map_err(Self::map_err);
+        Ok(crate::fs::s3::ObjectStream {
+            size,
+            stream: Box::pin(stream),
+        })
+    }
+
     async fn delete_object(&self, bucket: &str, key: &str) -> Result<(), FsError> {
         let path = self.path(bucket, key);
         match self.store.delete(&path).await {
@@ -397,6 +414,23 @@ mod tests {
         assert_eq!(keys[0].key, "files/a");
         assert_eq!(keys[1].key, "files/b");
         assert!(keys.iter().all(|k| k.last_modified > 0));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stream_roundtrip_matches_buffered() -> anyhow::Result<()> {
+        use futures_util::TryStreamExt as _;
+
+        let client = ObjectStoreClient::in_memory();
+        let body: Vec<u8> = (0..1_048_576u32).map(|i| (i % 251) as u8).collect();
+        client
+            .put_object("b", "files/big", Bytes::from(body.clone()), None, None)
+            .await?;
+        let obj = client.get_object_stream("b", "files/big").await?;
+        assert_eq!(obj.size, body.len() as u64);
+        let chunks: Vec<Bytes> = obj.stream.try_collect().await?;
+        let streamed: Vec<u8> = chunks.concat();
+        assert_eq!(streamed, body);
         Ok(())
     }
 
