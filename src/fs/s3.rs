@@ -65,6 +65,24 @@ pub trait S3Client: Send + Sync {
 
     /// Deletes an object.
     async fn delete_object(&self, bucket: &str, key: &str) -> Result<(), FsError>;
+
+    /// Lists keys under `prefix` with last-modified times.
+    ///
+    /// Backs the GC orphan-byte pass: keys the metadata no longer
+    /// references are unreachable and safe to reap once aged.
+    async fn list_keys(&self, bucket: &str, prefix: &str) -> Result<Vec<ListedKey>, FsError>;
+}
+
+/// A listed object key with its last-modified time (unix seconds).
+///
+/// Keys use the same relative form as `put/get/delete_object` (e.g.
+/// `"files/{id}"`), so listings compare directly against record keys.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListedKey {
+    /// Object key in relative form.
+    pub key: String,
+    /// Last-modified time as unix seconds.
+    pub last_modified: i64,
 }
 
 /// Configuration for the object-store client, mirroring `config::S3Config`
