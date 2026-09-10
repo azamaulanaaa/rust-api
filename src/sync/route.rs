@@ -397,7 +397,10 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body)?;
         assert_eq!(json["applied_seq"], 0);
         assert_eq!(json["head"], 0);
-        assert!(json["prefix"].as_str().unwrap_or_default().contains("u/alice"));
+        assert!(json["prefix"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("test-db/u/"));
 
         // Fresh client gets 304 with no body.
         let res = actix_web::test::call_service(
