@@ -36,6 +36,24 @@ impl From<oxkv::StoreError> for FsError {
     }
 }
 
+impl FsError {
+    /// Stable client-facing message: never carries request input.
+    ///
+    /// The inner detail stays in `Display` for server-side logs; the
+    /// wire body only gets this fixed string, so filenames, keys, and
+    /// sizes from the request can never reflect back to clients.
+    fn client_message(&self) -> &'static str {
+        match self {
+            Self::BadRequest(_) => "bad request",
+            Self::Forbidden => "forbidden",
+            Self::NotFound(_) => "not found",
+            Self::Conflict(_) => "conflict",
+            Self::PayloadTooLarge => "payload too large",
+            Self::Internal(_) | Self::Store(_) => "internal server error",
+        }
+    }
+}
+
 impl ResponseError for FsError {
     fn status_code(&self) -> StatusCode {
         match self {
@@ -61,7 +79,7 @@ impl ResponseError for FsError {
             }
             Self::Forbidden => {}
         }
-        let body = serde_json::json!({ "error": self.to_string() });
+        let body = serde_json::json!({ "error": self.client_message() });
         HttpResponse::build(self.status_code()).json(body)
     }
 }
@@ -86,5 +104,38 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["error"], "internal server error");
         assert!(!String::from_utf8_lossy(&body).contains("secret"));
+    }
+
+    #[actix_web::test]
+    async fn client_errors_never_echo_request_input() {
+        // Each body carries attacker-controlled input in its detail;
+        // the wire must only see the stable per-status message.
+        for (err, status, message) in [
+            (
+                FsError::BadRequest("blob size mismatch: got <script>alert(1)</script>".into()),
+                StatusCode::BAD_REQUEST,
+                "bad request",
+            ),
+            (
+                FsError::NotFound("file ../../etc/passwd not found".into()),
+                StatusCode::NOT_FOUND,
+                "not found",
+            ),
+            (
+                FsError::Conflict("rule p, ../../x already exists".into()),
+                StatusCode::CONFLICT,
+                "conflict",
+            ),
+        ] {
+            let res = err.error_response();
+            assert_eq!(res.status(), status);
+            let raw = actix_web::body::to_bytes(res.into_body()).await.unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+            assert_eq!(json["error"], message);
+            let text = String::from_utf8_lossy(&raw);
+            assert!(!text.contains("script"));
+            assert!(!text.contains("passwd"));
+            assert!(!text.contains("../"));
+        }
     }
 }
