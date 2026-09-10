@@ -137,29 +137,146 @@ async fn get_metadata(
     Ok(HttpResponse::Ok().json(meta))
 }
 
-#[utoipa::path(get, path = "/fs/files/{id}", tag = "fs", params(("id" = String, Path)), responses((status=200, description="binary")))]
+#[utoipa::path(get, path = "/fs/files/{id}", tag = "fs", params(("id" = String, Path), ("Range" = Option<String>, Header)), responses((status=200, description="binary"), (status=206, description="partial binary"), (status=416, description="range not satisfiable")))]
 #[get("/files/{id}")]
 async fn get_file(
     engine: web::Data<FsEngine>,
     claims: Validated<Claims>,
     path: web::Path<String>,
+    req: actix_web::HttpRequest,
 ) -> Result<HttpResponse, crate::fs::error::FsError> {
+    use actix_web::http::header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, RANGE};
+
     let id = path.into_inner();
-    let (rec, obj) = engine.get_object(&id, &claims.sub).await?;
-    // Mid-stream failures happen after headers are sent: log the detail
-    // server-side (the client just sees a truncated body).
-    let stream = obj.stream.map_err(|e| {
+    // Metadata first: one cheap cached read gives auth plus the total
+    // the range validates against, so exactly one S3 call follows.
+    let meta = engine.get_metadata(&id, &claims.sub).await?;
+    let header = req.headers().get(RANGE).and_then(|v| v.to_str().ok());
+    match parse_range(header, meta.size) {
+        RangeOutcome::Full => {
+            let (rec, obj) = engine.get_object(&id, &claims.sub).await?;
+            Ok(HttpResponse::Ok()
+                .content_type(rec.mimetype)
+                .insert_header((
+                    "Content-Disposition",
+                    format!("inline; filename=\"{}\"", sanitize_filename(&rec.name)),
+                ))
+                .insert_header((ACCEPT_RANGES, "bytes"))
+                .insert_header((CONTENT_LENGTH, obj.size))
+                .streaming(logged_stream(obj.stream)))
+        }
+        RangeOutcome::Ranged(r) => {
+            let (rec, obj) = engine
+                .get_object_range(&id, &claims.sub, r.start..r.end_inclusive + 1)
+                .await?;
+            // Headers describe what is actually streamed, not just what
+            // was asked: identical in every non-adversarial case.
+            let end = r.start + obj.size.saturating_sub(1);
+            Ok(HttpResponse::PartialContent()
+                .content_type(rec.mimetype)
+                .insert_header((
+                    "Content-Disposition",
+                    format!("inline; filename=\"{}\"", sanitize_filename(&rec.name)),
+                ))
+                .insert_header((ACCEPT_RANGES, "bytes"))
+                .insert_header((CONTENT_LENGTH, obj.size))
+                .insert_header((
+                    CONTENT_RANGE,
+                    format!("bytes {}-{}/{}", r.start, end, meta.size),
+                ))
+                .streaming(logged_stream(obj.stream)))
+        }
+        RangeOutcome::Unsatisfiable => Ok(HttpResponse::build(
+            actix_web::http::StatusCode::RANGE_NOT_SATISFIABLE,
+        )
+        .insert_header((CONTENT_RANGE, format!("bytes */{}", meta.size)))
+        .finish()),
+    }
+}
+
+/// Logs mid-stream download failures server-side (headers are already
+/// sent by then, so the client just sees a truncated body).
+fn logged_stream(
+    stream: crate::fs::s3::ByteStream,
+) -> impl futures_util::Stream<Item = Result<bytes::Bytes, crate::fs::error::FsError>> {
+    stream.map_err(|e| {
         tracing::warn!("file download stream failed: {e:?}");
         e
-    });
-    Ok(HttpResponse::Ok()
-        .content_type(rec.mimetype)
-        .insert_header((
-            "Content-Disposition",
-            format!("inline; filename=\"{}\"", sanitize_filename(&rec.name)),
-        ))
-        .insert_header((actix_web::http::header::CONTENT_LENGTH, obj.size))
-        .streaming(stream))
+    })
+}
+
+/// A satisfiable single byte range (inclusive end).
+struct ByteRange {
+    start: u64,
+    end_inclusive: u64,
+}
+
+/// Outcome of interpreting a `Range` header against a known total.
+enum RangeOutcome {
+    /// No (usable) header: serve the whole object (200).
+    Full,
+    /// Serve `start..=end_inclusive` (206).
+    Ranged(ByteRange),
+    /// Valid syntax past the end of the object (416).
+    Unsatisfiable,
+}
+
+/// Interprets a `Range` header against `total`.
+///
+/// Single `bytes=` ranges only; anything else (missing header, foreign
+/// unit, multi-range, malformed syntax, reversed bounds) falls back to a
+/// full 200 response per RFC 9110 §14.2. An empty object satisfies
+/// nothing, so any range on it is 416.
+fn parse_range(header: Option<&str>, total: u64) -> RangeOutcome {
+    let Some(spec) = header
+        .map(str::trim)
+        .and_then(|h| h.strip_prefix("bytes="))
+    else {
+        return RangeOutcome::Full;
+    };
+    if spec.contains(',') {
+        return RangeOutcome::Full;
+    }
+    let Some((start_s, end_s)) = spec.split_once('-') else {
+        return RangeOutcome::Full;
+    };
+    if total == 0 {
+        return RangeOutcome::Unsatisfiable;
+    }
+    if start_s.is_empty() {
+        // Suffix range: the last N bytes.
+        let Ok(n) = end_s.parse::<u64>() else {
+            return RangeOutcome::Full;
+        };
+        if n == 0 {
+            return RangeOutcome::Full;
+        }
+        let len = n.min(total);
+        return RangeOutcome::Ranged(ByteRange {
+            start: total - len,
+            end_inclusive: total - 1,
+        });
+    }
+    let Ok(start) = start_s.parse::<u64>() else {
+        return RangeOutcome::Full;
+    };
+    if start >= total {
+        return RangeOutcome::Unsatisfiable;
+    }
+    let end_inclusive = match end_s {
+        "" => total - 1,
+        s => match s.parse::<u64>() {
+            Ok(e) => e.min(total - 1),
+            Err(_) => return RangeOutcome::Full,
+        },
+    };
+    if end_inclusive < start {
+        return RangeOutcome::Full;
+    }
+    RangeOutcome::Ranged(ByteRange {
+        start,
+        end_inclusive,
+    })
 }
 
 /// Sanitizes a user-supplied filename for `Content-Disposition`.
@@ -286,6 +403,38 @@ mod tests {
         assert_eq!(sanitize_filename("   "), "file");
         assert_eq!(sanitize_filename(""), "file");
         assert_eq!(sanitize_filename(&"x".repeat(200)).len(), 100);
+    }
+
+    fn ranged(header: Option<&str>, total: u64) -> (u64, u64, bool, bool) {
+        match parse_range(header, total) {
+            RangeOutcome::Full => (0, 0, false, false),
+            RangeOutcome::Ranged(r) => (r.start, r.end_inclusive, true, false),
+            RangeOutcome::Unsatisfiable => (0, 0, false, true),
+        }
+    }
+
+    #[actix_web::test]
+    async fn parse_range_covers_http_semantics() {
+        // No header or foreign/multi/malformed units fall back to full.
+        assert_eq!(ranged(None, 1000), (0, 0, false, false));
+        assert_eq!(ranged(Some("items=0-99"), 1000), (0, 0, false, false));
+        assert_eq!(ranged(Some("bytes=0-99,200-299"), 1000), (0, 0, false, false));
+        assert_eq!(ranged(Some("bananas"), 1000), (0, 0, false, false));
+        assert_eq!(ranged(Some("bytes=abc-def"), 1000), (0, 0, false, false));
+        assert_eq!(ranged(Some("bytes=5-3"), 1000), (0, 0, false, false));
+        assert_eq!(ranged(Some("bytes=-0"), 1000), (0, 0, false, false));
+        assert_eq!(ranged(Some("bytes=-"), 1000), (0, 0, false, false));
+        // Bounded, open, and clamped ends.
+        assert_eq!(ranged(Some("bytes=0-99"), 1000), (0, 99, true, false));
+        assert_eq!(ranged(Some("bytes=900-"), 1000), (900, 999, true, false));
+        assert_eq!(ranged(Some("bytes=0-9999"), 1000), (0, 999, true, false));
+        // Suffix: last N bytes, capped at the total.
+        assert_eq!(ranged(Some("bytes=-100"), 1000), (900, 999, true, false));
+        assert_eq!(ranged(Some("bytes=-5000"), 1000), (0, 999, true, false));
+        // Past-the-end starts are unsatisfiable, including on empty files.
+        assert_eq!(ranged(Some("bytes=1000-"), 1000), (0, 0, false, true));
+        assert_eq!(ranged(Some("bytes=2000-3000"), 1000), (0, 0, false, true));
+        assert_eq!(ranged(Some("bytes=0-0"), 0), (0, 0, false, true));
     }
 
     #[actix_web::test]
@@ -627,6 +776,97 @@ mod tests {
         .await;
         assert_eq!(res.status(), http::StatusCode::OK);
         assert_eq!(test::read_body(res).await.len(), 524288);
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn ranged_download_serves_206_and_416() -> anyhow::Result<()> {
+        let fx = fixture(true).await?;
+        let mw = JwtClaimsMiddleware::<Claims>::new_with_jks(
+            &format!("{}/jwks", fx.server.uri()),
+            AUD,
+            &fx.issuer(),
+        )
+        .await?;
+        let module = FsApiModule::new(fx.engine.clone(), mw);
+        let app = test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+        let body: Vec<u8> = (0..8192u32).map(|i| (i % 251) as u8).collect();
+
+        let res = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/fs/uploads")
+                .insert_header(("Cookie", format!("auth_token={token}")))
+                .set_json(json!({"file_size": 8192, "part_size": 8192, "file_total_parts": 1}))
+                .to_request(),
+        )
+        .await;
+        let init: serde_json::Value = test::read_body_json(res).await;
+        let file_id = init["file_id"].as_str().unwrap();
+        let res = test::call_service(
+            &app,
+            test::TestRequest::put()
+                .uri(&format!("/fs/uploads/{file_id}/parts/0"))
+                .insert_header(("Cookie", format!("auth_token={token}")))
+                .set_payload(body.clone())
+                .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::NO_CONTENT);
+        let res = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!("/fs/uploads/{file_id}/complete"))
+                .insert_header(("Cookie", format!("auth_token={token}")))
+                .set_json(json!({"name":"r.bin","mimetype":"application/octet-stream"}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+
+        let get = |range: Option<&str>| {
+            let mut req = test::TestRequest::get()
+                .uri(&format!("/fs/files/{file_id}"))
+                .insert_header(("Cookie", format!("auth_token={token}")));
+            if let Some(r) = range {
+                req = req.insert_header(("Range", r));
+            }
+            test::call_service(&app, req.to_request())
+        };
+        let header = |res: &actix_web::dev::ServiceResponse, name: &str| {
+            res.headers().get(name).and_then(|v| v.to_str().ok()).unwrap_or_default().to_string()
+        };
+
+        // Full download advertises ranges.
+        let res = get(None).await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        assert_eq!(header(&res, "accept-ranges"), "bytes");
+        assert_eq!(header(&res, "content-length"), "8192");
+        assert_eq!(test::read_body(res).await.to_vec(), body);
+
+        // Bounded, open, and suffix ranges.
+        for (range, content_range, expected) in [
+            ("bytes=0-99", "bytes 0-99/8192", body[0..100].to_vec()),
+            ("bytes=8000-", "bytes 8000-8191/8192", body[8000..].to_vec()),
+            ("bytes=-100", "bytes 8092-8191/8192", body[8092..].to_vec()),
+        ] {
+            let res = get(Some(range)).await;
+            assert_eq!(res.status(), http::StatusCode::PARTIAL_CONTENT, "{range}");
+            assert_eq!(header(&res, "content-range"), content_range);
+            assert_eq!(header(&res, "accept-ranges"), "bytes");
+            assert_eq!(test::read_body(res).await.to_vec(), expected);
+        }
+
+        // Past-the-end range: 416 with the total for retries.
+        let res = get(Some("bytes=9000-9999")).await;
+        assert_eq!(res.status(), http::StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(header(&res, "content-range"), "bytes */8192");
+
+        // Malformed range: ignored per RFC, full body.
+        let res = get(Some("bananas")).await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        assert_eq!(test::read_body(res).await.to_vec(), body);
         Ok(())
     }
 }

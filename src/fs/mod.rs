@@ -467,6 +467,37 @@ impl FsEngine {
         Ok((rec, body))
     }
 
+    /// Streams one absolute byte range (`end` exclusive) of a file the
+    /// caller may read.
+    ///
+    /// Auth and metadata size come from the same checks as
+    /// [`FsEngine::get_object`]; sizes are immutable after completion,
+    /// so the range is clamped defensively and routes decide 416
+    /// against metadata they already hold.
+    #[tracing::instrument(skip(self), fields(file_id = %file_id, caller_sub = %caller_sub, start = range.start, end = range.end), err)]
+    pub async fn get_object_range(
+        &self,
+        file_id: &str,
+        caller_sub: &str,
+        range: std::ops::Range<u64>,
+    ) -> Result<(FileRecord, crate::fs::s3::ObjectStream), FsError> {
+        if !self.can_access(caller_sub, file_id, Action::Read).await? {
+            return Err(FsError::Forbidden);
+        }
+        let rec = self
+            .store
+            .get_file(file_id)
+            .await?
+            .ok_or_else(|| FsError::NotFound("file not found".into()))?;
+        let start = range.start.min(rec.size);
+        let end = range.end.min(rec.size).max(start);
+        let body = self
+            .s3
+            .get_object_range(&self.bucket, &rec.s3_key, start..end)
+            .await?;
+        Ok((rec, body))
+    }
+
     /// Returns upload progress; only owner may poll.
     #[tracing::instrument(skip(self), fields(file_id = %file_id, caller_sub = %caller_sub), err)]
     pub async fn get_progress(
