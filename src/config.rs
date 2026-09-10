@@ -95,6 +95,15 @@ pub struct DatabaseConfig {
     /// Defaults to `"oxkv"`.
     #[serde(default = "default_db_prefix")]
     pub prefix: String,
+    /// Mirror the master fs store in RAM for replica rebuilds.
+    ///
+    /// Prototype: when true, the snapshot manager keeps a lazily-warmed
+    /// [`oxkv::CachedOxKvStore`] mirror over the master fs prefix, so
+    /// full rebuilds serve bulk scans from memory after the first pass.
+    /// Costs one master key set in RAM; safe only while serve() holds
+    /// the single writer for the prefix. Defaults to false.
+    #[serde(default)]
+    pub mirror_master: bool,
 }
 
 fn default_db_prefix() -> String {
