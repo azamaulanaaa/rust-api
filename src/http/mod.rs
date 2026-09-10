@@ -84,12 +84,13 @@ impl ApiService {
         self
     }
 
-    /// Binds the composed application to `addr` and serves it until the
-    /// process is stopped.
+    /// Binds the composed application to `addr` and serves it until a
+    /// shutdown signal (Ctrl-C / SIGTERM) arrives, then drains
+    /// connections within the shutdown timeout before returning.
     pub async fn start(self, addr: SocketAddr) -> anyhow::Result<()> {
         let modules = Arc::new(self.modules);
 
-        HttpServer::new(move || {
+        let server = HttpServer::new(move || {
             let mut app = apply_limits(App::new())
                 .wrap(middleware::request_tracing::RequestTracingMiddleware)
                 .wrap(middleware::bearer_token::BearerTokenMiddleware)
@@ -106,10 +107,42 @@ impl ApiService {
         .client_request_timeout(CLIENT_TIMEOUT)
         .client_disconnect_timeout(CLIENT_TIMEOUT)
         .bind(addr)?
-        .run()
-        .await?;
+        .run();
+        let handle = server.handle();
+        tokio::spawn(async move {
+            shutdown_signal().await;
+            tracing::info!("shutdown signal received; draining connections");
+            handle.stop(true).await;
+        });
+        server.await?;
 
         Ok(())
+    }
+}
+
+/// Resolves when the process should shut down: Ctrl-C everywhere, plus
+/// SIGTERM on unix (container orchestrators). Separated for testability
+/// of the wiring in [`ApiService::start`].
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {},
+                    _ = term.recv() => {},
+                }
+            }
+            Err(e) => {
+                tracing::warn!("SIGTERM handler install failed ({e}); watching Ctrl-C only");
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
     }
 }
 
