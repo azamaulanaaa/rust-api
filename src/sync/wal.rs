@@ -147,6 +147,12 @@ impl Wal {
     }
 
     /// Range `from..=to` inclusive.
+    ///
+    /// Missing or undecodable entries are corruption: atomic appends keep
+    /// `1..=head` fully populated, so a gap means entries were lost, not
+    /// merely delayed. Gaps error instead of being skipped — replaying
+    /// past them would silently drop mutations — and callers fall back to
+    /// a full rebuild.
     pub async fn range(&self, from: u64, to: u64) -> Result<Vec<WalEntry>, FsError> {
         if from > to {
             return Ok(Vec::new());
@@ -154,14 +160,22 @@ impl Wal {
         let g = self.store.read().await;
         let mut out = Vec::new();
         for seq in from..=to {
-            if let Some(b) = g
+            let Some(b) = g
                 .get_bytes(&Self::entry_key(seq))
                 .await
                 .map_err(|e| FsError::Store(e.to_string()))?
-                && let Ok(e) = serde_json::from_slice::<WalEntry>(&b)
-            {
-                out.push(e);
+            else {
+                return Err(FsError::Store(format!("wal entry {seq} missing")));
+            };
+            let entry: WalEntry = serde_json::from_slice(&b)
+                .map_err(|e| FsError::Internal(format!("wal entry {seq} undecodable: {e}")))?;
+            if entry.seq != seq {
+                return Err(FsError::Internal(format!(
+                    "wal entry {seq} holds sequence {}",
+                    entry.seq
+                )));
             }
+            out.push(entry);
         }
         Ok(out)
     }
@@ -205,6 +219,32 @@ mod tests {
         let r = wal.range(1, 2).await?;
         assert_eq!(r.len(), 2);
         assert_eq!(r[0].seq, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn range_fails_loudly_on_gaps_and_garbage() -> anyhow::Result<()> {
+        let wal = test_wal().await;
+        let op = || WalOp::Attach {
+            row_type: "t".into(),
+            row_id: "1".into(),
+            file_id: "f".into(),
+        };
+        wal.append(op()).await?;
+        wal.append(op()).await?;
+        assert_eq!(wal.range(1, 2).await?.len(), 2);
+
+        // Deleted entry: gap errors instead of silently replaying past it.
+        let key1 = format!("wal:{:020}", 1);
+        wal.store.write().await.delete(&key1).await?;
+        assert!(wal.range(1, 2).await.is_err());
+        // Untouched suffix still reads.
+        assert_eq!(wal.range(2, 2).await?.len(), 1);
+
+        // Corrupt payload errors as well.
+        let key2 = format!("wal:{:020}", 2);
+        wal.store.write().await.set_bytes(&key2, b"not json").await?;
+        assert!(wal.range(2, 2).await.is_err());
         Ok(())
     }
 
