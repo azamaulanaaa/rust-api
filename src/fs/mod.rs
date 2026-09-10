@@ -442,12 +442,16 @@ impl FsEngine {
     }
 
     /// Streams a file body if caller has row `Read` or owns temp.
+    ///
+    /// Chunks flow straight from the object store to the response: the
+    /// full body is never buffered, so arbitrarily large files download
+    /// in constant memory.
     #[tracing::instrument(skip(self), fields(file_id = %file_id, caller_sub = %caller_sub), err)]
     pub async fn get_object(
         &self,
         file_id: &str,
         caller_sub: &str,
-    ) -> Result<(FileRecord, bytes::Bytes), FsError> {
+    ) -> Result<(FileRecord, crate::fs::s3::ObjectStream), FsError> {
         if !self.can_access(caller_sub, file_id, Action::Read).await? {
             return Err(FsError::Forbidden);
         }
@@ -456,7 +460,10 @@ impl FsEngine {
             .get_file(file_id)
             .await?
             .ok_or_else(|| FsError::NotFound("file not found".into()))?;
-        let body = self.s3.get_object(&self.bucket, &rec.s3_key).await?;
+        let body = self
+            .s3
+            .get_object_stream(&self.bucket, &rec.s3_key)
+            .await?;
         Ok((rec, body))
     }
 
@@ -635,6 +642,34 @@ mod tests {
             .unwrap();
         let meta = engine.get_metadata(&id, "bob").await?;
         assert_eq!(meta.name, "doc.txt");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn streamed_download_matches_upload() -> anyhow::Result<()> {
+        use futures_util::TryStreamExt as _;
+
+        let engine = make_engine("alice", false).await;
+        let id = engine.init_upload(valid_single(), "alice").await?;
+        let body: Vec<u8> = (0..1024u32).map(|i| (i % 251) as u8).collect();
+        engine
+            .upload_part(&id, 0, Bytes::from(body.clone()), None, "alice")
+            .await?;
+        engine
+            .complete_upload(
+                &id,
+                CompleteRequest {
+                    name: "big.bin".into(),
+                    mimetype: "application/octet-stream".into(),
+                },
+                "alice",
+            )
+            .await?;
+        let (rec, obj) = engine.get_object(&id, "alice").await?;
+        assert_eq!(obj.size, 1024);
+        let chunks: Vec<Bytes> = obj.stream.try_collect().await?;
+        assert_eq!(chunks.concat(), body);
+        assert_eq!(rec.size, 1024);
         Ok(())
     }
 

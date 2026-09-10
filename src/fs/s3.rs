@@ -4,12 +4,26 @@
 //! [`crate::fs::object_store`]. The trait remains the seam so `FsEngine`
 //! stays storage-agnostic and tests can inject `InMemory`.
 
+use std::pin::Pin;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
 
 use crate::fs::error::FsError;
+
+/// Streaming download body: object chunks that never materialize the whole
+/// file in memory at once.
+pub type ByteStream =
+    Pin<Box<dyn futures_util::Stream<Item = Result<Bytes, FsError>> + Send>>;
+
+/// A streaming object body with its total length.
+pub struct ObjectStream {
+    /// Total body length in bytes, for `Content-Length`.
+    pub size: u64,
+    /// Byte chunks in order; a mid-stream failure ends the download.
+    pub stream: ByteStream,
+}
 
 /// Abstraction over S3 operations used by [`crate::fs::FsEngine`].
 #[async_trait]
@@ -62,6 +76,21 @@ pub trait S3Client: Send + Sync {
 
     /// Fetches an object body.
     async fn get_object(&self, bucket: &str, key: &str) -> Result<Bytes, FsError>;
+
+    /// Streams an object body with its total length.
+    ///
+    /// Downloads must not buffer whole files: the default impl collects
+    /// through [`S3Client::get_object`] (keeps test doubles working),
+    /// production overrides with true streaming from the object store.
+    async fn get_object_stream(&self, bucket: &str, key: &str) -> Result<ObjectStream, FsError> {
+        let body = self.get_object(bucket, key).await?;
+        let size = body.len() as u64;
+        let stream = futures_util::stream::once(async move { Ok(body) });
+        Ok(ObjectStream {
+            size,
+            stream: Box::pin(stream),
+        })
+    }
 
     /// Deletes an object.
     async fn delete_object(&self, bucket: &str, key: &str) -> Result<(), FsError>;

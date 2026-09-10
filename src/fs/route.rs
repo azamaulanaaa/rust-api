@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use actix_web::{HttpResponse, delete, get, post, put, web};
 use bytes::Bytes;
+use futures_util::TryStreamExt as _;
 
 use crate::fs::FsEngine;
 use crate::fs::model::{CompleteRequest, InitRequest, InitResponse};
@@ -144,14 +145,21 @@ async fn get_file(
     path: web::Path<String>,
 ) -> Result<HttpResponse, crate::fs::error::FsError> {
     let id = path.into_inner();
-    let (rec, body) = engine.get_object(&id, &claims.sub).await?;
+    let (rec, obj) = engine.get_object(&id, &claims.sub).await?;
+    // Mid-stream failures happen after headers are sent: log the detail
+    // server-side (the client just sees a truncated body).
+    let stream = obj.stream.map_err(|e| {
+        tracing::warn!("file download stream failed: {e:?}");
+        e
+    });
     Ok(HttpResponse::Ok()
         .content_type(rec.mimetype)
         .insert_header((
             "Content-Disposition",
             format!("inline; filename=\"{}\"", sanitize_filename(&rec.name)),
         ))
-        .body(body))
+        .insert_header((actix_web::http::header::CONTENT_LENGTH, obj.size))
+        .streaming(stream))
 }
 
 /// Sanitizes a user-supplied filename for `Content-Disposition`.
