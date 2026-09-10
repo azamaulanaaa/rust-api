@@ -34,11 +34,68 @@ pub struct FsEngine {
     pub(crate) s3: Arc<dyn S3Client>,
     pub(crate) bucket: String,
     policy: PolicyEngine,
-    token_secret: Arc<Vec<u8>>,
+    token_keys: Arc<TokenKeys>,
     /// WAL for replica sync; `None` disables logging (tests).
     /// Production must wire it: without appends the WAL head never
     /// advances and replicas freeze at their last snapshot.
     wal: Option<Wal>,
+}
+
+/// One capability-token signing key: `kid` goes in the JWT header.
+#[derive(Clone)]
+struct TokenKey {
+    kid: String,
+    secret: Vec<u8>,
+}
+
+/// Capability-token signing keys: current mints, previous verifies only.
+///
+/// Token IDs stay UUIDv7 (oxkv sorts by creation time); only the HMAC
+/// material needs real entropy, so IDs and secrets evolve independently.
+#[derive(Clone)]
+pub struct TokenKeys {
+    current: TokenKey,
+    previous: Option<TokenKey>,
+}
+
+impl TokenKeys {
+    /// Ephemeral 256-bit key from the OS RNG: for tests and unconfigured
+    /// runs. Tokens die with the process — production must configure a
+    /// stable secret (see `CapabilityConfig`).
+    pub fn ephemeral() -> Self {
+        use rand::RngCore as _;
+
+        let mut secret = vec![0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut secret);
+        Self {
+            current: TokenKey {
+                kid: token::kid_for(&secret),
+                secret,
+            },
+            previous: None,
+        }
+    }
+
+    /// Configured keys from hex: current mints, previous (if any)
+    /// verifies during rotation. Rejects weak/truncated material.
+    pub fn from_hex(current: &str, previous: Option<&str>) -> Result<Self, FsError> {
+        let current_bytes = token::parse_secret_hex(current).map_err(FsError::BadRequest)?;
+        let current = TokenKey {
+            kid: token::kid_for(&current_bytes),
+            secret: current_bytes,
+        };
+        let previous = previous
+            .map(|s| {
+                token::parse_secret_hex(s)
+                    .map(|secret| TokenKey {
+                        kid: token::kid_for(&secret),
+                        secret,
+                    })
+                    .map_err(FsError::BadRequest)
+            })
+            .transpose()?;
+        Ok(Self { current, previous })
+    }
 }
 
 impl FsEngine {
@@ -52,13 +109,12 @@ impl FsEngine {
         let s3 = s3::build_s3_client(s3_config)
             .await
             .map_err(|e| FsError::Internal(format!("failed to build S3 client: {e}")))?;
-        let secret = Self::gen_secret();
         Ok(Self {
             store,
             s3,
             bucket: s3_config.bucket.clone(),
             policy,
-            token_secret: Arc::new(secret),
+            token_keys: Arc::new(TokenKeys::ephemeral()),
             wal: None,
         })
     }
@@ -91,28 +147,39 @@ impl FsEngine {
             s3,
             bucket,
             policy,
-            token_secret: Arc::new(Self::gen_secret()),
+            token_keys: Arc::new(TokenKeys::ephemeral()),
             wal: None,
         }
     }
 
-    fn gen_secret() -> Vec<u8> {
-        let a = uuid::Uuid::now_v7();
-        let b = uuid::Uuid::now_v7();
-        let mut v = Vec::with_capacity(32);
-        v.extend_from_slice(a.as_bytes());
-        v.extend_from_slice(b.as_bytes());
-        v
+    /// Overrides the capability-token signing keys (production wires
+    /// the configured secret; tests keep the ephemeral default).
+    pub fn with_token_keys(mut self, keys: TokenKeys) -> Self {
+        self.token_keys = Arc::new(keys);
+        self
     }
 
     /// Mint a capability token for `file_id` and `act`.
     pub fn mint_token(&self, sub: &str, file_id: &str, act: Action) -> Result<String, FsError> {
-        token::mint(sub, file_id, act, &self.token_secret, None)
+        let keys = &self.token_keys;
+        token::mint(
+            sub,
+            file_id,
+            act,
+            &keys.current.kid,
+            &keys.current.secret,
+            None,
+        )
     }
 
     /// Verify a capability token.
     pub fn verify_token(&self, token: &str, file_id: &str, act: Action) -> Result<(), FsError> {
-        token::verify(token, file_id, act, &self.token_secret)?;
+        let keys = &self.token_keys;
+        let mut secrets = vec![keys.current.secret.as_slice()];
+        if let Some(prev) = &keys.previous {
+            secrets.push(prev.secret.as_slice());
+        }
+        token::verify(token, file_id, act, &secrets)?;
         Ok(())
     }
 

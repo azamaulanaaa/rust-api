@@ -20,7 +20,7 @@ use clap::{Parser, Subcommand};
 use url::Url;
 
 use rust_api::{
-    fs::{FsEngine, route::FsApiModule, s3::S3ClientConfig, store::FsStore},
+    fs::{FsEngine, TokenKeys, route::FsApiModule, s3::S3ClientConfig, store::FsStore},
     http::{ApiService, middleware::jwt::Claims},
     oidc::{OidcClient, OidcConfig, route::OidcApiModule},
     policy::{PolicyEngine, admin, route::PolicyApiModule, setup::SetupApiModule},
@@ -55,6 +55,24 @@ enum Command {
         #[command(subcommand)]
         action: PolicyAction,
     },
+}
+
+/// Resolves capability-token signing keys from `[capability]`.
+///
+/// Config validation already rejected malformed hex; a missing secret
+/// falls back to an ephemeral OS-RNG key with a warning (tokens die
+/// with the process — acceptable for dev, a misconfiguration in prod).
+fn resolve_token_keys(config: &config::Config) -> anyhow::Result<TokenKeys> {
+    match &config.capability.secret {
+        Some(current) => TokenKeys::from_hex(current, config.capability.previous_secret.as_deref())
+            .map_err(|e| anyhow::anyhow!("capability secret: {e}")),
+        None => {
+            tracing::warn!(
+                "capability.secret not configured: using an ephemeral signing key; capability tokens will invalidate on restart"
+            );
+            Ok(TokenKeys::ephemeral())
+        }
+    }
 }
 
 /// Policy-store management actions (S3-only).
@@ -157,6 +175,8 @@ async fn main() -> anyhow::Result<()> {
 /// Runs the HTTP listener until stopped.
 async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
     let config = config::Config::try_from(config_path)?;
+    // Resolve before `config` is partially moved into module configs.
+    let token_keys = resolve_token_keys(&config)?;
 
     let telemetry = telemetry::init(
         verbose,
@@ -217,6 +237,7 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
         policy_engine.clone(),
     )
     .await?
+    .with_token_keys(token_keys)
     .with_wal(wal.clone());
     // GC: expire abandoned multipart uploads every hour (24h TTL)
     rust_api::fs::gc::spawn(std::sync::Arc::new(fs_engine.clone()));
