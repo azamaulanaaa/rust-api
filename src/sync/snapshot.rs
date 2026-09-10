@@ -73,7 +73,11 @@ impl SnapshotManager {
         }
     }
 
-    /// Replica prefix for `sub` (`{db}/u/{sub}`).
+    /// Replica prefix for `sub` (`{db}/u/{sha256-hex(sub)}`).
+    ///
+    /// The digest keeps replica prefixes fixed-length and safe by
+    /// construction (hex only): subjects are attacker-influenced OIDC
+    /// values, so embedding them raw would allow traversal or collisions.
     pub fn user_prefix(&self, sub: &str) -> String {
         format!(
             "{}/u/{}",
@@ -363,9 +367,19 @@ fn store_err(e: oxkv::StoreError) -> FsError {
     FsError::Store(e.to_string())
 }
 
-/// Makes a subject safe for embedding in an object prefix.
+/// Maps a subject to a prefix-safe identifier.
+///
+/// Subjects are attacker-influenced (OIDC `sub`), so a lossy replace is
+/// not enough: `a/b`, `a:b`, and `a_b` would all collide on one replica
+/// prefix and leak data across users. The SHA-256 hex digest is
+/// collision-resistant, fixed-length, and prefix-safe by construction
+/// (lowercase hex only, no separators or traversal sequences).
 fn safe_sub(sub: &str) -> String {
-    sub.replace(['/', ':'], "_")
+    use sha2::{Digest, Sha256};
+    Sha256::digest(sub.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 #[cfg(test)]
@@ -560,11 +574,17 @@ mod tests {
     #[tokio::test]
     async fn prefixes_are_stable_and_safe() {
         let (mgr, _) = test_manager().await;
-        assert_eq!(mgr.user_prefix("alice"), "test-db/u/alice");
-        assert_eq!(
-            mgr.resolve_object("a/b:c", "manifest.json").unwrap(),
-            "test-db/u/a_b_c/manifest.json"
-        );
+        // Stable and hex-only (prefix-safe by construction).
+        let prefix = mgr.user_prefix("alice");
+        assert_eq!(prefix, mgr.user_prefix("alice"));
+        let digest = prefix.strip_prefix("test-db/u/").expect("prefix shape");
+        assert_eq!(digest.len(), 64);
+        assert!(digest.bytes().all(|b| b.is_ascii_hexdigit()));
+        // Former collisions now isolate: each maps to its own prefix.
+        assert_ne!(mgr.user_prefix("a/b"), mgr.user_prefix("a:b"));
+        assert_ne!(mgr.user_prefix("a/b"), mgr.user_prefix("a_b"));
+        assert_ne!(mgr.user_prefix("alice"), mgr.user_prefix("bob"));
+        // Gateway still confines reads to the replica prefix.
         assert!(mgr.resolve_object("alice", "../escape").is_err());
         assert!(mgr.resolve_object("alice", "a/../../escape").is_err());
         assert!(mgr.resolve_object("alice", "").is_err());

@@ -32,6 +32,7 @@ toml = "0.9.8"
 
 base64 = "0.22.1"
 casbin = "2.20.0"
+sha2 = "0.10"
 jsonwebtoken = { version = "10.2.0", features = ["rust_crypto"] }
 openidconnect = { version = "4.0.1", default-features = false, features = ["reqwest", "rustls-tls"] }
 
