@@ -25,6 +25,8 @@ use model::{CompleteRequest, FileMetadata, InitRequest};
 use s3::S3Client;
 use store::{FileRecord, FsStore, UploadSession};
 
+use crate::sync::wal::{Wal, WalOp};
+
 /// Core file-system engine with temp per-user scope and row delegation.
 #[derive(Clone)]
 pub struct FsEngine {
@@ -33,6 +35,10 @@ pub struct FsEngine {
     pub(crate) bucket: String,
     policy: PolicyEngine,
     token_secret: Arc<Vec<u8>>,
+    /// WAL for replica sync; `None` disables logging (tests).
+    /// Production must wire it: without appends the WAL head never
+    /// advances and replicas freeze at their last snapshot.
+    wal: Option<Wal>,
 }
 
 impl FsEngine {
@@ -53,7 +59,24 @@ impl FsEngine {
             bucket: s3_config.bucket.clone(),
             policy,
             token_secret: Arc::new(secret),
+            wal: None,
         })
+    }
+
+    /// Attaches a [`Wal`] for replica sync; ops are logged after each
+    /// mutation (fail-closed: a logging failure fails the whole operation
+    /// so the WAL never silently misses a committed write).
+    pub fn with_wal(mut self, wal: Wal) -> Self {
+        self.wal = Some(wal);
+        self
+    }
+
+    /// Appends `op` when logging is wired; no-op otherwise.
+    async fn append_wal(&self, op: WalOp) -> Result<(), FsError> {
+        if let Some(wal) = &self.wal {
+            wal.append(op).await?;
+        }
+        Ok(())
     }
 
     /// Creates an engine from an explicit `S3Client` (tests).
@@ -69,6 +92,7 @@ impl FsEngine {
             bucket,
             policy,
             token_secret: Arc::new(Self::gen_secret()),
+            wal: None,
         }
     }
 
@@ -111,7 +135,15 @@ impl FsEngine {
         if self.store.get_file(file_id).await?.is_none() {
             return Err(FsError::NotFound("file not found".into()));
         }
-        self.store.attach(row_type, row_id, file_id).await
+        let count = self.store.attach(row_type, row_id, file_id).await?;
+        self
+            .append_wal(WalOp::Attach {
+                row_type: row_type.to_string(),
+                row_id: row_id.to_string(),
+                file_id: file_id.to_string(),
+            })
+            .await?;
+        Ok(count)
     }
 
     /// Detach a file from a row; caller must have `Write` on the row.
@@ -129,7 +161,15 @@ impl FsEngine {
                 crate::policy::PolicyError::AccessDenied => FsError::Forbidden,
                 other => FsError::Internal(other.to_string()),
             })?;
-        self.store.detach(row_type, row_id, file_id).await
+        let count = self.store.detach(row_type, row_id, file_id).await?;
+        self
+            .append_wal(WalOp::Detach {
+                row_type: row_type.to_string(),
+                row_id: row_id.to_string(),
+                file_id: file_id.to_string(),
+            })
+            .await?;
+        Ok(count)
     }
 
     async fn can_access(
@@ -319,6 +359,9 @@ impl FsEngine {
         };
         self.store.save_file(&record).await?;
         self.store.delete_session(file_id).await?;
+        self
+            .append_wal(WalOp::FileCreate { rec: record })
+            .await?;
         Ok(())
     }
 
@@ -385,6 +428,11 @@ impl FsEngine {
         }
         self.s3.delete_object(&self.bucket, &rec.s3_key).await?;
         self.store.delete_file(file_id).await?;
+        self
+            .append_wal(WalOp::FileDelete {
+                file_id: file_id.to_string(),
+            })
+            .await?;
         // clean refs key if orphan
         Ok(())
     }
@@ -592,6 +640,50 @@ mod tests {
         let tok = engine.mint_token("alice", "file1", Action::Read)?;
         engine.verify_token(&tok, "file1", Action::Read)?;
         assert!(engine.verify_token(&tok, "file1", Action::Write).is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mutations_append_to_wal() -> anyhow::Result<()> {
+        use crate::sync::wal::{Wal, WalOp};
+
+        let wal_prefix = format!("test-fs-wal-{}-{}", std::process::id(), {
+            use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+            URL_SAFE_NO_PAD.encode(rand::random::<[u8; 6]>())
+        });
+        let wal = Wal::new(crate::db::build_test_store(&wal_prefix).await);
+        let engine = make_engine("alice", false).await.with_wal(wal.clone());
+        engine
+            .policy
+            .add_rule("alice".into(), "invoice:123".into(), Action::Write)
+            .await
+            .unwrap();
+
+        let id = engine.init_upload(valid_single(), "alice").await?;
+        engine
+            .upload_part(&id, 0, Bytes::from(vec![1u8; 1024]), None, "alice")
+            .await?;
+        engine
+            .complete_upload(
+                &id,
+                CompleteRequest {
+                    name: "a.txt".into(),
+                    mimetype: "text/plain".into(),
+                },
+                "alice",
+            )
+            .await?;
+        engine.attach("invoice", "123", &id, "alice").await?;
+        engine.detach("invoice", "123", &id, "alice").await?;
+        engine.delete_file(&id, "alice").await?;
+
+        let entries = wal.range(1, wal.head().await?).await?;
+        let ops: Vec<&WalOp> = entries.iter().map(|e| &e.op).collect();
+        assert_eq!(ops.len(), 4);
+        assert!(matches!(&ops[0], WalOp::FileCreate { rec } if rec.id == id));
+        assert!(matches!(&ops[1], WalOp::Attach { file_id, .. } if file_id == &id));
+        assert!(matches!(&ops[2], WalOp::Detach { file_id, .. } if file_id == &id));
+        assert!(matches!(&ops[3], WalOp::FileDelete { file_id } if file_id == &id));
         Ok(())
     }
 }
