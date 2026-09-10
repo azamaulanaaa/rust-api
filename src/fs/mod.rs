@@ -410,6 +410,10 @@ impl FsEngine {
     }
 
     /// Deletes a finalized file; allowed when caller has row `Delete` or owns temp unreferenced file.
+    ///
+    /// Metadata goes first, then S3 bytes: a crash between the two leaks
+    /// an unreachable object (converges on retry, S3 delete is idempotent)
+    /// instead of a dangling record that serves errors.
     #[tracing::instrument(skip(self), fields(file_id = %file_id, caller_sub = %caller_sub), err)]
     pub async fn delete_file(&self, file_id: &str, caller_sub: &str) -> Result<(), FsError> {
         let rec = self
@@ -426,8 +430,8 @@ impl FsEngine {
         } else if !self.can_access(caller_sub, file_id, Action::Delete).await? {
             return Err(FsError::Forbidden);
         }
-        self.s3.delete_object(&self.bucket, &rec.s3_key).await?;
         self.store.delete_file(file_id).await?;
+        self.s3.delete_object(&self.bucket, &rec.s3_key).await?;
         self
             .append_wal(WalOp::FileDelete {
                 file_id: file_id.to_string(),
