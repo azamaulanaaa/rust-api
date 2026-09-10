@@ -58,6 +58,7 @@ impl TryFrom<&Path> for Config {
         let content = fs::read_to_string(value).context("Failed to read config file")?;
         let mut config: Self = toml::from_str(&content).context("Failed to parse config file")?;
         apply_env_overrides(&mut config);
+        config.validate().context("Invalid config values")?;
 
         Ok(config)
     }
@@ -96,6 +97,53 @@ fn prefer_env_opt(env: Option<String>, file: Option<String>) -> Option<String> {
     match env {
         Some(v) if !v.is_empty() => Some(v),
         _ => file,
+    }
+}
+
+impl Config {
+    /// Rejects values that would fail obscurely deep in startup (bad
+    /// URLs, empty bucket/credentials, out-of-range sampling, or a
+    /// prefix that escapes its bucket scope).
+    fn validate(&self) -> anyhow::Result<()> {
+        for (name, url) in [
+            ("public_address", &self.public_address),
+            ("authorization.issuer_url", &self.authorization.issuer_url),
+        ] {
+            let parsed: url::Url = url.parse().map_err(|e| {
+                anyhow::anyhow!("{name} is not a valid URL ({url:?}): {e}")
+            })?;
+            if parsed.scheme() != "http" && parsed.scheme() != "https" {
+                anyhow::bail!("{name} must use http(s), got {:?}", parsed.scheme());
+            }
+        }
+        if self.authorization.client_id.trim().is_empty() {
+            anyhow::bail!("authorization.client_id must not be empty");
+        }
+        if self.authorization.client_secret.trim().is_empty() {
+            anyhow::bail!("authorization.client_secret must not be empty (or set RUST_API_CLIENT_SECRET)");
+        }
+        if self.database.prefix.trim().is_empty() {
+            anyhow::bail!("database.prefix must not be empty");
+        }
+        if self.database.prefix.split('/').any(|seg| seg == ".." || seg == ".") {
+            anyhow::bail!(
+                "database.prefix must not contain '.' or '..' segments (got {:?})",
+                self.database.prefix
+            );
+        }
+        if self.s3.bucket.trim().is_empty() {
+            anyhow::bail!("s3.bucket must not be empty");
+        }
+        if self.s3.region.trim().is_empty() {
+            anyhow::bail!("s3.region must not be empty");
+        }
+        if !(0.0..=1.0).contains(&self.observability.sample_ratio) {
+            anyhow::bail!(
+                "observability.sample_ratio must be within 0.0..=1.0 (got {})",
+                self.observability.sample_ratio
+            );
+        }
+        Ok(())
     }
 }
 
@@ -320,6 +368,62 @@ mod tests {
         let cfg = Config::try_from(path.as_path()).unwrap();
         assert_eq!(cfg.database.prefix, "custom/prefix");
         let _ = std::fs::remove_file(&path);
+    }
+
+    fn minimal_toml() -> String {
+        r#"
+            public_address = "https://example.test"
+            listen_port = 8080
+            [authorization]
+            client_id = "cid"
+            client_secret = "csecret"
+            issuer_url = "https://idp.test"
+            [database]
+            prefix = "oxkv"
+            [s3]
+            bucket = "my-bucket"
+            region = "us-east-1"
+        "#
+        .to_string()
+    }
+
+    fn validation_error(toml: &str) -> String {
+        let path = tmp_toml(toml);
+        let err = Config::try_from(path.as_path()).unwrap_err();
+        let _ = std::fs::remove_file(&path);
+        // Debug renders the anyhow context chain, Display only the outer.
+        format!("{err:?}")
+    }
+
+    #[test]
+    fn validate_rejects_bad_values() {
+        // sample_ratio out of range (telemetry used to clamp silently).
+        let err = validation_error(
+            &minimal_toml().replace("region = \"us-east-1\"", "region = \"us-east-1\"\n[observability]\nsample_ratio = 1.5"),
+        );
+        assert!(err.contains("sample_ratio"), "unexpected: {err}");
+
+        // Prefix escaping its bucket scope.
+        let err = validation_error(&minimal_toml().replace("prefix = \"oxkv\"", "prefix = \"../escape\""));
+        assert!(err.contains("database.prefix"), "unexpected: {err}");
+
+        // Empty bucket / region.
+        let err = validation_error(&minimal_toml().replace("bucket = \"my-bucket\"", "bucket = \"\""));
+        assert!(err.contains("s3.bucket"), "unexpected: {err}");
+        let err = validation_error(&minimal_toml().replace("region = \"us-east-1\"", "region = \"\""));
+        assert!(err.contains("s3.region"), "unexpected: {err}");
+
+        // Non-URL addresses.
+        let err = validation_error(
+            &minimal_toml().replace("https://example.test", "not a url !!!"),
+        );
+        assert!(err.contains("public_address"), "unexpected: {err}");
+        let err = validation_error(&minimal_toml().replace("https://idp.test", "ftp://idp.test"));
+        assert!(err.contains("authorization.issuer_url"), "unexpected: {err}");
+
+        // Empty credentials.
+        let err = validation_error(&minimal_toml().replace("client_secret = \"csecret\"", "client_secret = \"\""));
+        assert!(err.contains("client_secret"), "unexpected: {err}");
     }
 
     #[test]
