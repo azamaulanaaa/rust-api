@@ -18,11 +18,12 @@ pub enum FsError {
     /// Conflict (e.g. duplicate).
     #[error("{0}")]
     Conflict(String),
-    /// S3 or store failure - 500.
-    #[error("internal server error: {0}")]
+    /// S3 or store failure - 500. The inner detail is logged server-side
+    /// only and never rendered to clients (see `error_response`).
+    #[error("internal server error")]
     Internal(String),
-    /// Oxkv store error
-    #[error("store error: {0}")]
+    /// Oxkv store error - 500. Same sanitization contract as `Internal`.
+    #[error("internal server error")]
     Store(String),
 }
 
@@ -44,10 +45,42 @@ impl ResponseError for FsError {
     }
 
     fn error_response(&self) -> HttpResponse {
-        if matches!(self, Self::Internal(_) | Self::Store(_)) {
-            tracing::warn!("fs error {}: {}", self.status_code(), self);
+        // Internal/store causes carry sensitive detail (S3 errors, store
+        // paths): log them here so call sites can't forget, never
+        // serialize them — the body only carries the stable Display text.
+        match self {
+            Self::Internal(detail) | Self::Store(detail) => {
+                tracing::warn!("fs error {}: internal: {detail}", self.status_code());
+            }
+            Self::BadRequest(_) | Self::NotFound(_) | Self::Conflict(_) => {
+                tracing::debug!("fs error {}: {}", self.status_code(), self);
+            }
+            Self::Forbidden => {}
         }
         let body = serde_json::json!({ "error": self.to_string() });
         HttpResponse::build(self.status_code()).json(body)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn internal_detail_never_reaches_clients() {
+        let err = FsError::Internal("secret bucket DSN".to_string());
+        assert_eq!(err.to_string(), "internal server error");
+        let store = FsError::Store("raw oxkv dump".to_string());
+        assert_eq!(store.to_string(), "internal server error");
+    }
+
+    #[actix_web::test]
+    async fn internal_body_is_sanitized() {
+        let res = FsError::Internal("secret bucket DSN".to_string()).error_response();
+        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = actix_web::body::to_bytes(res.into_body()).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], "internal server error");
+        assert!(!String::from_utf8_lossy(&body).contains("secret"));
     }
 }
