@@ -233,15 +233,33 @@ impl FsEngine {
     }
 
     /// Stores a single chunk; only the session owner may write.
-    #[tracing::instrument(skip(self, body, checksum_sha256), fields(file_id = %file_id, part_index, body_len = body.len(), caller_sub = %caller_sub), err)]
-    pub async fn upload_part(
+    ///
+    /// The body arrives as a chunk stream capped at the session's
+    /// expected part size: oversize bodies are cut mid-stream (413)
+    /// instead of buffered to completion, and a declared
+    /// `Content-Length` that already mismatches is rejected before a
+    /// single chunk is read. The part itself is still buffered once —
+    /// S3 SigV4 must hash the full part before sending, so zero-buffer
+    /// uploads are protocol-blocked; the bound is now the part size
+    /// (≤10 MiB by init validation), not the 16 MiB blanket cap.
+    #[tracing::instrument(skip(self, body, checksum_sha256), fields(file_id = %file_id, part_index, declared_len = declared_len, caller_sub = %caller_sub), err)]
+    pub async fn upload_part<S>(
         &self,
         file_id: &str,
         part_index: u64,
-        body: bytes::Bytes,
+        body: S,
+        declared_len: Option<u64>,
         checksum_sha256: Option<String>,
         caller_sub: &str,
-    ) -> Result<(), FsError> {
+    ) -> Result<(), FsError>
+    where
+        // No `Send` bound: actix `Payload` is `!Send` (thread-local h1
+        // body) and handlers run on the worker arbiter, so the intake
+        // future stays thread-local like the `Bytes` extractor was.
+        S: futures_util::Stream<Item = Result<bytes::Bytes, FsError>>,
+    {
+        use futures_util::StreamExt as _;
+
         let mut session = self
             .store
             .get_session(file_id)
@@ -258,12 +276,37 @@ impl FsEngine {
         } else {
             session.part_size
         };
-        if body.len() as u64 != expected {
+        match declared_len {
+            Some(n) if n > expected => return Err(FsError::PayloadTooLarge),
+            Some(n) if n != expected => {
+                return Err(FsError::BadRequest(format!(
+                    "declared part size {n} does not match expected {expected} bytes"
+                )));
+            }
+            _ => {}
+        }
+        // Absolute ceiling mirrors the HTTP payload cap: the old `Bytes`
+        // extractor rejected anything past it, and part sizes above it
+        // were never uploadable.
+        let ceiling =
+            expected.min(crate::http::MAX_PAYLOAD_BYTES as u64) + 1;
+        let mut buf = Vec::with_capacity(expected.min(crate::http::MAX_PAYLOAD_BYTES as u64) as usize);
+        let mut total = 0u64;
+        let mut stream = std::pin::pin!(body);
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            total += chunk.len() as u64;
+            if total >= ceiling {
+                return Err(FsError::PayloadTooLarge);
+            }
+            buf.extend_from_slice(&chunk);
+        }
+        if total != expected {
             return Err(FsError::BadRequest(format!(
-                "blob size mismatch for part {part_index}: expected {expected} bytes, got {}",
-                body.len()
+                "blob size mismatch for part {part_index}: expected {expected} bytes, got {total}"
             )));
         }
+        let body = bytes::Bytes::from(buf);
         if session.file_total_parts == 1 {
             self.s3
                 .put_object(
@@ -567,6 +610,11 @@ mod tests {
             file_total_parts: 1,
         }
     }
+
+    /// Wraps one buffered part as the chunk stream the engine now takes.
+    fn once_body(body: Vec<u8>) -> impl futures_util::Stream<Item = Result<Bytes, FsError>> {
+        futures_util::stream::once(async move { Ok(Bytes::from(body)) })
+    }
     #[allow(dead_code)]
     fn valid_multi() -> InitRequest {
         InitRequest {
@@ -602,7 +650,7 @@ mod tests {
         let id = engine.init_upload(valid_single(), "alice").await?;
         // bob cannot write alice's session
         let err = engine
-            .upload_part(&id, 0, Bytes::from(vec![1u8; 1024]), None, "bob")
+            .upload_part(&id, 0, once_body(vec![1u8; 1024]), None, None, "bob")
             .await
             .unwrap_err();
         assert!(matches!(err, FsError::Forbidden));
@@ -614,7 +662,7 @@ mod tests {
         let engine = make_engine("alice", false).await;
         let id = engine.init_upload(valid_single(), "alice").await?;
         engine
-            .upload_part(&id, 0, Bytes::from(vec![1u8; 1024]), None, "alice")
+            .upload_part(&id, 0, once_body(vec![1u8; 1024]), None, None, "alice")
             .await?;
         engine
             .complete_upload(
@@ -645,7 +693,7 @@ mod tests {
         let engine = make_engine("alice", false).await;
         let id = engine.init_upload(valid_single(), "alice").await?;
         engine
-            .upload_part(&id, 0, Bytes::from(vec![7u8; 1024]), None, "alice")
+            .upload_part(&id, 0, once_body(vec![7u8; 1024]), None, None, "alice")
             .await?;
         engine
             .complete_upload(
@@ -677,6 +725,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn upload_part_cuts_oversize_streams_early() -> anyhow::Result<()> {
+        use actix_web::ResponseError as _;
+
+        let engine = make_engine("alice", false).await;
+        let id = engine.init_upload(valid_single(), "alice").await?;
+        // Unbounded 1 KiB chunks against a 1 KiB part: the intake must
+        // 413 after the second chunk, not buffer forever.
+        let flood = futures_util::stream::repeat_with(|| {
+            Ok::<_, FsError>(Bytes::from(vec![0u8; 1024]))
+        });
+        let err = engine
+            .upload_part(&id, 0, flood, None, None, "alice")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, FsError::PayloadTooLarge));
+        assert_eq!(
+            err.status_code(),
+            actix_web::http::StatusCode::PAYLOAD_TOO_LARGE
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn upload_part_checks_declared_length_before_reading() -> anyhow::Result<()> {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        let engine = make_engine("alice", false).await;
+        let id = engine.init_upload(valid_single(), "alice").await?;
+        // Records whether the stream is polled at all: a declared length
+        // that already mismatches must fail before the first poll.
+        let polled = Arc::new(AtomicBool::new(false));
+        let flag = polled.clone();
+        let untouched = futures_util::stream::poll_fn(move |_| {
+            flag.store(true, Ordering::SeqCst);
+            std::task::Poll::Ready(None::<Result<Bytes, FsError>>)
+        });
+        let err = engine
+            .upload_part(&id, 0, untouched, Some(999), None, "alice")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, FsError::BadRequest(_)));
+        assert!(!polled.load(Ordering::SeqCst));
+        // Declared larger than expected is 413, not 400.
+        let err = engine
+            .upload_part(&id, 0, once_body(vec![1u8; 1024]), Some(2048), None, "alice")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, FsError::PayloadTooLarge));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn streamed_download_matches_upload() -> anyhow::Result<()> {
         use futures_util::TryStreamExt as _;
 
@@ -684,7 +787,7 @@ mod tests {
         let id = engine.init_upload(valid_single(), "alice").await?;
         let body: Vec<u8> = (0..1024u32).map(|i| (i % 251) as u8).collect();
         engine
-            .upload_part(&id, 0, Bytes::from(body.clone()), None, "alice")
+            .upload_part(&id, 0, once_body(body.clone()), None, None, "alice")
             .await?;
         engine
             .complete_upload(
@@ -731,7 +834,7 @@ mod tests {
 
         let id = engine.init_upload(valid_single(), "alice").await?;
         engine
-            .upload_part(&id, 0, Bytes::from(vec![1u8; 1024]), None, "alice")
+            .upload_part(&id, 0, once_body(vec![1u8; 1024]), None, None, "alice")
             .await?;
         engine
             .complete_upload(

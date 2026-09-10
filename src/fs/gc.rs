@@ -220,6 +220,11 @@ mod tests {
         }
     }
 
+    /// Wraps one buffered part as the chunk stream the engine now takes.
+    fn once_body(body: Vec<u8>) -> impl futures_util::Stream<Item = Result<Bytes, FsError>> {
+        futures_util::stream::once(async move { Ok(Bytes::from(body)) })
+    }
+
     #[test]
     fn is_expired_boundary() {
         let now = 1_000_000;
@@ -352,7 +357,7 @@ mod tests {
             )
             .await?;
         engine
-            .upload_part(&file_id, 0, Bytes::from(vec![9u8; 1024]), None, "alice")
+            .upload_part(&file_id, 0, once_body(vec![9u8; 1024]), None, None, "alice")
             .await?;
         // Fresh stray bytes (e.g. crash between put and metadata write).
         engine

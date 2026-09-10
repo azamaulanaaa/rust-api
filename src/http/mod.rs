@@ -14,7 +14,9 @@ pub mod middleware;
 /// Maximum raw request body: covers 10 MiB single-part uploads plus
 /// headroom. Without this the `Bytes` extractor falls back to actix's
 /// 256 KiB default and rejects every documented part size with 413.
-const MAX_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
+/// Shared with the FS part intake, which streams `Payload` directly and
+/// must enforce the same absolute ceiling chunk by chunk.
+pub(crate) const MAX_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 
 /// Maximum JSON body: control-plane payloads (policy rules, upload
 /// metadata) are small; anything larger is a misuse or abuse signal.
