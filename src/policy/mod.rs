@@ -232,22 +232,64 @@ impl PolicyEngine {
     }
 
     /// Atomically grants `user_id` the [`SUPERADMIN_ROLE`] provided no
-    /// user holds that role yet. Returns `false` when the bootstrap was
-    /// already completed (the check and the write share one lock, so two
-    /// concurrent first-time claims cannot both succeed).
+    /// user holds that role yet, plus the permission rules the role needs
+    /// to actually manage policies (`read`/`write` on `rules` and
+    /// `user_groups`). Without the latter a fresh bootstrap would return
+    /// `201` yet still get `403` on every `/policy/*` call.
+    ///
+    /// Returns `false` when the bootstrap was already completed (the check
+    /// and the write share one lock, so two concurrent first-time claims
+    /// cannot both succeed). When returning `false` any missing superadmin
+    /// permission rules are still repaired, so deployments bootstrapped
+    /// before the rules were seeded heal on the next claim attempt.
     pub async fn claim_superadmin(&self, user_id: &str) -> Result<bool, PolicyError> {
         let mut ef = self.enforcer.write().await;
         if !ef.get_users_for_role(SUPERADMIN_ROLE, None).is_empty() {
+            let repaired = Self::ensure_superadmin_rules(&mut ef).await?;
+            drop(ef);
+            if repaired {
+                self.append_wal(WalOp::PolicyAdd {
+                    obj: SUPERADMIN_ROLE.to_string(),
+                })
+                .await?;
+            }
             return Ok(false);
         }
         ef.add_grouping_policy(vec![user_id.to_string(), SUPERADMIN_ROLE.to_string()])
             .await?;
+        Self::ensure_superadmin_rules(&mut ef).await?;
         drop(ef);
         self.append_wal(WalOp::PolicyAdd {
             obj: SUPERADMIN_ROLE.to_string(),
         })
         .await?;
         Ok(true)
+    }
+
+    /// Idempotently grants [`SUPERADMIN_ROLE`] full management rights over
+    /// policy rules and group membership. Returns `true` when at least one
+    /// rule was newly added. Caller must hold the enforcer write lock so
+    /// the bootstrap check and the seed share one critical section.
+    async fn ensure_superadmin_rules(ef: &mut Enforcer) -> Result<bool, PolicyError> {
+        let mut added = false;
+        for (obj, act) in [
+            ("rules", Action::Read),
+            ("rules", Action::Write),
+            ("user_groups", Action::Read),
+            ("user_groups", Action::Write),
+        ] {
+            if ef
+                .add_policy(vec![
+                    SUPERADMIN_ROLE.to_string(),
+                    obj.to_string(),
+                    act.to_string(),
+                ])
+                .await?
+            {
+                added = true;
+            }
+        }
+        Ok(added)
     }
 
     /// Removes a user from a group
@@ -537,6 +579,46 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn superadmin_claim_seeds_management_rules() {
+        let engine = engine().await;
+
+        assert!(engine.claim_superadmin("alice").await.unwrap());
+        // The bootstrapped subject can actually manage policies now.
+        for obj in ["rules", "user_groups"] {
+            for act in [Action::Read, Action::Write] {
+                assert!(
+                    engine.authorize("alice", obj, act).await.unwrap(),
+                    "superadmin should hold {act} on {obj}"
+                );
+            }
+        }
+        assert!(!engine.claim_superadmin("mallory").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn superadmin_claim_heals_prefixed_deployments() {
+        use casbin::MgmtApi;
+
+        let engine = engine().await;
+        // Simulate a store bootstrapped before the seed existed: g-link
+        // only, no permission rules.
+        {
+            let mut ef = engine.enforcer.write().await;
+            ef.add_grouping_policy(vec![
+                "alice".to_string(),
+                SUPERADMIN_ROLE.to_string(),
+            ])
+            .await
+            .unwrap();
+        }
+        assert!(!engine.authorize("alice", "rules", Action::Read).await.unwrap());
+        // Next claim attempt still conflicts but repairs the missing rules.
+        assert!(!engine.claim_superadmin("bob").await.unwrap());
+        assert!(engine.authorize("alice", "rules", Action::Read).await.unwrap());
+        assert!(engine.authorize("alice", "user_groups", Action::Write).await.unwrap());
     }
 
     #[tokio::test]
