@@ -38,7 +38,7 @@ pub struct UploadSession {
 }
 
 /// Persisted file record after `CompleteUpload`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileRecord {
     /// File identifier.
     pub id: String,

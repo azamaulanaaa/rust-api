@@ -9,6 +9,11 @@ use tokio::sync::RwLock;
 use crate::fs::error::FsError;
 
 /// Operation recorded in WAL.
+///
+/// File and relation ops carry enough payload to re-apply against a
+/// replica (`FileCreate` embeds the full record); policy ops only mark
+/// visibility as changed — replay falls back to a full rebuild when any
+/// appear in range.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum WalOp {
     /// Policy rule added.
@@ -39,6 +44,16 @@ pub enum WalOp {
         /// File identifier.
         file_id: String,
     },
+    /// File metadata created (completed upload).
+    FileCreate {
+        /// Full record as persisted on master.
+        rec: crate::fs::store::FileRecord,
+    },
+    /// File metadata deleted.
+    FileDelete {
+        /// File identifier.
+        file_id: String,
+    },
 }
 
 /// Entry in WAL.
@@ -53,9 +68,13 @@ pub struct WalEntry {
 }
 
 /// WAL stored in an [`OxKvStore`] (per-user S3, scalable).
+///
+/// Clones share the append mutex: concurrent appends from any handle
+/// serialize, so sequence numbers stay gap-free and no entry is lost.
 #[derive(Clone)]
 pub struct Wal {
     store: Arc<RwLock<OxKvStore>>,
+    append_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Wal {
@@ -63,6 +82,7 @@ impl Wal {
     pub fn new(s3_store: OxKvStore) -> Self {
         Self {
             store: Arc::new(RwLock::new(s3_store)),
+            append_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -75,7 +95,11 @@ impl Wal {
     }
 
     /// Append an operation, returns new seq.
+    ///
+    /// Serialized against concurrent appends on any clone sharing this
+    /// handle's mutex.
     pub async fn append(&self, op: WalOp) -> Result<u64, FsError> {
+        let _guard = self.append_lock.lock().await;
         let g = self.store.write().await;
         let cur = g
             .get_bytes(Self::seq_key())
@@ -172,6 +196,36 @@ mod tests {
         let r = wal.range(1, 2).await?;
         assert_eq!(r.len(), 2);
         assert_eq!(r[0].seq, 1);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_appends_keep_unique_seqs() -> anyhow::Result<()> {
+        let wal = test_wal().await;
+        let mut handles = Vec::new();
+        for t in 0..8u32 {
+            let w = wal.clone();
+            handles.push(tokio::spawn(async move {
+                for _ in 0..25u32 {
+                    w.append(WalOp::Attach {
+                        row_type: "t".into(),
+                        row_id: t.to_string(),
+                        file_id: "f".into(),
+                    })
+                    .await
+                    .unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        assert_eq!(wal.head().await?, 200);
+        let entries = wal.range(1, 200).await?;
+        let mut seqs: Vec<u64> = entries.iter().map(|e| e.seq).collect();
+        seqs.sort_unstable();
+        seqs.dedup();
+        assert_eq!(seqs.len(), 200);
         Ok(())
     }
 }
