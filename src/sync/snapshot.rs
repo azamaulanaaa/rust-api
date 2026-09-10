@@ -300,36 +300,34 @@ impl SnapshotManager {
     }
 
     async fn copy_filtered(&self, sub: &str, dst: &FsStore) -> Result<(), FsError> {
+        // Single pass over the master listing: the record in hand answers
+        // the owner check (no re-read), and one rows scan serves both the
+        // visibility check and the attach loop. Previously each file cost
+        // a re-read plus two full-store scans (one inside can_read, one
+        // for attach) on top of the listing itself.
         for rec in self.store.list_files().await? {
-            if !self.can_read(sub, &rec.id).await? {
+            let rows = self.visible_rows(sub, &rec.id).await?;
+            if rec.owner_sub != sub && rows.is_empty() {
                 continue;
             }
             dst.save_file(&rec).await?;
-            let info = self.store.get_ref_info(&rec.id).await?;
-            if info.count > 0 {
-                // copy relations where row readable
-                for (ty, rid) in self.store.rows_for_file(&rec.id).await? {
-                    if self
-                        .policy
-                        .authorize_row(sub, &ty, &rid, Action::Read)
-                        .await
-                        .unwrap_or(false)
-                    {
-                        dst.attach(&ty, &rid, &rec.id).await?;
-                    }
+            if self.store.get_ref_info(&rec.id).await?.count > 0 {
+                for (ty, rid) in &rows {
+                    dst.attach(ty, rid, &rec.id).await?;
                 }
             }
         }
         Ok(())
     }
 
-    async fn can_read(&self, sub: &str, file_id: &str) -> Result<bool, FsError> {
-        let Some(rec) = self.store.get_file(file_id).await? else {
-            return Ok(false);
-        };
-        if rec.owner_sub == sub {
-            return Ok(true);
-        }
+    /// Rows of `file_id` that `sub` may read (each authorized individually).
+
+    async fn visible_rows(
+        &self,
+        sub: &str,
+        file_id: &str,
+    ) -> Result<Vec<(String, String)>, FsError> {
+        let mut out = Vec::new();
         for (ty, rid) in self.store.rows_for_file(file_id).await? {
             if self
                 .policy
@@ -337,10 +335,17 @@ impl SnapshotManager {
                 .await
                 .unwrap_or(false)
             {
-                return Ok(true);
+                out.push((ty, rid));
             }
         }
-        Ok(false)
+        Ok(out)
+    }
+
+    async fn can_read(&self, sub: &str, file_id: &str) -> Result<bool, FsError> {
+        let Some(rec) = self.store.get_file(file_id).await? else {
+            return Ok(false);
+        };
+        Ok(rec.owner_sub == sub || !self.visible_rows(sub, file_id).await?.is_empty())
     }
 }
 
