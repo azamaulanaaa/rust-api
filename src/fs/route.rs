@@ -149,9 +149,35 @@ async fn get_file(
         .content_type(rec.mimetype)
         .insert_header((
             "Content-Disposition",
-            format!("inline; filename=\"{}\"", rec.name),
+            format!("inline; filename=\"{}\"", sanitize_filename(&rec.name)),
         ))
         .body(body))
+}
+
+/// Sanitizes a user-supplied filename for `Content-Disposition`.
+///
+/// `name` arrives from `CompleteRequest` (only non-empty validated), so it
+/// may carry quotes, backslashes, path segments, or control characters —
+/// each a header-injection or traversal vector. Keeps the basename,
+/// replaces `"`/`\` with `_`, drops control characters, truncates to 100
+/// chars, and falls back to `"file"` when nothing safe remains.
+fn sanitize_filename(name: &str) -> String {
+    let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    let cleaned: String = base
+        .chars()
+        .filter(|c| !c.is_control())
+        .map(|c| match c {
+            '"' | '\\' => '_',
+            c => c,
+        })
+        .collect();
+    let truncated: String = cleaned.trim().chars().take(100).collect();
+    let truncated = truncated.trim();
+    if truncated.is_empty() {
+        "file".to_string()
+    } else {
+        truncated.to_string()
+    }
 }
 
 #[utoipa::path(delete, path = "/fs/files/{id}", tag = "fs", params(("id" = String, Path)), responses((status=204, description="deleted")))]
@@ -241,6 +267,19 @@ mod tests {
             engine,
         })
     }
+
+    #[actix_web::test]
+    async fn sanitize_filename_blocks_injection() {
+        assert_eq!(sanitize_filename("hello.txt"), "hello.txt");
+        assert_eq!(sanitize_filename("../../etc/passwd"), "passwd");
+        assert_eq!(sanitize_filename("a\\b\"c"), "b_c");
+        assert_eq!(sanitize_filename("a\r\nb"), "ab");
+        assert_eq!(sanitize_filename("\"\""), "__");
+        assert_eq!(sanitize_filename("   "), "file");
+        assert_eq!(sanitize_filename(""), "file");
+        assert_eq!(sanitize_filename(&"x".repeat(200)).len(), 100);
+    }
+
     #[actix_web::test]
     async fn unauthenticated_is_401() -> anyhow::Result<()> {
         let fx = fixture(true).await?;
