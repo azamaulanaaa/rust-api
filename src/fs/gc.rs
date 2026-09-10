@@ -43,17 +43,32 @@ pub async fn sweep_once(engine: &FsEngine) -> Result<usize, crate::fs::error::Fs
             s.id,
             now - s.created_at
         );
-        if let Some(upload_id) = s.s3_upload_id.as_deref() {
-            let _ = engine
+        // S3 first: on failure the session is kept so the next sweep
+        // retries instead of leaking bytes no record points at.
+        let s3_ok = if let Some(upload_id) = s.s3_upload_id.as_deref() {
+            engine
                 .s3
                 .abort_multipart_upload(&engine.bucket, &s.s3_key, upload_id)
                 .await
                 .map_err(|e| {
                     tracing::warn!("gc abort {} failed: {e}", s.id);
                     e
-                });
+                })
+                .is_ok()
         } else {
-            let _ = engine.s3.delete_object(&engine.bucket, &s.s3_key).await;
+            engine
+                .s3
+                .delete_object(&engine.bucket, &s.s3_key)
+                .await
+                .map_err(|e| {
+                    tracing::warn!("gc delete {} failed: {e}", s.id);
+                    e
+                })
+                .is_ok()
+        };
+        if !s3_ok {
+            tracing::warn!("fs gc keeping upload {} for retry", s.id);
+            continue;
         }
         engine.store.delete_session(&s.id).await?;
         cleaned += 1;
@@ -70,7 +85,20 @@ pub async fn sweep_once(engine: &FsEngine) -> Result<usize, crate::fs::error::Fs
             continue;
         }
         tracing::info!("fs gc expiring file {} (age {}s)", f.id, now - age);
-        let _ = engine.s3.delete_object(&engine.bucket, &f.s3_key).await;
+        // Same retain-on-failure contract as sessions above.
+        if engine
+            .s3
+            .delete_object(&engine.bucket, &f.s3_key)
+            .await
+            .map_err(|e| {
+                tracing::warn!("gc delete {} failed: {e}", f.id);
+                e
+            })
+            .is_err()
+        {
+            tracing::warn!("fs gc keeping file {} for retry", f.id);
+            continue;
+        }
         engine.store.delete_file(&f.id).await?;
         engine
             .append_wal(crate::sync::wal::WalOp::FileDelete {
@@ -269,7 +297,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sweep_abort_failure_is_swallowed() -> anyhow::Result<()> {
+    async fn sweep_retains_session_when_abort_fails() -> anyhow::Result<()> {
         struct FailS3;
         #[async_trait::async_trait]
         impl S3Client for FailS3 {
@@ -323,7 +351,7 @@ mod tests {
                 Err(FsError::NotFound("no".into()))
             }
             async fn delete_object(&self, _: &str, _: &str) -> Result<(), FsError> {
-                Ok(())
+                Err(FsError::Internal("delete failed".into()))
             }
         }
         let fail_prefix = {
@@ -342,9 +370,24 @@ mod tests {
             .store
             .save_session(&session_with_age("old-fail", TTL_SECS + 10, true))
             .await?;
+        engine
+            .store
+            .save_file(&FileRecord {
+                id: "old-fail-file".into(),
+                name: "f.txt".into(),
+                mimetype: "text/plain".into(),
+                size: 1,
+                s3_key: "files/old-fail-file".into(),
+                owner_sub: "alice".into(),
+                created_at: chrono::Utc::now().timestamp() - TTL_SECS - 10,
+            })
+            .await?;
+        // S3 failure keeps sessions and files for the next sweep instead
+        // of leaking bytes no record points at.
         let cleaned = sweep_once(&engine).await?;
-        assert_eq!(cleaned, 1);
-        assert!(engine.store.get_session("old-fail").await?.is_none());
+        assert_eq!(cleaned, 0);
+        assert!(engine.store.get_session("old-fail").await?.is_some());
+        assert!(engine.store.get_file("old-fail-file").await?.is_some());
         Ok(())
     }
 }
