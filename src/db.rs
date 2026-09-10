@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use object_store::ObjectStore;
-use oxkv::{ObjectPath, OxKvStore, StoreError};
+use oxkv::{LruCache, ObjectPath, OxKvStore, SstFile, StoreError};
 
 use crate::fs::s3::S3ClientConfig;
 
@@ -41,6 +41,18 @@ pub async fn build_s3_store(cfg: &S3ClientConfig, prefix: &str) -> Result<OxKvSt
         .with_prefix(object_prefix)
         .build()
         .await
+}
+
+/// Default SST block cache for replica opens.
+///
+/// Same 256 MB S3-FIFO sizing oxkv wires per handle in `build()`.
+/// Sharing one instance across opens (instead of dropping a cold cache
+/// with every handle) keeps repeated rebuilds from re-downloading hot
+/// SSTs; clones coordinate through the shared state.
+pub fn default_sst_cache() -> LruCache<String, Arc<SstFile>> {
+    LruCache::new(256 * 1024 * 1024, |_: &String, v: &Arc<SstFile>| {
+        u32::try_from(v.size()).unwrap_or(u32::MAX)
+    })
 }
 
 /// Builds an in-memory [`OxKvStore`] for tests (uses `skip_probe(true)` so
