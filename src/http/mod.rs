@@ -46,6 +46,7 @@ where
 /// Registers the built-in routes shared by every deployment.
 fn config(cfg: &mut web::ServiceConfig) {
     cfg.service(health::health);
+    cfg.service(health::ready);
 }
 
 /// A self-contained unit of the API surface: a set of routes plus its own
@@ -61,6 +62,7 @@ pub trait ApiModule: Send + Sync {
 /// application and binds it to a socket address.
 pub struct ApiService {
     modules: Vec<Box<dyn ApiModule>>,
+    readiness: Option<health::ReadyCheck>,
 }
 
 impl Default for ApiService {
@@ -74,6 +76,7 @@ impl ApiService {
     pub fn new() -> Self {
         Self {
             modules: Vec::new(),
+            readiness: None,
         }
     }
 
@@ -84,11 +87,21 @@ impl ApiService {
         self
     }
 
+    /// Injects the dependency check backing `GET /ready`. The check runs
+    /// on every probe poll, so it must be cheap and non-blocking. When
+    /// absent `/ready` still returns 200 once startup (which gates on
+    /// S3/OIDC/JWKS) has bound the listener.
+    pub fn with_readiness_check(mut self, check: health::ReadyCheck) -> Self {
+        self.readiness = Some(check);
+        self
+    }
+
     /// Binds the composed application to `addr` and serves it until a
     /// shutdown signal (Ctrl-C / SIGTERM) arrives, then drains
     /// connections within the shutdown timeout before returning.
     pub async fn start(self, addr: SocketAddr) -> anyhow::Result<()> {
         let modules = Arc::new(self.modules);
+        let readiness = self.readiness.clone();
 
         let server = HttpServer::new(move || {
             let mut app = apply_limits(App::new())
@@ -99,6 +112,10 @@ impl ApiService {
 
             for module in modules.iter() {
                 app = app.configure(move |cfg| module.configure(cfg));
+            }
+
+            if let Some(check) = readiness.clone() {
+                app = app.app_data(web::Data::new(check));
             }
 
             app

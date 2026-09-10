@@ -249,7 +249,14 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
         SyncApiModule::new(snapshot_manager.clone(), oidc_api_module.middleware());
 
     let listen_addr = SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), config.listen_port);
+    // Readiness fails when the policy lock is wedged (a writer stuck
+    // holding it). Startup itself already gates on S3/OIDC/JWKS.
+    let readiness: rust_api::http::health::ReadyCheck = Arc::new({
+        let enforcer = policy_engine.enforcer.clone();
+        move || enforcer.try_read().is_ok()
+    });
     ApiService::new()
+        .with_readiness_check(readiness)
         .register_module(Box::new(oidc_api_module))
         .register_module(Box::new(setup_api_module))
         .register_module(Box::new(policy_api_module))
