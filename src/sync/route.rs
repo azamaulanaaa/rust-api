@@ -1,15 +1,17 @@
-//! On-demand per-user replica endpoint plus the replica object gateway.
+//! Per-user replica pointer plus the replica object gateway.
 //!
-//! `GET /sync/clone` returns the replica pointer (`prefix`, `applied_seq`)
-//! with an `ETag` so repeat polls are a cheap `304`. Every object inside the
-//! replica prefix is individually addressable at `GET /sync/db/{object}`
+//! `GET /sync/status` returns the replica pointer (`prefix`, `applied_seq`,
+//! `head`) with an `ETag` so repeat polls are a cheap `304`; it never
+//! builds. `POST /sync/sync` advances the replica toward the WAL head
+//! (short-circuit, replay, or full recalc) and returns the new pointer.
+//! Every object inside the replica prefix is individually addressable at `GET /sync/db/{object}`
 //! with backend `ETag` passthrough and `If-None-Match` support: clients
 //! check for changes through headers and download only what moved.
 //! Engine files are immutable by construction (`Cache-Control: immutable`);
 //! only `manifest.json` is revalidated per commit.
 
 use actix_web::{
-    HttpRequest, HttpResponse, get,
+    HttpRequest, HttpResponse, get, post,
     http::header::{CACHE_CONTROL, CONTENT_TYPE, ETAG, IF_NONE_MATCH},
     web,
 };
@@ -20,7 +22,7 @@ use crate::http::{
 };
 use crate::sync::snapshot::SnapshotManager;
 
-/// Module exposing `GET /sync/clone` and `GET /sync/db/{object}`.
+/// Module exposing status/sync pointer endpoints and `GET /sync/db/{object}`.
 pub struct SyncApiModule {
     manager: SnapshotManager,
     jwt: JwtClaimsMiddleware<Claims>,
@@ -41,7 +43,8 @@ impl ApiModule for SyncApiModule {
             web::scope("/sync")
                 .app_data(mgr)
                 .wrap(jwt)
-                .service(clone_handler)
+                .service(status_handler)
+                .service(sync_handler)
                 .service(object_handler),
         );
     }
@@ -72,14 +75,51 @@ fn normalize_etag(tag: &str) -> &str {
         .unwrap_or(tag)
 }
 
-/// Returns the replica pointer for `sub`, building or replaying on demand.
+/// Returns the replica pointer for `sub` without building.
+///
+/// Pure read: reports the current coverage (`applied_seq`, `None` when the
+/// replica was never built) alongside the WAL `head`, so clients can decide
+/// whether a `POST /sync/sync` is worthwhile. Never touches the replica
+/// beyond the coverage-marker read.
+#[get("/status")]
+async fn status_handler(
+    manager: web::Data<SnapshotManager>,
+    claims: Validated<Claims>,
+    req: HttpRequest,
+) -> Result<HttpResponse, crate::fs::error::FsError> {
+    let sub = &claims.sub;
+    let head = manager.wal.head().await?;
+    let applied = manager.load_applied(sub).await?;
+    let etag = applied
+        .map(snapshot_etag)
+        .unwrap_or_else(|| "\"snap-none\"".to_string());
+    if let Some(header) = req
+        .headers()
+        .get(IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        && etag_matches(header, &etag)
+    {
+        return Ok(HttpResponse::NotModified()
+            .insert_header((ETAG, etag))
+            .finish());
+    }
+    Ok(HttpResponse::Ok()
+        .insert_header((ETAG, etag))
+        .json(serde_json::json!({
+            "prefix": manager.user_prefix(sub),
+            "applied_seq": applied,
+            "head": head,
+        })))
+}
+
+/// Advances the replica for `sub` toward the WAL head and returns the pointer.
 ///
 /// Fresh pointers (`applied >= head`) return without touching storage
 /// beyond the marker read. Otherwise small file/relation deltas replay and
 /// anything else falls back to a full rebuild; a lost fencing race adopts
 /// the winner's pointer instead of failing.
-#[get("/clone")]
-async fn clone_handler(
+#[post("/sync")]
+async fn sync_handler(
     manager: web::Data<SnapshotManager>,
     claims: Validated<Claims>,
     req: HttpRequest,
@@ -304,7 +344,7 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn unauthenticated_clone_is_401() -> anyhow::Result<()> {
+    async fn unauthenticated_status_and_sync_are_401() -> anyhow::Result<()> {
         let fx = fixture().await?;
         let mw = setup(&fx).await?;
         let module = SyncApiModule::new(fx.manager.clone(), mw);
@@ -313,7 +353,15 @@ mod tests {
         let res = actix_web::test::call_service(
             &app,
             actix_web::test::TestRequest::get()
-                .uri("/sync/clone")
+                .uri("/sync/status")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::UNAUTHORIZED);
+        let res = actix_web::test::call_service(
+            &app,
+            actix_web::test::TestRequest::post()
+                .uri("/sync/sync")
                 .to_request(),
         )
         .await;
@@ -322,7 +370,7 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn clone_returns_pointer_and_supports_304() -> anyhow::Result<()> {
+    async fn status_returns_pointer_and_supports_304() -> anyhow::Result<()> {
         let fx = fixture().await?;
         let mw = setup(&fx).await?;
         let module = SyncApiModule::new(fx.manager.clone(), mw);
@@ -332,7 +380,7 @@ mod tests {
         let res = actix_web::test::call_service(
             &app,
             actix_web::test::TestRequest::get()
-                .uri("/sync/clone")
+                .uri("/sync/status")
                 .insert_header(("Cookie", format!("auth_token={token}")))
                 .to_request(),
         )
@@ -348,13 +396,14 @@ mod tests {
         let body = actix_web::test::read_body(res).await;
         let json: serde_json::Value = serde_json::from_slice(&body)?;
         assert_eq!(json["applied_seq"], 0);
+        assert_eq!(json["head"], 0);
         assert!(json["prefix"].as_str().unwrap_or_default().contains("u/alice"));
 
         // Fresh client gets 304 with no body.
         let res = actix_web::test::call_service(
             &app,
             actix_web::test::TestRequest::get()
-                .uri("/sync/clone")
+                .uri("/sync/status")
                 .insert_header(("Cookie", format!("auth_token={token}")))
                 .insert_header((IF_NONE_MATCH, etag))
                 .to_request(),
@@ -365,15 +414,31 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn clone_skips_commit_when_fresh() -> anyhow::Result<()> {
+    async fn status_never_builds() -> anyhow::Result<()> {
         let fx = fixture().await?;
+        // Make the replica stale the way the engines do: master mutation
+        // plus WAL entry, with no advance.
+        let f2 = FileRecord {
+            id: "f2".into(),
+            name: "b.txt".into(),
+            mimetype: "text/plain".into(),
+            size: 2,
+            s3_key: "k/f2".into(),
+            owner_sub: "alice".into(),
+            created_at: 0,
+        };
+        fx.manager.store.save_file(&f2).await?;
+        fx.manager
+            .wal
+            .append(WalOp::FileCreate { rec: f2 })
+            .await?;
         let mw = setup(&fx).await?;
         let module = SyncApiModule::new(fx.manager.clone(), mw);
         let app =
             actix_web::test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
         let token = fx.token("alice")?;
 
-        // Manifest ETag is stable across a fresh re-poll: no commit ran.
+        // Manifest ETag is stable across status polls: no commit runs.
         let fetch_manifest_etag = || async {
             let res = actix_web::test::call_service(
                 &app,
@@ -391,22 +456,29 @@ mod tests {
                 .to_string()
         };
         let before = fetch_manifest_etag().await;
-        let res = actix_web::test::call_service(
-            &app,
-            actix_web::test::TestRequest::get()
-                .uri("/sync/clone")
-                .insert_header(("Cookie", format!("auth_token={token}")))
-                .to_request(),
-        )
-        .await;
-        assert_eq!(res.status(), http::StatusCode::OK);
+        // Status reports the gap but never closes it.
+        for _ in 0..2 {
+            let res = actix_web::test::call_service(
+                &app,
+                actix_web::test::TestRequest::get()
+                    .uri("/sync/status")
+                    .insert_header(("Cookie", format!("auth_token={token}")))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(res.status(), http::StatusCode::OK);
+            let body = actix_web::test::read_body(res).await;
+            let json: serde_json::Value = serde_json::from_slice(&body)?;
+            assert_eq!(json["applied_seq"], 0);
+            assert_eq!(json["head"], 1);
+        }
         let after = fetch_manifest_etag().await;
         assert_eq!(before, after);
         Ok(())
     }
 
     #[actix_web::test]
-    async fn clone_advances_via_replay() -> anyhow::Result<()> {
+    async fn sync_advances_via_replay() -> anyhow::Result<()> {
         let fx = fixture().await?;
         let f2 = FileRecord {
             id: "f2".into(),
@@ -430,8 +502,8 @@ mod tests {
 
         let res = actix_web::test::call_service(
             &app,
-            actix_web::test::TestRequest::get()
-                .uri("/sync/clone")
+            actix_web::test::TestRequest::post()
+                .uri("/sync/sync")
                 .insert_header(("Cookie", format!("auth_token={token}")))
                 .to_request(),
         )
