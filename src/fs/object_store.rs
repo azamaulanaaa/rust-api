@@ -285,6 +285,35 @@ impl S3Client for ObjectStoreClient {
             Err(e) => Err(Self::map_err(e)),
         }
     }
+
+    async fn list_keys(
+        &self,
+        bucket: &str,
+        prefix: &str,
+    ) -> Result<Vec<crate::fs::s3::ListedKey>, FsError> {
+        use futures_util::TryStreamExt as _;
+
+        let root = self.path(bucket, prefix);
+        let mut out = Vec::new();
+        let mut stream = self.store.list(Some(&root));
+        while let Some(meta) = stream.try_next().await.map_err(Self::map_err)? {
+            let full = meta.location.to_string();
+            // InMemory nests keys under the bucket; strip it back to the
+            // relative form the rest of the trait speaks.
+            let key = if self.is_memory {
+                full.strip_prefix(&format!("{bucket}/"))
+                    .unwrap_or(&full)
+                    .to_string()
+            } else {
+                full
+            };
+            out.push(crate::fs::s3::ListedKey {
+                key,
+                last_modified: meta.last_modified.timestamp(),
+            });
+        }
+        Ok(out)
+    }
 }
 
 /// Builds the configured `AmazonS3Builder` from [`S3ClientConfig`].
@@ -349,6 +378,27 @@ pub async fn build_s3_client(
 mod tests {
     use super::*;
     use bytes::Bytes;
+
+    #[tokio::test]
+    async fn list_keys_returns_relative_form() -> anyhow::Result<()> {
+        let client = ObjectStoreClient::in_memory();
+        client
+            .put_object("b", "files/a", Bytes::from_static(b"1"), None, None)
+            .await?;
+        client
+            .put_object("b", "files/b", Bytes::from_static(b"2"), None, None)
+            .await?;
+        client
+            .put_object("b", "other/c", Bytes::from_static(b"3"), None, None)
+            .await?;
+        let mut keys = client.list_keys("b", "files/").await?;
+        keys.sort_by(|a, b| a.key.cmp(&b.key));
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0].key, "files/a");
+        assert_eq!(keys[1].key, "files/b");
+        assert!(keys.iter().all(|k| k.last_modified > 0));
+        Ok(())
+    }
 
     #[tokio::test]
     async fn put_get_roundtrip() -> anyhow::Result<()> {

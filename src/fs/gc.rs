@@ -4,12 +4,18 @@
 //! Expired files are logged to the WAL (when the engine has one wired)
 //! so replicas replay the deletion instead of keeping stale copies.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::time::interval;
 
 use crate::fs::FsEngine;
+
+/// Object prefix holding file bytes (`UploadSession`/`FileRecord` keys
+/// are `files/{id}`); the orphan-byte pass lists exactly this scope so
+/// oxkv prefixes sharing the bucket are never touched.
+const FILE_BYTES_PREFIX: &str = "files/";
 
 /// TTL for abandoned sessions and orphaned files.
 pub const TTL_SECS: i64 = 24 * 3600;
@@ -27,14 +33,17 @@ pub fn spawn(engine: Arc<FsEngine>) {
     });
 }
 
-/// Single sweep: sessions and orphaned files.
+/// Single sweep: sessions, orphaned files, and orphan S3 bytes.
 #[tracing::instrument(skip(engine), err)]
 pub async fn sweep_once(engine: &FsEngine) -> Result<usize, crate::fs::error::FsError> {
     let now = chrono::Utc::now().timestamp();
     let mut cleaned = 0;
 
+    let sessions = engine.store.list_sessions().await?;
+    let files = engine.store.list_files().await?;
+
     // sessions
-    for s in engine.store.list_sessions().await? {
+    for s in &sessions {
         if now - s.created_at <= TTL_SECS {
             continue;
         }
@@ -75,7 +84,7 @@ pub async fn sweep_once(engine: &FsEngine) -> Result<usize, crate::fs::error::Fs
     }
 
     // orphaned / temp files
-    for f in engine.store.list_files().await? {
+    for f in &files {
         let info = engine.store.get_ref_info(&f.id).await?;
         if info.count != 0 {
             continue;
@@ -105,6 +114,45 @@ pub async fn sweep_once(engine: &FsEngine) -> Result<usize, crate::fs::error::Fs
                 file_id: f.id.clone(),
             })
             .await?;
+        cleaned += 1;
+    }
+
+    // orphan S3 bytes: listed keys no session or file record references.
+    // Crash windows between byte and metadata writes strand such keys;
+    // only reap them past the TTL so in-flight uploads always survive.
+    // A listing failure skips just this pass (metadata work above stands).
+    let mut live: HashSet<&str> = HashSet::new();
+    for s in &sessions {
+        live.insert(s.s3_key.as_str());
+    }
+    for f in &files {
+        live.insert(f.s3_key.as_str());
+    }
+    let listed = match engine.s3.list_keys(&engine.bucket, FILE_BYTES_PREFIX).await {
+        Ok(keys) => keys,
+        Err(e) => {
+            tracing::warn!("fs gc orphan-byte listing failed: {e}; skipping pass");
+            Vec::new()
+        }
+    };
+    for entry in listed {
+        if live.contains(entry.key.as_str()) || now - entry.last_modified <= TTL_SECS {
+            continue;
+        }
+        tracing::info!("fs gc expiring orphan bytes {}", entry.key);
+        if engine
+            .s3
+            .delete_object(&engine.bucket, &entry.key)
+            .await
+            .map_err(|e| {
+                tracing::warn!("gc delete {} failed: {e}", entry.key);
+                e
+            })
+            .is_err()
+        {
+            tracing::warn!("fs gc keeping orphan bytes {} for retry", entry.key);
+            continue;
+        }
         cleaned += 1;
     }
 
@@ -290,6 +338,146 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sweep_keeps_live_and_fresh_s3_keys() -> anyhow::Result<()> {
+        let engine = make_engine().await;
+        // Live single-part session: bytes exist, session still open.
+        let file_id = engine
+            .init_upload(
+                crate::fs::model::InitRequest {
+                    file_size: 1024,
+                    part_size: 1024,
+                    file_total_parts: 1,
+                },
+                "alice",
+            )
+            .await?;
+        engine
+            .upload_part(&file_id, 0, Bytes::from(vec![9u8; 1024]), None, "alice")
+            .await?;
+        // Fresh stray bytes (e.g. crash between put and metadata write).
+        engine
+            .s3
+            .put_object("test-bucket", "files/stray", Bytes::from_static(b"x"), None, None)
+            .await?;
+
+        assert_eq!(sweep_once(&engine).await?, 0);
+        assert!(engine.store.get_session(&file_id).await?.is_some());
+        assert!(engine.s3.get_object("test-bucket", "files/stray").await.is_ok());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sweep_reaps_aged_orphan_bytes() -> anyhow::Result<()> {
+        use crate::fs::s3::ListedKey;
+
+        struct ListS3 {
+            listed: Vec<ListedKey>,
+            deleted: std::sync::Mutex<Vec<String>>,
+        }
+        #[async_trait::async_trait]
+        impl S3Client for ListS3 {
+            async fn create_multipart_upload(
+                &self,
+                _: &str,
+                _: &str,
+                _: Option<String>,
+            ) -> Result<String, FsError> {
+                Ok("u".into())
+            }
+            async fn upload_part(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+                _: i32,
+                _: Bytes,
+                _: Option<String>,
+            ) -> Result<String, FsError> {
+                Ok("e".into())
+            }
+            async fn complete_multipart_upload(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+                _: Vec<String>,
+            ) -> Result<(), FsError> {
+                Ok(())
+            }
+            async fn abort_multipart_upload(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+            ) -> Result<(), FsError> {
+                Ok(())
+            }
+            async fn put_object(
+                &self,
+                _: &str,
+                _: &str,
+                _: Bytes,
+                _: Option<String>,
+                _: Option<String>,
+            ) -> Result<(), FsError> {
+                Ok(())
+            }
+            async fn get_object(&self, _: &str, _: &str) -> Result<Bytes, FsError> {
+                Err(FsError::NotFound("no".into()))
+            }
+            async fn delete_object(&self, _: &str, key: &str) -> Result<(), FsError> {
+                self.deleted.lock().expect("delete log").push(key.to_string());
+                Ok(())
+            }
+            async fn list_keys(&self, _: &str, _: &str) -> Result<Vec<ListedKey>, FsError> {
+                Ok(self.listed.clone())
+            }
+        }
+
+        let now = chrono::Utc::now().timestamp();
+        let s3 = Arc::new(ListS3 {
+            listed: vec![
+                ListedKey {
+                    key: "files/old-stray".into(),
+                    last_modified: now - TTL_SECS - 3600,
+                },
+                ListedKey {
+                    key: "files/fresh-stray".into(),
+                    last_modified: now - 60,
+                },
+                ListedKey {
+                    key: "files/live-key".into(),
+                    last_modified: now - TTL_SECS - 3600,
+                },
+            ],
+            deleted: std::sync::Mutex::new(Vec::new()),
+        });
+        let orphan_prefix = {
+            use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+            format!(
+                "test-gc-orphan-{}-{}",
+                std::process::id(),
+                URL_SAFE_NO_PAD.encode(rand::random::<[u8; 6]>())
+            )
+        };
+        let store = FsStore::new(build_test_store(&orphan_prefix).await);
+        let policy =
+            PolicyEngine::init_s3(build_test_store(&format!("{orphan_prefix}-p")).await).await?;
+        let engine = FsEngine::from_parts(store, s3.clone(), "b".into(), policy);
+        // Fresh session referencing live-key: aged but live, must survive.
+        let mut sess = session_with_age("sess-live", 60, false);
+        sess.s3_key = "files/live-key".into();
+        engine.store.save_session(&sess).await?;
+
+        assert_eq!(sweep_once(&engine).await?, 1);
+        assert_eq!(
+            *s3.deleted.lock().expect("delete log"),
+            vec!["files/old-stray".to_string()]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn sweep_empty_store_returns_zero() -> anyhow::Result<()> {
         let engine = make_engine().await;
         assert_eq!(sweep_once(&engine).await?, 0);
@@ -352,6 +540,13 @@ mod tests {
             }
             async fn delete_object(&self, _: &str, _: &str) -> Result<(), FsError> {
                 Err(FsError::Internal("delete failed".into()))
+            }
+            async fn list_keys(
+                &self,
+                _: &str,
+                _: &str,
+            ) -> Result<Vec<crate::fs::s3::ListedKey>, FsError> {
+                Ok(Vec::new())
             }
         }
         let fail_prefix = {
