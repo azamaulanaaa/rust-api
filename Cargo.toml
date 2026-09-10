@@ -48,6 +48,7 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 chrono = "0.4"
 uuid = { version = "1.18", features = ["v7", "serde"] }
+rand = "0.8.0"
 
 utoipa = { version = "5", features = ["actix_extras"] }
 utoipa-swagger-ui = { version = "9", features = ["actix-web"] }
@@ -57,7 +58,6 @@ clap = { version = "4.5.53", features = ["derive"] }
 thiserror = "2.0.18"
 
 [dev-dependencies]
-rand = "0.8.0"
 rsa = "0.9.10"
 wiremock = "0.6.5"
 

@@ -3,7 +3,6 @@
 use std::sync::Arc;
 
 use actix_web::{HttpResponse, delete, get, post, put, web};
-use bytes::Bytes;
 use futures_util::TryStreamExt as _;
 
 use crate::fs::FsEngine;

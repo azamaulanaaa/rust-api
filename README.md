@@ -159,11 +159,22 @@ region = "us-east-1"
 service_name = "rust-api"                   # resource attribute on exported telemetry
 otlp_endpoint = "http://localhost:4317"     # OTLP/gRPC collector endpoint
 sample_ratio = 1.0                          # fraction of traces sampled (0.0–1.0, default 1.0)
+
+# Optional — file-delegation (capability token) signing keys.
+# Omit the section and the server mints an ephemeral OS-RNG key per boot
+# (tokens die with the process — fine for dev, a warning in prod).
+# Generate: python3 -c "import secrets; print(secrets.token_hex(32))"
+# Rotate: move the current secret to previous_secret, deploy the new secret
+# as secret — tokens minted under either key verify until the old
+# generation expires (5-minute TTL).
+# [capability]
+# secret = "<64 hex chars>"                 # current key: mints tokens
+# previous_secret = "<64 hex chars>"       # old key: verifies only, during rotation
 ```
 
 Single bucket, prefix-scoped stores: `db::build_s3_store` builds one `AmazonS3` `ObjectStore` from `[s3]` and wraps it with `OxKvStore::builder().with_object_store(...).with_prefix("oxkv/policy")` etc. via the shared `fs::object_store::s3_builder`. Breaking change since `988873c`: `[database].path` (Redb file) is gone — use `[database].prefix`; old `*.redb` files are no longer read (no automatic migration).
 
-Secrets via environment (win over the file when present and non-empty, for secret managers): `RUST_API_CLIENT_SECRET`, `RUST_API_S3_ACCESS_KEY_ID`, `RUST_API_S3_SECRET_ACCESS_KEY`.
+Secrets via environment (win over the file when present and non-empty, for secret managers): `RUST_API_CLIENT_SECRET`, `RUST_API_S3_ACCESS_KEY_ID`, `RUST_API_S3_SECRET_ACCESS_KEY`, `RUST_API_CAPABILITY_SECRET`, `RUST_API_CAPABILITY_SECRET_PREV`.
 
 ## Production hardening
 

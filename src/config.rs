@@ -23,6 +23,9 @@ pub struct Config {
     pub database: DatabaseConfig,
     /// S3-compatible object storage settings for file uploads.
     pub s3: S3Config,
+    /// Capability-token signing keys; ephemeral when omitted.
+    #[serde(default)]
+    pub capability: CapabilityConfig,
     /// Telemetry settings; defaults apply when the section is omitted.
     #[serde(default)]
     pub observability: ObservabilityConfig,
@@ -42,6 +45,16 @@ pub const ENV_S3_ACCESS_KEY_ID: &str = "RUST_API_S3_ACCESS_KEY_ID";
 ///
 /// Present and non-empty wins over `s3.secret_access_key`.
 pub const ENV_S3_SECRET_ACCESS_KEY: &str = "RUST_API_S3_SECRET_ACCESS_KEY";
+
+/// Environment override for the capability-token signing secret.
+///
+/// Present and non-empty wins over `capability.secret`.
+pub const ENV_CAPABILITY_SECRET: &str = "RUST_API_CAPABILITY_SECRET";
+
+/// Environment override for the previous capability-token secret.
+///
+/// Present and non-empty wins over `capability.previous_secret`.
+pub const ENV_CAPABILITY_SECRET_PREV: &str = "RUST_API_CAPABILITY_SECRET_PREV";
 
 impl TryFrom<&Path> for Config {
     type Error = anyhow::Error;
@@ -80,6 +93,14 @@ fn apply_env_overrides(config: &mut Config) {
     config.s3.secret_access_key = prefer_env_opt(
         std::env::var(ENV_S3_SECRET_ACCESS_KEY).ok(),
         config.s3.secret_access_key.take(),
+    );
+    config.capability.secret = prefer_env_opt(
+        std::env::var(ENV_CAPABILITY_SECRET).ok(),
+        config.capability.secret.take(),
+    );
+    config.capability.previous_secret = prefer_env_opt(
+        std::env::var(ENV_CAPABILITY_SECRET_PREV).ok(),
+        config.capability.previous_secret.take(),
     );
 }
 
@@ -136,6 +157,12 @@ impl Config {
         }
         if self.s3.region.trim().is_empty() {
             anyhow::bail!("s3.region must not be empty");
+        }
+        if let Some(secret) = &self.capability.secret {
+            rust_api::fs::token::parse_secret_hex(secret).map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
+        if let Some(secret) = &self.capability.previous_secret {
+            rust_api::fs::token::parse_secret_hex(secret).map_err(|e| anyhow::anyhow!("{e}"))?;
         }
         if !(0.0..=1.0).contains(&self.observability.sample_ratio) {
             anyhow::bail!(
@@ -213,6 +240,25 @@ pub struct DatabaseConfig {
 
 fn default_db_prefix() -> String {
     "oxkv".to_string()
+}
+
+/// Capability-token (file delegation JWT) signing keys.
+///
+/// 64-char hex (32 bytes); generate with
+/// `python3 -c "import secrets; print(secrets.token_hex(32))"`.
+/// Omitted entirely means an ephemeral OS-RNG key per boot (tokens
+/// die with the process — fine for dev, logged as a warning).
+/// Rotate by moving the current secret to `previous_secret` and
+/// deploying the new one as `secret`: tokens minted under either key
+/// verify until the old generation expires (5-minute TTL).
+#[derive(Deserialize, Debug, Default)]
+pub struct CapabilityConfig {
+    /// Current signing secret: mints tokens.
+    #[serde(default)]
+    pub secret: Option<String>,
+    /// Previous signing secret: verifies only, during rotation.
+    #[serde(default)]
+    pub previous_secret: Option<String>,
 }
 
 /// Object-store settings (AmazonS3 via object_store; InMemory for tests).
@@ -424,6 +470,21 @@ mod tests {
         // Empty credentials.
         let err = validation_error(&minimal_toml().replace("client_secret = \"csecret\"", "client_secret = \"\""));
         assert!(err.contains("client_secret"), "unexpected: {err}");
+
+        // Truncated/non-hex capability secrets (weak HMAC material).
+        let err = validation_error(
+            &minimal_toml().replace("region = \"us-east-1\"", "region = \"us-east-1\"\n[capability]\nsecret = \"deadbeef\""),
+        );
+        assert!(err.contains("64 hex chars"), "unexpected: {err}");
+        let err = validation_error(
+            &minimal_toml().replace("region = \"us-east-1\"", &format!("region = \"us-east-1\"\n[capability]\nsecret = \"{}\"\nprevious_secret = \"zz\"", "ab".repeat(32))),
+        );
+        assert!(err.contains("64 hex chars"), "unexpected: {err}");
+        // A well-formed secret passes validation.
+        let ok = minimal_toml().replace("region = \"us-east-1\"", &format!("region = \"us-east-1\"\n[capability]\nsecret = \"{}\"", "ab".repeat(32)));
+        let path = tmp_toml(&ok);
+        assert!(Config::try_from(path.as_path()).is_ok());
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
