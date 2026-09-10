@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use oxkv::{GetSet, OxKvStore};
+use oxkv::{GetSet, OxKvStore, Store as _, Transaction as _};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
@@ -97,7 +97,10 @@ impl Wal {
     /// Append an operation, returns new seq.
     ///
     /// Serialized against concurrent appends on any clone sharing this
-    /// handle's mutex.
+    /// handle's mutex. The entry and the head pointer commit in one
+    /// transaction, so a crash can never leave an entry without its head
+    /// (or a head without its entry): the next append reuses the same
+    /// sequence instead of skipping it.
     pub async fn append(&self, op: WalOp) -> Result<u64, FsError> {
         let _guard = self.append_lock.lock().await;
         let g = self.store.write().await;
@@ -114,11 +117,17 @@ impl Wal {
             ts: chrono::Utc::now().timestamp(),
         };
         let val = serde_json::to_vec(&entry).map_err(|e| FsError::Internal(e.to_string()))?;
-        g.set_bytes(&Self::entry_key(seq), &val)
+        let seq_val = serde_json::to_vec(&seq).map_err(|e| FsError::Internal(e.to_string()))?;
+        let tx = g
+            .begin_tx()
+            .map_err(|e| FsError::Store(e.to_string()))?;
+        tx.set_bytes(&Self::entry_key(seq), &val)
             .await
             .map_err(|e| FsError::Store(e.to_string()))?;
-        let seq_val = serde_json::to_vec(&seq).map_err(|e| FsError::Internal(e.to_string()))?;
-        g.set_bytes(Self::seq_key(), &seq_val)
+        tx.set_bytes(Self::seq_key(), &seq_val)
+            .await
+            .map_err(|e| FsError::Store(e.to_string()))?;
+        tx.commit()
             .await
             .map_err(|e| FsError::Store(e.to_string()))?;
         Ok(seq)
