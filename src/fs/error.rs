@@ -9,6 +9,9 @@ pub enum FsError {
     /// Validation failure - 400.
     #[error("{0}")]
     BadRequest(String),
+    /// Request body exceeds the declared part size - 413.
+    #[error("payload too large")]
+    PayloadTooLarge,
     /// Caller lacks permission - 403.
     #[error("forbidden")]
     Forbidden,
@@ -37,6 +40,7 @@ impl ResponseError for FsError {
     fn status_code(&self) -> StatusCode {
         match self {
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
+            Self::PayloadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             Self::Forbidden => StatusCode::FORBIDDEN,
             Self::NotFound(_) => StatusCode::NOT_FOUND,
             Self::Conflict(_) => StatusCode::CONFLICT,
@@ -52,7 +56,7 @@ impl ResponseError for FsError {
             Self::Internal(detail) | Self::Store(detail) => {
                 tracing::warn!("fs error {}: internal: {detail}", self.status_code());
             }
-            Self::BadRequest(_) | Self::NotFound(_) | Self::Conflict(_) => {
+            Self::BadRequest(_) | Self::NotFound(_) | Self::Conflict(_) | Self::PayloadTooLarge => {
                 tracing::debug!("fs error {}: {}", self.status_code(), self);
             }
             Self::Forbidden => {}

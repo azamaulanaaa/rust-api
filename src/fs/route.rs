@@ -63,7 +63,7 @@ async fn upload_part(
     engine: web::Data<FsEngine>,
     claims: Validated<Claims>,
     path: web::Path<(String, u64)>,
-    body: Bytes,
+    payload: web::Payload,
     req: actix_web::HttpRequest,
 ) -> Result<HttpResponse, crate::fs::error::FsError> {
     let (id, idx) = path.into_inner();
@@ -79,8 +79,18 @@ async fn upload_part(
                 .and_then(|v| v.to_str().ok())
                 .map(|s| s.to_string())
         });
+    // Declared length lets the engine reject mismatches before reading
+    // a single body byte; garbage values fall back to chunk counting.
+    let declared_len = req
+        .headers()
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok());
+    let stream = payload.map_err(|_| {
+        crate::fs::error::FsError::BadRequest("request body interrupted".into())
+    });
     engine
-        .upload_part(&id, idx, body, checksum_sha256, &claims.sub)
+        .upload_part(&id, idx, stream, declared_len, checksum_sha256, &claims.sub)
         .await?;
     Ok(HttpResponse::NoContent().finish())
 }
@@ -867,6 +877,47 @@ mod tests {
         let res = get(Some("bananas")).await;
         assert_eq!(res.status(), http::StatusCode::OK);
         assert_eq!(test::read_body(res).await.to_vec(), body);
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn oversize_part_is_rejected_with_413() -> anyhow::Result<()> {
+        let fx = fixture(true).await?;
+        let mw = JwtClaimsMiddleware::<Claims>::new_with_jks(
+            &format!("{}/jwks", fx.server.uri()),
+            AUD,
+            &fx.issuer(),
+        )
+        .await?;
+        let module = FsApiModule::new(fx.engine.clone(), mw);
+        let app = test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+
+        let res = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/fs/uploads")
+                .insert_header(("Cookie", format!("auth_token={token}")))
+                .set_json(json!({"file_size": 1024, "part_size": 1024, "file_total_parts": 1}))
+                .to_request(),
+        )
+        .await;
+        let init: serde_json::Value = test::read_body_json(res).await;
+        let file_id = init["file_id"].as_str().unwrap();
+        // Twice the declared part size: the declared Content-Length
+        // already exceeds it, so this fails without streaming the body.
+        let res = test::call_service(
+            &app,
+            test::TestRequest::put()
+                .uri(&format!("/fs/uploads/{file_id}/parts/0"))
+                .insert_header(("Cookie", format!("auth_token={token}")))
+                .set_payload(vec![0u8; 2048])
+                .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::PAYLOAD_TOO_LARGE);
+        let err: serde_json::Value = test::read_body_json(res).await;
+        assert_eq!(err["error"], "payload too large");
         Ok(())
     }
 }
