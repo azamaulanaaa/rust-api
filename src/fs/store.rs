@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use oxkv::{GetSet, OxKvStore};
+use oxkv::{Direction, GetSet, KeyValue, OxKvStore};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
@@ -70,6 +70,30 @@ impl FsStore {
         }
     }
 
+    /// Point read through the single shared handle.
+    async fn get_one(&self, key: &str) -> Result<Option<Vec<u8>>, FsError> {
+        let g = self.inner.read().await;
+        g.get_bytes(key)
+            .await
+            .map_err(|e| FsError::Store(e.to_string()))
+    }
+
+    /// Range scan bounded to keys under `prefix:`.
+    ///
+    /// Full-store scans (`(None, None)` cursors) materialize every key;
+    /// bounding to the key-space prefix keeps each scan proportional to
+    /// its own key family instead of the whole store.
+    async fn scan_prefix(&self, prefix: &str) -> Result<Vec<KeyValue>, FsError> {
+        let g = self.inner.read().await;
+        g.gets_bytes(
+            None,
+            Direction::Next,
+            (Some(prefix.to_string()), Some(prefix_scan_end(prefix))),
+        )
+        .await
+        .map_err(|e| FsError::Store(e.to_string()))
+    }
+
     fn session_key(id: &str) -> String {
         format!("fs:uploads:{id}:meta")
     }
@@ -94,12 +118,7 @@ impl FsStore {
     /// Loads an upload session by file id.
     pub async fn get_session(&self, id: &str) -> Result<Option<UploadSession>, FsError> {
         let key = Self::session_key(id);
-        let g = self.inner.read().await;
-        let Some(bytes) = g
-            .get_bytes(&key)
-            .await
-            .map_err(|e| FsError::Store(e.to_string()))?
-        else {
+        let Some(bytes) = self.get_one(&key).await? else {
             return Ok(None);
         };
         let s = serde_json::from_slice(&bytes).map_err(|e| FsError::Internal(e.to_string()))?;
@@ -138,15 +157,7 @@ impl FsStore {
     /// Loads a staged single-part chunk.
     pub async fn get_staged_part(&self, id: &str, idx: u64) -> Result<Option<Vec<u8>>, FsError> {
         let key = Self::staged_key(id, idx);
-        let g = self.inner.read().await;
-        let Some(bytes) = g
-            .get_bytes(&key)
-            .await
-            .map_err(|e| FsError::Store(e.to_string()))?
-        else {
-            return Ok(None);
-        };
-        Ok(Some(bytes))
+        Ok(self.get_one(&key).await?)
     }
 
     /// Persists a finalized file record.
@@ -163,12 +174,7 @@ impl FsStore {
     /// Loads a finalized file record.
     pub async fn get_file(&self, id: &str) -> Result<Option<FileRecord>, FsError> {
         let key = Self::file_key(id);
-        let g = self.inner.read().await;
-        let Some(bytes) = g
-            .get_bytes(&key)
-            .await
-            .map_err(|e| FsError::Store(e.to_string()))?
-        else {
+        let Some(bytes) = self.get_one(&key).await? else {
             return Ok(None);
         };
         let r = serde_json::from_slice(&bytes).map_err(|e| FsError::Internal(e.to_string()))?;
@@ -190,12 +196,7 @@ impl FsStore {
     /// Returns ref-count info for a file (0 if never attached).
     pub async fn get_ref_info(&self, file_id: &str) -> Result<RefInfo, FsError> {
         let key = refs_key(file_id);
-        let g = self.inner.read().await;
-        let Some(bytes) = g
-            .get_bytes(&key)
-            .await
-            .map_err(|e| FsError::Store(e.to_string()))?
-        else {
+        let Some(bytes) = self.get_one(&key).await? else {
             return Ok(RefInfo::default());
         };
         let info = serde_json::from_slice(&bytes).map_err(|e| FsError::Internal(e.to_string()))?;
@@ -278,15 +279,10 @@ impl FsStore {
         serde_json::from_slice(&bytes).map_err(|e| FsError::Internal(e.to_string()))
     }
 
-    /// Lists rows referencing a file.
+    /// Lists rows referencing a file (scan bounded to `fs:rel:`).
     pub async fn rows_for_file(&self, file_id: &str) -> Result<Vec<(String, String)>, FsError> {
-        use oxkv::Direction;
         let suffix = format!(":{file_id}");
-        let g = self.inner.read().await;
-        let kvs = g
-            .gets_bytes(None, Direction::Next, (None, None))
-            .await
-            .map_err(|e| FsError::Store(e.to_string()))?;
+        let kvs = self.scan_prefix(crate::fs::relation::REL_PREFIX).await?;
         let mut out = Vec::new();
         for kv in kvs {
             if kv.key.starts_with(crate::fs::relation::REL_PREFIX) && kv.key.ends_with(&suffix) {
@@ -301,14 +297,9 @@ impl FsStore {
         Ok(out)
     }
 
-    /// Lists all finalized file records.
+    /// Lists all finalized file records (scan bounded to `fs:files:`).
     pub async fn list_files(&self) -> Result<Vec<FileRecord>, FsError> {
-        use oxkv::Direction;
-        let g = self.inner.read().await;
-        let kvs = g
-            .gets_bytes(None, Direction::Next, (None, None))
-            .await
-            .map_err(|e| FsError::Store(e.to_string()))?;
+        let kvs = self.scan_prefix("fs:files:").await?;
         let mut out = Vec::new();
         for kv in kvs {
             if kv.key.starts_with("fs:files:")
@@ -321,14 +312,9 @@ impl FsStore {
         Ok(out)
     }
 
-    /// Lists all upload sessions (scans `fs:uploads:*:meta`).
+    /// Lists all upload sessions (scan bounded to `fs:uploads:`).
     pub async fn list_sessions(&self) -> Result<Vec<UploadSession>, FsError> {
-        use oxkv::Direction;
-        let g = self.inner.read().await;
-        let kvs = g
-            .gets_bytes(None, Direction::Next, (None, None))
-            .await
-            .map_err(|e| FsError::Store(e.to_string()))?;
+        let kvs = self.scan_prefix("fs:uploads:").await?;
         let mut out = Vec::new();
         for kv in kvs {
             if kv.key.starts_with("fs:uploads:")
@@ -353,6 +339,19 @@ impl FsStore {
             .map_err(|e| FsError::Store(e.to_string()))?;
         Ok(kvs.into_iter().map(|kv| (kv.key, kv.value)).collect())
     }
+}
+
+/// Exclusive upper bound for a `prefix:` range scan (`:` -> `;`).
+///
+/// Every key starting with `prefix:` sorts strictly below the bound, so
+/// the engine can stop at the key family instead of walking the rest of
+/// the store. No stored key ever equals the bare prefix itself.
+fn prefix_scan_end(prefix: &str) -> String {
+    debug_assert!(prefix.ends_with(':'));
+    let mut end = prefix.to_string();
+    end.pop();
+    end.push(';');
+    end
 }
 
 #[cfg(test)]
