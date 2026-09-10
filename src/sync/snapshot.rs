@@ -41,6 +41,12 @@ pub struct SnapshotManager {
     pub(crate) db_prefix: String,
     /// Skip the oxkv storage probe (tests on `InMemory`).
     skip_probe: bool,
+    /// SST block cache shared by every replica open from this manager.
+    ///
+    /// Writer/reader opens used to build a private cold cache per call
+    /// (dropped with the handle); sharing keeps hot SSTs resident across
+    /// rebuilds. Clones share the state, matching the build lock.
+    sst_cache: oxkv::LruCache<String, std::sync::Arc<oxkv::SstFile>>,
     /// Serializes builds and replays per process (one live writer per prefix).
     build_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
 }
@@ -63,6 +69,7 @@ impl SnapshotManager {
             db_prefix,
             skip_probe,
             build_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            sst_cache: crate::db::default_sst_cache(),
         }
     }
 
@@ -211,22 +218,21 @@ impl SnapshotManager {
             .with_object_store(self.object_store.clone())
             .with_prefix(oxkv::ObjectPath::from(self.user_prefix(sub).as_str()))
             .skip_probe(self.skip_probe)
-            .build()
+            .build_with_cache(self.sst_cache.clone())
             .await
             .map_err(|e| FsError::Store(e.to_string()))
     }
 
     /// Opens a read-only follower over the replica (no ownership taken).
     async fn open_reader(&self, sub: &str) -> Result<OxKvReader, FsError> {
-        let base: std::sync::Arc<dyn object_store::ObjectStore> =
-            self.object_store.clone();
+        let base: std::sync::Arc<dyn object_store::ObjectStore> = self.object_store.clone();
         let storage: std::sync::Arc<dyn oxkv::Storage> = std::sync::Arc::new(base);
-        OxKvReader::open(
-            storage,
-            oxkv::ObjectPath::from(self.user_prefix(sub).as_str()),
-        )
-        .await
-        .map_err(|e| FsError::Store(e.to_string()))
+        oxkv::OxKvStore::builder()
+            .with_store(storage)
+            .with_prefix(oxkv::ObjectPath::from(self.user_prefix(sub).as_str()))
+            .build_reader_with_cache(self.sst_cache.clone())
+            .await
+            .map_err(|e| FsError::Store(e.to_string()))
     }
 
     /// Dumps the live replica as a map, or empty when never built.
