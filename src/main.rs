@@ -230,9 +230,16 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
             .build()
             .context("build snapshot object store")?,
     );
+    let master_store = if config.database.mirror_master {
+        FsStore::new_mirrored(fs_s3_store.clone())
+            .await
+            .map_err(|e| anyhow::anyhow!("open fs mirror: {e}"))?
+    } else {
+        FsStore::new(fs_s3_store.clone())
+    };
     let snapshot_manager = SnapshotManager::new(
         wal.clone(),
-        FsStore::new(fs_s3_store.clone()),
+        master_store,
         policy_engine.clone(),
         replica_objects,
         db_prefix,

@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use oxkv::{Direction, GetSet, KeyValue, OxKvStore};
+use oxkv::{CachedOxKvStore, Direction, GetSet, KeyValue, OxKvStore, WarmMode};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
@@ -60,6 +60,12 @@ pub struct FileRecord {
 #[derive(Clone)]
 pub struct FsStore {
     inner: Arc<RwLock<OxKvStore>>,
+    /// Lazily-warmed RAM mirror over the same handle (prototype).
+    ///
+    /// Reads route through the mirror when present; writes always go to
+    /// `inner`. The mirror never takes an epoch (it wraps a clone that
+    /// shares the session), so it cannot fence the writer.
+    mirror: Option<CachedOxKvStore>,
 }
 
 impl FsStore {
@@ -67,11 +73,59 @@ impl FsStore {
     pub fn new(s3_store: OxKvStore) -> Self {
         Self {
             inner: Arc::new(RwLock::new(s3_store)),
+            mirror: None,
         }
     }
 
-    /// Point read through the single shared handle.
+    /// Creates an FS store with a lazily-warmed RAM mirror (prototype).
+    ///
+    /// The mirror wraps a clone of `s3_store` (shared session/state, no
+    /// new epoch), warms key-by-key on read misses, and stays correct on
+    /// misses by falling through to the durable core. Call
+    /// [`refresh_mirror`](Self::refresh_mirror) before bulk scans so one
+    /// incremental WAL replay converges it instead of per-key misses.
+    /// Measure with `RUST_LOG=debug` (refresh counts are logged).
+    pub async fn new_mirrored(s3_store: OxKvStore) -> Result<Self, FsError> {
+        let mirror = CachedOxKvStore::open_with_mode(s3_store.clone(), WarmMode::Lazy)
+            .await
+            .map_err(|e| FsError::Store(e.to_string()))?;
+        Ok(Self {
+            inner: Arc::new(RwLock::new(s3_store)),
+            mirror: Some(mirror),
+        })
+    }
+
+    /// Test-only: mirror over a clone of this handle (shares session).
+    #[cfg(test)]
+    pub(crate) async fn mirrored_clone(&self) -> Result<Self, FsError> {
+        Self::new_mirrored(self.inner.read().await.clone()).await
+    }
+
+    /// Converges the mirror with master writes since the last call.
+    ///
+    /// No-op without a mirror. Returns replayed entries: 0 means already
+    /// converged (no I/O beyond the manifest check); a full re-warm only
+    /// happens on epoch/SST-set change, never on steady writes.
+    pub async fn refresh_mirror(&self) -> Result<usize, FsError> {
+        let Some(mirror) = &self.mirror else {
+            return Ok(0);
+        };
+        let applied = mirror
+            .refresh()
+            .await
+            .map_err(|e| FsError::Store(e.to_string()))?;
+        tracing::debug!(applied, "fs mirror refreshed");
+        Ok(applied)
+    }
+
+    /// Point read through the single shared handle (mirror first).
     async fn get_one(&self, key: &str) -> Result<Option<Vec<u8>>, FsError> {
+        if let Some(mirror) = &self.mirror {
+            return mirror
+                .get_bytes(key)
+                .await
+                .map_err(|e| FsError::Store(e.to_string()));
+        }
         let g = self.inner.read().await;
         g.get_bytes(key)
             .await
@@ -84,14 +138,17 @@ impl FsStore {
     /// bounding to the key-space prefix keeps each scan proportional to
     /// its own key family instead of the whole store.
     async fn scan_prefix(&self, prefix: &str) -> Result<Vec<KeyValue>, FsError> {
+        let cursor = (Some(prefix.to_string()), Some(prefix_scan_end(prefix)));
+        if let Some(mirror) = &self.mirror {
+            return mirror
+                .gets_bytes(None, Direction::Next, cursor)
+                .await
+                .map_err(|e| FsError::Store(e.to_string()));
+        }
         let g = self.inner.read().await;
-        g.gets_bytes(
-            None,
-            Direction::Next,
-            (Some(prefix.to_string()), Some(prefix_scan_end(prefix))),
-        )
-        .await
-        .map_err(|e| FsError::Store(e.to_string()))
+        g.gets_bytes(None, Direction::Next, cursor)
+            .await
+            .map_err(|e| FsError::Store(e.to_string()))
     }
 
     fn session_key(id: &str) -> String {
@@ -451,6 +508,50 @@ mod store_tests {
         assert!(store.get_file("file-1").await?.is_none());
         assert!(store.get_file("nonexistent").await?.is_none());
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn mirrored_store_serves_reads() -> anyhow::Result<()> {
+        // Writes land before and after the mirror opens: pre-existing
+        // keys arrive via fall-through/warm, later ones via refresh.
+        let plain = test_store().await;
+        let rec = FileRecord {
+            id: "mirror-1".to_string(),
+            name: "m.txt".to_string(),
+            mimetype: "text/plain".to_string(),
+            size: 5,
+            s3_key: "files/mirror-1".to_string(),
+            owner_sub: "bob".to_string(),
+            created_at: 0,
+        };
+        plain.save_file(&rec).await?;
+        plain.attach("invoice", "7", "mirror-1").await?;
+
+        let mirrored = FsStore::new_mirrored(clone_handle(&plain).await).await?;
+        // First refresh converges the pre-existing writes (WAL replay or
+        // warm, depending on what compacted); reads then serve correctly.
+        assert!(mirrored.refresh_mirror().await? > 0);
+        assert_eq!(mirrored.get_file("mirror-1").await?.unwrap().name, "m.txt");
+        assert_eq!(mirrored.list_files().await?.len(), 1);
+        assert_eq!(
+            mirrored.rows_for_file("mirror-1").await?,
+            vec![("invoice".to_string(), "7".to_string())]
+        );
+        assert_eq!(mirrored.get_ref_info("mirror-1").await?.count, 1);
+
+        // A write through the plain handle converges on refresh, and a
+        // second refresh with no writes is a manifest-check no-op.
+        plain.detach("invoice", "7", "mirror-1").await?;
+        mirrored.refresh_mirror().await?;
+        assert!(mirrored.rows_for_file("mirror-1").await?.is_empty());
+        assert_eq!(mirrored.get_ref_info("mirror-1").await?.count, 0);
+        assert_eq!(mirrored.refresh_mirror().await?, 0);
+        Ok(())
+    }
+
+    /// Clones the underlying handle out for mirror tests (shares session).
+    async fn clone_handle(store: &FsStore) -> oxkv::OxKvStore {
+        store.inner.read().await.clone()
     }
 
     #[tokio::test]

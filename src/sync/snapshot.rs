@@ -125,6 +125,9 @@ impl SnapshotManager {
     pub async fn build_full(&self, sub: &str) -> Result<u64, FsError> {
         let _guard = self.build_lock.lock().await;
         let head = self.wal.head().await?;
+        // Converge the RAM mirror before the bulk scan (no-op unless
+        // [database].mirror_master opted into the prototype).
+        self.store.refresh_mirror().await?;
 
         let snap_prefix = format!(
             "snap-{}-{head}-{}",
@@ -433,6 +436,27 @@ mod tests {
         mgr.store.save_file(&rec).await?;
         mgr.store.attach("invoice", "1", "f1").await?;
         mgr.store.save_file(&file_record("f2", "bob")).await?;
+
+        assert_eq!(mgr.build_full("alice").await?, 0);
+        assert_eq!(mgr.load_applied("alice").await?, Some(0));
+
+        assert!(replica_has(&mem, &mgr, "alice", "fs:files:f1:meta").await);
+        assert!(!replica_has(&mem, &mgr, "alice", "fs:files:f2:meta").await);
+        assert!(replica_has(&mem, &mgr, "alice", "fs:rel:invoice:1:f1").await);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn build_full_with_mirrored_master() -> anyhow::Result<()> {
+        let (mut mgr, mem) = test_manager().await;
+        mgr.policy
+            .add_rule("alice".into(), "invoice:1".into(), Action::Read)
+            .await?;
+        let rec = file_record("f1", "alice");
+        mgr.store.save_file(&rec).await?;
+        mgr.store.attach("invoice", "1", "f1").await?;
+        mgr.store.save_file(&file_record("f2", "bob")).await?;
+        mgr.store = mgr.store.mirrored_clone().await?;
 
         assert_eq!(mgr.build_full("alice").await?, 0);
         assert_eq!(mgr.load_applied("alice").await?, Some(0));
