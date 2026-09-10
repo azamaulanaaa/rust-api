@@ -1,4 +1,9 @@
 //! TOML configuration model for the server binary.
+//!
+//! Secrets may also arrive via the environment (secret managers inject
+//! them there): a present, non-empty variable wins over the file value.
+//! See [`ENV_CLIENT_SECRET`], [`ENV_S3_ACCESS_KEY_ID`],
+//! [`ENV_S3_SECRET_ACCESS_KEY`].
 
 use std::{fs, path::Path};
 
@@ -23,6 +28,21 @@ pub struct Config {
     pub observability: ObservabilityConfig,
 }
 
+/// Environment override for the OIDC client secret.
+///
+/// Present and non-empty wins over `authorization.client_secret`.
+pub const ENV_CLIENT_SECRET: &str = "RUST_API_CLIENT_SECRET";
+
+/// Environment override for the S3 access key id.
+///
+/// Present and non-empty wins over `s3.access_key_id`.
+pub const ENV_S3_ACCESS_KEY_ID: &str = "RUST_API_S3_ACCESS_KEY_ID";
+
+/// Environment override for the S3 secret access key.
+///
+/// Present and non-empty wins over `s3.secret_access_key`.
+pub const ENV_S3_SECRET_ACCESS_KEY: &str = "RUST_API_S3_SECRET_ACCESS_KEY";
+
 impl TryFrom<&Path> for Config {
     type Error = anyhow::Error;
 
@@ -36,9 +56,46 @@ impl TryFrom<&Path> for Config {
         }
 
         let content = fs::read_to_string(value).context("Failed to read config file")?;
-        let config: Self = toml::from_str(&content).context("Failed to parse config file")?;
+        let mut config: Self = toml::from_str(&content).context("Failed to parse config file")?;
+        apply_env_overrides(&mut config);
 
         Ok(config)
+    }
+}
+
+/// Overlays secret values from the environment onto a parsed config.
+///
+/// Split from file parsing so precedence is unit-testable without
+/// mutating the process environment (see `prefer_env` tests).
+fn apply_env_overrides(config: &mut Config) {
+    config.authorization.client_secret = prefer_env(
+        std::env::var(ENV_CLIENT_SECRET).ok(),
+        std::mem::take(&mut config.authorization.client_secret),
+    );
+    config.s3.access_key_id = prefer_env_opt(
+        std::env::var(ENV_S3_ACCESS_KEY_ID).ok(),
+        config.s3.access_key_id.take(),
+    );
+    config.s3.secret_access_key = prefer_env_opt(
+        std::env::var(ENV_S3_SECRET_ACCESS_KEY).ok(),
+        config.s3.secret_access_key.take(),
+    );
+}
+
+/// Effective required value: the env value wins when present and
+/// non-empty, otherwise the file value stands.
+fn prefer_env(env: Option<String>, file: String) -> String {
+    match env {
+        Some(v) if !v.is_empty() => v,
+        _ => file,
+    }
+}
+
+/// Effective optional value: same precedence as [`prefer_env`].
+fn prefer_env_opt(env: Option<String>, file: Option<String>) -> Option<String> {
+    match env {
+        Some(v) if !v.is_empty() => Some(v),
+        _ => file,
     }
 }
 
@@ -263,6 +320,20 @@ mod tests {
         let cfg = Config::try_from(path.as_path()).unwrap();
         assert_eq!(cfg.database.prefix, "custom/prefix");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn env_precedence_prefers_non_empty() {
+        assert_eq!(prefer_env(Some("e".into()), "f".into()), "e");
+        assert_eq!(prefer_env(None, "f".into()), "f");
+        assert_eq!(prefer_env(Some("".into()), "f".into()), "f");
+        assert_eq!(
+            prefer_env_opt(Some("e".into()), Some("f".into())),
+            Some("e".into())
+        );
+        assert_eq!(prefer_env_opt(None, Some("f".into())), Some("f".into()));
+        assert_eq!(prefer_env_opt(Some("".into()), Some("f".into())), Some("f".into()));
+        assert_eq!(prefer_env_opt(None, None), None);
     }
 
     #[test]

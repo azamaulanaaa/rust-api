@@ -163,6 +163,8 @@ sample_ratio = 1.0                          # fraction of traces sampled (0.0–
 
 Single bucket, prefix-scoped stores: `db::build_s3_store` builds one `AmazonS3` `ObjectStore` from `[s3]` and wraps it with `OxKvStore::builder().with_object_store(...).with_prefix("oxkv/policy")` etc. via the shared `fs::object_store::s3_builder`. Breaking change since `988873c`: `[database].path` (Redb file) is gone — use `[database].prefix`; old `*.redb` files are no longer read (no automatic migration).
 
+Secrets via environment (win over the file when present and non-empty, for secret managers): `RUST_API_CLIENT_SECRET`, `RUST_API_S3_ACCESS_KEY_ID`, `RUST_API_S3_SECRET_ACCESS_KEY`.
+
 ## Running
 
 ```bash
