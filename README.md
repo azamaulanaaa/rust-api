@@ -165,6 +165,42 @@ Single bucket, prefix-scoped stores: `db::build_s3_store` builds one `AmazonS3` 
 
 Secrets via environment (win over the file when present and non-empty, for secret managers): `RUST_API_CLIENT_SECRET`, `RUST_API_S3_ACCESS_KEY_ID`, `RUST_API_S3_SECRET_ACCESS_KEY`.
 
+## Production hardening
+
+The binary enforces no rate limits: per-IP throttling on the
+credential and control-plane routes is delegated to the load balancer
+in front of it. The routes that need it are `/auth/*` (login/callback
+are unauthenticated and each callback fans out to JWKS + token
+exchange), `/setup/*` (one-time bootstrap), and `/policy/*` (every
+write is Casbin evaluation work). Data-plane `/fs` and `/sync` reads
+can stay generous. Example for nginx:
+
+```nginx
+# 10 req/s burst 20 for auth + setup, 30 req/s burst 50 for policy writes.
+limit_req_zone $binary_remote_addr zone=auth:10m rate=10r/s;
+limit_req_zone $binary_remote_addr zone=policy:10m rate=30r/s;
+
+server {
+    listen 443 ssl;
+    location ~ ^/(auth|setup)/ {
+        limit_req zone=auth burst=20 nodelay;
+        proxy_pass http://rust-api:8080;
+    }
+    location /policy/ {
+        limit_req zone=policy burst=50 nodelay;
+        proxy_pass http://rust-api:8080;
+    }
+    location / {
+        proxy_pass http://rust-api:8080;
+    }
+}
+```
+
+Tune the rates to your IdP latency and admin headcount; the numbers
+above assume an interactive login flow, not machine-to-machine token
+churn. Never expose the binary directly to the internet without this
+(or an equivalent WAF/ingress) layer.
+
 ## Running
 
 ```bash
