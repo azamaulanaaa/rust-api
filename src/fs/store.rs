@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use oxkv::{CachedOxKvStore, Direction, GetSet, KeyValue, OxKvStore, WarmMode};
+use oxkv::{CachedOxKvStore, Direction, GetSet, KeyValue, OxKvStore, Store as _, Transaction as _, WarmMode};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
@@ -238,15 +238,15 @@ impl FsStore {
         Ok(Some(r))
     }
 
-    /// Deletes a finalized file record and its ref-count entry.
+    /// Deletes a finalized file record and its ref-count entry atomically.
     pub async fn delete_file(&self, id: &str) -> Result<(), FsError> {
         let key = Self::file_key(id);
         let refs = refs_key(id);
         let g = self.inner.write().await;
-        g.delete(&key)
-            .await
-            .map_err(|e| FsError::Store(e.to_string()))?;
-        let _ = g.delete(&refs).await;
+        let tx = g.begin_tx().map_err(store_err)?;
+        tx.delete(&key).await.map_err(store_err)?;
+        let _ = tx.delete(&refs).await;
+        tx.commit().await.map_err(store_err)?;
         Ok(())
     }
 
@@ -261,6 +261,9 @@ impl FsStore {
     }
 
     /// Attaches a file to a row; idempotent.
+    ///
+    /// The relation marker and the ref-count update commit in one
+    /// transaction: a crash can never leave one without the other.
     pub async fn attach(
         &self,
         row_type: &str,
@@ -270,28 +273,30 @@ impl FsStore {
         let rel = rel_key(row_type, row_id, file_id);
         let refs = refs_key(file_id);
         let g = self.inner.write().await;
-        if g.get_bytes(&rel)
+        let tx = g.begin_tx().map_err(store_err)?;
+        if tx
+            .get_bytes(&rel)
             .await
-            .map_err(|e| FsError::Store(e.to_string()))?
+            .map_err(store_err)?
             .is_some()
         {
-            let info = self.get_ref_info_inner(&g, file_id).await?;
+            let info = read_ref_info(&tx, file_id).await?;
+            tx.rollback().await.map_err(store_err)?;
             return Ok(info.count);
         }
-        let mut info = self.get_ref_info_inner(&g, file_id).await?;
+        let mut info = read_ref_info(&tx, file_id).await?;
         info.count = info.count.saturating_add(1);
         info.orphan_since = None;
-        g.set_bytes(&rel, b"1")
-            .await
-            .map_err(|e| FsError::Store(e.to_string()))?;
+        tx.set_bytes(&rel, b"1").await.map_err(store_err)?;
         let val = serde_json::to_vec(&info).map_err(|e| FsError::Internal(e.to_string()))?;
-        g.set_bytes(&refs, &val)
-            .await
-            .map_err(|e| FsError::Store(e.to_string()))?;
+        tx.set_bytes(&refs, &val).await.map_err(store_err)?;
+        tx.commit().await.map_err(store_err)?;
         Ok(info.count)
     }
 
     /// Detaches a file from a row; idempotent.
+    ///
+    /// Same atomicity contract as [`FsStore::attach`].
     pub async fn detach(
         &self,
         row_type: &str,
@@ -301,39 +306,27 @@ impl FsStore {
         let rel = rel_key(row_type, row_id, file_id);
         let refs = refs_key(file_id);
         let g = self.inner.write().await;
-        if g.get_bytes(&rel)
+        let tx = g.begin_tx().map_err(store_err)?;
+        if tx
+            .get_bytes(&rel)
             .await
-            .map_err(|e| FsError::Store(e.to_string()))?
+            .map_err(store_err)?
             .is_none()
         {
-            let info = self.get_ref_info_inner(&g, file_id).await?;
+            let info = read_ref_info(&tx, file_id).await?;
+            tx.rollback().await.map_err(store_err)?;
             return Ok(info.count);
         }
-        let mut info = self.get_ref_info_inner(&g, file_id).await?;
-        g.delete(&rel)
-            .await
-            .map_err(|e| FsError::Store(e.to_string()))?;
+        let mut info = read_ref_info(&tx, file_id).await?;
+        tx.delete(&rel).await.map_err(store_err)?;
         info.count = info.count.saturating_sub(1);
         if info.count == 0 {
             info.orphan_since = Some(chrono::Utc::now().timestamp());
         }
         let val = serde_json::to_vec(&info).map_err(|e| FsError::Internal(e.to_string()))?;
-        g.set_bytes(&refs, &val)
-            .await
-            .map_err(|e| FsError::Store(e.to_string()))?;
+        tx.set_bytes(&refs, &val).await.map_err(store_err)?;
+        tx.commit().await.map_err(store_err)?;
         Ok(info.count)
-    }
-
-    async fn get_ref_info_inner(&self, g: &OxKvStore, file_id: &str) -> Result<RefInfo, FsError> {
-        let key = refs_key(file_id);
-        let Some(bytes) = g
-            .get_bytes(&key)
-            .await
-            .map_err(|e| FsError::Store(e.to_string()))?
-        else {
-            return Ok(RefInfo::default());
-        };
-        serde_json::from_slice(&bytes).map_err(|e| FsError::Internal(e.to_string()))
     }
 
     /// Lists rows referencing a file (scan bounded to `fs:rel:`).
@@ -396,6 +389,21 @@ impl FsStore {
             .map_err(|e| FsError::Store(e.to_string()))?;
         Ok(kvs.into_iter().map(|kv| (kv.key, kv.value)).collect())
     }
+}
+
+/// Maps oxkv errors into [`FsError`].
+fn store_err(e: oxkv::StoreError) -> FsError {
+    FsError::Store(e.to_string())
+}
+
+/// Reads ref-count info through any [`GetSet`] handle (store or
+/// transaction); absent entries mean "never attached".
+async fn read_ref_info<T: GetSet>(tx: &T, file_id: &str) -> Result<RefInfo, FsError> {
+    let key = refs_key(file_id);
+    let Some(bytes) = tx.get_bytes(&key).await.map_err(store_err)? else {
+        return Ok(RefInfo::default());
+    };
+    serde_json::from_slice(&bytes).map_err(|e| FsError::Internal(e.to_string()))
 }
 
 /// Exclusive upper bound for a `prefix:` range scan (`:` -> `;`).
