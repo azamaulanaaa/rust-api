@@ -160,6 +160,7 @@ mod tests {
         Ok(SetupApiModule::new(
             PolicyEngine {
                 enforcer: fx.engine.enforcer.clone(),
+                wal: None,
             },
             middleware,
         ))
@@ -264,6 +265,7 @@ mod tests {
         let reopened = PolicyEngine::init_s3(s3_reopened).await?;
         let engine_clone = PolicyEngine {
             enforcer: reopened.enforcer.clone(),
+            wal: None,
         };
         let middleware =
             JwtClaimsMiddleware::<Claims>::new_with_jks(&jwks_url, AUDIENCE, &issuer).await?;

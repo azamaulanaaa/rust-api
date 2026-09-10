@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::RwLock;
 
+use crate::sync::wal::{Wal, WalOp};
+
 /// HTTP routes for managing policy rules and group membership.
 pub mod route;
 pub mod setup;
@@ -72,6 +74,10 @@ pub enum PolicyError {
     /// The subject does not hold the required permission.
     #[error("Access Denied")]
     AccessDenied,
+
+    /// Logging a committed mutation to the WAL failed.
+    #[error("WAL error: {0}")]
+    Wal(String),
 }
 
 /// Central authorization engine: a Casbin RBAC enforcer persisted to a
@@ -84,6 +90,10 @@ pub enum PolicyError {
 pub struct PolicyEngine {
     /// The underlying Casbin enforcer shared across workers.
     pub enforcer: Arc<RwLock<Enforcer>>,
+    /// WAL for replica sync; `None` disables logging (tests).
+    /// Production must wire it: without appends the WAL head never
+    /// advances and replicas freeze at their last snapshot.
+    wal: Option<Wal>,
 }
 
 /// The built-in role granted by the one-time bootstrap endpoint; holders
@@ -144,7 +154,26 @@ impl PolicyEngine {
         enforcer.enable_auto_save(true);
         Ok(Self {
             enforcer: Arc::new(RwLock::new(enforcer)),
+            wal: None,
         })
+    }
+
+    /// Attaches a [`Wal`] for replica sync; ops are logged after each
+    /// mutation (fail-closed: a logging failure fails the whole operation
+    /// so the WAL never silently misses a committed write).
+    pub fn with_wal(mut self, wal: Wal) -> Self {
+        self.wal = Some(wal);
+        self
+    }
+
+    /// Appends `op` when logging is wired; no-op otherwise.
+    async fn append_wal(&self, op: WalOp) -> Result<(), PolicyError> {
+        if let Some(wal) = &self.wal {
+            wal.append(op)
+                .await
+                .map_err(|e| PolicyError::Wal(e.to_string()))?;
+        }
+        Ok(())
     }
 }
 
@@ -163,7 +192,11 @@ impl PolicyEngine {
         act: Action,
     ) -> Result<bool, PolicyError> {
         let mut ef = self.enforcer.write().await;
-        let success = ef.add_policy(vec![sub, obj, act.to_string()]).await?;
+        let success = ef.add_policy(vec![sub, obj.clone(), act.to_string()]).await?;
+        drop(ef);
+        if success {
+            self.append_wal(WalOp::PolicyAdd { obj }).await?;
+        }
         Ok(success)
     }
 
@@ -175,14 +208,26 @@ impl PolicyEngine {
         act: Action,
     ) -> Result<bool, PolicyError> {
         let mut ef = self.enforcer.write().await;
-        let success = ef.remove_policy(vec![sub, obj, act.to_string()]).await?;
+        let success = ef
+            .remove_policy(vec![sub, obj.clone(), act.to_string()])
+            .await?;
+        drop(ef);
+        if success {
+            self.append_wal(WalOp::PolicyRemove { obj }).await?;
+        }
         Ok(success)
     }
 
     /// Assigns a user to a group (e.g., user_id, superuser)
     pub async fn assign_group(&self, user_id: String, group: String) -> Result<bool, PolicyError> {
         let mut ef = self.enforcer.write().await;
-        let success = ef.add_grouping_policy(vec![user_id, group]).await?;
+        let success = ef
+            .add_grouping_policy(vec![user_id, group.clone()])
+            .await?;
+        drop(ef);
+        if success {
+            self.append_wal(WalOp::PolicyAdd { obj: group }).await?;
+        }
         Ok(success)
     }
 
@@ -197,6 +242,11 @@ impl PolicyEngine {
         }
         ef.add_grouping_policy(vec![user_id.to_string(), SUPERADMIN_ROLE.to_string()])
             .await?;
+        drop(ef);
+        self.append_wal(WalOp::PolicyAdd {
+            obj: SUPERADMIN_ROLE.to_string(),
+        })
+        .await?;
         Ok(true)
     }
 
@@ -207,7 +257,11 @@ impl PolicyEngine {
         group: String,
     ) -> Result<bool, PolicyError> {
         let mut ef = self.enforcer.write().await;
-        let success = ef.remove_grouping_policy(vec![user_id, group]).await?;
+        let success = ef.remove_grouping_policy(vec![user_id, group.clone()]).await?;
+        drop(ef);
+        if success {
+            self.append_wal(WalOp::PolicyRemove { obj: group }).await?;
+        }
         Ok(success)
     }
 
@@ -254,9 +308,17 @@ impl PolicyEngine {
     /// deleting it. Returns `false` when the group holds no members.
     pub async fn delete_group(&self, group: &str) -> Result<bool, PolicyError> {
         let mut ef = self.enforcer.write().await;
-        Ok(ef
+        let removed = ef
             .remove_filtered_grouping_policy(1, vec![group.to_string()])
-            .await?)
+            .await?;
+        drop(ef);
+        if removed {
+            self.append_wal(WalOp::PolicyRemove {
+                obj: group.to_string(),
+            })
+            .await?;
+        }
+        Ok(removed)
     }
 
     /// Primary Authorization method.
@@ -475,5 +537,44 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn mutations_append_to_wal() {
+        use crate::sync::wal::{Wal, WalOp};
+
+        let prefix = format!("test-policy-wal-{}-{}", std::process::id(), uuid_like());
+        let wal = Wal::new(crate::db::build_test_store(&prefix).await);
+        let engine = engine().await.with_wal(wal.clone());
+
+        assert!(engine
+            .add_rule("alice".into(), "doc".into(), Action::Read)
+            .await
+            .unwrap());
+        // Duplicate: no mutation, no log entry.
+        assert!(!engine
+            .add_rule("alice".into(), "doc".into(), Action::Read)
+            .await
+            .unwrap());
+        assert!(engine
+            .assign_group("alice".into(), "admins".into())
+            .await
+            .unwrap());
+        assert!(engine
+            .remove_rule("alice".into(), "doc".into(), Action::Read)
+            .await
+            .unwrap());
+        assert!(engine
+            .remove_from_group("alice".into(), "admins".into())
+            .await
+            .unwrap());
+
+        let entries = wal.range(1, wal.head().await.unwrap()).await.unwrap();
+        let ops: Vec<&WalOp> = entries.iter().map(|e| &e.op).collect();
+        assert_eq!(ops.len(), 4);
+        assert!(matches!(&ops[0], WalOp::PolicyAdd { obj } if obj == "doc"));
+        assert!(matches!(&ops[1], WalOp::PolicyAdd { obj } if obj == "admins"));
+        assert!(matches!(&ops[2], WalOp::PolicyRemove { obj } if obj == "doc"));
+        assert!(matches!(&ops[3], WalOp::PolicyRemove { obj } if obj == "admins"));
     }
 }

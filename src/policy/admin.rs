@@ -4,6 +4,7 @@ use casbin::{CoreApi, DefaultModel, Enforcer, MgmtApi};
 use serde::{Deserialize, Serialize};
 
 use super::{RBAC_MODEL, adapter::OxkvAdapter};
+use crate::sync::wal::{Wal, WalOp};
 
 /// A portable snapshot of every policy rule in a store.
 #[derive(Debug, Serialize, Deserialize)]
@@ -42,9 +43,13 @@ pub async fn export_s3(s3_store: oxkv::OxKvStore) -> anyhow::Result<PolicyDump> 
 }
 
 /// Writes `dump`'s rules into an S3 store. Idempotent.
+///
+/// Newly added rules are appended to `wal` when wired, so replicas can
+/// replay the import instead of only discovering it via full recalc.
 pub async fn import_s3(
     s3_store: oxkv::OxKvStore,
     dump: &PolicyDump,
+    wal: Option<Wal>,
 ) -> anyhow::Result<ImportReport> {
     use anyhow::Context as _;
     let model = DefaultModel::from_str(RBAC_MODEL)
@@ -62,6 +67,13 @@ pub async fn import_s3(
     for rule in &dump.p {
         if enforcer.add_policy(rule.clone()).await? {
             report.rules_added += 1;
+            if let Some(wal) = &wal {
+                wal.append(WalOp::PolicyAdd {
+                    obj: rule.get(1).cloned().unwrap_or_default(),
+                })
+                .await
+                .context("append policy WAL")?;
+            }
         } else {
             report.duplicates += 1;
         }
@@ -69,6 +81,13 @@ pub async fn import_s3(
     for link in &dump.g {
         if enforcer.add_grouping_policy(link.clone()).await? {
             report.groups_added += 1;
+            if let Some(wal) = &wal {
+                wal.append(WalOp::PolicyAdd {
+                    obj: link.get(1).cloned().unwrap_or_default(),
+                })
+                .await
+                .context("append policy WAL")?;
+            }
         } else {
             report.duplicates += 1;
         }
@@ -97,6 +116,7 @@ pub async fn import(
 mod tests {
     use super::*;
     use crate::db::{build_test_store, build_test_store_new_session};
+    use crate::sync::wal::Wal;
     use std::sync::Arc;
 
     #[tokio::test]
@@ -115,7 +135,9 @@ mod tests {
             p: vec![vec!["admin".into(), "doc".into(), "read".into()]],
             g: vec![vec!["user-1".into(), "admin".into()]],
         };
-        import_s3(src_store, &dump).await?;
+        let wal = Wal::new(build_test_store("admin-test-wal").await);
+        import_s3(src_store, &dump, Some(wal.clone())).await?;
+        assert_eq!(wal.head().await?, 2);
 
         // Fresh handle, hence a new fencing session over the same prefix
         // (superseding the previous session via epoch fencing); the previous
@@ -126,13 +148,13 @@ mod tests {
 
         let dump: PolicyDump = serde_json::from_slice(&dump_bytes)?;
         let dst_store2 = build_test_store_new_session(shared.clone(), &dst_prefix).await;
-        let report = import_s3(dst_store2, &dump).await?;
+        let report = import_s3(dst_store2, &dump, None).await?;
         assert_eq!(report.rules_added, 1);
         assert_eq!(report.groups_added, 1);
 
         let dump: PolicyDump = serde_json::from_slice(&dump_bytes)?;
         let dst_store3 = build_test_store_new_session(shared, &dst_prefix).await;
-        let again = import_s3(dst_store3, &dump).await?;
+        let again = import_s3(dst_store3, &dump, None).await?;
         assert_eq!(again.rules_added, 0);
         assert_eq!(again.groups_added, 0);
         assert_eq!(again.duplicates, 2);
@@ -149,6 +171,6 @@ mod tests {
             p: vec![vec!["only-one-field".to_string()]],
             g: vec![],
         };
-        assert!(import_s3(store, &dump).await.is_err());
+        assert!(import_s3(store, &dump, None).await.is_err());
     }
 }

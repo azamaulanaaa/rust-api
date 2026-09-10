@@ -132,11 +132,17 @@ async fn main() -> anyhow::Result<()> {
                     &format!("{}/policy", cfg.database.prefix.trim_matches('/')),
                 )
                 .await?;
+                let wal_store = rust_api::db::build_s3_store(
+                    &s3_cfg,
+                    &format!("{}/wal", cfg.database.prefix.trim_matches('/')),
+                )
+                .await?;
+                let wal_for_import = rust_api::sync::wal::Wal::new(wal_store);
                 let bytes =
                     std::fs::read(&input).with_context(|| format!("read {}", input.display()))?;
                 let dump: rust_api::policy::admin::PolicyDump =
                     serde_json::from_slice(&bytes).context("parse policy dump")?;
-                let report = admin::import_s3(store, &dump).await?;
+                let report = admin::import_s3(store, &dump, Some(wal_for_import)).await?;
                 println!(
                     "imported {} rules and {} group memberships \
                      ({} duplicates skipped) into {}",
@@ -194,16 +200,20 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
     )
     .await
     .map_err(|e| anyhow::anyhow!("build fs OxKvStore: {e}"))?;
-    let policy_engine = PolicyEngine::init_s3(policy_store).await?;
+    let db_prefix = config.database.prefix.trim_matches('/').to_string();
+    let wal_store = rust_api::db::build_s3_store(&s3_client_config, &format!("{db_prefix}/wal"))
+        .await
+        .map_err(|e| anyhow::anyhow!("build wal OxKvStore: {e}"))?;
+    let wal = Wal::new(wal_store);
+    let policy_engine = PolicyEngine::init_s3(policy_store)
+        .await?
+        .with_wal(wal.clone());
     let setup_api_module = SetupApiModule::new(policy_engine.clone(), oidc_api_module.middleware());
     let policy_api_module =
         PolicyApiModule::new(policy_engine.clone(), oidc_api_module.middleware());
-    let fs_engine = FsEngine::init(
-        fs_s3_store.clone(),
-        &s3_client_config,
-        policy_engine.clone(),
-    )
-    .await?;
+    let fs_engine = FsEngine::init(fs_s3_store.clone(), &s3_client_config, policy_engine.clone())
+        .await?
+        .with_wal(wal.clone());
     // GC: expire abandoned multipart uploads every hour (24h TTL)
     rust_api::fs::gc::spawn(std::sync::Arc::new(fs_engine.clone()));
     let fs_api_module = FsApiModule::new(fs_engine, oidc_api_module.middleware());
@@ -211,10 +221,6 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
     // Per-user replica snapshots: master stays the write path, versioned
     // `{prefix}/u/{sub}/{seq}` prefixes are filtered read replicas served
     // over `/sync/db/` for oxkv readers (see `sync::snapshot`).
-    let db_prefix = config.database.prefix.trim_matches('/').to_string();
-    let wal_store = rust_api::db::build_s3_store(&s3_client_config, &format!("{db_prefix}/wal"))
-        .await
-        .map_err(|e| anyhow::anyhow!("build wal OxKvStore: {e}"))?;
     let replica_objects: Arc<dyn object_store::ObjectStore> = Arc::new(
         rust_api::fs::object_store::s3_builder(&s3_client_config)
             .build()
@@ -224,7 +230,7 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("build snapshot S3 client: {e}"))?;
     let snapshot_manager = SnapshotManager::new(
-        Wal::new(wal_store),
+        wal.clone(),
         FsStore::new(fs_s3_store.clone()),
         policy_engine.clone(),
         snapshot_s3,
