@@ -296,6 +296,24 @@ impl FsEngine {
             checksums: vec![None; req.file_total_parts as usize],
         };
         self.store.save_session(&session).await?;
+        // Persist S3-side state with the session: after a restart the
+        // client RAM map is empty and only this record can rehydrate
+        // (or abort) the backend upload.
+        if let Some(upload_id) = session.s3_upload_id.as_deref() {
+            let s3_upload_id = self.s3.backend_upload_id(upload_id).await.ok_or_else(|| {
+                FsError::Internal("multipart created but backend id missing".into())
+            })?;
+            self.store
+                .save_multipart(&crate::fs::store::PersistedMultipart {
+                    upload_id: upload_id.to_string(),
+                    bucket: self.bucket.clone(),
+                    key: session.s3_key.clone(),
+                    s3_upload_id,
+                    parts: std::collections::BTreeMap::new(),
+                    created_at: session.created_at,
+                })
+                .await?;
+        }
         Ok(file_id)
     }
 
@@ -396,6 +414,7 @@ impl FsEngine {
             .s3_upload_id
             .clone()
             .ok_or_else(|| FsError::Internal("missing s3 upload id".into()))?;
+        self.ensure_multipart(&upload_id).await?;
         let part_number = (part_index + 1) as i32;
         let etag = self
             .s3
@@ -408,13 +427,86 @@ impl FsEngine {
                 checksum_sha256.clone(),
             )
             .await?;
-        session.etags[part_index as usize] = Some(etag);
+        session.etags[part_index as usize] = Some(etag.clone());
         if session.checksums.len() != session.etags.len() {
             session.checksums.resize(session.etags.len(), None);
         }
         session.checksums[part_index as usize] = checksum_sha256;
         self.store.save_session(&session).await?;
+        // Mirror staged content ids into the durable record so a
+        // restarted client can still complete this upload.
+        if let Some(mut record) = self.store.load_multipart(&upload_id).await? {
+            record.parts.insert(part_index as usize, etag);
+            self.store.save_multipart(&record).await?;
+        }
         Ok(())
+    }
+
+    /// Rehydrates client-side multipart state from the durable record.
+    ///
+    /// Sessions predating persistence (or a crashed init between the
+    /// session write and the record write) have no record: their
+    /// backend upload is unaddressable, so callers get a clear restart
+    /// signal instead of an opaque `unknown upload_id`.
+    async fn ensure_multipart(&self, upload_id: &str) -> Result<(), FsError> {
+        let Some(record) = self.store.load_multipart(upload_id).await? else {
+            return Err(FsError::BadRequest(
+                "multipart state unavailable (restarted server or expired session); start a new upload"
+                    .into(),
+            ));
+        };
+        self.s3.restore_multipart(&record).await
+    }
+
+    /// Aborts the S3 side of an expired/abandoned session.
+    ///
+    /// `NotFound` from S3 means already gone (aborted, completed, or a
+    /// fresh InMemory backend after restart): success for GC purposes.
+    /// Any other failure propagates so the session is retained for
+    /// retry instead of leaking staged bytes no record points at.
+    pub(crate) async fn abort_session_upload(
+        &self,
+        session: &UploadSession,
+    ) -> Result<(), FsError> {
+        let Some(upload_id) = session.s3_upload_id.as_deref() else {
+            return self
+                .s3
+                .delete_object(&self.bucket, &session.s3_key)
+                .await
+                .map_err(|e| {
+                    tracing::warn!("gc delete {} failed: {e}", session.id);
+                    e
+                });
+        };
+        if self.store.load_multipart(upload_id).await?.is_none() {
+            // Predates persistence: backend unaddressable, staged parts
+            // unreachable. Warn loudly, let the session go (a future
+            // sweeper with S3 multipart listing could reclaim these).
+            tracing::warn!(
+                "gc expiring {} has no multipart record; staged S3 parts may leak",
+                session.id
+            );
+            return Ok(());
+        }
+        self.ensure_multipart(upload_id).await.map_err(|e| {
+            tracing::warn!("gc restore {} failed: {e}", session.id);
+            e
+        })?;
+        match self
+            .s3
+            .abort_multipart_upload(&self.bucket, &session.s3_key, upload_id)
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(FsError::NotFound(_)) => {
+                tracing::debug!("gc abort {} already gone", session.id);
+                Ok(())
+            }
+            Err(e) => {
+                tracing::warn!("gc abort {} failed: {e}", session.id);
+                Err(e)
+            }
+        }
     }
 
     /// Finalizes an upload session; only the owner may complete.
@@ -454,9 +546,13 @@ impl FsEngine {
                 .s3_upload_id
                 .as_deref()
                 .ok_or_else(|| FsError::Internal("missing s3 upload id".into()))?;
+            self.ensure_multipart(upload_id).await?;
             self.s3
                 .complete_multipart_upload(&self.bucket, &session.s3_key, upload_id, etags)
                 .await?;
+            // Drop the durable record with the completed upload (the
+            // session delete below cascades as a backstop).
+            self.store.delete_multipart(upload_id).await?;
         }
         let record = FileRecord {
             id: file_id.to_string(),
@@ -476,6 +572,11 @@ impl FsEngine {
     }
 
     /// Aborts a multipart upload; only the owner may cancel.
+    ///
+    /// S3 abort runs before the session is deleted, and a failed abort
+    /// (other than already-gone) fails the cancel: the session stays
+    /// so GC retries instead of leaking staged parts no record
+    /// points at.
     #[tracing::instrument(skip(self), fields(file_id = %file_id, caller_sub = %caller_sub), err)]
     pub async fn cancel_upload(&self, file_id: &str, caller_sub: &str) -> Result<(), FsError> {
         let session = self
@@ -486,11 +587,8 @@ impl FsEngine {
         if session.owner_sub != caller_sub {
             return Err(FsError::Forbidden);
         }
-        if let Some(upload_id) = session.s3_upload_id {
-            let _ = self
-                .s3
-                .abort_multipart_upload(&self.bucket, &session.s3_key, &upload_id)
-                .await;
+        if session.s3_upload_id.is_some() {
+            self.abort_session_upload(&session).await?;
         }
         self.store.delete_session(file_id).await?;
         Ok(())
