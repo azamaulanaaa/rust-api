@@ -67,6 +67,24 @@ pub trait S3Client: Send + Sync {
         upload_id: &str,
     ) -> Result<(), FsError>;
 
+    /// Returns the backend (S3-side) upload id for an engine-side alias,
+    /// when the client tracks one (used to persist resumable state).
+    /// Defaults to `None` for stateless test doubles.
+    async fn backend_upload_id(&self, upload_id: &str) -> Option<String> {
+        let _ = upload_id;
+        None
+    }
+
+    /// Rehydrates in-RAM multipart state from a persisted record after a
+    /// restart. Defaults to a no-op for stateless test doubles.
+    async fn restore_multipart(
+        &self,
+        record: &crate::fs::store::PersistedMultipart,
+    ) -> Result<(), FsError> {
+        let _ = record;
+        Ok(())
+    }
+
     /// Single-part put (used when `total_parts == 1`).
     async fn put_object(
         &self,
