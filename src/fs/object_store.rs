@@ -230,8 +230,51 @@ impl S3Client for ObjectStoreClient {
             return Err(FsError::Internal("bucket/key mismatch".into()));
         }
         if let Some(state) = states.remove(upload_id) {
-            let _ = self.multipart.abort_multipart(&state.path, &state.id).await;
+            // Propagate: the engine retries (restored from the persisted
+            // record), and GC retains the session until S3 confirms.
+            self.multipart.abort_multipart(&state.path, &state.id).await.map_err(Self::map_err)?;
         }
+        Ok(())
+    }
+
+    async fn backend_upload_id(&self, upload_id: &str) -> Option<String> {
+        let states = self.states.lock().await;
+        states.get(upload_id).map(|s| s.id.clone())
+    }
+
+    async fn restore_multipart(
+        &self,
+        record: &crate::fs::store::PersistedMultipart,
+    ) -> Result<(), FsError> {
+        use object_store::multipart::PartId;
+
+        if record.bucket.is_empty() || record.key.is_empty() {
+            return Err(FsError::Internal("multipart record missing bucket/key".into()));
+        }
+        let path = self.path(&record.bucket, &record.key);
+        let parts = record
+            .parts
+            .iter()
+            .map(|(idx, content_id)| {
+                (
+                    *idx,
+                    PartId {
+                        content_id: content_id.clone(),
+                    },
+                )
+            })
+            .collect();
+        let mut states = self.states.lock().await;
+        states.insert(
+            record.upload_id.clone(),
+            MultipartState {
+                bucket: record.bucket.clone(),
+                key: record.key.clone(),
+                path,
+                id: record.s3_upload_id.clone(),
+                parts,
+            },
+        );
         Ok(())
     }
 
