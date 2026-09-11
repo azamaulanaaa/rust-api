@@ -37,6 +37,30 @@ pub struct UploadSession {
     pub checksums: Vec<Option<String>>,
 }
 
+/// Durable S3-side multipart state: mirrors the client RAM map so
+/// uploads survive restarts. The object-store `MultipartId` is a plain
+/// string and staged `PartId`s rebuild from their content ids, so a
+/// fresh client rehydrates purely from this record (see
+/// `S3Client::restore_multipart`). Records live and die with their
+/// session: created at init, updated per part, deleted on
+/// complete/cancel/expiry via `delete_session` cascade.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedMultipart {
+    /// Engine-side alias (`ostore-…`, what sessions reference).
+    pub upload_id: String,
+    /// Bucket the S3 multipart targets.
+    pub bucket: String,
+    /// Key the S3 multipart targets.
+    pub key: String,
+    /// Backend upload id (real S3 `UploadId`).
+    pub s3_upload_id: String,
+    /// Part index (0-based) → staged content id.
+    #[serde(default)]
+    pub parts: std::collections::BTreeMap<usize, String>,
+    /// Creation timestamp (unix secs) for age tracking.
+    pub created_at: i64,
+}
+
 /// Persisted file record after `CompleteUpload`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileRecord {
@@ -157,6 +181,9 @@ impl FsStore {
     fn staged_key(id: &str, idx: u64) -> String {
         format!("fs:uploads:{id}:part:{idx}")
     }
+    fn multipart_key(upload_id: &str) -> String {
+        format!("fs:mp:{upload_id}")
+    }
     fn file_key(id: &str) -> String {
         format!("fs:files:{id}:meta")
     }
@@ -196,8 +223,48 @@ impl FsStore {
                     let k = Self::staged_key(id, idx);
                     let _ = g.delete(&k).await;
                 }
+                // Cascade: the multipart record lives and dies with its
+                // session, so expiry/GC can never strand one.
+                if let Some(upload_id) = s.s3_upload_id {
+                    let _ = g.delete(&Self::multipart_key(&upload_id)).await;
+                }
             }
         }
+        Ok(())
+    }
+
+    /// Persists S3-side multipart state (created at init, updated per part).
+    pub async fn save_multipart(&self, m: &PersistedMultipart) -> Result<(), FsError> {
+        let key = Self::multipart_key(&m.upload_id);
+        let val = serde_json::to_vec(m).map_err(|e| FsError::Internal(e.to_string()))?;
+        let g = self.inner.write().await;
+        g.set_bytes(&key, &val)
+            .await
+            .map_err(|e| FsError::Store(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Loads persisted multipart state by engine-side upload id.
+    pub async fn load_multipart(
+        &self,
+        upload_id: &str,
+    ) -> Result<Option<PersistedMultipart>, FsError> {
+        let key = Self::multipart_key(upload_id);
+        let Some(bytes) = self.get_one(&key).await? else {
+            return Ok(None);
+        };
+        let m =
+            serde_json::from_slice(&bytes).map_err(|e| FsError::Internal(e.to_string()))?;
+        Ok(Some(m))
+    }
+
+    /// Deletes a persisted multipart record (complete/cancel path).
+    pub async fn delete_multipart(&self, upload_id: &str) -> Result<(), FsError> {
+        let key = Self::multipart_key(upload_id);
+        let g = self.inner.write().await;
+        g.delete(&key)
+            .await
+            .map_err(|e| FsError::Store(e.to_string()))?;
         Ok(())
     }
 
@@ -437,7 +504,7 @@ fn prefix_scan_end(prefix: &str) -> String {
 
 #[cfg(test)]
 mod store_tests {
-    use super::{FileRecord, FsStore, UploadSession};
+    use super::{FileRecord, FsStore, PersistedMultipart, UploadSession};
     use crate::db::build_test_store;
 
     async fn test_store() -> FsStore {
@@ -466,6 +533,35 @@ mod store_tests {
             etags: vec![None],
             checksums: vec![None],
         }
+    }
+
+    fn sample_multipart(upload_id: &str) -> PersistedMultipart {
+        PersistedMultipart {
+            upload_id: upload_id.to_string(),
+            bucket: "b".to_string(),
+            key: "files/f".to_string(),
+            s3_upload_id: "real-backend-id".to_string(),
+            parts: [(0usize, "etag-0".to_string())].into_iter().collect(),
+            created_at: chrono::Utc::now().timestamp(),
+        }
+    }
+
+    #[tokio::test]
+    async fn multipart_record_roundtrip_and_session_cascade() -> anyhow::Result<()> {
+        let store = test_store().await;
+        assert!(store.load_multipart("up-1").await?.is_none());
+        store.save_multipart(&sample_multipart("up-1")).await?;
+        let loaded = store.load_multipart("up-1").await?.expect("should exist");
+        assert_eq!(loaded.s3_upload_id, "real-backend-id");
+        assert_eq!(loaded.parts.get(&0).map(String::as_str), Some("etag-0"));
+        // The record lives and dies with its session.
+        let mut sess = sample_session("sess-mp");
+        sess.s3_upload_id = Some("up-1".to_string());
+        store.save_session(&sess).await?;
+        store.delete_session("sess-mp").await?;
+        assert!(store.load_multipart("up-1").await?.is_none());
+        store.delete_multipart("up-1").await?;
+        Ok(())
     }
 
     #[tokio::test]
