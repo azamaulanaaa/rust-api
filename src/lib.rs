@@ -20,13 +20,12 @@ pub mod http;
 /// authorization-code flow with PKCE, CSRF state, and nonce validation.
 pub mod oidc;
 
-/// Casbin RBAC policy engine backed by Postgres, with management routes
-/// for permission rules and group membership.
+/// Casbin RBAC policy engine backed by prefix-scoped OxKV stores on S3,
+/// with management routes for permission rules and group membership.
 pub mod policy;
 
 /// Object-store file storage via `object_store` (AmazonS3 for S3/MinIO/R2,
-/// InMemory for tests) with chunked upload, mirroring the IndexedDB
-/// worker FS API (`src/worker/fs/index.ts`) over REST.
+/// InMemory for tests) with multipart upload over REST.
 pub mod fs;
 
 /// OpenAPI specification composed from all `utoipa::path` modules.
