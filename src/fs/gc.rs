@@ -52,30 +52,10 @@ pub async fn sweep_once(engine: &FsEngine) -> Result<usize, crate::fs::error::Fs
             s.id,
             now - s.created_at
         );
-        // S3 first: on failure the session is kept so the next sweep
-        // retries instead of leaking bytes no record points at.
-        let s3_ok = if let Some(upload_id) = s.s3_upload_id.as_deref() {
-            engine
-                .s3
-                .abort_multipart_upload(&engine.bucket, &s.s3_key, upload_id)
-                .await
-                .map_err(|e| {
-                    tracing::warn!("gc abort {} failed: {e}", s.id);
-                    e
-                })
-                .is_ok()
-        } else {
-            engine
-                .s3
-                .delete_object(&engine.bucket, &s.s3_key)
-                .await
-                .map_err(|e| {
-                    tracing::warn!("gc delete {} failed: {e}", s.id);
-                    e
-                })
-                .is_ok()
-        };
-        if !s3_ok {
+        // S3 first via the engine (restores post-restart state, tolerates
+        // already-gone): on failure the session is kept so the next
+        // sweep retries instead of leaking bytes no record points at.
+        if engine.abort_session_upload(s).await.is_err() {
             tracing::warn!("fs gc keeping upload {} for retry", s.id);
             continue;
         }
@@ -180,7 +160,7 @@ mod tests {
     use crate::fs::error::FsError;
     use crate::fs::object_store::ObjectStoreClient;
     use crate::fs::s3::S3Client;
-    use crate::fs::store::{FileRecord, FsStore, UploadSession};
+    use crate::fs::store::{FileRecord, FsStore, PersistedMultipart, UploadSession};
     use crate::policy::PolicyEngine;
     use bytes::Bytes;
 
@@ -483,6 +463,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sweep_reaps_restarted_multipart_session() -> anyhow::Result<()> {
+        use object_store::memory::InMemory;
+
+        // One backend surviving the "restart"; client RAM does not (S3
+        // buckets outlive process restarts, so the backend upload id
+        // stays addressable while the pre-restart RAM map is gone).
+        let inner = std::sync::Arc::new(InMemory::new());
+        let prefix = {
+            use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+            format!(
+                "test-gc-restart-{}-{}",
+                std::process::id(),
+                URL_SAFE_NO_PAD.encode(rand::random::<[u8; 6]>())
+            )
+        };
+        let store = FsStore::new(build_test_store(&prefix).await);
+        let policy =
+            PolicyEngine::init_s3(build_test_store(&format!("{prefix}-policy")).await).await?;
+        let pre: std::sync::Arc<dyn S3Client> =
+            std::sync::Arc::new(ObjectStoreClient::new_combined(inner.clone()));
+        let engine_pre =
+            FsEngine::from_parts(store.clone(), pre, "test-bucket".into(), policy.clone());
+        // Real multipart upload: backend id + durable record exist.
+        let file_id = engine_pre
+            .init_upload(
+                crate::fs::model::InitRequest {
+                    file_size: 2048,
+                    part_size: 1024,
+                    file_total_parts: 2,
+                },
+                "alice",
+            )
+            .await?;
+        // Age it past the TTL.
+        let mut sess = engine_pre
+            .store
+            .get_session(&file_id)
+            .await?
+            .expect("session exists");
+        let upload_id = sess.s3_upload_id.clone().expect("multipart session");
+        sess.created_at -= TTL_SECS + 100;
+        engine_pre.store.save_session(&sess).await?;
+        drop(engine_pre); // restart: RAM multipart states gone.
+        let post: std::sync::Arc<dyn S3Client> =
+            std::sync::Arc::new(ObjectStoreClient::new_combined(inner));
+        let engine_post = FsEngine::from_parts(store, post, "test-bucket".into(), policy);
+        // GC restores the backend upload from the record, aborts it for
+        // real, and converges the session plus its record.
+        assert_eq!(sweep_once(&engine_post).await?, 1);
+        assert!(engine_post.store.get_session(&file_id).await?.is_none());
+        assert!(engine_post.store.load_multipart(&upload_id).await?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn sweep_empty_store_returns_zero() -> anyhow::Result<()> {
         let engine = make_engine().await;
         assert_eq!(sweep_once(&engine).await?, 0);
@@ -569,6 +604,19 @@ mod tests {
         engine
             .store
             .save_session(&session_with_age("old-fail", TTL_SECS + 10, true))
+            .await?;
+        // Durable record present so expiry reaches the S3 abort (which
+        // fails) instead of taking the no-record early return.
+        engine
+            .store
+            .save_multipart(&PersistedMultipart {
+                upload_id: "upload-old-fail".into(),
+                bucket: "b".into(),
+                key: "files/old-fail".into(),
+                s3_upload_id: "real-fail".into(),
+                parts: Default::default(),
+                created_at: chrono::Utc::now().timestamp() - TTL_SECS - 10,
+            })
             .await?;
         engine
             .store
