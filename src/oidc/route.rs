@@ -3,13 +3,14 @@ use std::sync::Arc;
 use actix_web::{
     HttpRequest, HttpResponse, Responder,
     cookie::{Cookie, SameSite, time::Duration},
-    get, web,
+    get, post, web,
 };
 use openidconnect::{Nonce, PkceCodeVerifier};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use super::{OidcClient, OidcError};
 use crate::http::{ApiModule, middleware};
+use crate::http::middleware::jwt::{Audience, Validated};
 
 /// API module exposing `/auth/login` and `/auth/callback`, and owning the
 /// JWT validation middleware configured from the discovered provider.
@@ -53,18 +54,99 @@ where
 
 impl<C> ApiModule for OidcApiModule<C>
 where
-    C: DeserializeOwned + Send + Sync + 'static,
+    C: DeserializeOwned + Clone + Send + Sync + 'static,
 {
     fn configure(&self, cfg: &mut web::ServiceConfig) {
         let oidc_client = web::Data::from(self.oidc_client.clone());
 
+        // JWT wrap is safe for public routes: requests without any token
+        // pass through unmodified, while `/auth/me` gets validated claims.
         let scope = web::scope("/auth")
             .app_data(oidc_client)
+            .wrap(self.jwt_middleware.clone())
             .service(login)
-            .service(callback);
+            .service(callback)
+            .service(logout);
 
         cfg.service(scope);
     }
+}
+
+/// API module exposing the authenticated session probe.
+///
+/// Split from [`OidcApiModule`] (which is generic over the claims type `C`)
+/// so `/auth/me` always serves the concrete [`Claims`] shape the SPA
+/// codegen depends on, regardless of how the host app types its own claims.
+pub struct OidcSessionModule {
+    jwt: middleware::jwt::JwtClaimsMiddleware<middleware::jwt::Claims>,
+}
+
+impl OidcSessionModule {
+    /// Creates the module from the shared JWT middleware.
+    pub fn new(
+        jwt: middleware::jwt::JwtClaimsMiddleware<middleware::jwt::Claims>,
+    ) -> Self {
+        Self { jwt }
+    }
+}
+
+impl ApiModule for OidcSessionModule {
+    fn configure(&self, cfg: &mut web::ServiceConfig) {
+        cfg.service(
+            web::scope("/auth")
+                .wrap(self.jwt.clone())
+                .service(me),
+        );
+    }
+}
+
+/// Authenticated session probe returned by `GET /auth/me`.
+#[derive(Serialize, Deserialize, utoipa::ToSchema)]
+pub struct MeResponse {
+    /// Stable user identifier (`sub` claim).
+    pub sub: String,
+    /// Issuer that minted the token (`iss` claim).
+    pub iss: String,
+    /// Audience(s) the token was issued for.
+    pub aud: Vec<String>,
+    /// Expiration time (unix seconds).
+    pub exp: u64,
+}
+
+/// Returns the caller's session (`401` without valid credentials).
+///
+/// SPA entry point: TanStack guards and the worker poll this instead of
+/// decoding the JWT themselves, so claim-shape drift breaks codegen rather
+/// than silently mis-authorizing.
+#[utoipa::path(get, path = "/auth/me", tag = "auth", responses((status = 200, body = MeResponse), (status = 401, body = crate::http::error::ErrorBody)))]
+#[get("/me")]
+pub async fn me(claims: Validated<middleware::jwt::Claims>) -> impl Responder {
+    let aud = match &claims.aud {
+        Audience::Single(s) => vec![s.clone()],
+        Audience::Multi(v) => v.clone(),
+    };
+    HttpResponse::Ok().json(MeResponse {
+        sub: claims.sub.clone(),
+        iss: claims.iss.clone(),
+        aud,
+        exp: claims.exp,
+    })
+}
+
+/// Clears the `auth_token` session cookie (always `204`, even anonymous).
+///
+/// `POST` (not `GET`) so prefetchers and CSRF-prone links cannot log the
+/// user out; the cleared cookie mirrors the login `Secure`/`SameSite` flags
+/// so browsers actually drop it.
+#[utoipa::path(post, path = "/auth/logout", tag = "auth", responses((status = 204, description = "logged out")))]
+#[post("/logout")]
+pub async fn logout(oidc_client: web::Data<OidcClient>) -> impl Responder {
+    HttpResponse::NoContent()
+        .cookie(clear_cookie(
+            "auth_token".to_string(),
+            oidc_client.secure_cookies(),
+        ))
+        .finish()
 }
 
 #[get("/login")]
@@ -504,6 +586,86 @@ mod tests {
 
         assert_eq!(auth_cookie, body.token.as_deref().unwrap_or_default());
         Ok(())
+    }
+
+    /// Signs a session JWT the module's JWKS middleware accepts.
+    fn session_token(
+        fx: &Fixture,
+        sub: &str,
+        issuer: &str,
+    ) -> anyhow::Result<String> {
+        let mut header = Header::new(jsonwebtoken::Algorithm::RS256);
+        header.kid = Some("test-key-id".to_string());
+        encode(
+            &header,
+            &json!({
+                "iss": issuer,
+                "sub": sub,
+                "aud": CLIENT_ID,
+                "exp": 2_000_000_000i64,
+                "iat": 1_000_000_000i64,
+            }),
+            &fx.encoding_key,
+        )
+        .map_err(anyhow::Error::from)
+    }
+
+    #[tokio::test]
+    async fn me_returns_session_for_valid_cookie() -> anyhow::Result<()> {
+        use crate::http::middleware::jwt::{Claims, JwtClaimsMiddleware};
+
+        let fx = Fixture::new().await?;
+        let mw = JwtClaimsMiddleware::<Claims>::new_with_jks(
+            &format!("{}/jwks", fx.server.uri()),
+            CLIENT_ID,
+            &fx.server.uri(),
+        )
+        .await?;
+        let module = OidcSessionModule::new(mw);
+        let svc = test::init_service(
+            actix_web::App::new().configure(|cfg| ApiModule::configure(&module, cfg)),
+        )
+        .await;
+
+        let token = session_token(&fx, "alice", &fx.server.uri())?;
+        let res = test::call_service(
+            &svc,
+            test::TestRequest::get()
+                .uri("/auth/me")
+                .insert_header(("Cookie", format!("auth_token={token}")))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), 200);
+        let body: MeResponse = serde_json::from_slice(&test::read_body(res).await)?;
+        assert_eq!(body.sub, "alice");
+        assert_eq!(body.iss, fx.server.uri());
+        assert_eq!(body.aud, vec![CLIENT_ID.to_string()]);
+
+        // Anonymous probe is 401, never 500.
+        let res = test::call_service(&svc, test::TestRequest::get().uri("/auth/me").to_request())
+            .await;
+        assert_eq!(res.status(), 401);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn logout_clears_session_cookie() {
+        let fx = Fixture::new().await.unwrap();
+        let svc = test_app!(fx);
+
+        let res = test::call_service(
+            &svc,
+            test::TestRequest::post().uri("/auth/logout").to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), 204);
+        let cookie = res
+            .response()
+            .cookies()
+            .find(|c| c.name() == "auth_token")
+            .expect("logout must clear auth_token");
+        assert_eq!(cookie.max_age(), Some(Duration::ZERO));
     }
 
     #[tokio::test]
