@@ -439,6 +439,22 @@ impl PolicyEngine {
         }
     }
 
+    /// Returns `(obj, act)` pairs granted to `sub` by `p` rules.
+    ///
+    /// Used by incremental replica replay to find rows a group membership
+    /// change can affect, without scanning the whole policy.
+    pub async fn rules_for_subject(&self, sub: &str) -> Vec<(String, String)> {
+        let ef = self.enforcer.read().await;
+        ef.get_filtered_policy(0, vec![sub.to_string()])
+            .into_iter()
+            .filter_map(|r| {
+                let obj = r.get(1)?.clone();
+                let act = r.get(2)?.clone();
+                Some((obj, act))
+            })
+            .collect()
+    }
+
     /// Returns a list of all users that belong to a specific group
     pub async fn get_users_in_group(&self, group: &str) -> Vec<String> {
         let ef = self.enforcer.read().await;

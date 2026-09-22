@@ -115,9 +115,10 @@ async fn status_handler(
 /// Advances the replica for `sub` toward the WAL head and returns the pointer.
 ///
 /// Fresh pointers (`applied >= head`) return without touching storage
-/// beyond the marker read. Otherwise small file/relation deltas replay and
-/// anything else falls back to a full rebuild; a lost fencing race adopts
-/// the winner's pointer instead of failing.
+/// beyond the marker read. Otherwise small file/relation deltas and rich
+/// rule/group ops replay (irrelevant users/objects skip); legacy policy
+/// marks and oversized ranges fall back to a full rebuild. A lost fencing
+/// race adopts the winner's pointer instead of failing.
 #[post("/sync")]
 async fn sync_handler(
     manager: web::Data<SnapshotManager>,
