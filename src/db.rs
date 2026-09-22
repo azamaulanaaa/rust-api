@@ -78,10 +78,7 @@ pub async fn build_test_store(prefix: &str) -> OxKvStore {
 /// handle — adequate for single-threaded test reopen flows where the old
 /// handle is dropped first, not a model for production sharing.
 #[allow(clippy::expect_used)]
-pub async fn build_test_store_new_session(
-    inner: Arc<dyn ObjectStore>,
-    prefix: &str,
-) -> OxKvStore {
+pub async fn build_test_store_new_session(inner: Arc<dyn ObjectStore>, prefix: &str) -> OxKvStore {
     OxKvStore::builder()
         .with_object_store(inner)
         .with_prefix(ObjectPath::from(prefix))

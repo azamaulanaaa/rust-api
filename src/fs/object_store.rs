@@ -232,7 +232,10 @@ impl S3Client for ObjectStoreClient {
         if let Some(state) = states.remove(upload_id) {
             // Propagate: the engine retries (restored from the persisted
             // record), and GC retains the session until S3 confirms.
-            self.multipart.abort_multipart(&state.path, &state.id).await.map_err(Self::map_err)?;
+            self.multipart
+                .abort_multipart(&state.path, &state.id)
+                .await
+                .map_err(Self::map_err)?;
         }
         Ok(())
     }
@@ -249,7 +252,9 @@ impl S3Client for ObjectStoreClient {
         use object_store::multipart::PartId;
 
         if record.bucket.is_empty() || record.key.is_empty() {
-            return Err(FsError::Internal("multipart record missing bucket/key".into()));
+            return Err(FsError::Internal(
+                "multipart record missing bucket/key".into(),
+            ));
         }
         let path = self.path(&record.bucket, &record.key);
         let parts = record
@@ -351,7 +356,11 @@ impl S3Client for ObjectStoreClient {
             range: Some(object_store::GetRange::Bounded(range)),
             ..Default::default()
         };
-        let res = self.store.get_opts(&path, opts).await.map_err(Self::map_err)?;
+        let res = self
+            .store
+            .get_opts(&path, opts)
+            .await
+            .map_err(Self::map_err)?;
         let total = res.meta.size;
         let size = res.range.end.saturating_sub(res.range.start);
         let stream = res.into_stream().map_err(Self::map_err);

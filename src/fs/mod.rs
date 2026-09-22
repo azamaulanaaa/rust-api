@@ -203,13 +203,12 @@ impl FsEngine {
             return Err(FsError::NotFound("file not found".into()));
         }
         let count = self.store.attach(row_type, row_id, file_id).await?;
-        self
-            .append_wal(WalOp::Attach {
-                row_type: row_type.to_string(),
-                row_id: row_id.to_string(),
-                file_id: file_id.to_string(),
-            })
-            .await?;
+        self.append_wal(WalOp::Attach {
+            row_type: row_type.to_string(),
+            row_id: row_id.to_string(),
+            file_id: file_id.to_string(),
+        })
+        .await?;
         Ok(count)
     }
 
@@ -229,13 +228,12 @@ impl FsEngine {
                 other => FsError::Internal(other.to_string()),
             })?;
         let count = self.store.detach(row_type, row_id, file_id).await?;
-        self
-            .append_wal(WalOp::Detach {
-                row_type: row_type.to_string(),
-                row_id: row_id.to_string(),
-                file_id: file_id.to_string(),
-            })
-            .await?;
+        self.append_wal(WalOp::Detach {
+            row_type: row_type.to_string(),
+            row_id: row_id.to_string(),
+            file_id: file_id.to_string(),
+        })
+        .await?;
         Ok(count)
     }
 
@@ -373,9 +371,9 @@ impl FsEngine {
         // Absolute ceiling mirrors the HTTP payload cap: the old `Bytes`
         // extractor rejected anything past it, and part sizes above it
         // were never uploadable.
-        let ceiling =
-            expected.min(crate::http::MAX_PAYLOAD_BYTES as u64) + 1;
-        let mut buf = Vec::with_capacity(expected.min(crate::http::MAX_PAYLOAD_BYTES as u64) as usize);
+        let ceiling = expected.min(crate::http::MAX_PAYLOAD_BYTES as u64) + 1;
+        let mut buf =
+            Vec::with_capacity(expected.min(crate::http::MAX_PAYLOAD_BYTES as u64) as usize);
         let mut total = 0u64;
         let mut stream = std::pin::pin!(body);
         while let Some(chunk) = stream.next().await {
@@ -565,9 +563,7 @@ impl FsEngine {
         };
         self.store.save_file(&record).await?;
         self.store.delete_session(file_id).await?;
-        self
-            .append_wal(WalOp::FileCreate { rec: record })
-            .await?;
+        self.append_wal(WalOp::FileCreate { rec: record }).await?;
         Ok(())
     }
 
@@ -640,11 +636,10 @@ impl FsEngine {
         }
         self.store.delete_file(file_id).await?;
         self.s3.delete_object(&self.bucket, &rec.s3_key).await?;
-        self
-            .append_wal(WalOp::FileDelete {
-                file_id: file_id.to_string(),
-            })
-            .await?;
+        self.append_wal(WalOp::FileDelete {
+            file_id: file_id.to_string(),
+        })
+        .await?;
         // clean refs key if orphan
         Ok(())
     }
@@ -668,10 +663,7 @@ impl FsEngine {
             .get_file(file_id)
             .await?
             .ok_or_else(|| FsError::NotFound("file not found".into()))?;
-        let body = self
-            .s3
-            .get_object_stream(&self.bucket, &rec.s3_key)
-            .await?;
+        let body = self.s3.get_object_stream(&self.bucket, &rec.s3_key).await?;
         Ok((rec, body))
     }
 
@@ -897,9 +889,8 @@ mod tests {
         let id = engine.init_upload(valid_single(), "alice").await?;
         // Unbounded 1 KiB chunks against a 1 KiB part: the intake must
         // 413 after the second chunk, not buffer forever.
-        let flood = futures_util::stream::repeat_with(|| {
-            Ok::<_, FsError>(Bytes::from(vec![0u8; 1024]))
-        });
+        let flood =
+            futures_util::stream::repeat_with(|| Ok::<_, FsError>(Bytes::from(vec![0u8; 1024])));
         let err = engine
             .upload_part(&id, 0, flood, None, None, "alice")
             .await
@@ -937,7 +928,14 @@ mod tests {
         assert!(!polled.load(Ordering::SeqCst));
         // Declared larger than expected is 413, not 400.
         let err = engine
-            .upload_part(&id, 0, once_body(vec![1u8; 1024]), Some(2048), None, "alice")
+            .upload_part(
+                &id,
+                0,
+                once_body(vec![1u8; 1024]),
+                Some(2048),
+                None,
+                "alice",
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, FsError::PayloadTooLarge));

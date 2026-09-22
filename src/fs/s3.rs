@@ -14,8 +14,7 @@ use crate::fs::error::FsError;
 
 /// Streaming download body: object chunks that never materialize the whole
 /// file in memory at once.
-pub type ByteStream =
-    Pin<Box<dyn futures_util::Stream<Item = Result<Bytes, FsError>> + Send>>;
+pub type ByteStream = Pin<Box<dyn futures_util::Stream<Item = Result<Bytes, FsError>> + Send>>;
 
 /// A streaming object body with its lengths.
 pub struct ObjectStream {

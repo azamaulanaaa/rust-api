@@ -342,12 +342,24 @@ mod tests {
         // Fresh stray bytes (e.g. crash between put and metadata write).
         engine
             .s3
-            .put_object("test-bucket", "files/stray", Bytes::from_static(b"x"), None, None)
+            .put_object(
+                "test-bucket",
+                "files/stray",
+                Bytes::from_static(b"x"),
+                None,
+                None,
+            )
             .await?;
 
         assert_eq!(sweep_once(&engine).await?, 0);
         assert!(engine.store.get_session(&file_id).await?.is_some());
-        assert!(engine.s3.get_object("test-bucket", "files/stray").await.is_ok());
+        assert!(
+            engine
+                .s3
+                .get_object("test-bucket", "files/stray")
+                .await
+                .is_ok()
+        );
         Ok(())
     }
 
@@ -411,7 +423,10 @@ mod tests {
                 Err(FsError::NotFound("no".into()))
             }
             async fn delete_object(&self, _: &str, key: &str) -> Result<(), FsError> {
-                self.deleted.lock().expect("delete log").push(key.to_string());
+                self.deleted
+                    .lock()
+                    .expect("delete log")
+                    .push(key.to_string());
                 Ok(())
             }
             async fn list_keys(&self, _: &str, _: &str) -> Result<Vec<ListedKey>, FsError> {
@@ -513,7 +528,13 @@ mod tests {
         // real, and converges the session plus its record.
         assert_eq!(sweep_once(&engine_post).await?, 1);
         assert!(engine_post.store.get_session(&file_id).await?.is_none());
-        assert!(engine_post.store.load_multipart(&upload_id).await?.is_none());
+        assert!(
+            engine_post
+                .store
+                .load_multipart(&upload_id)
+                .await?
+                .is_none()
+        );
         Ok(())
     }
 

@@ -9,8 +9,8 @@ use openidconnect::{Nonce, PkceCodeVerifier};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use super::{OidcClient, OidcError};
-use crate::http::{ApiModule, middleware};
 use crate::http::middleware::jwt::{Audience, Validated};
+use crate::http::{ApiModule, middleware};
 
 /// API module exposing `/auth/login` and `/auth/callback`, and owning the
 /// JWT validation middleware configured from the discovered provider.
@@ -83,20 +83,14 @@ pub struct OidcSessionModule {
 
 impl OidcSessionModule {
     /// Creates the module from the shared JWT middleware.
-    pub fn new(
-        jwt: middleware::jwt::JwtClaimsMiddleware<middleware::jwt::Claims>,
-    ) -> Self {
+    pub fn new(jwt: middleware::jwt::JwtClaimsMiddleware<middleware::jwt::Claims>) -> Self {
         Self { jwt }
     }
 }
 
 impl ApiModule for OidcSessionModule {
     fn configure(&self, cfg: &mut web::ServiceConfig) {
-        cfg.service(
-            web::scope("/auth")
-                .wrap(self.jwt.clone())
-                .service(me),
-        );
+        cfg.service(web::scope("/auth").wrap(self.jwt.clone()).service(me));
     }
 }
 
@@ -593,11 +587,7 @@ mod tests {
     }
 
     /// Signs a session JWT the module's JWKS middleware accepts.
-    fn session_token(
-        fx: &Fixture,
-        sub: &str,
-        issuer: &str,
-    ) -> anyhow::Result<String> {
+    fn session_token(fx: &Fixture, sub: &str, issuer: &str) -> anyhow::Result<String> {
         let mut header = Header::new(jsonwebtoken::Algorithm::RS256);
         header.kid = Some("test-key-id".to_string());
         encode(
@@ -647,8 +637,8 @@ mod tests {
         assert_eq!(body.aud, vec![CLIENT_ID.to_string()]);
 
         // Anonymous probe is 401, never 500.
-        let res = test::call_service(&svc, test::TestRequest::get().uri("/auth/me").to_request())
-            .await;
+        let res =
+            test::call_service(&svc, test::TestRequest::get().uri("/auth/me").to_request()).await;
         assert_eq!(res.status(), 401);
         Ok(())
     }

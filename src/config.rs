@@ -149,9 +149,9 @@ impl Config {
             ("public_address", &self.public_address),
             ("authorization.issuer_url", &self.authorization.issuer_url),
         ] {
-            let parsed: url::Url = url.parse().map_err(|e| {
-                anyhow::anyhow!("{name} is not a valid URL ({url:?}): {e}")
-            })?;
+            let parsed: url::Url = url
+                .parse()
+                .map_err(|e| anyhow::anyhow!("{name} is not a valid URL ({url:?}): {e}"))?;
             if parsed.scheme() != "http" && parsed.scheme() != "https" {
                 anyhow::bail!("{name} must use http(s), got {:?}", parsed.scheme());
             }
@@ -160,12 +160,19 @@ impl Config {
             anyhow::bail!("authorization.client_id must not be empty");
         }
         if self.authorization.client_secret.trim().is_empty() {
-            anyhow::bail!("authorization.client_secret must not be empty (or set RUST_API_CLIENT_SECRET)");
+            anyhow::bail!(
+                "authorization.client_secret must not be empty (or set RUST_API_CLIENT_SECRET)"
+            );
         }
         if self.database.prefix.trim().is_empty() {
             anyhow::bail!("database.prefix must not be empty");
         }
-        if self.database.prefix.split('/').any(|seg| seg == ".." || seg == ".") {
+        if self
+            .database
+            .prefix
+            .split('/')
+            .any(|seg| seg == ".." || seg == ".")
+        {
             anyhow::bail!(
                 "database.prefix must not contain '.' or '..' segments (got {:?})",
                 self.database.prefix
@@ -489,44 +496,64 @@ mod tests {
     #[test]
     fn validate_rejects_bad_values() {
         // sample_ratio out of range (telemetry used to clamp silently).
-        let err = validation_error(
-            &minimal_toml().replace("region = \"us-east-1\"", "region = \"us-east-1\"\n[observability]\nsample_ratio = 1.5"),
-        );
+        let err = validation_error(&minimal_toml().replace(
+            "region = \"us-east-1\"",
+            "region = \"us-east-1\"\n[observability]\nsample_ratio = 1.5",
+        ));
         assert!(err.contains("sample_ratio"), "unexpected: {err}");
 
         // Prefix escaping its bucket scope.
-        let err = validation_error(&minimal_toml().replace("prefix = \"oxkv\"", "prefix = \"../escape\""));
+        let err = validation_error(
+            &minimal_toml().replace("prefix = \"oxkv\"", "prefix = \"../escape\""),
+        );
         assert!(err.contains("database.prefix"), "unexpected: {err}");
 
         // Empty bucket / region.
-        let err = validation_error(&minimal_toml().replace("bucket = \"my-bucket\"", "bucket = \"\""));
+        let err =
+            validation_error(&minimal_toml().replace("bucket = \"my-bucket\"", "bucket = \"\""));
         assert!(err.contains("s3.bucket"), "unexpected: {err}");
-        let err = validation_error(&minimal_toml().replace("region = \"us-east-1\"", "region = \"\""));
+        let err =
+            validation_error(&minimal_toml().replace("region = \"us-east-1\"", "region = \"\""));
         assert!(err.contains("s3.region"), "unexpected: {err}");
 
         // Non-URL addresses.
-        let err = validation_error(
-            &minimal_toml().replace("https://example.test", "not a url !!!"),
-        );
+        let err =
+            validation_error(&minimal_toml().replace("https://example.test", "not a url !!!"));
         assert!(err.contains("public_address"), "unexpected: {err}");
         let err = validation_error(&minimal_toml().replace("https://idp.test", "ftp://idp.test"));
-        assert!(err.contains("authorization.issuer_url"), "unexpected: {err}");
+        assert!(
+            err.contains("authorization.issuer_url"),
+            "unexpected: {err}"
+        );
 
         // Empty credentials.
-        let err = validation_error(&minimal_toml().replace("client_secret = \"csecret\"", "client_secret = \"\""));
+        let err = validation_error(
+            &minimal_toml().replace("client_secret = \"csecret\"", "client_secret = \"\""),
+        );
         assert!(err.contains("client_secret"), "unexpected: {err}");
 
         // Truncated/non-hex capability secrets (weak HMAC material).
-        let err = validation_error(
-            &minimal_toml().replace("region = \"us-east-1\"", "region = \"us-east-1\"\n[capability]\nsecret = \"deadbeef\""),
-        );
+        let err = validation_error(&minimal_toml().replace(
+            "region = \"us-east-1\"",
+            "region = \"us-east-1\"\n[capability]\nsecret = \"deadbeef\"",
+        ));
         assert!(err.contains("64 hex chars"), "unexpected: {err}");
-        let err = validation_error(
-            &minimal_toml().replace("region = \"us-east-1\"", &format!("region = \"us-east-1\"\n[capability]\nsecret = \"{}\"\nprevious_secret = \"zz\"", "ab".repeat(32))),
-        );
+        let err = validation_error(&minimal_toml().replace(
+            "region = \"us-east-1\"",
+            &format!(
+                "region = \"us-east-1\"\n[capability]\nsecret = \"{}\"\nprevious_secret = \"zz\"",
+                "ab".repeat(32)
+            ),
+        ));
         assert!(err.contains("64 hex chars"), "unexpected: {err}");
         // A well-formed secret passes validation.
-        let ok = minimal_toml().replace("region = \"us-east-1\"", &format!("region = \"us-east-1\"\n[capability]\nsecret = \"{}\"", "ab".repeat(32)));
+        let ok = minimal_toml().replace(
+            "region = \"us-east-1\"",
+            &format!(
+                "region = \"us-east-1\"\n[capability]\nsecret = \"{}\"",
+                "ab".repeat(32)
+            ),
+        );
         let path = tmp_toml(&ok);
         assert!(Config::try_from(path.as_path()).is_ok());
         let _ = std::fs::remove_file(&path);
@@ -557,19 +584,15 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         // Non-http(s) origins fail at startup, not obscurely in the browser.
-        let err = validation_error(
-            &minimal_toml().replace(
-                "region = \"us-east-1\"",
-                "region = \"us-east-1\"\n[http]\nallowed_origins = [\"ftp://app.example.com\"]",
-            ),
-        );
+        let err = validation_error(&minimal_toml().replace(
+            "region = \"us-east-1\"",
+            "region = \"us-east-1\"\n[http]\nallowed_origins = [\"ftp://app.example.com\"]",
+        ));
         assert!(err.contains("http.allowed_origins"), "unexpected: {err}");
-        let err = validation_error(
-            &minimal_toml().replace(
-                "region = \"us-east-1\"",
-                "region = \"us-east-1\"\n[http]\nallowed_origins = [\"not a url\"]",
-            ),
-        );
+        let err = validation_error(&minimal_toml().replace(
+            "region = \"us-east-1\"",
+            "region = \"us-east-1\"\n[http]\nallowed_origins = [\"not a url\"]",
+        ));
         assert!(err.contains("http.allowed_origins"), "unexpected: {err}");
     }
 
@@ -583,7 +606,10 @@ mod tests {
             Some("e".into())
         );
         assert_eq!(prefer_env_opt(None, Some("f".into())), Some("f".into()));
-        assert_eq!(prefer_env_opt(Some("".into()), Some("f".into())), Some("f".into()));
+        assert_eq!(
+            prefer_env_opt(Some("".into()), Some("f".into())),
+            Some("f".into())
+        );
         assert_eq!(prefer_env_opt(None, None), None);
     }
 

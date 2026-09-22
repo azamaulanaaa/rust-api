@@ -481,8 +481,7 @@ mod tests {
     async fn validator_rejects_malformed_writes() {
         use oxkv::Store as _;
 
-        let store =
-            oxkv::HookStore::new(BTreeStore::default()).with_validator(PolicyRuleValidator);
+        let store = oxkv::HookStore::new(BTreeStore::default()).with_validator(PolicyRuleValidator);
 
         // Valid p-rule passes.
         store
