@@ -29,6 +29,8 @@ The crate is intentionally business-logic free: applications compose `ApiModule`
 | GET | `/ready` | Readiness probe (policy-lock check) | none |
 | GET | `/auth/login` | Start OIDC login (redirects to provider) | none |
 | GET | `/auth/callback` | OIDC authorization-code callback | none |
+| GET | `/auth/me` | Session probe (`sub`, `iss`, `aud`, `exp`) | Bearer token |
+| POST | `/auth/logout` | Clear the session cookie (always `204`) | none |
 | POST | `/setup/admin` | One-time bootstrap: assign caller the `superadmin` role | Bearer token |
 | GET | `/policy/rules` | List policy rules | Bearer token |
 | POST | `/policy/rules` | Add a policy rule | Bearer token |
@@ -54,11 +56,15 @@ The crate is intentionally business-logic free: applications compose `ApiModule`
 
 Protected routes accept either an explicit `Authorization: Bearer <token>` header (preferred) or the session cookie set by `/auth/callback`. Requests without valid credentials get `401`; insufficient permissions get `403`. `/policy/*` additionally requires Casbin permissions (`rules:read/write` for rule endpoints, `user_groups:read/write` for group/user endpoints) — a merely valid token is not enough. `/setup/admin` requires a valid JWT but no policy check (one-time bootstrap). All errors use a uniform JSON envelope: `{"error": "<message>"}`.
 
-OpenAPI coverage is partial: `src/docs.rs` (`/openapi.json` + `/swagger-ui/`) currently documents `/health`, `/fs/*`, and `/policy/rules` only — `/ready`, `/auth/*`, `/sync/*`, `/setup/admin`, and `/policy/groups*`/`/policy/users` are served but not yet in the spec.
+Every served route is in the OpenAPI spec: `src/docs.rs` (`/openapi.json` + `/swagger-ui/`) covers `/health`, `/ready`, `/auth/*`, `/setup/admin`, `/fs/*`, `/policy/*`, and `/sync/*` — generate the SPA client from it instead of hand-writing fetch shapes.
 
 ### First-run bootstrap
 
 A fresh deployment boots with an empty policy store, so nobody can pass the self-authorization checks on `/policy` routes yet. Log in through `/auth/login`, then call `POST /setup/admin` **once** with your token: the first authenticated subject to do so becomes `superadmin` (`201`); every later call returns `409`, including after restarts. From there, grant permissions to groups and manage membership via the normal policy endpoints.
+
+### Browser clients (SPA/PWA)
+
+Cross-origin SPAs set `[http].allowed_origins` (or `RUST_API_ALLOWED_ORIGINS`) to their origin(s); credentials are always allowed. Auth flow: `GET /auth/login` → provider → `/auth/callback` (sets the `auth_token` cookie and returns the token) → `GET /auth/me` as the guard/session probe → `POST /auth/logout` to clear the cookie. Poll `GET /sync/status` (coverage `ETag`, `304` on repeat) and advance with `POST /sync/sync`, then read replica objects via `GET /sync/db/{object}` (`manifest.json` is `no-cache`, segments are immutable). Generate the client from `/openapi.json` — it covers every route.
 
 ## Architecture
 
@@ -66,19 +72,19 @@ A fresh deployment boots with an empty policy store, so nobody can pass the self
 src/
 ├── main.rs              binary entry point: config → telemetry → OIDC/policy/fs/sync wiring → listener
 ├── lib.rs               crate root and documentation
-├── config.rs            TOML configuration model ([database].prefix + mirror_master, [s3], [observability], [capability]; binary-private `mod config`)
+├── config.rs            TOML configuration model ([database].prefix + mirror_master, [s3], [observability], [capability], [http].allowed_origins + RUST_API_ALLOWED_ORIGINS; binary-private `mod config`)
 ├── db.rs                OxKV OxKvStore factory — one AmazonS3Builder for file bytes + OxKvStore; build_s3_store / build_test_store / build_test_store_new_session / build_scratch_store; single-live-handle-per-prefix contract
 ├── telemetry.rs         tracing subscriber + OTLP span/metric export bootstrap (otlp-grpc / otlp-http features)
-├── docs.rs              utoipa OpenAPI `ApiDoc` (partial: health + fs + policy/rules; served via http/docs.rs as /openapi.json + /swagger-ui/)
+├── docs.rs              utoipa OpenAPI `ApiDoc` (all routes; served via http/docs.rs as /openapi.json + /swagger-ui/)
 ├── http/                HTTP scaffolding shared by all modules
-│   ├── mod.rs           ApiService registry + ApiModule trait
+│   ├── mod.rs           ApiService registry + ApiModule trait + CORS builder
 │   ├── error.rs         ApiError enum and uniform JSON error envelope
 │   ├── health.rs        /health + /ready (readiness: policy-lock check)
 │   ├── docs.rs          mounts /openapi.json + /swagger-ui/*
 │   └── middleware/      bearer_token, jwks (debounced refresh), jwt (JWKS-backed claims + Validated extractor), request_tracing
-├── oidc/                OIDC client: /auth/login + /auth/callback (code flow, PKCE)
+├── oidc/                OIDC client: /auth/* (code flow, PKCE, session probe)
 │   ├── mod.rs           OidcClient, OidcConfig, PKCE/nonce/state helpers
-│   └── route.rs         OidcApiModule + login/callback handlers (seeds JwtClaimsMiddleware)
+│   └── route.rs         OidcApiModule (login/callback/logout) + OidcSessionModule (me) (seeds JwtClaimsMiddleware)
 ├── policy/              Casbin engine, oxkv adapter + validator, management routes
 │   ├── adapter.rs       OxkvAdapter<S: Store> + PolicyRuleValidator + encode_rule() (validates before tx)
 │   ├── admin.rs         export_s3 / import_s3 (OxKvStore, not file)
@@ -185,11 +191,18 @@ sample_ratio = 1.0                          # fraction of traces sampled (0.0–
 # [capability]
 # secret = "<64 hex chars>"                 # current key: mints tokens
 # previous_secret = "<64 hex chars>"       # old key: verifies only, during rotation
+
+# Optional — browser CORS origins (deny-by-default: empty serves no
+# Access-Control-Allow-Origin, i.e. same-origin only). List each SPA origin
+# explicitly when served cross-origin; credentials are always allowed so the
+# auth_token cookie and bearer header work.
+# [http]
+# allowed_origins = ["https://app.example.com", "http://localhost:5173"]
 ```
 
 Single bucket, prefix-scoped stores: `db::build_s3_store` builds one `AmazonS3` `ObjectStore` from `[s3]` and wraps it with `OxKvStore::builder().with_object_store(...).with_prefix("oxkv/policy")` etc. via the shared `fs::object_store::s3_builder`. Breaking change since `988873c`: `[database].path` (Redb file) is gone — use `[database].prefix`; old `*.redb` files are no longer read (no automatic migration).
 
-Secrets via environment (win over the file when present and non-empty, for secret managers): `RUST_API_CLIENT_SECRET`, `RUST_API_S3_ACCESS_KEY_ID`, `RUST_API_S3_SECRET_ACCESS_KEY`, `RUST_API_CAPABILITY_SECRET`, `RUST_API_CAPABILITY_SECRET_PREV`.
+Secrets via environment (win over the file when present and non-empty, for secret managers): `RUST_API_CLIENT_SECRET`, `RUST_API_S3_ACCESS_KEY_ID`, `RUST_API_S3_SECRET_ACCESS_KEY`, `RUST_API_CAPABILITY_SECRET`, `RUST_API_CAPABILITY_SECRET_PREV`, `RUST_API_ALLOWED_ORIGINS` (comma-separated).
 
 ## Production hardening
 

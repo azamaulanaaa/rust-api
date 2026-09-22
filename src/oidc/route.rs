@@ -149,6 +149,8 @@ pub async fn logout(oidc_client: web::Data<OidcClient>) -> impl Responder {
         .finish()
 }
 
+/// Starts the OIDC authorization-code flow (redirects to the provider).
+#[utoipa::path(get, path = "/auth/login", tag = "auth", responses((status = 302, description = "redirect to provider")))]
 #[get("/login")]
 pub async fn login(oidc_client: web::Data<OidcClient>) -> impl Responder {
     let auth_data = oidc_client.get_auth_url();
@@ -193,7 +195,7 @@ pub struct AuthCallbackQuery {
 }
 
 /// JSON body returned by `/auth/callback` describing the login outcome.
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, utoipa::ToSchema)]
 pub struct AuthResponse {
     /// Whether authentication completed successfully.
     pub success: bool,
@@ -203,6 +205,8 @@ pub struct AuthResponse {
     pub error: Option<String>,
 }
 
+/// OIDC authorization-code callback (validates state/nonce/PKCE, sets the session cookie).
+#[utoipa::path(get, path = "/auth/callback", tag = "auth", params(("code" = String, Query), ("state" = String, Query)), responses((status = 200, body = AuthResponse), (status = 400, body = AuthResponse), (status = 401, body = AuthResponse)))]
 #[get("/callback")]
 pub async fn callback(
     oidc_client: web::Data<OidcClient>,

@@ -50,6 +50,26 @@ impl ApiModule for SyncApiModule {
     }
 }
 
+/// Replica pointer returned by `GET /sync/status`.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct SyncStatusResponse {
+    /// Replica prefix for the caller (`{db}/u/{sha256-hex(sub)}`).
+    pub prefix: String,
+    /// WAL sequence covered by the replica (`None` when never built).
+    pub applied_seq: Option<u64>,
+    /// Current WAL head.
+    pub head: u64,
+}
+
+/// Replica pointer returned by `POST /sync/sync`.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct SyncAdvanceResponse {
+    /// Replica prefix for the caller (`{db}/u/{sha256-hex(sub)}`).
+    pub prefix: String,
+    /// WAL sequence covered after advancing.
+    pub applied_seq: u64,
+}
+
 /// Quoted `ETag` for a coverage point (coverage only moves forward, so the
 /// sequence alone identifies the content).
 fn snapshot_etag(applied: u64) -> String {
@@ -81,6 +101,7 @@ fn normalize_etag(tag: &str) -> &str {
 /// replica was never built) alongside the WAL `head`, so clients can decide
 /// whether a `POST /sync/sync` is worthwhile. Never touches the replica
 /// beyond the coverage-marker read.
+#[utoipa::path(get, path = "/sync/status", tag = "sync", responses((status = 200, body = SyncStatusResponse), (status = 304, description = "not modified"), (status = 401, body = crate::http::error::ErrorBody)))]
 #[get("/status")]
 async fn status_handler(
     manager: web::Data<SnapshotManager>,
@@ -103,13 +124,11 @@ async fn status_handler(
             .insert_header((ETAG, etag))
             .finish());
     }
-    Ok(HttpResponse::Ok()
-        .insert_header((ETAG, etag))
-        .json(serde_json::json!({
-            "prefix": manager.user_prefix(sub),
-            "applied_seq": applied,
-            "head": head,
-        })))
+    Ok(HttpResponse::Ok().insert_header((ETAG, etag)).json(SyncStatusResponse {
+        prefix: manager.user_prefix(sub),
+        applied_seq: applied,
+        head,
+    }))
 }
 
 /// Advances the replica for `sub` toward the WAL head and returns the pointer.
@@ -119,6 +138,7 @@ async fn status_handler(
 /// rule/group ops replay (irrelevant users/objects skip); legacy policy
 /// marks and oversized ranges fall back to a full rebuild. A lost fencing
 /// race adopts the winner's pointer instead of failing.
+#[utoipa::path(post, path = "/sync/sync", tag = "sync", responses((status = 200, body = SyncAdvanceResponse), (status = 304, description = "not modified"), (status = 401, body = crate::http::error::ErrorBody)))]
 #[post("/sync")]
 async fn sync_handler(
     manager: web::Data<SnapshotManager>,
@@ -153,12 +173,10 @@ async fn sync_handler(
             .insert_header((ETAG, etag))
             .finish());
     }
-    Ok(HttpResponse::Ok()
-        .insert_header((ETAG, etag))
-        .json(serde_json::json!({
-            "prefix": manager.user_prefix(sub),
-            "applied_seq": applied,
-        })))
+    Ok(HttpResponse::Ok().insert_header((ETAG, etag)).json(SyncAdvanceResponse {
+        prefix: manager.user_prefix(sub),
+        applied_seq: applied,
+    }))
 }
 
 /// Serves one object from the replica with `ETag` passthrough.
@@ -166,6 +184,7 @@ async fn sync_handler(
 /// `sub` always comes from the JWT, never the path, so callers can only
 /// read their own replica. Missing objects are `404`; `If-None-Match`
 /// matches are `304` without a body.
+#[utoipa::path(get, path = "/sync/db/{object}", tag = "sync", params(("object" = String, Path, description = "object key inside the replica prefix (e.g. manifest.json)")), responses((status = 200, description = "replica object bytes", content_type = "application/octet-stream"), (status = 304, description = "not modified"), (status = 401, body = crate::http::error::ErrorBody), (status = 404, description = "object not found")))]
 #[get("/db/{object:.*}")]
 async fn object_handler(
     manager: web::Data<SnapshotManager>,

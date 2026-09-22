@@ -55,15 +55,16 @@ impl ApiModule for SetupApiModule {
 }
 
 /// Body of a successful bootstrap response.
-#[derive(Serialize)]
-struct SetupResponse<'a> {
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct SetupResponse {
     /// Subject that was granted the role.
-    sub: &'a str,
+    pub sub: String,
     /// The role that was granted.
-    role: &'static str,
+    pub role: String,
 }
 
 /// Grants the caller the superadmin role if nobody holds it yet.
+#[utoipa::path(post, path = "/setup/admin", tag = "setup", responses((status = 201, body = SetupResponse), (status = 401, body = crate::http::error::ErrorBody), (status = 409, body = crate::http::error::ErrorBody)))]
 #[post("/admin")]
 async fn claim_admin(
     policy_engine: web::Data<PolicyEngine>,
@@ -78,8 +79,8 @@ async fn claim_admin(
         auth_claims.sub
     );
     Ok(HttpResponse::Created().json(SetupResponse {
-        sub: &auth_claims.sub,
-        role: SUPERADMIN_ROLE,
+        sub: auth_claims.sub.clone(),
+        role: SUPERADMIN_ROLE.to_string(),
     }))
 }
 
