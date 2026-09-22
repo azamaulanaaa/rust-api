@@ -68,8 +68,10 @@ pub async fn import_s3(
         if enforcer.add_policy(rule.clone()).await? {
             report.rules_added += 1;
             if let Some(wal) = &wal {
-                wal.append(WalOp::PolicyAdd {
+                wal.append(WalOp::PolicyRuleAdd {
+                    sub: rule.first().cloned().unwrap_or_default(),
                     obj: rule.get(1).cloned().unwrap_or_default(),
+                    act: rule.get(2).cloned().unwrap_or_default(),
                 })
                 .await
                 .context("append policy WAL")?;
@@ -82,8 +84,9 @@ pub async fn import_s3(
         if enforcer.add_grouping_policy(link.clone()).await? {
             report.groups_added += 1;
             if let Some(wal) = &wal {
-                wal.append(WalOp::PolicyAdd {
-                    obj: link.get(1).cloned().unwrap_or_default(),
+                wal.append(WalOp::GroupAdd {
+                    user: link.first().cloned().unwrap_or_default(),
+                    group: link.get(1).cloned().unwrap_or_default(),
                 })
                 .await
                 .context("append policy WAL")?;
