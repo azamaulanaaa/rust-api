@@ -4,7 +4,9 @@
 
 use std::sync::Arc;
 
-use oxkv::{CachedOxKvStore, Direction, GetSet, KeyValue, OxKvStore, Store as _, Transaction as _, WarmMode};
+use oxkv::{
+    CachedOxKvStore, Direction, GetSet, KeyValue, OxKvStore, Store as _, Transaction as _, WarmMode,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
@@ -253,8 +255,7 @@ impl FsStore {
         let Some(bytes) = self.get_one(&key).await? else {
             return Ok(None);
         };
-        let m =
-            serde_json::from_slice(&bytes).map_err(|e| FsError::Internal(e.to_string()))?;
+        let m = serde_json::from_slice(&bytes).map_err(|e| FsError::Internal(e.to_string()))?;
         Ok(Some(m))
     }
 
@@ -357,12 +358,7 @@ impl FsStore {
         let refs = refs_key(file_id);
         let g = self.inner.write().await;
         let tx = g.begin_tx().map_err(store_err)?;
-        if tx
-            .get_bytes(&rel)
-            .await
-            .map_err(store_err)?
-            .is_some()
-        {
+        if tx.get_bytes(&rel).await.map_err(store_err)?.is_some() {
             let info = read_ref_info(&tx, file_id).await?;
             tx.rollback().await.map_err(store_err)?;
             return Ok(info.count);
@@ -390,12 +386,7 @@ impl FsStore {
         let refs = refs_key(file_id);
         let g = self.inner.write().await;
         let tx = g.begin_tx().map_err(store_err)?;
-        if tx
-            .get_bytes(&rel)
-            .await
-            .map_err(store_err)?
-            .is_none()
-        {
+        if tx.get_bytes(&rel).await.map_err(store_err)?.is_none() {
             let info = read_ref_info(&tx, file_id).await?;
             tx.rollback().await.map_err(store_err)?;
             return Ok(info.count);
@@ -427,6 +418,31 @@ impl FsStore {
                 }
             }
         }
+        Ok(out)
+    }
+
+    /// Lists files attached to one row via a bounded `fs:rel:{type}:{id}:` scan.
+    ///
+    /// Used by incremental policy replay to resync only the row a rule
+    /// changed, instead of scanning the whole store for a full rebuild.
+    pub async fn files_for_row(
+        &self,
+        row_type: &str,
+        row_id: &str,
+    ) -> Result<Vec<String>, FsError> {
+        let prefix = crate::fs::relation::rel_prefix_for_row(row_type, row_id);
+        let kvs = self.scan_prefix(&prefix).await?;
+        let mut out = Vec::new();
+        for kv in kvs {
+            if let Some(file_id) = kv.key.strip_prefix(&prefix)
+                && !file_id.is_empty()
+                && !file_id.contains(':')
+            {
+                out.push(file_id.to_string());
+            }
+        }
+        out.sort();
+        out.dedup();
         Ok(out)
     }
 
