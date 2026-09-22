@@ -191,11 +191,19 @@ impl PolicyEngine {
         obj: String,
         act: Action,
     ) -> Result<bool, PolicyError> {
+        let act_str = act.to_string();
         let mut ef = self.enforcer.write().await;
-        let success = ef.add_policy(vec![sub, obj.clone(), act.to_string()]).await?;
+        let success = ef
+            .add_policy(vec![sub.clone(), obj.clone(), act_str.clone()])
+            .await?;
         drop(ef);
         if success {
-            self.append_wal(WalOp::PolicyAdd { obj }).await?;
+            self.append_wal(WalOp::PolicyRuleAdd {
+                sub,
+                obj,
+                act: act_str,
+            })
+            .await?;
         }
         Ok(success)
     }
@@ -207,13 +215,19 @@ impl PolicyEngine {
         obj: String,
         act: Action,
     ) -> Result<bool, PolicyError> {
+        let act_str = act.to_string();
         let mut ef = self.enforcer.write().await;
         let success = ef
-            .remove_policy(vec![sub, obj.clone(), act.to_string()])
+            .remove_policy(vec![sub.clone(), obj.clone(), act_str.clone()])
             .await?;
         drop(ef);
         if success {
-            self.append_wal(WalOp::PolicyRemove { obj }).await?;
+            self.append_wal(WalOp::PolicyRuleRemove {
+                sub,
+                obj,
+                act: act_str,
+            })
+            .await?;
         }
         Ok(success)
     }
@@ -222,11 +236,15 @@ impl PolicyEngine {
     pub async fn assign_group(&self, user_id: String, group: String) -> Result<bool, PolicyError> {
         let mut ef = self.enforcer.write().await;
         let success = ef
-            .add_grouping_policy(vec![user_id, group.clone()])
+            .add_grouping_policy(vec![user_id.clone(), group.clone()])
             .await?;
         drop(ef);
         if success {
-            self.append_wal(WalOp::PolicyAdd { obj: group }).await?;
+            self.append_wal(WalOp::GroupAdd {
+                user: user_id,
+                group,
+            })
+            .await?;
         }
         Ok(success)
     }
@@ -247,9 +265,11 @@ impl PolicyEngine {
         if !ef.get_users_for_role(SUPERADMIN_ROLE, None).is_empty() {
             let repaired = Self::ensure_superadmin_rules(&mut ef).await?;
             drop(ef);
-            if repaired {
-                self.append_wal(WalOp::PolicyAdd {
-                    obj: SUPERADMIN_ROLE.to_string(),
+            for (obj, act) in repaired {
+                self.append_wal(WalOp::PolicyRuleAdd {
+                    sub: SUPERADMIN_ROLE.to_string(),
+                    obj,
+                    act: act.to_string(),
                 })
                 .await?;
             }
@@ -257,21 +277,32 @@ impl PolicyEngine {
         }
         ef.add_grouping_policy(vec![user_id.to_string(), SUPERADMIN_ROLE.to_string()])
             .await?;
-        Self::ensure_superadmin_rules(&mut ef).await?;
+        let seeded = Self::ensure_superadmin_rules(&mut ef).await?;
         drop(ef);
-        self.append_wal(WalOp::PolicyAdd {
-            obj: SUPERADMIN_ROLE.to_string(),
+        self.append_wal(WalOp::GroupAdd {
+            user: user_id.to_string(),
+            group: SUPERADMIN_ROLE.to_string(),
         })
         .await?;
+        for (obj, act) in seeded {
+            self.append_wal(WalOp::PolicyRuleAdd {
+                sub: SUPERADMIN_ROLE.to_string(),
+                obj,
+                act: act.to_string(),
+            })
+            .await?;
+        }
         Ok(true)
     }
 
     /// Idempotently grants [`SUPERADMIN_ROLE`] full management rights over
-    /// policy rules and group membership. Returns `true` when at least one
-    /// rule was newly added. Caller must hold the enforcer write lock so
+    /// policy rules and group membership. Returns the newly added
+    /// `(obj, act)` pairs. Caller must hold the enforcer write lock so
     /// the bootstrap check and the seed share one critical section.
-    async fn ensure_superadmin_rules(ef: &mut Enforcer) -> Result<bool, PolicyError> {
-        let mut added = false;
+    async fn ensure_superadmin_rules(
+        ef: &mut Enforcer,
+    ) -> Result<Vec<(String, Action)>, PolicyError> {
+        let mut added = Vec::new();
         for (obj, act) in [
             ("rules", Action::Read),
             ("rules", Action::Write),
@@ -286,7 +317,7 @@ impl PolicyEngine {
                 ])
                 .await?
             {
-                added = true;
+                added.push((obj.to_string(), act));
             }
         }
         Ok(added)
@@ -299,10 +330,16 @@ impl PolicyEngine {
         group: String,
     ) -> Result<bool, PolicyError> {
         let mut ef = self.enforcer.write().await;
-        let success = ef.remove_grouping_policy(vec![user_id, group.clone()]).await?;
+        let success = ef
+            .remove_grouping_policy(vec![user_id.clone(), group.clone()])
+            .await?;
         drop(ef);
         if success {
-            self.append_wal(WalOp::PolicyRemove { obj: group }).await?;
+            self.append_wal(WalOp::GroupRemove {
+                user: user_id,
+                group,
+            })
+            .await?;
         }
         Ok(success)
     }
@@ -355,8 +392,8 @@ impl PolicyEngine {
             .await?;
         drop(ef);
         if removed {
-            self.append_wal(WalOp::PolicyRemove {
-                obj: group.to_string(),
+            self.append_wal(WalOp::GroupDelete {
+                group: group.to_string(),
             })
             .await?;
         }
@@ -607,18 +644,30 @@ mod tests {
         // only, no permission rules.
         {
             let mut ef = engine.enforcer.write().await;
-            ef.add_grouping_policy(vec![
-                "alice".to_string(),
-                SUPERADMIN_ROLE.to_string(),
-            ])
-            .await
-            .unwrap();
+            ef.add_grouping_policy(vec!["alice".to_string(), SUPERADMIN_ROLE.to_string()])
+                .await
+                .unwrap();
         }
-        assert!(!engine.authorize("alice", "rules", Action::Read).await.unwrap());
+        assert!(
+            !engine
+                .authorize("alice", "rules", Action::Read)
+                .await
+                .unwrap()
+        );
         // Next claim attempt still conflicts but repairs the missing rules.
         assert!(!engine.claim_superadmin("bob").await.unwrap());
-        assert!(engine.authorize("alice", "rules", Action::Read).await.unwrap());
-        assert!(engine.authorize("alice", "user_groups", Action::Write).await.unwrap());
+        assert!(
+            engine
+                .authorize("alice", "rules", Action::Read)
+                .await
+                .unwrap()
+        );
+        assert!(
+            engine
+                .authorize("alice", "user_groups", Action::Write)
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -629,34 +678,48 @@ mod tests {
         let wal = Wal::new(crate::db::build_test_store(&prefix).await);
         let engine = engine().await.with_wal(wal.clone());
 
-        assert!(engine
-            .add_rule("alice".into(), "doc".into(), Action::Read)
-            .await
-            .unwrap());
+        assert!(
+            engine
+                .add_rule("alice".into(), "doc".into(), Action::Read)
+                .await
+                .unwrap()
+        );
         // Duplicate: no mutation, no log entry.
-        assert!(!engine
-            .add_rule("alice".into(), "doc".into(), Action::Read)
-            .await
-            .unwrap());
-        assert!(engine
-            .assign_group("alice".into(), "admins".into())
-            .await
-            .unwrap());
-        assert!(engine
-            .remove_rule("alice".into(), "doc".into(), Action::Read)
-            .await
-            .unwrap());
-        assert!(engine
-            .remove_from_group("alice".into(), "admins".into())
-            .await
-            .unwrap());
+        assert!(
+            !engine
+                .add_rule("alice".into(), "doc".into(), Action::Read)
+                .await
+                .unwrap()
+        );
+        assert!(
+            engine
+                .assign_group("alice".into(), "admins".into())
+                .await
+                .unwrap()
+        );
+        assert!(
+            engine
+                .remove_rule("alice".into(), "doc".into(), Action::Read)
+                .await
+                .unwrap()
+        );
+        assert!(
+            engine
+                .remove_from_group("alice".into(), "admins".into())
+                .await
+                .unwrap()
+        );
 
         let entries = wal.range(1, wal.head().await.unwrap()).await.unwrap();
         let ops: Vec<&WalOp> = entries.iter().map(|e| &e.op).collect();
         assert_eq!(ops.len(), 4);
-        assert!(matches!(&ops[0], WalOp::PolicyAdd { obj } if obj == "doc"));
-        assert!(matches!(&ops[1], WalOp::PolicyAdd { obj } if obj == "admins"));
-        assert!(matches!(&ops[2], WalOp::PolicyRemove { obj } if obj == "doc"));
-        assert!(matches!(&ops[3], WalOp::PolicyRemove { obj } if obj == "admins"));
+        assert!(matches!(&ops[0], WalOp::PolicyRuleAdd { sub, obj, act }
+            if sub == "alice" && obj == "doc" && act == "read"));
+        assert!(matches!(&ops[1], WalOp::GroupAdd { user, group }
+            if user == "alice" && group == "admins"));
+        assert!(matches!(&ops[2], WalOp::PolicyRuleRemove { sub, obj, act }
+            if sub == "alice" && obj == "doc" && act == "read"));
+        assert!(matches!(&ops[3], WalOp::GroupRemove { user, group }
+            if user == "alice" && group == "admins"));
     }
 }
