@@ -79,11 +79,7 @@ impl SnapshotManager {
     /// construction (hex only): subjects are attacker-influenced OIDC
     /// values, so embedding them raw would allow traversal or collisions.
     pub fn user_prefix(&self, sub: &str) -> String {
-        format!(
-            "{}/u/{}",
-            self.db_prefix.trim_matches('/'),
-            safe_sub(sub)
-        )
+        format!("{}/u/{}", self.db_prefix.trim_matches('/'), safe_sub(sub))
     }
 
     /// Full object key for `tail` inside the replica.
@@ -110,11 +106,7 @@ impl SnapshotManager {
         }
         let reader = self.open_reader(sub).await?;
         let tx = reader.begin_tx().map_err(store_err)?;
-        let out = match tx
-            .get_bytes(APPLIED_KEY)
-            .await
-            .map_err(store_err)?
-        {
+        let out = match tx.get_bytes(APPLIED_KEY).await.map_err(store_err)? {
             Some(bytes) => serde_json::from_slice(&bytes).ok(),
             None => None,
         };
@@ -140,8 +132,7 @@ impl SnapshotManager {
         );
         let scratch = FsStore::new(crate::db::build_scratch_store(&snap_prefix).await);
         self.copy_filtered(sub, &scratch).await?;
-        let mut new_map: HashMap<String, Vec<u8>> =
-            scratch.dump_kvs().await?.into_iter().collect();
+        let mut new_map: HashMap<String, Vec<u8>> = scratch.dump_kvs().await?.into_iter().collect();
         new_map.insert(
             APPLIED_KEY.to_string(),
             serde_json::to_vec(&head).map_err(|e| FsError::Internal(e.to_string()))?,
@@ -192,14 +183,7 @@ impl SnapshotManager {
             return Ok(applied);
         }
         let entries = self.wal.range(applied + 1, head).await?;
-        if entries.len() > 1000
-            || entries.iter().any(|e| {
-                matches!(
-                    e.op,
-                    WalOp::PolicyAdd { .. } | WalOp::PolicyRemove { .. }
-                )
-            })
-        {
+        if entries.len() > 1000 || entries.iter().any(|e| e.op.is_policy_op()) {
             return Err(FsError::Internal(
                 "replay needs full recalc (policy change or range too large)".into(),
             ));
@@ -303,7 +287,13 @@ impl SnapshotManager {
             } => {
                 dst.detach(row_type, row_id, file_id).await?;
             }
-            WalOp::PolicyAdd { .. } | WalOp::PolicyRemove { .. } => {
+            WalOp::PolicyAdd { .. }
+            | WalOp::PolicyRemove { .. }
+            | WalOp::PolicyRuleAdd { .. }
+            | WalOp::PolicyRuleRemove { .. }
+            | WalOp::GroupAdd { .. }
+            | WalOp::GroupRemove { .. }
+            | WalOp::GroupDelete { .. } => {
                 return Err(FsError::Internal(
                     "policy op reached apply (should have bailed earlier)".into(),
                 ));

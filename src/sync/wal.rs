@@ -11,20 +11,64 @@ use crate::fs::error::FsError;
 /// Operation recorded in WAL.
 ///
 /// File and relation ops carry enough payload to re-apply against a
-/// replica (`FileCreate` embeds the full record); policy ops only mark
-/// visibility as changed — replay falls back to a full rebuild when any
-/// appear in range.
+/// replica (`FileCreate` embeds the full record). Rich policy ops carry
+/// the full rule/link so replay can resync only the affected user/row;
+/// legacy `PolicyAdd`/`PolicyRemove` (object only) always fall back to a
+/// full rebuild.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum WalOp {
-    /// Policy rule added.
+    /// Legacy policy mark (object only, pre-rich WAL).
+    ///
+    /// Kept for reading WALs written before rich ops existed; new code
+    /// never writes it. Replay treats it as needing a full recalc.
     PolicyAdd {
         /// Object affected.
         obj: String,
     },
-    /// Policy rule removed.
+    /// Legacy policy mark (object only, pre-rich WAL).
+    ///
+    /// Kept for reading WALs written before rich ops existed; new code
+    /// never writes it. Replay treats it as needing a full recalc.
     PolicyRemove {
         /// Object affected.
         obj: String,
+    },
+    /// Permission rule added (`p = sub, obj, act`).
+    PolicyRuleAdd {
+        /// Rule subject (user or group).
+        sub: String,
+        /// Rule object (`{row_type}:{row_id}` for rows).
+        obj: String,
+        /// Rule action (`read`/`write`/`delete`/`execute`).
+        act: String,
+    },
+    /// Permission rule removed (`p = sub, obj, act`).
+    PolicyRuleRemove {
+        /// Rule subject (user or group).
+        sub: String,
+        /// Rule object (`{row_type}:{row_id}` for rows).
+        obj: String,
+        /// Rule action (`read`/`write`/`delete`/`execute`).
+        act: String,
+    },
+    /// Group membership added (`g = user, group`).
+    GroupAdd {
+        /// Member subject.
+        user: String,
+        /// Group joined.
+        group: String,
+    },
+    /// Group membership removed (`g = user, group`).
+    GroupRemove {
+        /// Member subject.
+        user: String,
+        /// Group left.
+        group: String,
+    },
+    /// Group deleted (every membership link to `group` removed).
+    GroupDelete {
+        /// Group removed.
+        group: String,
     },
     /// File attached to row.
     Attach {
@@ -54,6 +98,27 @@ pub enum WalOp {
         /// File identifier.
         file_id: String,
     },
+}
+
+impl WalOp {
+    /// True for any policy-shape op (legacy or rich).
+    pub fn is_policy_op(&self) -> bool {
+        matches!(
+            self,
+            Self::PolicyAdd { .. }
+                | Self::PolicyRemove { .. }
+                | Self::PolicyRuleAdd { .. }
+                | Self::PolicyRuleRemove { .. }
+                | Self::GroupAdd { .. }
+                | Self::GroupRemove { .. }
+                | Self::GroupDelete { .. }
+        )
+    }
+
+    /// True for legacy object-only marks that cannot replay incrementally.
+    pub fn is_legacy_policy_mark(&self) -> bool {
+        matches!(self, Self::PolicyAdd { .. } | Self::PolicyRemove { .. })
+    }
 }
 
 /// Entry in WAL.
@@ -118,9 +183,7 @@ impl Wal {
         };
         let val = serde_json::to_vec(&entry).map_err(|e| FsError::Internal(e.to_string()))?;
         let seq_val = serde_json::to_vec(&seq).map_err(|e| FsError::Internal(e.to_string()))?;
-        let tx = g
-            .begin_tx()
-            .map_err(|e| FsError::Store(e.to_string()))?;
+        let tx = g.begin_tx().map_err(|e| FsError::Store(e.to_string()))?;
         tx.set_bytes(&Self::entry_key(seq), &val)
             .await
             .map_err(|e| FsError::Store(e.to_string()))?;
@@ -243,8 +306,44 @@ mod tests {
 
         // Corrupt payload errors as well.
         let key2 = format!("wal:{:020}", 2);
-        wal.store.write().await.set_bytes(&key2, b"not json").await?;
+        wal.store
+            .write()
+            .await
+            .set_bytes(&key2, b"not json")
+            .await?;
         assert!(wal.range(2, 2).await.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rich_policy_ops_roundtrip_and_classify() -> anyhow::Result<()> {
+        let wal = test_wal().await;
+        wal.append(WalOp::PolicyRuleAdd {
+            sub: "editors".into(),
+            obj: "invoice:1".into(),
+            act: "read".into(),
+        })
+        .await?;
+        wal.append(WalOp::GroupAdd {
+            user: "alice".into(),
+            group: "editors".into(),
+        })
+        .await?;
+        wal.append(WalOp::PolicyAdd { obj: "doc".into() }).await?;
+        let entries = wal.range(1, 3).await?;
+        assert!(matches!(
+            &entries[0].op,
+            WalOp::PolicyRuleAdd { sub, obj, act }
+            if sub == "editors" && obj == "invoice:1" && act == "read"
+        ));
+        assert!(entries[0].op.is_policy_op());
+        assert!(!entries[0].op.is_legacy_policy_mark());
+        assert!(entries[2].op.is_legacy_policy_mark());
+
+        // Legacy payload (object only) still deserializes.
+        let legacy = serde_json::to_vec(&WalOp::PolicyAdd { obj: "x".into() })?;
+        let back: WalOp = serde_json::from_slice(&legacy)?;
+        assert!(back.is_legacy_policy_mark());
         Ok(())
     }
 
