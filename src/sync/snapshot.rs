@@ -302,14 +302,23 @@ impl SnapshotManager {
                     "legacy policy op reached apply (needs full recalc)".into(),
                 ));
             }
-            WalOp::PolicyRuleAdd { sub, obj, act } | WalOp::PolicyRuleRemove { sub, obj, act } => {
-                self.apply_rule_op(sub, &dst, sub, obj, act).await?;
+            WalOp::PolicyRuleAdd {
+                sub: rule_sub,
+                obj,
+                act,
+            }
+            | WalOp::PolicyRuleRemove {
+                sub: rule_sub,
+                obj,
+                act,
+            } => {
+                self.apply_rule_op(sub, dst, rule_sub, obj, act).await?;
             }
             WalOp::GroupAdd { user, group } | WalOp::GroupRemove { user, group } => {
-                self.apply_membership_op(sub, &dst, user, group).await?;
+                self.apply_membership_op(sub, dst, user, group).await?;
             }
             WalOp::GroupDelete { group } => {
-                self.apply_group_delete(sub, &dst, group).await?;
+                self.apply_group_delete(sub, dst, group).await?;
             }
         }
         Ok(())
@@ -501,7 +510,6 @@ impl SnapshotManager {
     }
 
     /// Rows of `file_id` that `sub` may read (each authorized individually).
-
     async fn visible_rows(
         &self,
         sub: &str,

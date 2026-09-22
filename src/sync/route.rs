@@ -247,8 +247,17 @@ async fn object_handler(
 }
 
 /// True when `e` is an oxkv fencing loss (another writer won the epoch).
+///
+/// Matches on the inner detail rather than `Display`: `Store`/`Internal`
+/// sanitize their wire text to a fixed `"internal server error"` string
+/// (see `FsError::client_message`), so the fencing signal is only visible
+/// in the carried detail.
 fn is_fenced(e: &crate::fs::error::FsError) -> bool {
-    e.to_string().contains("fenced")
+    match e {
+        crate::fs::error::FsError::Store(detail)
+        | crate::fs::error::FsError::Internal(detail) => detail.contains("fenced"),
+        _ => false,
+    }
 }
 
 #[cfg(test)]

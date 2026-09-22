@@ -282,7 +282,7 @@ impl FsStore {
     /// Loads a staged single-part chunk.
     pub async fn get_staged_part(&self, id: &str, idx: u64) -> Result<Option<Vec<u8>>, FsError> {
         let key = Self::staged_key(id, idx);
-        Ok(self.get_one(&key).await?)
+        self.get_one(&key).await
     }
 
     /// Persists a finalized file record.
