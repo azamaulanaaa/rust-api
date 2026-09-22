@@ -22,7 +22,10 @@ use url::Url;
 use rust_api::{
     fs::{FsEngine, TokenKeys, route::FsApiModule, s3::S3ClientConfig, store::FsStore},
     http::{ApiService, middleware::jwt::Claims},
-    oidc::{OidcClient, OidcConfig, route::{OidcApiModule, OidcSessionModule}},
+    oidc::{
+        OidcClient, OidcConfig,
+        route::{OidcApiModule, OidcSessionModule},
+    },
     policy::{PolicyEngine, admin, route::PolicyApiModule, setup::SetupApiModule},
     sync::{route::SyncApiModule, snapshot::SnapshotManager, wal::Wal},
     telemetry,

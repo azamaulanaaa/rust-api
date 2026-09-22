@@ -43,33 +43,25 @@ mod tests {
     #[actix_web::test]
     async fn ready_without_check_is_200() {
         let app = test::init_service(App::new().service(ready)).await;
-        let resp = test::call_service(&app, test::TestRequest::get().uri("/ready").to_request())
-            .await;
+        let resp =
+            test::call_service(&app, test::TestRequest::get().uri("/ready").to_request()).await;
         assert_eq!(resp.status(), 200);
     }
 
     #[actix_web::test]
     async fn ready_reflects_check() {
         let passing: ReadyCheck = Arc::new(|| true);
-        let app = test::init_service(
-            App::new()
-                .app_data(web::Data::new(passing))
-                .service(ready),
-        )
-        .await;
-        let resp = test::call_service(&app, test::TestRequest::get().uri("/ready").to_request())
-            .await;
+        let app =
+            test::init_service(App::new().app_data(web::Data::new(passing)).service(ready)).await;
+        let resp =
+            test::call_service(&app, test::TestRequest::get().uri("/ready").to_request()).await;
         assert_eq!(resp.status(), 200);
 
         let failing: ReadyCheck = Arc::new(|| false);
-        let app = test::init_service(
-            App::new()
-                .app_data(web::Data::new(failing))
-                .service(ready),
-        )
-        .await;
-        let resp = test::call_service(&app, test::TestRequest::get().uri("/ready").to_request())
-            .await;
+        let app =
+            test::init_service(App::new().app_data(web::Data::new(failing)).service(ready)).await;
+        let resp =
+            test::call_service(&app, test::TestRequest::get().uri("/ready").to_request()).await;
         assert_eq!(resp.status(), 503);
     }
 }

@@ -85,9 +85,8 @@ async fn upload_part(
         .get("content-length")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<u64>().ok());
-    let stream = payload.map_err(|_| {
-        crate::fs::error::FsError::BadRequest("request body interrupted".into())
-    });
+    let stream = payload
+        .map_err(|_| crate::fs::error::FsError::BadRequest("request body interrupted".into()));
     engine
         .upload_part(&id, idx, stream, declared_len, checksum_sha256, &claims.sub)
         .await?;
@@ -237,10 +236,7 @@ enum RangeOutcome {
 /// full 200 response per RFC 9110 §14.2. An empty object satisfies
 /// nothing, so any range on it is 416.
 fn parse_range(header: Option<&str>, total: u64) -> RangeOutcome {
-    let Some(spec) = header
-        .map(str::trim)
-        .and_then(|h| h.strip_prefix("bytes="))
-    else {
+    let Some(spec) = header.map(str::trim).and_then(|h| h.strip_prefix("bytes=")) else {
         return RangeOutcome::Full;
     };
     if spec.contains(',') {
@@ -427,7 +423,10 @@ mod tests {
         // No header or foreign/multi/malformed units fall back to full.
         assert_eq!(ranged(None, 1000), (0, 0, false, false));
         assert_eq!(ranged(Some("items=0-99"), 1000), (0, 0, false, false));
-        assert_eq!(ranged(Some("bytes=0-99,200-299"), 1000), (0, 0, false, false));
+        assert_eq!(
+            ranged(Some("bytes=0-99,200-299"), 1000),
+            (0, 0, false, false)
+        );
         assert_eq!(ranged(Some("bananas"), 1000), (0, 0, false, false));
         assert_eq!(ranged(Some("bytes=abc-def"), 1000), (0, 0, false, false));
         assert_eq!(ranged(Some("bytes=5-3"), 1000), (0, 0, false, false));
@@ -844,7 +843,11 @@ mod tests {
             test::call_service(&app, req.to_request())
         };
         let header = |res: &actix_web::dev::ServiceResponse, name: &str| {
-            res.headers().get(name).and_then(|v| v.to_str().ok()).unwrap_or_default().to_string()
+            res.headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_string()
         };
 
         // Full download advertises ranges.

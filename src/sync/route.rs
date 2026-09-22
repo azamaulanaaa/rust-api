@@ -11,9 +11,9 @@
 //! only `manifest.json` is revalidated per commit.
 
 use actix_web::{
-    HttpRequest, HttpResponse, get, post,
+    HttpRequest, HttpResponse, get,
     http::header::{CACHE_CONTROL, CONTENT_TYPE, ETAG, IF_NONE_MATCH},
-    web,
+    post, web,
 };
 
 use crate::http::{
@@ -124,11 +124,13 @@ async fn status_handler(
             .insert_header((ETAG, etag))
             .finish());
     }
-    Ok(HttpResponse::Ok().insert_header((ETAG, etag)).json(SyncStatusResponse {
-        prefix: manager.user_prefix(sub),
-        applied_seq: applied,
-        head,
-    }))
+    Ok(HttpResponse::Ok()
+        .insert_header((ETAG, etag))
+        .json(SyncStatusResponse {
+            prefix: manager.user_prefix(sub),
+            applied_seq: applied,
+            head,
+        }))
 }
 
 /// Advances the replica for `sub` toward the WAL head and returns the pointer.
@@ -173,10 +175,12 @@ async fn sync_handler(
             .insert_header((ETAG, etag))
             .finish());
     }
-    Ok(HttpResponse::Ok().insert_header((ETAG, etag)).json(SyncAdvanceResponse {
-        prefix: manager.user_prefix(sub),
-        applied_seq: applied,
-    }))
+    Ok(HttpResponse::Ok()
+        .insert_header((ETAG, etag))
+        .json(SyncAdvanceResponse {
+            prefix: manager.user_prefix(sub),
+            applied_seq: applied,
+        }))
 }
 
 /// Serves one object from the replica with `ETag` passthrough.
@@ -254,8 +258,9 @@ async fn object_handler(
 /// in the carried detail.
 fn is_fenced(e: &crate::fs::error::FsError) -> bool {
     match e {
-        crate::fs::error::FsError::Store(detail)
-        | crate::fs::error::FsError::Internal(detail) => detail.contains("fenced"),
+        crate::fs::error::FsError::Store(detail) | crate::fs::error::FsError::Internal(detail) => {
+            detail.contains("fenced")
+        }
         _ => false,
     }
 }
@@ -426,10 +431,12 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body)?;
         assert_eq!(json["applied_seq"], 0);
         assert_eq!(json["head"], 0);
-        assert!(json["prefix"]
-            .as_str()
-            .unwrap_or_default()
-            .starts_with("test-db/u/"));
+        assert!(
+            json["prefix"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("test-db/u/")
+        );
 
         // Fresh client gets 304 with no body.
         let res = actix_web::test::call_service(
@@ -460,10 +467,7 @@ mod tests {
             created_at: 0,
         };
         fx.manager.store.save_file(&f2).await?;
-        fx.manager
-            .wal
-            .append(WalOp::FileCreate { rec: f2 })
-            .await?;
+        fx.manager.wal.append(WalOp::FileCreate { rec: f2 }).await?;
         let mw = setup(&fx).await?;
         let module = SyncApiModule::new(fx.manager.clone(), mw);
         let app =
@@ -522,10 +526,7 @@ mod tests {
             created_at: 0,
         };
         fx.manager.store.save_file(&f2).await?;
-        fx.manager
-            .wal
-            .append(WalOp::FileCreate { rec: f2 })
-            .await?;
+        fx.manager.wal.append(WalOp::FileCreate { rec: f2 }).await?;
         let mw = setup(&fx).await?;
         let module = SyncApiModule::new(fx.manager.clone(), mw);
         let app =

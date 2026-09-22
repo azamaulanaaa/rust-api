@@ -93,8 +93,7 @@ pub fn verify(
     validation.validate_exp = true;
     validation.leeway = 0;
     for secret in secrets {
-        let data = match decode::<FsClaims>(token, &DecodingKey::from_secret(secret), &validation)
-        {
+        let data = match decode::<FsClaims>(token, &DecodingKey::from_secret(secret), &validation) {
             Ok(data) => data,
             Err(_) => continue,
         };

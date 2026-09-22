@@ -35,11 +35,11 @@ const CLIENT_TIMEOUT: Duration = Duration::from_secs(60);
 fn apply_limits<T>(app: App<T>) -> App<T>
 where
     T: actix_web::dev::ServiceFactory<
-        actix_web::dev::ServiceRequest,
-        Config = (),
-        Error = actix_web::Error,
-        InitError = (),
-    >,
+            actix_web::dev::ServiceRequest,
+            Config = (),
+            Error = actix_web::Error,
+            InitError = (),
+        >,
 {
     app.app_data(web::PayloadConfig::new(MAX_PAYLOAD_BYTES))
         .app_data(web::JsonConfig::default().limit(MAX_JSON_BYTES))
@@ -72,7 +72,11 @@ pub fn cors(allowed_origins: &[String]) -> actix_cors::Cors {
         ])
         .allowed_header("x-checksum-sha256")
         .allowed_header("checksum-sha256")
-        .expose_headers(vec![header::ETAG, header::CONTENT_RANGE, header::ACCEPT_RANGES])
+        .expose_headers(vec![
+            header::ETAG,
+            header::CONTENT_RANGE,
+            header::ACCEPT_RANGES,
+        ])
         .supports_credentials()
         .max_age(3600);
     for origin in allowed_origins {
@@ -239,8 +243,7 @@ mod tests {
 
         // With the shared limits the same body passes through untouched.
         let svc =
-            test::init_service(apply_limits(App::new()).route("/echo", web::put().to(echo)))
-                .await;
+            test::init_service(apply_limits(App::new()).route("/echo", web::put().to(echo))).await;
         let res = test::call_service(&svc, payload()).await;
         assert_eq!(res.status(), 200);
         assert_eq!(test::read_body(res).await.len(), 300_000);
@@ -287,12 +290,8 @@ mod tests {
         assert!(res.headers().get("access-control-allow-origin").is_none());
 
         // Empty origins: deny-by-default, no CORS headers at all.
-        let svc = test::init_service(
-            App::new()
-                .wrap(cors(&[]))
-                .route("/ping", web::get().to(ok)),
-        )
-        .await;
+        let svc =
+            test::init_service(App::new().wrap(cors(&[])).route("/ping", web::get().to(ok))).await;
         let res = test::call_service(
             &svc,
             test::TestRequest::get()
