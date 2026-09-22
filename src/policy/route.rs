@@ -100,7 +100,7 @@ pub struct ActionResponse {
 }
 
 /// A flat list of string identifiers.
-#[derive(Serialize, utoipa::ToSchema)]
+#[derive(Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ListResponse {
     /// The listed items (users or groups).
     pub items: Vec<String>,
@@ -217,6 +217,7 @@ async fn remove_rule(
     Ok(HttpResponse::Ok().json(ActionResponse { success }))
 }
 
+#[utoipa::path(get, path = "/policy/groups/{user_id}", tag = "policy", params(("user_id" = String, Path)), responses((status = 200, body = ListResponse), (status = 401, body = crate::http::error::ErrorBody), (status = 403, body = crate::http::error::ErrorBody)))]
 #[get("/groups/{user_id}")]
 async fn get_user_groups(
     policy_engine: web::Data<PolicyEngine>,
@@ -237,6 +238,7 @@ async fn get_user_groups(
     Ok(HttpResponse::Ok().json(ListResponse { items: groups }))
 }
 
+#[utoipa::path(get, path = "/policy/groups/{group_name}/users", tag = "policy", params(("group_name" = String, Path)), responses((status = 200, body = ListResponse), (status = 401, body = crate::http::error::ErrorBody), (status = 403, body = crate::http::error::ErrorBody)))]
 #[get("/groups/{group_name}/users")]
 async fn get_group_users(
     policy_engine: web::Data<PolicyEngine>,
@@ -257,6 +259,7 @@ async fn get_group_users(
     Ok(HttpResponse::Ok().json(ListResponse { items: users }))
 }
 
+#[utoipa::path(post, path = "/policy/groups", tag = "policy", request_body = GroupRequest, responses((status = 200, body = ActionResponse), (status = 401, body = crate::http::error::ErrorBody), (status = 403, body = crate::http::error::ErrorBody)))]
 #[post("/groups")]
 async fn assign_group(
     policy_engine: web::Data<PolicyEngine>,
@@ -277,6 +280,7 @@ async fn assign_group(
     Ok(HttpResponse::Ok().json(ActionResponse { success }))
 }
 
+#[utoipa::path(delete, path = "/policy/groups/{group_name}/users/{user_id}", tag = "policy", params(("group_name" = String, Path), ("user_id" = String, Path)), responses((status = 200, body = ActionResponse), (status = 401, body = crate::http::error::ErrorBody), (status = 403, body = crate::http::error::ErrorBody)))]
 #[delete("/groups/{group_name}/users/{user_id}")]
 async fn remove_user_from_group(
     policy_engine: web::Data<PolicyEngine>,
@@ -298,7 +302,7 @@ async fn remove_user_from_group(
 }
 
 /// Paginated group listing.
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct GroupsResponse {
     /// Page of groups with member counts.
     pub groups: Vec<GroupSummary>,
@@ -311,7 +315,7 @@ pub struct GroupsResponse {
 }
 
 /// Paginated user-assignment listing.
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct UsersResponse {
     /// Page of subjects with their groups.
     pub users: Vec<UserAssignment>,
@@ -324,6 +328,7 @@ pub struct UsersResponse {
 }
 
 /// Lists every known group with member counts.
+#[utoipa::path(get, path = "/policy/groups", tag = "policy", params(("limit" = Option<usize>, Query), ("offset" = Option<usize>, Query)), responses((status = 200, body = GroupsResponse), (status = 401, body = crate::http::error::ErrorBody), (status = 403, body = crate::http::error::ErrorBody)))]
 #[get("/groups")]
 async fn list_groups(
     policy_engine: web::Data<PolicyEngine>,
@@ -353,6 +358,7 @@ async fn list_groups(
 }
 
 /// Lists every subject holding group memberships.
+#[utoipa::path(get, path = "/policy/users", tag = "policy", params(("limit" = Option<usize>, Query), ("offset" = Option<usize>, Query)), responses((status = 200, body = UsersResponse), (status = 401, body = crate::http::error::ErrorBody), (status = 403, body = crate::http::error::ErrorBody)))]
 #[get("/users")]
 async fn list_users(
     policy_engine: web::Data<PolicyEngine>,
@@ -382,6 +388,7 @@ async fn list_users(
 }
 
 /// Deletes a group together with every membership link to it.
+#[utoipa::path(delete, path = "/policy/groups/{group_name}", tag = "policy", params(("group_name" = String, Path)), responses((status = 200, body = ActionResponse), (status = 401, body = crate::http::error::ErrorBody), (status = 403, body = crate::http::error::ErrorBody)))]
 #[delete("/groups/{group_name}")]
 async fn delete_group(
     policy_engine: web::Data<PolicyEngine>,

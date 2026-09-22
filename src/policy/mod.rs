@@ -101,7 +101,7 @@ pub struct PolicyEngine {
 pub const SUPERADMIN_ROLE: &str = "superadmin";
 
 /// One group and how many subjects belong to it.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct GroupSummary {
     /// Group (role) name.
     pub name: String,
@@ -110,7 +110,7 @@ pub struct GroupSummary {
 }
 
 /// One subject's group memberships.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct UserAssignment {
     /// Subject identifier.
     pub sub: String,
