@@ -9,8 +9,9 @@
 //!
 //! The `sync:applied` sentinel inside the prefix tracks WAL coverage, so no
 //! sidecar pointer object exists. Small deltas replay with idempotent
-//! re-apply (sentinel written last); policy changes and large ranges fall
-//! back to full recalc. Served read-only via `/sync/db/`; wasm clients open
+//! re-apply (sentinel written last); legacy policy marks and large ranges
+//! fall back to full recalc, while rich rule/group ops resync only the
+//! affected user/row. Served read-only via `/sync/db/`; wasm clients open
 //! an `OxKvReader` over the prefix and follow the live manifest.
 
 use std::collections::HashMap;
@@ -25,6 +26,13 @@ use super::wal::{Wal, WalOp};
 
 /// Sync-version marker stored inside every replica prefix.
 const APPLIED_KEY: &str = "sync:applied";
+
+/// Upper bound for file/relation ops replayed incrementally.
+const MAX_REPLAY_OPS: usize = 1000;
+
+/// Upper bound for files touched by one policy op before falling back to
+/// a full recalc (keeps one group/row change from scanning the store).
+const MAX_POLICY_REPLAY_FILES: usize = 1000;
 
 /// Manager for per-user replicas.
 #[derive(Clone)]
@@ -171,9 +179,11 @@ impl SnapshotManager {
     ///
     /// Ops apply in order with visibility re-checked against current master
     /// state, then the coverage marker advances: re-applying converges, so a
-    /// crash between ops heals on the next poll. Policy ops change
-    /// visibility wholesale — any in range (or a range over 1000 entries)
-    /// falls back to a full recalc via `Err`.
+    /// crash between ops heals on the next poll. Legacy policy marks (object
+    /// only) and ranges over [`MAX_REPLAY_OPS`] entries fall back to a full
+    /// recalc via `Err`; rich rule/group ops resync only the affected
+    /// user/row (irrelevant users/objects skip, oversized fan-out falls
+    /// back via `Err`).
     pub async fn replay(&self, head: u64, sub: &str) -> Result<u64, FsError> {
         let _guard = self.build_lock.lock().await;
         let Some(applied) = self.load_applied(sub).await? else {
@@ -183,9 +193,9 @@ impl SnapshotManager {
             return Ok(applied);
         }
         let entries = self.wal.range(applied + 1, head).await?;
-        if entries.len() > 1000 || entries.iter().any(|e| e.op.is_policy_op()) {
+        if entries.len() > MAX_REPLAY_OPS || entries.iter().any(|e| e.op.is_legacy_policy_mark()) {
             return Err(FsError::Internal(
-                "replay needs full recalc (policy change or range too large)".into(),
+                "replay needs full recalc (legacy policy mark or range too large)".into(),
             ));
         }
         let writer = self.open_writer(sub).await?;
@@ -287,19 +297,186 @@ impl SnapshotManager {
             } => {
                 dst.detach(row_type, row_id, file_id).await?;
             }
-            WalOp::PolicyAdd { .. }
-            | WalOp::PolicyRemove { .. }
-            | WalOp::PolicyRuleAdd { .. }
-            | WalOp::PolicyRuleRemove { .. }
-            | WalOp::GroupAdd { .. }
-            | WalOp::GroupRemove { .. }
-            | WalOp::GroupDelete { .. } => {
+            WalOp::PolicyAdd { .. } | WalOp::PolicyRemove { .. } => {
                 return Err(FsError::Internal(
-                    "policy op reached apply (should have bailed earlier)".into(),
+                    "legacy policy op reached apply (needs full recalc)".into(),
                 ));
+            }
+            WalOp::PolicyRuleAdd { sub, obj, act } | WalOp::PolicyRuleRemove { sub, obj, act } => {
+                self.apply_rule_op(sub, &dst, sub, obj, act).await?;
+            }
+            WalOp::GroupAdd { user, group } | WalOp::GroupRemove { user, group } => {
+                self.apply_membership_op(sub, &dst, user, group).await?;
+            }
+            WalOp::GroupDelete { group } => {
+                self.apply_group_delete(sub, &dst, group).await?;
             }
         }
         Ok(())
+    }
+
+    /// Resyncs the single row a permission rule changed.
+    ///
+    /// Skips fast: non-`read` actions never affect read replicas,
+    /// non-row objects (`rules`, `user_groups`, …) hold no files, direct
+    /// rules for other users cannot match, and group rules skip when `sub`
+    /// holds no current membership. Otherwise every file on the row is
+    /// re-checked via [`Self::resync_file`] (idempotent: converge, never
+    /// over-delete). Fan-out over [`MAX_POLICY_REPLAY_FILES`] falls back
+    /// via `Err`.
+    async fn apply_rule_op(
+        &self,
+        sub: &str,
+        dst: &FsStore,
+        rule_sub: &str,
+        obj: &str,
+        act: &str,
+    ) -> Result<(), FsError> {
+        if !act.eq_ignore_ascii_case("read") {
+            return Ok(());
+        }
+        let Some((row_type, row_id)) = split_row_obj(obj) else {
+            return Ok(());
+        };
+        if rule_sub != sub
+            && !self
+                .policy
+                .get_groups_of_user(sub)
+                .await
+                .iter()
+                .any(|g| g == rule_sub)
+        {
+            return Ok(());
+        }
+        let files = self.store.files_for_row(row_type, row_id).await?;
+        if files.len() > MAX_POLICY_REPLAY_FILES {
+            return Err(FsError::Internal(
+                "replay needs full recalc (policy fan-out too large)".into(),
+            ));
+        }
+        for file_id in files {
+            self.resync_file(sub, dst, row_type, row_id, &file_id)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Resyncs rows a membership change can affect (only when `user == sub`).
+    ///
+    /// Drops through when the change is for another user. For `sub` itself,
+    /// every `read` row the group grants is resynced; groups with no row
+    /// reads (e.g. `superadmin` on `rules`/`user_groups`) are a no-op.
+    /// Oversized fan-out falls back via `Err`.
+    async fn apply_membership_op(
+        &self,
+        sub: &str,
+        dst: &FsStore,
+        user: &str,
+        group: &str,
+    ) -> Result<(), FsError> {
+        if user != sub {
+            return Ok(());
+        }
+        let rows = self.read_rows_for_group(group).await?;
+        let mut total = 0usize;
+        for (row_type, row_id) in rows {
+            let files = self.store.files_for_row(&row_type, &row_id).await?;
+            total += files.len();
+            if total > MAX_POLICY_REPLAY_FILES {
+                return Err(FsError::Internal(
+                    "replay needs full recalc (policy fan-out too large)".into(),
+                ));
+            }
+            for file_id in files {
+                self.resync_file(sub, dst, &row_type, &row_id, &file_id)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Resyncs rows a deleted group could have exposed.
+    ///
+    /// Past membership is unknowable (links are already gone), so any group
+    /// holding row `read` rules resyncs its rows: [`Self::resync_file`]
+    /// re-checks current visibility, making over-application safe (files
+    /// still visible via other rows stay, others converge to deleted).
+    /// Groups with no row reads skip; oversized fan-out falls back via `Err`.
+    async fn apply_group_delete(
+        &self,
+        sub: &str,
+        dst: &FsStore,
+        group: &str,
+    ) -> Result<(), FsError> {
+        let rows = self.read_rows_for_group(group).await?;
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let mut total = 0usize;
+        for (row_type, row_id) in rows {
+            let files = self.store.files_for_row(&row_type, &row_id).await?;
+            total += files.len();
+            if total > MAX_POLICY_REPLAY_FILES {
+                return Err(FsError::Internal(
+                    "replay needs full recalc (policy fan-out too large)".into(),
+                ));
+            }
+            for file_id in files {
+                self.resync_file(sub, dst, &row_type, &row_id, &file_id)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Converges one file on the replica after a policy change.
+    ///
+    /// Readable files are ensured present with the changed row attached
+    /// (or detached when that row alone turned unreadable); files readable
+    /// via no row are deleted. Missing master records delete the stale
+    /// replica copy.
+    async fn resync_file(
+        &self,
+        sub: &str,
+        dst: &FsStore,
+        row_type: &str,
+        row_id: &str,
+        file_id: &str,
+    ) -> Result<(), FsError> {
+        let Some(rec) = self.store.get_file(file_id).await? else {
+            dst.delete_file(file_id).await?;
+            return Ok(());
+        };
+        if !self.can_read(sub, file_id).await? {
+            dst.delete_file(file_id).await?;
+            return Ok(());
+        }
+        dst.save_file(&rec).await?;
+        if self
+            .policy
+            .authorize_row(sub, row_type, row_id, Action::Read)
+            .await
+            .unwrap_or(false)
+        {
+            dst.attach(row_type, row_id, file_id).await?;
+        } else {
+            dst.detach(row_type, row_id, file_id).await?;
+        }
+        Ok(())
+    }
+
+    /// Row `(type, id)` pairs `group` currently grants `read` on.
+    async fn read_rows_for_group(&self, group: &str) -> Result<Vec<(String, String)>, FsError> {
+        let mut out = Vec::new();
+        for (obj, act) in self.policy.rules_for_subject(group).await {
+            if !act.eq_ignore_ascii_case("read") {
+                continue;
+            }
+            if let Some((ty, rid)) = split_row_obj(&obj) {
+                out.push((ty.to_string(), rid.to_string()));
+            }
+        }
+        Ok(out)
     }
 
     async fn copy_filtered(&self, sub: &str, dst: &FsStore) -> Result<(), FsError> {
@@ -355,6 +532,19 @@ impl SnapshotManager {
 /// Maps oxkv errors into [`FsError`].
 fn store_err(e: oxkv::StoreError) -> FsError {
     FsError::Store(e.to_string())
+}
+
+/// Splits a rule object into `(row_type, row_id)` when it names a row.
+///
+/// Row objects are `{type}:{id}`; control-plane objects (`rules`,
+/// `user_groups`, …) contain no colon and return `None` so policy replay
+/// can skip them without touching storage.
+fn split_row_obj(obj: &str) -> Option<(&str, &str)> {
+    let (ty, rid) = obj.split_once(':')?;
+    if ty.is_empty() || rid.is_empty() {
+        return None;
+    }
+    Some((ty, rid))
 }
 
 /// Maps a subject to a prefix-safe identifier.
@@ -547,7 +737,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replay_bails_on_policy_ops() -> anyhow::Result<()> {
+    async fn replay_bails_on_legacy_policy_marks() -> anyhow::Result<()> {
         let (mgr, _) = test_manager().await;
         mgr.store.save_file(&file_record("f1", "alice")).await?;
         mgr.build_full("alice").await?;
@@ -559,6 +749,127 @@ mod tests {
         assert!(mgr.replay(1, "alice").await.is_err());
         assert_eq!(mgr.load_applied("alice").await?, Some(0));
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn replay_skips_irrelevant_policy_ops() -> anyhow::Result<()> {
+        let (mgr, mem) = test_manager().await;
+        mgr.store.save_file(&file_record("f1", "alice")).await?;
+        mgr.build_full("alice").await?;
+        // Other user's membership, non-row object, and non-read action:
+        // none can affect alice's read replica.
+        mgr.wal
+            .append(WalOp::GroupAdd {
+                user: "bob".into(),
+                group: "editors".into(),
+            })
+            .await?;
+        mgr.wal
+            .append(WalOp::PolicyRuleAdd {
+                sub: "editors".into(),
+                obj: "rules".into(),
+                act: "read".into(),
+            })
+            .await?;
+        mgr.wal
+            .append(WalOp::PolicyRuleAdd {
+                sub: "editors".into(),
+                obj: "invoice:9".into(),
+                act: "write".into(),
+            })
+            .await?;
+        assert_eq!(mgr.replay(3, "alice").await?, 3);
+        assert_eq!(mgr.load_applied("alice").await?, Some(3));
+        assert!(replica_has(&mem, &mgr, "alice", "fs:files:f1:meta").await);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replay_applies_rule_grant_then_revoke() -> anyhow::Result<()> {
+        let (mgr, mem) = test_manager().await;
+        // Bob's file on invoice:1; alice sees nothing yet.
+        mgr.store.save_file(&file_record("f1", "bob")).await?;
+        mgr.store.attach("invoice", "1", "f1").await?;
+        mgr.build_full("alice").await?;
+        assert!(!replica_has(&mem, &mgr, "alice", "fs:files:f1:meta").await);
+
+        // Grant editors read on the row, add alice to editors (master
+        // mutation first, WAL entries like the engines append).
+        mgr.policy
+            .add_rule("editors".into(), "invoice:1".into(), Action::Read)
+            .await?;
+        mgr.policy
+            .assign_group("alice".into(), "editors".into())
+            .await?;
+        mgr.wal
+            .append(WalOp::PolicyRuleAdd {
+                sub: "editors".into(),
+                obj: "invoice:1".into(),
+                act: "read".into(),
+            })
+            .await?;
+        mgr.wal
+            .append(WalOp::GroupAdd {
+                user: "alice".into(),
+                group: "editors".into(),
+            })
+            .await?;
+        assert_eq!(mgr.replay(2, "alice").await?, 2);
+        assert!(replica_has(&mem, &mgr, "alice", "fs:files:f1:meta").await);
+        assert!(replica_has(&mem, &mgr, "alice", "fs:rel:invoice:1:f1").await);
+
+        // Revoke the rule: the file must leave the replica.
+        mgr.policy
+            .remove_rule("editors".into(), "invoice:1".into(), Action::Read)
+            .await?;
+        mgr.wal
+            .append(WalOp::PolicyRuleRemove {
+                sub: "editors".into(),
+                obj: "invoice:1".into(),
+                act: "read".into(),
+            })
+            .await?;
+        assert_eq!(mgr.replay(3, "alice").await?, 3);
+        assert!(!replica_has(&mem, &mgr, "alice", "fs:files:f1:meta").await);
+        assert!(!replica_has(&mem, &mgr, "alice", "fs:rel:invoice:1:f1").await);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replay_group_remove_converges() -> anyhow::Result<()> {
+        let (mgr, mem) = test_manager().await;
+        mgr.policy
+            .add_rule("editors".into(), "invoice:1".into(), Action::Read)
+            .await?;
+        mgr.policy
+            .assign_group("alice".into(), "editors".into())
+            .await?;
+        mgr.store.save_file(&file_record("f1", "bob")).await?;
+        mgr.store.attach("invoice", "1", "f1").await?;
+        mgr.build_full("alice").await?;
+        assert!(replica_has(&mem, &mgr, "alice", "fs:files:f1:meta").await);
+
+        mgr.policy
+            .remove_from_group("alice".into(), "editors".into())
+            .await?;
+        mgr.wal
+            .append(WalOp::GroupRemove {
+                user: "alice".into(),
+                group: "editors".into(),
+            })
+            .await?;
+        assert_eq!(mgr.replay(1, "alice").await?, 1);
+        assert!(!replica_has(&mem, &mgr, "alice", "fs:files:f1:meta").await);
+        Ok(())
+    }
+
+    #[test]
+    fn split_row_obj_rejects_control_plane_objects() {
+        assert_eq!(split_row_obj("invoice:123"), Some(("invoice", "123")));
+        assert_eq!(split_row_obj("rules"), None);
+        assert_eq!(split_row_obj("user_groups"), None);
+        assert_eq!(split_row_obj(":123"), None);
+        assert_eq!(split_row_obj("invoice:"), None);
     }
 
     #[tokio::test]
