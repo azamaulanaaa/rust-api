@@ -51,6 +51,36 @@ fn config(cfg: &mut web::ServiceConfig) {
     cfg.service(health::ready);
 }
 
+/// Builds the CORS middleware for browser clients.
+///
+/// Empty `allowed_origins` disables CORS responses (same-origin only).
+/// Each origin must be an exact `http(s)` origin without trailing slash;
+/// credentials are always allowed so the `auth_token` cookie and
+/// `Authorization` bearer header work cross-origin. `ETag` and range
+/// headers are exposed so `/sync/db/*` conditional polls and `/fs`
+/// ranged downloads work from the browser.
+pub fn cors(allowed_origins: &[String]) -> actix_cors::Cors {
+    use actix_web::http::header;
+    let mut cors = actix_cors::Cors::default()
+        .allowed_methods(vec!["GET", "POST", "PUT", "DELETE", "OPTIONS"])
+        .allowed_headers(vec![
+            header::AUTHORIZATION,
+            header::CONTENT_TYPE,
+            header::IF_NONE_MATCH,
+            header::RANGE,
+            header::CONTENT_LENGTH,
+        ])
+        .allowed_header("x-checksum-sha256")
+        .allowed_header("checksum-sha256")
+        .expose_headers(vec![header::ETAG, header::CONTENT_RANGE, header::ACCEPT_RANGES])
+        .supports_credentials()
+        .max_age(3600);
+    for origin in allowed_origins {
+        cors = cors.allowed_origin(origin);
+    }
+    cors
+}
+
 /// A self-contained unit of the API surface: a set of routes plus its own
 /// app data and middleware. Implement this to plug business functionality
 /// into an [`ApiService`].
@@ -65,6 +95,7 @@ pub trait ApiModule: Send + Sync {
 pub struct ApiService {
     modules: Vec<Box<dyn ApiModule>>,
     readiness: Option<health::ReadyCheck>,
+    cors_origins: Vec<String>,
 }
 
 impl Default for ApiService {
@@ -79,7 +110,17 @@ impl ApiService {
         Self {
             modules: Vec::new(),
             readiness: None,
+            cors_origins: Vec::new(),
         }
+    }
+
+    /// Sets the browser origins allowed by CORS (empty = same-origin only).
+    ///
+    /// Pass `config.http.allowed_origins`; each entry must be an exact
+    /// `http(s)` origin. Credentials are always allowed.
+    pub fn with_cors_origins(mut self, origins: Vec<String>) -> Self {
+        self.cors_origins = origins;
+        self
     }
 
     /// Adds a module to the service. Modules are mounted in registration
@@ -104,9 +145,11 @@ impl ApiService {
     pub async fn start(self, addr: SocketAddr) -> anyhow::Result<()> {
         let modules = Arc::new(self.modules);
         let readiness = self.readiness.clone();
+        let cors_origins = self.cors_origins.clone();
 
         let server = HttpServer::new(move || {
             let mut app = apply_limits(App::new())
+                .wrap(cors(&cors_origins))
                 .wrap(middleware::request_tracing::RequestTracingMiddleware)
                 .wrap(middleware::bearer_token::BearerTokenMiddleware)
                 .configure(config)
@@ -201,5 +244,63 @@ mod tests {
         let res = test::call_service(&svc, payload()).await;
         assert_eq!(res.status(), 200);
         assert_eq!(test::read_body(res).await.len(), 300_000);
+    }
+
+    /// CORS echoes an explicitly allowed browser origin (with credentials)
+    /// and stays silent otherwise: empty origins mean same-origin only.
+    #[actix_web::test]
+    async fn cors_allows_configured_origin_only() {
+        async fn ok() -> HttpResponse {
+            HttpResponse::Ok().finish()
+        }
+
+        let svc = test::init_service(
+            App::new()
+                .wrap(cors(&["https://app.example.com".to_string()]))
+                .route("/ping", web::get().to(ok)),
+        )
+        .await;
+        let res = test::call_service(
+            &svc,
+            test::TestRequest::get()
+                .uri("/ping")
+                .insert_header(("Origin", "https://app.example.com"))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(
+            res.headers()
+                .get("access-control-allow-origin")
+                .and_then(|v| v.to_str().ok()),
+            Some("https://app.example.com")
+        );
+
+        // Unlisted origin gets no CORS headers.
+        let res = test::call_service(
+            &svc,
+            test::TestRequest::get()
+                .uri("/ping")
+                .insert_header(("Origin", "https://evil.example.com"))
+                .to_request(),
+        )
+        .await;
+        assert!(res.headers().get("access-control-allow-origin").is_none());
+
+        // Empty origins: deny-by-default, no CORS headers at all.
+        let svc = test::init_service(
+            App::new()
+                .wrap(cors(&[]))
+                .route("/ping", web::get().to(ok)),
+        )
+        .await;
+        let res = test::call_service(
+            &svc,
+            test::TestRequest::get()
+                .uri("/ping")
+                .insert_header(("Origin", "https://app.example.com"))
+                .to_request(),
+        )
+        .await;
+        assert!(res.headers().get("access-control-allow-origin").is_none());
     }
 }

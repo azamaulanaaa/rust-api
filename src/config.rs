@@ -29,6 +29,9 @@ pub struct Config {
     /// Telemetry settings; defaults apply when the section is omitted.
     #[serde(default)]
     pub observability: ObservabilityConfig,
+    /// HTTP edge settings (CORS); defaults apply when omitted.
+    #[serde(default)]
+    pub http: HttpConfig,
 }
 
 /// Environment override for the OIDC client secret.
@@ -55,6 +58,12 @@ pub const ENV_CAPABILITY_SECRET: &str = "RUST_API_CAPABILITY_SECRET";
 ///
 /// Present and non-empty wins over `capability.previous_secret`.
 pub const ENV_CAPABILITY_SECRET_PREV: &str = "RUST_API_CAPABILITY_SECRET_PREV";
+
+/// Environment override for the browser origins allowed by CORS.
+///
+/// Comma-separated origins (e.g. `https://app.example.com,http://localhost:5173`);
+/// present and non-empty wins over `http.allowed_origins`.
+pub const ENV_ALLOWED_ORIGINS: &str = "RUST_API_ALLOWED_ORIGINS";
 
 impl TryFrom<&Path> for Config {
     type Error = anyhow::Error;
@@ -102,6 +111,16 @@ fn apply_env_overrides(config: &mut Config) {
         std::env::var(ENV_CAPABILITY_SECRET_PREV).ok(),
         config.capability.previous_secret.take(),
     );
+    if let Ok(raw) = std::env::var(ENV_ALLOWED_ORIGINS)
+        && !raw.trim().is_empty()
+    {
+        config.http.allowed_origins = raw
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+    }
 }
 
 /// Effective required value: the env value wins when present and
@@ -169,6 +188,17 @@ impl Config {
                 "observability.sample_ratio must be within 0.0..=1.0 (got {})",
                 self.observability.sample_ratio
             );
+        }
+        for origin in &self.http.allowed_origins {
+            let parsed: url::Url = origin.parse().map_err(|e| {
+                anyhow::anyhow!("http.allowed_origins entry {origin:?} is not a valid URL: {e}")
+            })?;
+            if parsed.scheme() != "http" && parsed.scheme() != "https" {
+                anyhow::bail!(
+                    "http.allowed_origins entry {origin:?} must use http(s), got {:?}",
+                    parsed.scheme()
+                );
+            }
         }
         Ok(())
     }
@@ -240,6 +270,21 @@ pub struct DatabaseConfig {
 
 fn default_db_prefix() -> String {
     "oxkv".to_string()
+}
+
+/// HTTP edge settings for browser clients.
+///
+/// CORS is deny-by-default: empty `allowed_origins` serves API responses
+/// without `Access-Control-Allow-Origin` (same-origin only). List each
+/// browser origin explicitly when the SPA is served cross-origin; origins
+/// must be `http(s)` URLs without trailing slash. Credentials are always
+/// allowed so the `auth_token` cookie and `Authorization` bearer header
+/// work across origins.
+#[derive(Deserialize, Debug, Default, Clone)]
+pub struct HttpConfig {
+    /// Browser origins allowed by CORS (e.g. `["https://app.example.com"]`).
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
 }
 
 /// Capability-token (file delegation JWT) signing keys.
@@ -485,6 +530,47 @@ mod tests {
         let path = tmp_toml(&ok);
         assert!(Config::try_from(path.as_path()).is_ok());
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn http_allowed_origins_default_empty_and_validate() {
+        // Omitted [http] section means same-origin only.
+        let path = tmp_toml(&minimal_toml());
+        let cfg = Config::try_from(path.as_path()).expect("should parse");
+        assert!(cfg.http.allowed_origins.is_empty());
+        let _ = std::fs::remove_file(&path);
+
+        // Explicit origins parse.
+        let toml = minimal_toml().replace(
+            "region = \"us-east-1\"",
+            "region = \"us-east-1\"\n[http]\nallowed_origins = [\"https://app.example.com\", \"http://localhost:5173\"]",
+        );
+        let path = tmp_toml(&toml);
+        let cfg = Config::try_from(path.as_path()).expect("should parse");
+        assert_eq!(
+            cfg.http.allowed_origins,
+            vec![
+                "https://app.example.com".to_string(),
+                "http://localhost:5173".to_string()
+            ]
+        );
+        let _ = std::fs::remove_file(&path);
+
+        // Non-http(s) origins fail at startup, not obscurely in the browser.
+        let err = validation_error(
+            &minimal_toml().replace(
+                "region = \"us-east-1\"",
+                "region = \"us-east-1\"\n[http]\nallowed_origins = [\"ftp://app.example.com\"]",
+            ),
+        );
+        assert!(err.contains("http.allowed_origins"), "unexpected: {err}");
+        let err = validation_error(
+            &minimal_toml().replace(
+                "region = \"us-east-1\"",
+                "region = \"us-east-1\"\n[http]\nallowed_origins = [\"not a url\"]",
+            ),
+        );
+        assert!(err.contains("http.allowed_origins"), "unexpected: {err}");
     }
 
     #[test]

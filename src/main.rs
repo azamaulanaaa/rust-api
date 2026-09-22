@@ -277,6 +277,7 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
         move || enforcer.try_read().is_ok()
     });
     ApiService::new()
+        .with_cors_origins(config.http.allowed_origins.clone())
         .with_readiness_check(readiness)
         .register_module(Box::new(oidc_api_module))
         .register_module(Box::new(setup_api_module))
