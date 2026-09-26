@@ -42,7 +42,7 @@ pub async fn sweep_once(engine: &FsEngine) -> Result<usize, crate::fs::error::Fs
 
     // sessions
     for s in &sessions {
-        if now - s.created_at <= TTL_SECS {
+        if !s.is_expired(now, TTL_SECS) {
             continue;
         }
         tracing::info!(
@@ -72,7 +72,11 @@ pub async fn sweep_once(engine: &FsEngine) -> Result<usize, crate::fs::error::Fs
             continue;
         }
         tracing::info!("fs gc expiring file {} (age {}s)", f.id, now - age);
-        // Same retain-on-failure contract as sessions above.
+        // Same retain-on-failure contract as sessions above. Age is measured
+        // from `orphan_since` when the file was attached and later detached,
+        // falling back to `created_at` for a file that was never referenced;
+        // unlike a session there is no record method to delegate to, since
+        // the timestamp lives on `RefInfo`, not on `FileRecord`.
         if engine
             .s3
             .delete_object(&engine.bucket, &f.s3_key)
@@ -140,13 +144,6 @@ pub async fn sweep_once(engine: &FsEngine) -> Result<usize, crate::fs::error::Fs
     Ok(cleaned)
 }
 
-impl crate::fs::store::UploadSession {
-    /// Check if expired at `now`.
-    pub fn is_expired(&self, now: i64) -> bool {
-        now - self.created_at > TTL_SECS
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -210,8 +207,8 @@ mod tests {
             etags: vec![None],
             checksums: vec![None],
         };
-        assert!(!s.is_expired(now));
-        assert!(s.is_expired(now + 1));
+        assert!(!s.is_expired(now, TTL_SECS));
+        assert!(s.is_expired(now + 1, TTL_SECS));
     }
 
     #[tokio::test]

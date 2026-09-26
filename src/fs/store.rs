@@ -39,6 +39,17 @@ pub struct UploadSession {
     pub checksums: Vec<Option<String>>,
 }
 
+impl UploadSession {
+    /// True when the session is older than `ttl_secs` at `now`.
+    ///
+    /// Takes the TTL as an argument so the retention policy stays with the
+    /// sweeper ([`crate::fs::gc::TTL_SECS`]) rather than being baked into
+    /// the record type.
+    pub fn is_expired(&self, now: i64, ttl_secs: i64) -> bool {
+        now - self.created_at > ttl_secs
+    }
+}
+
 /// Durable S3-side multipart state: mirrors the client RAM map so
 /// uploads survive restarts. The object-store `MultipartId` is a plain
 /// string and staged `PartId`s rebuild from their content ids, so a
