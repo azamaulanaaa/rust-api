@@ -1,3 +1,13 @@
+//! Actix routes for the OIDC login, callback, session, and logout flows.
+//!
+//! [`OidcApiModule`](crate::oidc::route::OidcApiModule) owns the provider
+//! client and the public `/auth/login`, `/auth/callback`, and
+//! `/auth/logout` routes, and seeds the JWT validation middleware every
+//! other module reuses. [`OidcSessionModule`](crate::oidc::route::OidcSessionModule)
+//! is split out so `/auth/me` always serves the concrete
+//! [`Claims`](crate::http::middleware::jwt::Claims) shape the SPA
+//! codegen depends on, independent of how a host app types its own claims.
+
 use std::sync::Arc;
 
 use actix_web::{

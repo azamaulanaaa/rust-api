@@ -10,6 +10,7 @@
 use std::{
     future::{Ready, ready},
     rc::Rc,
+    sync::LazyLock,
     time::Instant,
 };
 
@@ -22,7 +23,6 @@ use opentelemetry::{
     KeyValue, global,
     metrics::{Counter, Histogram},
 };
-use std::sync::LazyLock;
 use tracing::{Instrument, field::Empty};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 

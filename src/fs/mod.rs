@@ -19,13 +19,12 @@ use std::sync::Arc;
 
 use crate::policy::row::RowAuthorizer;
 use crate::policy::{Action, PolicyEngine};
+use crate::sync::wal::{Wal, WalOp};
 
 use error::FsError;
 use model::{CompleteRequest, FileMetadata, InitRequest};
 use s3::S3Client;
 use store::{FileRecord, FsStore, UploadSession};
-
-use crate::sync::wal::{Wal, WalOp};
 
 /// Core file-system engine with temp per-user scope and row delegation.
 #[derive(Clone)]

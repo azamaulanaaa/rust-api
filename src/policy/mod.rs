@@ -1,3 +1,14 @@
+//! Casbin RBAC policy engine backed by prefix-scoped OxKV stores, with
+//! management routes for permission rules and group membership.
+//!
+//! [`PolicyEngine`](crate::policy::PolicyEngine) owns the enforcer and is
+//! cheap to clone (the enforcer sits behind an `Arc`), so the same policy
+//! state is shared across every API module.
+//! [`Authorizer`](crate::policy::Authorizer) is the read-only handle for
+//! callers that must never mutate policies, and
+//! [`row::RowAuthorizer`](crate::policy::row::RowAuthorizer) adds
+//! row-level (`{type}:{id}`) checks on top.
+
 use std::sync::Arc;
 use std::{collections::HashMap, fmt, str::FromStr};
 

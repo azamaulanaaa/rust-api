@@ -1,3 +1,10 @@
+//! Actix routes for `/policy` rule and group management.
+//!
+//! Every handler is self-authorizing: it first requires the caller to hold
+//! Casbin permission on the [`Resource`](crate::policy::route::Resource) it
+//! touches (`rules` for rule endpoints, `user_groups` for membership and
+//! listing endpoints), so a merely valid token is not enough.
+
 use std::sync::Arc;
 
 use actix_web::{HttpResponse, Responder, delete, get, post, web};

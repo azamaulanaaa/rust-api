@@ -1,3 +1,11 @@
+//! Actix middleware extracting the `Authorization: Bearer <token>` header.
+//!
+//! Runs globally and is deliberately permissive: it only parses the header
+//! and stashes the raw string in request extensions, leaving every
+//! accept/reject decision to the downstream
+//! [`JwtClaimsMiddleware`](crate::http::middleware::jwt::JwtClaimsMiddleware).
+//! A request that presents no header passes through untouched.
+
 use std::{
     future::{Ready, ready},
     rc::Rc,
