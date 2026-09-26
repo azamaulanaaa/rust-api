@@ -91,14 +91,69 @@ pub struct FsStore {
     /// `inner`. The mirror never takes an epoch (it wraps a clone that
     /// shares the session), so it cannot fence the writer.
     mirror: Option<CachedOxKvStore>,
+    /// True when this store is the master `{db}/fs` prefix.
+    ///
+    /// Decides whether a lost epoch latches the process-wide fencing signal.
+    /// The same `FsStore` type also backs per-user *replica* prefixes during
+    /// a sync build, where losing a race is routine and resolved by adopting
+    /// the winner's coverage -- so latching there would take a healthy server
+    /// out of rotation over a non-event. Marking it explicitly at the one
+    /// place that owns the master store ([`FsEngine::init`](crate::fs::FsEngine::init))
+    /// keeps the distinction with the ownership rather than inferred from a
+    /// key prefix.
+    primary: bool,
 }
 
 impl FsStore {
+    /// The master `{db}/fs` prefix, named in the fencing-loss log line.
+    const FS_PREFIX: &str = "{db}/fs";
+
+    /// Whether a failure on this store should latch the process-wide
+    /// fencing signal.
+    ///
+    /// The rule is: only the master prefix, and only a lost epoch. Both
+    /// halves are load-bearing and neither is obvious from the call site, so
+    /// they live in one predicate.
+    fn latches(&self, err: &FsError) -> bool {
+        // A replica write that loses a build race is recovered from by
+        // `sync` (adopting the winner's coverage), and latching it would
+        // take a healthy server out of rotation over a non-event.
+        self.primary && err.is_fencing_loss()
+    }
+
+    /// Maps oxkv errors into [`FsError`], latching a fencing loss when this
+    /// store owns the master prefix.
+    ///
+    /// Latching here rather than in [`FsError`]'s own conversion is the whole
+    /// point. The same `FsError` carries replica-write failures, and `sync`
+    /// recovers from those by design. A mark on the one store that owns the
+    /// primary prefix keeps the distinction with the ownership rather than
+    /// inferred from a key prefix.
+    fn store_err(&self, e: oxkv::StoreError) -> FsError {
+        let err = FsError::from(e);
+        if self.latches(&err) {
+            crate::fencing::note_primary_loss(Self::FS_PREFIX, err.detail());
+        }
+        err
+    }
+
     /// Creates an FS store from an [`OxKvStore`] (per-user S3, scalable).
+    ///
+    /// Not the master store: see [`FsStore::primary`].
     pub fn new(s3_store: OxKvStore) -> Self {
         Self {
             inner: Arc::new(RwLock::new(s3_store)),
             mirror: None,
+            primary: false,
+        }
+    }
+
+    /// Creates the master `{db}/fs` store, whose fencing losses are terminal
+    /// for this process.
+    pub fn primary(s3_store: OxKvStore) -> Self {
+        Self {
+            primary: true,
+            ..Self::new(s3_store)
         }
     }
 
@@ -117,6 +172,7 @@ impl FsStore {
         Ok(Self {
             inner: Arc::new(RwLock::new(s3_store)),
             mirror: Some(mirror),
+            primary: false,
         })
     }
 
@@ -292,7 +348,7 @@ impl FsStore {
         let key = Self::file_key(id);
         let refs = refs_key(id);
         let g = self.inner.write().await;
-        let tx = g.begin_tx().map_err(store_err)?;
+        let tx = g.begin_tx().map_err(|e| self.store_err(e))?;
         let suffix = format!(":{id}");
         let cursor = (
             Some(REL_PREFIX.to_string()),
@@ -301,15 +357,15 @@ impl FsStore {
         let kvs = tx
             .gets_bytes(None, Direction::Next, cursor)
             .await
-            .map_err(store_err)?;
+            .map_err(|e| self.store_err(e))?;
         for kv in &kvs {
             if kv.key.starts_with(REL_PREFIX) && kv.key.ends_with(&suffix) {
-                tx.delete(&kv.key).await.map_err(store_err)?;
+                tx.delete(&kv.key).await.map_err(|e| self.store_err(e))?;
             }
         }
-        tx.delete(&key).await.map_err(store_err)?;
+        tx.delete(&key).await.map_err(|e| self.store_err(e))?;
         let _ = tx.delete(&refs).await;
-        tx.commit().await.map_err(store_err)?;
+        tx.commit().await.map_err(|e| self.store_err(e))?;
         Ok(())
     }
 
@@ -336,19 +392,28 @@ impl FsStore {
         let rel = rel_key(row_type, row_id, file_id);
         let refs = refs_key(file_id);
         let g = self.inner.write().await;
-        let tx = g.begin_tx().map_err(store_err)?;
-        if tx.get_bytes(&rel).await.map_err(store_err)?.is_some() {
-            let info = read_ref_info(&tx, file_id).await?;
-            tx.rollback().await.map_err(store_err)?;
+        let tx = g.begin_tx().map_err(|e| self.store_err(e))?;
+        if tx
+            .get_bytes(&rel)
+            .await
+            .map_err(|e| self.store_err(e))?
+            .is_some()
+        {
+            let info = read_ref_info(&tx, file_id, self.primary).await?;
+            tx.rollback().await.map_err(|e| self.store_err(e))?;
             return Ok(info.count);
         }
-        let mut info = read_ref_info(&tx, file_id).await?;
+        let mut info = read_ref_info(&tx, file_id, self.primary).await?;
         info.count = info.count.saturating_add(1);
         info.orphan_since = None;
-        tx.set_bytes(&rel, b"1").await.map_err(store_err)?;
+        tx.set_bytes(&rel, b"1")
+            .await
+            .map_err(|e| self.store_err(e))?;
         let val = serde_json::to_vec(&info).map_err(|e| FsError::Internal(e.to_string()))?;
-        tx.set_bytes(&refs, &val).await.map_err(store_err)?;
-        tx.commit().await.map_err(store_err)?;
+        tx.set_bytes(&refs, &val)
+            .await
+            .map_err(|e| self.store_err(e))?;
+        tx.commit().await.map_err(|e| self.store_err(e))?;
         Ok(info.count)
     }
 
@@ -364,21 +429,28 @@ impl FsStore {
         let rel = rel_key(row_type, row_id, file_id);
         let refs = refs_key(file_id);
         let g = self.inner.write().await;
-        let tx = g.begin_tx().map_err(store_err)?;
-        if tx.get_bytes(&rel).await.map_err(store_err)?.is_none() {
-            let info = read_ref_info(&tx, file_id).await?;
-            tx.rollback().await.map_err(store_err)?;
+        let tx = g.begin_tx().map_err(|e| self.store_err(e))?;
+        if tx
+            .get_bytes(&rel)
+            .await
+            .map_err(|e| self.store_err(e))?
+            .is_none()
+        {
+            let info = read_ref_info(&tx, file_id, self.primary).await?;
+            tx.rollback().await.map_err(|e| self.store_err(e))?;
             return Ok(info.count);
         }
-        let mut info = read_ref_info(&tx, file_id).await?;
-        tx.delete(&rel).await.map_err(store_err)?;
+        let mut info = read_ref_info(&tx, file_id, self.primary).await?;
+        tx.delete(&rel).await.map_err(|e| self.store_err(e))?;
         info.count = info.count.saturating_sub(1);
         if info.count == 0 {
             info.orphan_since = Some(chrono::Utc::now().timestamp());
         }
         let val = serde_json::to_vec(&info).map_err(|e| FsError::Internal(e.to_string()))?;
-        tx.set_bytes(&refs, &val).await.map_err(store_err)?;
-        tx.commit().await.map_err(store_err)?;
+        tx.set_bytes(&refs, &val)
+            .await
+            .map_err(|e| self.store_err(e))?;
+        tx.commit().await.map_err(|e| self.store_err(e))?;
         Ok(info.count)
     }
 
@@ -468,16 +540,26 @@ impl FsStore {
     }
 }
 
-/// Maps oxkv errors into [`FsError`].
-fn store_err(e: oxkv::StoreError) -> FsError {
-    FsError::from(e)
-}
-
 /// Reads ref-count info through any [`GetSet`] handle (store or
 /// transaction); absent entries mean "never attached".
-async fn read_ref_info<T: GetSet>(tx: &T, file_id: &str) -> Result<RefInfo, FsError> {
+///
+/// `primary` carries the owning store's mark, because a transaction is not
+/// an `FsStore` and a fencing loss on this read still has to reach the
+/// latch when the read is part of a master mutation.
+async fn read_ref_info<T: GetSet>(
+    tx: &T,
+    file_id: &str,
+    primary: bool,
+) -> Result<RefInfo, FsError> {
     let key = refs_key(file_id);
-    let Some(bytes) = tx.get_bytes(&key).await.map_err(store_err)? else {
+    let bytes = tx.get_bytes(&key).await.map_err(|e| {
+        let err = FsError::from(e);
+        if primary && err.is_fencing_loss() {
+            crate::fencing::note_primary_loss(FsStore::FS_PREFIX, err.detail());
+        }
+        err
+    })?;
+    let Some(bytes) = bytes else {
         return Ok(RefInfo::default());
     };
     serde_json::from_slice(&bytes).map_err(|e| FsError::Internal(e.to_string()))
@@ -500,6 +582,32 @@ fn prefix_scan_end(prefix: &str) -> String {
 mod tests {
     use super::{FileRecord, FsStore, PersistedMultipart, UploadSession};
     use crate::db::build_test_store;
+
+    /// Which failures take this process out of rotation.
+    ///
+    /// The master/replica split is the whole point of the latch, and it is
+    /// the half that can be asserted without touching the process-wide
+    /// signal: a replica write that loses a build race is recovered from by
+    /// `sync`, so latching it would pull a healthy server out of rotation
+    /// over a non-event. A non-fencing failure on the master is a plain 500
+    /// and must not latch either, or a flaky S3 would read as a lost lease.
+    #[tokio::test]
+    async fn only_a_fenced_master_write_latches() {
+        use crate::fs::error::FsError;
+
+        let master =
+            FsStore::primary(build_test_store(&crate::db::test_prefix("latch-master")).await);
+        let replica =
+            FsStore::new(build_test_store(&crate::db::test_prefix("latch-replica")).await);
+
+        let fenced = FsError::from(oxkv::StoreError::Fenced("epoch 2".into()));
+        let other = FsError::from(oxkv::StoreError::Storage("bucket gone".into()));
+
+        assert!(master.latches(&fenced), "a fenced master write is terminal");
+        assert!(!replica.latches(&fenced), "a replica build race is not");
+        assert!(!master.latches(&other), "a flaky store is not a lost epoch");
+        assert!(!replica.latches(&other));
+    }
 
     async fn test_store() -> FsStore {
         let s3 = build_test_store(&crate::db::test_prefix("fs-store")).await;

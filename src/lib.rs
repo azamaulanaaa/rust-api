@@ -55,6 +55,10 @@ pub mod db;
 /// divergence.
 pub mod lease;
 
+/// Process-wide latch for a lost primary write session, covering the
+/// uncooperative case the lease cannot see.
+pub mod fencing;
+
 /// Telemetry bootstrap: global [`tracing`] subscriber installation and
 /// OpenTelemetry wiring.
 pub mod telemetry;

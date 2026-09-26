@@ -78,6 +78,7 @@ src/
 ├── config.rs            TOML configuration model ([database].prefix + mirror_master, [s3], [observability], [capability], [http].allowed_origins + RUST_API_ALLOWED_ORIGINS; binary-private `mod config`)
 ├── db.rs                OxKV store factory — one AmazonS3Builder for file bytes + OxKvStore; build_s3_store / build_test_store / build_test_store_new_session / build_scratch_store / test_prefix; single-live-handle-per-prefix contract
 ├── lease.rs             single-writer lease on [database].prefix (startup refusal + renewal + release)
+├── fencing.rs           process-wide latch for a fenced *primary* prefix; gates /ready alongside the lease
 ├── telemetry.rs         tracing subscriber + OTLP span/metric export bootstrap (otlp-grpc / otlp-http features)
 ├── docs.rs              utoipa OpenAPI `ApiDoc` (all routes; served via http/docs.rs as /openapi.json + /swagger-ui/)
 ├── records.rs           shared change-feed vocabulary — FileRecord, WalOp/WalEntry, ChangeSink/ChangeError; the leaf that breaks the fs↔sync cycle (see Layering)
@@ -147,11 +148,17 @@ So the server claims an explicit **writer lease** (`src/lease.rs`) on `{prefix}/
 | Orderly shutdown | Lease is released, so a rolling restart hands over without waiting out the TTL |
 | Record unparseable | Refused, never overwritten — guessing the owner is the failure this exists to prevent |
 
+The lease only sees writers that take it. `src/fencing.rs` covers the uncooperative case: if a primary prefix (`{db}/fs`, `{db}/policy`, `{db}/wal`) is fenced anyway — an older build, a `writer_lease_ttl_secs = 0` deployment, an operator running `policy import` against a live prefix — the loss latches a process-wide signal that `/ready` also reports, and the log gets one `error` line naming the prefix. Every subsequent write on that handle fails the same way, so only the first is logged at `error` and the repeats drop to `debug`.
+
+A **replica** fencing loss deliberately does not latch. Losing a build race is routine and `sync` resolves it by adopting the winner's coverage, so `FsStore` carries an explicit primary mark (`FsStore::primary` vs `FsStore::new`) that decides whether a failure is terminal; `sync`'s replica stores are never marked. A latch in the shared `oxkv::StoreError → FsError` conversion would have pulled a healthy server out of rotation every time two workers raced to build one user's replica.
+
+The process is **not** terminated on a fencing loss. It is already read-only, so it can no longer diverge, and exiting immediately means zero healthy writers if the successor is not serving yet — marking the instance unready drains it through the load balancer instead, and leaves the restart to an operator who has the log line saying the handle is terminal.
+
 The lease cannot stop a network partition from splitting the prefix; nothing lease-based can. What it buys is that the losing side *finds out* and stops taking traffic rather than discovering it through corrupted data.
 
 > **Set `writer_lease_ttl_secs = 0` only where exactly one process can ever reach the bucket** (a laptop, a single container). It disables enforcement and logs a warning at startup. The TTL must otherwise exceed your worst-case pause between renewals — a long GC pause or a slow S3 round trip — or a healthy process gets displaced by its own peer. Renewal runs at a third of the TTL, so two consecutive missed renewals still leave a full TTL of headroom.
 
-`/ready` reports 503 when the lease is lost, so this composes with an existing readiness probe rather than requiring a new one.
+`/ready` reports 503 when the lease is lost **or** a primary prefix is fenced (see below), so this composes with an existing readiness probe rather than requiring a new one.
 
 ### Fencing losses are typed, not string-matched
 

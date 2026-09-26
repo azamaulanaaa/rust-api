@@ -143,7 +143,7 @@ impl FsEngine {
         s3_config: &s3::S3ClientConfig,
         policy: PolicyEngine,
     ) -> Result<Self, FsError> {
-        let store = FsStore::new(s3_store);
+        let store = FsStore::primary(s3_store);
         let s3 = s3::build_s3_client(s3_config)
             .await
             .map_err(|e| FsError::Internal(format!("failed to build S3 client: {e}")))?;
@@ -801,7 +801,7 @@ mod tests {
         use crate::db::build_test_store;
         let prefix = format!("{}-{sub}", crate::db::test_prefix("fs-engine"));
         let s3_store = build_test_store(&prefix).await;
-        let store = FsStore::new(s3_store);
+        let store = FsStore::primary(s3_store);
         let policy_prefix = format!("{prefix}-policy");
         let policy_store = build_test_store(&policy_prefix).await;
         let policy = PolicyEngine::init_s3(policy_store).await.unwrap();
