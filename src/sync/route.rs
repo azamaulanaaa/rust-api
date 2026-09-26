@@ -311,9 +311,9 @@ mod tests {
         let manager = SnapshotManager::new(
             wal,
             backing,
-            policy,
+            policy.authorizer(),
             mem.clone() as std::sync::Arc<dyn object_store::ObjectStore>,
-            "test-db".into(),
+            "test-db",
             true,
         );
         manager.build_full("alice").await?;
