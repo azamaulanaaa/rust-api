@@ -53,10 +53,12 @@ The crate is intentionally business-logic free: applications compose `ApiModule`
 | GET | `/sync/status` | Replica pointer + coverage ETag (`prefix`, `applied_seq`, `head`; never builds) | Bearer token |
 | POST | `/sync/sync` | Advance replica toward WAL head (short-circuit, replay, or full recalc) | Bearer token |
 | GET | `/sync/db/{object}` | One replica object (manifest/SST/WAL) with ETag + `If-None-Match` | Bearer token |
+| GET | `/openapi.json` | Generated OpenAPI 3.1 document (served from `src/docs.rs`) | none |
+| GET | `/swagger-ui/` | Swagger UI for the spec above | none |
 
-Protected routes accept either an explicit `Authorization: Bearer <token>` header (preferred) or the session cookie set by `/auth/callback`. Requests without valid credentials get `401`; insufficient permissions get `403`. `/policy/*` additionally requires Casbin permissions (`rules:read/write` for rule endpoints, `user_groups:read/write` for group/user endpoints) — a merely valid token is not enough. `/setup/admin` requires a valid JWT but no policy check (one-time bootstrap). All errors use a uniform JSON envelope: `{"error": "<message>"}`.
+Protected routes accept either an explicit `Authorization: Bearer <token>` header (preferred) or the session cookie set by `/auth/callback`. Requests without valid credentials get `401`; insufficient permissions get `403`. `/policy/*` additionally requires Casbin permissions (`rules` + `read`/`write` for rule endpoints, `user_groups` + `read`/`write` for group/user endpoints) — a merely valid token is not enough. `/setup/admin` requires a valid JWT but no policy check (one-time bootstrap). Errors use a `{"error": "<message>"}` envelope with a stable, non-sensitive message per status (`"forbidden"`, `"not found"`, `"internal server error"`, …); server-side causes are logged, never serialized. Two deliberate exceptions use their own bodies: `/auth/callback` returns an `AuthResponse` envelope (`success`/`token`/`error`) because the SPA reads the token from it, and the OpenAPI/Swagger routes return spec documents.
 
-Every served route is in the OpenAPI spec: `src/docs.rs` (`/openapi.json` + `/swagger-ui/`) covers `/health`, `/ready`, `/auth/*`, `/setup/admin`, `/fs/*`, `/policy/*`, and `/sync/*` — generate the SPA client from it instead of hand-writing fetch shapes.
+Every served route is in the OpenAPI spec: `src/docs.rs` (`/openapi.json` + `/swagger-ui/`) covers `/health`, `/ready`, `/auth/*`, `/setup/admin`, `/fs/*`, `/policy/*`, and `/sync/*` — generate the SPA client from it instead of hand-writing fetch shapes. `spec_covers_all_served_routes` fails the build if a route is added to a module without appearing in the spec.
 
 ### First-run bootstrap
 
@@ -292,6 +294,7 @@ impl ApiModule for MyModule {
 ```
 
 Handlers can extract validated JWT claims via the `Validated<C>` extractor (returns 401 automatically when claims are absent). See the crate documentation (`cargo doc --no-deps --open`) for details.
+
 ## Development
 
 ```bash
