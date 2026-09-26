@@ -72,7 +72,7 @@ async fn claim_admin(
 ) -> Result<impl Responder, ApiError> {
     let claimed = policy_engine.claim_superadmin(&auth_claims.sub).await?;
     if !claimed {
-        return Err(ApiError::Conflict("setup already completed".to_string()));
+        return Err(ApiError::Conflict);
     }
     tracing::info!(
         "bootstrap: assigned {SUPERADMIN_ROLE} role to {}",
