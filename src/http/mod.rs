@@ -1,3 +1,13 @@
+//! HTTP server scaffolding: a modular service registry plus the request
+//! middleware every module builds on (bearer-token extraction, JWKS-backed
+//! JWT validation, per-request tracing) and the shared body-size limits.
+//!
+//! [`ApiService`](crate::http::ApiService) composes
+//! [`ApiModule`](crate::http::ApiModule) implementations into one Actix
+//! application; [`cors`](crate::http::cors) and
+//! [`health`](crate::http::health) hold the edge settings and probes that
+//! are not module-specific.
+
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use actix_web::{App, HttpServer, web};

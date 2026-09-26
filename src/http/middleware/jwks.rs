@@ -8,11 +8,9 @@
 use std::{
     collections::HashMap,
     str::FromStr,
-    sync::Arc,
+    sync::{Arc, LazyLock},
     time::{Duration, Instant},
 };
-
-use std::sync::LazyLock;
 
 use jsonwebtoken::{
     Algorithm, DecodingKey,

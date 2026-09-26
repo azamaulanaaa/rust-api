@@ -1,3 +1,10 @@
+//! Liveness and readiness probes.
+//!
+//! [`health`](crate::http::health::health) is a static 200 so a wedged
+//! dependency cannot fail the liveness check;
+//! [`ready`](crate::http::health::ready) reflects the injected
+//! [`ReadyCheck`](crate::http::health::ReadyCheck).
+
 use std::sync::Arc;
 
 use actix_web::{HttpResponse, Responder, get, web};

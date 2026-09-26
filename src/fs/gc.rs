@@ -4,9 +4,7 @@
 //! Expired files are logged to the WAL (when the engine has one wired)
 //! so replicas replay the deletion instead of keeping stale copies.
 
-use std::collections::HashSet;
-use std::sync::Arc;
-use std::time::Duration;
+use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use tokio::time::interval;
 

@@ -1,3 +1,13 @@
+//! OpenID Connect client and login/callback routes implementing the
+//! authorization-code flow with PKCE, CSRF state, and nonce validation.
+//!
+//! [`OidcClient`](crate::oidc::OidcClient) wraps the discovered provider
+//! metadata: it builds authorization URLs with fresh PKCE/CSRF/nonce
+//! values and exchanges authorization codes for signature-verified ID
+//! tokens. Multi-tenant providers that publish a `{tenantid}` issuer
+//! placeholder are supported by resolving the expected issuer per token
+//! instead of pinning it statically.
+
 use openidconnect::core::{CoreClient, CoreProviderMetadata, CoreResponseType};
 use openidconnect::{
     AuthenticationFlow, AuthorizationCode, ClientId, ClientSecret, CsrfToken, EndpointMaybeSet,
