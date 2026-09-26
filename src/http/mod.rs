@@ -100,12 +100,62 @@ pub fn cors(allowed_origins: &[String]) -> actix_cors::Cors {
 /// app data and middleware. Implement this to plug business functionality
 /// into an [`ApiService`].
 pub trait ApiModule: Send + Sync {
+    /// The single route prefix this module owns, e.g. `/fs`.
+    ///
+    /// Declared so [`ApiService::configure`] can refuse to mount two
+    /// modules on the same prefix. Actix matches services in registration
+    /// order and a scope matches its whole prefix rather than the paths it
+    /// declares, so the second module's routes are not merged with the
+    /// first's -- they are unreachable, and the symptom is a `404` on a
+    /// route that is documented, present in the OpenAPI document, and
+    /// covered by a passing unit test that happens to mount the module
+    /// alone.
+    ///
+    /// Return the empty string for a module that mounts only top-level
+    /// routes (`/health`, `/openapi.json`); such a module still conflicts
+    /// with any other empty-prefix module.
+    fn prefix(&self) -> &str;
+
     /// Registers this module's scopes, services, and app data on the Actix
     /// application configuration.
     fn configure(&self, cfg: &mut web::ServiceConfig);
 }
 
-/// Registers the modules and readiness probe onto a `ServiceConfig`.
+/// Two modules declared the same [`ApiModule::prefix`].
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "two API modules both claim the route prefix `{prefix}`: the first \
+     registered answers every `{prefix}`/* request and the second's routes \
+     are unreachable. Merge them into one module, or give one a different prefix."
+)]
+pub struct DuplicateRoutePrefix {
+    /// The contested prefix.
+    pub prefix: String,
+}
+
+/// Rejects a module set in which two modules claim the same
+/// [`ApiModule::prefix`].
+///
+/// Called before anything is mounted, so a rejected composition leaves no
+/// half-registered routes behind.
+fn check_prefixes(modules: &[Box<dyn ApiModule>]) -> Result<(), DuplicateRoutePrefix> {
+    let mut seen: Vec<&str> = Vec::with_capacity(modules.len());
+    for module in modules {
+        let prefix = module.prefix();
+        if seen.contains(&prefix) {
+            return Err(DuplicateRoutePrefix {
+                prefix: prefix.to_string(),
+            });
+        }
+        seen.push(prefix);
+    }
+    Ok(())
+}
+
+/// Mounts the modules and readiness probe onto a `ServiceConfig`.
+///
+/// Infallible by contract: [`check_prefixes`] has already rejected
+/// collisions, and both call sites run it first.
 ///
 /// Shared by [`ApiService::configure`] and [`wired_app!`] so the public
 /// composable path and the served path cannot drift.
@@ -132,6 +182,12 @@ fn register_modules(
 /// needs. Expanding at the call site gives each site the concrete type
 /// inference it requires while keeping a single description of the
 /// middleware order and the registered app data.
+///
+/// Crate-internal, and the only thing that mounts without threading a
+/// `Result` through actix's `configure` closures, which return `()`. Both
+/// call sites run [`check_prefixes`] first and surface the error properly;
+/// the assertion here is unreachable, and turning it into a startup panic
+/// beats silently shadowing a module.
 macro_rules! wired_app {
     ($modules:expr, $readiness:expr, $cors_origins:expr) => {{
         apply_limits(App::new())
@@ -139,7 +195,12 @@ macro_rules! wired_app {
             .wrap(middleware::request_tracing::RequestTracingMiddleware)
             .wrap(middleware::bearer_token::BearerTokenMiddleware)
             .configure(health_routes)
-            .configure(|cfg| register_modules($modules, $readiness, cfg))
+            .configure(|cfg| {
+                if let Err(e) = check_prefixes($modules) {
+                    panic!("{e}");
+                }
+                register_modules($modules, $readiness, cfg);
+            })
             // Mounted last on purpose. The API modules are the surface that
             // matters, and anything catch-all mounted ahead of them can
             // shadow them -- which is exactly what a `web::scope("")`
@@ -235,20 +296,30 @@ impl ApiService {
     /// plus [`apply_limits`], [`health_routes`], and [`docs::config`], and
     /// the result is exactly what `start` serves.
     ///
+    /// Fails with [`DuplicateRoutePrefix`] if two registered modules declare
+    /// the same [`ApiModule::prefix`]. Checked before anything is mounted.
+    ///
     /// Note what is deliberately *not* offered: a method returning the
     /// assembled `App`. actix-web exposes no nameable public type for it
     /// (`BoxedHttpServiceFactory` is crate-private), so such a signature
     /// would either leak an unnameable `impl` bound that `HttpServer::new`
     /// rejects, or force a dynamic factory per worker. Configuring an `App`
     /// the caller already owns is both expressible and cheaper.
-    pub fn configure(&self, cfg: &mut web::ServiceConfig) {
+    pub fn configure(&self, cfg: &mut web::ServiceConfig) -> Result<(), DuplicateRoutePrefix> {
+        check_prefixes(&self.modules)?;
         register_modules(&self.modules, &self.readiness, cfg);
+        Ok(())
     }
 
     /// Binds the composed application to `addr` and serves it until a
     /// shutdown signal (Ctrl-C / SIGTERM) arrives, then drains
     /// connections within the shutdown timeout before returning.
     pub async fn start(self, addr: SocketAddr) -> anyhow::Result<()> {
+        // Before the listener exists, so a bad composition is a startup
+        // error naming the prefix rather than a running server with a
+        // module whose routes 404.
+        check_prefixes(&self.modules)?;
+
         let modules = Arc::new(self.modules);
         let readiness = self.readiness.clone();
         let cors_origins = self.cors_origins.clone();
@@ -281,6 +352,10 @@ mod tests {
     struct PingModule;
 
     impl ApiModule for PingModule {
+        fn prefix(&self) -> &str {
+            "/ping"
+        }
+
         fn configure(&self, cfg: &mut web::ServiceConfig) {
             cfg.service(
                 web::scope("/ping")
@@ -382,7 +457,7 @@ mod tests {
         let app = test::init_service(
             apply_limits(App::new())
                 .configure(health_routes)
-                .configure(|cfg| service.configure(cfg)),
+                .configure(|cfg| service.configure(cfg).expect("no prefix collision")),
         )
         .await;
         for uri in ["/health", "/ping"] {
@@ -390,6 +465,61 @@ mod tests {
                 test::call_service(&app, test::TestRequest::get().uri(uri).to_request()).await;
             assert_eq!(res.status(), 200, "{uri} missing from the configured app");
         }
+    }
+
+    /// A module set that mounts two of the same prefix is a composition
+    /// error, and it has to surface as one.
+    ///
+    /// Actix does not report it: a scope matches its whole prefix and
+    /// services are tried in registration order, so the second module's
+    /// routes are simply never consulted. The result is a server that
+    /// starts cleanly and 404s a documented route. `OidcApiModule` and
+    /// `OidcSessionModule` both claiming `/auth` is exactly what happened.
+    #[actix_web::test]
+    async fn two_modules_on_one_prefix_is_rejected() {
+        let service = ApiService::new()
+            .register_module(Box::new(PingModule))
+            .register_module(Box::new(PingModule));
+
+        // Captured out of the closure because actix's `configure` takes an
+        // infallible `FnOnce(&mut ServiceConfig)`.
+        let outcome = std::cell::RefCell::new(None);
+        let app = test::init_service(apply_limits(App::new()).configure(|cfg| {
+            *outcome.borrow_mut() = Some(service.configure(cfg).err());
+        }))
+        .await;
+
+        let err = outcome
+            .into_inner()
+            .expect("configure ran")
+            .expect("duplicate /ping should be refused");
+        assert_eq!(err.prefix, "/ping");
+        // The message has to name the prefix and say what happened,
+        // because this is the only diagnostic a host app gets.
+        let rendered = err.to_string();
+        assert!(rendered.contains("/ping"), "{rendered}");
+        assert!(rendered.contains("unreachable"), "{rendered}");
+
+        // Prefixes are checked before anything is mounted, so the refused
+        // set left no half-registered routes behind.
+        let res =
+            test::call_service(&app, test::TestRequest::get().uri("/ping").to_request()).await;
+        assert_eq!(res.status(), 404);
+    }
+
+    /// The same set through the served path, which is where a bad
+    /// composition would otherwise bind a socket and serve a broken API.
+    #[actix_web::test]
+    async fn start_refuses_a_duplicate_prefix_before_binding() {
+        let service = ApiService::new()
+            .register_module(Box::new(PingModule))
+            .register_module(Box::new(PingModule));
+        // Port 0 is never bound because validation runs first.
+        let err = service
+            .start("127.0.0.1:0".parse().expect("literal addr"))
+            .await
+            .expect_err("start should refuse a duplicate prefix");
+        assert!(err.to_string().contains("/ping"), "unexpected error: {err}");
     }
 
     /// Regression: a `web::scope("")` around the spec routes matched every

@@ -36,6 +36,10 @@ impl PolicyApiModule {
 }
 
 impl ApiModule for PolicyApiModule {
+    fn prefix(&self) -> &str {
+        "/policy"
+    }
+
     fn configure(&self, cfg: &mut web::ServiceConfig) {
         let policy_engine = web::Data::from(self.policy_engine.clone());
         let jwt_middleware = self.jwt_middleware.clone();

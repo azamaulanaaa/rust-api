@@ -37,6 +37,10 @@ impl SyncApiModule {
 }
 
 impl ApiModule for SyncApiModule {
+    fn prefix(&self) -> &str {
+        "/sync"
+    }
+
     fn configure(&self, cfg: &mut web::ServiceConfig) {
         let mgr = web::Data::new(self.manager.clone());
         let jwt = self.jwt.clone();

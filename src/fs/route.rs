@@ -29,6 +29,10 @@ impl FsApiModule {
 }
 
 impl ApiModule for FsApiModule {
+    fn prefix(&self) -> &str {
+        "/fs"
+    }
+
     fn configure(&self, cfg: &mut web::ServiceConfig) {
         let engine = web::Data::from(self.engine.clone());
         let jwt = self.jwt.clone();
