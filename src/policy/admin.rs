@@ -4,7 +4,7 @@ use casbin::{CoreApi, DefaultModel, Enforcer, MgmtApi};
 use serde::{Deserialize, Serialize};
 
 use super::{RBAC_MODEL, adapter::OxkvAdapter};
-use crate::sync::wal::{Wal, WalOp};
+use crate::records::{ChangeSink, WalOp};
 
 /// A portable snapshot of every policy rule in a store.
 #[derive(Debug, Serialize, Deserialize)]
@@ -44,12 +44,12 @@ pub async fn export_s3(s3_store: oxkv::OxKvStore) -> anyhow::Result<PolicyDump> 
 
 /// Writes `dump`'s rules into an S3 store. Idempotent.
 ///
-/// Newly added rules are appended to `wal` when wired, so replicas can
+/// Newly added rules are announced to `feed` when wired, so replicas can
 /// replay the import instead of only discovering it via full recalc.
 pub async fn import_s3(
     s3_store: oxkv::OxKvStore,
     dump: &PolicyDump,
-    wal: Option<Wal>,
+    feed: Option<std::sync::Arc<dyn ChangeSink>>,
 ) -> anyhow::Result<ImportReport> {
     use anyhow::Context as _;
     let model = DefaultModel::from_str(RBAC_MODEL)
@@ -67,14 +67,14 @@ pub async fn import_s3(
     for rule in &dump.p {
         if enforcer.add_policy(rule.clone()).await? {
             report.rules_added += 1;
-            if let Some(wal) = &wal {
-                wal.append(WalOp::PolicyRuleAdd {
+            if let Some(feed) = &feed {
+                feed.append(WalOp::PolicyRuleAdd {
                     sub: rule.first().cloned().unwrap_or_default(),
                     obj: rule.get(1).cloned().unwrap_or_default(),
                     act: rule.get(2).cloned().unwrap_or_default(),
                 })
                 .await
-                .context("append policy WAL")?;
+                .context("append policy change feed")?;
             }
         } else {
             report.duplicates += 1;
@@ -83,13 +83,13 @@ pub async fn import_s3(
     for link in &dump.g {
         if enforcer.add_grouping_policy(link.clone()).await? {
             report.groups_added += 1;
-            if let Some(wal) = &wal {
-                wal.append(WalOp::GroupAdd {
+            if let Some(feed) = &feed {
+                feed.append(WalOp::GroupAdd {
                     user: link.first().cloned().unwrap_or_default(),
                     group: link.get(1).cloned().unwrap_or_default(),
                 })
                 .await
-                .context("append policy WAL")?;
+                .context("append policy change feed")?;
             }
         } else {
             report.duplicates += 1;
@@ -119,7 +119,7 @@ mod tests {
             g: vec![vec!["user-1".into(), "admin".into()]],
         };
         let wal = Wal::new(build_test_store(&crate::db::test_prefix("admin-wal")).await);
-        import_s3(src_store, &dump, Some(wal.clone())).await?;
+        import_s3(src_store, &dump, Some(Arc::new(wal.clone()))).await?;
         assert_eq!(wal.head().await?, 2);
 
         // Fresh handle, hence a new fencing session over the same prefix

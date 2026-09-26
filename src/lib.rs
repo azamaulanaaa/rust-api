@@ -37,6 +37,15 @@ pub mod docs;
 /// Per-user filtered replicas on stable OxKvStore prefixes.
 pub mod sync;
 
+/// Shared change-feed vocabulary: [`FileRecord`](records::FileRecord),
+/// [`WalOp`](records::WalOp), and the
+/// [`ChangeSink`](records::ChangeSink) seam.
+///
+/// The pivot that lets `fs`/`policy` (which emit changes) and `sync`
+/// (which consumes them) depend on this module instead of on each other.
+/// Depends on nothing else in the crate.
+pub mod records;
+
 /// OxKV store factory (prefix-scoped inside configured S3 bucket) plus the
 /// single-writer lease that guards a `[database].prefix` scope.
 pub mod db;

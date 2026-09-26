@@ -254,6 +254,7 @@ async fn object_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::records::ChangeSink;
     use actix_web::{App, http};
     use jsonwebtoken::EncodingKey;
     use serde_json::json;
@@ -262,7 +263,8 @@ mod tests {
     use crate::http::middleware::jwks::test_support::{rsa_key, sign_rs256, spawn_jwks};
     use crate::http::middleware::jwt::JwtClaimsMiddleware;
     use crate::policy::PolicyEngine;
-    use crate::sync::wal::{Wal, WalOp};
+    use crate::records::WalOp;
+    use crate::sync::wal::Wal;
 
     const KID: &str = "sync-route-test-kid";
     const AUD: &str = "test-aud";

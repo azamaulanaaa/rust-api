@@ -1,8 +1,9 @@
 //! GC for abandoned uploads and orphaned files.
 //!
 //! Sessions and temp/orphaned files older than 24h are removed.
-//! Expired files are logged to the WAL (when the engine has one wired)
-//! so replicas replay the deletion instead of keeping stale copies.
+//! Expired files are announced to the change feed (when the engine has a
+//! sink wired) so replicas replay the deletion instead of keeping stale
+//! copies.
 
 use std::{collections::HashSet, sync::Arc, time::Duration};
 
@@ -92,7 +93,7 @@ pub async fn sweep_once(engine: &FsEngine) -> Result<usize, crate::fs::error::Fs
         }
         engine.store.delete_file(&f.id).await?;
         engine
-            .append_wal(crate::sync::wal::WalOp::FileDelete {
+            .announce(crate::records::WalOp::FileDelete {
                 file_id: f.id.clone(),
             })
             .await?;
@@ -279,10 +280,11 @@ mod tests {
 
     #[tokio::test]
     async fn sweep_logs_orphan_deletes_to_wal() -> anyhow::Result<()> {
-        use crate::sync::wal::{Wal, WalOp};
+        use crate::records::WalOp;
+        use crate::sync::wal::Wal;
 
         let wal = Wal::new(build_test_store(&crate::db::test_prefix("gc-wal")).await);
-        let engine = make_engine().await.with_wal(wal.clone());
+        let engine = make_engine().await.with_change_sink(Arc::new(wal.clone()));
         let old = FileRecord {
             id: "gc-wal-file".into(),
             name: "b.txt".into(),

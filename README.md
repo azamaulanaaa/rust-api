@@ -80,6 +80,7 @@ src/
 ├── lease.rs             single-writer lease on [database].prefix (startup refusal + renewal + release)
 ├── telemetry.rs         tracing subscriber + OTLP span/metric export bootstrap (otlp-grpc / otlp-http features)
 ├── docs.rs              utoipa OpenAPI `ApiDoc` (all routes; served via http/docs.rs as /openapi.json + /swagger-ui/)
+├── records.rs           shared change-feed vocabulary — FileRecord, WalOp/WalEntry, ChangeSink/ChangeError; the leaf that breaks the fs↔sync cycle (see Layering)
 ├── http/                HTTP scaffolding shared by all modules
 │   ├── mod.rs           ApiService registry + ApiModule trait + CORS builder
 │   ├── error.rs         ApiError enum and uniform JSON error envelope
@@ -98,7 +99,7 @@ src/
 │   └── setup.rs         /setup/admin one-time superadmin claim
 ├── sync/                Per-user replicas (stable OxKvStore prefixes + manifest, WAL-backed)
 │   ├── mod.rs           module re-exports
-│   ├── wal.rs           Wal on OxKvStore — WalOp::{PolicyRuleAdd/Remove,GroupAdd/Remove/Delete,Attach,Detach,FileCreate,FileDelete} (+ legacy PolicyAdd/Remove marks), wal:{seq:020} + wal:seq, serialized appends
+│   ├── wal.rs           Wal on OxKvStore — the durable `ChangeSink` (wal:{seq:020} + wal:seq, serialized appends); op types live in `records.rs`
 │   ├── snapshot.rs      SnapshotManager — one filtered replica per user ({db}/u/{sha256-hex(sub)} + sync:applied marker), tx-atomic rebuilds, idempotent replay
 │   └── route.rs         GET /sync/status (pointer + ETag, no build) + POST /sync/sync (advance) + GET /sync/db/{object} (segments + ETags)
 └── fs/                  Object-store file storage (AmazonS3/MinIO/R2 via object_store, InMemory for tests)
@@ -182,9 +183,25 @@ The part cap is enforced at `init`, not at `complete`, so a client learns its sp
 
 ### Per-user replicas (WAL)
 
-The master `FsStore` and `Wal` both live on prefix-scoped `OxKvStore`s and remain the sole write path. `Wal` appends `wal:{seq:020}` entries plus `wal:seq` head (`sync/wal.rs`, `WalOp::{PolicyRuleAdd/Remove,GroupAdd/Remove/Delete,Attach,Detach,FileCreate,FileDelete}` plus legacy `PolicyAdd/Remove` marks). Each user owns one replica prefix (`{db}/u/{sha256-hex(sub)}/`) holding their filtered file set with its own oxkv `manifest.json` (the segment list): builds filter through `RowAuthorizer`/`owner==sub` into a RAM scratch store, diff against the live replica, and commit the diff plus the `sync:applied` coverage marker in a single transaction — so a crash before commit leaves the old state untouched and an empty diff commits nothing at all. Replica prefixes hash the subject (`SHA-256 hex`) so attacker-influenced OIDC `sub` values cannot traverse or collide. `GET /sync/status` returns the replica pointer with a coverage `ETag` (repeat polls get `304` without touching storage beyond the marker read, and it never builds), `POST /sync/sync` advances it, and `GET /sync/db/{object}` serves one replica object with backend `ETag` passthrough and `If-None-Match` support — non-manifest engine files are immutable by construction (`Cache-Control: public, max-age=31536000, immutable`), only `manifest.json` is revalidated (`Cache-Control: no-cache`). Replicas hold filtered file/relation metadata; file bytes stay in S3. Wasm clients open an `OxKvReader` over the prefix and follow the live manifest.
+The master `FsStore` and `Wal` both live on prefix-scoped `OxKvStore`s and remain the sole write path. `Wal` appends `wal:{seq:020}` entries plus a `wal:seq` head. The op vocabulary (`WalOp::{PolicyRuleAdd/Remove,GroupAdd/Remove/Delete,Attach,Detach,FileCreate,FileDelete}` plus legacy `PolicyAdd/Remove` marks) and the `FileRecord` it carries live in `src/records.rs`, not in `sync/` — see [Layering](#layering). Each user owns one replica prefix (`{db}/u/{sha256-hex(sub)}/`) holding their filtered file set with its own oxkv `manifest.json` (the segment list): builds filter through `RowAuthorizer`/`owner==sub` into a RAM scratch store, diff against the live replica, and commit the diff plus the `sync:applied` coverage marker in a single transaction — so a crash before commit leaves the old state untouched and an empty diff commits nothing at all. Replica prefixes hash the subject (`SHA-256 hex`) so attacker-influenced OIDC `sub` values cannot traverse or collide. `GET /sync/status` returns the replica pointer with a coverage `ETag` (repeat polls get `304` without touching storage beyond the marker read, and it never builds), `POST /sync/sync` advances it, and `GET /sync/db/{object}` serves one replica object with backend `ETag` passthrough and `If-None-Match` support — non-manifest engine files are immutable by construction (`Cache-Control: public, max-age=31536000, immutable`), only `manifest.json` is revalidated (`Cache-Control: no-cache`). Replicas hold filtered file/relation metadata; file bytes stay in S3. Wasm clients open an `OxKvReader` over the prefix and follow the live manifest.
 
-Every master mutation is also appended to the shared `Wal` (`{db}/wal`): file creates/deletes and attach/detach from `FsEngine`, rich rule/group changes from `PolicyEngine` (including `policy import`), each after the mutation commits — a logging failure fails the whole operation, and concurrent appends serialize on a mutex shared by all engine handles. `POST /sync/sync` short-circuits when coverage already meets the WAL head; otherwise deltas of ≤1000 ops replay onto the live prefix (file/relation ops re-applied with visibility re-checked; rule/group ops resync only the affected user/row with irrelevant users/objects skipped, marker last — a crash heals on the next poll), while legacy policy marks, oversized fan-out, larger deltas, or fencing losses fall back to full recalc — or adopt the winner's coverage on a lost build race. No version GC is needed: there is only ever one prefix per user, maintained by oxkv's own WAL GC and compaction.
+Every master mutation is also announced to the shared change feed (`{db}/wal`): file creates/deletes and attach/detach from `FsEngine`, rich rule/group changes from `PolicyEngine` (including `policy import`), each after the mutation commits — a logging failure fails the whole operation, and concurrent appends serialize on a mutex shared by all engine handles. `POST /sync/sync` short-circuits when coverage already meets the WAL head; otherwise deltas of ≤1000 ops replay onto the live prefix (file/relation ops re-applied with visibility re-checked; rule/group ops resync only the affected user/row with irrelevant users/objects skipped, marker last — a crash heals on the next poll), while legacy policy marks, oversized fan-out, larger deltas, or fencing losses fall back to full recalc — or adopt the winner's coverage on a lost build race. No version GC is needed: there is only ever one prefix per user, maintained by oxkv's own WAL GC and compaction.
+
+### Layering
+
+`fs` and `policy` *emit* changes; `sync` *consumes* them. The vocabulary both sides need — `FileRecord`, `WalOp`, and the `ChangeSink` trait — lives in `src/records.rs`, which depends on nothing else in the crate:
+
+```text
+       records
+       /     \
+  fs, policy   sync
+       \     /
+   (fs::store, the replica write path)
+```
+
+`FsEngine::with_change_sink` and `PolicyEngine::with_change_sink` take `Arc<dyn ChangeSink>`, so neither names `sync` and the graph is a DAG. `sync::wal::Wal` is the durable implementation.
+
+This is enforced, not just documented: `records::tests::producers_do_not_depend_on_the_consumer` fails if any production `use` in `fs/` or `policy/` names `crate::sync`, and `this_module_depends_on_nothing_in_the_crate` keeps `records` a leaf. Rust permits module cycles, so nothing else would notice the edge creeping back.
 
 ## Configuration
 

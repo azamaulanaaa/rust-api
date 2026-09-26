@@ -75,23 +75,11 @@ pub struct PersistedMultipart {
 }
 
 /// Persisted file record after `CompleteUpload`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FileRecord {
-    /// File identifier.
-    pub id: String,
-    /// Original filename.
-    pub name: String,
-    /// MIME type.
-    pub mimetype: String,
-    /// Size in bytes.
-    pub size: u64,
-    /// S3 key.
-    pub s3_key: String,
-    /// Owner subject.
-    pub owner_sub: String,
-    /// Creation timestamp.
-    pub created_at: i64,
-}
+///
+/// Re-exported from [`crate::records`], where it lives because
+/// [`WalOp::FileCreate`](crate::records::WalOp::FileCreate) carries one and
+/// `sync` has to read it without importing the whole `fs` module.
+pub use crate::records::FileRecord;
 
 /// Thin wrapper around an `oxkv` LSM store for FS keys.
 #[derive(Clone)]
