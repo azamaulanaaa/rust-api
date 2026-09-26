@@ -142,8 +142,8 @@ impl PolicyEngine {
     /// Generic initializer over any [`oxkv::Store`] (e.g. `OxKvStore` in
     /// production, `InMemory`-backed `OxKvStore` or `BTreeStore` in tests).
     ///
-    /// Writes are validated through [`PolicyRuleValidator`](adapter::PolicyRuleValidator)
-    /// by the adapter (see [`adapter::encode_rule`]).
+    /// Writes are validated through `adapter::PolicyRuleValidator` by the
+    /// adapter itself, before any transaction opens.
     pub async fn init_with_store<S>(store: S) -> Result<Self, PolicyError>
     where
         S: oxkv::Store + Send + Sync + 'static,

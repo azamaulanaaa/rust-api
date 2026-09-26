@@ -228,8 +228,13 @@ pub struct ObservabilityConfig {
     /// Service name attached to every exported telemetry resource.
     #[serde(default = "default_service_name")]
     pub service_name: String,
-    /// OTLP/gRPC collector endpoint (e.g. `http://localhost:4317`).
-    /// Span export is disabled when absent.
+    /// OTLP collector endpoint. Span export is disabled when absent.
+    ///
+    /// The transport follows the compiled cargo feature, not this string:
+    /// the default `otlp-http` expects an HTTP/protobuf endpoint
+    /// (`http://localhost:4318/v1/traces`), `otlp-grpc` expects a gRPC
+    /// collector address (`http://localhost:4317`). See
+    /// [`telemetry::init`](crate::telemetry::init).
     #[serde(default)]
     pub otlp_endpoint: Option<String>,
     /// Fraction of traces sampled, between 0.0 and 1.0 (default 1.0 = all).

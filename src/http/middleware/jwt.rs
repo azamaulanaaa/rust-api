@@ -1,8 +1,9 @@
 //! Actix middleware validating JWTs against a JWKS-backed key store.
 //!
 //! Validated claims (generic over `C`) are inserted into request extensions
-//! — consume them with [`Validated`] — and requests without any token pass
-//! through unmodified so routes decide their own auth requirements.
+//! — consume them with [`Validated`](crate::http::middleware::jwt::Validated) —
+//! and requests without any token pass through unmodified so routes decide
+//! their own auth requirements.
 
 use std::{
     future::{Ready, ready},
