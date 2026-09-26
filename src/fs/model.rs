@@ -14,8 +14,19 @@ pub struct InitRequest {
     pub file_total_parts: u64,
 }
 
+/// Maximum parts in one multipart upload.
+///
+/// S3's own per-upload limit. Enforcing it at init matters three times
+/// over: it turns what would otherwise be an S3 rejection at
+/// `complete_upload` -- *after* the client has uploaded every part -- into
+/// a 400 on the first call; and it bounds the per-session `etags` and
+/// `checksums` vectors the engine allocates from this count, which is what
+/// keeps a 70-byte request body from becoming a multi-terabyte allocation.
+pub const MAX_MULTIPART_PARTS: u64 = 10_000;
+
 impl InitRequest {
-    /// Validates the same constraints as the TS `Schema.filter`.
+    /// Validates the same constraints as the TS `Schema.filter`, plus
+    /// [`MAX_MULTIPART_PARTS`].
     pub fn validate(&self) -> Result<(), crate::fs::error::FsError> {
         use crate::fs::error::FsError;
         if self.file_size == 0 {
@@ -41,6 +52,16 @@ impl InitRequest {
                 ));
             }
         } else {
+            // Before the arithmetic checks, because a count this large is
+            // the interesting error: `expected` would otherwise report
+            // something like "must be exactly 18014398509481983 parts".
+            if self.file_total_parts > MAX_MULTIPART_PARTS {
+                return Err(FsError::BadRequest(format!(
+                    "file_total_parts must be at most {MAX_MULTIPART_PARTS} (S3's per-upload part \
+                     limit); got {}. Raise part_size (max 512 KB) to split a larger file.",
+                    self.file_total_parts
+                )));
+            }
             let is_multiple_of_1kb = self.part_size.is_multiple_of(1024);
             let within_bounds = self.part_size <= 524288;
             if !is_multiple_of_1kb || !within_bounds {
@@ -55,10 +76,13 @@ impl InitRequest {
                     self.part_size
                 )));
             }
-            // `checked_mul`: the two fields are independent u64s from the
-            // wire, and a huge `file_size` can satisfy the `expected` check
-            // above while overflowing the product (panic in debug, silent
-            // wrap in release).
+            // `checked_mul` is a backstop, not the primary guard: the
+            // `MAX_MULTIPART_PARTS` cap above already makes the product
+            // unreachable-overflow (10,000 x 512 KB is ~5 GB). It stays
+            // because the cost of being wrong here is a debug panic or a
+            // silent release wrap, and the cost of the guard is one line.
+            // `init_request_caps_parts_before_arithmetic` pins that the cap
+            // is what actually rejects these inputs now.
             let product = self
                 .file_total_parts
                 .checked_mul(self.part_size)
@@ -276,21 +300,70 @@ mod tests {
         );
     }
 
-    /// The declared part count and size are independent `u64`s from the
-    /// wire. A `file_size` large enough to satisfy the `ceil(file_size /
-    /// part_size)` check can still overflow the product, which used to
-    /// panic in debug builds and wrap silently in release.
+    /// The part count used to be unbounded, and these two inputs are the
+    /// ones that broke it. Both are arithmetically self-consistent
+    /// (`file_total_parts == ceil(file_size / part_size)` and the product
+    /// equals `file_size`), so they sailed through every check and reached
+    /// `vec![None; n]` in the engine:
+    ///
+    /// - 2^54 parts: a 383 TiB allocation, which **aborts** the process.
+    /// - 2^54 parts with an overflowing product: a debug panic / release
+    ///   wrap.
+    ///
+    /// The `MAX_MULTIPART_PARTS` cap now rejects both, and it is checked
+    /// before the arithmetic so the error names the real problem.
     #[test]
-    fn init_request_rejects_overflowing_part_product() {
+    fn init_request_caps_parts_before_arithmetic() {
+        // The exact body from the abort: passes every arithmetic check.
         assert_bad(
             InitRequest {
-                // ceil((2^64 - 512) / 1024) == 2^54, and 2^54 * 1024 == 2^64.
+                file_size: u64::MAX - 1023,
+                part_size: 1024,
+                // = ceil((2^64 - 1024) / 1024) = 2^54 - 1
+                file_total_parts: (1u64 << 54) - 1,
+            },
+            "at most 10000",
+        );
+        // The one that used to overflow the product, also capped now.
+        assert_bad(
+            InitRequest {
                 file_size: u64::MAX - 511,
                 part_size: 1024,
                 file_total_parts: 1u64 << 54,
             },
-            "overflows u64",
+            "at most 10000",
         );
+        // One over the limit, with math that also checks out.
+        assert_bad(
+            InitRequest {
+                file_size: (MAX_MULTIPART_PARTS + 1) * 1024,
+                part_size: 1024,
+                file_total_parts: MAX_MULTIPART_PARTS + 1,
+            },
+            "at most 10000",
+        );
+        // The message has to tell the client what to do about it.
+        let err = InitRequest {
+            file_size: (MAX_MULTIPART_PARTS + 1) * 1024,
+            part_size: 1024,
+            file_total_parts: MAX_MULTIPART_PARTS + 1,
+        }
+        .validate()
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("part_size"), "unhelpful message: {err}");
+    }
+
+    /// The cap is inclusive: exactly 10,000 parts is a legal upload.
+    #[test]
+    fn init_request_accepts_exactly_the_part_limit() {
+        InitRequest {
+            file_size: MAX_MULTIPART_PARTS * 1024,
+            part_size: 1024,
+            file_total_parts: MAX_MULTIPART_PARTS,
+        }
+        .validate()
+        .expect("10,000 parts is S3's limit, not over it");
     }
 
     #[test]

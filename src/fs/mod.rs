@@ -26,6 +26,32 @@ use model::{CompleteRequest, FileMetadata, InitRequest};
 use s3::S3Client;
 use store::{FileRecord, FsStore, UploadSession};
 
+/// Allocates `len` empty per-part slots without risking a process abort.
+///
+/// `vec![None; len]` *aborts* the process when the allocation fails, and
+/// `len` is a field straight off the wire. Before this existed, a 70-byte
+/// `POST /fs/uploads` declaring `2^54` parts allocated 383 TiB and killed
+/// the server — a hard abort, not a catchable panic, so no handler could
+/// have contained it.
+///
+/// [`InitRequest::validate`] caps the count at
+/// [`MAX_MULTIPART_PARTS`](model::MAX_MULTIPART_PARTS), so this should not
+/// fire. It exists because the failure mode of getting that cap wrong is
+/// an uncatchable process death, which is worth a second layer: a bad
+/// count has to degrade to a 4xx either way.
+fn part_slots(len: u64) -> Result<Vec<Option<String>>, FsError> {
+    let len = usize::try_from(len)
+        .map_err(|_| FsError::BadRequest("file_total_parts does not fit in memory".into()))?;
+    let mut slots: Vec<Option<String>> = Vec::new();
+    // `try_reserve_exact` then `resize`: after the reservation succeeds,
+    // `resize` only fills the reserved capacity and cannot reallocate.
+    slots.try_reserve_exact(len).map_err(|_| {
+        FsError::BadRequest("file_total_parts is too large to track upload state".into())
+    })?;
+    slots.resize(len, None);
+    Ok(slots)
+}
+
 /// Core file-system engine with temp per-user scope and row delegation.
 #[derive(Clone)]
 pub struct FsEngine {
@@ -288,6 +314,12 @@ impl FsEngine {
                 .await?;
             Some(id)
         };
+        // Allocate before touching S3 is not possible (the multipart upload
+        // is created first), so the slot vectors are built fallibly: a
+        // failure here has to surface as a 4xx rather than take the process
+        // down with it.
+        let etags = part_slots(req.file_total_parts)?;
+        let checksums = part_slots(req.file_total_parts)?;
         let session = UploadSession {
             id: file_id.clone(),
             file_size: req.file_size,
@@ -297,8 +329,8 @@ impl FsEngine {
             s3_key,
             owner_sub: owner_sub.to_string(),
             created_at: chrono::Utc::now().timestamp(),
-            etags: vec![None; req.file_total_parts as usize],
-            checksums: vec![None; req.file_total_parts as usize],
+            etags,
+            checksums,
         };
         self.store.save_session(&session).await?;
         // Persist S3-side state with the session: after a restart the
@@ -792,6 +824,48 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, FsError::BadRequest(_)));
         Ok(())
+    }
+
+    /// End-to-end version of the allocation-abort regression: the abusive
+    /// body must come back as a 4xx, not take the process with it. Running
+    /// this against the unfixed engine would abort the test binary, which
+    /// is exactly the failure being guarded.
+    #[tokio::test]
+    async fn init_upload_rejects_an_allocation_bomb_without_dying() -> anyhow::Result<()> {
+        let engine = make_engine("alice").await;
+        let err = engine
+            .init_upload(
+                InitRequest {
+                    file_size: u64::MAX - 1023,
+                    part_size: 1024,
+                    file_total_parts: (1u64 << 54) - 1,
+                },
+                "alice",
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, FsError::BadRequest(_)),
+            "expected a 4xx, got {err:?}"
+        );
+        Ok(())
+    }
+
+    /// The slot vectors are built fallibly, so an absurd count is a 4xx even
+    /// if validation is bypassed or the cap is later raised by mistake.
+    #[test]
+    fn part_slots_never_aborts() {
+        // Legal: exactly the S3 limit.
+        assert_eq!(
+            part_slots(model::MAX_MULTIPART_PARTS).unwrap().len(),
+            10_000
+        );
+        // Illegal by the cap, but reachable only if validation is skipped;
+        // must return an error rather than attempt the allocation.
+        let err = part_slots(u64::MAX).expect_err("u64::MAX must not allocate");
+        assert!(matches!(err, FsError::BadRequest(_)), "got {err:?}");
+        // The failure message must not leak memory state to the client.
+        assert!(!err.to_string().contains("memory"), "leaks: {err}");
     }
 
     #[tokio::test]
