@@ -175,7 +175,7 @@ async fn main() -> anyhow::Result<()> {
                     std::fs::read(&input).with_context(|| format!("read {}", input.display()))?;
                 let dump: rust_api::policy::admin::PolicyDump =
                     serde_json::from_slice(&bytes).context("parse policy dump")?;
-                let report = admin::import_s3(store, &dump, Some(wal_for_import)).await?;
+                let report = admin::import_s3(store, &dump, Some(Arc::new(wal_for_import))).await?;
                 println!(
                     "imported {} rules and {} group memberships \
                      ({} duplicates skipped) into {}",
@@ -244,7 +244,7 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
     let wal = Wal::new(wal_store);
     let policy_engine = PolicyEngine::init_s3(policy_store)
         .await?
-        .with_wal(wal.clone());
+        .with_change_sink(Arc::new(wal.clone()));
     let setup_api_module = SetupApiModule::new(policy_engine.clone(), oidc_api_module.middleware());
     let policy_api_module =
         PolicyApiModule::new(policy_engine.clone(), oidc_api_module.middleware());
@@ -255,7 +255,7 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
     )
     .await?
     .with_token_keys(token_keys)
-    .with_wal(wal.clone());
+    .with_change_sink(Arc::new(wal.clone()));
     // GC: expire abandoned multipart uploads every hour (24h TTL)
     rust_api::fs::gc::spawn(std::sync::Arc::new(fs_engine.clone()));
     let fs_api_module = FsApiModule::new(fs_engine, oidc_api_module.middleware());

@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use crate::policy::row::RowAuthorizer;
 use crate::policy::{Action, PolicyEngine};
-use crate::sync::wal::{Wal, WalOp};
+use crate::records::{ChangeError, ChangeSink, WalOp};
 
 use error::FsError;
 use model::{CompleteRequest, FileMetadata, InitRequest};
@@ -52,6 +52,16 @@ fn part_slots(len: u64) -> Result<Vec<Option<String>>, FsError> {
     Ok(slots)
 }
 
+/// Maps a rejected feed append back onto an [`FsError`].
+///
+/// The feed reports failures opaquely (it may not be a store at all), and
+/// the producer only has two things to say about it: it is not the
+/// client's fault, and the reason belongs in the server log. Both hold
+/// for every sink.
+fn feed_error(e: ChangeError) -> FsError {
+    FsError::Internal(e.detail().to_string())
+}
+
 /// Core file-system engine with temp per-user scope and row delegation.
 #[derive(Clone)]
 pub struct FsEngine {
@@ -60,10 +70,13 @@ pub struct FsEngine {
     pub(crate) bucket: String,
     policy: PolicyEngine,
     token_keys: Arc<TokenKeys>,
-    /// WAL for replica sync; `None` disables logging (tests).
-    /// Production must wire it: without appends the WAL head never
+    /// Change feed for replica sync; `None` disables logging (tests).
+    /// Production must wire it: without appends the feed head never
     /// advances and replicas freeze at their last snapshot.
-    wal: Option<Wal>,
+    ///
+    /// Typed as [`ChangeSink`] rather than a concrete WAL so this module
+    /// has no compile-time path to `sync` — see [`crate::records`].
+    feed: Option<Arc<dyn ChangeSink>>,
 }
 
 /// One capability-token signing key: `kid` goes in the JWT header.
@@ -140,22 +153,25 @@ impl FsEngine {
             bucket: s3_config.bucket.clone(),
             policy,
             token_keys: Arc::new(TokenKeys::ephemeral()),
-            wal: None,
+            feed: None,
         })
     }
 
-    /// Attaches a [`Wal`] for replica sync; ops are logged after each
-    /// mutation (fail-closed: a logging failure fails the whole operation
-    /// so the WAL never silently misses a committed write).
-    pub fn with_wal(mut self, wal: Wal) -> Self {
-        self.wal = Some(wal);
+    /// Attaches a [`ChangeSink`] for replica sync; ops are announced after
+    /// each mutation (fail-closed: a logging failure fails the whole
+    /// operation so the feed never silently misses a committed write).
+    ///
+    /// Takes a trait object so this module never names `sync`. The
+    /// concrete implementation is [`sync::wal::Wal`](crate::sync::wal::Wal).
+    pub fn with_change_sink(mut self, feed: Arc<dyn ChangeSink>) -> Self {
+        self.feed = Some(feed);
         self
     }
 
-    /// Appends `op` when logging is wired; no-op otherwise.
-    async fn append_wal(&self, op: WalOp) -> Result<(), FsError> {
-        if let Some(wal) = &self.wal {
-            wal.append(op).await?;
+    /// Announces `op` when a feed is wired; no-op otherwise.
+    async fn announce(&self, op: WalOp) -> Result<(), FsError> {
+        if let Some(feed) = &self.feed {
+            feed.append(op).await.map_err(feed_error)?;
         }
         Ok(())
     }
@@ -166,7 +182,7 @@ impl FsEngine {
     /// storage-agnostic" contract: production goes through
     /// [`init`](Self::init), while this lets a host app (or a test) supply
     /// a different byte backend or metadata store. Callers own
-    /// [`with_wal`](Self::with_wal) and
+    /// [`with_change_sink`](Self::with_change_sink) and
     /// [`with_token_keys`](Self::with_token_keys) separately, exactly as
     /// `init` leaves them.
     pub fn from_parts(
@@ -181,7 +197,7 @@ impl FsEngine {
             bucket,
             policy,
             token_keys: Arc::new(TokenKeys::ephemeral()),
-            wal: None,
+            feed: None,
         }
     }
 
@@ -236,7 +252,7 @@ impl FsEngine {
             return Err(FsError::NotFound("file not found".into()));
         }
         let count = self.store.attach(row_type, row_id, file_id).await?;
-        self.append_wal(WalOp::Attach {
+        self.announce(WalOp::Attach {
             row_type: row_type.to_string(),
             row_id: row_id.to_string(),
             file_id: file_id.to_string(),
@@ -261,7 +277,7 @@ impl FsEngine {
                 other => FsError::Internal(other.to_string()),
             })?;
         let count = self.store.detach(row_type, row_id, file_id).await?;
-        self.append_wal(WalOp::Detach {
+        self.announce(WalOp::Detach {
             row_type: row_type.to_string(),
             row_id: row_id.to_string(),
             file_id: file_id.to_string(),
@@ -602,7 +618,7 @@ impl FsEngine {
         };
         self.store.save_file(&record).await?;
         self.store.delete_session(file_id).await?;
-        self.append_wal(WalOp::FileCreate { rec: record }).await?;
+        self.announce(WalOp::FileCreate { rec: record }).await?;
         Ok(())
     }
 
@@ -675,7 +691,7 @@ impl FsEngine {
         }
         self.store.delete_file(file_id).await?;
         self.s3.delete_object(&self.bucket, &rec.s3_key).await?;
-        self.append_wal(WalOp::FileDelete {
+        self.announce(WalOp::FileDelete {
             file_id: file_id.to_string(),
         })
         .await?;
@@ -1047,11 +1063,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mutations_append_to_wal() -> anyhow::Result<()> {
-        use crate::sync::wal::{Wal, WalOp};
+    async fn mutations_are_announced_to_the_feed() -> anyhow::Result<()> {
+        use crate::records::WalOp;
+        use crate::sync::wal::Wal;
 
         let wal = Wal::new(crate::db::build_test_store(&crate::db::test_prefix("fs-wal")).await);
-        let engine = make_engine("alice").await.with_wal(wal.clone());
+        let engine = make_engine("alice")
+            .await
+            .with_change_sink(Arc::new(wal.clone()));
         engine
             .policy
             .add_rule("alice".into(), "invoice:123".into(), Action::Write)

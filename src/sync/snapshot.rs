@@ -21,9 +21,10 @@ use crate::fs::error::FsError;
 use crate::fs::store::FsStore;
 use crate::policy::row::RowAuthorizer;
 use crate::policy::{Action, Authorizer};
+use crate::records::WalOp;
 use oxkv::{Direction, GetSet as _, OxKvReader, Store as _, Transaction as _};
 
-use super::wal::{Wal, WalOp};
+use super::wal::Wal;
 
 /// Sync-version marker stored inside every replica prefix.
 const APPLIED_KEY: &str = "sync:applied";
@@ -604,6 +605,7 @@ fn safe_sub(sub: &str) -> String {
 mod tests {
     use super::*;
     use crate::fs::store::FileRecord;
+    use crate::records::ChangeSink;
     use object_store::memory::InMemory;
 
     /// Builds a manager plus the [`PolicyEngine`] it reads through.

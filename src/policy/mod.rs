@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::RwLock;
 
-use crate::sync::wal::{Wal, WalOp};
+use crate::records::{ChangeError, ChangeSink, WalOp};
 
 /// Casbin storage adapter persisting policies to an embedded oxkv store.
 pub mod adapter;
@@ -93,9 +93,9 @@ pub enum PolicyError {
     #[error("access denied")]
     AccessDenied,
 
-    /// Logging a committed mutation to the WAL failed.
-    #[error("wal error: {0}")]
-    Wal(String),
+    /// Announcing a committed mutation to the change feed failed.
+    #[error("change feed error: {0}")]
+    ChangeFeed(String),
 }
 
 /// Central authorization engine: a Casbin RBAC enforcer persisted to a
@@ -110,19 +110,22 @@ pub struct PolicyEngine {
     ///
     /// Private on purpose. `Enforcer` is casbin's own type and its methods
     /// (`add_policy`, `remove_grouping_policy`, …) bypass this engine's
-    /// `add_rule`/`assign_group` wrappers, which is where the WAL append
+    /// `add_rule`/`assign_group` wrappers, which is where the feed append
     /// lives. Exposing it publicly made it possible to mutate policy
-    /// without logging the change, so replicas would silently drift from
-    /// the master with nothing in the feed to replay.
+    /// without announcing the change, so replicas would silently drift
+    /// from the master with nothing to replay.
     ///
     /// Use the methods on this type to mutate, [`authorizer`](Self::authorizer)
     /// for a read-only handle, and [`is_unlocked`](Self::is_unlocked) for a
     /// non-blocking liveness probe.
     enforcer: Arc<RwLock<Enforcer>>,
-    /// WAL for replica sync; `None` disables logging (tests).
-    /// Production must wire it: without appends the WAL head never
+    /// Change feed for replica sync; `None` disables logging (tests).
+    /// Production must wire it: without appends the feed head never
     /// advances and replicas freeze at their last snapshot.
-    wal: Option<Wal>,
+    ///
+    /// Typed as [`ChangeSink`] rather than a concrete WAL so this module
+    /// has no compile-time path to `sync` — see [`crate::records`].
+    feed: Option<Arc<dyn ChangeSink>>,
 }
 
 /// The built-in role granted by the one-time bootstrap endpoint; holders
@@ -183,24 +186,27 @@ impl PolicyEngine {
         enforcer.enable_auto_save(true);
         Ok(Self {
             enforcer: Arc::new(RwLock::new(enforcer)),
-            wal: None,
+            feed: None,
         })
     }
 
-    /// Attaches a [`Wal`] for replica sync; ops are logged after each
-    /// mutation (fail-closed: a logging failure fails the whole operation
-    /// so the WAL never silently misses a committed write).
-    pub fn with_wal(mut self, wal: Wal) -> Self {
-        self.wal = Some(wal);
+    /// Attaches a [`ChangeSink`] for replica sync; ops are announced after
+    /// each mutation (fail-closed: a logging failure fails the whole
+    /// operation so the feed never silently misses a committed write).
+    ///
+    /// Takes a trait object so this module never names `sync`. The
+    /// concrete implementation is [`sync::wal::Wal`](crate::sync::wal::Wal).
+    pub fn with_change_sink(mut self, feed: Arc<dyn ChangeSink>) -> Self {
+        self.feed = Some(feed);
         self
     }
 
-    /// Appends `op` when logging is wired; no-op otherwise.
-    async fn append_wal(&self, op: WalOp) -> Result<(), PolicyError> {
-        if let Some(wal) = &self.wal {
-            wal.append(op)
+    /// Announces `op` when a feed is wired; no-op otherwise.
+    async fn announce(&self, op: WalOp) -> Result<(), PolicyError> {
+        if let Some(feed) = &self.feed {
+            feed.append(op)
                 .await
-                .map_err(|e| PolicyError::Wal(e.to_string()))?;
+                .map_err(|e: ChangeError| PolicyError::ChangeFeed(e.detail().to_string()))?;
         }
         Ok(())
     }
@@ -225,7 +231,7 @@ impl PolicyEngine {
             .await?;
         drop(ef);
         if success {
-            self.append_wal(WalOp::PolicyRuleAdd {
+            self.announce(WalOp::PolicyRuleAdd {
                 sub,
                 obj,
                 act: act_str,
@@ -249,7 +255,7 @@ impl PolicyEngine {
             .await?;
         drop(ef);
         if success {
-            self.append_wal(WalOp::PolicyRuleRemove {
+            self.announce(WalOp::PolicyRuleRemove {
                 sub,
                 obj,
                 act: act_str,
@@ -267,7 +273,7 @@ impl PolicyEngine {
             .await?;
         drop(ef);
         if success {
-            self.append_wal(WalOp::GroupAdd {
+            self.announce(WalOp::GroupAdd {
                 user: user_id,
                 group,
             })
@@ -293,7 +299,7 @@ impl PolicyEngine {
             let repaired = Self::ensure_superadmin_rules(&mut ef).await?;
             drop(ef);
             for (obj, act) in repaired {
-                self.append_wal(WalOp::PolicyRuleAdd {
+                self.announce(WalOp::PolicyRuleAdd {
                     sub: SUPERADMIN_ROLE.to_string(),
                     obj,
                     act: act.to_string(),
@@ -306,13 +312,13 @@ impl PolicyEngine {
             .await?;
         let seeded = Self::ensure_superadmin_rules(&mut ef).await?;
         drop(ef);
-        self.append_wal(WalOp::GroupAdd {
+        self.announce(WalOp::GroupAdd {
             user: user_id.to_string(),
             group: SUPERADMIN_ROLE.to_string(),
         })
         .await?;
         for (obj, act) in seeded {
-            self.append_wal(WalOp::PolicyRuleAdd {
+            self.announce(WalOp::PolicyRuleAdd {
                 sub: SUPERADMIN_ROLE.to_string(),
                 obj,
                 act: act.to_string(),
@@ -362,7 +368,7 @@ impl PolicyEngine {
             .await?;
         drop(ef);
         if success {
-            self.append_wal(WalOp::GroupRemove {
+            self.announce(WalOp::GroupRemove {
                 user: user_id,
                 group,
             })
@@ -419,7 +425,7 @@ impl PolicyEngine {
             .await?;
         drop(ef);
         if removed {
-            self.append_wal(WalOp::GroupDelete {
+            self.announce(WalOp::GroupDelete {
                 group: group.to_string(),
             })
             .await?;
@@ -597,6 +603,7 @@ impl Authorizer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sync::wal::Wal;
 
     async fn engine() -> PolicyEngine {
         let s3 = crate::db::build_test_store(&crate::db::test_prefix("policy")).await;
@@ -610,7 +617,7 @@ mod tests {
     fn error_display_is_lowercase_sentence_style() {
         for rendered in [
             PolicyError::AccessDenied.to_string(),
-            PolicyError::Wal("seq 7 missing".into()).to_string(),
+            PolicyError::ChangeFeed("seq 7 missing".into()).to_string(),
         ] {
             let first = rendered.chars().next().expect("non-empty display");
             assert!(
@@ -800,12 +807,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mutations_append_to_wal() {
-        use crate::sync::wal::{Wal, WalOp};
+    async fn mutations_are_announced_to_the_feed() {
+        use crate::records::WalOp;
 
         let prefix = crate::db::test_prefix("policy-wal");
         let wal = Wal::new(crate::db::build_test_store(&prefix).await);
-        let engine = engine().await.with_wal(wal.clone());
+        let engine = engine().await.with_change_sink(Arc::new(wal.clone()));
 
         assert!(
             engine

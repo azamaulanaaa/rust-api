@@ -1,122 +1,19 @@
-//! WAL for master changes on S3.
+//! Durable change feed on S3: the [`ChangeSink`] implementation behind
+//! every replica.
+//!
+//! The op vocabulary ([`WalOp`], [`WalEntry`],
+//! [`FileRecord`](crate::records::FileRecord)) lives in
+//! [`crate::records`] so that `fs` and `policy` can announce changes
+//! without depending on this module. Only the storage lives here.
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use oxkv::{GetSet, OxKvStore, Store as _, Transaction as _};
-use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
 use crate::fs::error::FsError;
-
-/// Operation recorded in WAL.
-///
-/// File and relation ops carry enough payload to re-apply against a
-/// replica (`FileCreate` embeds the full record). Rich policy ops carry
-/// the full rule/link so replay can resync only the affected user/row;
-/// legacy `PolicyAdd`/`PolicyRemove` (object only) always fall back to a
-/// full rebuild.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum WalOp {
-    /// Legacy policy mark (object only, pre-rich WAL).
-    ///
-    /// Kept for reading WALs written before rich ops existed; new code
-    /// never writes it. Replay treats it as needing a full recalc.
-    PolicyAdd {
-        /// Object affected.
-        obj: String,
-    },
-    /// Legacy policy mark (object only, pre-rich WAL).
-    ///
-    /// Kept for reading WALs written before rich ops existed; new code
-    /// never writes it. Replay treats it as needing a full recalc.
-    PolicyRemove {
-        /// Object affected.
-        obj: String,
-    },
-    /// Permission rule added (`p = sub, obj, act`).
-    PolicyRuleAdd {
-        /// Rule subject (user or group).
-        sub: String,
-        /// Rule object (`{row_type}:{row_id}` for rows).
-        obj: String,
-        /// Rule action (`read`/`write`/`delete`/`execute`).
-        act: String,
-    },
-    /// Permission rule removed (`p = sub, obj, act`).
-    PolicyRuleRemove {
-        /// Rule subject (user or group).
-        sub: String,
-        /// Rule object (`{row_type}:{row_id}` for rows).
-        obj: String,
-        /// Rule action (`read`/`write`/`delete`/`execute`).
-        act: String,
-    },
-    /// Group membership added (`g = user, group`).
-    GroupAdd {
-        /// Member subject.
-        user: String,
-        /// Group joined.
-        group: String,
-    },
-    /// Group membership removed (`g = user, group`).
-    GroupRemove {
-        /// Member subject.
-        user: String,
-        /// Group left.
-        group: String,
-    },
-    /// Group deleted (every membership link to `group` removed).
-    GroupDelete {
-        /// Group removed.
-        group: String,
-    },
-    /// File attached to row.
-    Attach {
-        /// Row type.
-        row_type: String,
-        /// Row identifier.
-        row_id: String,
-        /// File identifier.
-        file_id: String,
-    },
-    /// File detached from row.
-    Detach {
-        /// Row type.
-        row_type: String,
-        /// Row identifier.
-        row_id: String,
-        /// File identifier.
-        file_id: String,
-    },
-    /// File metadata created (completed upload).
-    FileCreate {
-        /// Full record as persisted on master.
-        rec: crate::fs::store::FileRecord,
-    },
-    /// File metadata deleted.
-    FileDelete {
-        /// File identifier.
-        file_id: String,
-    },
-}
-
-impl WalOp {
-    /// True for legacy object-only marks that cannot replay incrementally.
-    pub fn is_legacy_policy_mark(&self) -> bool {
-        matches!(self, Self::PolicyAdd { .. } | Self::PolicyRemove { .. })
-    }
-}
-
-/// Entry in WAL.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WalEntry {
-    /// Monotonic sequence.
-    pub seq: u64,
-    /// Operation.
-    pub op: WalOp,
-    /// Timestamp.
-    pub ts: i64,
-}
+use crate::records::{ChangeError, ChangeSink, WalEntry, WalOp};
 
 /// WAL stored in an [`OxKvStore`] (per-user S3, scalable).
 ///
@@ -145,14 +42,14 @@ impl Wal {
         format!("wal:{seq:020}")
     }
 
-    /// Append an operation, returns new seq.
+    /// Append an operation, returns the new sequence.
     ///
     /// Serialized against concurrent appends on any clone sharing this
     /// handle's mutex. The entry and the head pointer commit in one
     /// transaction, so a crash can never leave an entry without its head
     /// (or a head without its entry): the next append reuses the same
     /// sequence instead of skipping it.
-    pub async fn append(&self, op: WalOp) -> Result<u64, FsError> {
+    async fn append_entry(&self, op: WalOp) -> Result<u64, FsError> {
         let _guard = self.append_lock.lock().await;
         let g = self.store.write().await;
         let cur = g
@@ -221,6 +118,29 @@ impl Wal {
             out.push(entry);
         }
         Ok(out)
+    }
+}
+
+/// The only reason `fs` and `policy` know anything about replicas.
+///
+/// `ChangeSink` is one method, so a producer can be handed this trait
+/// object without a compile-time path to `sync::wal`, `sync::snapshot`,
+/// or anything else in `sync`.
+///
+/// The sequence number is dropped here. No caller used it, and handing
+/// one out would invite a producer to treat its own append as a
+/// replication guarantee. A caller that needs the head can ask
+/// [`Wal::head`] — that is the value replicas compare coverage against.
+#[async_trait]
+impl ChangeSink for Wal {
+    async fn append(&self, op: WalOp) -> Result<(), ChangeError> {
+        // `ChangeError` is a string, so a fencing loss survives the trip
+        // back to the producer intact -- which is the only thing that
+        // matters, since the producer has no way to classify the cause.
+        self.append_entry(op)
+            .await
+            .map(|_| ())
+            .map_err(ChangeError::new)
     }
 }
 
