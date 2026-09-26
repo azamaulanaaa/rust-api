@@ -71,6 +71,7 @@ pub fn default_sst_cache() -> LruCache<String, Arc<SstFile>> {
 /// Use it with the `build_test_store*` family rather than a fixed string:
 /// a shared prefix silently fences another test's session via oxkv epoch
 /// takeover, which fails intermittently and only under load.
+#[cfg(test)]
 pub fn test_prefix(name: &str) -> String {
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     format!(
@@ -84,6 +85,7 @@ pub fn test_prefix(name: &str) -> String {
 /// `InMemory`'s missing conditional-write probe does not fail). Each prefix gets a
 /// fresh `InMemory` so tests are isolated; for reopening the same prefix
 /// within one test use [`build_test_store_new_session`].
+#[cfg(test)]
 #[allow(clippy::expect_used)]
 pub async fn build_test_store(prefix: &str) -> OxKvStore {
     let inner = Arc::new(object_store::memory::InMemory::new()) as Arc<dyn ObjectStore>;
@@ -102,6 +104,7 @@ pub async fn build_test_store(prefix: &str) -> OxKvStore {
 /// memtable/WAL buffer superseding the previous session), not a shared
 /// handle — adequate for single-threaded test reopen flows where the old
 /// handle is dropped first, not a model for production sharing.
+#[cfg(test)]
 #[allow(clippy::expect_used)]
 pub async fn build_test_store_new_session(inner: Arc<dyn ObjectStore>, prefix: &str) -> OxKvStore {
     OxKvStore::builder()
@@ -132,14 +135,57 @@ pub async fn build_scratch_store(prefix: &str) -> OxKvStore {
         .expect("scratch OxKvStore must build")
 }
 
-// The `#[allow(clippy::expect_used)]` attributes on the builders above are
-// not covered by the crate-root `cfg_attr(test, allow(..))`: they are
-// unconditional public API, so they compile in non-test builds too and
-// need their own exemption.
+// `build_scratch_store` keeps its own `#[allow(clippy::expect_used)]`: unlike
+// the test-only builders it is unconditional public API -- `sync` uses it to
+// assemble a snapshot in RAM -- so it compiles in non-test builds and is not
+// covered by the crate-root `cfg_attr(test, allow(..))`.
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// The test-only store builders are not part of the public API.
+    ///
+    /// They hand back `InMemory` stores opened with `skip_probe(true)`, which
+    /// is the safe choice for a test backend with no conditional-write probe
+    /// and the *wrong* choice for anything else -- no probe means no
+    /// `manifest.json` CAS guard and no fencing detection. Shipping them as
+    /// default public API advertised exactly that as a supported way to build
+    /// a store, on a crate whose single-writer story is the headline. They
+    /// stay reachable from every test in this crate, and a host app that
+    /// wants one can build it from `object_store::memory::InMemory` in three
+    /// lines, which the `skip_probe` note in
+    /// [`build_scratch_store`](Self::build_scratch_store) already shows.
+    ///
+    /// `build_scratch_store` is deliberately *not* in this set: `sync` uses it
+    /// to assemble a snapshot in RAM before uploading it, so it is real API.
+    #[test]
+    fn test_only_store_builders_are_not_public() {
+        for name in [
+            "test_prefix",
+            "build_test_store",
+            "build_test_store_new_session",
+        ] {
+            let src = std::fs::read_to_string("src/db.rs").expect("readable");
+            let needle = format!("pub fn {name}");
+            let needle = if src.contains(&needle) {
+                needle
+            } else {
+                // The store builders are async.
+                format!("pub async fn {name}")
+            };
+            let at = src
+                .find(&needle)
+                .unwrap_or_else(|| panic!("{name} should still exist"));
+            // A `#[cfg(test)]` between the item's doc comment and its
+            // signature, which is where rustfmt keeps the attributes.
+            let above = &src[..at];
+            let gated = above
+                .rfind("#[cfg(test)]")
+                .is_some_and(|i| !above[i..].contains("///"));
+            assert!(gated, "{name} is public API but only used by tests");
+        }
+    }
 
     #[tokio::test]
     async fn test_store_roundtrip() -> anyhow::Result<()> {
