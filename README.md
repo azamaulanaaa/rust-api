@@ -336,6 +336,31 @@ impl ApiModule for MyModule {
 
 Handlers can extract validated JWT claims via the `Validated<C>` extractor (returns 401 automatically when claims are absent). See the crate documentation (`cargo doc --no-deps --open`) for details.
 
+### Mounting inside your own server
+
+`ApiService::start` owns the listener. To keep it, register your modules and apply the same global stack yourself — every piece is public:
+
+```rust
+use actix_web::App;
+use rust_api::http::{
+    self, middleware::{bearer_token::BearerTokenMiddleware,
+                      request_tracing::RequestTracingMiddleware},
+};
+
+let app = http::apply_limits(App::new())
+    .wrap(http::cors(&allowed_origins))
+    .wrap(RequestTracingMiddleware)
+    .wrap(BearerTokenMiddleware)
+    .configure(http::health_routes)
+    .configure(|cfg| svc.configure(cfg))   // your modules + readiness probe
+    .configure(http::docs::config);        // /openapi.json + /swagger-ui
+HttpServer::new(move || app.clone()).run().await?;
+```
+
+`http::docs::config` is mounted **last** on purpose: a catch-all mount registered ahead of your modules can shadow them.
+
+> There is deliberately no `ApiService::build() -> App`. actix-web exposes no nameable public type for an assembled `App` (`BoxedHttpServiceFactory` is crate-private), so such a signature would either leak an unnameable `impl` bound that `HttpServer::new` rejects, or force a dynamic factory per worker. Configuring an `App` you already own is expressible and cheaper.
+
 ## Development
 
 ```bash
@@ -352,6 +377,8 @@ mise run cov                              # coverage via cargo llvm-cov
 `mise run build` / `run` / `test` link with zig for local cross builds; CI uses plain `cargo`. The `licenses`/`advisories`/`bans`/`cov` tasks call the underlying cargo plugins directly.
 
 Every public item must carry rustdoc — enforced at compile time via `[lints.rust] missing_docs = "deny"` in `Cargo.toml`, and by a `cargo doc --no-deps` step in CI so unresolved intra-doc links also fail.
+
+The composition root is covered too: `http::tests` builds the real served application in-process (via `wired_app!`) and asserts that built-in routes, CORS, the readiness probe, the OpenAPI document, and a registered module's routes are all reachable — no socket required. `docs::tests` additionally checks that every declared path is *mounted*, not merely present in the spec.
 Dependency licensing is enforced via [`cargo-deny`](https://embarkstudios.github.io/cargo-deny/) (`deny.toml`: `licenses` + `advisories` + `bans`); all three run in CI. Note that `bans` is configured with `multiple-versions = "warn"`, so duplicate transitive versions (currently `rand` ×3, `base64` ×3) are reported but do not fail the job.
 `oxkv` 0.7 (`oxkv` + `oxkv-s3` features) + `object_store` 0.12 (shared `AmazonS3Builder` for file bytes and `OxKvStore`).
 
