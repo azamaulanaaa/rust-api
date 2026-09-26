@@ -501,12 +501,14 @@ impl SnapshotManager {
         Ok(out)
     }
 
+    /// Writes the caller's visible file set into `dst`.
+    ///
+    /// One pass over the master listing: the record in hand answers the
+    /// owner check (no re-read), and one rows scan serves both the
+    /// visibility check and the attach loop. Previously each file cost
+    /// a re-read plus two full-store scans (one inside `can_read`, one
+    /// for attach) on top of the listing itself.
     async fn copy_filtered(&self, sub: &str, dst: &FsStore) -> Result<(), FsError> {
-        // Single pass over the master listing: the record in hand answers
-        // the owner check (no re-read), and one rows scan serves both the
-        // visibility check and the attach loop. Previously each file cost
-        // a re-read plus two full-store scans (one inside can_read, one
-        // for attach) on top of the listing itself.
         for rec in self.store.list_files().await? {
             let rows = self.visible_rows(sub, &rec.id).await?;
             if rec.owner_sub != sub && rows.is_empty() {
@@ -542,6 +544,8 @@ impl SnapshotManager {
         Ok(out)
     }
 
+    /// True when `sub` may read `file_id`, by ownership or through any
+    /// row that grants `read`.
     async fn can_read(&self, sub: &str, file_id: &str) -> Result<bool, FsError> {
         let Some(rec) = self.store.get_file(file_id).await? else {
             return Ok(false);
