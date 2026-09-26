@@ -5,9 +5,11 @@
 //! `AmazonS3` (S3, MinIO, R2 via `endpoint_url`) while tests use
 //! `InMemory` — no external service required.
 
-use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
+use std::{
+    borrow::Cow,
+    collections::{BTreeMap, HashMap},
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 use bytes::Bytes;

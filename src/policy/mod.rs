@@ -9,8 +9,7 @@
 //! [`row::RowAuthorizer`](crate::policy::row::RowAuthorizer) adds
 //! row-level (`{type}:{id}`) checks on top.
 
-use std::sync::Arc;
-use std::{collections::HashMap, fmt, str::FromStr};
+use std::{collections::HashMap, fmt, str::FromStr, sync::Arc};
 
 use casbin::{CoreApi, DefaultModel, Enforcer, MgmtApi, RbacApi};
 use serde::{Deserialize, Serialize};

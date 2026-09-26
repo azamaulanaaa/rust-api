@@ -4,8 +4,7 @@
 //! [`crate::fs::object_store`]. The trait remains the seam so `FsEngine`
 //! stays storage-agnostic and tests can inject `InMemory`.
 
-use std::pin::Pin;
-use std::sync::Arc;
+use std::{pin::Pin, sync::Arc};
 
 use async_trait::async_trait;
 use bytes::Bytes;
