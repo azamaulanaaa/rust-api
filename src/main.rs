@@ -23,10 +23,7 @@ use url::Url;
 use rust_api::{
     fs::{FsEngine, TokenKeys, route::FsApiModule, s3::S3ClientConfig, store::FsStore},
     http::{ApiService, middleware::jwt::Claims},
-    oidc::{
-        OidcClient, OidcConfig,
-        route::{OidcApiModule, OidcSessionModule},
-    },
+    oidc::{OidcClient, OidcConfig, route::OidcApiModule},
     policy::{PolicyEngine, admin, route::PolicyApiModule, setup::SetupApiModule},
     sync::{route::SyncApiModule, snapshot::SnapshotManager, wal::Wal},
     telemetry,
@@ -298,12 +295,10 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
             policy_engine.is_unlocked() && !lease_lost.load(std::sync::atomic::Ordering::Relaxed)
         }
     });
-    let session_api_module = OidcSessionModule::new(oidc_api_module.middleware());
     ApiService::new()
         .with_cors_origins(config.http.allowed_origins.clone())
         .with_readiness_check(readiness)
         .register_module(Box::new(oidc_api_module))
-        .register_module(Box::new(session_api_module))
         .register_module(Box::new(setup_api_module))
         .register_module(Box::new(policy_api_module))
         .register_module(Box::new(fs_api_module))

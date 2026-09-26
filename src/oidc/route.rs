@@ -1,12 +1,15 @@
 //! Actix routes for the OIDC login, callback, session, and logout flows.
 //!
 //! [`OidcApiModule`](crate::oidc::route::OidcApiModule) owns the provider
-//! client and the public `/auth/login`, `/auth/callback`, and
-//! `/auth/logout` routes, and seeds the JWT validation middleware every
-//! other module reuses. [`OidcSessionModule`](crate::oidc::route::OidcSessionModule)
-//! is split out so `/auth/me` always serves the concrete
-//! [`Claims`](crate::http::middleware::jwt::Claims) shape the SPA
-//! codegen depends on, independent of how a host app types its own claims.
+//! client and the whole `/auth` scope -- `/auth/login`, `/auth/callback`,
+//! `/auth/logout`, and the `/auth/me` session probe -- and seeds the JWT
+//! validation middleware every other module reuses.
+//!
+//! It is one module rather than a public-flow module plus a session module
+//! because actix matches scopes by prefix: two modules registering
+//! `web::scope("/auth")` means whichever is registered first swallows every
+//! `/auth/*` path and the other's routes are unreachable. One module owns
+//! one prefix.
 
 use std::sync::Arc;
 
@@ -22,14 +25,22 @@ use super::{OidcClient, OidcError};
 use crate::http::middleware::jwt::{Audience, Validated};
 use crate::http::{ApiModule, middleware};
 
-/// API module exposing `/auth/login` and `/auth/callback`, and owning the
-/// JWT validation middleware configured from the discovered provider.
+/// API module exposing the `/auth` routes and owning the JWT validation
+/// middleware configured from the discovered provider.
 pub struct OidcApiModule<C>
 where
     C: DeserializeOwned,
 {
     oidc_client: Arc<OidcClient>,
     jwt_middleware: middleware::jwt::JwtClaimsMiddleware<C>,
+    /// Middleware for `/auth/me` only.
+    ///
+    /// `C` is the host app's claims type; `me` has to answer with the
+    /// concrete [`Claims`](middleware::jwt::Claims) shape the SPA codegen
+    /// depends on, so it needs its own middleware. Keeping it on the single
+    /// `/auth/me` resource is what lets the rest of the scope stay generic:
+    /// the scope itself never has to name `Claims`.
+    session_middleware: middleware::jwt::JwtClaimsMiddleware<middleware::jwt::Claims>,
 }
 
 impl<C> OidcApiModule<C>
@@ -46,9 +57,21 @@ where
         )
         .await?;
 
+        // Same provider, same keys, different claims type. Loading the JWKS
+        // twice costs one extra request at startup and keeps `/auth/me`
+        // answerable for a host app that types its own claims as anything
+        // other than `Claims`.
+        let session_middleware = middleware::jwt::JwtClaimsMiddleware::new_with_jks(
+            oidc_client.jwks_uri().as_str(),
+            oidc_client.client_id().as_str(),
+            oidc_client.issuer(),
+        )
+        .await?;
+
         Ok(Self {
             oidc_client: Arc::new(oidc_client),
             jwt_middleware,
+            session_middleware,
         })
     }
 
@@ -69,39 +92,28 @@ where
     fn configure(&self, cfg: &mut web::ServiceConfig) {
         let oidc_client = web::Data::from(self.oidc_client.clone());
 
-        // JWT wrap is safe for public routes: requests without any token
-        // pass through unmodified, while `/auth/me` gets validated claims.
-        let scope = web::scope("/auth")
-            .app_data(oidc_client)
-            .wrap(self.jwt_middleware.clone())
-            .service(login)
-            .service(callback)
-            .service(logout);
-
-        cfg.service(scope);
-    }
-}
-
-/// API module exposing the authenticated session probe.
-///
-/// Split from [`OidcApiModule`] (which is generic over the claims type `C`)
-/// so `/auth/me` always serves the concrete
-/// [`Claims`](crate::http::middleware::jwt::Claims) shape the SPA
-/// codegen depends on, regardless of how the host app types its own claims.
-pub struct OidcSessionModule {
-    jwt: middleware::jwt::JwtClaimsMiddleware<middleware::jwt::Claims>,
-}
-
-impl OidcSessionModule {
-    /// Creates the module from the shared JWT middleware.
-    pub fn new(jwt: middleware::jwt::JwtClaimsMiddleware<middleware::jwt::Claims>) -> Self {
-        Self { jwt }
-    }
-}
-
-impl ApiModule for OidcSessionModule {
-    fn configure(&self, cfg: &mut web::ServiceConfig) {
-        cfg.service(web::scope("/auth").wrap(self.jwt.clone()).service(me));
+        // JWT wrap is safe for the public routes: requests without any token
+        // pass through unmodified. `/auth/me` gets its own `Claims`-typed
+        // middleware on the resource instead, so this scope does not have to
+        // name a concrete claims type.
+        //
+        // The whole scope lives here on purpose. A second module registering
+        // `web::scope("/auth")` would match every `/auth/*` path, and since
+        // actix tries services in registration order the later module's
+        // routes would be unreachable rather than merged.
+        cfg.service(
+            web::scope("/auth")
+                .app_data(oidc_client)
+                .wrap(self.jwt_middleware.clone())
+                .service(login)
+                .service(callback)
+                .service(logout)
+                .service(
+                    web::resource("/me")
+                        .wrap(self.session_middleware.clone())
+                        .route(web::get().to(me)),
+                ),
+        );
     }
 }
 
@@ -123,8 +135,10 @@ pub struct MeResponse {
 /// SPA entry point: TanStack guards and the worker poll this instead of
 /// decoding the JWT themselves, so claim-shape drift breaks codegen rather
 /// than silently mis-authorizing.
+/// Registered through an explicit `web::resource` rather than a `#[get]`
+/// attribute, because the route needs its own `Claims`-typed middleware and
+/// only a resource can carry one.
 #[utoipa::path(get, path = "/auth/me", tag = "auth", responses((status = 200, body = MeResponse), (status = 401, body = crate::http::error::ErrorBody)))]
-#[get("/me")]
 pub async fn me(claims: Validated<middleware::jwt::Claims>) -> impl Responder {
     let aud = match &claims.aud {
         Audience::Single(s) => vec![s.clone()],
@@ -615,22 +629,19 @@ mod tests {
         .map_err(anyhow::Error::from)
     }
 
+    /// The session probe has to survive being served from the same scope as
+    /// the public flow.
+    ///
+    /// This used to register `OidcSessionModule` alongside `OidcApiModule`,
+    /// both claiming `web::scope("/auth")`. Actix tries services in
+    /// registration order and a scope matches its whole prefix, so the first
+    /// scope swallowed every `/auth/*` path and `/auth/me` was a `404` in the
+    /// shipped server -- while this test, which mounted the session module
+    /// alone, passed. The composition is what matters, so the test composes.
     #[tokio::test]
     async fn me_returns_session_for_valid_cookie() -> anyhow::Result<()> {
-        use crate::http::middleware::jwt::{Claims, JwtClaimsMiddleware};
-
         let fx = Fixture::new().await?;
-        let mw = JwtClaimsMiddleware::<Claims>::new_with_jks(
-            &format!("{}/jwks", fx.server.uri()),
-            CLIENT_ID,
-            &fx.server.uri(),
-        )
-        .await?;
-        let module = OidcSessionModule::new(mw);
-        let svc = test::init_service(
-            actix_web::App::new().configure(|cfg| ApiModule::configure(&module, cfg)),
-        )
-        .await;
+        let svc = test_app!(fx);
 
         let token = session_token(&fx, "alice", &fx.server.uri())?;
         let res = test::call_service(
