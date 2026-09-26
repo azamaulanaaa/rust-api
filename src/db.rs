@@ -125,6 +125,10 @@ pub async fn build_scratch_store(prefix: &str) -> OxKvStore {
         .expect("scratch OxKvStore must build")
 }
 
+// The `#[allow(clippy::expect_used)]` attributes on the builders above are
+// not covered by the crate-root `cfg_attr(test, allow(..))`: they are
+// unconditional public API, so they compile in non-test builds too and
+// need their own exemption.
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {

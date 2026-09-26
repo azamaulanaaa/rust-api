@@ -6,11 +6,14 @@
 //! [`http::ApiModule`] implementations onto an [`http::ApiService`]
 //! to build their own API surface on top of the shared auth/policy plumbing.
 
-#![deny(clippy::unwrap_used, clippy::expect_used)]
+// `unwrap_used`/`expect_used` are denied package-wide via [lints.clippy]
+// in Cargo.toml, so the level is declared once and applies to every
+// target. This attribute only opens the test escape hatch, which is why
+// individual `#[cfg(test)]` modules do not need their own `#[allow]`.
+//
+// Public items must carry rustdoc comments; that lint is enforced the
+// same way, via [lints.rust] in Cargo.toml.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
-
-// Public items must carry rustdoc comments; the lint is enforced
-// package-wide via [lints.rust] in Cargo.toml.
 
 /// HTTP server scaffolding: modular service registry plus request
 /// middleware (bearer-token extraction, JWKS-backed JWT validation).

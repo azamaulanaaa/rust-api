@@ -6,7 +6,8 @@
 //! `policy export/import` subcommands manage policy data as JSON for
 //! backups and migrations.
 
-#![deny(clippy::unwrap_used, clippy::expect_used)]
+// The deny level comes from [lints.clippy] in Cargo.toml (it applies to
+// this target too); this attribute only opens the test escape hatch.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 use std::{
