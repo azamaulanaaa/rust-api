@@ -303,9 +303,11 @@ where
                 }
 
                 match decode::<C>(&token, &signing_key.decoding_key, &validation) {
-                    Ok(token_data) => req.extensions_mut().insert(token_data.claims),
+                    Ok(token_data) => {
+                        req.extensions_mut().insert(token_data.claims);
+                    }
                     Err(e) => return Err(ApiError::InvalidCredentials(Box::new(e)).into()),
-                };
+                }
             }
 
             svc.call(req).await
@@ -376,6 +378,7 @@ mod tests {
         let result = Validated::<Claims>::from_request(&req, &mut payload).await;
         assert_eq!(result.unwrap_err().as_response_error().status_code(), 401);
     }
+
     #[test]
     fn issuer_template_parses_and_resolves() {
         let tpl = IssuerTemplate::parse("https://login.test/{tenantid}/v2.0")

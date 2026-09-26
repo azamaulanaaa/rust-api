@@ -78,6 +78,10 @@ where
     }
 }
 
+/// Pulls the `Authorization` header's bearer token, if it parses as one.
+///
+/// Returns `None` for a missing header, a non-UTF-8 value, or a scheme
+/// other than `Bearer` — the same cases [`parse_bearer_token`] rejects.
 fn extract_bearer_token(req: &ServiceRequest) -> Option<BearerToken> {
     req.headers()
         .get(header::AUTHORIZATION)?
@@ -86,6 +90,12 @@ fn extract_bearer_token(req: &ServiceRequest) -> Option<BearerToken> {
         .and_then(parse_bearer_token)
 }
 
+/// Splits `auth_str` into its scheme and token, accepting any casing of
+/// `Bearer` per RFC 7235.
+///
+/// The token is returned verbatim (not trimmed): a value that decoded as
+/// `"Bearer  abc"` keeps its leading space, and deciding whether that is
+/// acceptable belongs to the validator, not the extractor.
 fn parse_bearer_token(auth_str: &str) -> Option<BearerToken> {
     let mut parts = auth_str.splitn(2, ' ');
     match (parts.next(), parts.next()) {

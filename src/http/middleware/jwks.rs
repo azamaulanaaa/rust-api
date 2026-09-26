@@ -191,6 +191,67 @@ fn to_signing_key(jwk: &Jwk) -> Option<(String, SigningKey)> {
     ))
 }
 
+/// Shared fixtures for JWT/JWKS test modules across this crate.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    use jsonwebtoken::EncodingKey;
+    use rsa::{RsaPrivateKey, RsaPublicKey, pkcs1::EncodeRsaPrivateKey, traits::PublicKeyParts};
+    use serde::Deserialize;
+    use serde_json::json;
+    use wiremock::MockServer;
+
+    /// Minimal claims shape used by decode assertions.
+    #[derive(Debug, Clone, Deserialize)]
+    pub(crate) struct TestClaims {
+        pub sub: String,
+    }
+
+    /// Serves a static JWKS document on a fresh mock provider.
+    pub(crate) async fn spawn_jwks(body: serde_json::Value) -> MockServer {
+        let server = MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/jwks"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// Generates an RSA keypair and returns (jwks JSON entry, encoding key).
+    pub(crate) fn rsa_key(kid: &str) -> anyhow::Result<(serde_json::Value, EncodingKey)> {
+        let mut rng = rand::thread_rng();
+        let private = RsaPrivateKey::new(&mut rng, 2048)?;
+        let public = RsaPublicKey::from(&private);
+        let n = URL_SAFE_NO_PAD.encode(public.n().to_bytes_be());
+        let e = URL_SAFE_NO_PAD.encode(public.e().to_bytes_be());
+
+        let entry = json!({
+            "kty": "RSA",
+            "use": "sig",
+            "kid": kid,
+            "alg": "RS256",
+            "n": n,
+            "e": e,
+        });
+
+        let der = private.to_pkcs1_der()?;
+        Ok((entry, EncodingKey::from_rsa_der(der.as_bytes())))
+    }
+
+    /// Signs `claims` as an RS256 JWT under the given `kid`.
+    pub(crate) fn sign_rs256(
+        claims: &serde_json::Value,
+        kid: &str,
+        key: &EncodingKey,
+    ) -> anyhow::Result<String> {
+        let mut header = jsonwebtoken::Header::new(Algorithm::RS256);
+        header.kid = Some(kid.to_string());
+        Ok(jsonwebtoken::encode(&header, claims, key)?)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -366,66 +427,5 @@ mod tests {
         .unwrap();
 
         assert!(to_signing_key(&jwk).is_none());
-    }
-}
-
-/// Shared fixtures for JWT/JWKS test modules across this crate.
-#[cfg(test)]
-pub(crate) mod test_support {
-    use super::*;
-    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-    use jsonwebtoken::EncodingKey;
-    use rsa::{RsaPrivateKey, RsaPublicKey, pkcs1::EncodeRsaPrivateKey, traits::PublicKeyParts};
-    use serde::Deserialize;
-    use serde_json::json;
-    use wiremock::MockServer;
-
-    /// Minimal claims shape used by decode assertions.
-    #[derive(Debug, Clone, Deserialize)]
-    pub(crate) struct TestClaims {
-        pub sub: String,
-    }
-
-    /// Serves a static JWKS document on a fresh mock provider.
-    pub(crate) async fn spawn_jwks(body: serde_json::Value) -> MockServer {
-        let server = MockServer::start().await;
-        wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/jwks"))
-            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(body))
-            .mount(&server)
-            .await;
-        server
-    }
-
-    /// Generates an RSA keypair and returns (jwks JSON entry, encoding key).
-    pub(crate) fn rsa_key(kid: &str) -> anyhow::Result<(serde_json::Value, EncodingKey)> {
-        let mut rng = rand::thread_rng();
-        let private = RsaPrivateKey::new(&mut rng, 2048)?;
-        let public = RsaPublicKey::from(&private);
-        let n = URL_SAFE_NO_PAD.encode(public.n().to_bytes_be());
-        let e = URL_SAFE_NO_PAD.encode(public.e().to_bytes_be());
-
-        let entry = json!({
-            "kty": "RSA",
-            "use": "sig",
-            "kid": kid,
-            "alg": "RS256",
-            "n": n,
-            "e": e,
-        });
-
-        let der = private.to_pkcs1_der()?;
-        Ok((entry, EncodingKey::from_rsa_der(der.as_bytes())))
-    }
-
-    /// Signs `claims` as an RS256 JWT under the given `kid`.
-    pub(crate) fn sign_rs256(
-        claims: &serde_json::Value,
-        kid: &str,
-        key: &EncodingKey,
-    ) -> anyhow::Result<String> {
-        let mut header = jsonwebtoken::Header::new(Algorithm::RS256);
-        header.kid = Some(kid.to_string());
-        Ok(jsonwebtoken::encode(&header, claims, key)?)
     }
 }
