@@ -153,6 +153,7 @@ mod tests {
     use crate::fs::FsEngine;
     use crate::fs::error::FsError;
     use crate::fs::object_store::ObjectStoreClient;
+    use crate::fs::s3::ListedKey;
     use crate::fs::s3::S3Client;
     use crate::fs::store::{FileRecord, FsStore, PersistedMultipart, UploadSession};
     use crate::policy::PolicyEngine;
@@ -345,80 +346,108 @@ mod tests {
         Ok(())
     }
 
+    /// Scriptable [`S3Client`] double: records deletions and returns a
+    /// canned listing, so the sweeper's orphan-byte and
+    /// retain-on-failure paths can be driven without a real backend.
+    ///
+    /// One double covers both, because the two tests that need it differ
+    /// only in what `list_keys` reports and whether the byte operations
+    /// succeed -- and a per-test struct meant re-listing all nine trait
+    /// methods every time a method was added to `S3Client`.
+    struct FakeS3 {
+        listed: Vec<ListedKey>,
+        deleted: std::sync::Mutex<Vec<String>>,
+        /// When false, `delete_object`/`abort_multipart_upload` fail.
+        writes_succeed: bool,
+    }
+
+    impl FakeS3 {
+        fn new(listed: Vec<ListedKey>, writes_succeed: bool) -> Self {
+            Self {
+                listed,
+                deleted: std::sync::Mutex::new(Vec::new()),
+                writes_succeed,
+            }
+        }
+
+        fn deleted(&self) -> Vec<String> {
+            self.deleted.lock().expect("delete log").clone()
+        }
+
+        /// Error every byte-mutating call when the double is in failure mode.
+        fn write_guard(&self, op: &str) -> Result<(), FsError> {
+            if self.writes_succeed {
+                Ok(())
+            } else {
+                Err(FsError::Internal(format!("{op} failed")))
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl S3Client for FakeS3 {
+        async fn create_multipart_upload(
+            &self,
+            _: &str,
+            _: &str,
+            _: Option<String>,
+        ) -> Result<String, FsError> {
+            Ok("u".into())
+        }
+        async fn upload_part(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: i32,
+            _: Bytes,
+            _: Option<String>,
+        ) -> Result<String, FsError> {
+            Ok("e".into())
+        }
+        async fn complete_multipart_upload(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: Vec<String>,
+        ) -> Result<(), FsError> {
+            Ok(())
+        }
+        async fn abort_multipart_upload(&self, _: &str, _: &str, _: &str) -> Result<(), FsError> {
+            self.write_guard("abort")
+        }
+        async fn put_object(
+            &self,
+            _: &str,
+            _: &str,
+            _: Bytes,
+            _: Option<String>,
+            _: Option<String>,
+        ) -> Result<(), FsError> {
+            self.write_guard("put")
+        }
+        async fn get_object(&self, _: &str, _: &str) -> Result<Bytes, FsError> {
+            Err(FsError::NotFound("no".into()))
+        }
+        async fn delete_object(&self, _: &str, key: &str) -> Result<(), FsError> {
+            self.write_guard("delete")?;
+            self.deleted
+                .lock()
+                .expect("delete log")
+                .push(key.to_string());
+            Ok(())
+        }
+        async fn list_keys(&self, _: &str, _: &str) -> Result<Vec<ListedKey>, FsError> {
+            Ok(self.listed.clone())
+        }
+    }
+
     #[tokio::test]
     async fn sweep_reaps_aged_orphan_bytes() -> anyhow::Result<()> {
-        use crate::fs::s3::ListedKey;
-
-        struct ListS3 {
-            listed: Vec<ListedKey>,
-            deleted: std::sync::Mutex<Vec<String>>,
-        }
-        #[async_trait::async_trait]
-        impl S3Client for ListS3 {
-            async fn create_multipart_upload(
-                &self,
-                _: &str,
-                _: &str,
-                _: Option<String>,
-            ) -> Result<String, FsError> {
-                Ok("u".into())
-            }
-            async fn upload_part(
-                &self,
-                _: &str,
-                _: &str,
-                _: &str,
-                _: i32,
-                _: Bytes,
-                _: Option<String>,
-            ) -> Result<String, FsError> {
-                Ok("e".into())
-            }
-            async fn complete_multipart_upload(
-                &self,
-                _: &str,
-                _: &str,
-                _: &str,
-                _: Vec<String>,
-            ) -> Result<(), FsError> {
-                Ok(())
-            }
-            async fn abort_multipart_upload(
-                &self,
-                _: &str,
-                _: &str,
-                _: &str,
-            ) -> Result<(), FsError> {
-                Ok(())
-            }
-            async fn put_object(
-                &self,
-                _: &str,
-                _: &str,
-                _: Bytes,
-                _: Option<String>,
-                _: Option<String>,
-            ) -> Result<(), FsError> {
-                Ok(())
-            }
-            async fn get_object(&self, _: &str, _: &str) -> Result<Bytes, FsError> {
-                Err(FsError::NotFound("no".into()))
-            }
-            async fn delete_object(&self, _: &str, key: &str) -> Result<(), FsError> {
-                self.deleted
-                    .lock()
-                    .expect("delete log")
-                    .push(key.to_string());
-                Ok(())
-            }
-            async fn list_keys(&self, _: &str, _: &str) -> Result<Vec<ListedKey>, FsError> {
-                Ok(self.listed.clone())
-            }
-        }
-
         let now = chrono::Utc::now().timestamp();
-        let s3 = Arc::new(ListS3 {
-            listed: vec![
+        let s3 = Arc::new(FakeS3::new(
+            vec![
                 ListedKey {
                     key: "files/old-stray".into(),
                     last_modified: now - TTL_SECS - 3600,
@@ -432,8 +461,8 @@ mod tests {
                     last_modified: now - TTL_SECS - 3600,
                 },
             ],
-            deleted: std::sync::Mutex::new(Vec::new()),
-        });
+            true,
+        ));
         let orphan_prefix = crate::db::test_prefix("gc-orphan");
         let store = FsStore::new(build_test_store(&orphan_prefix).await);
         let policy =
@@ -445,10 +474,7 @@ mod tests {
         engine.store.save_session(&sess).await?;
 
         assert_eq!(sweep_once(&engine).await?, 1);
-        assert_eq!(
-            *s3.deleted.lock().expect("delete log"),
-            vec!["files/old-stray".to_string()]
-        );
+        assert_eq!(s3.deleted(), vec!["files/old-stray".to_string()]);
         Ok(())
     }
 
@@ -515,74 +541,18 @@ mod tests {
 
     #[tokio::test]
     async fn sweep_retains_session_when_abort_fails() -> anyhow::Result<()> {
-        struct FailS3;
-        #[async_trait::async_trait]
-        impl S3Client for FailS3 {
-            async fn create_multipart_upload(
-                &self,
-                _: &str,
-                _: &str,
-                _: Option<String>,
-            ) -> Result<String, FsError> {
-                Ok("u".into())
-            }
-            async fn upload_part(
-                &self,
-                _: &str,
-                _: &str,
-                _: &str,
-                _: i32,
-                _: Bytes,
-                _: Option<String>,
-            ) -> Result<String, FsError> {
-                Ok("e".into())
-            }
-            async fn complete_multipart_upload(
-                &self,
-                _: &str,
-                _: &str,
-                _: &str,
-                _: Vec<String>,
-            ) -> Result<(), FsError> {
-                Ok(())
-            }
-            async fn abort_multipart_upload(
-                &self,
-                _: &str,
-                _: &str,
-                _: &str,
-            ) -> Result<(), FsError> {
-                Err(FsError::Internal("abort failed".into()))
-            }
-            async fn put_object(
-                &self,
-                _: &str,
-                _: &str,
-                _: Bytes,
-                _: Option<String>,
-                _: Option<String>,
-            ) -> Result<(), FsError> {
-                Ok(())
-            }
-            async fn get_object(&self, _: &str, _: &str) -> Result<Bytes, FsError> {
-                Err(FsError::NotFound("no".into()))
-            }
-            async fn delete_object(&self, _: &str, _: &str) -> Result<(), FsError> {
-                Err(FsError::Internal("delete failed".into()))
-            }
-            async fn list_keys(
-                &self,
-                _: &str,
-                _: &str,
-            ) -> Result<Vec<crate::fs::s3::ListedKey>, FsError> {
-                Ok(Vec::new())
-            }
-        }
         let fail_prefix = crate::db::test_prefix("gc-fail");
         let store = FsStore::new(build_test_store(&fail_prefix).await);
         let policy =
             PolicyEngine::init_s3(build_test_store(&format!("{fail_prefix}-p")).await).await?;
-        let engine = FsEngine::from_parts(store, Arc::new(FailS3), "b".into(), policy);
+        // Every byte-mutating call fails, so both the session abort and the
+        // orphaned-file delete are retained for the next sweep.
+        let engine = FsEngine::from_parts(
+            store,
+            Arc::new(FakeS3::new(Vec::new(), false)),
+            "b".into(),
+            policy,
+        );
         engine
             .store
             .save_session(&session_with_age("old-fail", TTL_SECS + 10, true))

@@ -747,7 +747,6 @@ mod tests {
     use super::*;
 
     use crate::fs::object_store::ObjectStoreClient;
-    use crate::policy::{Action, PolicyEngine};
     use bytes::Bytes;
 
     async fn make_engine(sub: &str) -> FsEngine {
