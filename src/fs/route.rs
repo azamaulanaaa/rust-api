@@ -6,7 +6,9 @@ use actix_web::{HttpResponse, delete, get, post, put, web};
 use futures_util::TryStreamExt as _;
 
 use crate::fs::FsEngine;
+use crate::fs::error::FsError;
 use crate::fs::model::{CompleteRequest, InitRequest, InitResponse};
+use crate::fs::s3::ByteStream;
 use crate::http::ApiModule;
 use crate::http::middleware::jwt::{Claims, JwtClaimsMiddleware, Validated};
 
@@ -51,7 +53,7 @@ async fn init_upload(
     engine: web::Data<FsEngine>,
     claims: Validated<Claims>,
     body: web::Json<InitRequest>,
-) -> Result<HttpResponse, crate::fs::error::FsError> {
+) -> Result<HttpResponse, FsError> {
     let file_id = engine.init_upload(body.into_inner(), &claims.sub).await?;
     Ok(HttpResponse::Created().json(serde_json::json!({ "file_id": file_id })))
 }
@@ -64,7 +66,7 @@ async fn upload_part(
     path: web::Path<(String, u64)>,
     payload: web::Payload,
     req: actix_web::HttpRequest,
-) -> Result<HttpResponse, crate::fs::error::FsError> {
+) -> Result<HttpResponse, FsError> {
     let (id, idx) = path.into_inner();
     // Checksum passthrough: S3 validates, we just forward base64 SHA256 if provided
     let checksum_sha256 = req
@@ -85,8 +87,7 @@ async fn upload_part(
         .get("content-length")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<u64>().ok());
-    let stream = payload
-        .map_err(|_| crate::fs::error::FsError::BadRequest("request body interrupted".into()));
+    let stream = payload.map_err(|_| FsError::BadRequest("request body interrupted".into()));
     engine
         .upload_part(&id, idx, stream, declared_len, checksum_sha256, &claims.sub)
         .await?;
@@ -100,7 +101,7 @@ async fn complete_upload(
     claims: Validated<Claims>,
     path: web::Path<String>,
     body: web::Json<CompleteRequest>,
-) -> Result<HttpResponse, crate::fs::error::FsError> {
+) -> Result<HttpResponse, FsError> {
     body.validate()?;
     let id = path.into_inner();
     engine
@@ -115,7 +116,7 @@ async fn cancel_upload(
     engine: web::Data<FsEngine>,
     claims: Validated<Claims>,
     path: web::Path<String>,
-) -> Result<HttpResponse, crate::fs::error::FsError> {
+) -> Result<HttpResponse, FsError> {
     let id = path.into_inner();
     engine.cancel_upload(&id, &claims.sub).await?;
     Ok(HttpResponse::NoContent().finish())
@@ -127,7 +128,7 @@ async fn get_progress(
     engine: web::Data<FsEngine>,
     claims: Validated<Claims>,
     path: web::Path<String>,
-) -> Result<HttpResponse, crate::fs::error::FsError> {
+) -> Result<HttpResponse, FsError> {
     let id = path.into_inner();
     let prog = engine.get_progress(&id, &claims.sub).await?;
     Ok(HttpResponse::Ok().json(prog))
@@ -139,7 +140,7 @@ async fn get_metadata(
     engine: web::Data<FsEngine>,
     claims: Validated<Claims>,
     path: web::Path<String>,
-) -> Result<HttpResponse, crate::fs::error::FsError> {
+) -> Result<HttpResponse, FsError> {
     let id = path.into_inner();
     let meta = engine.get_metadata(&id, &claims.sub).await?;
     Ok(HttpResponse::Ok().json(meta))
@@ -152,7 +153,7 @@ async fn get_file(
     claims: Validated<Claims>,
     path: web::Path<String>,
     req: actix_web::HttpRequest,
-) -> Result<HttpResponse, crate::fs::error::FsError> {
+) -> Result<HttpResponse, FsError> {
     use actix_web::http::header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, RANGE};
 
     let id = path.into_inner();
@@ -205,8 +206,8 @@ async fn get_file(
 /// Logs mid-stream download failures server-side (headers are already
 /// sent by then, so the client just sees a truncated body).
 fn logged_stream(
-    stream: crate::fs::s3::ByteStream,
-) -> impl futures_util::Stream<Item = Result<bytes::Bytes, crate::fs::error::FsError>> {
+    stream: ByteStream,
+) -> impl futures_util::Stream<Item = Result<bytes::Bytes, FsError>> {
     stream.map_err(|e| {
         tracing::warn!("file download stream failed: {e:?}");
         e
@@ -316,7 +317,7 @@ async fn delete_file(
     engine: web::Data<FsEngine>,
     claims: Validated<Claims>,
     path: web::Path<String>,
-) -> Result<HttpResponse, crate::fs::error::FsError> {
+) -> Result<HttpResponse, FsError> {
     let id = path.into_inner();
     engine.delete_file(&id, &claims.sub).await?;
     Ok(HttpResponse::NoContent().finish())
