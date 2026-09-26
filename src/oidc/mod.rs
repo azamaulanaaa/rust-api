@@ -36,34 +36,39 @@ pub struct OidcConfig {
 }
 
 /// Errors raised by [`OidcClient`] during discovery and token exchange.
+///
+/// Display text is lowercase sentence style, matching
+/// [`FsError`](crate::fs::error::FsError) and
+/// [`ApiError`](crate::http::error::ApiError): these strings reach server
+/// logs and startup error output, so they read as one voice.
 #[derive(Error, Debug)]
 pub enum OidcError {
     /// Client configuration could not be applied.
-    #[error("Configuration error: {0}")]
+    #[error("configuration error: {0}")]
     Configuration(String),
 
     /// A provider or redirect URL failed to parse.
-    #[error("Invalid URL format: {0}")]
+    #[error("invalid URL format: {0}")]
     UrlParse(#[from] url::ParseError),
 
     /// The outbound HTTP request to the provider failed.
-    #[error("HTTP client error: {0}")]
+    #[error("http client error: {0}")]
     HttpClient(#[from] reqwest::Error),
 
     /// The provider's discovery document was missing or malformed.
-    #[error("Failed to discover OIDC provider: {0}")]
+    #[error("failed to discover OIDC provider: {0}")]
     Discovery(String),
 
     /// The authorization-code exchange was rejected by the provider.
-    #[error("Failed to exchange authorization code: {0}")]
+    #[error("failed to exchange authorization code: {0}")]
     ExchangeFailure(String),
 
     /// The provider's token response contained no ID token.
-    #[error("Provider did not return an ID token")]
+    #[error("provider did not return an ID token")]
     MissingIdToken,
 
     /// The ID token failed signature, nonce, or claims validation.
-    #[error("ID token validation failed: {0}")]
+    #[error("id token validation failed: {0}")]
     InvalidToken(String),
 }
 
@@ -318,6 +323,25 @@ mod tests {
         // Fail closed: garbage can only make cookies stricter.
         assert!(secure_scheme("not a url"));
         assert!(secure_scheme(""));
+    }
+
+    /// Every variant renders lowercase sentence style, matching
+    /// `FsError`/`ApiError` so log output reads as one voice. The enum doc
+    /// makes this a contract rather than a coincidence.
+    #[test]
+    fn error_display_is_lowercase_sentence_style() {
+        for rendered in [
+            OidcError::MissingIdToken.to_string(),
+            OidcError::Discovery("no issuer".into()).to_string(),
+            OidcError::ExchangeFailure("400 from /token".into()).to_string(),
+            OidcError::InvalidToken("aud mismatch".into()).to_string(),
+        ] {
+            let first = rendered.chars().next().expect("non-empty display");
+            assert!(
+                first.is_lowercase(),
+                "expected lowercase start, got {rendered:?}"
+            );
+        }
     }
 
     #[tokio::test]

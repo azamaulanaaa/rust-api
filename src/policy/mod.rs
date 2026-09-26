@@ -72,22 +72,28 @@ impl FromStr for Action {
 }
 
 /// Errors raised by [`PolicyEngine`] and [`Authorizer`].
+///
+/// Display text is lowercase sentence style, matching
+/// [`FsError`](crate::fs::error::FsError) and
+/// [`ApiError`](crate::http::error::ApiError). These strings are internal:
+/// the `From<PolicyError> for ApiError` impl maps every variant onto a
+/// sanitized `ApiError` before anything reaches a client.
 #[derive(Debug, Error)]
 pub enum PolicyError {
     /// An operation on the policy store failed.
-    #[error("Policy store error: {0}")]
+    #[error("policy store error: {0}")]
     Store(#[from] oxkv::StoreError),
 
     /// The Casbin engine rejected an operation or failed enforcement.
-    #[error("Casbin authorization engine error: {0}")]
+    #[error("casbin authorization engine error: {0}")]
     Casbin(#[from] casbin::Error),
 
     /// The subject does not hold the required permission.
-    #[error("Access Denied")]
+    #[error("access denied")]
     AccessDenied,
 
     /// Logging a committed mutation to the WAL failed.
-    #[error("WAL error: {0}")]
+    #[error("wal error: {0}")]
     Wal(String),
 }
 
@@ -551,6 +557,23 @@ mod tests {
         let prefix = format!("test-policy-mod-{}-{}", std::process::id(), uuid_like());
         let s3 = crate::db::build_test_store(&prefix).await;
         PolicyEngine::init_s3(s3).await.unwrap()
+    }
+
+    /// Every variant renders lowercase sentence style, so policy and OIDC
+    /// failures read the same in logs as the FS ones. The enum doc makes
+    /// this a contract rather than a coincidence.
+    #[test]
+    fn error_display_is_lowercase_sentence_style() {
+        for rendered in [
+            PolicyError::AccessDenied.to_string(),
+            PolicyError::Wal("seq 7 missing".into()).to_string(),
+        ] {
+            let first = rendered.chars().next().expect("non-empty display");
+            assert!(
+                first.is_lowercase(),
+                "expected lowercase start, got {rendered:?}"
+            );
+        }
     }
 
     fn uuid_like() -> String {
