@@ -152,6 +152,12 @@ The lease cannot stop a network partition from splitting the prefix; nothing lea
 
 `/ready` reports 503 when the lease is lost, so this composes with an existing readiness probe rather than requiring a new one.
 
+### Fencing losses are typed, not string-matched
+
+A store whose epoch was lost surfaces as `FsError::Fenced`, classified in one place — `From<oxkv::StoreError>` — and detected with `FsError::is_fencing_loss()`. It used to be a `detail.contains("fenced")` search on the flattened store message, so any rewording in `oxkv` would have silently turned the recoverable path in `POST /sync/sync` (adopt the concurrent builder's coverage) into a 500 for every client.
+
+Keeping that correct means every `oxkv::StoreError` → `FsError` conversion has to route through `From`, including the private `store_err` helpers in `fs::store` and `sync::snapshot`; those are one-liners for exactly that reason. The reason string is operator-facing: it is logged at `error` level (a lost epoch is terminal for that handle, not a blip) and never serialized.
+
 ### Row-level and file delegation
 
 Business rows authorize as `{row_type}:{row_id}` via `RowAuthorizer` (`policy/row.rs`). Files are not gated by a coarse `fs` object; instead:

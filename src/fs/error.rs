@@ -28,15 +28,48 @@ pub enum FsError {
     /// Oxkv store error - 500. Same sanitization contract as `Internal`.
     #[error("internal server error")]
     Store(String),
+    /// The store's epoch was lost to another writer - 500.
+    ///
+    /// Split out from [`Store`](Self::Store) because it is *actionable*:
+    /// `oxkv` documents `StoreError::Fenced` as terminal ("the current
+    /// process must stop writing and restart via `ownership.json` CAS"),
+    /// and a caller that can recover from losing a fencing race — such as
+    /// adopting a concurrent builder's coverage instead of failing — has to
+    /// be able to recognise the condition.
+    ///
+    /// It used to detect that by searching the flattened detail for the
+    /// substring `"fenced"`, which silently degraded to a 500 for every
+    /// client if `oxkv` ever reworded the message. Same sanitization
+    /// contract as `Store`: the reason is logged, never sent.
+    #[error("internal server error")]
+    Fenced(String),
 }
 
 impl From<oxkv::StoreError> for FsError {
+    /// The single place an `oxkv` error is classified.
+    ///
+    /// Every conversion into `FsError` must go through here — including
+    /// the `store_err` helpers in `fs::store` and `sync::snapshot` — or a
+    /// fencing loss gets flattened into [`Store`](Self::Store) and becomes
+    /// undetectable again.
     fn from(e: oxkv::StoreError) -> Self {
-        Self::Store(e.to_string())
+        match e {
+            oxkv::StoreError::Fenced(reason) => Self::Fenced(reason),
+            other => Self::Store(other.to_string()),
+        }
     }
 }
 
 impl FsError {
+    /// True when this is a lost epoch, i.e. another writer took the prefix.
+    ///
+    /// The detection point for recoverable fencing races. Distinct from a
+    /// generic store failure: a fencing loss can be raced and retried,
+    /// while a corrupt or missing store cannot.
+    pub fn is_fencing_loss(&self) -> bool {
+        matches!(self, Self::Fenced(_))
+    }
+
     /// Stable client-facing message: never carries request input.
     ///
     /// The inner detail stays in `Display` for server-side logs; the
@@ -49,7 +82,7 @@ impl FsError {
             Self::NotFound(_) => "not found",
             Self::Conflict(_) => "conflict",
             Self::PayloadTooLarge => "payload too large",
-            Self::Internal(_) | Self::Store(_) => "internal server error",
+            Self::Internal(_) | Self::Store(_) | Self::Fenced(_) => "internal server error",
         }
     }
 }
@@ -62,7 +95,9 @@ impl ResponseError for FsError {
             Self::Forbidden => StatusCode::FORBIDDEN,
             Self::NotFound(_) => StatusCode::NOT_FOUND,
             Self::Conflict(_) => StatusCode::CONFLICT,
-            Self::Internal(_) | Self::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::Internal(_) | Self::Store(_) | Self::Fenced(_) => {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
         }
     }
 
@@ -71,6 +106,16 @@ impl ResponseError for FsError {
         // paths): log them here so call sites can't forget, never
         // serialize them — the body only carries the stable Display text.
         match self {
+            // A lost epoch is not a transient blip: every subsequent write
+            // on this handle will fail the same way. `error` so it stands
+            // out in a log tail and is not lost among store warnings.
+            Self::Fenced(detail) => {
+                tracing::error!(
+                    "fs error {}: store epoch lost to another writer ({detail}); \
+                     this handle must stop writing and be rebuilt",
+                    self.status_code()
+                );
+            }
             Self::Internal(detail) | Self::Store(detail) => {
                 tracing::warn!("fs error {}: internal: {detail}", self.status_code());
             }
@@ -94,6 +139,40 @@ mod tests {
         assert_eq!(err.to_string(), "internal server error");
         let store = FsError::Store("raw oxkv dump".to_string());
         assert_eq!(store.to_string(), "internal server error");
+        let fenced = FsError::Fenced("epoch 7 superseded by 8".to_string());
+        assert_eq!(fenced.to_string(), "internal server error");
+    }
+
+    /// `From<oxkv::StoreError>` is the only place fencing is classified, so
+    /// the split has to hold for every other oxkv error too.
+    #[test]
+    fn oxkv_fencing_is_classified_and_others_are_not() {
+        assert!(FsError::from(oxkv::StoreError::Fenced("epoch 2".into())).is_fencing_loss());
+        for other in [
+            oxkv::StoreError::Storage("disk".into()),
+            oxkv::StoreError::CasConflict("race".into()),
+            oxkv::StoreError::NotModified,
+        ] {
+            let mapped = FsError::from(other);
+            assert!(
+                !mapped.is_fencing_loss(),
+                "misdclassified: {mapped:?} ({mapped})"
+            );
+            assert!(matches!(mapped, FsError::Store(_)), "got {mapped:?}");
+        }
+    }
+
+    /// The fencing reason is operator-facing and must not reach the wire.
+    #[actix_web::test]
+    async fn fencing_reason_is_logged_but_not_serialized() {
+        let res = FsError::Fenced("epoch 7 superseded by writer on host-a".into()).error_response();
+        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let raw = actix_web::body::to_bytes(res.into_body()).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(json["error"], "internal server error");
+        let text = String::from_utf8_lossy(&raw);
+        assert!(!text.contains("epoch"), "leaks epoch: {text}");
+        assert!(!text.contains("host-a"), "leaks host: {text}");
     }
 
     #[actix_web::test]

@@ -125,7 +125,7 @@ impl FsStore {
     pub async fn new_mirrored(s3_store: OxKvStore) -> Result<Self, FsError> {
         let mirror = CachedOxKvStore::open_with_mode(s3_store.clone(), WarmMode::Lazy)
             .await
-            .map_err(|e| FsError::Store(e.to_string()))?;
+            .map_err(FsError::from)?;
         Ok(Self {
             inner: Arc::new(RwLock::new(s3_store)),
             mirror: Some(mirror),
@@ -147,10 +147,7 @@ impl FsStore {
         let Some(mirror) = &self.mirror else {
             return Ok(0);
         };
-        let applied = mirror
-            .refresh()
-            .await
-            .map_err(|e| FsError::Store(e.to_string()))?;
+        let applied = mirror.refresh().await.map_err(FsError::from)?;
         tracing::debug!(applied, "fs mirror refreshed");
         Ok(applied)
     }
@@ -158,15 +155,10 @@ impl FsStore {
     /// Point read through the single shared handle (mirror first).
     async fn get_one(&self, key: &str) -> Result<Option<Vec<u8>>, FsError> {
         if let Some(mirror) = &self.mirror {
-            return mirror
-                .get_bytes(key)
-                .await
-                .map_err(|e| FsError::Store(e.to_string()));
+            return mirror.get_bytes(key).await.map_err(FsError::from);
         }
         let g = self.inner.read().await;
-        g.get_bytes(key)
-            .await
-            .map_err(|e| FsError::Store(e.to_string()))
+        g.get_bytes(key).await.map_err(FsError::from)
     }
 
     /// Range scan bounded to keys under `prefix:`.
@@ -180,12 +172,12 @@ impl FsStore {
             return mirror
                 .gets_bytes(None, Direction::Next, cursor)
                 .await
-                .map_err(|e| FsError::Store(e.to_string()));
+                .map_err(FsError::from);
         }
         let g = self.inner.read().await;
         g.gets_bytes(None, Direction::Next, cursor)
             .await
-            .map_err(|e| FsError::Store(e.to_string()))
+            .map_err(FsError::from)
     }
 
     fn session_key(id: &str) -> String {
@@ -206,9 +198,7 @@ impl FsStore {
         let key = Self::session_key(&s.id);
         let val = serde_json::to_vec(s).map_err(|e| FsError::Internal(e.to_string()))?;
         let g = self.inner.write().await;
-        g.set_bytes(&key, &val)
-            .await
-            .map_err(|e| FsError::Store(e.to_string()))?;
+        g.set_bytes(&key, &val).await.map_err(FsError::from)?;
         Ok(())
     }
 
@@ -228,9 +218,7 @@ impl FsStore {
         let key = Self::session_key(id);
         {
             let g = self.inner.write().await;
-            g.delete(&key)
-                .await
-                .map_err(|e| FsError::Store(e.to_string()))?;
+            g.delete(&key).await.map_err(FsError::from)?;
             if let Some(s) = session {
                 for idx in 0..s.file_total_parts {
                     let k = Self::staged_key(id, idx);
@@ -251,9 +239,7 @@ impl FsStore {
         let key = Self::multipart_key(&m.upload_id);
         let val = serde_json::to_vec(m).map_err(|e| FsError::Internal(e.to_string()))?;
         let g = self.inner.write().await;
-        g.set_bytes(&key, &val)
-            .await
-            .map_err(|e| FsError::Store(e.to_string()))?;
+        g.set_bytes(&key, &val).await.map_err(FsError::from)?;
         Ok(())
     }
 
@@ -274,9 +260,7 @@ impl FsStore {
     pub async fn delete_multipart(&self, upload_id: &str) -> Result<(), FsError> {
         let key = Self::multipart_key(upload_id);
         let g = self.inner.write().await;
-        g.delete(&key)
-            .await
-            .map_err(|e| FsError::Store(e.to_string()))?;
+        g.delete(&key).await.map_err(FsError::from)?;
         Ok(())
     }
 
@@ -284,9 +268,7 @@ impl FsStore {
     pub async fn save_staged_part(&self, id: &str, idx: u64, data: Vec<u8>) -> Result<(), FsError> {
         let key = Self::staged_key(id, idx);
         let g = self.inner.write().await;
-        g.set_bytes(&key, &data)
-            .await
-            .map_err(|e| FsError::Store(e.to_string()))?;
+        g.set_bytes(&key, &data).await.map_err(FsError::from)?;
         Ok(())
     }
 
@@ -301,9 +283,7 @@ impl FsStore {
         let key = Self::file_key(&rec.id);
         let val = serde_json::to_vec(rec).map_err(|e| FsError::Internal(e.to_string()))?;
         let g = self.inner.write().await;
-        g.set_bytes(&key, &val)
-            .await
-            .map_err(|e| FsError::Store(e.to_string()))?;
+        g.set_bytes(&key, &val).await.map_err(FsError::from)?;
         Ok(())
     }
 
@@ -495,14 +475,14 @@ impl FsStore {
         let kvs = g
             .gets_bytes(None, Direction::Next, (None, None))
             .await
-            .map_err(|e| FsError::Store(e.to_string()))?;
+            .map_err(FsError::from)?;
         Ok(kvs.into_iter().map(|kv| (kv.key, kv.value)).collect())
     }
 }
 
 /// Maps oxkv errors into [`FsError`].
 fn store_err(e: oxkv::StoreError) -> FsError {
-    FsError::Store(e.to_string())
+    FsError::from(e)
 }
 
 /// Reads ref-count info through any [`GetSet`] handle (store or
