@@ -101,6 +101,34 @@ enum PolicyAction {
     },
 }
 
+/// Projects the config's `[s3]` section into the storage-agnostic
+/// [`S3ClientConfig`] the engine and store factory consume.
+///
+/// The binary keeps its own [`config::S3Config`] so the library stays
+/// decoupled from the config file format; this is the single place the
+/// two are translated.
+fn s3_client_config(cfg: &config::Config) -> S3ClientConfig {
+    S3ClientConfig {
+        bucket: cfg.s3.bucket.clone(),
+        region: cfg.s3.region.clone(),
+        endpoint_url: cfg.s3.endpoint_url.clone(),
+        force_path_style: cfg.s3.force_path_style,
+        access_key_id: cfg.s3.access_key_id.clone(),
+        secret_access_key: cfg.s3.secret_access_key.clone(),
+    }
+}
+
+/// Object prefix for one domain under the configured `[database].prefix`.
+///
+/// `db_prefix` is the already-trimmed root prefix. Every store the server
+/// builds is `{db_prefix}/{domain}` in the single configured bucket:
+/// `policy`, `fs`, `wal`, and (under
+/// [`SnapshotManager`](rust_api::sync::snapshot::SnapshotManager))
+/// `u/{sha256-hex(sub)}` per user.
+fn domain_prefix(db_prefix: &str, domain: &str) -> String {
+    format!("{db_prefix}/{domain}")
+}
+
 /// Bootstraps the server: loads configuration, initializes the OIDC client
 /// and policy engine, registers their API modules, and starts listening.
 #[tokio::main]
@@ -112,17 +140,10 @@ async fn main() -> anyhow::Result<()> {
         Command::Policy { action } => match action {
             PolicyAction::Export { config, out } => {
                 let cfg = config::Config::try_from(config.as_path())?;
-                let s3_cfg = S3ClientConfig {
-                    bucket: cfg.s3.bucket.clone(),
-                    region: cfg.s3.region.clone(),
-                    endpoint_url: cfg.s3.endpoint_url.clone(),
-                    force_path_style: cfg.s3.force_path_style,
-                    access_key_id: cfg.s3.access_key_id.clone(),
-                    secret_access_key: cfg.s3.secret_access_key.clone(),
-                };
+                let db_prefix = cfg.database.prefix.trim_matches('/').to_string();
                 let store = rust_api::db::build_s3_store(
-                    &s3_cfg,
-                    &format!("{}/policy", cfg.database.prefix.trim_matches('/')),
+                    &s3_client_config(&cfg),
+                    &domain_prefix(&db_prefix, "policy"),
                 )
                 .await?;
                 let dump = admin::export_s3(store).await?;
@@ -140,24 +161,14 @@ async fn main() -> anyhow::Result<()> {
             }
             PolicyAction::Import { config, input } => {
                 let cfg = config::Config::try_from(config.as_path())?;
-                let s3_cfg = S3ClientConfig {
-                    bucket: cfg.s3.bucket.clone(),
-                    region: cfg.s3.region.clone(),
-                    endpoint_url: cfg.s3.endpoint_url.clone(),
-                    force_path_style: cfg.s3.force_path_style,
-                    access_key_id: cfg.s3.access_key_id.clone(),
-                    secret_access_key: cfg.s3.secret_access_key.clone(),
-                };
-                let store = rust_api::db::build_s3_store(
-                    &s3_cfg,
-                    &format!("{}/policy", cfg.database.prefix.trim_matches('/')),
-                )
-                .await?;
-                let wal_store = rust_api::db::build_s3_store(
-                    &s3_cfg,
-                    &format!("{}/wal", cfg.database.prefix.trim_matches('/')),
-                )
-                .await?;
+                let s3_cfg = s3_client_config(&cfg);
+                let db_prefix = cfg.database.prefix.trim_matches('/').to_string();
+                let store =
+                    rust_api::db::build_s3_store(&s3_cfg, &domain_prefix(&db_prefix, "policy"))
+                        .await?;
+                let wal_store =
+                    rust_api::db::build_s3_store(&s3_cfg, &domain_prefix(&db_prefix, "wal"))
+                        .await?;
                 let wal_for_import = rust_api::sync::wal::Wal::new(wal_store);
                 let bytes =
                     std::fs::read(&input).with_context(|| format!("read {}", input.display()))?;
@@ -178,8 +189,12 @@ async fn main() -> anyhow::Result<()> {
 /// Runs the HTTP listener until stopped.
 async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
     let config = config::Config::try_from(config_path)?;
-    // Resolve before `config` is partially moved into module configs.
+    // Resolve everything that borrows `config` before it is partially moved
+    // into the module configs below.
     let token_keys = resolve_token_keys(&config)?;
+    let s3_client_config = s3_client_config(&config);
+    let db_prefix = config.database.prefix.trim_matches('/').to_string();
+    let mirror_master = config.database.mirror_master;
 
     let telemetry = telemetry::init(
         verbose,
@@ -202,31 +217,19 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
     .await?;
     let oidc_api_module = OidcApiModule::<Claims>::init(oidc_client).await?;
 
-    let s3_client_config = S3ClientConfig {
-        bucket: config.s3.bucket.clone(),
-        region: config.s3.region.clone(),
-        endpoint_url: config.s3.endpoint_url.clone(),
-        force_path_style: config.s3.force_path_style,
-        access_key_id: config.s3.access_key_id.clone(),
-        secret_access_key: config.s3.secret_access_key.clone(),
-    };
     // Single bucket, prefix-scoped OxKvStores per domain (scalable, no local files).
-    let policy_store = rust_api::db::build_s3_store(
-        &s3_client_config,
-        &format!("{}/policy", config.database.prefix.trim_matches('/')),
-    )
-    .await
-    .map_err(|e| anyhow::anyhow!("build policy OxKvStore: {e}"))?;
-    let fs_s3_store = rust_api::db::build_s3_store(
-        &s3_client_config,
-        &format!("{}/fs", config.database.prefix.trim_matches('/')),
-    )
-    .await
-    .map_err(|e| anyhow::anyhow!("build fs OxKvStore: {e}"))?;
-    let db_prefix = config.database.prefix.trim_matches('/').to_string();
-    let wal_store = rust_api::db::build_s3_store(&s3_client_config, &format!("{db_prefix}/wal"))
-        .await
-        .map_err(|e| anyhow::anyhow!("build wal OxKvStore: {e}"))?;
+    let policy_store =
+        rust_api::db::build_s3_store(&s3_client_config, &domain_prefix(&db_prefix, "policy"))
+            .await
+            .map_err(|e| anyhow::anyhow!("build policy OxKvStore: {e}"))?;
+    let fs_s3_store =
+        rust_api::db::build_s3_store(&s3_client_config, &domain_prefix(&db_prefix, "fs"))
+            .await
+            .map_err(|e| anyhow::anyhow!("build fs OxKvStore: {e}"))?;
+    let wal_store =
+        rust_api::db::build_s3_store(&s3_client_config, &domain_prefix(&db_prefix, "wal"))
+            .await
+            .map_err(|e| anyhow::anyhow!("build wal OxKvStore: {e}"))?;
     let wal = Wal::new(wal_store);
     let policy_engine = PolicyEngine::init_s3(policy_store)
         .await?
@@ -254,7 +257,7 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
             .build()
             .context("build snapshot object store")?,
     );
-    let master_store = if config.database.mirror_master {
+    let master_store = if mirror_master {
         FsStore::new_mirrored(fs_s3_store.clone())
             .await
             .map_err(|e| anyhow::anyhow!("open fs mirror: {e}"))?
