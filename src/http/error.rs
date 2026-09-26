@@ -6,11 +6,16 @@
 //! response renderer — they are never sent to clients.
 
 use actix_web::{HttpResponse, ResponseError, http::StatusCode};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Wire format for every API error: `{"error": "<message>"}`.
-#[derive(Debug, Serialize, utoipa::ToSchema)]
+///
+/// `Deserialize` as well as `Serialize` so tests can assert on the served
+/// body through this type rather than through an anonymous
+/// `serde_json::Value` -- the point being to check that what is on the wire
+/// really is this shape.
+#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ErrorBody {
     /// Stable, non-sensitive description of the failure.
     pub error: String,
@@ -58,6 +63,22 @@ impl ApiError {
             Self::Conflict => StatusCode::CONFLICT,
         }
     }
+
+    /// Renders the uniform envelope for an arbitrary status and message.
+    ///
+    /// The single place the body is constructed, so a status cannot end up
+    /// paired with a differently-shaped body. [`FsError`] renders through
+    /// here too: it is a second `ResponseError` implementation in this crate
+    /// with its own status table, and while it built its body with a bare
+    /// `json!` macro the served shape for `/fs` and `/sync` was an anonymous
+    /// value that the OpenAPI document described as
+    /// [`ErrorBody`] only by convention. Now it is
+    /// [`ErrorBody`] by construction.
+    pub(crate) fn envelope(status: StatusCode, message: &str) -> HttpResponse {
+        HttpResponse::build(status).json(ErrorBody {
+            error: message.to_string(),
+        })
+    }
 }
 
 impl ResponseError for ApiError {
@@ -72,15 +93,86 @@ impl ResponseError for ApiError {
             tracing::warn!("API {} {}: {cause}", self.status(), self);
         }
 
-        HttpResponse::build(self.status()).json(ErrorBody {
-            error: self.to_string(),
-        })
+        Self::envelope(self.status(), &self.to_string())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Reads a source file's production code: everything before the
+    /// top-level `#[cfg(test)]` module, with comment lines dropped.
+    fn production_source(path: &str) -> String {
+        let src = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+        let mut out = String::new();
+        for line in src.lines() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            if trimmed == "#[cfg(test)]" {
+                break;
+            }
+            out.push_str(line);
+            out.push('\n');
+        }
+        out
+    }
+
+    /// The error envelope is built in exactly one place.
+    ///
+    /// This crate has two `ResponseError` implementations -- `ApiError` for
+    /// control-plane failures and `FsError` for the file engine's richer set
+    /// -- and `FsError` used to assemble its own body with a bare `json!`
+    /// macro. The two produced identical bytes, which is precisely the
+    /// problem: the OpenAPI document described every error as `ErrorBody`,
+    /// `/fs` and `/sync` served an anonymous value that only matched the
+    /// schema by convention, and no test could tell the difference.
+    ///
+    /// So the duplication is checked structurally instead. A behavioural
+    /// test cannot work here, and writing one anyway would be worse than
+    /// none: it would read as coverage of a property it does not have.
+    #[test]
+    fn the_envelope_has_one_construction_site() {
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap_or_else(|e| panic!("{dir:?}: {e}")) {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                    out.push(path);
+                }
+            }
+        }
+
+        let mut files = Vec::new();
+        walk(std::path::Path::new("src"), &mut files);
+
+        let mut sites: Vec<String> = Vec::new();
+        for path in &files {
+            let rel = path.to_string_lossy().replace('\\', "/");
+            let src = production_source(&rel);
+            for line in src.lines() {
+                // A hand-rolled body: either the struct literal or a
+                // `json!` that emits the envelope's key.
+                if line.contains("ErrorBody {")
+                    || (line.contains("json!") && line.contains("\"error\""))
+                {
+                    sites.push(rel.clone());
+                    break;
+                }
+            }
+        }
+        sites.sort();
+        assert_eq!(
+            sites,
+            vec!["src/http/error.rs".to_string()],
+            "the error envelope must be constructed in exactly one file. Build it \
+             through `ApiError::envelope` so `/fs` and `/sync` serve the `ErrorBody` \
+             the OpenAPI document names."
+        );
+    }
 
     #[test]
     fn statuses_map_to_expected_codes() {

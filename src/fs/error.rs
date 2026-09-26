@@ -1,4 +1,19 @@
 //! Error type for the FS module, mapped to the uniform `{"error":...}` envelope.
+//!
+//! # `Display` is not the client-facing message
+//!
+//! [`ApiError`](crate::http::error::ApiError)'s `#[error]` text *is* the
+//! response body, and no variant of it carries a `String` so that cannot
+//! leak. This type is the other way round: the 4xx variants hold
+//! request-derived detail (a filename, a key, a size) and their `Display` is
+//! that detail, which is for logs only. The wire gets a fixed string per
+//! status instead.
+//!
+//! The two contracts are opposites for the same trait method, which is worth
+//! stating at both types: reaching for `to_string()` when building a response
+//! from an `FsError` sends user input to the client. Both render through
+//! [`ApiError::envelope`](crate::http::error::ApiError), so the body is
+//! `ErrorBody` either way.
 
 use actix_web::{HttpResponse, ResponseError, http::StatusCode};
 use thiserror::Error;
@@ -140,8 +155,12 @@ impl ResponseError for FsError {
             }
             Self::Forbidden => {}
         }
-        let body = serde_json::json!({ "error": self.client_message() });
-        HttpResponse::build(self.status_code()).json(body)
+        // Rendered through `ApiError` so the served body is literally the
+        // `ErrorBody` the OpenAPI document names, not a hand-built value
+        // that happens to have the same shape. This type exists because the
+        // FS engine's errors are richer than the API's, not because the
+        // envelope needed a second implementation.
+        crate::http::error::ApiError::envelope(self.status_code(), self.client_message())
     }
 }
 
@@ -175,6 +194,70 @@ mod tests {
                 "misdclassified: {mapped:?} ({mapped})"
             );
             assert!(matches!(mapped, FsError::Store(_)), "got {mapped:?}");
+        }
+    }
+
+    /// `/fs` and `/sync` bodies are the documented `ErrorBody`, not a value
+    /// that merely resembles it.
+    ///
+    /// The OpenAPI document names `ErrorBody` for this crate's errors, and
+    /// `FsError` used to build its body with a bare `json!` macro -- so the
+    /// served shape for every `/fs` and `/sync` failure was an anonymous
+    /// value that matched the schema only by convention, in a second
+    /// `ResponseError` impl that could drift from the first.
+    ///
+    /// What this checks is the contract half: every variant renders a body
+    /// that deserializes as `ErrorBody` and carries the sanitized message.
+    /// It deliberately does *not* claim to detect the duplication -- a
+    /// hand-built `json!` with the same keys serializes to the same bytes,
+    /// which is exactly why the duplication was invisible. That is
+    /// `http::error::tests::the_envelope_has_one_construction_site`.
+    ///
+    /// The expected message is `client_message()` and not `Display`, which is
+    /// the opposite of `ApiError`, where `#[error]` *is* the body. `FsError`
+    /// keeps request-derived text in its variants and out of the wire, so the
+    /// two types have opposite contracts for the same trait method and a
+    /// refactor that confuses them leaks input.
+    #[actix_web::test]
+    async fn fs_and_api_errors_render_one_envelope() {
+        use crate::http::error::{ApiError, ErrorBody};
+
+        async fn body_of(res: HttpResponse) -> String {
+            let raw = actix_web::body::to_bytes(res.into_body())
+                .await
+                .expect("body");
+            String::from_utf8(raw.to_vec()).expect("utf-8 json")
+        }
+
+        for err in [
+            FsError::BadRequest("got 7".into()),
+            FsError::PayloadTooLarge,
+            FsError::Forbidden,
+            FsError::NotFound("no such file".into()),
+            FsError::Conflict("exists".into()),
+            FsError::Internal("dsn".into()),
+            FsError::Store("oxkv".into()),
+            FsError::Fenced("epoch 2".into()),
+        ] {
+            let expected = err.client_message().to_string();
+            let parsed: ErrorBody = serde_json::from_str(&body_of(err.error_response()).await)
+                .expect("body is an ErrorBody");
+            assert_eq!(
+                parsed.error, expected,
+                "{parsed:?} must carry the sanitized message, never the detail"
+            );
+        }
+
+        // And the two types agree wherever their statuses overlap, despite
+        // the opposite `Display` contracts.
+        for (api, expected) in [
+            (ApiError::Forbidden, "forbidden"),
+            (ApiError::Internal("dsn".into()), "internal server error"),
+            (ApiError::Conflict, "conflict"),
+        ] {
+            let parsed: ErrorBody =
+                serde_json::from_str(&body_of(api.error_response()).await).expect("ErrorBody");
+            assert_eq!(parsed.error, expected);
         }
     }
 
