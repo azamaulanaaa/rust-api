@@ -101,20 +101,6 @@ pub enum WalOp {
 }
 
 impl WalOp {
-    /// True for any policy-shape op (legacy or rich).
-    pub fn is_policy_op(&self) -> bool {
-        matches!(
-            self,
-            Self::PolicyAdd { .. }
-                | Self::PolicyRemove { .. }
-                | Self::PolicyRuleAdd { .. }
-                | Self::PolicyRuleRemove { .. }
-                | Self::GroupAdd { .. }
-                | Self::GroupRemove { .. }
-                | Self::GroupDelete { .. }
-        )
-    }
-
     /// True for legacy object-only marks that cannot replay incrementally.
     pub fn is_legacy_policy_mark(&self) -> bool {
         matches!(self, Self::PolicyAdd { .. } | Self::PolicyRemove { .. })
@@ -328,7 +314,6 @@ mod tests {
             WalOp::PolicyRuleAdd { sub, obj, act }
             if sub == "editors" && obj == "invoice:1" && act == "read"
         ));
-        assert!(entries[0].op.is_policy_op());
         assert!(!entries[0].op.is_legacy_policy_mark());
         assert!(entries[2].op.is_legacy_policy_mark());
 

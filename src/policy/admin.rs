@@ -98,23 +98,6 @@ pub async fn import_s3(
     Ok(report)
 }
 
-/// Deprecated file-based export shim — use [`export_s3`].
-#[deprecated(note = "Use export_s3/import_s3 with OxKvStore")]
-#[allow(missing_docs)]
-pub async fn export(_store_path: &std::path::Path) -> anyhow::Result<PolicyDump> {
-    anyhow::bail!("export(Path) removed — use export_s3(OxKvStore) via --config")
-}
-
-/// Deprecated file-based import shim — use [`import_s3`].
-#[deprecated(note = "Use export_s3/import_s3 with OxKvStore")]
-#[allow(missing_docs)]
-pub async fn import(
-    _store_path: &std::path::Path,
-    _dump: &PolicyDump,
-) -> anyhow::Result<ImportReport> {
-    anyhow::bail!("import(Path) removed — use import_s3(OxKvStore, dump) via --config")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

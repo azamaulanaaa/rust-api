@@ -134,7 +134,15 @@ impl FsEngine {
         Ok(())
     }
 
-    /// Creates an engine from an explicit `S3Client` (tests).
+    /// Creates an engine from an explicit [`FsStore`] and [`S3Client`].
+    ///
+    /// The injection point behind the `S3Client` "seam so `FsEngine` stays
+    /// storage-agnostic" contract: production goes through
+    /// [`init`](Self::init), while this lets a host app (or a test) supply
+    /// a different byte backend or metadata store. Callers own
+    /// [`with_wal`](Self::with_wal) and
+    /// [`with_token_keys`](Self::with_token_keys) separately, exactly as
+    /// `init` leaves them.
     pub fn from_parts(
         store: FsStore,
         s3: Arc<dyn S3Client>,
@@ -766,14 +774,6 @@ mod tests {
     /// Wraps one buffered part as the chunk stream the engine now takes.
     fn once_body(body: Vec<u8>) -> impl futures_util::Stream<Item = Result<Bytes, FsError>> {
         futures_util::stream::once(async move { Ok(Bytes::from(body)) })
-    }
-    #[allow(dead_code)]
-    fn valid_multi() -> InitRequest {
-        InitRequest {
-            file_size: 524288,
-            part_size: 262144,
-            file_total_parts: 2,
-        }
     }
 
     #[tokio::test]
