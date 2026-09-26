@@ -191,9 +191,13 @@ impl From<PolicyError> for ApiError {
     fn from(value: PolicyError) -> Self {
         match value {
             PolicyError::AccessDenied => ApiError::Forbidden,
-            PolicyError::Store(e) => ApiError::Internal(Box::new(e)),
-            PolicyError::Casbin(e) => ApiError::Internal(Box::new(e)),
-            PolicyError::ChangeFeed(msg) => ApiError::Internal(msg.into()),
+            // The fencing case is handed over whole rather than unwrapped,
+            // so its `Display` reaches the log line that `ApiError` writes
+            // for a 500. `error!` is the wrong verb to place here, and a
+            // `tracing::error!` inside a `From` would be a side effect in a
+            // conversion; the distinguishable text is the mechanism, and
+            // its wording matches `FsError::Fenced` so one query finds both.
+            other => ApiError::Internal(Box::new(other)),
         }
     }
 }
@@ -453,6 +457,50 @@ mod tests {
 
     const KID: &str = "policy-route-test-kid";
     const AUD: &str = "test-aud";
+
+    /// A fencing loss is a 500 that says so in the log and nothing in the
+    /// body.
+    ///
+    /// Both halves matter. The client must not learn the store's reason --
+    /// `ApiError::Internal` only ever renders its fixed `Display`. The
+    /// operator must be able to tell this apart from any other 500, which
+    /// is the entire point of lifting the variant out of casbin: the text
+    /// `ApiError` logs for a cause is the only thing that reaches a log
+    /// line, so the wording is the mechanism.
+    #[test]
+    fn fencing_loss_is_a_sanitized_500_with_a_distinguishable_log_line() {
+        use crate::http::error::ApiError;
+        use actix_web::ResponseError as _;
+        use actix_web::body::MessageBody as _;
+        use std::error::Error as _;
+
+        let api: ApiError = PolicyError::Fenced("epoch 7 superseded".into()).into();
+        assert_eq!(
+            api.status_code(),
+            actix_web::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+
+        // Nothing about the store reaches the wire.
+        assert_eq!(api.to_string(), "internal server error");
+        let body = api.error_response();
+        assert!(
+            !String::from_utf8_lossy(&body.into_body().try_into_bytes().unwrap())
+                .contains("epoch 7"),
+            "the fencing reason must not be serialized to the client"
+        );
+
+        // But the log line is searchable, and matches the `fs` wording so
+        // one query finds a fencing loss on either store.
+        let logged = api
+            .source()
+            .expect("the cause is retained for logging")
+            .to_string();
+        assert!(
+            logged.contains("store epoch lost to another writer"),
+            "{logged}"
+        );
+        assert!(logged.contains("epoch 7 superseded"), "{logged}");
+    }
 
     struct Fixture {
         server: wiremock::MockServer,

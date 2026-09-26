@@ -372,6 +372,131 @@ mod tests {
     use casbin::{CoreApi, DefaultModel, Enforcer, MgmtApi};
     use oxkv::BTreeStore;
 
+    /// A store whose commits report a lost epoch.
+    ///
+    /// Reads come from a real `BTreeStore` so the engine loads normally; only
+    /// the durability step fails, which is exactly when `oxkv` fences a
+    /// writer. Using a real backend here rather than a hand-built error is
+    /// the point: the test has to prove that casbin carries the
+    /// `oxkv::StoreError` through `AdapterError` intact, because
+    /// `From<casbin::Error> for PolicyError` depends on downcasting that box
+    /// and would degrade to an opaque 500 the moment casbin flattened it to
+    /// a string.
+    struct FencedStore(BTreeStore);
+
+    #[async_trait::async_trait]
+    impl oxkv::GetSet for FencedStore {
+        async fn get_bytes(&self, key: &str) -> Result<Option<Vec<u8>>, oxkv::StoreError> {
+            self.0.get_bytes(key).await
+        }
+        async fn has(&self, key: &str) -> Result<bool, oxkv::StoreError> {
+            oxkv::GetSet::has(&self.0, key).await
+        }
+        async fn delete(&self, key: &str) -> Result<bool, oxkv::StoreError> {
+            self.0.delete(key).await
+        }
+        async fn set_bytes(
+            &self,
+            key: &str,
+            value: &[u8],
+        ) -> Result<Option<Vec<u8>>, oxkv::StoreError> {
+            self.0.set_bytes(key, value).await
+        }
+        async fn gets_bytes(
+            &self,
+            limit: Option<u32>,
+            direction: oxkv::Direction,
+            cursor: (Option<String>, Option<String>),
+        ) -> Result<Vec<oxkv::KeyValue>, oxkv::StoreError> {
+            self.0.gets_bytes(limit, direction, cursor).await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl oxkv::Store for FencedStore {
+        type Transaction = FencedTx;
+        fn begin_tx(&self) -> Result<Self::Transaction, oxkv::StoreError> {
+            Ok(FencedTx)
+        }
+    }
+
+    struct FencedTx;
+
+    #[async_trait::async_trait]
+    impl oxkv::GetSet for FencedTx {
+        async fn get_bytes(&self, _key: &str) -> Result<Option<Vec<u8>>, oxkv::StoreError> {
+            Ok(None)
+        }
+        async fn has(&self, _key: &str) -> Result<bool, oxkv::StoreError> {
+            Ok(false)
+        }
+        async fn delete(&self, _key: &str) -> Result<bool, oxkv::StoreError> {
+            Ok(false)
+        }
+        async fn set_bytes(
+            &self,
+            _key: &str,
+            _value: &[u8],
+        ) -> Result<Option<Vec<u8>>, oxkv::StoreError> {
+            Ok(None)
+        }
+        async fn gets_bytes(
+            &self,
+            _limit: Option<u32>,
+            _direction: oxkv::Direction,
+            _cursor: (Option<String>, Option<String>),
+        ) -> Result<Vec<oxkv::KeyValue>, oxkv::StoreError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl oxkv::Transaction for FencedTx {
+        async fn commit(self) -> Result<(), oxkv::StoreError> {
+            Err(oxkv::StoreError::Fenced("epoch 7 superseded".into()))
+        }
+        async fn rollback(self) -> Result<(), oxkv::StoreError> {
+            Ok(())
+        }
+    }
+
+    /// A policy write that loses the epoch has to be recognisable as such.
+    ///
+    /// Before this, every policy failure reached the client as a 500 with
+    /// the fencing reason buried inside casbin's adapter wrapper, so a
+    /// process that had stopped being the writer looked identical to one
+    /// with a flaky store. Same condition, same prefix, same log query as
+    /// `FsError::Fenced` -- and the classification is a downcast of the box
+    /// casbin hands back, so if casbin ever stops preserving it this test is
+    /// what notices.
+    #[tokio::test]
+    async fn a_fenced_policy_write_is_typed_as_a_fencing_loss() {
+        let engine =
+            crate::policy::PolicyEngine::init_with_store(FencedStore(BTreeStore::default()))
+                .await
+                .expect("engine loads from a readable store");
+
+        let err = engine
+            .add_rule(
+                "alice".into(),
+                "invoice:1".into(),
+                crate::policy::Action::Write,
+            )
+            .await
+            .expect_err("a fenced commit cannot succeed");
+
+        assert!(
+            err.is_fencing_loss(),
+            "expected a fencing loss, got {err:?} ({err})"
+        );
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("epoch lost to another writer"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("epoch 7 superseded"), "{rendered}");
+    }
+
     #[tokio::test]
     async fn persists_rules_across_reopen() {
         use std::sync::Arc;

@@ -159,6 +159,14 @@ A store whose epoch was lost surfaces as `FsError::Fenced`, classified in one pl
 
 Keeping that correct means every `oxkv::StoreError` → `FsError` conversion has to route through `From`, including the private `store_err` helpers in `fs::store` and `sync::snapshot`; those are one-liners for exactly that reason. The reason string is operator-facing: it is logged at `error` level (a lost epoch is terminal for that handle, not a blip) and never serialized.
 
+Policy writes reach the store through casbin, whose `Adapter` trait is written in `casbin::Error`, so there the `oxkv::StoreError` arrives boxed inside `AdapterError` and the classification has to be redone at the boundary: `From<casbin::Error> for PolicyError` downcasts that box and lifts the epoch loss into `PolicyError::Fenced`, which `PolicyError::is_fencing_loss()` detects. Without it a stale writer's policy write produced
+
+```text
+Casbin(AdapterError(AdapterError(Fenced("epoch 7 superseded"))))
+```
+
+— a 500 indistinguishable from any other store failure, on the same prefix and the same condition `FsError::Fenced` already reports. `PolicyError::Fenced` deliberately renders the same text as `FsError::Fenced` ("store epoch lost to another writer …"), so one log query finds a fencing loss on either store, and the client still only ever sees `{"error":"internal server error"}`. `policy::adapter::tests::a_fenced_policy_write_is_typed_as_a_fencing_loss` drives this through a real casbin enforcer over a store whose `commit` reports a lost epoch, so it also pins the assumption that casbin preserves the box rather than flattening it to a string.
+
 ### Row-level and file delegation
 
 Business rows authorize as `{row_type}:{row_id}` via `RowAuthorizer` (`policy/row.rs`). Files are not gated by a coarse `fs` object; instead:
