@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use crate::fs::error::FsError;
 use crate::fs::store::FsStore;
 use crate::policy::row::RowAuthorizer;
-use crate::policy::{Action, PolicyEngine};
+use crate::policy::{Action, Authorizer};
 use oxkv::{Direction, GetSet as _, OxKvReader, Store as _, Transaction as _};
 
 use super::wal::{Wal, WalOp};
@@ -43,7 +43,14 @@ pub struct SnapshotManager {
     /// Master file store.
     pub(crate) store: FsStore,
     /// Policy for filtering.
-    pub policy: PolicyEngine,
+    ///
+    /// The read-only [`Authorizer`](crate::policy::Authorizer), not a
+    /// [`PolicyEngine`](crate::policy::PolicyEngine): a snapshot build
+    /// only ever *asks* whether the caller may read a row. Holding the full
+    /// engine here — and exposing it as a public field — would hand every
+    /// consumer of `SnapshotManager` a write-capable engine, which is the
+    /// bypass `PolicyEngine::enforcer` being private exists to prevent.
+    pub(crate) policy: Authorizer,
     /// Shared object store backing every replica prefix.
     pub(crate) object_store: std::sync::Arc<dyn object_store::ObjectStore>,
     /// Root prefix for replica prefixes (e.g. `"oxkv"`).
@@ -62,12 +69,18 @@ pub struct SnapshotManager {
 
 impl SnapshotManager {
     /// Create a manager.
+    ///
+    /// Takes an [`Authorizer`] rather than a
+    /// [`PolicyEngine`](crate::policy::PolicyEngine): replicas are a read
+    /// projection, so this type never needs write access to policy.
+    /// `skip_probe` is `true` only for `InMemory` backends, which have no
+    /// conditional-write probe to run.
     pub fn new(
         wal: Wal,
         store: FsStore,
-        policy: PolicyEngine,
+        policy: Authorizer,
         object_store: std::sync::Arc<dyn object_store::ObjectStore>,
-        db_prefix: String,
+        db_prefix: impl Into<String>,
         skip_probe: bool,
     ) -> Self {
         Self {
@@ -75,7 +88,7 @@ impl SnapshotManager {
             store,
             policy,
             object_store,
-            db_prefix,
+            db_prefix: db_prefix.into(),
             skip_probe,
             build_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             sst_cache: crate::db::default_sst_cache(),
@@ -593,12 +606,22 @@ mod tests {
     use crate::fs::store::FileRecord;
     use object_store::memory::InMemory;
 
-    async fn test_manager() -> (SnapshotManager, std::sync::Arc<InMemory>) {
+    /// Builds a manager plus the [`PolicyEngine`] it reads through.
+    ///
+    /// The engine comes back alongside so tests can mutate policy and then
+    /// let the replica *observe* the change, rather than mutating through
+    /// the manager — the manager deliberately only holds a read-only
+    /// `Authorizer`, which is the property under test.
+    async fn test_manager() -> (
+        SnapshotManager,
+        crate::policy::PolicyEngine,
+        std::sync::Arc<InMemory>,
+    ) {
         let mem = std::sync::Arc::new(InMemory::new());
         let wal = Wal::new(crate::db::build_test_store(&crate::db::test_prefix("snap-wal")).await);
         let store =
             FsStore::new(crate::db::build_test_store(&crate::db::test_prefix("snap-store")).await);
-        let policy = PolicyEngine::init_s3(
+        let policy = crate::policy::PolicyEngine::init_s3(
             crate::db::build_test_store(&crate::db::test_prefix("snap-policy")).await,
         )
         .await
@@ -606,12 +629,12 @@ mod tests {
         let mgr = SnapshotManager::new(
             wal,
             store,
-            policy,
+            policy.authorizer(),
             mem.clone() as std::sync::Arc<dyn object_store::ObjectStore>,
-            "test-db".into(),
+            "test-db",
             true,
         );
-        (mgr, mem)
+        (mgr, policy, mem)
     }
 
     fn file_record(id: &str, owner: &str) -> FileRecord {
@@ -649,8 +672,8 @@ mod tests {
 
     #[tokio::test]
     async fn build_full_filters_into_live_prefix() -> anyhow::Result<()> {
-        let (mgr, mem) = test_manager().await;
-        mgr.policy
+        let (mgr, policy, mem) = test_manager().await;
+        policy
             .add_rule("alice".into(), "invoice:1".into(), Action::Read)
             .await?;
         let rec = file_record("f1", "alice");
@@ -669,8 +692,8 @@ mod tests {
 
     #[tokio::test]
     async fn build_full_with_mirrored_master() -> anyhow::Result<()> {
-        let (mut mgr, mem) = test_manager().await;
-        mgr.policy
+        let (mut mgr, policy, mem) = test_manager().await;
+        policy
             .add_rule("alice".into(), "invoice:1".into(), Action::Read)
             .await?;
         let rec = file_record("f1", "alice");
@@ -692,7 +715,7 @@ mod tests {
     async fn build_is_idempotent_without_new_manifest_cas() -> anyhow::Result<()> {
         use object_store::ObjectStore as _;
 
-        let (mgr, mem) = test_manager().await;
+        let (mgr, _, mem) = test_manager().await;
         mgr.store.save_file(&file_record("f1", "alice")).await?;
         mgr.build_full("alice").await?;
 
@@ -707,14 +730,14 @@ mod tests {
 
     #[tokio::test]
     async fn fresh_prefix_has_no_coverage() -> anyhow::Result<()> {
-        let (mgr, _) = test_manager().await;
+        let (mgr, _, _) = test_manager().await;
         assert_eq!(mgr.load_applied("alice").await?, None);
         Ok(())
     }
 
     #[tokio::test]
     async fn replay_applies_file_delta() -> anyhow::Result<()> {
-        let (mgr, mem) = test_manager().await;
+        let (mgr, _, mem) = test_manager().await;
         mgr.store.save_file(&file_record("f1", "alice")).await?;
         mgr.build_full("alice").await?;
 
@@ -732,8 +755,8 @@ mod tests {
 
     #[tokio::test]
     async fn replay_detach_and_delete_converge() -> anyhow::Result<()> {
-        let (mgr, mem) = test_manager().await;
-        mgr.policy
+        let (mgr, policy, mem) = test_manager().await;
+        policy
             .add_rule("alice".into(), "invoice:1".into(), Action::Read)
             .await?;
         mgr.store.save_file(&file_record("f1", "alice")).await?;
@@ -765,7 +788,7 @@ mod tests {
 
     #[tokio::test]
     async fn replay_bails_on_legacy_policy_marks() -> anyhow::Result<()> {
-        let (mgr, _) = test_manager().await;
+        let (mgr, _, _) = test_manager().await;
         mgr.store.save_file(&file_record("f1", "alice")).await?;
         mgr.build_full("alice").await?;
         mgr.wal
@@ -780,7 +803,7 @@ mod tests {
 
     #[tokio::test]
     async fn replay_skips_irrelevant_policy_ops() -> anyhow::Result<()> {
-        let (mgr, mem) = test_manager().await;
+        let (mgr, _, mem) = test_manager().await;
         mgr.store.save_file(&file_record("f1", "alice")).await?;
         mgr.build_full("alice").await?;
         // Other user's membership, non-row object, and non-read action:
@@ -813,7 +836,7 @@ mod tests {
 
     #[tokio::test]
     async fn replay_applies_rule_grant_then_revoke() -> anyhow::Result<()> {
-        let (mgr, mem) = test_manager().await;
+        let (mgr, policy, mem) = test_manager().await;
         // Bob's file on invoice:1; alice sees nothing yet.
         mgr.store.save_file(&file_record("f1", "bob")).await?;
         mgr.store.attach("invoice", "1", "f1").await?;
@@ -822,10 +845,10 @@ mod tests {
 
         // Grant editors read on the row, add alice to editors (master
         // mutation first, WAL entries like the engines append).
-        mgr.policy
+        policy
             .add_rule("editors".into(), "invoice:1".into(), Action::Read)
             .await?;
-        mgr.policy
+        policy
             .assign_group("alice".into(), "editors".into())
             .await?;
         mgr.wal
@@ -846,7 +869,7 @@ mod tests {
         assert!(replica_has(&mem, &mgr, "alice", "fs:rel:invoice:1:f1").await);
 
         // Revoke the rule: the file must leave the replica.
-        mgr.policy
+        policy
             .remove_rule("editors".into(), "invoice:1".into(), Action::Read)
             .await?;
         mgr.wal
@@ -864,11 +887,11 @@ mod tests {
 
     #[tokio::test]
     async fn replay_group_remove_converges() -> anyhow::Result<()> {
-        let (mgr, mem) = test_manager().await;
-        mgr.policy
+        let (mgr, policy, mem) = test_manager().await;
+        policy
             .add_rule("editors".into(), "invoice:1".into(), Action::Read)
             .await?;
-        mgr.policy
+        policy
             .assign_group("alice".into(), "editors".into())
             .await?;
         mgr.store.save_file(&file_record("f1", "bob")).await?;
@@ -876,7 +899,7 @@ mod tests {
         mgr.build_full("alice").await?;
         assert!(replica_has(&mem, &mgr, "alice", "fs:files:f1:meta").await);
 
-        mgr.policy
+        policy
             .remove_from_group("alice".into(), "editors".into())
             .await?;
         mgr.wal
@@ -901,7 +924,7 @@ mod tests {
 
     #[tokio::test]
     async fn prefixes_are_stable_and_safe() {
-        let (mgr, _) = test_manager().await;
+        let (mgr, _, _) = test_manager().await;
         // Stable and hex-only (prefix-safe by construction).
         let prefix = mgr.user_prefix("alice");
         assert_eq!(prefix, mgr.user_prefix("alice"));

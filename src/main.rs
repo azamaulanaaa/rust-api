@@ -278,7 +278,8 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
     let snapshot_manager = SnapshotManager::new(
         wal.clone(),
         master_store,
-        policy_engine.clone(),
+        // Replicas only read policy, so hand over the read-only view.
+        policy_engine.authorizer(),
         replica_objects,
         db_prefix,
         false,
@@ -292,9 +293,9 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
     // successor now owns the prefix and this process must stop taking
     // traffic. Startup itself already gates on S3/OIDC/JWKS/lease.
     let readiness: rust_api::http::health::ReadyCheck = Arc::new({
-        let enforcer = policy_engine.enforcer.clone();
+        let policy_engine = policy_engine.clone();
         move || {
-            enforcer.try_read().is_ok() && !lease_lost.load(std::sync::atomic::Ordering::Relaxed)
+            policy_engine.is_unlocked() && !lease_lost.load(std::sync::atomic::Ordering::Relaxed)
         }
     });
     let session_api_module = OidcSessionModule::new(oidc_api_module.middleware());

@@ -107,7 +107,18 @@ pub enum PolicyError {
 #[derive(Clone)]
 pub struct PolicyEngine {
     /// The underlying Casbin enforcer shared across workers.
-    pub enforcer: Arc<RwLock<Enforcer>>,
+    ///
+    /// Private on purpose. `Enforcer` is casbin's own type and its methods
+    /// (`add_policy`, `remove_grouping_policy`, …) bypass this engine's
+    /// `add_rule`/`assign_group` wrappers, which is where the WAL append
+    /// lives. Exposing it publicly made it possible to mutate policy
+    /// without logging the change, so replicas would silently drift from
+    /// the master with nothing in the feed to replay.
+    ///
+    /// Use the methods on this type to mutate, [`authorizer`](Self::authorizer)
+    /// for a read-only handle, and [`is_unlocked`](Self::is_unlocked) for a
+    /// non-blocking liveness probe.
+    enforcer: Arc<RwLock<Enforcer>>,
     /// WAL for replica sync; `None` disables logging (tests).
     /// Production must wire it: without appends the WAL head never
     /// advances and replicas freeze at their last snapshot.
@@ -491,6 +502,18 @@ impl PolicyEngine {
             enforcer: self.enforcer.clone(),
         }
     }
+
+    /// Non-blocking liveness probe: `true` when the enforcer's write lock
+    /// is free.
+    ///
+    /// The only sanctioned way to inspect the enforcer from outside. Backs
+    /// the `/ready` check, which must stay cheap: a `try_read` on a
+    /// `try_lock`-free `RwLock` never blocks and never does I/O. A `false`
+    /// here means a writer is holding the lock — normally a policy write
+    /// in flight, pathologically a wedged one.
+    pub fn is_unlocked(&self) -> bool {
+        self.enforcer.try_read().is_ok()
+    }
 }
 
 /// A capability-limited handle to the policy engine exposing only read and
@@ -545,6 +568,29 @@ impl Authorizer {
     pub async fn get_groups_of_user(&self, user_id: &str) -> Vec<String> {
         let ef = self.enforcer.read().await;
         ef.get_roles_for_user(user_id, None)
+    }
+
+    /// Returns the `(obj, act)` pairs granted to `sub` by `p` rules.
+    ///
+    /// Read-only mirror of [`PolicyEngine::rules_for_subject`], so a
+    /// caller holding only an `Authorizer` can still answer "what does this
+    /// group grant?" without a write-capable engine.
+    pub async fn rules_for_subject(&self, sub: &str) -> Vec<(String, String)> {
+        let ef = self.enforcer.read().await;
+        ef.get_filtered_policy(0, vec![sub.to_string()])
+            .into_iter()
+            .filter_map(|r| {
+                let obj = r.get(1)?.clone();
+                let act = r.get(2)?.clone();
+                Some((obj, act))
+            })
+            .collect()
+    }
+
+    /// Non-blocking liveness probe, mirroring
+    /// [`PolicyEngine::is_unlocked`] over the same shared enforcer.
+    pub fn is_unlocked(&self) -> bool {
+        self.enforcer.try_read().is_ok()
     }
 }
 
@@ -659,6 +705,46 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn is_unlocked_tracks_the_write_lock() {
+        let engine = engine().await;
+        assert!(engine.is_unlocked(), "idle engine must probe ready");
+
+        // Hold the write lock the way a policy mutation does: a wedged
+        // writer is exactly what `/ready` is meant to catch.
+        let guard = engine.enforcer.write().await;
+        assert!(
+            !engine.is_unlocked(),
+            "a held write lock must read as not-ready"
+        );
+        drop(guard);
+        assert!(engine.is_unlocked(), "probe must recover");
+    }
+
+    #[tokio::test]
+    async fn authorizer_shares_the_engines_policy_state() {
+        let engine = engine().await;
+        engine
+            .assign_group("alice".into(), "editors".into())
+            .await
+            .unwrap();
+        engine
+            .add_rule("editors".into(), "doc".into(), Action::Write)
+            .await
+            .unwrap();
+
+        // The handle has to observe writes made through the engine, or it
+        // is useless for the cross-module sharing it exists to support.
+        let auth = engine.authorizer();
+        assert_eq!(auth.get_groups_of_user("alice").await, vec!["editors"]);
+        assert!(
+            auth.authorize("alice", "doc", Action::Write).await.unwrap(),
+            "authorizer must see the engine's rules"
+        );
+        // And it is the read side of the same enforcer, not a copy.
+        assert!(auth.is_unlocked());
     }
 
     #[tokio::test]
