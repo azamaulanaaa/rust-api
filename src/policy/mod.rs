@@ -87,7 +87,7 @@ pub enum PolicyError {
 
     /// The Casbin engine rejected an operation or failed enforcement.
     #[error("casbin authorization engine error: {0}")]
-    Casbin(#[from] casbin::Error),
+    Casbin(casbin::Error),
 
     /// The subject does not hold the required permission.
     #[error("access denied")]
@@ -96,6 +96,54 @@ pub enum PolicyError {
     /// Announcing a committed mutation to the change feed failed.
     #[error("change feed error: {0}")]
     ChangeFeed(String),
+
+    /// The policy store's epoch was lost to another writer.
+    ///
+    /// Wording mirrors [`FsError::Fenced`](crate::fs::error::FsError) on
+    /// purpose: both are the same condition on the same prefix, so one log
+    /// query finds either. The detail is the store's reason and stays
+    /// server-side.
+    #[error(
+        "store epoch lost to another writer ({0}); \
+         this handle must stop writing and be rebuilt"
+    )]
+    Fenced(String),
+}
+
+impl PolicyError {
+    /// True when this is a lost epoch, i.e. another writer took the prefix.
+    ///
+    /// The detection point for a policy write that failed because this
+    /// process is no longer the writer, as opposed to a rejected or
+    /// unreachable store.
+    pub fn is_fencing_loss(&self) -> bool {
+        matches!(self, Self::Fenced(_))
+    }
+}
+
+impl From<casbin::Error> for PolicyError {
+    /// Lifts a lost epoch out of casbin's adapter wrapper.
+    ///
+    /// [`OxkvAdapter`](crate::policy::adapter::OxkvAdapter) satisfies
+    /// casbin's `Adapter` trait, whose signatures are written in
+    /// `casbin::Error`, so an `oxkv::StoreError` crosses that boundary
+    /// boxed inside `AdapterError`. This is the one place that boxing can
+    /// still be undone, and skipping it leaves a stale writer's policy
+    /// write indistinguishable from any other 500 -- the same undetectable
+    /// condition [`FsError::Fenced`](crate::fs::error::FsError) exists to
+    /// rule out, reached by a different route.
+    ///
+    /// Matching on the downcast rather than the message text means a
+    /// reworded `oxkv` error cannot silently degrade the classification.
+    fn from(e: casbin::Error) -> Self {
+        if let casbin::Error::AdapterError(adapter) = &e
+            && let Some(oxkv::StoreError::Fenced(reason)) =
+                adapter.0.downcast_ref::<oxkv::StoreError>()
+        {
+            return Self::Fenced(reason.clone());
+        }
+        Self::Casbin(e)
+    }
 }
 
 /// Central authorization engine: a Casbin RBAC enforcer persisted to a
@@ -613,11 +661,53 @@ mod tests {
     /// Every variant renders lowercase sentence style, so policy and OIDC
     /// failures read the same in logs as the FS ones. The enum doc makes
     /// this a contract rather than a coincidence.
+    /// Only a lost epoch is lifted out of casbin's wrapper.
+    ///
+    /// The tempting version of this test matches the message text, which
+    /// would pass for the wrong reason: an unrelated store failure that
+    /// happened to mention fencing would be reclassified, and a reworded
+    /// `oxkv` error would silently stop being recognised. Downcasting is
+    /// what makes the classification depend on the error's type.
+    #[test]
+    fn only_a_lost_epoch_is_lifted_out_of_the_adapter_wrapper() {
+        use casbin::error::AdapterError;
+
+        // The shape `OxkvAdapter` actually produces.
+        let adapter = |e: oxkv::StoreError| {
+            PolicyError::from(casbin::Error::AdapterError(AdapterError(Box::new(e))))
+        };
+
+        let fenced = adapter(oxkv::StoreError::Fenced("epoch 7 superseded".into()));
+        assert!(fenced.is_fencing_loss(), "{fenced:?}");
+        assert!(fenced.to_string().contains("epoch 7 superseded"));
+
+        for other in [
+            oxkv::StoreError::Storage("bucket gone".into()),
+            oxkv::StoreError::CasConflict("two writers".into()),
+            oxkv::StoreError::Other("fenced-ish wording that must not count".into()),
+        ] {
+            let classified = adapter(other.clone());
+            assert!(
+                !classified.is_fencing_loss(),
+                "{other:?} was misread as a fencing loss"
+            );
+            assert!(matches!(classified, PolicyError::Casbin(_)));
+        }
+
+        // A casbin failure that never touched the store is untouched too.
+        let engine_failure = PolicyError::from(casbin::Error::PolicyError(
+            casbin::error::PolicyError::UnmatchPolicyDefinition(0, 0),
+        ));
+        assert!(!engine_failure.is_fencing_loss());
+        assert!(matches!(engine_failure, PolicyError::Casbin(_)));
+    }
+
     #[test]
     fn error_display_is_lowercase_sentence_style() {
         for rendered in [
             PolicyError::AccessDenied.to_string(),
             PolicyError::ChangeFeed("seq 7 missing".into()).to_string(),
+            PolicyError::Fenced("epoch 7 superseded".into()).to_string(),
         ] {
             let first = rendered.chars().next().expect("non-empty display");
             assert!(
