@@ -338,12 +338,14 @@ mod tests {
             PolicyEngine::init_s3(crate::db::build_test_store(&format!("{tag}-policy")).await)
                 .await?;
         let manager = SnapshotManager::new(
-            wal,
-            backing,
-            policy.authorizer(),
-            mem.clone() as std::sync::Arc<dyn object_store::ObjectStore>,
+            crate::sync::snapshot::SnapshotDeps {
+                wal,
+                store: backing,
+                policy: policy.authorizer(),
+                object_store: mem.clone() as std::sync::Arc<dyn object_store::ObjectStore>,
+            },
             "test-db",
-            true,
+            crate::sync::snapshot::ReplicaBackend::InMemory,
         );
         manager.build_full("alice").await?;
         Ok(Fixture {
