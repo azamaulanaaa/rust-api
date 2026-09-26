@@ -126,31 +126,59 @@ pub struct RuleListResponse {
     pub offset: usize,
 }
 
-/// Query parameters for `GET /policy/rules`.
+/// Query parameters shared by every `/policy` listing endpoint.
+///
+/// `limit`/`offset` are optional and resolved by [`Page`], which is the
+/// single place the `DEFAULT_PAGE_SIZE`/`MAX_PAGE_SIZE` bounds live.
+/// Private to this module: the OpenAPI surface declares the two params
+/// inline on each route.
 #[derive(Debug, Deserialize)]
-pub struct RulesQuery {
+struct RulesQuery {
     /// Page size; defaults to 100 and is capped at 1000.
     pub limit: Option<usize>,
-    /// Number of rules to skip; defaults to 0.
+    /// Number of items to skip; defaults to 0.
     pub offset: Option<usize>,
 }
 
-/// Applies `offset`/`limit` to a full rule list. Kept pure for unit testing;
-/// `limit` is capped at [`MAX_PAGE_SIZE`](const@MAX_PAGE_SIZE).
-fn paginate(rules: &[Vec<String>], limit: Option<usize>, offset: usize) -> Vec<Vec<String>> {
-    let start = offset.min(rules.len());
-    let end = start
-        .saturating_add(limit.unwrap_or(MAX_PAGE_SIZE).min(MAX_PAGE_SIZE))
-        .min(rules.len());
-    rules[start..end].to_vec()
-}
-
-/// Maximum number of rules returned in one page.
 /// Page size used when the client does not specify one.
 pub(crate) const DEFAULT_PAGE_SIZE: usize = 100;
 
-/// Maximum number of rules returned in one page.
+/// Upper bound on the page size a client may ask for.
 pub(crate) const MAX_PAGE_SIZE: usize = 1000;
+
+/// A resolved pagination window.
+///
+/// Every listing endpoint resolves its `limit`/`offset` through this so
+/// they cannot drift apart: the cap, the default, and the value echoed
+/// back in the response all come from the same computation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Page {
+    /// Effective page size, after the [`MAX_PAGE_SIZE`] cap.
+    limit: usize,
+    /// Offset this page starts at.
+    offset: usize,
+}
+
+impl Page {
+    /// Resolves the client's requested window against the shared bounds.
+    fn from_query(query: &RulesQuery) -> Self {
+        Self {
+            limit: query.limit.unwrap_or(DEFAULT_PAGE_SIZE).min(MAX_PAGE_SIZE),
+            offset: query.offset.unwrap_or(0),
+        }
+    }
+
+    /// Slices `items` to this window. An offset past the end yields an
+    /// empty page rather than panicking. Consumes the collection so
+    /// callers do not need `Clone` on their response types.
+    fn apply<T>(&self, items: impl IntoIterator<Item = T>) -> Vec<T> {
+        items
+            .into_iter()
+            .skip(self.offset)
+            .take(self.limit)
+            .collect()
+    }
+}
 
 /// Maps domain policy failures onto the uniform API error envelope:
 /// `AccessDenied` becomes 403 Forbidden; store/engine failures become 500
@@ -179,14 +207,12 @@ async fn get_rules(
 
     let all_rules = policy_engine.get_all_rules().await;
     let total = all_rules.len();
-    let limit = query.limit.unwrap_or(DEFAULT_PAGE_SIZE);
-    let offset = query.offset.unwrap_or(0);
-    let rules = paginate(&all_rules, Some(limit), offset);
+    let page = Page::from_query(&query);
     Ok(HttpResponse::Ok().json(RuleListResponse {
-        rules,
+        rules: page.apply(all_rules),
         total,
-        limit: limit.min(MAX_PAGE_SIZE),
-        offset,
+        limit: page.limit,
+        offset: page.offset,
     }))
 }
 
@@ -352,15 +378,12 @@ async fn list_groups(
 
     let all = policy_engine.list_groups().await;
     let total = all.len();
-    let limit = query.limit.unwrap_or(DEFAULT_PAGE_SIZE).min(MAX_PAGE_SIZE);
-    let offset = query.offset.unwrap_or(0);
-    let groups = all.into_iter().skip(offset).take(limit).collect();
-
+    let page = Page::from_query(&query);
     Ok(HttpResponse::Ok().json(GroupsResponse {
-        groups,
+        groups: page.apply(all),
         total,
-        limit,
-        offset,
+        limit: page.limit,
+        offset: page.offset,
     }))
 }
 
@@ -382,15 +405,12 @@ async fn list_users(
 
     let all = policy_engine.list_user_assignments().await;
     let total = all.len();
-    let limit = query.limit.unwrap_or(DEFAULT_PAGE_SIZE).min(MAX_PAGE_SIZE);
-    let offset = query.offset.unwrap_or(0);
-    let users = all.into_iter().skip(offset).take(limit).collect();
-
+    let page = Page::from_query(&query);
     Ok(HttpResponse::Ok().json(UsersResponse {
-        users,
+        users: page.apply(all),
         total,
-        limit,
-        offset,
+        limit: page.limit,
+        offset: page.offset,
     }))
 }
 
@@ -480,26 +500,42 @@ mod tests {
     }
 
     #[test]
-    fn paginate_slices_and_caps_limit() {
+    fn page_slices_caps_and_defaults() {
         let rules: Vec<Vec<String>> = (0..10).map(|i| rule(&format!("u{i}"))).collect();
 
-        // Default limit applies when unset.
         // Default limit (100) exceeds this list, so the whole set returns.
-        assert_eq!(paginate(&rules, None, 0), rules);
-
-        // Offset slices from the right position.
-        let page = paginate(&rules, Some(3), 4);
-        assert_eq!(page, rules[4..7].to_vec());
-
-        // Limit above MAX_PAGE_SIZE gets capped.
-        let big: Vec<Vec<String>> = (0..(MAX_PAGE_SIZE + 50)).map(|_| rule("x")).collect();
         assert_eq!(
-            paginate(&big, Some(MAX_PAGE_SIZE * 2), 0).len(),
-            MAX_PAGE_SIZE
+            Page::from_query(&RulesQuery {
+                limit: None,
+                offset: None
+            })
+            .apply(rules.clone()),
+            rules
         );
 
+        // Offset slices from the right position.
+        let page = Page::from_query(&RulesQuery {
+            limit: Some(3),
+            offset: Some(4),
+        });
+        assert_eq!(page.apply(rules.clone()), rules[4..7].to_vec());
+
+        // Limit above MAX_PAGE_SIZE gets capped, and the capped value is
+        // what the response echoes back.
+        let big: Vec<Vec<String>> = (0..(MAX_PAGE_SIZE + 50)).map(|_| rule("x")).collect();
+        let capped = Page::from_query(&RulesQuery {
+            limit: Some(MAX_PAGE_SIZE * 2),
+            offset: Some(0),
+        });
+        assert_eq!(capped.limit, MAX_PAGE_SIZE);
+        assert_eq!(capped.apply(big.clone()).len(), MAX_PAGE_SIZE);
+
         // Offset past the end yields an empty page, not a panic.
-        assert!(paginate(&rules, Some(3), 99).is_empty());
+        let past_end = Page::from_query(&RulesQuery {
+            limit: Some(3),
+            offset: Some(99),
+        });
+        assert!(past_end.apply(rules.clone()).is_empty());
     }
 
     #[actix_web::test]
