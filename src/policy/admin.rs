@@ -126,11 +126,8 @@ mod tests {
     async fn export_import_round_trip() -> anyhow::Result<()> {
         let shared =
             Arc::new(object_store::memory::InMemory::new()) as Arc<dyn object_store::ObjectStore>;
-        let src_prefix = format!("admin-test-src-{}-{}", std::process::id(), {
-            use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-            URL_SAFE_NO_PAD.encode(rand::random::<[u8; 6]>())
-        });
-        let dst_prefix = format!("{src_prefix}-dst");
+        let src_prefix = crate::db::test_prefix("admin-src");
+        let dst_prefix = crate::db::test_prefix("admin-dst");
         let src_store = build_test_store_new_session(shared.clone(), &src_prefix).await;
         let _dst_store = build_test_store_new_session(shared.clone(), &dst_prefix).await;
 
@@ -138,7 +135,7 @@ mod tests {
             p: vec![vec!["admin".into(), "doc".into(), "read".into()]],
             g: vec![vec!["user-1".into(), "admin".into()]],
         };
-        let wal = Wal::new(build_test_store("admin-test-wal").await);
+        let wal = Wal::new(build_test_store(&crate::db::test_prefix("admin-wal")).await);
         import_s3(src_store, &dump, Some(wal.clone())).await?;
         assert_eq!(wal.head().await?, 2);
 
@@ -169,7 +166,7 @@ mod tests {
         // The adapter enforces PolicyRuleValidator on every write path
         // itself (see encode_rule), so an invalid dump fails the import
         // instead of being persisted.
-        let store = build_test_store("admin-test-invalid").await;
+        let store = build_test_store(&crate::db::test_prefix("admin-invalid")).await;
         let dump = PolicyDump {
             p: vec![vec!["only-one-field".to_string()]],
             g: vec![],

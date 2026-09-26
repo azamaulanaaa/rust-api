@@ -743,12 +743,9 @@ mod tests {
     use crate::policy::{Action, PolicyEngine};
     use bytes::Bytes;
 
-    async fn make_engine(sub: &str, _grant: bool) -> FsEngine {
+    async fn make_engine(sub: &str) -> FsEngine {
         use crate::db::build_test_store;
-        let prefix = format!("test-fs-engine-{}-{sub}", {
-            use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-            URL_SAFE_NO_PAD.encode(rand::random::<[u8; 6]>())
-        });
+        let prefix = format!("{}-{sub}", crate::db::test_prefix("fs-engine"));
         let s3_store = build_test_store(&prefix).await;
         let store = FsStore::new(s3_store);
         let policy_prefix = format!("{prefix}-policy");
@@ -781,7 +778,7 @@ mod tests {
 
     #[tokio::test]
     async fn init_upload_validates() -> anyhow::Result<()> {
-        let engine = make_engine("alice", false).await;
+        let engine = make_engine("alice").await;
         let id = engine.init_upload(valid_single(), "alice").await?;
         assert!(!id.is_empty());
         let err = engine
@@ -801,7 +798,7 @@ mod tests {
 
     #[tokio::test]
     async fn temp_upload_owned_by_caller() -> anyhow::Result<()> {
-        let engine = make_engine("alice", false).await;
+        let engine = make_engine("alice").await;
         let id = engine.init_upload(valid_single(), "alice").await?;
         // bob cannot write alice's session
         let err = engine
@@ -814,7 +811,7 @@ mod tests {
 
     #[tokio::test]
     async fn attach_requires_row_write() -> anyhow::Result<()> {
-        let engine = make_engine("alice", false).await;
+        let engine = make_engine("alice").await;
         let id = engine.init_upload(valid_single(), "alice").await?;
         engine
             .upload_part(&id, 0, once_body(vec![1u8; 1024]), None, None, "alice")
@@ -845,7 +842,7 @@ mod tests {
 
     #[tokio::test]
     async fn row_access_grants_file_read() -> anyhow::Result<()> {
-        let engine = make_engine("alice", false).await;
+        let engine = make_engine("alice").await;
         let id = engine.init_upload(valid_single(), "alice").await?;
         engine
             .upload_part(&id, 0, once_body(vec![7u8; 1024]), None, None, "alice")
@@ -883,7 +880,7 @@ mod tests {
     async fn upload_part_cuts_oversize_streams_early() -> anyhow::Result<()> {
         use actix_web::ResponseError as _;
 
-        let engine = make_engine("alice", false).await;
+        let engine = make_engine("alice").await;
         let id = engine.init_upload(valid_single(), "alice").await?;
         // Unbounded 1 KiB chunks against a 1 KiB part: the intake must
         // 413 after the second chunk, not buffer forever.
@@ -908,7 +905,7 @@ mod tests {
             atomic::{AtomicBool, Ordering},
         };
 
-        let engine = make_engine("alice", false).await;
+        let engine = make_engine("alice").await;
         let id = engine.init_upload(valid_single(), "alice").await?;
         // Records whether the stream is polled at all: a declared length
         // that already mismatches must fail before the first poll.
@@ -944,7 +941,7 @@ mod tests {
     async fn streamed_download_matches_upload() -> anyhow::Result<()> {
         use futures_util::TryStreamExt as _;
 
-        let engine = make_engine("alice", false).await;
+        let engine = make_engine("alice").await;
         let id = engine.init_upload(valid_single(), "alice").await?;
         let body: Vec<u8> = (0..1024u32).map(|i| (i % 251) as u8).collect();
         engine
@@ -970,7 +967,7 @@ mod tests {
 
     #[tokio::test]
     async fn token_mint_verify() -> anyhow::Result<()> {
-        let engine = make_engine("alice", false).await;
+        let engine = make_engine("alice").await;
         let tok = engine.mint_token("alice", "file1", Action::Read)?;
         engine.verify_token(&tok, "file1", Action::Read)?;
         assert!(engine.verify_token(&tok, "file1", Action::Write).is_err());
@@ -981,12 +978,8 @@ mod tests {
     async fn mutations_append_to_wal() -> anyhow::Result<()> {
         use crate::sync::wal::{Wal, WalOp};
 
-        let wal_prefix = format!("test-fs-wal-{}-{}", std::process::id(), {
-            use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-            URL_SAFE_NO_PAD.encode(rand::random::<[u8; 6]>())
-        });
-        let wal = Wal::new(crate::db::build_test_store(&wal_prefix).await);
-        let engine = make_engine("alice", false).await.with_wal(wal.clone());
+        let wal = Wal::new(crate::db::build_test_store(&crate::db::test_prefix("fs-wal")).await);
+        let engine = make_engine("alice").await.with_wal(wal.clone());
         engine
             .policy
             .add_rule("alice".into(), "invoice:123".into(), Action::Write)

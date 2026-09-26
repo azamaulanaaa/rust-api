@@ -269,7 +269,6 @@ fn is_fenced(e: &crate::fs::error::FsError) -> bool {
 mod tests {
     use super::*;
     use actix_web::{App, http};
-    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
     use jsonwebtoken::EncodingKey;
     use serde_json::json;
 
@@ -305,11 +304,7 @@ mod tests {
         let (key, enc) = rsa_key(KID)?;
         let jwks = json!({"keys": [key]});
         let server = spawn_jwks(jwks).await;
-        let tag = format!(
-            "test-sync-route-{}-{}",
-            std::process::id(),
-            URL_SAFE_NO_PAD.encode(rand::random::<[u8; 8]>())
-        );
+        let tag = crate::db::test_prefix("sync-route");
         let mem = std::sync::Arc::new(object_store::memory::InMemory::new());
         let wal = Wal::new(crate::db::build_test_store(&format!("{tag}-wal")).await);
         let backing = FsStore::new(crate::db::build_test_store(&format!("{tag}-store")).await);

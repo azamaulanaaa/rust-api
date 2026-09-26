@@ -592,11 +592,14 @@ mod tests {
 
     async fn test_manager() -> (SnapshotManager, std::sync::Arc<InMemory>) {
         let mem = std::sync::Arc::new(InMemory::new());
-        let wal = Wal::new(crate::db::build_test_store("snap-test-wal").await);
-        let store = FsStore::new(crate::db::build_test_store("snap-test-store").await);
-        let policy = PolicyEngine::init_s3(crate::db::build_test_store("snap-test-policy").await)
-            .await
-            .unwrap();
+        let wal = Wal::new(crate::db::build_test_store(&crate::db::test_prefix("snap-wal")).await);
+        let store =
+            FsStore::new(crate::db::build_test_store(&crate::db::test_prefix("snap-store")).await);
+        let policy = PolicyEngine::init_s3(
+            crate::db::build_test_store(&crate::db::test_prefix("snap-policy")).await,
+        )
+        .await
+        .unwrap();
         let mgr = SnapshotManager::new(
             wal,
             store,
