@@ -21,11 +21,17 @@ use jsonwebtoken::{
 /// pool and avoids constructing a new client per refresh (previously
 /// `reqwest::get` did that). The client is `rustls`-only to match the
 /// workspace-wide `reqwest` feature set and save `native-tls` compile time.
+///
+/// The `expect` is the crate's convention for a build-time-only failure
+/// that cannot be surfaced to a caller (same as `db::build_test_store`):
+/// it fires at first use and only on a malformed TLS backend, so there is
+/// no request to fail.
+#[allow(clippy::expect_used)]
 static JWKS_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
-        .unwrap_or_else(|e| panic!("failed to build JWKS reqwest client: {e}"))
+        .expect("JWKS reqwest client must build")
 });
 
 /// Minimum interval between two JWKS fetches triggered by unknown-key misses.
