@@ -16,6 +16,7 @@ use actix_web::{
     post, web,
 };
 
+use crate::fs::error::FsError;
 use crate::http::{
     ApiModule,
     middleware::jwt::{Claims, JwtClaimsMiddleware, Validated},
@@ -107,7 +108,7 @@ async fn status_handler(
     manager: web::Data<SnapshotManager>,
     claims: Validated<Claims>,
     req: HttpRequest,
-) -> Result<HttpResponse, crate::fs::error::FsError> {
+) -> Result<HttpResponse, FsError> {
     let sub = &claims.sub;
     let head = manager.wal.head().await?;
     let applied = manager.load_applied(sub).await?;
@@ -146,11 +147,11 @@ async fn sync_handler(
     manager: web::Data<SnapshotManager>,
     claims: Validated<Claims>,
     req: HttpRequest,
-) -> Result<HttpResponse, crate::fs::error::FsError> {
+) -> Result<HttpResponse, FsError> {
     let sub = &claims.sub;
     let head = manager.wal.head().await?;
     let applied = manager.load_applied(sub).await?;
-    let built: Result<u64, crate::fs::error::FsError> = match applied {
+    let built: Result<u64, FsError> = match applied {
         Some(a) if a >= head => Ok(a),
         _ => match manager.replay(head, sub).await {
             Ok(a) => Ok(a),
@@ -195,7 +196,7 @@ async fn object_handler(
     claims: Validated<Claims>,
     path: web::Path<String>,
     req: HttpRequest,
-) -> Result<HttpResponse, crate::fs::error::FsError> {
+) -> Result<HttpResponse, FsError> {
     use object_store::ObjectStore as _;
 
     let tail = path.into_inner();
@@ -220,7 +221,7 @@ async fn object_handler(
             Err(object_store::Error::NotModified { .. }) => {
                 return Ok(HttpResponse::NotModified().finish());
             }
-            Err(e) => return Err(crate::fs::error::FsError::Internal(e.to_string())),
+            Err(e) => return Err(FsError::Internal(e.to_string())),
         }
     } else {
         match store.get(&object_path).await {
@@ -228,7 +229,7 @@ async fn object_handler(
             Err(object_store::Error::NotFound { .. }) => {
                 return Ok(HttpResponse::NotFound().finish());
             }
-            Err(e) => return Err(crate::fs::error::FsError::Internal(e.to_string())),
+            Err(e) => return Err(FsError::Internal(e.to_string())),
         }
     };
 
@@ -246,7 +247,7 @@ async fn object_handler(
     let bytes = out
         .bytes()
         .await
-        .map_err(|e| crate::fs::error::FsError::Internal(e.to_string()))?;
+        .map_err(|e| FsError::Internal(e.to_string()))?;
     Ok(resp.body(bytes))
 }
 
@@ -256,11 +257,9 @@ async fn object_handler(
 /// sanitize their wire text to a fixed `"internal server error"` string
 /// (see `FsError::client_message`), so the fencing signal is only visible
 /// in the carried detail.
-fn is_fenced(e: &crate::fs::error::FsError) -> bool {
+fn is_fenced(e: &FsError) -> bool {
     match e {
-        crate::fs::error::FsError::Store(detail) | crate::fs::error::FsError::Internal(detail) => {
-            detail.contains("fenced")
-        }
+        FsError::Store(detail) | FsError::Internal(detail) => detail.contains("fenced"),
         _ => false,
     }
 }
@@ -364,12 +363,10 @@ mod tests {
 
     #[test]
     fn is_fenced_matches_oxkv_fencing() {
-        assert!(is_fenced(&crate::fs::error::FsError::Store(
+        assert!(is_fenced(&FsError::Store(
             "fenced: epoch 2 superseded".into()
         )));
-        assert!(!is_fenced(&crate::fs::error::FsError::Internal(
-            "boom".into()
-        )));
+        assert!(!is_fenced(&FsError::Internal("boom".into())));
     }
 
     #[actix_web::test]
