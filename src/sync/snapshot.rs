@@ -230,7 +230,7 @@ impl SnapshotManager {
             .skip_probe(self.skip_probe)
             .build_with_cache(self.sst_cache.clone())
             .await
-            .map_err(|e| FsError::Store(e.to_string()))
+            .map_err(FsError::from)
     }
 
     /// Opens a read-only follower over the replica (no ownership taken).
@@ -246,7 +246,7 @@ impl SnapshotManager {
             .with_prefix(oxkv::ObjectPath::from(self.user_prefix(sub).as_str()))
             .build_reader_with_cache(self.sst_cache.clone())
             .await
-            .map_err(|e| FsError::Store(e.to_string()))
+            .map_err(FsError::from)
     }
 
     /// Dumps the live replica as a map, or empty when never built.
@@ -556,7 +556,7 @@ impl SnapshotManager {
 
 /// Maps oxkv errors into [`FsError`].
 fn store_err(e: oxkv::StoreError) -> FsError {
-    FsError::Store(e.to_string())
+    FsError::from(e)
 }
 
 /// Splits a rule object into `(row_type, row_id)` when it names a row.

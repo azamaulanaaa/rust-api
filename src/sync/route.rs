@@ -162,7 +162,7 @@ async fn sync_handler(
     // adopt their coverage instead of failing.
     let applied = match built {
         Ok(a) => a,
-        Err(e) if is_fenced(&e) => manager.load_applied(sub).await?.ok_or(e)?,
+        Err(e) if e.is_fencing_loss() => manager.load_applied(sub).await?.ok_or(e)?,
         Err(e) => return Err(e),
     };
     let etag = snapshot_etag(applied);
@@ -249,19 +249,6 @@ async fn object_handler(
         .await
         .map_err(|e| FsError::Internal(e.to_string()))?;
     Ok(resp.body(bytes))
-}
-
-/// True when `e` is an oxkv fencing loss (another writer won the epoch).
-///
-/// Matches on the inner detail rather than `Display`: `Store`/`Internal`
-/// sanitize their wire text to a fixed `"internal server error"` string
-/// (see `FsError::client_message`), so the fencing signal is only visible
-/// in the carried detail.
-fn is_fenced(e: &FsError) -> bool {
-    match e {
-        FsError::Store(detail) | FsError::Internal(detail) => detail.contains("fenced"),
-        _ => false,
-    }
 }
 
 #[cfg(test)]
@@ -362,11 +349,18 @@ mod tests {
     }
 
     #[test]
-    fn is_fenced_matches_oxkv_fencing() {
-        assert!(is_fenced(&FsError::Store(
-            "fenced: epoch 2 superseded".into()
-        )));
-        assert!(!is_fenced(&FsError::Internal("boom".into())));
+    fn lost_fencing_race_is_recognised_from_the_typed_variant() {
+        // Regression: this used to be `detail.contains("fenced")`, so a
+        // rewording in oxkv would have turned a recoverable race into a
+        // 500 for every client. Now it is a typed variant produced by
+        // `From<oxkv::StoreError>`.
+        assert!(
+            FsError::from(oxkv::StoreError::Fenced("epoch 2 superseded".into())).is_fencing_loss()
+        );
+        // A generic store failure is not a fencing loss and must not be
+        // treated as one.
+        assert!(!FsError::from(oxkv::StoreError::Storage("disk".into())).is_fencing_loss());
+        assert!(!FsError::Internal("fenced: looks like it".into()).is_fencing_loss());
     }
 
     #[actix_web::test]

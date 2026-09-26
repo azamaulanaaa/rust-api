@@ -158,7 +158,7 @@ impl Wal {
         let cur = g
             .get_bytes(Self::seq_key())
             .await
-            .map_err(|e| FsError::Store(e.to_string()))?
+            .map_err(FsError::from)?
             .and_then(|b| serde_json::from_slice::<u64>(&b).ok())
             .unwrap_or(0);
         let seq = cur + 1;
@@ -169,27 +169,21 @@ impl Wal {
         };
         let val = serde_json::to_vec(&entry).map_err(|e| FsError::Internal(e.to_string()))?;
         let seq_val = serde_json::to_vec(&seq).map_err(|e| FsError::Internal(e.to_string()))?;
-        let tx = g.begin_tx().map_err(|e| FsError::Store(e.to_string()))?;
+        let tx = g.begin_tx().map_err(FsError::from)?;
         tx.set_bytes(&Self::entry_key(seq), &val)
             .await
-            .map_err(|e| FsError::Store(e.to_string()))?;
+            .map_err(FsError::from)?;
         tx.set_bytes(Self::seq_key(), &seq_val)
             .await
-            .map_err(|e| FsError::Store(e.to_string()))?;
-        tx.commit()
-            .await
-            .map_err(|e| FsError::Store(e.to_string()))?;
+            .map_err(FsError::from)?;
+        tx.commit().await.map_err(FsError::from)?;
         Ok(seq)
     }
 
     /// Current head seq.
     pub async fn head(&self) -> Result<u64, FsError> {
         let g = self.store.read().await;
-        let Some(b) = g
-            .get_bytes(Self::seq_key())
-            .await
-            .map_err(|e| FsError::Store(e.to_string()))?
-        else {
+        let Some(b) = g.get_bytes(Self::seq_key()).await.map_err(FsError::from)? else {
             return Ok(0);
         };
         serde_json::from_slice(&b).map_err(|e| FsError::Internal(e.to_string()))
@@ -212,7 +206,7 @@ impl Wal {
             let Some(b) = g
                 .get_bytes(&Self::entry_key(seq))
                 .await
-                .map_err(|e| FsError::Store(e.to_string()))?
+                .map_err(FsError::from)?
             else {
                 return Err(FsError::Store(format!("wal entry {seq} missing")));
             };
