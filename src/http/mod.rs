@@ -40,9 +40,10 @@ const CLIENT_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Applies the shared body-size limits to an Actix application.
 ///
-/// Split out so the limits are unit-testable: the production server and
-/// the regression test below both go through this one function.
-fn apply_limits<T>(app: App<T>) -> App<T>
+/// Split out so the limits are unit-testable, and public so a host app
+/// mounting the API in its own `App` can apply the same ceilings — see
+/// [`ApiService::configure`] for the full recipe.
+pub fn apply_limits<T>(app: App<T>) -> App<T>
 where
     T: actix_web::dev::ServiceFactory<
             actix_web::dev::ServiceRequest,
@@ -55,8 +56,8 @@ where
         .app_data(web::JsonConfig::default().limit(MAX_JSON_BYTES))
 }
 
-/// Registers the built-in routes shared by every deployment.
-fn config(cfg: &mut web::ServiceConfig) {
+/// Registers the built-in probe routes shared by every deployment.
+pub fn health_routes(cfg: &mut web::ServiceConfig) {
     cfg.service(health::health);
     cfg.service(health::ready);
 }
@@ -102,6 +103,75 @@ pub trait ApiModule: Send + Sync {
     /// Registers this module's scopes, services, and app data on the Actix
     /// application configuration.
     fn configure(&self, cfg: &mut web::ServiceConfig);
+}
+
+/// Registers the modules and readiness probe onto a `ServiceConfig`.
+///
+/// Shared by [`ApiService::configure`] and [`wired_app!`] so the public
+/// composable path and the served path cannot drift.
+fn register_modules(
+    modules: &[Box<dyn ApiModule>],
+    readiness: &Option<health::ReadyCheck>,
+    cfg: &mut web::ServiceConfig,
+) {
+    for module in modules {
+        module.configure(cfg);
+    }
+    if let Some(check) = readiness {
+        cfg.app_data(web::Data::new(check.clone()));
+    }
+}
+
+/// Expands the full application wiring at the call site:
+/// `wired_app!(&modules, &readiness, &cors_origins)`.
+///
+/// A macro rather than a function for one specific reason: actix-web's
+/// assembled `App` has no nameable public type, so a function can only
+/// return an opaque `impl` bound, and `HttpServer::new` rejects that
+/// because the bound is weaker than the `IntoServiceFactory` impl it
+/// needs. Expanding at the call site gives each site the concrete type
+/// inference it requires while keeping a single description of the
+/// middleware order and the registered app data.
+macro_rules! wired_app {
+    ($modules:expr, $readiness:expr, $cors_origins:expr) => {{
+        apply_limits(App::new())
+            .wrap(cors($cors_origins))
+            .wrap(middleware::request_tracing::RequestTracingMiddleware)
+            .wrap(middleware::bearer_token::BearerTokenMiddleware)
+            .configure(health_routes)
+            .configure(|cfg| register_modules($modules, $readiness, cfg))
+            // Mounted last on purpose. The API modules are the surface that
+            // matters, and anything catch-all mounted ahead of them can
+            // shadow them -- which is exactly what a `web::scope("")`
+            // around the spec routes used to do.
+            .configure(docs::config)
+    }};
+}
+
+/// Resolves when the process should shut down: Ctrl-C everywhere, plus
+/// SIGTERM on unix (container orchestrators). Separated for testability
+/// of the wiring in [`ApiService::start`].
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {},
+                    _ = term.recv() => {},
+                }
+            }
+            Err(e) => {
+                tracing::warn!("SIGTERM handler install failed ({e}); watching Ctrl-C only");
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 /// The HTTP server: composes [`ApiModule`]s into a single Actix Web
@@ -153,6 +223,28 @@ impl ApiService {
         self
     }
 
+    /// Registers this service's modules and readiness probe onto an
+    /// existing `web::ServiceConfig`.
+    ///
+    /// The composable half of [`start`](Self::start), and the piece a host
+    /// app needs to mount this API inside its own `App` rather than giving
+    /// up the listener. Pair it with the global middleware this module
+    /// already exposes — [`cors`],
+    /// [`RequestTracingMiddleware`](middleware::request_tracing::RequestTracingMiddleware),
+    /// [`BearerTokenMiddleware`](middleware::bearer_token::BearerTokenMiddleware) —
+    /// plus [`apply_limits`], [`health_routes`], and [`docs::config`], and
+    /// the result is exactly what `start` serves.
+    ///
+    /// Note what is deliberately *not* offered: a method returning the
+    /// assembled `App`. actix-web exposes no nameable public type for it
+    /// (`BoxedHttpServiceFactory` is crate-private), so such a signature
+    /// would either leak an unnameable `impl` bound that `HttpServer::new`
+    /// rejects, or force a dynamic factory per worker. Configuring an `App`
+    /// the caller already owns is both expressible and cheaper.
+    pub fn configure(&self, cfg: &mut web::ServiceConfig) {
+        register_modules(&self.modules, &self.readiness, cfg);
+    }
+
     /// Binds the composed application to `addr` and serves it until a
     /// shutdown signal (Ctrl-C / SIGTERM) arrives, then drains
     /// connections within the shutdown timeout before returning.
@@ -161,29 +253,12 @@ impl ApiService {
         let readiness = self.readiness.clone();
         let cors_origins = self.cors_origins.clone();
 
-        let server = HttpServer::new(move || {
-            let mut app = apply_limits(App::new())
-                .wrap(cors(&cors_origins))
-                .wrap(middleware::request_tracing::RequestTracingMiddleware)
-                .wrap(middleware::bearer_token::BearerTokenMiddleware)
-                .configure(config)
-                .configure(docs::config);
-
-            for module in modules.iter() {
-                app = app.configure(move |cfg| module.configure(cfg));
-            }
-
-            if let Some(check) = readiness.clone() {
-                app = app.app_data(web::Data::new(check));
-            }
-
-            app
-        })
-        .shutdown_timeout(SHUTDOWN_TIMEOUT_SECS)
-        .client_request_timeout(CLIENT_TIMEOUT)
-        .client_disconnect_timeout(CLIENT_TIMEOUT)
-        .bind(addr)?
-        .run();
+        let server = HttpServer::new(move || wired_app!(&modules, &readiness, &cors_origins))
+            .shutdown_timeout(SHUTDOWN_TIMEOUT_SECS)
+            .client_request_timeout(CLIENT_TIMEOUT)
+            .client_disconnect_timeout(CLIENT_TIMEOUT)
+            .bind(addr)?
+            .run();
         let handle = server.handle();
         tokio::spawn(async move {
             shutdown_signal().await;
@@ -196,36 +271,146 @@ impl ApiService {
     }
 }
 
-/// Resolves when the process should shut down: Ctrl-C everywhere, plus
-/// SIGTERM on unix (container orchestrators). Separated for testability
-/// of the wiring in [`ApiService::start`].
-async fn shutdown_signal() {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-        match signal(SignalKind::terminate()) {
-            Ok(mut term) => {
-                tokio::select! {
-                    _ = tokio::signal::ctrl_c() => {},
-                    _ = term.recv() => {},
-                }
-            }
-            Err(e) => {
-                tracing::warn!("SIGTERM handler install failed ({e}); watching Ctrl-C only");
-                let _ = tokio::signal::ctrl_c().await;
-            }
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use actix_web::{HttpResponse, test};
+
+    /// A module that exists only to prove the composition root mounts what
+    /// it is given, in a *scope* — the shape every real module uses.
+    struct PingModule;
+
+    impl ApiModule for PingModule {
+        fn configure(&self, cfg: &mut web::ServiceConfig) {
+            cfg.service(
+                web::scope("/ping")
+                    .route(
+                        "",
+                        web::get().to(|| async { HttpResponse::Ok().body("pong") }),
+                    )
+                    .route(
+                        "/deep",
+                        web::get().to(|| async { HttpResponse::Ok().body("deep") }),
+                    ),
+            );
+        }
+    }
+
+    /// Builds the real served application in-process — no socket, no
+    /// shutdown signal.
+    ///
+    /// This is what `wired_app!` exists for. Before it, the composition
+    /// root (CORS, middleware order, readiness, module mounting) was only
+    /// reachable through `start()`, so none of it could be asserted.
+    ///
+    /// A macro rather than a helper fn because `test::init_service` returns
+    /// a service over actix-http's own `Request` type, which the crate does
+    /// not depend on directly and so cannot name in a signature. Expanding
+    /// here keeps the concrete type inferred at each use.
+    macro_rules! served {
+        ($service:expr) => {{
+            test::init_service(wired_app!(
+                &$service.modules,
+                &$service.readiness,
+                &$service.cors_origins
+            ))
+            .await
+        }};
+    }
+
+    #[actix_web::test]
+    async fn composition_root_serves_health_and_registered_modules() {
+        let service = ApiService::new().register_module(Box::new(PingModule));
+        let app = served!(service);
+
+        // Built-in routes survive composition.
+        let res =
+            test::call_service(&app, test::TestRequest::get().uri("/health").to_request()).await;
+        assert_eq!(res.status(), 200);
+
+        // And so does a registered module's route.
+        let res =
+            test::call_service(&app, test::TestRequest::get().uri("/ping").to_request()).await;
+        assert_eq!(res.status(), 200);
+        assert_eq!(test::read_body(res).await, "pong");
+
+        // The OpenAPI document is mounted by the same wiring.
+        let res = test::call_service(
+            &app,
+            test::TestRequest::get().uri("/openapi.json").to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), 200);
+    }
+
+    #[actix_web::test]
+    async fn composition_root_applies_cors_and_readiness() {
+        // CORS reaches the composed app, not just a hand-built one.
+        let origins = vec!["https://app.example.com".to_string()];
+        let service = ApiService::new().with_cors_origins(origins);
+        let app = served!(service);
+        let res = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/health")
+                .insert_header(("Origin", "https://app.example.com"))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(
+            res.headers()
+                .get("access-control-allow-origin")
+                .and_then(|v| v.to_str().ok()),
+            Some("https://app.example.com")
+        );
+
+        // A failing readiness check must surface through the composed app.
+        let failing: health::ReadyCheck = Arc::new(|| false);
+        let service = ApiService::new().with_readiness_check(failing);
+        let app = served!(service);
+        let res =
+            test::call_service(&app, test::TestRequest::get().uri("/ready").to_request()).await;
+        assert_eq!(res.status(), 503);
+    }
+
+    /// `ApiService::configure` is the documented way for a host app to mount
+    /// the API into its own `App`, so the two paths must produce the same
+    /// routes.
+    #[actix_web::test]
+    async fn configure_matches_the_served_wiring() {
+        let service = ApiService::new().register_module(Box::new(PingModule));
+        let app = test::init_service(
+            apply_limits(App::new())
+                .configure(health_routes)
+                .configure(|cfg| service.configure(cfg)),
+        )
+        .await;
+        for uri in ["/health", "/ping"] {
+            let res =
+                test::call_service(&app, test::TestRequest::get().uri(uri).to_request()).await;
+            assert_eq!(res.status(), 200, "{uri} missing from the configured app");
+        }
+    }
+
+    /// Regression: a `web::scope("")` around the spec routes matched every
+    /// request and shadowed every service registered after it. Because the
+    /// spec was mounted before the API modules, every `/fs`, `/policy`,
+    /// `/auth`, `/sync`, and `/setup` route 404'd in the real server while
+    /// `/health`, `/ready`, and `/openapi.json` still answered — so the
+    /// server looked healthy and served nothing.
+    ///
+    /// `docs::tests` only ever checked that paths were *declared*; nothing
+    /// asserted they were *mounted*. These two do.
+    #[actix_web::test]
+    async fn spec_routes_do_not_shadow_module_routes() {
+        let service = ApiService::new().register_module(Box::new(PingModule));
+        let app = served!(service);
+        for uri in ["/ping", "/ping/deep", "/openapi.json"] {
+            let res =
+                test::call_service(&app, test::TestRequest::get().uri(uri).to_request()).await;
+            assert_eq!(res.status(), 200, "{uri} is shadowed by another mount");
+        }
+    }
 
     /// Raw-bytes echo handler exercising the `Bytes` extractor limit.
     async fn echo(body: web::Bytes) -> HttpResponse {
