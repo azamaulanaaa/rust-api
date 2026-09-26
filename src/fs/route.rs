@@ -381,6 +381,77 @@ mod tests {
         })
     }
 
+    /// Every route the OpenAPI document lists for `/fs` is actually mounted.
+    ///
+    /// This module's `configure` is one of five near-identical builder
+    /// chains, each listing its own services, and a service left out of one
+    /// of them is invisible: it compiles, the spec still lists the path, and
+    /// the only symptom is a `404` on a documented endpoint. That is the
+    /// same failure mode as the `/auth` shadowing bug, and this module had
+    /// the widest exposure -- seven of its eight routes had no route-level
+    /// test, so a forgotten `.service(...)` would have shipped unnoticed.
+    ///
+    /// The discriminator cannot be the status. These handlers are asked for
+    /// resources that do not exist, and a mounted one answers `404` with the
+    /// uniform envelope, while actix's default service answers `404` with a
+    /// bare text body. So the assertion is on the body: a routed request is
+    /// always answered by this crate's own error rendering.
+    #[actix_web::test]
+    async fn every_documented_route_is_mounted() {
+        let fx = fixture(true).await.expect("fixture");
+        let module = FsApiModule::new(
+            fx.engine.clone(),
+            JwtClaimsMiddleware::<Claims>::new_with_jks(
+                &format!("{}/jwks", fx.issuer()),
+                AUD,
+                &fx.issuer(),
+            )
+            .await
+            .expect("middleware"),
+        );
+        // `apply_limits` is part of the real composition (`wired_app!` applies
+        // it before the modules), and it is what installs the uniform
+        // envelope for a malformed JSON body. Without it actix answers with
+        // a bare text 400, which is what two of these routes return when the
+        // request has no body at all.
+        let app = test::init_service(
+            crate::http::apply_limits(App::new()).configure(|cfg| module.configure(cfg)),
+        )
+        .await;
+        let token = fx.token("alice").expect("token");
+
+        let mut unrouted: Vec<String> = Vec::new();
+        for (method, uri) in [
+            (http::Method::POST, "/fs/uploads"),
+            (http::Method::PUT, "/fs/uploads/up_1/parts/1"),
+            (http::Method::POST, "/fs/uploads/up_1/complete"),
+            (http::Method::DELETE, "/fs/uploads/up_1"),
+            (http::Method::GET, "/fs/uploads/up_1"),
+            (http::Method::GET, "/fs/files/f_1/meta"),
+            (http::Method::GET, "/fs/files/f_1"),
+            (http::Method::DELETE, "/fs/files/f_1"),
+        ] {
+            let res = test::call_service(
+                &app,
+                test::TestRequest::default()
+                    .method(method.clone())
+                    .uri(uri)
+                    .insert_header(("Cookie", format!("auth_token={token}")))
+                    .to_request(),
+            )
+            .await;
+            let status = res.status();
+            let body = test::read_body(res).await;
+            if serde_json::from_slice::<crate::http::error::ErrorBody>(&body).is_err() {
+                unrouted.push(format!("{method} {uri} -> {status} (no error envelope)"));
+            }
+        }
+        assert!(
+            unrouted.is_empty(),
+            "documented in the OpenAPI document but not served by the module: {unrouted:?}"
+        );
+    }
+
     #[actix_web::test]
     async fn sanitize_filename_blocks_injection() {
         assert_eq!(sanitize_filename("hello.txt"), "hello.txt");
