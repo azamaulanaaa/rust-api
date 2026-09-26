@@ -70,6 +70,22 @@ impl FsError {
         matches!(self, Self::Fenced(_))
     }
 
+    /// The store's own reason for a failure, for server-side logs.
+    ///
+    /// Never rendered to a client: every variant's `Display` is the fixed
+    /// sanitized text, and only this reaches an operator.
+    pub fn detail(&self) -> &str {
+        match self {
+            Self::BadRequest(d)
+            | Self::NotFound(d)
+            | Self::Conflict(d)
+            | Self::Internal(d)
+            | Self::Store(d)
+            | Self::Fenced(d) => d,
+            Self::PayloadTooLarge | Self::Forbidden => "",
+        }
+    }
+
     /// Stable client-facing message: never carries request input.
     ///
     /// The inner detail stays in `Display` for server-side logs; the

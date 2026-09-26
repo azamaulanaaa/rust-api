@@ -495,6 +495,15 @@ mod tests {
             "{rendered}"
         );
         assert!(rendered.contains("epoch 7 superseded"), "{rendered}");
+
+        // And it took this instance out of rotation, which is the part that
+        // makes the classification worth having: `/ready` reports on the
+        // latch, and before it existed a fenced policy write was a 500 on a
+        // server that still claimed to be healthy.
+        assert!(
+            crate::fencing::primary_loss(),
+            "a fenced policy write must latch the process-wide signal"
+        );
     }
 
     #[tokio::test]

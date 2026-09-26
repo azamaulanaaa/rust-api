@@ -110,6 +110,9 @@ pub enum PolicyError {
     Fenced(String),
 }
 
+/// The master policy prefix, named in the fencing-loss log line.
+const POLICY_PREFIX: &str = "{db}/policy";
+
 impl PolicyError {
     /// True when this is a lost epoch, i.e. another writer took the prefix.
     ///
@@ -140,6 +143,9 @@ impl From<casbin::Error> for PolicyError {
             && let Some(oxkv::StoreError::Fenced(reason)) =
                 adapter.0.downcast_ref::<oxkv::StoreError>()
         {
+            // Casbin backs only the master policy store, so a lost epoch here
+            // is always a primary loss and never a recoverable race.
+            crate::fencing::note_primary_loss(POLICY_PREFIX, reason);
             return Self::Fenced(reason.clone());
         }
         Self::Casbin(e)

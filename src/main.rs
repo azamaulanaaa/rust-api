@@ -292,7 +292,20 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
     let readiness: rust_api::http::health::ReadyCheck = Arc::new({
         let policy_engine = policy_engine.clone();
         move || {
-            policy_engine.is_unlocked() && !lease_lost.load(std::sync::atomic::Ordering::Relaxed)
+            // Three independent reasons this instance cannot serve writes,
+            // any one of which is enough to take it out of rotation:
+            //
+            // - the policy lock is held, so reads would block;
+            // - the single-writer lease was lost, meaning a peer took the
+            //   prefix cooperatively;
+            // - a primary prefix was fenced outright, which is the same
+            //   condition arriving without cooperation (an older build, a
+            //   `writer_lease_ttl_secs = 0` deployment, an operator running
+            //   `policy import` against a live prefix). The lease check
+            //   cannot see that, so `fencing` reports it separately.
+            policy_engine.is_unlocked()
+                && !lease_lost.load(std::sync::atomic::Ordering::Relaxed)
+                && !rust_api::fencing::primary_loss()
         }
     });
     ApiService::new()

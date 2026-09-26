@@ -15,6 +15,10 @@ use tokio::sync::RwLock;
 use crate::fs::error::FsError;
 use crate::records::{ChangeError, ChangeSink, WalEntry, WalOp};
 
+/// The master change-feed prefix this store writes to, named in the
+/// fencing-loss log line so an operator can tell which prefix died.
+const WAL_PREFIX: &str = "{db}/wal";
+
 /// WAL stored in an [`OxKvStore`] (per-user S3, scalable).
 ///
 /// Clones share the append mutex: concurrent appends from any handle
@@ -50,6 +54,20 @@ impl Wal {
     /// (or a head without its entry): the next append reuses the same
     /// sequence instead of skipping it.
     async fn append_entry(&self, op: WalOp) -> Result<u64, FsError> {
+        let result = self.append_entry_locked(op).await;
+        if let Err(e) = &result
+            && e.is_fencing_loss()
+        {
+            // The WAL lives on the master change-feed prefix, so losing it is
+            // terminal for this process -- the same condition `fs` and
+            // `policy` report. Replica build races land on a per-user prefix
+            // and are not fenced through here.
+            crate::fencing::note_primary_loss(WAL_PREFIX, e.detail());
+        }
+        result
+    }
+
+    async fn append_entry_locked(&self, op: WalOp) -> Result<u64, FsError> {
         let _guard = self.append_lock.lock().await;
         let g = self.store.write().await;
         let cur = g
