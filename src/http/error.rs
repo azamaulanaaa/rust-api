@@ -35,6 +35,18 @@ pub enum ApiError {
     #[error("authentication required")]
     MissingCredentials,
 
+    /// The request body could not be parsed into the handler's type. HTTP
+    /// 400.
+    ///
+    /// Exists because actix's own JSON-extractor failure is a bare
+    /// `400 Bad Request` in `text/plain` -- the one way a documented route
+    /// answers outside the uniform envelope, reached by any client that
+    /// sends a truncated or mistyped payload. [`apply_limits`](crate::http::apply_limits)
+    /// installs this as the extractor's error handler; the extractor's
+    /// message names the offending field and is logged, never sent.
+    #[error("bad request")]
+    BadRequest,
+
     /// Credential was present but failed verification; the source holds the
     /// rejection detail for logs only. HTTP 401.
     #[error("invalid credentials")]
@@ -57,6 +69,7 @@ pub enum ApiError {
 impl ApiError {
     fn status(&self) -> StatusCode {
         match self {
+            Self::BadRequest => StatusCode::BAD_REQUEST,
             Self::MissingCredentials | Self::InvalidCredentials(_) => StatusCode::UNAUTHORIZED,
             Self::Forbidden => StatusCode::FORBIDDEN,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,

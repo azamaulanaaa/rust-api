@@ -16,6 +16,8 @@ use actix_web::{App, HttpServer, web};
 pub mod docs;
 /// Shared error type rendering a uniform JSON error envelope.
 pub mod error;
+
+use error::ApiError;
 /// Built-in liveness probe shared by every deployment.
 pub mod health;
 /// Request middleware for token extraction and validation.
@@ -53,7 +55,21 @@ where
         >,
 {
     app.app_data(web::PayloadConfig::new(MAX_PAYLOAD_BYTES))
-        .app_data(web::JsonConfig::default().limit(MAX_JSON_BYTES))
+        .app_data(
+            web::JsonConfig::default()
+                .limit(MAX_JSON_BYTES)
+                .error_handler(|err, _| {
+                    // Actix's default for a malformed body is a bare `400 Bad
+                    // Request` in text/plain, which is the one way a documented
+                    // route can answer outside the uniform envelope -- and it is
+                    // reached by any client that sends a truncated or mistyped
+                    // payload, i.e. routinely. The extractor's message names the
+                    // offending field and the expected type, so it is logged and
+                    // not sent, same contract as every other cause in this crate.
+                    tracing::debug!("malformed JSON body: {err}");
+                    ApiError::BadRequest.into()
+                }),
+        )
 }
 
 /// Logs a mid-stream response body failure server-side.
@@ -368,7 +384,7 @@ impl ApiService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use actix_web::{HttpResponse, test};
+    use actix_web::{HttpResponse, http::StatusCode, http::header::CONTENT_TYPE, post, test, web};
 
     /// A module that exists only to prove the composition root mounts what
     /// it is given, in a *scope* — the shape every real module uses.
@@ -568,6 +584,56 @@ mod tests {
     /// Raw-bytes echo handler exercising the `Bytes` extractor limit.
     async fn echo(body: web::Bytes) -> HttpResponse {
         HttpResponse::Ok().body(body)
+    }
+
+    /// A malformed JSON body answers inside the envelope.
+    ///
+    /// Actix's default for a body that will not deserialize is a bare
+    /// `400 Bad Request` in `text/plain`, so a documented route could answer
+    /// outside the uniform envelope -- and would, routinely, for any client
+    /// that sends a truncated or mistyped payload. This pins the fix to
+    /// `apply_limits`, which is the one place the `JsonConfig` lives, so a
+    /// host app following the documented recipe inherits it.
+    #[actix_web::test]
+    async fn malformed_json_answers_inside_the_envelope() {
+        #[post("/thing")]
+        async fn thing(_body: web::Json<serde_json::Value>) -> HttpResponse {
+            HttpResponse::Ok().finish()
+        }
+
+        // Control: without `apply_limits`, actix's own text 400.
+        let bare = test::init_service(App::new().service(thing)).await;
+        let res = test::call_service(
+            &bare,
+            test::TestRequest::post()
+                .uri("/thing")
+                .insert_header((CONTENT_TYPE, "application/json"))
+                .set_payload("{not json")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let raw = test::read_body(res).await;
+        assert!(
+            serde_json::from_slice::<error::ErrorBody>(&raw).is_err(),
+            "control: actix's default is not the envelope"
+        );
+
+        // With it, the same request is answered by this crate.
+        let wrapped = test::init_service(apply_limits(App::new()).service(thing)).await;
+        let res = test::call_service(
+            &wrapped,
+            test::TestRequest::post()
+                .uri("/thing")
+                .insert_header((CONTENT_TYPE, "application/json"))
+                .set_payload("{not json")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let parsed: error::ErrorBody =
+            serde_json::from_slice(&test::read_body(res).await).expect("envelope");
+        assert_eq!(parsed.error, "bad request");
     }
 
     /// 300 KiB exceeds actix's 256 KiB `Bytes` default: without the shared
