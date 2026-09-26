@@ -19,7 +19,11 @@ pub struct ErrorBody {
 /// Application-wide API error.
 ///
 /// The `Display` text (via `#[error]`) doubles as the client-facing body,
-/// while any `#[source]` cause is reserved for server-side logging.
+/// while any `#[source]` cause is reserved for server-side logging. That
+/// split is why no variant carries a `String`: a payload here would be
+/// request-derived text on the wire. Detail belongs in a `#[source]`
+/// cause, which is logged and never serialized. This mirrors the
+/// sanitization contract in [`FsError`](crate::fs::error::FsError).
 #[derive(Debug, Error)]
 pub enum ApiError {
     /// Request carried no credential at all. HTTP 401.
@@ -41,8 +45,8 @@ pub enum ApiError {
 
     /// The request conflicts with already-established state; used by the
     /// one-time bootstrap route once setup has been completed. HTTP 409.
-    #[error("conflict: {0}")]
-    Conflict(String),
+    #[error("conflict")]
+    Conflict,
 }
 
 impl ApiError {
@@ -51,7 +55,7 @@ impl ApiError {
             Self::MissingCredentials | Self::InvalidCredentials(_) => StatusCode::UNAUTHORIZED,
             Self::Forbidden => StatusCode::FORBIDDEN,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
-            Self::Conflict(_) => StatusCode::CONFLICT,
+            Self::Conflict => StatusCode::CONFLICT,
         }
     }
 }
@@ -87,12 +91,13 @@ mod tests {
         );
         assert_eq!(ApiError::Forbidden.status(), 403);
         assert_eq!(ApiError::Internal("db down".into()).status(), 500);
-        assert_eq!(ApiError::Conflict("done".into()).status(), 409);
+        assert_eq!(ApiError::Conflict.status(), 409);
     }
 
     #[test]
     fn display_messages_are_stable_and_sanitized() {
-        // Display must never embed the cause: it becomes the client body.
+        // Display must never embed a cause or caller-supplied text: it
+        // becomes the client body.
         let internal = ApiError::Internal("secret db DSN".into());
         assert_eq!(internal.to_string(), "internal server error");
 
@@ -105,6 +110,20 @@ mod tests {
                 .to_string(),
             "raw jwks dump"
         );
+    }
+
+    /// Every variant renders a fixed string, so no request-derived payload
+    /// can reach the wire through the envelope. The FS engine holds the
+    /// same line (see `FsError::client_message`); this pins the API side.
+    #[test]
+    fn every_variant_has_a_fixed_client_message() {
+        for (err, message) in [
+            (ApiError::MissingCredentials, "authentication required"),
+            (ApiError::Forbidden, "forbidden"),
+            (ApiError::Conflict, "conflict"),
+        ] {
+            assert_eq!(err.to_string(), message);
+        }
     }
 
     #[actix_web::test]
