@@ -68,29 +68,53 @@ pub struct SnapshotManager {
     build_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
 }
 
+/// The collaborators a [`SnapshotManager`] reads master state through.
+///
+/// Grouped so [`SnapshotManager::new`] is three arguments instead of six,
+/// and so adding a fourth source of master state is a field addition rather
+/// than a signature change for every caller.
+pub struct SnapshotDeps {
+    /// Change feed to replay from.
+    pub wal: Wal,
+    /// Master file store (reads only; the master is written through
+    /// [`FsEngine`](crate::fs::FsEngine)).
+    pub store: FsStore,
+    /// Read-only policy view for row visibility checks.
+    pub policy: Authorizer,
+    /// Object store backing every replica prefix.
+    pub object_store: std::sync::Arc<dyn object_store::ObjectStore>,
+}
+
+/// What a replica prefix is opened against.
+///
+/// An enum rather than a `skip_probe: bool`, because the flag was the sixth
+/// positional argument of a six-argument constructor and nothing at the call
+/// site said what `true` meant. Passing the wrong one is not a compile error
+/// and not a wrong answer either -- it is a probe run against a backend that
+/// has no conditional writes, or a skipped probe against real S3, and the
+/// second of those loses the check that guards the `manifest.json` CAS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplicaBackend {
+    /// A real object store. Opens probe for conditional writes.
+    ObjectStore,
+    /// `InMemory`, which has no conditional-write probe to run. Tests only.
+    InMemory,
+}
+
 impl SnapshotManager {
     /// Create a manager.
     ///
     /// Takes an [`Authorizer`] rather than a
     /// [`PolicyEngine`](crate::policy::PolicyEngine): replicas are a read
     /// projection, so this type never needs write access to policy.
-    /// `skip_probe` is `true` only for `InMemory` backends, which have no
-    /// conditional-write probe to run.
-    pub fn new(
-        wal: Wal,
-        store: FsStore,
-        policy: Authorizer,
-        object_store: std::sync::Arc<dyn object_store::ObjectStore>,
-        db_prefix: impl Into<String>,
-        skip_probe: bool,
-    ) -> Self {
+    pub fn new(deps: SnapshotDeps, db_prefix: impl Into<String>, backend: ReplicaBackend) -> Self {
         Self {
-            wal,
-            store,
-            policy,
-            object_store,
+            wal: deps.wal,
+            store: deps.store,
+            policy: deps.policy,
+            object_store: deps.object_store,
             db_prefix: db_prefix.into(),
-            skip_probe,
+            skip_probe: matches!(backend, ReplicaBackend::InMemory),
             build_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             sst_cache: crate::db::default_sst_cache(),
         }
@@ -629,14 +653,70 @@ mod tests {
         .await
         .unwrap();
         let mgr = SnapshotManager::new(
-            wal,
-            store,
-            policy.authorizer(),
-            mem.clone() as std::sync::Arc<dyn object_store::ObjectStore>,
+            crate::sync::snapshot::SnapshotDeps {
+                wal,
+                store,
+                policy: policy.authorizer(),
+                object_store: mem.clone() as std::sync::Arc<dyn object_store::ObjectStore>,
+            },
             "test-db",
-            true,
+            crate::sync::snapshot::ReplicaBackend::InMemory,
         );
         (mgr, policy, mem)
+    }
+
+    /// The backend choice maps to the probe flag, and the polarity is the
+    /// whole risk.
+    ///
+    /// `skip_probe` was a bare `bool` in a six-argument constructor, so
+    /// nothing at the call site distinguished "probe real S3" from "no
+    /// probe". Getting it backwards is not a compile error and not a wrong
+    /// answer: skipping the probe against real S3 drops the conditional-write
+    /// check that guards the `manifest.json` CAS, which only shows up later
+    /// as two builders believing they both won.
+    #[tokio::test]
+    async fn replica_backend_selects_the_storage_probe() {
+        let deps = async {
+            SnapshotDeps {
+                wal: Wal::new(
+                    crate::db::build_test_store(&crate::db::test_prefix("probe-wal")).await,
+                ),
+                store: FsStore::new(
+                    crate::db::build_test_store(&crate::db::test_prefix("probe-store")).await,
+                ),
+                policy: crate::policy::PolicyEngine::init_s3(
+                    crate::db::build_test_store(&crate::db::test_prefix("probe-policy")).await,
+                )
+                .await
+                .expect("engine")
+                .authorizer(),
+                object_store: std::sync::Arc::new(object_store::memory::InMemory::new())
+                    as std::sync::Arc<dyn object_store::ObjectStore>,
+            }
+        }
+        .await;
+
+        let make = |backend| {
+            SnapshotManager::new(
+                SnapshotDeps {
+                    wal: deps.wal.clone(),
+                    store: deps.store.clone(),
+                    policy: deps.policy.clone(),
+                    object_store: deps.object_store.clone(),
+                },
+                "test-db",
+                backend,
+            )
+        };
+
+        assert!(
+            !make(ReplicaBackend::ObjectStore).skip_probe,
+            "real object stores must be probed for conditional writes"
+        );
+        assert!(
+            make(ReplicaBackend::InMemory).skip_probe,
+            "InMemory has no conditional writes to probe"
+        );
     }
 
     fn file_record(id: &str, owner: &str) -> FileRecord {

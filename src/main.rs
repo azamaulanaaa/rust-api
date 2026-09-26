@@ -273,13 +273,15 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
         FsStore::new(fs_s3_store.clone())
     };
     let snapshot_manager = SnapshotManager::new(
-        wal.clone(),
-        master_store,
-        // Replicas only read policy, so hand over the read-only view.
-        policy_engine.authorizer(),
-        replica_objects,
+        rust_api::sync::snapshot::SnapshotDeps {
+            wal: wal.clone(),
+            store: master_store,
+            // Replicas only read policy, so hand over the read-only view.
+            policy: policy_engine.authorizer(),
+            object_store: replica_objects,
+        },
         db_prefix,
-        false,
+        rust_api::sync::snapshot::ReplicaBackend::ObjectStore,
     );
     let sync_api_module =
         SyncApiModule::new(snapshot_manager.clone(), oidc_api_module.middleware());
