@@ -89,7 +89,7 @@ src/
 │   └── middleware/      bearer_token, jwks (debounced refresh), jwt (JWKS-backed claims + Validated extractor), request_tracing
 ├── oidc/                OIDC client: /auth/* (code flow, PKCE, session probe)
 │   ├── mod.rs           OidcClient, OidcConfig, PKCE/nonce/state helpers
-│   └── route.rs         OidcApiModule (login/callback/logout) + OidcSessionModule (me) (seeds JwtClaimsMiddleware)
+│   └── route.rs         OidcApiModule owns all of /auth (login/callback/logout/me) and seeds JwtClaimsMiddleware
 ├── policy/              Casbin engine, oxkv adapter + validator, management routes
 │   ├── adapter.rs       OxkvAdapter<S: Store> + PolicyRuleValidator + encode_rule() (validates before tx)
 │   ├── admin.rs         export_s3 / import_s3 (OxKvStore, not file)
