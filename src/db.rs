@@ -1,9 +1,16 @@
-//! OxKV store factory.
+//! Storage plumbing: OxKV store factory and the single-writer lease.
 //!
 //! Centralizes conversion from S3 configuration + prefix into an
 //! `object_store` + `oxkv::OxKvStore`. Reuses the same bucket/region/endpoint
 //! settings that the file-byte store uses, but with a distinct prefix for
 //! transactional keys (`p:`, `g:`, `fs:`, `wal:`) so one bucket hosts both.
+//!
+//! [`WriterLease`](crate::lease::WriterLease) lives there instead: `oxkv`
+//! deliberately acquires ownership by CAS-bumping `ownership.json`, i.e.
+//! last-writer-wins, so a second process on the same prefix cannot be
+//! *detected* through `oxkv` -- it can only fence the first one at write
+//! time. The lease is the missing half, a heartbeat record in the same
+//! bucket that makes a live predecessor observable at startup.
 
 use std::sync::Arc;
 

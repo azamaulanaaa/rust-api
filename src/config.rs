@@ -278,10 +278,28 @@ pub struct DatabaseConfig {
     /// the single writer for the prefix. Defaults to false.
     #[serde(default)]
     pub mirror_master: bool,
+    /// Seconds a single-writer lease stays valid without a renewal.
+    ///
+    /// The server claims a lease on `[database].prefix` at startup and
+    /// refuses to start if another process holds a live one, because two
+    /// writers on one prefix silently diverge (see
+    /// [`rust_api::lease`]). It must exceed the worst-case pause between
+    /// renewals -- a long GC pause or a slow S3 round trip -- or a healthy
+    /// process will be displaced by its own peer.
+    ///
+    /// Set to `0` to disable the lease entirely. Only safe when exactly one
+    /// process can ever reach the bucket, e.g. a laptop; a disabled lease
+    /// puts split brain back on the operator.
+    #[serde(default = "default_writer_lease_ttl_secs")]
+    pub writer_lease_ttl_secs: u64,
 }
 
 fn default_db_prefix() -> String {
     "oxkv".to_string()
+}
+
+fn default_writer_lease_ttl_secs() -> u64 {
+    rust_api::lease::DEFAULT_LEASE_TTL_SECS
 }
 
 /// HTTP edge settings for browser clients.
@@ -626,5 +644,35 @@ mod tests {
         assert_eq!(d.sample_ratio, 1.0);
         assert_eq!(default_service_name(), "rust-api");
         assert_eq!(default_sample_ratio(), 1.0);
+    }
+
+    /// The lease TTL is the knob that decides how long a crashed writer
+    /// blocks its replacement, so the default has to be a real value rather
+    /// than zero -- zero silently disables single-writer enforcement.
+    #[test]
+    fn writer_lease_ttl_defaults_on_and_can_be_disabled() {
+        let path = tmp_toml(&minimal_toml());
+        let cfg = Config::try_from(path.as_path()).expect("should parse");
+        assert_eq!(cfg.database.writer_lease_ttl_secs, 60);
+        assert_eq!(
+            cfg.database.writer_lease_ttl_secs,
+            default_writer_lease_ttl_secs()
+        );
+        let _ = std::fs::remove_file(&path);
+
+        // Must land in the [database] table, not after `region` (which
+        // sits in [s3] -- serde ignores unknown keys there, so the test
+        // would silently assert the default).
+        let toml = minimal_toml().replace(
+            "prefix = \"oxkv\"",
+            "prefix = \"oxkv\"\nwriter_lease_ttl_secs = 0",
+        );
+        let path = tmp_toml(&toml);
+        let cfg = Config::try_from(path.as_path()).expect("should parse");
+        assert_eq!(
+            cfg.database.writer_lease_ttl_secs, 0,
+            "0 disables the lease"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }
