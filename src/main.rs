@@ -48,7 +48,7 @@ enum Command {
     Serve {
         /// Path of the TOML configuration file to load at startup.
         #[arg(short, long)]
-        config: String,
+        config: PathBuf,
         /// Enable debug-level logging.
         #[arg(long, default_value_t = false)]
         verbose: bool,
@@ -84,7 +84,7 @@ enum PolicyAction {
     /// Write every stored policy rule to a JSON file (S3 prefix from --config).
     Export {
         /// Path of the TOML config file (provides [s3] + [database].prefix).
-        #[arg(long)]
+        #[arg(short, long)]
         config: PathBuf,
         /// Output JSON file.
         #[arg(long)]
@@ -93,7 +93,7 @@ enum PolicyAction {
     /// Load policy rules from a JSON file into a store (S3 prefix from --config).
     Import {
         /// Path of the TOML config file (provides [s3] + [database].prefix).
-        #[arg(long)]
+        #[arg(short, long)]
         config: PathBuf,
         /// Input JSON file.
         #[arg(long)]
@@ -136,7 +136,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Serve { config, verbose } => serve(Path::new(&config), verbose).await,
+        Command::Serve { config, verbose } => serve(&config, verbose).await,
         Command::Policy { action } => match action {
             PolicyAction::Export { config, out } => {
                 let cfg = config::Config::try_from(config.as_path())?;
