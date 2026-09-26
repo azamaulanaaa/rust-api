@@ -45,7 +45,7 @@ impl InitRequest {
             let within_bounds = self.part_size <= 524288;
             if !is_multiple_of_1kb || !within_bounds {
                 return Err(FsError::BadRequest(
-                    "part_size must be a power-of-two multiple of 1 KB up to 512 KB (e.g., 131072, 262144, 524288)".into(),
+                    "part_size must be a multiple of 1 KB up to 512 KB (e.g., 131072, 262144, 524288)".into(),
                 ));
             }
             let expected = self.file_size.div_ceil(self.part_size);
@@ -55,7 +55,16 @@ impl InitRequest {
                     self.part_size
                 )));
             }
-            let product = self.file_total_parts * self.part_size;
+            // `checked_mul`: the two fields are independent u64s from the
+            // wire, and a huge `file_size` can satisfy the `expected` check
+            // above while overflowing the product (panic in debug, silent
+            // wrap in release).
+            let product = self
+                .file_total_parts
+                .checked_mul(self.part_size)
+                .ok_or_else(|| {
+                    FsError::BadRequest("file_total_parts * part_size overflows u64".into())
+                })?;
             if product != self.file_size {
                 return Err(FsError::BadRequest(format!(
                     "Inconsistent math: file_total_parts ({}) * part_size ({}) must equal file_size ({})",
@@ -242,6 +251,46 @@ mod tests {
         }
         .validate()
         .unwrap();
+    }
+
+    /// `part_size` is constrained to a 1 KB multiple, not a power of two:
+    /// the error message used to promise "power-of-two" while the check
+    /// accepted any multiple. Pins the behavior the message now describes.
+    #[test]
+    fn init_request_multi_part_allows_any_1kb_multiple() {
+        // 3 KiB is not a power of two but is a valid part size.
+        InitRequest {
+            file_size: 6144,
+            part_size: 3072,
+            file_total_parts: 2,
+        }
+        .validate()
+        .unwrap();
+        assert_bad(
+            InitRequest {
+                file_size: 6144,
+                part_size: 3073,
+                file_total_parts: 2,
+            },
+            "part_size",
+        );
+    }
+
+    /// The declared part count and size are independent `u64`s from the
+    /// wire. A `file_size` large enough to satisfy the `ceil(file_size /
+    /// part_size)` check can still overflow the product, which used to
+    /// panic in debug builds and wrap silently in release.
+    #[test]
+    fn init_request_rejects_overflowing_part_product() {
+        assert_bad(
+            InitRequest {
+                // ceil((2^64 - 512) / 1024) == 2^54, and 2^54 * 1024 == 2^64.
+                file_size: u64::MAX - 511,
+                part_size: 1024,
+                file_total_parts: 1u64 << 54,
+            },
+            "overflows u64",
+        );
     }
 
     #[test]
