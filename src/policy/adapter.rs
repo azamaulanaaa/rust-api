@@ -98,7 +98,9 @@ impl Validator for PolicyRuleValidator {
         let mut parts = key.splitn(3, SEP);
         let (Some(sec), Some(ptype), Some(hash)) = (parts.next(), parts.next(), parts.next())
         else {
-            return Err(format!("policy keys must be '{{sec}}:{SEP}{{hash}}', got '{key}'").into());
+            return Err(
+                format!("policy keys must be '{{sec}}:ptype:{{hash}}', got '{key}'").into(),
+            );
         };
         if sec != "p" && sec != "g" {
             return Err(format!("unknown policy section '{sec}' in key '{key}'").into());
@@ -500,6 +502,27 @@ mod tests {
         // Unknown section rejected at staging.
         let tx = store.begin_tx().unwrap();
         assert!(tx.set_bytes("x:m:ff04", br#"["a","b"]"#).await.is_err());
+    }
+
+    /// The key-shape rejection has to name the segment it is actually
+    /// missing. The message used to render `{sec}:{SEP}{hash}`, which
+    /// both interpolated the separator constant and dropped `ptype` — so
+    /// a two-segment key was reported as malformed in a format that
+    /// looked like the valid one.
+    #[tokio::test]
+    async fn validator_error_names_the_ptype_segment() {
+        use oxkv::Store as _;
+
+        let store = oxkv::HookStore::new(BTreeStore::default()).with_validator(PolicyRuleValidator);
+        let tx = store.begin_tx().unwrap();
+        let err = tx
+            .set_bytes("p:only-two", br#"["alice","doc","read"]"#)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("{sec}:ptype:{hash}"),
+            "unexpected: {err}"
+        );
     }
 
     #[tokio::test]
