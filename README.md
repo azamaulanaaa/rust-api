@@ -16,6 +16,7 @@ The crate is intentionally business-logic free: applications compose `ApiModule`
 - **Capability tokens** — short-lived HMAC JWT (`fs/token.rs`, 5m) available via `FsEngine::mint_token` / `verify_token` after row authorization, without extra policy hits; `kid`-keyed rotation (`secret` mints, `previous_secret` verifies-only, see `[capability]`) with ephemeral per-boot fallback. Note: the current `/fs/*` routes authenticate with the OIDC JWT (`claims.sub` + `can_access`) and do not consume capability tokens yet — the engine API is ready for direct `PUT`/`GET` delegation.
 - **GC for orphans** — hourly sweeper removes abandoned upload sessions and temp/orphaned files (`refs==0` and `age>24h` or `orphan_since>24h`), plus a third pass that lists `files/` object bytes and reaps bytes with no live session/file key older than 24h.
 - **Per-user filtered replicas with WAL (S3, oxkv manifest)** — WAL lives as `wal:{seq:020}` + `wal:seq` inside an `OxKvStore`; each user owns one replica prefix (`{db}/u/{sha256-hex(sub)}/`) holding their filtered file set with its own oxkv `manifest.json` (the segment list); `GET /sync/status` reports the pointer (`prefix`, `applied_seq`, `head`) with an `ETag` (repeat polls get `304`) without building, and every object inside the prefix is individually cached at `GET /sync/db/{object}` with backend `ETag` passthrough and `If-None-Match` support — mutable manifest plus immutable, forever-cacheable segments: `manifest.json` is served `no-cache`, every other replica object is `public, max-age=31536000, immutable`. `POST /sync/sync` short-circuits when coverage already meets the WAL head; deltas of ≤1000 file/relation ops replay onto the live prefix, while policy changes, larger deltas, or fencing losses fall back to full recalc (or adopt the winner's coverage).
+- **Single-writer enforcement** — the server claims a lease on `[database].prefix` before opening any store and refuses to start if another live process holds it; the holder renews at a third of the TTL, releases on clean shutdown, and reports `/ready` 503 if a successor ever takes over (see [Single-writer enforcement](#single-writer-enforcement))
 - **WAL-instrumented mutations** — `FsEngine` (complete/attach/detach/delete) and `PolicyEngine` (rule/group changes, including `policy import`) append to one shared `Wal` after each mutation commits (fail-closed: a logging failure fails the whole operation, so the WAL never silently misses a write); concurrent appends serialize on a mutex shared by all handles. Engines without a wired WAL log nothing (tests).
 - **Transactional replica builds** — snapshots filter into a RAM scratch store, diff against the live replica, and commit the diff plus the coverage marker in one transaction: a crash before commit leaves the old state untouched (oxkv replays only listed WALs on open), and an empty diff commits nothing — mid-broken writes are handled by the engine, not app scaffolding.
 - **Modular composition** — implement the `ApiModule` trait and register onto `ApiService`; JWT auth middleware is applied per module scope (global middleware is bearer-token extraction + request tracing)
@@ -75,7 +76,8 @@ src/
 ├── main.rs              binary entry point: config → telemetry → OIDC/policy/fs/sync wiring → listener
 ├── lib.rs               crate root and documentation
 ├── config.rs            TOML configuration model ([database].prefix + mirror_master, [s3], [observability], [capability], [http].allowed_origins + RUST_API_ALLOWED_ORIGINS; binary-private `mod config`)
-├── db.rs                OxKV store factory — one AmazonS3Builder for file bytes + OxKvStore; build_s3_store / build_test_store / build_test_store_new_session / build_scratch_store; single-live-handle-per-prefix contract
+├── db.rs                OxKV store factory — one AmazonS3Builder for file bytes + OxKvStore; build_s3_store / build_test_store / build_test_store_new_session / build_scratch_store / test_prefix; single-live-handle-per-prefix contract
+├── lease.rs             single-writer lease on [database].prefix (startup refusal + renewal + release)
 ├── telemetry.rs         tracing subscriber + OTLP span/metric export bootstrap (otlp-grpc / otlp-http features)
 ├── docs.rs              utoipa OpenAPI `ApiDoc` (all routes; served via http/docs.rs as /openapi.json + /swagger-ui/)
 ├── http/                HTTP scaffolding shared by all modules
@@ -130,6 +132,26 @@ Rules persist to a prefix-scoped [`oxkv::OxKvStore`](https://docs.rs/oxkv) under
 
 > **Single-live-handle-per-prefix:** each `OxKvStore` owns a fresh fencing session (memtable/WAL buffer). Two live handles on the same prefix can fence each other or diverge on real S3. Share the handle via `Arc` — do not build a second one. Tests use `db::build_test_store` (fresh `InMemory` per prefix) and `build_test_store_new_session` for single-threaded reopen (new session superseding the previous one). Exception: the `policy export` / `policy import` CLI subcommands open a short-lived second handle on `{prefix}/policy` (and `{prefix}/wal` for import) — never run them concurrently with a live server on the same prefix.
 
+### Single-writer enforcement
+
+`oxkv` acquires a prefix by CAS-bumping `ownership.json`: last writer wins, and the loser is fenced at write time (`StoreError::Fenced`, which oxkv documents as "the current process must stop writing and restart"). That is a correct *takeover* protocol and a useless *detection* protocol — nothing in it distinguishes "my predecessor is still serving traffic" from "my predecessor crashed". A second replica pointed at the same prefix would start cleanly, serve writes that silently diverge, and only fail later and elsewhere.
+
+So the server claims an explicit **writer lease** (`src/lease.rs`) on `{prefix}/_rust-api-writer-lease.json`, covering every prefix-scoped store: `policy`, `fs`, `wal`, and each per-user replica. It is claimed *before* any store is opened, because opening a store is what takes the epoch.
+
+| Situation | Behavior |
+|---|---|
+| Second process starts, lease live | **Refuses to start**, naming the holder, its pid, and how long until the lease goes stale |
+| Predecessor crashed | Lease goes stale after `writer_lease_ttl_secs`; the next start takes over automatically and logs who it displaced |
+| Predecessor stalls past the TTL | Successor takes over; the predecessor notices on its next renewal, logs an error, and `/ready` turns **503** so the orchestrator drains it |
+| Orderly shutdown | Lease is released, so a rolling restart hands over without waiting out the TTL |
+| Record unparseable | Refused, never overwritten — guessing the owner is the failure this exists to prevent |
+
+The lease cannot stop a network partition from splitting the prefix; nothing lease-based can. What it buys is that the losing side *finds out* and stops taking traffic rather than discovering it through corrupted data.
+
+> **Set `writer_lease_ttl_secs = 0` only where exactly one process can ever reach the bucket** (a laptop, a single container). It disables enforcement and logs a warning at startup. The TTL must otherwise exceed your worst-case pause between renewals — a long GC pause or a slow S3 round trip — or a healthy process gets displaced by its own peer. Renewal runs at a third of the TTL, so two consecutive missed renewals still leave a full TTL of headroom.
+
+`/ready` reports 503 when the lease is lost, so this composes with an existing readiness probe rather than requiring a new one.
+
 ### Row-level and file delegation
 
 Business rows authorize as `{row_type}:{row_id}` via `RowAuthorizer` (`policy/row.rs`). Files are not gated by a coarse `fs` object; instead:
@@ -163,6 +185,7 @@ issuer_url = "https://idp.example.com"      # base URL of the OIDC discovery doc
 prefix = "oxkv"                             # object prefix inside the S3 bucket for OxKV keys (default "oxkv")
                                             # policy → {prefix}/policy, fs → {prefix}/fs, wal → {prefix}/wal,
                                             # replicas → {prefix}/u/{sha256-hex(sub)}; no local file
+# writer_lease_ttl_secs = 60                 # single-writer lease TTL (default 60; 0 disables enforcement)
 # mirror_master = false                     # prototype: keep a lazily-warmed in-RAM mirror of the master fs
                                             # store to serve full replica rebuild scans from memory after the
                                             # first pass (costs one master key set in RAM; only with single writer)

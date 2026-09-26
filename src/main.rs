@@ -196,6 +196,7 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
     let s3_client_config = s3_client_config(&config);
     let db_prefix = config.database.prefix.trim_matches('/').to_string();
     let mirror_master = config.database.mirror_master;
+    let lease_ttl = config.database.writer_lease_ttl_secs;
 
     let telemetry = telemetry::init(
         verbose,
@@ -217,6 +218,15 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
     })
     .await?;
     let oidc_api_module = OidcApiModule::<Claims>::init(oidc_client).await?;
+
+    // Claim the prefix BEFORE building any store: opening an OxKvStore
+    // takes an epoch, so a check afterwards would already have displaced
+    // the incumbent. Every prefix-scoped store built below (policy, fs,
+    // wal, and each per-user replica) then lives under this one lease.
+    // `_lease_guard` is held for the rest of `serve`, so the lease is
+    // renewed while serving and released on the way out.
+    let (lease_lost, _lease_guard) =
+        claim_writer_lease(&s3_client_config, &db_prefix, lease_ttl).await?;
 
     // Single bucket, prefix-scoped OxKvStores per domain (scalable, no local files).
     let policy_store =
@@ -278,10 +288,14 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
 
     let listen_addr = SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), config.listen_port);
     // Readiness fails when the policy lock is wedged (a writer stuck
-    // holding it). Startup itself already gates on S3/OIDC/JWKS.
+    // holding it) or when the single-writer lease is lost, which means a
+    // successor now owns the prefix and this process must stop taking
+    // traffic. Startup itself already gates on S3/OIDC/JWKS/lease.
     let readiness: rust_api::http::health::ReadyCheck = Arc::new({
         let enforcer = policy_engine.enforcer.clone();
-        move || enforcer.try_read().is_ok()
+        move || {
+            enforcer.try_read().is_ok() && !lease_lost.load(std::sync::atomic::Ordering::Relaxed)
+        }
     });
     let session_api_module = OidcSessionModule::new(oidc_api_module.middleware());
     ApiService::new()
@@ -302,4 +316,50 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
     telemetry.shutdown()?;
 
     Ok(())
+}
+
+/// Claims the single-writer lease for `db_prefix` and starts renewing it.
+///
+/// Returns the flag to gate `/ready` on plus a guard that must be held for
+/// the server's lifetime: dropping the guard stops renewal and releases the
+/// lease, which is what makes a rolling restart hand the prefix over without
+/// a TTL wait.
+///
+/// A `ttl_secs` of `0` disables the lease (documented single-node escape
+/// hatch) and yields a flag that is never set.
+async fn claim_writer_lease(
+    s3_cfg: &S3ClientConfig,
+    db_prefix: &str,
+    ttl_secs: u64,
+) -> anyhow::Result<(
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+    Option<rust_api::lease::LeaseGuard>,
+)> {
+    use std::sync::atomic::AtomicBool;
+
+    if ttl_secs == 0 {
+        tracing::warn!(
+            prefix = %db_prefix,
+            "[database].writer_lease_ttl_secs is 0: single-writer enforcement is DISABLED. \
+             Two processes on this prefix will silently diverge."
+        );
+        return Ok((Arc::new(AtomicBool::new(false)), None));
+    }
+    let store = rust_api::db::build_object_store(s3_cfg)
+        .context("build object store for the single-writer lease")?;
+    let lease = rust_api::lease::WriterLease::acquire(store, db_prefix, ttl_secs)
+        .await
+        .with_context(|| format!("claim single-writer lease for prefix {db_prefix:?}"))?;
+    tracing::info!(
+        instance = lease.instance(),
+        ttl_secs,
+        "holding single-writer lease for {db_prefix:?}"
+    );
+    // Renew at a third of the TTL: two consecutive missed renewals still
+    // leave a full TTL of headroom before a peer would consider us stale.
+    let (lost, guard) = rust_api::lease::spawn_renewer(
+        lease,
+        std::time::Duration::from_secs(ttl_secs / 3).max(std::time::Duration::from_secs(1)),
+    );
+    Ok((lost, Some(guard)))
 }

@@ -37,8 +37,14 @@ pub mod docs;
 /// Per-user filtered replicas on stable OxKvStore prefixes.
 pub mod sync;
 
-/// OxKV store factory (prefix-scoped inside configured S3 bucket).
+/// OxKV store factory (prefix-scoped inside configured S3 bucket) plus the
+/// single-writer lease that guards a `[database].prefix` scope.
 pub mod db;
+
+/// Single-writer lease: makes a second process on the same
+/// `[database].prefix` observable at startup instead of a silent
+/// divergence.
+pub mod lease;
 
 /// Telemetry bootstrap: global [`tracing`] subscriber installation and
 /// OpenTelemetry wiring.
