@@ -89,6 +89,10 @@ impl<C> ApiModule for OidcApiModule<C>
 where
     C: DeserializeOwned + Clone + Send + Sync + 'static,
 {
+    fn prefix(&self) -> &str {
+        "/auth"
+    }
+
     fn configure(&self, cfg: &mut web::ServiceConfig) {
         let oidc_client = web::Data::from(self.oidc_client.clone());
 

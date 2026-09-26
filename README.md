@@ -82,7 +82,7 @@ src/
 ├── docs.rs              utoipa OpenAPI `ApiDoc` (all routes; served via http/docs.rs as /openapi.json + /swagger-ui/)
 ├── records.rs           shared change-feed vocabulary — FileRecord, WalOp/WalEntry, ChangeSink/ChangeError; the leaf that breaks the fs↔sync cycle (see Layering)
 ├── http/                HTTP scaffolding shared by all modules
-│   ├── mod.rs           ApiService registry + ApiModule trait + CORS builder
+│   ├── mod.rs           ApiService registry + ApiModule trait (declared route prefix, duplicate-prefix check) + CORS builder
 │   ├── error.rs         ApiError enum and uniform JSON error envelope
 │   ├── health.rs        /health + /ready (readiness: policy-lock check)
 │   ├── docs.rs          mounts /openapi.json + /swagger-ui/*
@@ -344,12 +344,20 @@ use rust_api::http::ApiModule;
 struct MyModule;
 
 impl ApiModule for MyModule {
+    // The one prefix this module owns. Declaring it is what lets
+    // `ApiService` refuse a set that mounts `/my-scope` twice.
+    fn prefix(&self) -> &str {
+        "/my-scope"
+    }
+
     fn configure(&self, cfg: &mut actix_web::web::ServiceConfig) {
         cfg.service(actix_web::web::scope("/my-scope")
             .service(my_handler));
     }
 }
 ```
+
+A module owns exactly one prefix. Actix matches a scope by its whole prefix and tries services in registration order, so a module cannot contribute a route to a prefix another module already claimed — it would be silently unreachable.
 
 Handlers can extract validated JWT claims via the `Validated<C>` extractor (returns 401 automatically when claims are absent). See the crate documentation (`cargo doc --no-deps --open`) for details.
 
@@ -369,10 +377,12 @@ let app = http::apply_limits(App::new())
     .wrap(RequestTracingMiddleware)
     .wrap(BearerTokenMiddleware)
     .configure(http::health_routes)
-    .configure(|cfg| svc.configure(cfg))   // your modules + readiness probe
-    .configure(http::docs::config);        // /openapi.json + /swagger-ui
+    .configure(|cfg| svc.configure(cfg))?   // your modules + readiness probe
+    .configure(http::docs::config);         // /openapi.json + /swagger-ui
 HttpServer::new(move || app.clone()).run().await?;
 ```
+
+`svc.configure` returns `Result<_, DuplicateRoutePrefix>`: each `ApiModule` declares the single prefix it owns, and a set that mounts the same prefix twice is refused before anything is registered. Actix itself cannot report this — a scope matches its whole prefix and services are tried in registration order, so a second module on the same prefix has its routes silently ignored while its `/prefix/*` requests are answered by the first module.
 
 `http::docs::config` is mounted **last** on purpose: a catch-all mount registered ahead of your modules can shadow them.
 
