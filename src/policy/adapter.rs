@@ -124,8 +124,8 @@ impl Validator for PolicyRuleValidator {
 ///
 /// Generic over the backend so production can use a prefix-scoped `OxKvStore`
 /// while tests use the in-memory B-tree store or an `InMemory`-backed `OxKvStore`.
-/// Every write path validates rules through [`PolicyRuleValidator`] (see
-/// [`encode_rule`]) before staging them.
+/// Every write path validates rules through [`PolicyRuleValidator`] via the
+/// private `encode_rule` helper, before staging them.
 pub struct OxkvAdapter<S: Store> {
     store: S,
 }

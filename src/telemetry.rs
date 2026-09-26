@@ -3,9 +3,15 @@
 //!
 //! Console output is always enabled; `RUST_LOG` overrides the filter when
 //! set, otherwise the level derives from the CLI's verbose flag. When an
-//! OTLP endpoint is configured, spans are batch-exported over gRPC and the
+//! OTLP endpoint is configured, spans are batch-exported over OTLP and the
 //! W3C Trace Context propagator is registered globally so distributed
 //! traces can be continued across service boundaries.
+//!
+//! Transport follows the compiled cargo feature, not the endpoint string:
+//! the default `otlp-http` feature exports over HTTP/protobuf and
+//! `otlp-grpc` exports over gRPC. The two expect different endpoint shapes
+//! (`http://collector:4318/v1/traces` versus `http://collector:4317`), so
+//! switching features means updating `observability.otlp_endpoint` too.
 
 use anyhow::Context;
 use opentelemetry::global;
@@ -88,9 +94,10 @@ impl Telemetry {
 ///
 /// Log filtering uses `RUST_LOG` syntax; when the environment variable is
 /// unset, `verbose` selects between `debug` and `info` levels. When
-/// `otlp_endpoint` is `Some`, spans are exported via OTLP/gRPC and the W3C
+/// `otlp_endpoint` is `Some`, spans are exported over OTLP and the W3C
 /// Trace Context propagator is registered globally; request metrics are
-/// exported through a second OTLP/gRPC pipeline on the same endpoint.
+/// exported through a second OTLP pipeline on the same endpoint, over the
+/// same transport (HTTP/protobuf by default, gRPC with `otlp-grpc`).
 pub fn init(
     verbose: bool,
     service_name: &str,

@@ -1,11 +1,12 @@
 //! Per-user filtered replicas on stable `OxKvStore` prefixes.
 //!
 //! The master [`FsStore`] remains the sole write path. Each user owns one
-//! replica prefix (`{db_prefix}/u/{sub}/`) holding their filtered file set.
-//! Builds filter into a RAM scratch store, diff against the live replica,
-//! and commit the diff plus the coverage marker in ONE transaction: crash
-//! before commit leaves the old state untouched (oxkv replays only listed
-//! WALs on open), and an empty diff commits nothing at all.
+//! replica prefix (`{db_prefix}/u/{sha256-hex(sub)}/`) holding their
+//! filtered file set. Builds filter into a RAM scratch store, diff against
+//! the live replica, and commit the diff plus the coverage marker in ONE
+//! transaction: crash before commit leaves the old state untouched (oxkv
+//! replays only listed WALs on open), and an empty diff commits nothing at
+//! all.
 //!
 //! The `sync:applied` sentinel inside the prefix tracks WAL coverage, so no
 //! sidecar pointer object exists. Small deltas replay with idempotent
@@ -180,7 +181,7 @@ impl SnapshotManager {
     /// Ops apply in order with visibility re-checked against current master
     /// state, then the coverage marker advances: re-applying converges, so a
     /// crash between ops heals on the next poll. Legacy policy marks (object
-    /// only) and ranges over [`MAX_REPLAY_OPS`] entries fall back to a full
+    /// only) and ranges over `MAX_REPLAY_OPS` entries fall back to a full
     /// recalc via `Err`; rich rule/group ops resync only the affected
     /// user/row (irrelevant users/objects skip, oversized fan-out falls
     /// back via `Err`).
@@ -214,6 +215,14 @@ impl SnapshotManager {
     }
 
     /// Opens the replica writer (acquires/takes over the prefix epoch).
+    ///
+    /// A fresh handle is taken per build/replay rather than cached for the
+    /// manager's lifetime: replicas are read-mostly and idle long enough
+    /// for a cached writer to sit on a stale epoch, and `build_lock`
+    /// serializes open→write→commit so two handles on one prefix are never
+    /// live at the same time (the `db::build_s3_store` contract holds for
+    /// every *concurrent* writer; it is a new session per *sequential*
+    /// build, exactly like the `policy export` CLI).
     async fn open_writer(&self, sub: &str) -> Result<oxkv::OxKvStore, FsError> {
         oxkv::OxKvStore::builder()
             .with_object_store(self.object_store.clone())
@@ -225,6 +234,10 @@ impl SnapshotManager {
     }
 
     /// Opens a read-only follower over the replica (no ownership taken).
+    ///
+    /// Followers never take an epoch, so they cannot fence the writer; the
+    /// shared SST cache keeps repeated opens from re-downloading hot
+    /// segments.
     async fn open_reader(&self, sub: &str) -> Result<OxKvReader, FsError> {
         let base: std::sync::Arc<dyn object_store::ObjectStore> = self.object_store.clone();
         let storage: std::sync::Arc<dyn oxkv::Storage> = std::sync::Arc::new(base);

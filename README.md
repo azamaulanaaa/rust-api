@@ -8,7 +8,7 @@ The crate is intentionally business-logic free: applications compose `ApiModule`
 
 - **OIDC authentication** — authorization-code flow with PKCE, CSRF state, and nonce validation against any spec-compliant identity provider (Keycloak, Entra ID, Auth0, …)
 - **JWT validation via JWKS** — refreshable multi-algorithm key store with rotation support; unknown `kid` triggers a debounced re-fetch of the provider's keys
-- **Casbin RBAC on OxKV OxKvStore** — permission rules and group membership backed by a prefix-scoped [`oxkv::OxKvStore`](https://docs.rs/oxkv) (`{prefix}/policy` inside the configured S3 bucket via `object_store::aws::AmazonS3`); one `OxKvStore` per domain sharing a single `AmazonS3Builder` setup (`db.rs`); no local Redb file required
+- **Casbin RBAC on OxKV stores** — permission rules and group membership backed by a prefix-scoped [`oxkv::OxKvStore`](https://docs.rs/oxkv) (`{prefix}/policy` inside the configured S3 bucket via `object_store::aws::AmazonS3`); one `OxKvStore` per domain sharing a single `AmazonS3Builder` setup (`db.rs`); no local Redb file required
 - **Validated persistence** — every rule write is validated through `policy::adapter::encode_rule` / `PolicyRuleValidator` (`{sec}:{ptype}:{hash}` key shape, JSON array value, arity 3 for `p` / 2 for `g`) before any transaction opens; malformed rules fail at the API boundary instead of poisoning startup
 - **Single-live-handle-per-prefix** — each `OxKvStore` owns a fencing session (memtable/WAL buffer); two live handles on the same prefix can fence/diverge on real S3 — share via `Arc` instead of building a second one (`db::build_s3_store` docs); tests use `InMemory`-backed `OxKvStore` with `skip_probe(true)` and `build_test_store_new_session` for single-threaded reopen
 - **Modular row-level authorization** — business rows authorize as `{type}:{id}` objects via `policy::row::RowAuthorizer`; files delegate to owning rows instead of a coarse `fs` gate
@@ -73,7 +73,7 @@ src/
 ├── main.rs              binary entry point: config → telemetry → OIDC/policy/fs/sync wiring → listener
 ├── lib.rs               crate root and documentation
 ├── config.rs            TOML configuration model ([database].prefix + mirror_master, [s3], [observability], [capability], [http].allowed_origins + RUST_API_ALLOWED_ORIGINS; binary-private `mod config`)
-├── db.rs                OxKV OxKvStore factory — one AmazonS3Builder for file bytes + OxKvStore; build_s3_store / build_test_store / build_test_store_new_session / build_scratch_store; single-live-handle-per-prefix contract
+├── db.rs                OxKV store factory — one AmazonS3Builder for file bytes + OxKvStore; build_s3_store / build_test_store / build_test_store_new_session / build_scratch_store; single-live-handle-per-prefix contract
 ├── telemetry.rs         tracing subscriber + OTLP span/metric export bootstrap (otlp-grpc / otlp-http features)
 ├── docs.rs              utoipa OpenAPI `ApiDoc` (all routes; served via http/docs.rs as /openapi.json + /swagger-ui/)
 ├── http/                HTTP scaffolding shared by all modules

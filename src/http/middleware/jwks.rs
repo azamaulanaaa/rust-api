@@ -48,11 +48,11 @@ pub struct SigningKey {
 
 /// Refreshable JWKS-backed signing key store.
 ///
-/// Keys are loaded once on construction and served from cache afterwards.
-/// When a token references an unknown `kid` (typically right after the
-/// provider rotated its signing keys), the JWKS document is refetched —
-/// debounced by [`JWKS_REFRESH_DEBOUNCE`] so repeated misses cannot be used
-/// to flood the provider.
+/// One cache per process, shared by every `JwtClaimsMiddleware` clone
+/// (clones share the `Arc` state, so one provider fetch serves all
+/// workers). On an unknown-`kid` miss the document is refetched at most
+/// once per `JWKS_REFRESH_DEBOUNCE`, and a fetch that fails or returns
+/// no usable keys keeps the previous set rather than dropping it.
 #[derive(Clone)]
 pub struct JwksKeys {
     inner: Arc<JwksKeysInner>,

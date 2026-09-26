@@ -75,7 +75,8 @@ where
 /// API module exposing the authenticated session probe.
 ///
 /// Split from [`OidcApiModule`] (which is generic over the claims type `C`)
-/// so `/auth/me` always serves the concrete [`Claims`] shape the SPA
+/// so `/auth/me` always serves the concrete
+/// [`Claims`](crate::http::middleware::jwt::Claims) shape the SPA
 /// codegen depends on, regardless of how the host app types its own claims.
 pub struct OidcSessionModule {
     jwt: middleware::jwt::JwtClaimsMiddleware<middleware::jwt::Claims>,

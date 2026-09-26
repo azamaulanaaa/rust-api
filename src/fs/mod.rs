@@ -640,7 +640,6 @@ impl FsEngine {
             file_id: file_id.to_string(),
         })
         .await?;
-        // clean refs key if orphan
         Ok(())
     }
 
