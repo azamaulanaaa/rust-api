@@ -163,15 +163,7 @@ mod tests {
     use bytes::Bytes;
 
     async fn make_engine() -> FsEngine {
-        use crate::db::build_test_store;
-        let prefix = {
-            use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-            format!(
-                "test-gc-{}-{}",
-                std::process::id(),
-                URL_SAFE_NO_PAD.encode(rand::random::<[u8; 6]>())
-            )
-        };
+        let prefix = crate::db::test_prefix("gc");
         let store = FsStore::new(build_test_store(&prefix).await);
         let policy_store = build_test_store(&format!("{prefix}-policy")).await;
         let policy = PolicyEngine::init_s3(policy_store).await.unwrap();
@@ -292,11 +284,7 @@ mod tests {
     async fn sweep_logs_orphan_deletes_to_wal() -> anyhow::Result<()> {
         use crate::sync::wal::{Wal, WalOp};
 
-        let wal_prefix = format!("test-gc-wal-{}-{}", std::process::id(), {
-            use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-            URL_SAFE_NO_PAD.encode(rand::random::<[u8; 6]>())
-        });
-        let wal = Wal::new(build_test_store(&wal_prefix).await);
+        let wal = Wal::new(build_test_store(&crate::db::test_prefix("gc-wal")).await);
         let engine = make_engine().await.with_wal(wal.clone());
         let old = FileRecord {
             id: "gc-wal-file".into(),
@@ -450,14 +438,7 @@ mod tests {
             ],
             deleted: std::sync::Mutex::new(Vec::new()),
         });
-        let orphan_prefix = {
-            use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-            format!(
-                "test-gc-orphan-{}-{}",
-                std::process::id(),
-                URL_SAFE_NO_PAD.encode(rand::random::<[u8; 6]>())
-            )
-        };
+        let orphan_prefix = crate::db::test_prefix("gc-orphan");
         let store = FsStore::new(build_test_store(&orphan_prefix).await);
         let policy =
             PolicyEngine::init_s3(build_test_store(&format!("{orphan_prefix}-p")).await).await?;
@@ -483,14 +464,7 @@ mod tests {
         // buckets outlive process restarts, so the backend upload id
         // stays addressable while the pre-restart RAM map is gone).
         let inner = std::sync::Arc::new(InMemory::new());
-        let prefix = {
-            use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-            format!(
-                "test-gc-restart-{}-{}",
-                std::process::id(),
-                URL_SAFE_NO_PAD.encode(rand::random::<[u8; 6]>())
-            )
-        };
+        let prefix = crate::db::test_prefix("gc-restart");
         let store = FsStore::new(build_test_store(&prefix).await);
         let policy =
             PolicyEngine::init_s3(build_test_store(&format!("{prefix}-policy")).await).await?;
@@ -608,14 +582,7 @@ mod tests {
                 Ok(Vec::new())
             }
         }
-        let fail_prefix = {
-            use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-            format!(
-                "test-gc-fail-{}-{}",
-                std::process::id(),
-                URL_SAFE_NO_PAD.encode(rand::random::<[u8; 6]>())
-            )
-        };
+        let fail_prefix = crate::db::test_prefix("gc-fail");
         let store = FsStore::new(build_test_store(&fail_prefix).await);
         let policy =
             PolicyEngine::init_s3(build_test_store(&format!("{fail_prefix}-p")).await).await?;

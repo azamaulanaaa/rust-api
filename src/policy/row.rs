@@ -96,11 +96,7 @@ mod tests {
 
     #[tokio::test]
     async fn authorize_row_via_policy() {
-        let prefix = format!("test-row-{}-{}", std::process::id(), {
-            use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-            URL_SAFE_NO_PAD.encode(rand::random::<[u8; 6]>())
-        });
-        let s3 = crate::db::build_test_store(&prefix).await;
+        let s3 = crate::db::build_test_store(&crate::db::test_prefix("row")).await;
         let engine = PolicyEngine::init_s3(s3).await.unwrap();
         engine
             .assign_group("alice".into(), "editors".into())

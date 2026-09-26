@@ -420,7 +420,6 @@ async fn delete_group(
 mod tests {
     use super::*;
     use actix_web::{App, http};
-    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
     use jsonwebtoken::EncodingKey;
     use serde_json::json;
 
@@ -452,11 +451,7 @@ mod tests {
         let (key, enc) = rsa_key(KID)?;
         let jwks = json!({"keys": [key]});
         let server = spawn_jwks(jwks).await;
-        let prefix = format!(
-            "test-policy-route-{}-{}",
-            std::process::id(),
-            URL_SAFE_NO_PAD.encode(rand::random::<[u8; 8]>())
-        );
+        let prefix = crate::db::test_prefix("policy-route");
         let s3 = crate::db::build_test_store(&prefix).await;
         let engine = PolicyEngine::init_s3(s3).await?;
         if grant_alice {

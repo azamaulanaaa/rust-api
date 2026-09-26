@@ -250,15 +250,7 @@ mod tests {
     use crate::db::build_test_store;
 
     async fn test_wal() -> Wal {
-        let prefix = {
-            use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-            format!(
-                "test-wal-{}-{}",
-                std::process::id(),
-                URL_SAFE_NO_PAD.encode(rand::random::<[u8; 6]>())
-            )
-        };
-        let s3 = build_test_store(&prefix).await;
+        let s3 = build_test_store(&crate::db::test_prefix("wal")).await;
         Wal::new(s3)
     }
 

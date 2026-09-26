@@ -554,8 +554,7 @@ mod tests {
     use super::*;
 
     async fn engine() -> PolicyEngine {
-        let prefix = format!("test-policy-mod-{}-{}", std::process::id(), uuid_like());
-        let s3 = crate::db::build_test_store(&prefix).await;
+        let s3 = crate::db::build_test_store(&crate::db::test_prefix("policy")).await;
         PolicyEngine::init_s3(s3).await.unwrap()
     }
 
@@ -574,11 +573,6 @@ mod tests {
                 "expected lowercase start, got {rendered:?}"
             );
         }
-    }
-
-    fn uuid_like() -> String {
-        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-        URL_SAFE_NO_PAD.encode(rand::random::<[u8; 8]>())
     }
 
     #[tokio::test]
@@ -724,7 +718,7 @@ mod tests {
     async fn mutations_append_to_wal() {
         use crate::sync::wal::{Wal, WalOp};
 
-        let prefix = format!("test-policy-wal-{}-{}", std::process::id(), uuid_like());
+        let prefix = crate::db::test_prefix("policy-wal");
         let wal = Wal::new(crate::db::build_test_store(&prefix).await);
         let engine = engine().await.with_wal(wal.clone());
 

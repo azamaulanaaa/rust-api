@@ -368,21 +368,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::policy::RBAC_MODEL;
     use casbin::{CoreApi, DefaultModel, Enforcer, MgmtApi};
     use oxkv::BTreeStore;
-
-    const MODEL: &str = r#"
-        [request_definition]
-        r = sub, obj, act
-        [policy_definition]
-        p = sub, obj, act
-        [role_definition]
-        g = _, _
-        [policy_effect]
-        e = some(where (p.eft == allow))
-        [matchers]
-        m = g(r.sub, p.sub) && r.obj == p.obj && r.act == p.act
-    "#;
 
     #[tokio::test]
     async fn persists_rules_across_reopen() {
@@ -400,7 +388,7 @@ mod tests {
                 .await
                 .unwrap()
         };
-        let model = DefaultModel::from_str(MODEL).await.unwrap();
+        let model = DefaultModel::from_str(RBAC_MODEL).await.unwrap();
 
         {
             let adapter = OxkvAdapter::new(
@@ -424,7 +412,7 @@ mod tests {
         }
 
         {
-            let model = DefaultModel::from_str(MODEL).await.unwrap();
+            let model = DefaultModel::from_str(RBAC_MODEL).await.unwrap();
             let adapter = OxkvAdapter::new(
                 oxkv::HookStore::new(open(backend.clone()).await)
                     .with_validator(PolicyRuleValidator),
@@ -529,7 +517,7 @@ mod tests {
     async fn adapter_validates_writes_on_oxkv_store() {
         // The adapter enforces PolicyRuleValidator itself (see encode_rule),
         // so validation holds on the LSM backend without a HookStore wrap.
-        let s3 = crate::db::build_test_store("adapter-s3-validate").await;
+        let s3 = crate::db::build_test_store(&crate::db::test_prefix("adapter-validate")).await;
         let mut adapter = OxkvAdapter::new(s3);
 
         // Wrong arity rejected without touching the store.

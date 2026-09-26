@@ -87,7 +87,6 @@ async fn claim_admin(
 #[cfg(test)]
 mod tests {
     use actix_web::{App, http, test};
-    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
     use jsonwebtoken::EncodingKey;
     use serde_json::json;
 
@@ -110,7 +109,7 @@ mod tests {
         let jwks = json!({ "keys": [key] });
         let server = spawn_jwks(jwks).await;
 
-        let store_prefix = format!("rust-api-setup-test-{}-{}", std::process::id(), uuid_like());
+        let store_prefix = crate::db::test_prefix("setup");
         let shared_store = std::sync::Arc::new(object_store::memory::InMemory::new())
             as std::sync::Arc<dyn object_store::ObjectStore>;
         let s3 = crate::db::build_test_store_new_session(shared_store.clone(), &store_prefix).await;
@@ -122,11 +121,6 @@ mod tests {
             shared_store,
             engine,
         })
-    }
-
-    /// Suffix unique enough for parallel test processes on one machine.
-    fn uuid_like() -> String {
-        URL_SAFE_NO_PAD.encode(rand::random::<[u8; 8]>())
     }
 
     impl Fixture {

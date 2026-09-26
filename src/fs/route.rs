@@ -327,8 +327,6 @@ mod tests {
     use super::*;
 
     use actix_web::{App, http, test};
-    use base64::Engine as _;
-    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use jsonwebtoken::EncodingKey;
     use serde_json::json;
 
@@ -362,11 +360,7 @@ mod tests {
         let (key, enc) = rsa_key(KID)?;
         let jwks = json!({"keys": [key]});
         let server = spawn_jwks(jwks).await;
-        let policy_prefix = format!(
-            "fs-route-policy-{}-{}",
-            std::process::id(),
-            URL_SAFE_NO_PAD.encode(rand::random::<[u8; 8]>())
-        );
+        let policy_prefix = crate::db::test_prefix("fs-route-policy");
         let policy_store = build_test_store(&policy_prefix).await;
         let policy = PolicyEngine::init_s3(policy_store).await?;
         if grant_alice {
@@ -383,11 +377,7 @@ mod tests {
                 .add_rule("writers".into(), "fs".into(), Action::Delete)
                 .await?;
         }
-        let fs_prefix = format!(
-            "fs-route-store-{}-{}",
-            std::process::id(),
-            URL_SAFE_NO_PAD.encode(rand::random::<[u8; 8]>())
-        );
+        let fs_prefix = crate::db::test_prefix("fs-route-store");
         let store = FsStore::new(build_test_store(&fs_prefix).await);
         let s3 = ObjectStoreClient::in_memory();
         let engine = FsEngine::from_parts(store, s3, "test-bucket".into(), policy);

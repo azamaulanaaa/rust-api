@@ -55,6 +55,24 @@ pub fn default_sst_cache() -> LruCache<String, Arc<SstFile>> {
     })
 }
 
+/// Builds a collision-resistant OxKV prefix for one test.
+///
+/// `name` identifies the test or fixture (e.g. `"fs-store"`). The pid and
+/// a random suffix are appended so tests never share a prefix -- not
+/// within one binary (they run in parallel), not across concurrent `cargo
+/// test` invocations, and not with a stray object left in a real bucket.
+/// Use it with the `build_test_store*` family rather than a fixed string:
+/// a shared prefix silently fences another test's session via oxkv epoch
+/// takeover, which fails intermittently and only under load.
+pub fn test_prefix(name: &str) -> String {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    format!(
+        "{name}-{}-{}",
+        std::process::id(),
+        URL_SAFE_NO_PAD.encode(rand::random::<[u8; 8]>())
+    )
+}
+
 /// Builds an in-memory [`OxKvStore`] for tests (uses `skip_probe(true)` so
 /// `InMemory`'s missing conditional-write probe does not fail). Each prefix gets a
 /// fresh `InMemory` so tests are isolated; for reopening the same prefix
@@ -114,7 +132,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_roundtrip() -> anyhow::Result<()> {
-        let store = build_test_store("test-oxkv").await;
+        let store = build_test_store(&test_prefix("db-test")).await;
         use oxkv::{GetSet, Store as OxStore, Transaction as _};
         let s = store;
         s.set_bytes("hello", b"world").await?;

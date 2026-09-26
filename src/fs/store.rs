@@ -406,11 +406,11 @@ impl FsStore {
     /// Lists rows referencing a file (scan bounded to `fs:rel:`).
     pub async fn rows_for_file(&self, file_id: &str) -> Result<Vec<(String, String)>, FsError> {
         let suffix = format!(":{file_id}");
-        let kvs = self.scan_prefix(crate::fs::relation::REL_PREFIX).await?;
+        let kvs = self.scan_prefix(REL_PREFIX).await?;
         let mut out = Vec::new();
         for kv in kvs {
-            if kv.key.starts_with(crate::fs::relation::REL_PREFIX) && kv.key.ends_with(&suffix) {
-                let rest = &kv.key[crate::fs::relation::REL_PREFIX.len()..];
+            if kv.key.starts_with(REL_PREFIX) && kv.key.ends_with(&suffix) {
+                let rest = &kv.key[REL_PREFIX.len()..];
                 if let Some((ty, rem)) = rest.split_once(':')
                     && let Some((rid, _)) = rem.split_once(':')
                 {
@@ -480,7 +480,6 @@ impl FsStore {
     ///
     /// The caller owns filtering: everything present is returned as-is.
     pub(crate) async fn dump_kvs(&self) -> Result<Vec<(String, Vec<u8>)>, FsError> {
-        use oxkv::Direction;
         let g = self.inner.read().await;
         let kvs = g
             .gets_bytes(None, Direction::Next, (None, None))
@@ -519,20 +518,12 @@ fn prefix_scan_end(prefix: &str) -> String {
 }
 
 #[cfg(test)]
-mod store_tests {
+mod tests {
     use super::{FileRecord, FsStore, PersistedMultipart, UploadSession};
     use crate::db::build_test_store;
 
     async fn test_store() -> FsStore {
-        let prefix = {
-            use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-            format!(
-                "test-fs-{}-{}",
-                std::process::id(),
-                URL_SAFE_NO_PAD.encode(rand::random::<[u8; 6]>())
-            )
-        };
-        let s3 = build_test_store(&prefix).await;
+        let s3 = build_test_store(&crate::db::test_prefix("fs-store")).await;
         FsStore::new(s3)
     }
 
@@ -751,11 +742,6 @@ mod store_tests {
         assert!(store.get_staged_part("ghost", 0).await?.is_none());
         Ok(())
     }
-}
-
-#[cfg(test)]
-mod key_tests {
-    use super::FsStore;
 
     #[test]
     fn keys_are_namespaced_and_distinct() {
