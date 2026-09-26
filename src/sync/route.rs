@@ -12,13 +12,13 @@
 
 use actix_web::{
     HttpRequest, HttpResponse, get,
-    http::header::{CACHE_CONTROL, CONTENT_TYPE, ETAG, IF_NONE_MATCH},
+    http::header::{CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, ETAG, IF_NONE_MATCH},
     post, web,
 };
 
 use crate::fs::error::FsError;
 use crate::http::{
-    ApiModule,
+    ApiModule, logged_body,
     middleware::jwt::{Claims, JwtClaimsMiddleware, Validated},
 };
 use crate::sync::snapshot::SnapshotManager;
@@ -237,8 +237,33 @@ async fn object_handler(
         }
     };
 
+    // Read the head off `out` before `into_stream` consumes it.
+    let etag = out.meta.e_tag.clone();
+    let size = out.range.end.saturating_sub(out.range.start);
+    object_response(out, &tail, etag, size)
+}
+
+/// The `200` response for one replica object, streaming `out`.
+///
+/// Split out from [`object_handler`] so the streaming property is testable:
+/// the caller has to hand over a [`GetResult`] it has not read yet, and the
+/// only way to build the response is to consume it as a stream.
+///
+/// A replica prefix holds oxkv's own files, and an SST segment is sized for
+/// compaction throughput rather than for a browser -- tens to hundreds of
+/// megabytes. Collecting it would put that segment in resident memory once
+/// per in-flight request, on every worker, for a payload the client is
+/// going to buffer anyway. `Content-Length` is taken from the range
+/// `object_store` already resolved, so clients still see the size up front
+/// and the immutability caching still behaves.
+fn object_response(
+    out: object_store::GetResult,
+    tail: &str,
+    etag: Option<String>,
+    size: u64,
+) -> Result<HttpResponse, FsError> {
     let mut resp = HttpResponse::Ok();
-    if let Some(ref etag) = out.meta.e_tag {
+    if let Some(ref etag) = etag {
         resp.insert_header((ETAG, etag.as_str()));
     }
     if tail == "manifest.json" {
@@ -248,11 +273,9 @@ async fn object_handler(
         resp.insert_header((CACHE_CONTROL, "public, max-age=31536000, immutable"));
         resp.insert_header((CONTENT_TYPE, "application/octet-stream"));
     }
-    let bytes = out
-        .bytes()
-        .await
-        .map_err(|e| FsError::Internal(e.to_string()))?;
-    Ok(resp.body(bytes))
+    Ok(resp
+        .insert_header((CONTENT_LENGTH, size))
+        .streaming(logged_body(out.into_stream())))
 }
 
 #[cfg(test)]
@@ -337,6 +360,90 @@ mod tests {
             &fx.issuer(),
         )
         .await
+    }
+
+    /// The replica object response is built without reading the body.
+    ///
+    /// This is the guard for the memory property, and it works because
+    /// [`object_response`] takes a `GetResult` it has not touched. The
+    /// stream handed in yields one chunk and then fails: an implementation
+    /// that collected the body would read past that failure, surface it as
+    /// a handler error instead of a `200`, and record a poll. So a revert
+    /// to `out.bytes()` fails fast here rather than quietly passing.
+    ///
+    /// Resident memory is not directly observable from a unit test. What is
+    /// observable -- and what keeps a 256 MB SST out of the heap once per
+    /// in-flight request -- is that not one byte of the segment is read
+    /// before the response exists.
+    #[test]
+    fn object_response_does_not_read_the_body() {
+        use object_store::{GetResult, GetResultPayload, ObjectMeta};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const SEGMENT: u64 = 256 * 1024 * 1024;
+
+        let polls = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&polls);
+        let payload =
+            GetResultPayload::Stream(Box::pin(futures_util::stream::unfold(0u8, move |step| {
+                let seen = Arc::clone(&seen);
+                async move {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    Some((
+                        match step {
+                            // One good chunk...
+                            0 => Ok(bytes::Bytes::from_static(b"partial")),
+                            // ...then a mid-stream failure that a collecting
+                            // implementation cannot avoid running into.
+                            _ => Err(object_store::Error::NotFound {
+                                path: "seg-0001.sst".into(),
+                                source: "stream aborted".into(),
+                            }),
+                        },
+                        step + 1,
+                    ))
+                }
+            })));
+
+        let out = GetResult {
+            payload,
+            meta: ObjectMeta {
+                location: "seg-0001.sst".into(),
+                last_modified: chrono::Utc::now(),
+                size: SEGMENT,
+                e_tag: Some("\"v1\"".into()),
+                version: None,
+            },
+            range: 0..SEGMENT,
+            attributes: object_store::Attributes::new(),
+        };
+
+        let resp = object_response(out, "seg-0001.sst", Some("\"v1\"".into()), SEGMENT)
+            .expect("building the response must not read the body");
+
+        assert_eq!(
+            polls.load(Ordering::SeqCst),
+            0,
+            "the body was read before the response existed"
+        );
+        assert_eq!(
+            resp.headers()
+                .get(CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok()),
+            Some(SEGMENT.to_string().as_str()),
+            "a streamed body must declare its length up front"
+        );
+        assert_eq!(
+            resp.headers().get(ETAG).and_then(|v| v.to_str().ok()),
+            Some("\"v1\"")
+        );
+        assert_eq!(
+            resp.headers()
+                .get(CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("public, max-age=31536000, immutable")
+        );
     }
 
     #[test]
@@ -574,6 +681,16 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("application/json")
         );
+        // The body is streamed, so its length has to be declared up front.
+        // A chunked response would still be correct for a client, but
+        // `manifest.json` is what a client polls to discover what changed,
+        // and a known length is what lets it fail fast on a truncated read.
+        let declared = res
+            .headers()
+            .get(actix_web::http::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<usize>().ok())
+            .expect("streamed replica objects must declare Content-Length");
         // InMemory supplies ETags, so the conditional roundtrip below runs.
         let etag = res
             .headers()
@@ -581,6 +698,14 @@ mod tests {
             .and_then(|v| v.to_str().ok())
             .map(str::to_string)
             .expect("object responses must carry an ETag");
+        let body = actix_web::test::read_body(res).await;
+        assert_eq!(
+            body.len(),
+            declared,
+            "declared length must match the bytes actually streamed"
+        );
+        serde_json::from_slice::<serde_json::Value>(&body)
+            .expect("streamed manifest is still valid JSON");
         {
             let res = actix_web::test::call_service(
                 &app,

@@ -56,6 +56,29 @@ where
         .app_data(web::JsonConfig::default().limit(MAX_JSON_BYTES))
 }
 
+/// Logs a mid-stream response body failure server-side.
+///
+/// By the time a body chunk fails, the response head is already on the
+/// wire and the status cannot be changed: the client sees a truncated
+/// body and nothing else. This is the only place the operator finds out
+/// why, so every streaming body should pass through it.
+///
+/// Generic over the error type because the two streaming sources report
+/// different ones -- [`FsError`](crate::fs::error::FsError) for file
+/// downloads, `object_store::Error` for raw replica objects -- and neither
+/// should be translated just to be logged.
+pub fn logged_body<S, E>(stream: S) -> impl futures_util::Stream<Item = Result<bytes::Bytes, E>>
+where
+    S: futures_util::Stream<Item = Result<bytes::Bytes, E>>,
+    E: std::fmt::Debug,
+{
+    use futures_util::TryStreamExt as _;
+    stream.map_err(|e| {
+        tracing::warn!("response body stream failed: {e:?}");
+        e
+    })
+}
+
 /// Registers the built-in probe routes shared by every deployment.
 pub fn health_routes(cfg: &mut web::ServiceConfig) {
     cfg.service(health::health);

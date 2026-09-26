@@ -67,7 +67,7 @@ A fresh deployment boots with an empty policy store, so nobody can pass the self
 
 ### Browser clients (SPA/PWA)
 
-Cross-origin SPAs set `[http].allowed_origins` (or `RUST_API_ALLOWED_ORIGINS`) to their origin(s); credentials are always allowed. Auth flow: `GET /auth/login` → provider → `/auth/callback` (sets the `auth_token` cookie and returns the token) → `GET /auth/me` as the guard/session probe → `POST /auth/logout` to clear the cookie. Poll `GET /sync/status` (coverage `ETag`, `304` on repeat) and advance with `POST /sync/sync`, then read replica objects via `GET /sync/db/{object}` (`manifest.json` is `no-cache`, segments are immutable). Generate the client from `/openapi.json` — it covers every route.
+Cross-origin SPAs set `[http].allowed_origins` (or `RUST_API_ALLOWED_ORIGINS`) to their origin(s); credentials are always allowed. Auth flow: `GET /auth/login` → provider → `/auth/callback` (sets the `auth_token` cookie and returns the token) → `GET /auth/me` as the guard/session probe → `POST /auth/logout` to clear the cookie. Poll `GET /sync/status` (coverage `ETag`, `304` on repeat) and advance with `POST /sync/sync`, then read replica objects via `GET /sync/db/{object}` (`manifest.json` is `no-cache`, segments are immutable). Replica objects are streamed with a declared `Content-Length` rather than buffered, so a multi-hundred-megabyte SST segment does not have to fit in the heap once per in-flight request. Generate the client from `/openapi.json` — it covers every route.
 
 ## Architecture
 
