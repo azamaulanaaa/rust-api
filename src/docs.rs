@@ -71,6 +71,10 @@ mod tests {
     /// Guards the PWA contract: every served route the SPA codegen depends
     /// on must appear in the spec, so drift breaks this test instead of the
     /// frontend at runtime.
+    ///
+    /// The list is exhaustive by hand: it must be updated whenever a route
+    /// is added to a module's `configure`, not only when a new
+    /// `utoipa::path` handler is written.
     #[test]
     fn spec_covers_all_served_routes() {
         let spec: Value =
@@ -89,6 +93,8 @@ mod tests {
             "/fs/uploads/{id}/parts/{idx}",
             "/fs/uploads/{id}/complete",
             "/fs/uploads/{id}",
+            "/fs/files/{id}/meta",
+            "/fs/files/{id}",
             "/policy/rules",
             "/policy/groups",
             "/policy/groups/{user_id}",
