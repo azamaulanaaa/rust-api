@@ -19,18 +19,20 @@ use tokio::sync::RwLock;
 
 use crate::sync::wal::{Wal, WalOp};
 
-/// HTTP routes for managing policy rules and group membership.
-pub mod route;
-pub mod setup;
-
 /// Casbin storage adapter persisting policies to an embedded oxkv store.
 pub mod adapter;
 
 /// JSON export/import of policy data for backups and migrations.
 pub mod admin;
 
+/// HTTP routes for managing policy rules and group membership.
+pub mod route;
+
 /// Modular row-level authorization.
 pub mod row;
+
+/// One-time bootstrap route claiming the built-in superadmin role.
+pub mod setup;
 
 /// The operation a policy rule grants on an object.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
@@ -192,9 +194,7 @@ impl PolicyEngine {
         }
         Ok(())
     }
-}
 
-impl PolicyEngine {
     /// Returns all granular permissions (p-rules)
     pub async fn get_all_rules(&self) -> Vec<Vec<String>> {
         let ef = self.enforcer.read().await;
