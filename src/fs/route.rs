@@ -8,9 +8,8 @@ use futures_util::TryStreamExt as _;
 use crate::fs::FsEngine;
 use crate::fs::error::FsError;
 use crate::fs::model::{CompleteRequest, InitRequest, InitResponse};
-use crate::fs::s3::ByteStream;
-use crate::http::ApiModule;
 use crate::http::middleware::jwt::{Claims, JwtClaimsMiddleware, Validated};
+use crate::http::{ApiModule, logged_body};
 
 /// API module exposing `/fs` routes, protected by JWT validation.
 pub struct FsApiModule {
@@ -176,7 +175,7 @@ async fn get_file(
                 ))
                 .insert_header((ACCEPT_RANGES, "bytes"))
                 .insert_header((CONTENT_LENGTH, obj.size))
-                .streaming(logged_stream(obj.stream)))
+                .streaming(logged_body(obj.stream)))
         }
         RangeOutcome::Ranged(r) => {
             let (rec, obj) = engine
@@ -197,7 +196,7 @@ async fn get_file(
                     CONTENT_RANGE,
                     format!("bytes {}-{}/{}", r.start, end, meta.size),
                 ))
-                .streaming(logged_stream(obj.stream)))
+                .streaming(logged_body(obj.stream)))
         }
         RangeOutcome::Unsatisfiable => Ok(HttpResponse::build(
             actix_web::http::StatusCode::RANGE_NOT_SATISFIABLE,
@@ -205,17 +204,6 @@ async fn get_file(
         .insert_header((CONTENT_RANGE, format!("bytes */{}", meta.size)))
         .finish()),
     }
-}
-
-/// Logs mid-stream download failures server-side (headers are already
-/// sent by then, so the client just sees a truncated body).
-fn logged_stream(
-    stream: ByteStream,
-) -> impl futures_util::Stream<Item = Result<bytes::Bytes, FsError>> {
-    stream.map_err(|e| {
-        tracing::warn!("file download stream failed: {e:?}");
-        e
-    })
 }
 
 /// A satisfiable single byte range (inclusive end).
