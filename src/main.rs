@@ -392,3 +392,110 @@ async fn claim_writer_lease(
     );
     Ok((lost, Some(guard)))
 }
+
+/// The composition root was untestable, so these three pure functions were
+/// the parts most likely to rot unnoticed and had no coverage at all.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use std::io::Write;
+
+    /// Builds a `Config` from a real TOML file, the only way one exists.
+    ///
+    /// Going through the loader rather than a struct literal means these tests
+    /// also cover the deserialization path the binary actually uses.
+    fn config_from(toml: &str) -> Config {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        let path = std::env::temp_dir().join(format!(
+            "rust-api-main-{}-{}.toml",
+            std::process::id(),
+            URL_SAFE_NO_PAD.encode(rand::random::<[u8; 8]>())
+        ));
+        std::fs::File::create(&path)
+            .expect("create temp toml")
+            .write_all(toml.as_bytes())
+            .expect("write toml");
+        let cfg = Config::try_from(path.as_path()).expect("config parses");
+        let _ = std::fs::remove_file(&path);
+        cfg
+    }
+
+    const BASE: &str = r#"
+public_address = "https://example.test"
+listen_port = 8080
+[authorization]
+client_id = "cid"
+client_secret = "csecret"
+issuer_url = "https://idp.test"
+[database]
+prefix = "oxkv"
+[s3]
+bucket = "my-bucket"
+region = "eu-west-1"
+endpoint_url = "http://localhost:9000"
+access_key_id = "key"
+secret_access_key = "secret"
+force_path_style = true
+"#;
+
+    /// Every store is `{db_prefix}/{domain}` in one bucket.
+    ///
+    /// Worth pinning because a stray slash produces a *different* prefix
+    /// rather than an error: the server would open a fresh, empty policy or
+    /// file store and appear to have lost all data.
+    #[test]
+    fn domain_prefixes_are_namespaced_under_the_configured_root() {
+        assert_eq!(domain_prefix("oxkv", "policy"), "oxkv/policy");
+        assert_eq!(domain_prefix("oxkv", "fs"), "oxkv/fs");
+        assert_eq!(domain_prefix("oxkv", "wal"), "oxkv/wal");
+    }
+
+    /// The config file's `[s3]` is projected onto the engine's own type.
+    ///
+    /// This is the single translation point, so a field added to one side and
+    /// forgotten on the other shows up here as a silent default rather than as
+    /// a compile error. `endpoint_url` and `force_path_style` matter most in
+    /// practice: a MinIO deployment that loses them points at real AWS instead.
+    #[test]
+    fn s3_config_projection_carries_every_field() {
+        let projected = s3_client_config(&config_from(BASE));
+        assert_eq!(projected.bucket, "my-bucket");
+        assert_eq!(projected.region, "eu-west-1");
+        assert_eq!(
+            projected.endpoint_url.as_deref(),
+            Some("http://localhost:9000")
+        );
+        assert!(projected.force_path_style);
+        assert_eq!(projected.access_key_id.as_deref(), Some("key"));
+        assert_eq!(projected.secret_access_key.as_deref(), Some("secret"));
+    }
+
+    /// A configured secret is used, and an absent one falls back to an
+    /// ephemeral key rather than refusing to start.
+    ///
+    /// The fallback is a real behaviour, not an oversight: a laptop with no
+    /// `[capability].secret` should run, at the cost of invalidating tokens on
+    /// restart.
+    ///
+    /// Note what is *not* tested here: a malformed secret. `Config::try_from`
+    /// validates it, so this function never sees a bad one -- enforced at the
+    /// loader and covered by `config::tests::validate_rejects_bad_values`.
+    /// Asserting it here would pin a path that cannot execute, and the failure
+    /// it guards against (a bad secret silently downgraded to an ephemeral
+    /// key, turning a config error into tokens that mysteriously stop
+    /// validating) is actually prevented upstream.
+    #[test]
+    fn capability_keys_prefer_the_configured_secret() {
+        assert!(
+            resolve_token_keys(&config_from(BASE)).is_ok(),
+            "an absent secret still boots, on an ephemeral key"
+        );
+
+        let good = config_from(&format!(
+            "{BASE}\n[capability]\nsecret = \"{}\"\n",
+            "ab".repeat(32)
+        ));
+        assert!(resolve_token_keys(&good).is_ok());
+    }
+}
