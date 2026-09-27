@@ -27,12 +27,43 @@ use crate::sync::snapshot::SnapshotManager;
 pub struct SyncApiModule {
     manager: SnapshotManager,
     jwt: JwtClaimsMiddleware<Claims>,
+    /// Caps concurrent replica downloads.
+    ///
+    /// This is the control that matters for this module: `/sync/db/{object}`
+    /// can serve an oxkv SST segment, so N concurrent readers is N segments
+    /// of bandwidth and object-store egress. A request-rate limit does not
+    /// bound that, since the allowed rate can still be in flight all at once.
+    gate: crate::limits::ConcurrencyGate,
 }
 
 impl SyncApiModule {
     /// Create the module.
     pub fn new(manager: SnapshotManager, jwt: JwtClaimsMiddleware<Claims>) -> Self {
-        Self { manager, jwt }
+        Self {
+            manager,
+            jwt,
+            gate: crate::limits::ConcurrencyGate::new(0),
+        }
+    }
+
+    /// The module's download gate, for a caller that needs to reason about
+    /// the same slots -- tests, or a host app composing its own routes.
+    pub fn gate(&self) -> crate::limits::ConcurrencyGate {
+        self.gate.clone()
+    }
+
+    /// Create the module with a cap on concurrent replica downloads.
+    ///
+    /// `max_concurrent` of `0` disables the gate.
+    pub fn with_download_gate(
+        manager: SnapshotManager,
+        jwt: JwtClaimsMiddleware<Claims>,
+        max_concurrent: usize,
+    ) -> Self {
+        Self {
+            gate: crate::limits::ConcurrencyGate::new(max_concurrent),
+            ..Self::new(manager, jwt)
+        }
     }
 }
 
@@ -47,6 +78,7 @@ impl ApiModule for SyncApiModule {
         cfg.service(
             web::scope("/sync")
                 .app_data(mgr)
+                .app_data(web::Data::new(self.gate.clone()))
                 .wrap(jwt)
                 .service(status_handler)
                 .service(sync_handler)
@@ -195,6 +227,7 @@ async fn sync_handler(
 #[get("/db/{object:.*}")]
 async fn object_handler(
     manager: web::Data<SnapshotManager>,
+    gate: web::Data<crate::limits::ConcurrencyGate>,
     claims: Validated<Claims>,
     path: web::Path<String>,
     req: HttpRequest,
@@ -203,6 +236,13 @@ async fn object_handler(
 
     let tail = path.into_inner();
     let key = manager.resolve_object(&claims.sub, &tail)?;
+
+    // Taken before the object store is touched, so a refused request costs one
+    // `get` at most rather than a whole segment read.
+    let permit = gate.acquire();
+    if permit.is_none() && !gate.is_disabled() {
+        return Err(FsError::TooManyRequests);
+    }
 
     let store = manager.object_store.clone();
     let object_path = object_store::path::Path::from(key.as_str());
@@ -238,7 +278,7 @@ async fn object_handler(
     // Read the head off `out` before `into_stream` consumes it.
     let etag = out.meta.e_tag.clone();
     let size = out.range.end.saturating_sub(out.range.start);
-    object_response(out, &tail, etag, size)
+    object_response(out, &tail, etag, size, permit)
 }
 
 /// The `200` response for one replica object, streaming `out`.
@@ -259,6 +299,7 @@ fn object_response(
     tail: &str,
     etag: Option<String>,
     size: u64,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
 ) -> Result<HttpResponse, FsError> {
     let mut resp = HttpResponse::Ok();
     if let Some(ref etag) = etag {
@@ -273,7 +314,13 @@ fn object_response(
     }
     Ok(resp
         .insert_header((CONTENT_LENGTH, size))
-        .streaming(logged_body(out.into_stream())))
+        // The permit travels with the body, so the slot is held until the
+        // download finishes or the client goes away -- not merely until this
+        // handler returns.
+        .streaming(crate::limits::GatedStream::new(
+            logged_body(out.into_stream()),
+            permit,
+        )))
 }
 
 #[cfg(test)]
@@ -420,7 +467,7 @@ mod tests {
             attributes: object_store::Attributes::new(),
         };
 
-        let resp = object_response(out, "seg-0001.sst", Some("\"v1\"".into()), SEGMENT)
+        let resp = object_response(out, "seg-0001.sst", Some("\"v1\"".into()), SEGMENT, None)
             .expect("building the response must not read the body");
 
         assert_eq!(
@@ -658,6 +705,64 @@ mod tests {
             json["applied_seq"], 0,
             "coverage reported is from before the rebuild: {json}"
         );
+        Ok(())
+    }
+
+    /// The replica gateway refuses rather than reading a segment it has no
+    /// room for.
+    ///
+    /// `/sync/db/{object}` can serve an oxkv SST segment, so this is the one
+    /// place in the crate where a single request's cost is unbounded by the
+    /// request. A rate limit does not cover it: a client allowed a hundred
+    /// reads a minute can have a hundred of these in flight at once.
+    ///
+    /// The gate shares its semaphore across clones, so the test can hold the
+    /// only slot against the *real* module and then drive the real handler --
+    /// no stand-in route and no hand-built response.
+    #[actix_web::test]
+    async fn a_full_download_gate_refuses_rather_than_reading() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        let module = SyncApiModule::with_download_gate(fx.manager.clone(), setup(&fx).await?, 1);
+        let gate = module.gate();
+        let app =
+            actix_web::test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+
+        let read = || async {
+            actix_web::test::call_service(
+                &app,
+                actix_web::test::TestRequest::get()
+                    .uri("/sync/db/manifest.json")
+                    .insert_header(("Cookie", format!("auth_token={token}")))
+                    .to_request(),
+            )
+            .await
+            .status()
+        };
+
+        // A free slot serves.
+        assert_eq!(read().await, http::StatusCode::OK);
+
+        // Hold the only slot: the next read must be refused, not served.
+        let held = gate.acquire().expect("the only slot is free");
+        assert_eq!(read().await, http::StatusCode::TOO_MANY_REQUESTS);
+
+        // And the refusal is inside the uniform envelope, not actix's default.
+        let res = actix_web::test::call_service(
+            &app,
+            actix_web::test::TestRequest::get()
+                .uri("/sync/db/manifest.json")
+                .insert_header(("Cookie", format!("auth_token={token}")))
+                .to_request(),
+        )
+        .await;
+        let json: serde_json::Value =
+            serde_json::from_slice(&actix_web::test::read_body(res).await)?;
+        assert_eq!(json["error"], "too many requests", "{json}");
+
+        // Releasing the slot restores service.
+        drop(held);
+        assert_eq!(read().await, http::StatusCode::OK);
         Ok(())
     }
 

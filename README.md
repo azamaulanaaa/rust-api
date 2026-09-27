@@ -77,7 +77,8 @@ Cross-origin SPAs set `[http].allowed_origins` (or `RUST_API_ALLOWED_ORIGINS`) t
 src/
 ├── main.rs              binary entry point: config → telemetry → OIDC/policy/fs/sync wiring → listener
 ├── lib.rs               crate root and documentation
-├── config.rs            TOML configuration model ([database].prefix + mirror_master, [s3], [observability], [capability], [http].allowed_origins + RUST_API_ALLOWED_ORIGINS; binary-private `mod config`)
+├── config.rs            TOML configuration model ([database].prefix + mirror_master, [s3], [observability], [capability], [http].allowed_origins + RUST_API_ALLOWED_ORIGINS, [limits]; binary-private `mod config`)
+├── limits.rs           cost controls: per-peer token bucket + concurrency gate for /sync/db downloads
 ├── db.rs                OxKV store factory — one AmazonS3Builder for file bytes + OxKvStore; build_s3_store / build_object_store / build_scratch_store / default_sst_cache; single-live-handle-per-prefix contract (the test-only builders build_test_store* / test_prefix are `#[cfg(test)]`, not API)
 ├── lease.rs             single-writer lease on [database].prefix (startup refusal + renewal + release)
 ├── fencing.rs           process-wide latch for a fenced *primary* prefix; gates /ready alongside the lease
@@ -358,6 +359,21 @@ mise install
 
 cargo run -- serve --config config.toml
 ```
+
+### Cost limits
+
+`[limits]` bounds the two places where one request's cost is not bounded by the request. **Both default to off (`0`)** — a default limit is a default outage, since the right number depends on your egress budget and your clients' poll interval, neither of which this crate can know.
+
+```toml
+[limits]
+rate_per_minute = 600          # per peer address; 0 disables
+rate_burst = 120               # defaults to rate_per_minute
+max_concurrent_downloads = 16  # concurrent GET /sync/db/{object}; 0 disables
+```
+
+`max_concurrent_downloads` is the one that matters. A replica prefix holds oxkv's own files, so `GET /sync/db/{object}` can be a multi-hundred-megabyte SST read — and **a rate limit does not bound that**, because an allowed rate can still be in flight all at once. The gate caps concurrency, and the permit is held by the response *body* rather than the handler, so a client that opens a read and then stops consuming still occupies its slot until it disconnects. Refusals are `429` inside the uniform error envelope.
+
+`rate_per_minute` is a token bucket per peer address, installed as the outermost middleware so it also covers the routes a subject-keyed limiter could not reach — `/auth/login`, which is an outbound round trip to the identity provider, and `/health`, which a load balancer polls hard. Two honest limitations: buckets are keyed by **address, not subject**, so clients behind one NAT share a budget (a fairness property, not a safety one, and the concurrency gate — the control that matters — is keyed on nothing at all); and idle buckets are evicted after ten minutes so the map cannot grow with IPv6 rotation.
 
 ### Logging & tracing
 

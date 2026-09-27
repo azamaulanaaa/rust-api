@@ -228,11 +228,17 @@ fn register_modules(
 /// the assertion here is unreachable, and turning it into a startup panic
 /// beats silently shadowing a module.
 macro_rules! wired_app {
-    ($modules:expr, $readiness:expr, $cors_origins:expr) => {{
+    ($modules:expr, $readiness:expr, $cors_origins:expr, $bucket:expr) => {{
         apply_limits(App::new())
             .wrap(cors($cors_origins))
             .wrap(middleware::request_tracing::RequestTracingMiddleware)
             .wrap(middleware::bearer_token::BearerTokenMiddleware)
+            // Outermost, so it also bounds the routes a subject-keyed limiter
+            // could not reach -- `/auth/login`, which is an outbound round trip
+            // to the identity provider, and `/health`, which a load balancer
+            // polls hard. A zero limit leaves it installed but inert, costing
+            // one atomic load per request.
+            .wrap(crate::limits::RateLimit::new($bucket.clone()))
             .configure(health_routes)
             .configure(|cfg| {
                 if let Err(e) = check_prefixes($modules) {
@@ -280,6 +286,8 @@ pub struct ApiService {
     modules: Vec<Box<dyn ApiModule>>,
     readiness: Option<health::ReadyCheck>,
     cors_origins: Vec<String>,
+    /// Request-rate bucket, keyed by peer address. Disabled at `0`.
+    bucket: crate::limits::TokenBucket,
 }
 
 impl Default for ApiService {
@@ -295,6 +303,7 @@ impl ApiService {
             modules: Vec::new(),
             readiness: None,
             cors_origins: Vec::new(),
+            bucket: crate::limits::TokenBucket::new(0, 0),
         }
     }
 
@@ -311,6 +320,16 @@ impl ApiService {
     /// order; use builder-style chaining to register several.
     pub fn register_module(mut self, module: Box<dyn ApiModule>) -> Self {
         self.modules.push(module);
+        self
+    }
+
+    /// Sets the request-rate limit, per peer address.
+    ///
+    /// `per_minute == 0` disables it, which is the default. Installed as the
+    /// outermost middleware, so it also bounds the routes a subject-keyed
+    /// limiter could not reach.
+    pub fn with_rate_limit(mut self, bucket: crate::limits::TokenBucket) -> Self {
+        self.bucket = bucket;
         self
     }
 
@@ -362,13 +381,15 @@ impl ApiService {
         let modules = Arc::new(self.modules);
         let readiness = self.readiness.clone();
         let cors_origins = self.cors_origins.clone();
+        let bucket = self.bucket.clone();
 
-        let server = HttpServer::new(move || wired_app!(&modules, &readiness, &cors_origins))
-            .shutdown_timeout(SHUTDOWN_TIMEOUT_SECS)
-            .client_request_timeout(CLIENT_TIMEOUT)
-            .client_disconnect_timeout(CLIENT_TIMEOUT)
-            .bind(addr)?
-            .run();
+        let server =
+            HttpServer::new(move || wired_app!(&modules, &readiness, &cors_origins, &bucket))
+                .shutdown_timeout(SHUTDOWN_TIMEOUT_SECS)
+                .client_request_timeout(CLIENT_TIMEOUT)
+                .client_disconnect_timeout(CLIENT_TIMEOUT)
+                .bind(addr)?
+                .run();
         let handle = server.handle();
         tokio::spawn(async move {
             shutdown_signal().await;
@@ -426,7 +447,8 @@ mod tests {
             test::init_service(wired_app!(
                 &$service.modules,
                 &$service.readiness,
-                &$service.cors_origins
+                &$service.cors_origins,
+                &$service.bucket
             ))
             .await
         }};

@@ -294,8 +294,11 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
     // writes to S3. This bounds object-store pressure as much as CPU.
     rust_api::sync::snapshot::BuildPool::new(build_jobs)
         .spawn(std::sync::Arc::new(snapshot_manager.clone()), 2);
-    let sync_api_module =
-        SyncApiModule::new(snapshot_manager.clone(), oidc_api_module.middleware());
+    let sync_api_module = SyncApiModule::with_download_gate(
+        snapshot_manager.clone(),
+        oidc_api_module.middleware(),
+        config.limits.max_concurrent_downloads,
+    );
 
     let listen_addr = SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), config.listen_port);
     // Readiness fails when the policy lock is wedged (a writer stuck
@@ -323,6 +326,10 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
     });
     ApiService::new()
         .with_cors_origins(config.http.allowed_origins.clone())
+        .with_rate_limit(rust_api::limits::TokenBucket::new(
+            config.limits.burst_or_rate(),
+            config.limits.rate_per_minute,
+        ))
         .with_readiness_check(readiness)
         .register_module(Box::new(oidc_api_module))
         .register_module(Box::new(setup_api_module))
