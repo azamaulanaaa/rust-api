@@ -62,3 +62,151 @@ pub mod fencing;
 /// Telemetry bootstrap: global [`tracing`] subscriber installation and
 /// OpenTelemetry wiring.
 pub mod telemetry;
+
+#[cfg(test)]
+mod tests {
+    /// Every advisory this project suppresses is suppressed on purpose.
+    ///
+    /// The `[[advisories.ignore]]` entries in `deny.toml` are all cases
+    /// where the fix is genuinely unreachable -- an upstream crate pins the
+    /// dependency, or no patched version exists at all -- so the only honest
+    /// move is to record the blocker and move on. That makes the list exactly
+    /// the kind of thing that grows without anyone noticing: each addition
+    /// turns the build green, and nothing records why the previous ones were
+    /// acceptable.
+    ///
+    /// So the reason is required, and required to be substantial: a bare
+    /// `reason = "known"` passes this crate's reviewer and nothing else. A
+    /// `TODO` or a link with no explanation fails.
+    ///
+    /// Note what this does *not* do: it does not make the list exhaustive or
+    /// correct. A suppression that is unjustified but well written still
+    /// passes. It makes the additions legible, which is the part that
+    /// mechanical checking can do.
+    #[test]
+    fn every_ignore_is_justified() {
+        let deny = std::fs::read_to_string("deny.toml").expect("deny.toml is readable");
+
+        /// Splits `deny.toml` into `(id, reason)` pairs.
+        ///
+        /// Minimal by design: it recognises `[[advisories.ignore]]` headers and
+        /// the two keys, and handles TOML's `"""` multi-line form because a
+        /// real rationale does not fit on one line. A full TOML parser would be
+        /// a dependency for a test that only needs these three shapes.
+        fn parse(text: &str) -> Vec<(String, String)> {
+            let mut entries: Vec<(String, String)> = Vec::new();
+            let mut id: Option<String> = None;
+            let mut reason: Option<String> = None;
+            let mut in_block = false;
+
+            let flush = |id: &mut Option<String>, reason: &mut Option<String>, out: &mut Vec<_>| {
+                if let (Some(i), Some(r)) = (id.take(), reason.take()) {
+                    out.push((i, r));
+                }
+            };
+
+            for raw in text.lines() {
+                let line = raw.trim();
+
+                if in_block {
+                    if line == "\"\"\"" {
+                        in_block = false;
+                    } else {
+                        reason.get_or_insert_with(String::new).push(' ');
+                        reason
+                            .as_mut()
+                            .expect("just inserted")
+                            .push_str(&line.replace('\\', " "));
+                    }
+                    continue;
+                }
+
+                if line == "[[advisories.ignore]]" {
+                    flush(&mut id, &mut reason, &mut entries);
+                    continue;
+                }
+                if let Some(v) = line.strip_prefix("id = ") {
+                    id = Some(v.trim().trim_matches('"').to_string());
+                } else if let Some(v) = line.strip_prefix("reason = \"\"\"") {
+                    // Opening line of a multi-line string; text after the
+                    // opening quotes counts.
+                    let head = v.trim_end_matches('"').trim();
+                    reason = Some(if head.is_empty() {
+                        String::new()
+                    } else {
+                        format!("{head} ")
+                    });
+                    in_block = true;
+                } else if let Some(v) = line.strip_prefix("reason = ") {
+                    reason = Some(v.trim().trim_matches('"').to_string());
+                }
+            }
+            flush(&mut id, &mut reason, &mut entries);
+            entries
+        }
+
+        let entries = parse(&deny);
+        assert!(
+            !entries.is_empty(),
+            "no [[advisories.ignore]] entries found; the parser is broken, not the config"
+        );
+
+        for (id, reason) in &entries {
+            assert!(
+                id.starts_with("RUSTSEC-") || id.starts_with("CVE-"),
+                "advisory id looks wrong: {id:?}"
+            );
+
+            // A link is not a justification. Measure the prose with URLs
+            // removed, so "see <link>" cannot satisfy the length check.
+            let prose = strip_urls(reason);
+            assert!(
+                prose.split_whitespace().count() >= 20,
+                "{id} is suppressed with {} words of prose. Say which crate, why the \
+                 fix is unreachable, and what limits the exposure.",
+                prose.split_whitespace().count()
+            );
+            assert!(
+                !prose.contains("TODO") && !prose.contains("FIXME"),
+                "{id} is suppressed with a TODO in its reason"
+            );
+
+            // The reason has to say *why the fix is not taken*, or a reader
+            // cannot tell "nobody has fixed it" from "we have not picked it up".
+            // Those are very different: the second is a bug.
+            let lower = reason.to_lowercase();
+            let unavailability = [
+                "fixed in",           // a fix exists; something upstream blocks it
+                "no patched version", // no fix exists at all
+                "unmaintained",       // not a vulnerability, no fix coming
+                "latest release",     // upstream has nothing newer
+            ];
+            assert!(
+                unavailability.iter().any(|u| lower.contains(u)),
+                "{id} does not say why the fix is unavailable (expected one of \
+                 {unavailability:?})"
+            );
+        }
+    }
+
+    /// Removes `http(s)://...` runs so word counts measure prose.
+    fn strip_urls(text: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        let mut rest = text;
+        while let Some(at) = rest.find("http") {
+            out.push_str(&rest[..at]);
+            let tail = &rest[at..];
+            match tail.find(|c: char| c.is_whitespace()) {
+                Some(end) => {
+                    rest = &tail[end..];
+                }
+                None => {
+                    rest = "";
+                    break;
+                }
+            }
+        }
+        out.push_str(rest);
+        out
+    }
+}

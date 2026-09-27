@@ -40,6 +40,94 @@ wildcards = "deny"
 version = 2
 yanked = "warn"
 
+# Known-unfixable advisories, each with the upstream blocker named and a
+# compensating control. Every one of these is blocked on a dependency we do
+# not control, so the honest options were "fail the build forever" or
+# "document why and re-check". These were chosen deliberately and are
+# re-examined whenever a pinned dependency moves; see the "Known unfixable
+# advisories" section of the README for the full table.
+#
+# There is a test (`advisories::every_ignore_is_justified`) that fails if an
+# entry here has no substantive `reason`, because an ignore list that grows
+# silently is how a real vulnerability gets waved through.
+#
+# The one thing this list must never do is hide a *new* finding: an advisory
+# that is not listed below still fails the check.
+
+[[advisories.ignore]]
+id = "RUSTSEC-2026-0258"
+reason = """
+h2: unbounded empty DATA frames allow memory exhaustion. Fixed in h2 >= 0.4.16, \
+but every published actix-http through 3.18.12 requires h2 ^0.3.27, so no \
+actix-web release can carry the fix yet. h2 IS compiled in (actix-web enables \
+its http2 feature by default) and reachable by any client that speaks h2c to \
+this listener, so the exposure is real rather than theoretical. Mitigation \
+today is to terminate HTTP/2 in front of this process. Re-check when \
+actix-web moves off h2 0.3.
+"""
+
+[[advisories.ignore]]
+id = "RUSTSEC-2026-0194"
+reason = """
+quick-xml: quadratic runtime scanning a start tag for duplicate attribute \
+names, a denial-of-service. Fixed in quick-xml >= 0.41.0. quick-xml is reached \
+only through object_store, and oxkv 0.7.0 (the latest release) pins \
+object_store ^0.12 in its public API -- \
+OxKvStore::builder().with_object_store() takes Arc<dyn object_store::ObjectStore> \
+-- so object_store cannot be moved off 0.12 without an upstream oxkv release. \
+Both this and RUSTSEC-2026-0195 are response-parsing DoS: triggering one \
+requires the S3 endpoint to return a crafted XML body, and the S3 origin is a \
+configured, trusted endpoint (AWS, or a MinIO/R2 the operator controls).
+"""
+
+[[advisories.ignore]]
+id = "RUSTSEC-2026-0195"
+reason = """
+quick-xml: unbounded namespace-declaration allocation in NsReader, a \
+memory-exhaustion denial of service. Fixed in quick-xml >= 0.41.0. Same \
+upstream block as RUSTSEC-2026-0194: object_store 0.12.5 is the only 0.12.x \
+published, and oxkv 0.7.0 pins object_store ^0.12 in its public API, so the \
+fix cannot be taken without an upstream oxkv release. Response-parsing only, \
+from a trusted S3 origin.
+"""
+
+[[advisories.ignore]]
+id = "RUSTSEC-2023-0071"
+reason = """
+rsa: the Marvin attack recovers an RSA private key from decryption timing. \
+No patched version of `rsa` exists at all, so this can never be bumped away. \
+The vulnerable path is RSA private-key decryption, which this crate does not \
+perform: JWTs are verified as RS256 against public keys fetched from the \
+provider's JWKS. There is no RSA signing outside tests either -- the OIDC \
+flow is authorization-code with PKCE, with no encrypted ID tokens and no \
+private_key_jwt client assertion. Recorded rather than ignored silently \
+because a future change adding client-assertion signing would make this \
+reachable and it would then need a real answer.
+"""
+
+[[advisories.ignore]]
+id = "RUSTSEC-2025-0134"
+reason = """
+rustls-pemfile is unmaintained (repository archived August 2025). This is a \
+maintenance signal, not a vulnerability. Reached only through object_store, so \
+it carries the same oxkv ^0.12 pin as the quick-xml entries above. Per the \
+advisory the crate is now a thin wrapper over parsing code that lives in \
+rustls-pki-types, so the abandoned surface is a forwarding shim rather than \
+its own crypto.
+"""
+
+[[advisories.ignore]]
+id = "RUSTSEC-2026-0249"
+reason = """
+smartstring is unmaintained (archived May 2026), all versions affected, and no \
+replacement is offered upstream. Reached through casbin -> rhai, and casbin \
+2.20.0 is the latest published release, so it cannot be dropped by bumping. \
+The compensating control is that rhai only ever evaluates RBAC_MODEL, a \
+compile-time constant in src/policy/mod.rs -- no request-derived or \
+attacker-controlled expression reaches the evaluator, which is the only way a \
+parser DoS in that path would be exploitable.
+"""
+
 [sources]
 unknown-registry = "warn"
 unknown-git = "warn"
