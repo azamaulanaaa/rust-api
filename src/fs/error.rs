@@ -43,8 +43,16 @@ pub enum FsError {
     /// Oxkv store error - 500. Same sanitization contract as `Internal`.
     #[error("internal server error")]
     Store(String),
-    /// The store's epoch was lost to another writer - 500.
+    /// A cost limit refused the request - 429.
     ///
+    /// Raised when no concurrency slot was free for a replica download. A
+    /// request *rate* limit would not catch the shape that matters here: a
+    /// client allowed a hundred reads a minute can still have a hundred
+    /// multi-hundred-megabyte segments in flight at once.
+    #[error("too many requests")]
+    TooManyRequests,
+
+    /// The store's epoch was lost to another writer - 500.    ///
     /// Split out from [`Store`](Self::Store) because it is *actionable*:
     /// `oxkv` documents `StoreError::Fenced` as terminal ("the current
     /// process must stop writing and restart via `ownership.json` CAS"),
@@ -97,7 +105,7 @@ impl FsError {
             | Self::Internal(d)
             | Self::Store(d)
             | Self::Fenced(d) => d,
-            Self::PayloadTooLarge | Self::Forbidden => "",
+            Self::PayloadTooLarge | Self::Forbidden | Self::TooManyRequests => "",
         }
     }
 
@@ -114,6 +122,7 @@ impl FsError {
             Self::Conflict(_) => "conflict",
             Self::PayloadTooLarge => "payload too large",
             Self::Internal(_) | Self::Store(_) | Self::Fenced(_) => "internal server error",
+            Self::TooManyRequests => "too many requests",
         }
     }
 }
@@ -129,6 +138,7 @@ impl ResponseError for FsError {
             Self::Internal(_) | Self::Store(_) | Self::Fenced(_) => {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
+            Self::TooManyRequests => StatusCode::TOO_MANY_REQUESTS,
         }
     }
 
@@ -152,6 +162,9 @@ impl ResponseError for FsError {
             }
             Self::BadRequest(_) | Self::NotFound(_) | Self::Conflict(_) | Self::PayloadTooLarge => {
                 tracing::debug!("fs error {}: {}", self.status_code(), self);
+            }
+            Self::TooManyRequests => {
+                tracing::debug!("fs error {}: download gate full", self.status_code());
             }
             Self::Forbidden => {}
         }

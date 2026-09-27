@@ -64,6 +64,10 @@ pub enum ApiError {
     /// one-time bootstrap route once setup has been completed. HTTP 409.
     #[error("conflict")]
     Conflict,
+
+    /// A cost limit refused the request. HTTP 429.
+    #[error("too many requests")]
+    TooManyRequests,
 }
 
 impl ApiError {
@@ -74,6 +78,7 @@ impl ApiError {
             Self::Forbidden => StatusCode::FORBIDDEN,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::Conflict => StatusCode::CONFLICT,
+            Self::TooManyRequests => StatusCode::TOO_MANY_REQUESTS,
         }
     }
 

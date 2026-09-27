@@ -32,6 +32,9 @@ pub struct Config {
     /// HTTP edge settings (CORS); defaults apply when omitted.
     #[serde(default)]
     pub http: HttpConfig,
+    /// Cost limits; all off by default (see [`LimitsConfig`]).
+    #[serde(default)]
+    pub limits: LimitsConfig,
 }
 
 /// Environment override for the OIDC client secret.
@@ -315,6 +318,46 @@ pub struct HttpConfig {
     /// Browser origins allowed by CORS (e.g. `["https://app.example.com"]`).
     #[serde(default)]
     pub allowed_origins: Vec<String>,
+}
+
+/// Cost limits for requests whose work a single request does not bound.
+///
+/// Both default to off (`0`) rather than to a guessed number. A default
+/// limit is a default outage: too low and a legitimate burst gets 429s, too
+/// high and it is not a limit. The values a deployment wants depend on its
+/// egress budget and its client poll interval, neither of which this crate
+/// can know.
+#[derive(Deserialize, Debug, Default, Clone)]
+pub struct LimitsConfig {
+    /// Requests per minute per peer address, after an initial burst of the
+    /// same size. `0` disables the bucket.
+    #[serde(default)]
+    pub rate_per_minute: u32,
+
+    /// Peak burst allowed before the refill rate applies. `0` means "same as
+    /// `rate_per_minute`", so a plain rate limit needs one number.
+    #[serde(default)]
+    pub rate_burst: u32,
+
+    /// Concurrent `/sync/db/{object}` downloads. `0` disables the gate.
+    ///
+    /// This is the one that bounds real cost: a replica prefix holds oxkv
+    /// files, so one of these requests can be a multi-hundred-megabyte SST
+    /// read. A rate limit does not bound that, since an allowed rate can still
+    /// be in flight all at once.
+    #[serde(default)]
+    pub max_concurrent_downloads: usize,
+}
+
+impl LimitsConfig {
+    /// Burst to use when none is configured.
+    pub fn burst_or_rate(&self) -> u32 {
+        if self.rate_burst == 0 {
+            self.rate_per_minute
+        } else {
+            self.rate_burst
+        }
+    }
 }
 
 /// Capability-token (file delegation JWT) signing keys.

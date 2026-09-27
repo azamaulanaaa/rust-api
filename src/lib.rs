@@ -59,6 +59,10 @@ pub mod lease;
 /// uncooperative case the lease cannot see.
 pub mod fencing;
 
+/// Cost controls: a request-rate bucket and a concurrency gate for the
+/// endpoints whose work a single request does not bound.
+pub mod limits;
+
 /// Telemetry bootstrap: global [`tracing`] subscriber installation and
 /// OpenTelemetry wiring.
 pub mod telemetry;
