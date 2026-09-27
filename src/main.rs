@@ -272,6 +272,11 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
     } else {
         FsStore::new(fs_s3_store.clone())
     };
+    // The rebuild queue is created here so the receiving end can be drained by
+    // a worker pool. `POST /sync/sync` runs bounded incremental replays inline
+    // and *queues* full rebuilds, so without the pool a subject that needs a
+    // recalc would report `pending` forever and never converge.
+    let (builds, build_jobs) = rust_api::sync::snapshot::BuildQueue::new();
     let snapshot_manager = SnapshotManager::new(
         rust_api::sync::snapshot::SnapshotDeps {
             wal: wal.clone(),
@@ -279,10 +284,16 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
             // Replicas only read policy, so hand over the read-only view.
             policy: policy_engine.authorizer(),
             object_store: replica_objects,
+            builds,
         },
         db_prefix,
         rust_api::sync::snapshot::ReplicaBackend::ObjectStore,
     );
+    // Deliberately small: each build streams its diff, so memory tracks the
+    // size of a change rather than a replica, but it still scans the master and
+    // writes to S3. This bounds object-store pressure as much as CPU.
+    rust_api::sync::snapshot::BuildPool::new(build_jobs)
+        .spawn(std::sync::Arc::new(snapshot_manager.clone()), 2);
     let sync_api_module =
         SyncApiModule::new(snapshot_manager.clone(), oidc_api_module.middleware());
 

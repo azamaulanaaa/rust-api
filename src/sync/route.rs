@@ -71,8 +71,20 @@ pub struct SyncStatusResponse {
 pub struct SyncAdvanceResponse {
     /// Replica prefix for the caller (`{db}/u/{sha256-hex(sub)}`).
     pub prefix: String,
-    /// WAL sequence covered after advancing.
+    /// WAL sequence covered by the replica.
+    ///
+    /// May be below the WAL head even on a 200: see
+    /// [`pending`](Self::pending).
     pub applied_seq: u64,
+    /// True when a full rebuild is queued or already running, so
+    /// `applied_seq` is what the replica covered *before* it.
+    ///
+    /// A rebuild scans the whole master, so it is queued rather than run
+    /// inside the request; keep polling `GET /sync/status` and advancing until
+    /// this is false. Additive to the response, so existing clients keep
+    /// working -- but a client that assumed one `POST /sync/sync` always
+    /// converged would now need to read this.
+    pub pending: bool,
 }
 
 /// Quoted `ETag` for a coverage point (coverage only moves forward, so the
@@ -153,23 +165,8 @@ async fn sync_handler(
     req: HttpRequest,
 ) -> Result<HttpResponse, FsError> {
     let sub = &claims.sub;
-    let head = manager.wal.head().await?;
-    let applied = manager.load_applied(sub).await?;
-    let built: Result<u64, FsError> = match applied {
-        Some(a) if a >= head => Ok(a),
-        _ => match manager.replay(head, sub).await {
-            Ok(a) => Ok(a),
-            Err(_) => manager.build_full(sub).await,
-        },
-    };
-    // A lost fencing race means a concurrent builder just published:
-    // adopt their coverage instead of failing.
-    let applied = match built {
-        Ok(a) => a,
-        Err(e) if e.is_fencing_loss() => manager.load_applied(sub).await?.ok_or(e)?,
-        Err(e) => return Err(e),
-    };
-    let etag = snapshot_etag(applied);
+    let outcome = manager.advance(sub).await?;
+    let etag = snapshot_etag(outcome.applied_seq);
     if let Some(header) = req
         .headers()
         .get(IF_NONE_MATCH)
@@ -184,7 +181,8 @@ async fn sync_handler(
         .insert_header((ETAG, etag))
         .json(SyncAdvanceResponse {
             prefix: manager.user_prefix(sub),
-            applied_seq: applied,
+            applied_seq: outcome.applied_seq,
+            pending: outcome.pending,
         }))
 }
 
@@ -343,6 +341,7 @@ mod tests {
                 store: backing,
                 policy: policy.authorizer(),
                 object_store: mem.clone() as std::sync::Arc<dyn object_store::ObjectStore>,
+                builds: crate::sync::snapshot::BuildQueue::new().0,
             },
             "test-db",
             crate::sync::snapshot::ReplicaBackend::InMemory,
@@ -614,6 +613,54 @@ mod tests {
         Ok(())
     }
 
+    /// A rebuild that cannot be replayed is queued, not run inside the
+    /// request, and the response says so.
+    ///
+    /// The `200` with `pending: true` is the contract change to be careful
+    /// about: a caller that issued one `POST /sync/sync` and expected to read
+    /// its replica immediately would now see coverage from before the rebuild.
+    /// The field is what makes that visible rather than silent, and
+    /// `GET /sync/status` is the poll that watches it move.
+    #[actix_web::test]
+    async fn a_needed_rebuild_is_reported_as_pending() -> anyhow::Result<()> {
+        use crate::records::WalOp;
+
+        let fx = fixture().await?;
+        let module = SyncApiModule::new(fx.manager.clone(), setup(&fx).await?);
+        let app =
+            actix_web::test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+
+        // The fixture has already built the replica, so a plain advance is a
+        // no-op. A legacy policy mark is the one delta that cannot be
+        // replayed incrementally -- it carries no rule, only an object name --
+        // and forces the full-recalculate path.
+        fx.manager
+            .wal
+            .append(WalOp::PolicyAdd {
+                obj: "invoice:1".into(),
+            })
+            .await?;
+
+        let res = actix_web::test::call_service(
+            &app,
+            actix_web::test::TestRequest::post()
+                .uri("/sync/sync")
+                .insert_header(("Cookie", format!("auth_token={token}")))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let json: serde_json::Value =
+            serde_json::from_slice(&actix_web::test::read_body(res).await)?;
+        assert_eq!(json["pending"], true, "a full rebuild was queued: {json}");
+        assert_eq!(
+            json["applied_seq"], 0,
+            "coverage reported is from before the rebuild: {json}"
+        );
+        Ok(())
+    }
+
     #[actix_web::test]
     async fn sync_advances_via_replay() -> anyhow::Result<()> {
         let fx = fixture().await?;
@@ -646,6 +693,8 @@ mod tests {
         let body = actix_web::test::read_body(res).await;
         let json: serde_json::Value = serde_json::from_slice(&body)?;
         assert_eq!(json["applied_seq"], 1);
+        // A bounded replay runs inline, so the caller is not left pending.
+        assert_eq!(json["pending"], false);
 
         // The replayed prefix is served through the gateway.
         let res = actix_web::test::call_service(
