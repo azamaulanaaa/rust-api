@@ -13,6 +13,12 @@ use tokio::sync::RwLock;
 use crate::fs::error::FsError;
 use crate::fs::relation::{REL_PREFIX, RefInfo, refs_key, rel_key};
 
+/// Key prefix under which finalized file records live.
+const FILES_PREFIX: &str = "fs:files:";
+
+/// Suffix marking the metadata half of a file record's key.
+const FILE_META_SUFFIX: &str = ":meta";
+
 /// In-flight multipart session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UploadSession {
@@ -234,7 +240,7 @@ impl FsStore {
         format!("fs:mp:{upload_id}")
     }
     fn file_key(id: &str) -> String {
-        format!("fs:files:{id}:meta")
+        format!("{FILES_PREFIX}{id}{FILE_META_SUFFIX}")
     }
 
     /// Persists an upload session.
@@ -499,11 +505,11 @@ impl FsStore {
 
     /// Lists all finalized file records (scan bounded to `fs:files:`).
     pub async fn list_files(&self) -> Result<Vec<FileRecord>, FsError> {
-        let kvs = self.scan_prefix("fs:files:").await?;
+        let kvs = self.scan_prefix(FILES_PREFIX).await?;
         let mut out = Vec::new();
         for kv in kvs {
-            if kv.key.starts_with("fs:files:")
-                && kv.key.ends_with(":meta")
+            if kv.key.starts_with(FILES_PREFIX)
+                && kv.key.ends_with(FILE_META_SUFFIX)
                 && let Ok(r) = serde_json::from_slice::<FileRecord>(&kv.value)
             {
                 out.push(r);
@@ -530,13 +536,138 @@ impl FsStore {
     /// Dumps every raw key-value pair for verbatim replica copies.
     ///
     /// The caller owns filtering: everything present is returned as-is.
-    pub(crate) async fn dump_kvs(&self) -> Result<Vec<(String, Vec<u8>)>, FsError> {
-        let g = self.inner.read().await;
-        let kvs = g
-            .gets_bytes(None, Direction::Next, (None, None))
+    /// The next finalized file record in key order, or `None` at the end of
+    /// `fs:files:`.
+    ///
+    /// Takes the walk rather than creating one so a caller can page through
+    /// the whole keyspace while holding at most [`SCAN_PAGE`] records -- the
+    /// replica rebuild filters records one at a time and keeps none of them.
+    /// The prefix stays private here so the key layout has one owner.
+    pub(crate) async fn next_file(
+        &self,
+        scan: &mut KvPages,
+    ) -> Result<Option<FileRecord>, FsError> {
+        while let Some(kv) = scan.next().await? {
+            if !kv.key.starts_with(FILES_PREFIX) || !kv.key.ends_with(FILE_META_SUFFIX) {
+                continue;
+            }
+            // A record that will not decode is skipped rather than fatal, the
+            // same as `list_files`: one bad row must not stop a rebuild for
+            // every other file the user can see.
+            if let Ok(rec) = serde_json::from_slice::<FileRecord>(&kv.value) {
+                return Ok(Some(rec));
+            }
+        }
+        Ok(None)
+    }
+
+    /// The underlying handle, for a paged scan of the whole keyspace.
+    ///
+    /// [`FsStore::pages`] needs the store itself rather than the `FsStore`
+    /// wrapper so that a walk can outlive a method call -- the rebuild diff
+    /// holds two walks open at once, one per side.
+    pub(crate) fn kv_handle(&self) -> Arc<RwLock<OxKvStore>> {
+        Arc::clone(&self.inner)
+    }
+
+    /// A key-ordered, paginated walk over the whole keyspace.
+    pub(crate) fn pages(&self) -> KvPages {
+        KvPages::new(self.kv_handle())
+    }
+}
+
+/// Keys fetched per round trip during a [`KvPages`] walk.
+///
+/// The memory ceiling of a paged walk is this, not the keyspace. Large enough
+/// that the inclusive-cursor resume below can never be handed back a page
+/// containing only the duplicate key, small enough that a full scan of a large
+/// replica is not one enormous allocation.
+const SCAN_PAGE: u32 = 512;
+
+/// A key-ordered walk over an oxkv store that holds one page at a time.
+///
+/// `gets_bytes` with a `None` limit returns the entire keyspace, so anything
+/// built on it is O(keyspace) in memory no matter how carefully the caller
+/// iterates. That is what made the replica rebuild hold roughly three copies
+/// of a user's data: the master file list, the freshly-built scratch replica,
+/// and the live replica it was diffed against, all as collections.
+///
+/// This walks in pages instead. The two sides of a rebuild diff are both
+/// key-ordered by construction, so they can be merged in lockstep and compared
+/// a record at a time.
+pub(crate) struct KvPages {
+    store: Arc<RwLock<OxKvStore>>,
+    /// Inclusive resume point; `None` until the first page.
+    cursor: Option<String>,
+    buffer: std::vec::IntoIter<KeyValue>,
+    exhausted: bool,
+}
+
+impl KvPages {
+    /// Starts a walk over `store`, ascending from the first key.
+    pub(crate) fn new(store: Arc<RwLock<OxKvStore>>) -> Self {
+        Self {
+            store,
+            cursor: None,
+            buffer: Vec::new().into_iter(),
+            exhausted: false,
+        }
+    }
+
+    /// Starts a walk over a handle this walk exclusively owns, for the replica
+    /// side, which is not wrapped in an [`FsStore`].
+    pub(crate) fn owned(handle: OxKvStore) -> Self {
+        Self::new(Arc::new(RwLock::new(handle)))
+    }
+
+    /// The next key/value, or `None` at the end of the keyspace.
+    pub(crate) async fn next(&mut self) -> Result<Option<KeyValue>, FsError> {
+        if let Some(kv) = self.buffer.next() {
+            return Ok(Some(kv));
+        }
+        if self.exhausted {
+            return Ok(None);
+        }
+
+        let mut page: Vec<KeyValue> = {
+            let g = self.store.read().await;
+            g.gets_bytes(
+                Some(SCAN_PAGE),
+                Direction::Next,
+                (self.cursor.clone(), None),
+            )
             .await
-            .map_err(FsError::from)?;
-        Ok(kvs.into_iter().map(|kv| (kv.key, kv.value)).collect())
+            .map_err(FsError::from)?
+            .into_iter()
+            .collect()
+        };
+
+        // `gets_bytes` bounds are inclusive, so a resumed page comes back with
+        // the resume key as its first entry. Dropping exactly that entry --
+        // and nothing else -- is what stops the walk revisiting one key
+        // forever. Nudging the key instead is not an option: keys are
+        // arbitrary byte strings and "the next key after X" is not
+        // expressible.
+        if self
+            .cursor
+            .as_ref()
+            .is_some_and(|resume| page.first().is_some_and(|kv| kv.key == *resume))
+        {
+            page.remove(0);
+        }
+
+        if page.is_empty() {
+            // Either the keyspace is empty, or the previous page's last key was
+            // the final one. `SCAN_PAGE > 1` is what makes that safe: a page
+            // holding nothing but the resume key means there is nothing after
+            // it, never that the limit clipped the result to a single entry.
+            self.exhausted = true;
+            return Ok(None);
+        }
+
+        self.cursor = page.last().map(|kv| kv.key.clone());
+        self.buffer = page.into_iter();
+        Ok(self.buffer.next())
     }
 }
 
@@ -580,8 +711,9 @@ fn prefix_scan_end(prefix: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{FileRecord, FsStore, PersistedMultipart, UploadSession};
+    use super::{FileRecord, FsStore, PersistedMultipart, SCAN_PAGE, UploadSession};
     use crate::db::build_test_store;
+    use oxkv::GetSet as _;
 
     /// Which failures take this process out of rotation.
     ///
@@ -607,6 +739,88 @@ mod tests {
         assert!(!replica.latches(&fenced), "a replica build race is not");
         assert!(!master.latches(&other), "a flaky store is not a lost epoch");
         assert!(!replica.latches(&other));
+    }
+
+    /// A paged walk must visit every key exactly once.
+    ///
+    /// `gets_bytes` takes *inclusive* cursor bounds, so resuming from the last
+    /// key of a page hands that same key back as the first entry of the next
+    /// one. Get that wrong and the walk either loops forever on one key or --
+    /// worse, if the dedup is too eager -- silently skips keys, which for the
+    /// replica rebuild means a user's file quietly never appears in their
+    /// replica with no error anywhere.
+    ///
+    /// Spans several pages deliberately: the boundary is the only place the
+    /// inclusive-cursor handling is exercised, and a single-page walk would
+    /// pass with the dedup removed entirely.
+    #[tokio::test]
+    async fn paged_walk_visits_every_key_exactly_once() {
+        /// More keys than `SCAN_PAGE`, so at least one page boundary falls
+        /// strictly inside the keyspace.
+        const KEYS: usize = SCAN_PAGE as usize * 3 + 7;
+
+        let store = test_store().await;
+        let expected: Vec<String> = (0..KEYS).map(|i| format!("k:{i:06}")).collect();
+        for key in &expected {
+            store
+                .inner
+                .write()
+                .await
+                .set_bytes(key, key.as_bytes())
+                .await
+                .unwrap();
+        }
+
+        let mut pages = store.pages();
+        let mut seen: Vec<String> = Vec::new();
+        while let Some(kv) = pages.next().await.expect("walk") {
+            assert!(!seen.contains(&kv.key), "key {} visited twice", kv.key);
+            seen.push(kv.key.clone());
+        }
+
+        assert_eq!(
+            seen, expected,
+            "walk did not reproduce the keyspace in order"
+        );
+    }
+
+    /// An empty keyspace terminates instead of looping.
+    #[tokio::test]
+    async fn paged_walk_over_an_empty_store_terminates() {
+        let store = test_store().await;
+        let mut pages = store.pages();
+        assert!(pages.next().await.expect("walk").is_none());
+        assert!(pages.next().await.expect("walk").is_none());
+    }
+
+    /// A keyspace of exactly one page, and one page plus one, are the two
+    /// sizes where an off-by-one in the boundary handling hides.
+    #[tokio::test]
+    async fn paged_walk_handles_exact_page_multiples() {
+        for size in [
+            SCAN_PAGE as usize,
+            SCAN_PAGE as usize + 1,
+            SCAN_PAGE as usize * 2,
+        ] {
+            let store = test_store().await;
+            let expected: Vec<String> = (0..size).map(|i| format!("k:{i:06}")).collect();
+            for key in &expected {
+                store
+                    .inner
+                    .write()
+                    .await
+                    .set_bytes(key, key.as_bytes())
+                    .await
+                    .unwrap();
+            }
+
+            let mut pages = store.pages();
+            let mut seen = Vec::new();
+            while let Some(kv) = pages.next().await.expect("walk") {
+                seen.push(kv.key.clone());
+            }
+            assert_eq!(seen, expected, "wrong walk for size {size}");
+        }
     }
 
     async fn test_store() -> FsStore {
