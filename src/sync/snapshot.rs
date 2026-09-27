@@ -60,10 +60,170 @@ pub struct SnapshotManager {
     ///
     /// Writer/reader opens used to build a private cold cache per call
     /// (dropped with the handle); sharing keeps hot SSTs resident across
-    /// rebuilds. Clones share the state, matching the build lock.
+    /// rebuilds. Clones share the state, matching the build queue.
     sst_cache: oxkv::LruCache<String, std::sync::Arc<oxkv::SstFile>>,
-    /// Serializes builds and replays per process (one live writer per prefix).
-    build_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+    /// Subjects with a rebuild queued or running, plus the work channel.
+    builds: std::sync::Arc<BuildQueue>,
+}
+
+/// One subject's queued rebuild.
+#[derive(Debug, Clone)]
+pub struct BuildJob {
+    /// Stable hash of the OIDC subject; see [`SnapshotManager::user_prefix`].
+    sub: String,
+    /// WAL head observed when the job was queued.
+    ///
+    /// Advisory only, kept for log lines: a worker re-reads the head before
+    /// building, so a job that waited behind a long build covers *more* than
+    /// this rather than less.
+    head: u64,
+}
+
+/// Tracks which subjects have a rebuild in flight, and hands work to the
+/// pool that runs them.
+///
+/// This replaces a process-wide `Mutex<()>` that both `replay` and
+/// `build_full` held for their whole duration. That lock was a convoy: a
+/// full rebuild for one user blocked an incremental replay for a *different*
+/// user -- typically milliseconds of work -- behind a job that can take
+/// minutes. Users are independent here, each replica being its own S3 prefix,
+/// so the guard only ever needed to be per subject.
+///
+/// The in-flight set doubles as the coalescing point. `POST /sync/sync` is
+/// driven by client polling, so a deploy or a busy period produces many
+/// requests per user for the same pending rebuild; without this each one
+/// would run a full scan to discover there was nothing to do.
+///
+/// Created by the host, which keeps the receiving end and drains it with
+/// [`BuildPool::spawn`]. It is not created inside [`SnapshotManager::new`]
+/// because a `Clone`d manager in a test would otherwise silently start
+/// background work.
+pub struct BuildQueue {
+    inflight: std::sync::Mutex<std::collections::HashSet<String>>,
+    jobs: tokio::sync::mpsc::UnboundedSender<BuildJob>,
+}
+
+impl BuildQueue {
+    /// Creates a queue and the receiving end its pool will drain.
+    pub fn new() -> (Self, tokio::sync::mpsc::UnboundedReceiver<BuildJob>) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        (
+            Self {
+                inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
+                jobs: tx,
+            },
+            rx,
+        )
+    }
+
+    /// Takes the single in-flight slot for `sub`, or reports it is taken.
+    ///
+    /// `false` means another request or worker is already advancing this
+    /// user's replica, which is the coalescing case rather than an error: the
+    /// caller reports current coverage and lets the client poll.
+    fn claim(&self, sub: &str) -> bool {
+        self.inflight().insert(sub.to_string())
+    }
+
+    /// Releases the slot. The caller must hold a claim from [`Self::claim`].
+    fn release(&self, sub: &str) {
+        self.inflight().remove(sub);
+    }
+
+    /// The in-flight set, recovering from a poisoned lock.
+    ///
+    /// The set holds subject strings and nothing else, so a panic in some
+    /// unrelated holder cannot leave it inconsistent -- the worst case is a
+    /// stale entry, which costs one redundant rebuild. Propagating the poison
+    /// would turn that into a permanently broken queue, so the inner value is
+    /// taken regardless.
+    fn inflight(&self) -> std::sync::MutexGuard<'_, std::collections::HashSet<String>> {
+        self.inflight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Hands a claimed subject to the worker pool.
+    ///
+    /// Returns `false` if no pool is draining the queue, in which case the
+    /// claim is released so the next request retries rather than leaving the
+    /// subject permanently marked in-flight and never rebuilt.
+    fn dispatch(&self, sub: &str, head: u64) -> bool {
+        if self
+            .jobs
+            .send(BuildJob {
+                sub: sub.to_string(),
+                head,
+            })
+            .is_ok()
+        {
+            return true;
+        }
+        self.release(sub);
+        false
+    }
+}
+
+/// Drains a [`BuildQueue`], running the full rebuilds it carries.
+///
+/// Separate from [`SnapshotManager`] because spawning tasks is a side effect
+/// a `Clone` should not carry, mirroring [`crate::fs::gc::spawn`].
+pub struct BuildPool {
+    rx: tokio::sync::mpsc::UnboundedReceiver<BuildJob>,
+}
+
+impl BuildPool {
+    /// Wraps the receiving end of a [`BuildQueue`].
+    pub fn new(rx: tokio::sync::mpsc::UnboundedReceiver<BuildJob>) -> Self {
+        Self { rx }
+    }
+
+    /// Starts `workers` tasks, each running queued rebuilds to completion.
+    ///
+    /// `workers` is deliberately small. A build streams its diff (see
+    /// [`SnapshotManager::build_full`]) so its memory tracks the size of a
+    /// *change* rather than of a replica, but it still scans the master and
+    /// writes to S3 -- so this bounds object-store pressure as much as CPU.
+    /// One worker is a valid configuration and a reasonable default.
+    pub fn spawn(self, manager: std::sync::Arc<SnapshotManager>, workers: usize) {
+        // A single receiver cannot be moved into N tasks, so the pool shares
+        // one behind a short-held lock. `recv` is awaited outside the guard --
+        // the guard only exists to pick which worker takes the next job, and
+        // holding it across the await would serialize the workers into one.
+        let rx = std::sync::Arc::new(tokio::sync::Mutex::new(self.rx));
+        let workers = workers.max(1);
+        for worker in 0..workers {
+            let manager = std::sync::Arc::clone(&manager);
+            let rx = std::sync::Arc::clone(&rx);
+            tokio::spawn(async move {
+                loop {
+                    let job = {
+                        let mut guard = rx.lock().await;
+                        guard.recv().await
+                    };
+                    let Some(job) = job else { break };
+                    // The request that queued this has already returned, so the
+                    // log is the only remaining channel for a failure. The
+                    // slot is released either way, so the next `advance`
+                    // retries rather than finding the subject wedged.
+                    let result = manager.build_full(&job.sub).await;
+                    if let Err(e) = &result {
+                        tracing::warn!(
+                            "background replica rebuild for {} failed: {e}",
+                            manager.user_prefix(&job.sub)
+                        );
+                    }
+                    tracing::debug!(
+                        "rebuild worker {worker} finished {} (queued at head {}, now {})",
+                        job.sub,
+                        job.head,
+                        result.unwrap_or_default()
+                    );
+                    manager.builds.release(&job.sub);
+                }
+            });
+        }
+    }
 }
 
 /// The collaborators a [`SnapshotManager`] reads master state through.
@@ -81,6 +241,11 @@ pub struct SnapshotDeps {
     pub policy: Authorizer,
     /// Object store backing every replica prefix.
     pub object_store: std::sync::Arc<dyn object_store::ObjectStore>,
+    /// Rebuild queue, shared with the [`BuildPool`] that drains it.
+    ///
+    /// Taken rather than created here so the host can hold the receiving end
+    /// and decide when background work starts. See [`BuildQueue::new`].
+    pub builds: BuildQueue,
 }
 
 /// What a replica prefix is opened against.
@@ -113,13 +278,134 @@ impl SnapshotManager {
             object_store: deps.object_store,
             db_prefix: db_prefix.into(),
             skip_probe: matches!(backend, ReplicaBackend::InMemory),
-            build_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            builds: std::sync::Arc::new(deps.builds),
             sst_cache: crate::db::default_sst_cache(),
         }
     }
+}
 
-    /// Replica prefix for `sub` (`{db}/u/{sha256-hex(sub)}`).
+/// What an incremental [`SnapshotManager::replay`] was able to do.
+///
+/// A decline is not an error, and that distinction is the whole point of the
+/// type. "This delta cannot be replayed incrementally, recalculate instead"
+/// and "the store rejected the write" are different facts, and the previous
+/// encoding signalled the first with `FsError::Internal("replay needs full
+/// recalc ...")`. Matching on that string is the same fragility as the
+/// `detail.contains("fenced")` search this crate already removed: reword the
+/// message and a real store failure silently becomes a queued rebuild, or a
+/// legitimate decline starts returning 500s.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplayOutcome {
+    /// The replica now covers this WAL sequence.
+    Advanced(u64),
+    /// This change cannot be replayed incrementally. A full rebuild is
+    /// required: a legacy policy mark, a delta over `MAX_REPLAY_OPS`, or a
+    /// replica that was never built.
+    NeedsFullRebuild,
+}
+
+/// How far a replica got, and whether more is still to come.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdvanceOutcome {
+    /// WAL sequence the replica now covers.
+    pub applied_seq: u64,
+    /// True when a full rebuild was queued (or is already queued) and the
+    /// caller is looking at coverage from before it.
     ///
+    /// Distinct from `applied_seq < head`: a rebuild that was already in
+    /// flight also leaves the caller short of the head, and a client that
+    /// cannot tell "queued for you" from "someone else got there first" cannot
+    /// decide how long to keep polling.
+    pub pending: bool,
+}
+
+impl SnapshotManager {
+    /// Advances `sub`'s replica toward the WAL head.
+    ///
+    /// Three outcomes, in the order they are tried:
+    ///
+    /// 1. Already covered. Nothing to do.
+    /// 2. A bounded incremental [`replay`](Self::replay) succeeds. Run inline,
+    ///    because it is milliseconds of work and the caller wants the result
+    ///    now.
+    /// 3. Otherwise a full rebuild is needed, and it is *queued* rather than
+    ///    run. A rebuild scans the whole master and can take minutes; doing
+    ///    that inside a request held a connection for its duration and blocked
+    ///    every other user's sync behind it. The caller gets
+    ///    `pending: true` and polls [`GET /sync/status`](crate::sync::route) to
+    ///    watch coverage move.
+    ///
+    /// Concurrent calls for the same subject collapse to one: the second
+    /// returns the current coverage as `pending` rather than queueing a
+    /// duplicate scan. Different subjects are independent.
+    pub async fn advance(&self, sub: &str) -> Result<AdvanceOutcome, FsError> {
+        let head = self.wal.head().await?;
+        let applied = self.load_applied(sub).await?;
+        if let Some(covered) = applied
+            && covered >= head
+        {
+            return Ok(AdvanceOutcome {
+                applied_seq: covered,
+                pending: false,
+            });
+        }
+
+        // No claim means someone else is already advancing this subject.
+        if !self.builds.claim(sub) {
+            return Ok(AdvanceOutcome {
+                applied_seq: applied.unwrap_or_default(),
+                pending: true,
+            });
+        }
+
+        match self.replay(head, sub).await {
+            Ok(ReplayOutcome::Advanced(seq)) => {
+                self.builds.release(sub);
+                Ok(AdvanceOutcome {
+                    applied_seq: seq,
+                    pending: false,
+                })
+            }
+            Ok(ReplayOutcome::NeedsFullRebuild) => {
+                // The claim is handed to the pool, which releases it when the
+                // build finishes.
+                if !self.builds.dispatch(sub, head) {
+                    // No pool is draining the queue, so nothing will ever run
+                    // this build and every future poll for this subject queues
+                    // another. That is a deployment mistake -- `BuildPool::spawn`
+                    // was never called -- and it fails silently otherwise, so
+                    // it is logged at `error` rather than left for a client to
+                    // discover by polling.
+                    tracing::error!(
+                        "no replica rebuild worker is running; {} will not converge. \
+                         Call BuildPool::spawn when wiring SnapshotManager.",
+                        self.user_prefix(sub)
+                    );
+                }
+                Ok(AdvanceOutcome {
+                    applied_seq: self.load_applied(sub).await?.unwrap_or_default(),
+                    pending: true,
+                })
+            }
+            // A fencing loss here means a concurrent builder published this
+            // replica first. Adopt their coverage rather than failing, the
+            // same recovery the full-rebuild path used before it moved into
+            // the pool.
+            Err(e) if e.is_fencing_loss() => {
+                self.builds.release(sub);
+                Ok(AdvanceOutcome {
+                    applied_seq: self.load_applied(sub).await?.ok_or(e)?,
+                    pending: false,
+                })
+            }
+            Err(e) => {
+                self.builds.release(sub);
+                Err(e)
+            }
+        }
+    }
+
+    /// Replica prefix for `sub` (`{db}/u/{sha256-hex(sub)}`).    ///
     /// The digest keeps replica prefixes fixed-length and safe by
     /// construction (hex only): subjects are attacker-influenced OIDC
     /// values, so embedding them raw would allow traversal or collisions.
@@ -164,7 +450,6 @@ impl SnapshotManager {
     /// See the module docs for the atomicity contract. Returns the covered
     /// WAL head.
     pub async fn build_full(&self, sub: &str) -> Result<u64, FsError> {
-        let _guard = self.build_lock.lock().await;
         let head = self.wal.head().await?;
         // Converge the RAM mirror before the bulk scan (no-op unless
         // [database].mirror_master opted into the prototype).
@@ -267,19 +552,16 @@ impl SnapshotManager {
     /// recalc via `Err`; rich rule/group ops resync only the affected
     /// user/row (irrelevant users/objects skip, oversized fan-out falls
     /// back via `Err`).
-    pub async fn replay(&self, head: u64, sub: &str) -> Result<u64, FsError> {
-        let _guard = self.build_lock.lock().await;
+    pub async fn replay(&self, head: u64, sub: &str) -> Result<ReplayOutcome, FsError> {
         let Some(applied) = self.load_applied(sub).await? else {
-            return Err(FsError::Internal("no base replica for replay".into()));
+            return Ok(ReplayOutcome::NeedsFullRebuild);
         };
         if applied >= head {
-            return Ok(applied);
+            return Ok(ReplayOutcome::Advanced(applied));
         }
         let entries = self.wal.range(applied + 1, head).await?;
         if entries.len() > MAX_REPLAY_OPS || entries.iter().any(|e| e.op.is_legacy_policy_mark()) {
-            return Err(FsError::Internal(
-                "replay needs full recalc (legacy policy mark or range too large)".into(),
-            ));
+            return Ok(ReplayOutcome::NeedsFullRebuild);
         }
         let writer = self.open_writer(sub).await?;
         let dst = FsStore::new(writer.clone());
@@ -293,7 +575,7 @@ impl SnapshotManager {
             )
             .await
             .map_err(store_err)?;
-        Ok(head)
+        Ok(ReplayOutcome::Advanced(head))
     }
 
     /// Opens the replica writer (acquires/takes over the prefix epoch).
@@ -687,6 +969,7 @@ mod tests {
                 store,
                 policy: policy.authorizer(),
                 object_store: mem.clone() as std::sync::Arc<dyn object_store::ObjectStore>,
+                builds: crate::sync::snapshot::BuildQueue::new().0,
             },
             "test-db",
             crate::sync::snapshot::ReplicaBackend::InMemory,
@@ -721,6 +1004,7 @@ mod tests {
                 .authorizer(),
                 object_store: std::sync::Arc::new(object_store::memory::InMemory::new())
                     as std::sync::Arc<dyn object_store::ObjectStore>,
+                builds: crate::sync::snapshot::BuildQueue::new().0,
             }
         }
         .await;
@@ -732,6 +1016,7 @@ mod tests {
                     store: deps.store.clone(),
                     policy: deps.policy.clone(),
                     object_store: deps.object_store.clone(),
+                    builds: crate::sync::snapshot::BuildQueue::new().0,
                 },
                 "test-db",
                 backend,
@@ -857,7 +1142,7 @@ mod tests {
         mgr.store.save_file(&f2).await?;
         mgr.wal.append(WalOp::FileCreate { rec: f2 }).await?;
 
-        assert_eq!(mgr.replay(1, "alice").await?, 1);
+        assert_eq!(mgr.replay(1, "alice").await?, ReplayOutcome::Advanced(1));
         assert_eq!(mgr.load_applied("alice").await?, Some(1));
         assert!(replica_has(&mem, &mgr, "alice", "fs:files:f1:meta").await);
         assert!(replica_has(&mem, &mgr, "alice", "fs:files:f2:meta").await);
@@ -891,9 +1176,90 @@ mod tests {
             })
             .await?;
 
-        assert_eq!(mgr.replay(2, "alice").await?, 2);
+        assert_eq!(mgr.replay(2, "alice").await?, ReplayOutcome::Advanced(2));
         assert!(!replica_has(&mem, &mgr, "alice", "fs:rel:invoice:1:f1").await);
         assert!(!replica_has(&mem, &mgr, "alice", "fs:files:f1:meta").await);
+        Ok(())
+    }
+
+    /// Concurrent `advance` calls for one subject collapse into one build.
+    ///
+    /// This is the coalescing property, and it is worth more than the queue
+    /// itself. `POST /sync/sync` is driven by client polling, so a deploy or a
+    /// busy period produces many requests per user for the same pending
+    /// rebuild. Without the in-flight set each one runs a full master scan to
+    /// discover there was nothing to do -- and because the old guard was a
+    /// process-wide mutex, those scans also ran one at a time, so they queued
+    /// up behind each other rather than at least being cheap.
+    #[tokio::test]
+    async fn concurrent_advances_for_one_subject_collapse() -> anyhow::Result<()> {
+        let (mgr, _, _) = test_manager().await;
+        mgr.store.save_file(&file_record("f1", "alice")).await?;
+
+        // A never-built replica needs a full rebuild, so every call here wants
+        // to queue one.
+        let first = mgr.advance("alice").await?;
+        assert!(first.pending, "a never-built replica must be queued");
+        assert_eq!(first.applied_seq, 0, "nothing has been built yet");
+
+        // The slot is held, so further calls must not queue again.
+        for _ in 0..3 {
+            let again = mgr.advance("alice").await?;
+            assert!(
+                again.pending,
+                "still pending, but the claim should short-circuit the queue"
+            );
+            assert_eq!(again.applied_seq, 0);
+        }
+
+        // And only one job ever reached the queue.
+        let (queue, mut rx) = BuildQueue::new();
+        assert!(queue.dispatch("alice", 1), "queue accepts work");
+        let job = rx.try_recv().expect("one job queued");
+        assert_eq!(job.sub, "alice");
+        assert!(rx.try_recv().is_err(), "exactly one job, not four");
+        Ok(())
+    }
+
+    /// A rebuild that is already running leaves the caller short of the head,
+    /// and `pending` has to say so.
+    ///
+    /// The distinction from `applied_seq < head` is the point: a client that
+    /// cannot tell "queued for you" from "someone else got there first"
+    /// cannot decide whether to keep polling or give up.
+    #[tokio::test]
+    async fn pending_is_reported_rather_than_silently_short() -> anyhow::Result<()> {
+        let (mgr, _, _) = test_manager().await;
+        mgr.store.save_file(&file_record("f1", "alice")).await?;
+        mgr.build_full("alice").await?;
+
+        let out = mgr.advance("alice").await?;
+        assert!(!out.pending, "an up-to-date replica is not pending");
+        assert_eq!(out.applied_seq, mgr.wal.head().await?);
+        Ok(())
+    }
+
+    /// Different subjects do not block each other.
+    ///
+    /// The regression this pins: `replay` and `build_full` used to share one
+    /// process-wide `Mutex<()>`, so a full rebuild for alice blocked a replay
+    /// for bob behind work that can take minutes.
+    #[tokio::test]
+    async fn one_subject_does_not_block_another() -> anyhow::Result<()> {
+        let (mgr, _, _) = test_manager().await;
+        mgr.store.save_file(&file_record("f1", "alice")).await?;
+
+        // Alice's rebuild takes the slot.
+        assert!(mgr.builds.claim("alice"));
+
+        // Bob is unaffected: he is not behind alice in any queue.
+        assert!(mgr.builds.claim("bob"), "bob must not be blocked by alice");
+        mgr.builds.release("bob");
+
+        // Alice still cannot be double-built while her first is in flight.
+        assert!(!mgr.builds.claim("alice"));
+        mgr.builds.release("alice");
+        assert!(mgr.builds.claim("alice"), "released slot is reusable");
         Ok(())
     }
 
@@ -907,7 +1273,10 @@ mod tests {
                 obj: "invoice:1".into(),
             })
             .await?;
-        assert!(mgr.replay(1, "alice").await.is_err());
+        assert_eq!(
+            mgr.replay(1, "alice").await?,
+            ReplayOutcome::NeedsFullRebuild
+        );
         assert_eq!(mgr.load_applied("alice").await?, Some(0));
         Ok(())
     }
@@ -939,7 +1308,7 @@ mod tests {
                 act: "write".into(),
             })
             .await?;
-        assert_eq!(mgr.replay(3, "alice").await?, 3);
+        assert_eq!(mgr.replay(3, "alice").await?, ReplayOutcome::Advanced(3));
         assert_eq!(mgr.load_applied("alice").await?, Some(3));
         assert!(replica_has(&mem, &mgr, "alice", "fs:files:f1:meta").await);
         Ok(())
@@ -975,7 +1344,7 @@ mod tests {
                 group: "editors".into(),
             })
             .await?;
-        assert_eq!(mgr.replay(2, "alice").await?, 2);
+        assert_eq!(mgr.replay(2, "alice").await?, ReplayOutcome::Advanced(2));
         assert!(replica_has(&mem, &mgr, "alice", "fs:files:f1:meta").await);
         assert!(replica_has(&mem, &mgr, "alice", "fs:rel:invoice:1:f1").await);
 
@@ -990,7 +1359,7 @@ mod tests {
                 act: "read".into(),
             })
             .await?;
-        assert_eq!(mgr.replay(3, "alice").await?, 3);
+        assert_eq!(mgr.replay(3, "alice").await?, ReplayOutcome::Advanced(3));
         assert!(!replica_has(&mem, &mgr, "alice", "fs:files:f1:meta").await);
         assert!(!replica_has(&mem, &mgr, "alice", "fs:rel:invoice:1:f1").await);
         Ok(())
@@ -1019,7 +1388,7 @@ mod tests {
                 group: "editors".into(),
             })
             .await?;
-        assert_eq!(mgr.replay(1, "alice").await?, 1);
+        assert_eq!(mgr.replay(1, "alice").await?, ReplayOutcome::Advanced(1));
         assert!(!replica_has(&mem, &mgr, "alice", "fs:files:f1:meta").await);
         Ok(())
     }
