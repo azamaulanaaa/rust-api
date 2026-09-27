@@ -15,14 +15,12 @@
 //! affected user/row. Served read-only via `/sync/db/`; wasm clients open
 //! an `OxKvReader` over the prefix and follow the live manifest.
 
-use std::collections::HashMap;
-
 use crate::fs::error::FsError;
-use crate::fs::store::FsStore;
+use crate::fs::store::{FsStore, KvPages};
 use crate::policy::row::RowAuthorizer;
 use crate::policy::{Action, Authorizer};
 use crate::records::WalOp;
-use oxkv::{Direction, GetSet as _, OxKvReader, Store as _, Transaction as _};
+use oxkv::{GetSet as _, OxKvReader, Store as _, Transaction as _};
 
 use super::wal::Wal;
 
@@ -179,37 +177,83 @@ impl SnapshotManager {
         );
         let scratch = FsStore::new(crate::db::build_scratch_store(&snap_prefix).await);
         self.copy_filtered(sub, &scratch).await?;
-        let mut new_map: HashMap<String, Vec<u8>> = scratch.dump_kvs().await?.into_iter().collect();
-        new_map.insert(
-            APPLIED_KEY.to_string(),
-            serde_json::to_vec(&head).map_err(|e| FsError::Internal(e.to_string()))?,
-        );
-        let cur_map = self.read_live(sub).await?;
 
-        let mut dels = Vec::new();
-        for key in cur_map.keys() {
-            if !new_map.contains_key(key) {
-                dels.push(key.clone());
+        // One writer, used for three jobs: the live side of the diff, the
+        // transaction the diff is staged in, and the handle the commit runs on.
+        // Reading the live side through the writer rather than a separate
+        // reader is safe because nothing has been written through it yet, so
+        // its session overlay is empty and it observes exactly the committed
+        // state the replica currently holds.
+        let writer = self.open_writer(sub).await?;
+
+        let mut desired = scratch.pages();
+        let mut live = KvPages::owned(writer.clone());
+
+        let tx = writer.begin_tx().map_err(store_err)?;
+        let mut wrote = false;
+
+        // The coverage marker is control metadata, not replica data. It lives
+        // on the live side only -- it is written after the diff, below -- so
+        // the merge has to step over it rather than read it as a key the
+        // filter dropped and delete it.
+        async fn next_data_key(live: &mut KvPages) -> Result<Option<oxkv::KeyValue>, FsError> {
+            while let Some(kv) = live.next().await? {
+                if kv.key != APPLIED_KEY {
+                    return Ok(Some(kv));
+                }
+            }
+            Ok(None)
+        }
+
+        // Merge-join. Both sides are key-ordered by construction, so this
+        // holds one key per side rather than a map of the whole replica.
+        loop {
+            let a = desired.next().await?;
+            let b = next_data_key(&mut live).await?;
+            match (a, b) {
+                (None, None) => break,
+                (Some(a), None) => {
+                    tx.put_bytes(&a.key, &a.value).await.map_err(store_err)?;
+                    wrote = true;
+                }
+                (None, Some(b)) => {
+                    tx.delete(&b.key).await.map_err(store_err)?;
+                    wrote = true;
+                }
+                (Some(a), Some(b)) => match a.key.cmp(&b.key) {
+                    // Only on the desired side: a new or changed key.
+                    std::cmp::Ordering::Less => {
+                        tx.put_bytes(&a.key, &a.value).await.map_err(store_err)?;
+                        wrote = true;
+                    }
+                    // Only on the live side: the filter dropped it, or the
+                    // master no longer has it.
+                    std::cmp::Ordering::Greater => {
+                        tx.delete(&b.key).await.map_err(store_err)?;
+                        wrote = true;
+                    }
+                    std::cmp::Ordering::Equal => {
+                        if a.value != b.value {
+                            tx.put_bytes(&a.key, &a.value).await.map_err(store_err)?;
+                            wrote = true;
+                        }
+                    }
+                },
             }
         }
-        let mut puts = Vec::new();
-        for (key, value) in &new_map {
-            if cur_map.get(key) != Some(value) {
-                puts.push((key.clone(), value.clone()));
-            }
-        }
-        if dels.is_empty() && puts.is_empty() {
+
+        // Coverage marker last, in the same transaction as the data. A crash
+        // before commit leaves the previous state and its marker untouched, so
+        // the next build simply redoes the work.
+        let marker = serde_json::to_vec(&head).map_err(|e| FsError::Internal(e.to_string()))?;
+        let covered = self.load_applied(sub).await? == Some(head);
+        if !wrote && covered {
+            tx.rollback().await.map_err(store_err)?;
             return Ok(head);
         }
-
-        let writer = self.open_writer(sub).await?;
-        let tx = writer.begin_tx().map_err(store_err)?;
-        for key in &dels {
-            tx.delete(key).await.map_err(store_err)?;
-        }
-        for (key, value) in &puts {
-            tx.put_bytes(key, value).await.map_err(store_err)?;
-        }
+        tx.put_bytes(APPLIED_KEY, &marker)
+            .await
+            .map_err(store_err)?;
         tx.commit().await.map_err(store_err)?;
         Ok(head)
     }
@@ -285,27 +329,6 @@ impl SnapshotManager {
             .build_reader_with_cache(self.sst_cache.clone())
             .await
             .map_err(FsError::from)
-    }
-
-    /// Dumps the live replica as a map, or empty when never built.
-    async fn read_live(&self, sub: &str) -> Result<HashMap<String, Vec<u8>>, FsError> {
-        use object_store::ObjectStore as _;
-
-        let manifest =
-            object_store::path::Path::from(format!("{}/manifest.json", self.user_prefix(sub)));
-        match self.object_store.get(&manifest).await {
-            Ok(_) => {}
-            Err(object_store::Error::NotFound { .. }) => return Ok(HashMap::new()),
-            Err(e) => return Err(FsError::Internal(e.to_string())),
-        }
-        let reader = self.open_reader(sub).await?;
-        let tx = reader.begin_tx().map_err(store_err)?;
-        let kvs = tx
-            .gets_bytes(None, Direction::Next, (None, None))
-            .await
-            .map_err(store_err)?;
-        tx.rollback().await.map_err(store_err)?;
-        Ok(kvs.into_iter().map(|kv| (kv.key, kv.value)).collect())
     }
 
     /// Applies one WAL op onto a replica under construction.
@@ -547,7 +570,13 @@ impl SnapshotManager {
     /// a re-read plus two full-store scans (one inside `can_read`, one
     /// for attach) on top of the listing itself.
     async fn copy_filtered(&self, sub: &str, dst: &FsStore) -> Result<(), FsError> {
-        for rec in self.store.list_files().await? {
+        // Paged, not collected. `list_files` returns every record in the
+        // master as a `Vec<FileRecord>`, which for a large master is the
+        // single largest allocation in the rebuild and is entirely
+        // unnecessary: the filter below decides per record and keeps none of
+        // them. The key layout stays in `fs::store`; this only drives it.
+        let mut scan = self.store.pages();
+        while let Some(rec) = self.store.next_file(&mut scan).await? {
             let rows = self.visible_rows(sub, &rec.id).await?;
             if rec.owner_sub != sub && rows.is_empty() {
                 continue;
