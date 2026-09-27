@@ -426,6 +426,23 @@ The composition root is covered too: `http::tests` builds the real served applic
 Dependency licensing is enforced via [`cargo-deny`](https://embarkstudios.github.io/cargo-deny/) (`deny.toml`: `licenses` + `advisories` + `bans`); all three run in CI. Note that `bans` is configured with `multiple-versions = "warn"`, so duplicate transitive versions (currently `rand` ×3, `base64` ×3) are reported but do not fail the job.
 `oxkv` 0.7 (`oxkv` + `oxkv-s3` features) + `object_store` 0.12 (shared `AmazonS3Builder` for file bytes and `OxKvStore`).
 
+### Known unfixable advisories
+
+`mise run advisories` is green, and it is green because of six **documented suppressions** in `deny.toml` — not because the findings are gone. Every one is blocked on a dependency we do not control, so each is recorded with the blocker and the compensating control rather than left to fail the build forever. An advisory that is *not* in that list still fails the check, and `lib::tests::every_ignore_is_justified` fails if an entry is added without a substantive reason (a bare link does not pass).
+
+| Advisory | Crate | Why the fix is not taken | Exposure today |
+|---|---|---|---|
+| RUSTSEC-2026-0258 | `h2` 0.3.27 | Fixed in `h2 >= 0.4.16`, but every `actix-http` through 3.18.12 requires `h2 ^0.3.27` — no actix-web release can take it | **Real.** `h2` is compiled in (actix-web enables `http2` by default) and reachable by any client speaking `h2c`. Terminate HTTP/2 in front of this process, or bound memory |
+| RUSTSEC-2026-0194 | `quick-xml` 0.38.4 | Fixed in `>= 0.41.0`. Reached only via `object_store`, and `oxkv` 0.7.0 (latest) pins `object_store ^0.12` in its public API | Low — response-parsing DoS; needs a crafted XML body from the S3 origin, which is a configured trusted endpoint |
+| RUSTSEC-2026-0195 | `quick-xml` 0.38.4 | Same `oxkv` pin | Low — unbounded allocation on the same response path |
+| RUSTSEC-2023-0071 | `rsa` 0.9.10 | **No patched version exists.** | None — the Marvin attack needs RSA *private-key decryption*. We only verify RS256 against JWKS public keys; no RSA signing outside tests, no encrypted ID tokens, no `private_key_jwt` |
+| RUSTSEC-2025-0134 | `rustls-pemfile` 2.2.0 | Unmaintained, not a vulnerability; same `oxkv` pin | None — a forwarding shim over `rustls-pki-types` per the advisory |
+| RUSTSEC-2026-0249 | `smartstring` 1.0.1 | Unmaintained; via `casbin` → `rhai`, and `casbin` 2.20.0 is latest | None — `rhai` only ever evaluates `RBAC_MODEL`, a compile-time constant, so no request-derived expression reaches the parser |
+
+Two of these are worth an operational note rather than a code change. The `h2` finding is the one to act on: it is genuinely reachable, and the mitigation is deployment-side. And the `rsa` entry is load-bearing on a property of this crate — authorization-code flow with PKCE, no client-assertion signing. Adding `private_key_jwt` would make it live, and this table is where that should be noticed.
+
+Re-examine this list whenever `oxkv`, `actix-web`, or `casbin` moves; the `oxkv` pin is the single blocker holding three of the six.
+
 ## Releases
 
 Release archives are built with [cargo-dist](https://opensource.axo.dev/cargo-dist/), configured in `dist-workspace.toml` (version 0.30.2, `ci = "github"`, no installers) against the `[profile.dist]` in `Cargo.toml`. Targets: `aarch64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu`, `x86_64-pc-windows-msvc`.
