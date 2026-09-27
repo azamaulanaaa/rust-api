@@ -27,7 +27,7 @@ The crate is intentionally business-logic free: applications compose `ApiModule`
 | Method | Path | Description | Auth |
 |---|---|---|---|
 | GET | `/health` | Liveness probe | none |
-| GET | `/ready` | Readiness probe (policy-lock check) | none |
+| GET | `/ready` | Readiness probe (policy lock, writer lease, primary fencing) — wire it to a real probe, see [Readiness](#readiness) | none |
 | GET | `/auth/login` | Start OIDC login (redirects to provider) | none |
 | GET | `/auth/callback` | OIDC authorization-code callback | none |
 | GET | `/auth/me` | Session probe (`sub`, `iss`, `aud`, `exp`) | Bearer token |
@@ -88,7 +88,7 @@ src/
 ├── http/                HTTP scaffolding shared by all modules
 │   ├── mod.rs           ApiService registry + ApiModule trait (declared route prefix, duplicate-prefix check) + CORS builder
 │   ├── error.rs         ApiError enum and uniform JSON error envelope
-│   ├── health.rs        /health + /ready (readiness: policy-lock check)
+│   ├── health.rs        /health + /ready (readiness: policy lock + writer lease + primary fencing)
 │   ├── docs.rs          mounts /openapi.json + /swagger-ui/*
 │   └── middleware/      bearer_token, jwks (debounced refresh), jwt (JWKS-backed claims + Validated extractor), request_tracing
 ├── oidc/                OIDC client: /auth/* (code flow, PKCE, session probe)
@@ -375,6 +375,35 @@ max_concurrent_downloads = 16  # concurrent GET /sync/db/{object}; 0 disables
 
 `rate_per_minute` is a token bucket per peer address, installed as the outermost middleware so it also covers the routes a subject-keyed limiter could not reach — `/auth/login`, which is an outbound round trip to the identity provider, and `/health`, which a load balancer polls hard. Two honest limitations: buckets are keyed by **address, not subject**, so clients behind one NAT share a budget (a fairness property, not a safety one, and the concurrency gate — the control that matters — is keyed on nothing at all); and idle buckets are evicted after ten minutes so the map cannot grow with IPv6 rotation.
 
+### Operations
+
+#### Backups and restore
+
+**`policy export` backs up policy rules only.** It writes every `p` and `g` rule in `{db}/policy` to JSON. It does **not** contain file metadata (`{db}/fs`), the change feed (`{db}/wal`), or any file bytes. Treating it as a full backup and restoring from it onto a fresh bucket gives you working authorization and an empty filesystem, which looks like total data loss rather than like a partial restore.
+
+A real restore is therefore two separate things:
+
+| What | Where it lives | How to restore it |
+|---|---|---|
+| Policy rules | `{db}/policy` | `rust-api policy import --config … --input backup.json` (idempotent; re-running is safe) |
+| File metadata + relations | `{db}/fs` | Copy the prefix's objects back. Enable S3 bucket versioning and rely on it, or copy prefixes between buckets |
+| Change feed | `{db}/wal` | Nothing to restore — it is a replay log, not a source of truth, and a fresh prefix simply replays from zero |
+| File bytes | user buckets, outside this server's prefixes | Your own S3 lifecycle rules |
+
+`policy import` opens a second handle on `{db}/policy` and `{db}/wal`, which fences a live server on the same prefix. **Stop the server first** (or run it against a different `[database].prefix`).
+
+There is no automated backup job and no restore drill in this repository. Both are the operator's, and both are worth rehearsing before you need them.
+
+#### Readiness
+
+`GET /ready` returns 503 for any of three independent conditions: the policy lock is held, the single-writer lease was lost, or a primary prefix was fenced. `/health` is liveness and stays 200.
+
+Wire `/ready` to something that actually acts on it — a Kubernetes readiness probe, or a load balancer health check. If it is only *served* and nothing reads it, none of the three conditions removes the instance from rotation, and the single-writer guarantees above degrade to "documented" rather than enforced. This matters most for the fencing case: it fires from a background task, so no client ever sees the error.
+
+#### Telemetry
+
+Traces and metrics go to an OTLP endpoint configured under `[observability]`, with the exporter chosen by the `otlp-http` (default) or `otlp-grpc` cargo feature. `telemetry.rs` has no unit tests and cannot usefully have any: the global subscriber installs once per process, and confirming that spans and metrics actually arrive needs a collector. **Verify it once against a real collector** — a misconfigured exporter fails silently, and you will not find out until you need the traces.
+
 ### Logging & tracing
 
 Console output is always enabled. Log level follows `RUST_LOG` when set, otherwise derives from `--verbose` (debug) vs default (info):
@@ -391,7 +420,7 @@ docker run -p 4317:4317 grafana/otel-lgtm
 
 ## Policy data management
 
-Policies can be exported to JSON for backups and re-imported into a fresh store (e.g. when moving hosts). Both commands take `--config` (provides `[s3]` + `[database].prefix`) — not a file path:
+Policies can be exported to JSON and re-imported into a fresh store (e.g. when moving hosts). This covers **policy rules only** — see [Backups and restore](#backups-and-restore) for what a real restore needs. Both commands take `--config` (provides `[s3]` + `[database].prefix`) — not a file path:
 
 ```bash
 rust-api policy export --config config.toml --out backup.json
