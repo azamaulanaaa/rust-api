@@ -344,25 +344,90 @@ mod tests {
     }
 
     /// Reads a source file's *production* code: everything before the
-    /// top-level `#[cfg(test)]` module, with comment lines dropped.
+    /// column-0 `#[cfg(test)]` module, with comment lines dropped.
+    ///
+    /// The attribute is matched at column 0 rather than after `trim_start`,
+    /// and that is the whole correctness of this helper. Several files carry
+    /// an *indented* `#[cfg(test)]` on an inner test-only item -- `fs/store.rs`
+    /// has two, at `:207` and `:237`, above a test module that does not open
+    /// until `:712`. Matching after `trim_start` stops the scan at the first
+    /// of those, so `production_source("src/fs/store.rs")` returned lines
+    /// 1-206 and the remaining ~500 lines of production code were never
+    /// inspected: `use crate::sync::wal::Wal;` planted at `:400` left
+    /// `producers_do_not_depend_on_the_consumer` green. `src/limits.rs` has
+    /// the same shape, so the entire `RateLimit` middleware was outside
+    /// `http::error`'s envelope scan.
+    ///
+    /// A helper that under-reports is worse than no helper: it reads as
+    /// coverage of the whole file. `production_source_sees_past_an_indented_
+    /// cfg_test` below is what stops it regressing.
     fn production_source(path: &str) -> String {
         let src = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
         let mut out = String::new();
         for line in src.lines() {
-            let trimmed = line.trim_start();
-            if trimmed.starts_with("//") {
+            if line.trim_start().starts_with("//") {
                 continue;
             }
-            // A column-0 `#[cfg(test)]` opens the test module; everything
+            // Only the column-0 attribute opens the test module; everything
             // from there on is test-only, and tests legitimately reach
             // across the boundary to build fixtures.
-            if trimmed == "#[cfg(test)]" {
+            if line == "#[cfg(test)]" {
                 break;
             }
             out.push_str(line);
             out.push('\n');
         }
         out
+    }
+
+    /// A file shaped like `fs/store.rs`: production code, an *indented*
+    /// `#[cfg(test)]` on a single test-only item, more production code, then
+    /// the real test module at column 0.
+    const FIXTURE: &str = r#"pub fn before() {}
+    #[cfg(test)]
+    pub(crate) fn test_only_item() {}
+pub fn after() {}
+#[cfg(test)]
+mod tests {}
+"#;
+
+    fn fixture_path(name: &str) -> std::path::PathBuf {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        std::env::temp_dir().join(format!(
+            "rust-api-{name}-{}-{}.rs",
+            std::process::id(),
+            URL_SAFE_NO_PAD.encode(rand::random::<[u8; 8]>())
+        ))
+    }
+
+    /// The helper itself, tested directly.
+    ///
+    /// An indented `#[cfg(test)]` gates ONE test-only item and says nothing
+    /// about where the file's test module begins, so the scan has to run
+    /// past it. This writes a file shaped like `fs/store.rs` and asserts the
+    /// production code *after* the indented attribute is in the output --
+    /// the assertion the old helper failed, because it stopped at the
+    /// attribute and returned everything above it.
+    #[test]
+    fn production_source_sees_past_an_indented_cfg_test() {
+        let path = fixture_path("records-prod-source");
+        std::fs::write(&path, FIXTURE).expect("write the fixture");
+        let src = production_source(path.to_str().expect("utf-8 path"));
+        let _ = std::fs::remove_file(&path);
+
+        assert!(
+            src.contains("pub fn before()"),
+            "code above the indented attribute is production: {src}"
+        );
+        assert!(
+            src.contains("pub fn after()"),
+            "an indented #[cfg(test)] on one item must not end the scan; \
+             everything before the column-0 module is production code"
+        );
+        assert!(
+            !src.contains("mod tests"),
+            "the column-0 module is the stop point: {src}"
+        );
     }
 
     /// The whole point of this module: `fs` and `policy` must not depend on
