@@ -448,7 +448,7 @@ impl FsStore {
             }
         }
         tx.delete(&key).await.map_err(|e| self.store_err(e))?;
-        let _ = tx.delete(&refs).await;
+        tx.delete(&refs).await.map_err(|e| self.store_err(e))?;
         tx.commit().await.map_err(|e| self.store_err(e))?;
         Ok(())
     }
@@ -1251,6 +1251,55 @@ mod tests {
             );
         }
         Ok(())
+    }
+
+    /// Every delete in `delete_file` reports its error.
+    ///
+    /// The doc above promises the record, its ref-count entry and every
+    /// relation marker are removed "atomically". Five of the six deletes
+    /// in the transaction mapped their error through `store_err`; the
+    /// ref-count one read `let _ = tx.delete(&refs).await`, so a failure
+    /// committed the transaction anyway and left `fs:files:{id}:refs`
+    /// holding `count > 0` for a file whose record and relation markers
+    /// were already gone.
+    ///
+    /// Bounded today -- ids are uuidv7 and never reused, and `attach`
+    /// requires the record to exist -- so this is a latent inconsistency
+    /// rather than live corruption. It is still a swallowed error on the
+    /// exact invariant a previous commit claimed to have made atomic, and
+    /// the cost of noticing it later is that the claim was false.
+    ///
+    /// Read from the source because the failure needs a delete that fails
+    /// while its siblings in the same transaction succeed, which a
+    /// concrete `OxKvStore` will not do on demand. The shape is what
+    /// regressed; the behaviour is not observable single-threaded.
+    #[test]
+    fn delete_file_does_not_swallow_a_delete() {
+        let src = std::fs::read_to_string("src/fs/store.rs").expect("read store.rs");
+        let body = src
+            .split_once("pub async fn delete_file")
+            .expect("delete_file exists")
+            .1
+            .split_once("\n    /// ")
+            .expect("the next doc comment ends the body")
+            .0;
+        assert!(
+            !body.contains("let _ ="),
+            "a delete in delete_file still discards its error:\n{body}"
+        );
+        let mut rest = body;
+        let mut deletes = 0;
+        while let Some(at) = rest.find("tx.delete(") {
+            deletes += 1;
+            let statement = &rest[at..];
+            let end = statement.find(';').expect("a delete statement ends");
+            assert!(
+                statement[..end].contains("store_err"),
+                "a delete in delete_file does not report its error:\n{body}"
+            );
+            rest = &statement[end..];
+        }
+        assert_eq!(deletes, 3, "the record, the refs and the markers");
     }
 
     /// The cascade rows go first, the session key last, in one transaction,
