@@ -997,18 +997,64 @@ impl SnapshotManager {
         Ok(())
     }
 
-    /// Row `(type, id)` pairs `group` currently grants `read` on.
+    /// Row `(type, id)` pairs readable through `group`, at any depth.
+    ///
+    /// This is the decision [`Self::apply_membership_op`] stands in for, so
+    /// it has to be the same question `enforce` asks and not a narrower
+    /// one. It used to ask the narrower one:
+    ///
+    /// ```text
+    /// for (obj, act) in self.policy.rules_for_subject(group).await { … }
+    /// ```
+    ///
+    /// [`Authorizer::rules_for_subject`] is a direct `p`-rule read -- rules
+    /// whose `p.sub` is literally `group` -- so `alice ∈ editors ∈ staff`
+    /// with `p, staff, invoice:1, read` returned nothing for `editors`.
+    /// Replaying `WalOp::GroupAdd { user: alice, group: editors }` then
+    /// resynced no rows at all, and the file `enforce` would have
+    /// authorized never reached alice's replica. That is the same
+    /// direct-vs-transitive asymmetry 77036cb fixed on the rule path
+    /// (`apply_rule_op`'s skip set built from `get_groups_of_user`), and it
+    /// is the same shape of harm: the full rebuild routes every file
+    /// through `visible_rows` -> `authorize_row` and gets this right, so
+    /// the incremental path was weaker than the rebuild.
+    ///
+    /// Inverted relative to a revocation, so less bad than the rule-path bug
+    /// and still worth fixing: the resync here only ever ADDS what
+    /// [`Self::resync_file`] then re-checks through `can_read` /
+    /// `authorize_row`, so widening this set cannot over-include. It only
+    /// decides how much gets re-checked, and a stale-absent file converges
+    /// on the next replay of a membership op or the next full rebuild --
+    /// except that neither is guaranteed to come, which is what makes the
+    /// silent staleness worth closing rather than noting.
+    ///
+    /// Walks the hierarchy with [`Self::implicit_groups`] rather than a
+    /// second traversal, so "the closure of a group under `g`" has exactly
+    /// one definition in this module. Unbounded like that closure, and
+    /// deliberately: it errs toward re-checking MORE rows, which is the
+    /// safe direction for a set that only feeds idempotent resyncs, while
+    /// a depth limit would re-introduce a skip — and a skip is the whole
+    /// bug. The cost is already bounded where it can actually hurt, by
+    /// [`MAX_POLICY_REPLAY_FILES`] over the fan-out itself.
+    ///
+    /// Deduped, because a group and its ancestors commonly share a row and
+    /// every repeated entry is a repeated resync of the same files.
     async fn read_rows_for_group(&self, group: &str) -> Result<Vec<(String, String)>, FsError> {
-        let mut out = Vec::new();
-        for (obj, act) in self.policy.rules_for_subject(group).await {
-            if !act.eq_ignore_ascii_case("read") {
-                continue;
-            }
-            if let Some((ty, rid)) = split_row_obj(&obj) {
-                out.push((ty.to_string(), rid.to_string()));
+        let mut out: std::collections::BTreeSet<(String, String)> =
+            std::collections::BTreeSet::new();
+        let mut subjects = vec![group.to_string()];
+        subjects.extend(self.implicit_groups(group).await);
+        for subject in &subjects {
+            for (obj, act) in self.policy.rules_for_subject(subject).await {
+                if !act.eq_ignore_ascii_case("read") {
+                    continue;
+                }
+                if let Some((ty, rid)) = split_row_obj(&obj) {
+                    out.insert((ty.to_string(), rid.to_string()));
+                }
             }
         }
-        Ok(out)
+        Ok(out.into_iter().collect())
     }
 
     /// Writes the caller's visible file set into `dst`.
@@ -1932,6 +1978,127 @@ mod tests {
         assert!(
             replica_has(&mem, &mgr, "alice", "fs:files:f1:meta").await,
             "a grant an `enforce` would authorize must not be silently absent"
+        );
+        Ok(())
+    }
+
+    /// The membership path's mirror of the two tests above.
+    ///
+    /// `apply_rule_op` got the nested-group fix in 77036cb; the path that
+    /// handles a GROUP MEMBERSHIP change never got it, because
+    /// `read_rows_for_group` resolved the group's rules through
+    /// `rules_for_subject`, which reads rules whose `p.sub` is literally the
+    /// group name and nothing above it. So here `alice ∈ editors ∈ staff`
+    /// with the rule naming `staff`, and the replayed op is the one that
+    /// makes alice a member at all:
+    ///
+    /// ```text
+    /// WalOp::GroupAdd { user: alice, group: editors }
+    /// ```
+    ///
+    /// The old code asked `rules_for_subject("editors")`, found no `p` row
+    /// (the grant names `staff`), resynced nothing, and left the file out of
+    /// alice's replica — while `enforce` authorized it, and while the full
+    /// rebuild, which routes every file through `visible_rows` ->
+    /// `authorize_row`, would have included it. The incremental path being
+    /// weaker than the rebuild is the asymmetry; the shape of the harm is
+    /// under-inclusion rather than the over-inclusion 77036cb fixed, which
+    /// is why it was not a blocker, but it is the same class and it is
+    /// silent.
+    ///
+    /// Seeded by a full rebuild taken while the rule and the OUTER
+    /// membership already exist and only alice's own membership is missing,
+    /// so `!replica_has` is established first: the file is provably absent
+    /// before the replay, and the only thing that can put it there is the
+    /// membership op resolving transitively.
+    #[tokio::test]
+    async fn a_membership_op_resolves_the_groups_ancestor_rules() -> anyhow::Result<()> {
+        let (mgr, policy, mem) = test_manager().await;
+        policy
+            .assign_group("editors".into(), "staff".into())
+            .await?;
+        policy
+            .add_rule("staff".into(), "invoice:1".into(), Action::Read)
+            .await?;
+        mgr.store.save_file(&file_record("f1", "bob")).await?;
+        mgr.store.attach("invoice", "1", "f1").await?;
+        // Alice is in nothing yet, so the rebuild authorizes nothing.
+        mgr.build_full("alice").await?;
+        assert!(!replica_has(&mem, &mgr, "alice", "fs:files:f1:meta").await);
+
+        // Master mutation first, WAL entry second, as the engines append.
+        policy
+            .assign_group("alice".into(), "editors".into())
+            .await?;
+        mgr.wal
+            .append(WalOp::GroupAdd {
+                user: "alice".into(),
+                group: "editors".into(),
+            })
+            .await?;
+        assert_eq!(mgr.replay(1, "alice").await?, ReplayOutcome::Advanced(1));
+        assert!(
+            replica_has(&mem, &mgr, "alice", "fs:files:f1:meta").await,
+            "a grant held by an ANCESTOR of the joined group must reach the \
+             replica; a direct-only rule read resynced no rows and left a \
+             file an `enforce` authorizes silently absent"
+        );
+        assert!(
+            replica_has(&mem, &mgr, "alice", "fs:rel:invoice:1:f1").await,
+            "and it must be attached to the row the ancestor's rule grants"
+        );
+        Ok(())
+    }
+
+    /// The direct rule still resolves, and a rule the ancestor does NOT hold
+    /// does not get conjured in.
+    ///
+    /// The transitive widening is only sound if the group's own rows still
+    /// come through and the answer stays bounded by what the hierarchy
+    /// actually grants; pinning both halves keeps a future "just return
+    /// everything" shortcut from passing.
+    #[tokio::test]
+    async fn a_membership_op_still_resolves_the_groups_own_rules() -> anyhow::Result<()> {
+        let (mgr, policy, mem) = test_manager().await;
+        policy
+            .assign_group("editors".into(), "staff".into())
+            .await?;
+        // Direct grant on the joined group, ancestor grant on another row.
+        policy
+            .add_rule("editors".into(), "invoice:1".into(), Action::Read)
+            .await?;
+        policy
+            .add_rule("staff".into(), "report:9".into(), Action::Read)
+            .await?;
+        mgr.store.save_file(&file_record("f1", "bob")).await?;
+        mgr.store.attach("invoice", "1", "f1").await?;
+        mgr.store.save_file(&file_record("f2", "bob")).await?;
+        mgr.store.attach("report", "9", "f2").await?;
+        mgr.store.save_file(&file_record("f3", "bob")).await?;
+        mgr.store.attach("secret", "7", "f3").await?;
+        mgr.build_full("alice").await?;
+
+        policy
+            .assign_group("alice".into(), "editors".into())
+            .await?;
+        mgr.wal
+            .append(WalOp::GroupAdd {
+                user: "alice".into(),
+                group: "editors".into(),
+            })
+            .await?;
+        assert_eq!(mgr.replay(1, "alice").await?, ReplayOutcome::Advanced(1));
+        assert!(
+            replica_has(&mem, &mgr, "alice", "fs:files:f1:meta").await,
+            "the joined group's own read rows must still resolve"
+        );
+        assert!(
+            replica_has(&mem, &mgr, "alice", "fs:files:f2:meta").await,
+            "and its ancestors' alongside them"
+        );
+        assert!(
+            !replica_has(&mem, &mgr, "alice", "fs:files:f3:meta").await,
+            "a row neither the group nor its ancestors grants stays out"
         );
         Ok(())
     }
