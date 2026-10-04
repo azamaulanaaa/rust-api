@@ -390,7 +390,6 @@ impl S3Client for ObjectStoreClient {
         let stream = res.into_stream().map_err(Self::map_err);
         Ok(crate::fs::s3::ObjectStream {
             size,
-            total: size,
             stream: Box::pin(stream),
         })
     }
@@ -413,12 +412,10 @@ impl S3Client for ObjectStoreClient {
             .get_opts(&path, opts)
             .await
             .map_err(Self::map_err)?;
-        let total = res.meta.size;
         let size = res.range.end.saturating_sub(res.range.start);
         let stream = res.into_stream().map_err(Self::map_err);
         Ok(crate::fs::s3::ObjectStream {
             size,
-            total,
             stream: Box::pin(stream),
         })
     }
