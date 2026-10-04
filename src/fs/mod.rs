@@ -469,13 +469,20 @@ impl FsEngine {
         let Some(rec) = self.store.get_file(file_id).await? else {
             return Err(FsError::NotFound("file not found".into()));
         };
-        if rec.owner_sub == caller_sub {
-            return Ok(true);
-        }
         let rows = self.store.rows_for_file(file_id).await?;
         if rows.is_empty() {
-            return Ok(false);
+            // An unreferenced file is a temp upload, and the temp model is
+            // owner-scoped: `delete_file`'s doc and its `info.count == 0`
+            // gate both say so. Ownership is therefore the WHOLE answer here,
+            // which is what this branch has always meant.
+            return Ok(rec.owner_sub == caller_sub);
         }
+        // A file attached to rows is governed by the ROW policy, including for
+        // the user who uploaded it. Short-circuiting on ownership before this
+        // loop would let an uploader Read or Delete a file attached to a row
+        // they hold no grant on -- so an owner attaching a file to a shared
+        // row would lose the ability to remove it, while a user they never
+        // granted anything to would lose the ability to read it.
         for (ty, rid) in rows {
             if self
                 .policy
@@ -1603,8 +1610,14 @@ mod tests {
         // Read on the row is not write on it: the action is part of the key.
         assert!(!engine.can_access("bob", &id, Action::Delete).await?);
 
-        // The owner always reaches their own file, whatever policy says.
-        assert!(engine.can_access("alice", &id, Action::Delete).await?);
+        // The OWNER is now subject to the row policy like anyone else.
+        // Alice holds Write on invoice:123, not Delete, so a file attached to
+        // that row is not hers to remove. This assertion used to read "the
+        // owner always reaches their own file, whatever policy says", which
+        // is the bug: it let an uploader delete a file another user was
+        // relying on through a row they control.
+        assert!(!engine.can_access("alice", &id, Action::Delete).await?);
+        assert!(engine.can_access("alice", &id, Action::Write).await?);
         // And a policy change made after the fact is seen, which is only
         // true because the handle shares the engine rather than copying it.
         policy
@@ -1612,6 +1625,39 @@ mod tests {
             .await
             .unwrap();
         assert!(!engine.can_access("bob", &id, Action::Read).await?);
+        Ok(())
+    }
+
+    /// Ownership still answers for an UNREFERENCED file — that is the temp
+    /// upload model, and it is the only place ownership grants anything.
+    ///
+    /// The narrowing in `can_access` must not take that with it: `init_upload`
+    /// + `upload_part` + `complete_upload` produces a file attached to no row,
+    /// and its owner must be able to read and delete it without a policy grant.
+    #[tokio::test]
+    async fn the_owner_reaches_their_own_unreferenced_temp_file() -> anyhow::Result<()> {
+        let (engine, _policy) = make_engine_and_policy("alice").await;
+        let id = engine.init_upload(valid_single(), "alice").await?;
+        engine
+            .upload_part(&id, 0, once_body(vec![9u8; 1024]), None, None, "alice")
+            .await?;
+        engine
+            .complete_upload(
+                &id,
+                CompleteRequest {
+                    name: "scratch.txt".into(),
+                    mimetype: "text/plain".into(),
+                },
+                "alice",
+            )
+            .await?;
+
+        // No rows: ownership is the whole answer.
+        assert!(engine.can_access("alice", &id, Action::Read).await?);
+        assert!(engine.can_access("alice", &id, Action::Delete).await?);
+        // And it is still owner-scoped, not world-readable.
+        assert!(!engine.can_access("bob", &id, Action::Read).await?);
+        assert!(!engine.can_access("bob", &id, Action::Delete).await?);
         Ok(())
     }
 
