@@ -31,6 +31,9 @@ pub use super::jwks::SigningKey;
 /// `https://login.microsoftonline.com/{tenantid}/v2.0`).
 const TENANT_PLACEHOLDER: &str = "{tenantid}";
 
+/// Path of the browser session cookie this middleware reads.
+const AUTH_COOKIE: &str = "auth_token";
+
 /// A multi-tenant issuer template: the provider's discovery document
 /// publishes an issuer containing a literal `{tenantid}` placeholder that
 /// each token resolves to its issuing tenant.
@@ -332,57 +335,110 @@ where
         // request's extension-based parse cache, which would collide with a
         // live extensions() borrow held across an array literal.
         let bearer = req.extensions().get::<BearerToken>().cloned().map(|v| v.0);
-        let cookie_token = req.cookie("auth_token").map(|c| c.value().to_string());
+        let cookie_token = req.cookie(AUTH_COOKIE).map(|c| c.value().to_string());
         let token = bearer.or(cookie_token);
-
         Box::pin(async move {
+            // An unusable credential is NOT the same as a missing one, and
+            // this middleware is wrapped over the whole /auth scope --
+            // including /auth/login, /auth/callback and /auth/logout, none of
+            // which take a `Validated<C>`. Hard-failing here made the cookie's
+            // own lifetime the lockout: `callback` sets it with a 7-day
+            // max_age while the token's `exp` is provider-controlled and
+            // typically ~1h, so an hour after login every browser request
+            // carried an expired JWT, `/auth/login` 401'd before its handler
+            // ran, and the user could neither re-authenticate nor clear the
+            // cookie.
+            //
+            // So an unusable credential now degrades to anonymous and the
+            // request proceeds. Routes that need a subject still 401, because
+            // `Validated<C>` is what produces that 401 -- not this
+            // middleware. An invalid token is evidence of an expired session,
+            // not a reason to refuse to serve the endpoints whose entire job
+            // is to establish a new one.
+            //
+            // The precedence above is unaffected: a valid header still wins,
+            // and a stale cookie still cannot shadow it.
+            let mut unusable: Option<String> = None;
+
             if let Some(token) = token {
-                let header = match jsonwebtoken::decode_header(&token) {
-                    Ok(h) => h,
-                    Err(e) => {
-                        return Err(ApiError::InvalidCredentials(Box::new(e)).into());
+                // `Ok` inserts the claims. `Err((reason, true))` is a security decision
+                // and stays a hard 401 -- see the line table below. `Err((reason, false))` is an
+                // unusable *session* and degrades to anonymous below.
+                //
+                // The distinction is load-bearing. A token from a tenant the
+                // allowlist rejects is an attack, and Blocker 1's whole point
+                // is that it fails CLOSED -- so it must not quietly become "no
+                // credential", which would serve every unauthenticated route
+                // with a forged token in hand. An expired `exp` is the opposite:
+                // it is a browser replaying its own dead cookie, and refusing it
+                // locks the user out of the very endpoints that would fix it.
+                let claims = async {
+                    let header = jsonwebtoken::decode_header(&token)
+                        .map_err(|e| (format!("undecodable header: {e}"), true))?;
+
+                    let signing_key = keys
+                        .get(header.kid.as_deref())
+                        .await
+                        .ok_or_else(|| ("no signing key matches kid".to_string(), true))?;
+
+                    // Pin validation to the selected key's own algorithm so a
+                    // token cannot downgrade to an unexpected algorithm. For
+                    // multi-tenant providers, derive the exact expected issuer
+                    // from the token's tid claim first.
+                    let mut validation = validation.clone();
+                    validation.algorithms = vec![signing_key.algorithm];
+                    if let Some(template) = &issuer_template {
+                        let tenant_id = extract_unverified_claim(&token, "tid")
+                            .filter(|t| !t.is_empty())
+                            .ok_or_else(|| ("token has no tenant identifier".to_string(), true))?;
+                        // The issuer is derived from the token's own `tid`, so
+                        // resolving it proves nothing on its own. This check is
+                        // the tenant gate and it fails closed.
+                        let expected = template
+                            .resolve_checked(&tenant_id)
+                            .map_err(|cause| (cause, true))?;
+                        validation.set_issuer(&[expected]);
                     }
-                };
 
-                let Some(signing_key) = keys.get(header.kid.as_deref()).await else {
-                    let cause = format!("no signing key matches kid {:?}", header.kid);
-                    return Err(ApiError::InvalidCredentials(cause.into()).into());
-                };
-
-                // Pin validation to the selected key's own algorithm so a
-                // token cannot downgrade to an unexpected algorithm. For
-                // multi-tenant providers, derive the exact expected issuer
-                // from the token's tid claim first.
-                let mut validation = validation.clone();
-                validation.algorithms = vec![signing_key.algorithm];
-                if let Some(template) = &issuer_template {
-                    let Some(tenant_id) =
-                        extract_unverified_claim(&token, "tid").filter(|t| !t.is_empty())
-                    else {
-                        return Err(ApiError::InvalidCredentials(
-                            "missing tenant identifier".into(),
-                        )
-                        .into());
-                    };
-                    // The issuer is derived from the token's own `tid`, so
-                    // resolving it proves nothing on its own. This check is
-                    // the tenant gate and it fails closed.
-                    let expected = template.resolve_checked(&tenant_id).map_err(|cause| {
-                        tracing::warn!("rejecting token from unknown tenant: {cause}");
-                        ApiError::InvalidCredentials(cause.into())
-                    })?;
-                    validation.set_issuer(&[expected]);
+                    decode::<C>(&token, &signing_key.decoding_key, &validation)
+                        .map(|td| td.claims)
+                        .map_err(|e| (format!("token failed validation: {e}"), false))
                 }
+                .await;
 
-                match decode::<C>(&token, &signing_key.decoding_key, &validation) {
-                    Ok(token_data) => {
-                        req.extensions_mut().insert(token_data.claims);
+                match claims {
+                    Ok(claims) => {
+                        req.extensions_mut().insert(claims);
                     }
-                    Err(e) => return Err(ApiError::InvalidCredentials(Box::new(e)).into()),
+                    Err((reason, hard)) if hard => {
+                        // Fail closed: a token the tenant gate rejects never
+                        // reaches a handler.
+                        return Err(ApiError::InvalidCredentials(reason.into()).into());
+                    }
+                    Err((reason, _)) => {
+                        tracing::warn!(
+                            reason,
+                            "unusable credential; continuing unauthenticated so the public \
+                             auth routes stay reachable"
+                        );
+                        unusable = Some(reason);
+                    }
                 }
             }
 
-            svc.call(req).await
+            let mut resp = svc.call(req).await?;
+            if unusable.is_some() {
+                // Clear the stale cookie on the way out. Without this the
+                // browser keeps replaying an expired JWT on every request
+                // until the next successful login overwrites it.
+                resp.headers_mut().append(
+                    actix_web::http::header::SET_COOKIE,
+                    actix_web::http::header::HeaderValue::from_static(
+                        "auth_token=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax",
+                    ),
+                );
+            }
+            Ok(resp)
         })
     }
 }
@@ -596,7 +652,7 @@ mod tests {
     /// `JwtClaimsMiddlewareService::call`:
     ///
     ///     let bearer = req.extensions().get::<BearerToken>().cloned().map(|v| v.0);
-    ///     let cookie_token = req.cookie("auth_token").map(|c| c.value().to_string());
+    ///     let cookie_token = req.cookie(AUTH_COOKIE).map(|c| c.value().to_string());
     ///     let token = bearer.or(cookie_token);
     ///
     /// and before this test NOTHING in the crate exercised it. Every
@@ -731,6 +787,136 @@ mod tests {
             "a non-Bearer Authorization header is not a credential, and \
              must not authenticate the request"
         );
+
+        Ok(())
+    }
+    /// Regression for the lockout: an unusable credential must degrade to
+    /// anonymous rather than 401, or the cookie becomes the lockout.
+    ///
+    /// `callback` sets `auth_token` with a 7-day `max_age` while the token's own
+    /// `exp` is provider-controlled and typically ~1h. So an hour after login a
+    /// browser sends an expired JWT on *every* request, and because this middleware
+    /// is wrapped over the whole `/auth` scope — including `/auth/login`,
+    /// `/auth/callback` and `/auth/logout`, none of which take a `Validated<C>` —
+    /// a hard 401 there meant the user could neither re-authenticate nor clear the
+    /// cookie. Recovery required deleting cookies by hand.
+    ///
+    /// The degraded request reaches a handler that needs no subject, and carries a
+    /// `Set-Cookie` that clears the dead cookie so the browser stops replaying it.
+    #[tokio::test]
+    async fn an_expired_cookie_does_not_lock_out_the_public_auth_routes() -> anyhow::Result<()> {
+        let (key, enc) = rsa_key("kid-t")?;
+        let server = spawn_jwks(json!({ "keys": [key] })).await;
+
+        let mw = JwtClaimsMiddleware::<TestClaims>::new_with_jks(
+            &format!("{}/jwks", server.uri()),
+            "test-aud",
+            &format!("{}/{{tenantid}}/v2.0", server.uri()),
+        )
+        .await?
+        .with_allowed_tenants(vec!["tenant-guid".to_string()]);
+
+        let svc = actix_web::test::init_service(
+            actix_web::App::new()
+                .wrap(mw)
+                // Stands in for /auth/login and /auth/callback: a handler that
+                // takes no `Validated<C>`, so it must be reachable anonymously.
+                .service(actix_web::web::resource("/auth/login").to(|| async { "redirect" })),
+        )
+        .await;
+
+        // exp in the past, but signed by the key the middleware trusts, so this is
+        // an EXPIRED SESSION rather than a forged token.
+        let expired = sign_rs256(
+            &json!({
+                "sub": "u9",
+                "aud": "test-aud",
+                "iss": format!("{}/tenant-guid/v2.0", server.uri()),
+                "tid": "tenant-guid",
+                "exp": 1_000_000u64,
+            }),
+            "kid-t",
+            &enc,
+        )?;
+
+        let res = actix_web::test::try_call_service(
+            &svc,
+            actix_web::test::TestRequest::get()
+                .uri("/auth/login")
+                .insert_header(("Cookie", format!("auth_token={expired}")))
+                .to_request(),
+        )
+        .await
+        .expect("the expired-cookie request is served, not refused");
+
+        assert_eq!(
+            res.status(),
+            200,
+            "an expired session cookie must not 401 the route that re-authenticates"
+        );
+
+        // And the dead cookie is cleared, so the browser stops replaying it.
+        let cleared = res
+            .headers()
+            .get(actix_web::http::header::SET_COOKIE)
+            .expect("the expired cookie is cleared on the way out")
+            .to_str()?
+            .to_string();
+        assert!(
+            cleared.contains("auth_token=") && cleared.contains("Max-Age=0"),
+            "expected the session cookie to be expired, got: {cleared}"
+        );
+
+        Ok(())
+    }
+
+    /// The degradation is scoped to an expired SESSION. A forged tenant binding is
+    /// an attack, and Blocker 1 exists so it fails CLOSED — it must not become
+    /// "no credential", which would serve unauthenticated routes with a forged
+    /// token in hand.
+    #[tokio::test]
+    async fn a_forged_tenant_still_fails_closed_rather_than_degrading() -> anyhow::Result<()> {
+        let (key, enc) = rsa_key("kid-t")?;
+        let server = spawn_jwks(json!({ "keys": [key] })).await;
+
+        let mw = JwtClaimsMiddleware::<TestClaims>::new_with_jks(
+            &format!("{}/jwks", server.uri()),
+            "test-aud",
+            &format!("{}/{{tenantid}}/v2.0", server.uri()),
+        )
+        .await?
+        .with_allowed_tenants(vec!["tenant-guid".to_string()]);
+
+        let svc = actix_web::test::init_service(
+            actix_web::App::new()
+                .wrap(mw)
+                .service(actix_web::web::resource("/auth/login").to(|| async { "redirect" })),
+        )
+        .await;
+
+        let forged = sign_rs256(
+            &json!({
+                "sub": "attacker",
+                "aud": "test-aud",
+                "iss": format!("{}/tenant-guid/v2.0", server.uri()),
+                "tid": "attacker-guid",
+                "exp": 2000000000u64,
+            }),
+            "kid-t",
+            &enc,
+        )?;
+
+        let res = actix_web::test::try_call_service(
+            &svc,
+            actix_web::test::TestRequest::get()
+                .uri("/auth/login")
+                .insert_header(("Cookie", format!("auth_token={forged}")))
+                .to_request(),
+        )
+        .await;
+
+        let err = res.expect_err("a token from an untrusted tenant must not degrade to anonymous");
+        assert_eq!(err.as_response_error().status_code(), 401);
 
         Ok(())
     }
