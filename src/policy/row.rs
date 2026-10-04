@@ -5,7 +5,7 @@
 
 use async_trait::async_trait;
 
-use super::{Action, Authorizer, PolicyEngine, PolicyError};
+use super::{Action, Authorizer, PolicyError};
 
 /// Row-level authorizer for business entities.
 ///
@@ -38,29 +38,15 @@ pub fn row_object(row_type: &str, row_id: &str) -> String {
     format!("{row_type}:{row_id}")
 }
 
-#[async_trait]
-impl RowAuthorizer for PolicyEngine {
-    async fn authorize_row(
-        &self,
-        sub: &str,
-        row_type: &str,
-        row_id: &str,
-        act: Action,
-    ) -> Result<bool, PolicyError> {
-        self.authorize(sub, row_object(row_type, row_id), act).await
-    }
-
-    async fn require_row(
-        &self,
-        sub: &str,
-        row_type: &str,
-        row_id: &str,
-        act: Action,
-    ) -> Result<(), PolicyError> {
-        self.require(sub, row_object(row_type, row_id), act).await
-    }
-}
-
+/// Row-level checks for business entities.
+///
+/// Implemented only for [`Authorizer`], the read-only handle. It was also
+/// implemented for [`PolicyEngine`](super::PolicyEngine), byte-identically,
+/// and that impl existed only because `fs` had been handed the whole engine
+/// where it only ever reads. The duplication was a second place a row-object
+/// or denial-mapping change had to be applied, and the write-capable impl
+/// meant a consumer holding the engine had no reason to reach for the
+/// handle that actually matched its use.
 #[async_trait]
 impl RowAuthorizer for Authorizer {
     async fn authorize_row(
@@ -107,30 +93,25 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(
-            engine
-                .authorize_row("alice", "invoice", "123", Action::Write)
-                .await
-                .unwrap()
-        );
-        assert!(
-            !engine
-                .authorize_row("alice", "invoice", "123", Action::Read)
-                .await
-                .unwrap()
-        );
-        assert!(
-            engine
-                .require_row("alice", "invoice", "999", Action::Write)
-                .await
-                .is_err()
-        );
-
+        // Rows are checked through the read handle, which is the only impl
+        // of this trait: policy is seeded through the engine above because
+        // writing rules is exactly what the engine is for.
         let auth = engine.authorizer();
         assert!(
             auth.authorize_row("alice", "invoice", "123", Action::Write)
                 .await
                 .unwrap()
+        );
+        assert!(
+            !auth
+                .authorize_row("alice", "invoice", "123", Action::Read)
+                .await
+                .unwrap()
+        );
+        assert!(
+            auth.require_row("alice", "invoice", "999", Action::Write)
+                .await
+                .is_err()
         );
     }
 }

@@ -166,7 +166,7 @@ mod tests {
         let policy_store = build_test_store(&format!("{prefix}-policy")).await;
         let policy = PolicyEngine::init_s3(policy_store).await.unwrap();
         let s3 = ObjectStoreClient::in_memory();
-        FsEngine::from_parts(store, s3, "test-bucket".into(), policy)
+        FsEngine::from_parts(store, s3, "test-bucket".into(), policy.authorizer())
     }
 
     fn session_with_age(id: &str, age_secs: i64, multipart: bool) -> UploadSession {
@@ -469,7 +469,7 @@ mod tests {
         let store = FsStore::new(build_test_store(&orphan_prefix).await);
         let policy =
             PolicyEngine::init_s3(build_test_store(&format!("{orphan_prefix}-p")).await).await?;
-        let engine = FsEngine::from_parts(store, s3.clone(), "b".into(), policy);
+        let engine = FsEngine::from_parts(store, s3.clone(), "b".into(), policy.authorizer());
         // Fresh session referencing live-key: aged but live, must survive.
         let mut sess = session_with_age("sess-live", 60, false);
         sess.s3_key = "files/live-key".into();
@@ -494,8 +494,12 @@ mod tests {
             PolicyEngine::init_s3(build_test_store(&format!("{prefix}-policy")).await).await?;
         let pre: std::sync::Arc<dyn S3Client> =
             std::sync::Arc::new(ObjectStoreClient::new_combined(inner.clone()));
-        let engine_pre =
-            FsEngine::from_parts(store.clone(), pre, "test-bucket".into(), policy.clone());
+        let engine_pre = FsEngine::from_parts(
+            store.clone(),
+            pre,
+            "test-bucket".into(),
+            policy.authorizer(),
+        );
         // Real multipart upload: backend id + durable record exist.
         let file_id = engine_pre
             .init_upload(
@@ -519,7 +523,8 @@ mod tests {
         drop(engine_pre); // restart: RAM multipart states gone.
         let post: std::sync::Arc<dyn S3Client> =
             std::sync::Arc::new(ObjectStoreClient::new_combined(inner));
-        let engine_post = FsEngine::from_parts(store, post, "test-bucket".into(), policy);
+        let engine_post =
+            FsEngine::from_parts(store, post, "test-bucket".into(), policy.authorizer());
         // GC restores the backend upload from the record, aborts it for
         // real, and converges the session plus its record.
         assert_eq!(sweep_once(&engine_post).await?, 1);
@@ -553,7 +558,7 @@ mod tests {
             store,
             Arc::new(FakeS3::new(Vec::new(), false)),
             "b".into(),
-            policy,
+            policy.authorizer(),
         );
         engine
             .store

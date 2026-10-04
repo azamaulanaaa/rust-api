@@ -313,7 +313,9 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
     let fs_engine = FsEngine::init(
         fs_s3_store.clone(),
         &s3_client_config,
-        policy_engine.clone(),
+        // `fs` only ever reads policy, so it gets the read-only handle --
+        // the same one the replica snapshot manager already takes.
+        policy_engine.authorizer(),
     )
     .await?
     .with_token_keys(token_keys)

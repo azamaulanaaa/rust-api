@@ -18,7 +18,7 @@ pub mod token;
 use std::sync::Arc;
 
 use crate::policy::row::RowAuthorizer;
-use crate::policy::{Action, PolicyEngine};
+use crate::policy::{Action, Authorizer};
 use crate::records::{ChangeError, ChangeSink, WalOp};
 
 use error::FsError;
@@ -68,7 +68,17 @@ pub struct FsEngine {
     pub(crate) store: FsStore,
     pub(crate) s3: Arc<dyn S3Client>,
     pub(crate) bucket: String,
-    policy: PolicyEngine,
+    /// Row-level checks only, so this is the read-only
+    /// [`Authorizer`](crate::policy::Authorizer) and not the whole engine.
+    ///
+    /// Every use of `self.policy` in production is `require_row` or
+    /// `authorize_row`, so handing the engine over granted `fs` a write
+    /// capability nothing here should have: `fs` has no change feed for
+    /// policy mutations, so a rule added through this field would reach
+    /// replicas' policy state with no WAL op and no way to replay it.
+    /// `sync::SnapshotManager` already holds the same handle for the same
+    /// reason.
+    policy: Authorizer,
     token_keys: Arc<TokenKeys>,
     /// Change feed for replica sync; `None` disables logging (tests).
     /// Production must wire it: without appends the feed head never
@@ -141,7 +151,7 @@ impl FsEngine {
     pub async fn init(
         s3_store: oxkv::OxKvStore,
         s3_config: &s3::S3ClientConfig,
-        policy: PolicyEngine,
+        policy: Authorizer,
     ) -> Result<Self, FsError> {
         let store = FsStore::primary(s3_store);
         let s3 = s3::build_s3_client(s3_config)
@@ -189,7 +199,7 @@ impl FsEngine {
         store: FsStore,
         s3: Arc<dyn S3Client>,
         bucket: String,
-        policy: PolicyEngine,
+        policy: Authorizer,
     ) -> Self {
         Self {
             store,
@@ -795,9 +805,19 @@ mod tests {
     use super::*;
 
     use crate::fs::object_store::ObjectStoreClient;
+    use crate::policy::PolicyEngine;
     use bytes::Bytes;
 
     async fn make_engine(sub: &str) -> FsEngine {
+        make_engine_and_policy(sub).await.0
+    }
+
+    /// The engine plus the write-capable policy handle.
+    ///
+    /// `FsEngine` only holds an `Authorizer`, so a test that needs to grant a
+    /// rule has to keep the engine that seeded it -- which is the point of
+    /// the narrower field, not a workaround for it.
+    async fn make_engine_and_policy(sub: &str) -> (FsEngine, PolicyEngine) {
         use crate::db::build_test_store;
         let prefix = format!("{}-{sub}", crate::db::test_prefix("fs-engine"));
         let s3_store = build_test_store(&prefix).await;
@@ -806,7 +826,9 @@ mod tests {
         let policy_store = build_test_store(&policy_prefix).await;
         let policy = PolicyEngine::init_s3(policy_store).await.unwrap();
         let s3 = ObjectStoreClient::in_memory();
-        FsEngine::from_parts(store, s3, "test-bucket".to_string(), policy)
+        let engine =
+            FsEngine::from_parts(store, s3, "test-bucket".to_string(), policy.authorizer());
+        (engine, policy)
     }
 
     fn valid_single() -> InitRequest {
@@ -899,7 +921,7 @@ mod tests {
 
     #[tokio::test]
     async fn attach_requires_row_write() -> anyhow::Result<()> {
-        let engine = make_engine("alice").await;
+        let (engine, policy) = make_engine_and_policy("alice").await;
         let id = engine.init_upload(valid_single(), "alice").await?;
         engine
             .upload_part(&id, 0, once_body(vec![1u8; 1024]), None, None, "alice")
@@ -917,8 +939,7 @@ mod tests {
         // no row permission -> forbidden
         assert!(engine.attach("invoice", "123", &id, "alice").await.is_err());
         // grant alice write on invoice:123
-        engine
-            .policy
+        policy
             .add_rule("alice".into(), "invoice:123".into(), Action::Write)
             .await
             .unwrap();
@@ -930,7 +951,7 @@ mod tests {
 
     #[tokio::test]
     async fn row_access_grants_file_read() -> anyhow::Result<()> {
-        let engine = make_engine("alice").await;
+        let (engine, policy) = make_engine_and_policy("alice").await;
         let id = engine.init_upload(valid_single(), "alice").await?;
         engine
             .upload_part(&id, 0, once_body(vec![7u8; 1024]), None, None, "alice")
@@ -948,20 +969,111 @@ mod tests {
         // bob cannot read temp file owned by alice
         assert!(engine.get_metadata(&id, "bob").await.is_err());
         // grant bob read via row
-        engine
-            .policy
+        policy
             .add_rule("alice".into(), "invoice:123".into(), Action::Write)
             .await
             .unwrap();
         engine.attach("invoice", "123", &id, "alice").await?;
-        engine
-            .policy
+        policy
             .add_rule("bob".into(), "invoice:123".into(), Action::Read)
             .await
             .unwrap();
         let meta = engine.get_metadata(&id, "bob").await?;
         assert_eq!(meta.name, "doc.txt");
         Ok(())
+    }
+
+    /// `can_access` is the one FS call site that goes through
+    /// `authorize_row` rather than `require_row`, so it is the one path the
+    /// narrowed field could have broken silently: the trait impl it resolves
+    /// against moved when `policy` became an `Authorizer`.
+    ///
+    /// Denial is asserted as carefully as the grant. A delegation mistake
+    /// that resolved to a permissive default would still return `true` for
+    /// the granted subject, so only the granted assertion would notice
+    /// nothing.
+    #[tokio::test]
+    async fn authorize_row_decides_access_through_the_narrowed_policy_field() -> anyhow::Result<()>
+    {
+        let (engine, policy) = make_engine_and_policy("alice").await;
+        let id = engine.init_upload(valid_single(), "alice").await?;
+        engine
+            .upload_part(&id, 0, once_body(vec![9u8; 1024]), None, None, "alice")
+            .await?;
+        engine
+            .complete_upload(
+                &id,
+                CompleteRequest {
+                    name: "doc.txt".into(),
+                    mimetype: "text/plain".into(),
+                },
+                "alice",
+            )
+            .await?;
+        policy
+            .add_rule("alice".into(), "invoice:123".into(), Action::Write)
+            .await
+            .unwrap();
+        engine.attach("invoice", "123", &id, "alice").await?;
+
+        // A linked row with no rule for bob is a deny, not an error.
+        assert!(!engine.can_access("bob", &id, Action::Read).await?);
+
+        policy
+            .add_rule("bob".into(), "invoice:123".into(), Action::Read)
+            .await
+            .unwrap();
+        assert!(engine.can_access("bob", &id, Action::Read).await?);
+        // Read on the row is not write on it: the action is part of the key.
+        assert!(!engine.can_access("bob", &id, Action::Delete).await?);
+
+        // The owner always reaches their own file, whatever policy says.
+        assert!(engine.can_access("alice", &id, Action::Delete).await?);
+        // And a policy change made after the fact is seen, which is only
+        // true because the handle shares the engine rather than copying it.
+        policy
+            .remove_rule("bob".into(), "invoice:123".into(), Action::Read)
+            .await
+            .unwrap();
+        assert!(!engine.can_access("bob", &id, Action::Read).await?);
+        Ok(())
+    }
+
+    /// `FsEngine` holds the read-only handle, not the write-capable engine.
+    ///
+    /// Every production use of the field is `require_row`/`authorize_row`, so
+    /// the engine was a grant `fs` did not need and should not have had: it
+    /// has no change feed for policy mutations, so a rule added through it
+    /// would reach replicas with no WAL op to replay. Asserting the field's
+    /// type is the only way to keep that true -- every behavioural test here
+    /// passes either way, because the handle and the engine agree.
+    #[test]
+    fn the_policy_field_is_the_read_only_handle() {
+        let src = std::fs::read_to_string("src/fs/mod.rs").expect("read src/fs/mod.rs");
+        let field = src
+            .lines()
+            .find(|line| line.trim_start().starts_with("policy: "))
+            .expect("FsEngine declares a policy field");
+        assert_eq!(
+            field.trim(),
+            "policy: Authorizer,",
+            "FsEngine's policy field must be the read-only Authorizer"
+        );
+
+        // And there is exactly one `RowAuthorizer` impl in the crate, for
+        // that handle.
+        let row = std::fs::read_to_string("src/policy/row.rs").expect("read src/policy/row.rs");
+        let impls: Vec<&str> = row
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("impl RowAuthorizer for"))
+            .collect();
+        assert_eq!(
+            impls,
+            vec!["impl RowAuthorizer for Authorizer {"],
+            "RowAuthorizer must be implemented once, for the handle whose \
+             capability matches the trait"
+        );
     }
 
     #[tokio::test]
@@ -1068,11 +1180,9 @@ mod tests {
         use crate::sync::wal::Wal;
 
         let wal = Wal::new(crate::db::build_test_store(&crate::db::test_prefix("fs-wal")).await);
-        let engine = make_engine("alice")
-            .await
-            .with_change_sink(Arc::new(wal.clone()));
-        engine
-            .policy
+        let (engine, policy) = make_engine_and_policy("alice").await;
+        let engine = engine.with_change_sink(Arc::new(wal.clone()));
+        policy
             .add_rule("alice".into(), "invoice:123".into(), Action::Write)
             .await
             .unwrap();

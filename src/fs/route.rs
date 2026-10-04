@@ -373,7 +373,7 @@ mod tests {
         let fs_prefix = crate::db::test_prefix("fs-route-store");
         let store = FsStore::new(build_test_store(&fs_prefix).await);
         let s3 = ObjectStoreClient::in_memory();
-        let engine = FsEngine::from_parts(store, s3, "test-bucket".into(), policy);
+        let engine = FsEngine::from_parts(store, s3, "test-bucket".into(), policy.authorizer());
         Ok(Fixture {
             server,
             enc,
