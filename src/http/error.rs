@@ -118,6 +118,7 @@ impl ResponseError for ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::production_source;
 
     /// Reads a source file's production code: everything before the
     /// column-0 `#[cfg(test)]` module, with comment lines dropped.
@@ -127,64 +128,6 @@ mod tests {
     /// file's test module, and this walk reads every file under `src`. The
     /// `trim_start` variant stopped at the first such item -- `limits.rs`
     /// carries two, at `:171` and `:203`, so the whole `RateLimit`
-    /// middleware was invisible to the scan below -- which is why a
-    /// hand-rolled `json!({"error": ...})` anywhere past that line read as
-    /// "one construction site" without being looked at.
-    fn production_source(path: &str) -> String {
-        let src = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
-        let mut out = String::new();
-        for line in src.lines() {
-            if line.trim_start().starts_with("//") {
-                continue;
-            }
-            if line == "#[cfg(test)]" {
-                break;
-            }
-            out.push_str(line);
-            out.push('\n');
-        }
-        out
-    }
-
-    /// A file shaped like `limits.rs`: production code, an *indented*
-    /// `#[cfg(test)]` on a single test-only item, more production code, then
-    /// the real test module at column 0.
-    const FIXTURE: &str = r#"pub fn before() {}
-    #[cfg(test)]
-    pub(crate) fn test_only_item() {}
-pub fn after() {}
-#[cfg(test)]
-mod tests {}
-"#;
-
-    /// The helper itself: it walks `src`, so a truncated scan is a silently
-    /// weakened guard rather than a failing one. See the identical fixture
-    /// test in `records::tests`, which is the twin of this helper.
-    #[test]
-    fn production_source_does_not_stop_at_an_indented_cfg_test() {
-        let path = std::env::temp_dir().join(format!(
-            "rust-api-error-prod-source-{}-{}.rs",
-            std::process::id(),
-            base64::Engine::encode(
-                &base64::engine::general_purpose::URL_SAFE_NO_PAD,
-                rand::random::<[u8; 8]>(),
-            )
-        ));
-        std::fs::write(&path, FIXTURE).expect("write the fixture");
-
-        let src = production_source(path.to_str().expect("utf-8 path"));
-        let _ = std::fs::remove_file(&path);
-
-        assert!(
-            src.contains("pub fn after()"),
-            "an indented #[cfg(test)] gates one item, not the rest of the file: {src}"
-        );
-        assert!(
-            !src.contains("mod tests"),
-            "the column-0 module is the stop point: {src}"
-        );
-    }
-
     /// The error envelope is built in exactly one place.
     ///
     /// This crate has two `ResponseError` implementations -- `ApiError` for
