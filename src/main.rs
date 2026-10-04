@@ -1,13 +1,13 @@
-//! Executable entry point for the rust-api starter-kit server.
+//! Executable entry point for the rust-api starter kit server.
 //!
-//! `serve` loads TOML configuration, initializes the OIDC client and Casbin
-//! policy engine, registers their API modules onto an
-//! [`rust_api::http::ApiService`], and starts the HTTP listener. The
-//! `policy export/import` subcommands manage policy data as JSON for
-//! backups and migrations.
+//! `serve` loads the TOML configuration. It starts the OIDC client and the
+//! Casbin policy engine. It registers their API modules on an
+//! [`rust_api::http::ApiService`]. It starts the HTTP listener. The
+//! `policy export` and `policy import` subcommands manage policy data as
+//! JSON, for backups and migrations.
 
-// The deny level comes from [lints.clippy] in Cargo.toml (it applies to
-// this target too); this attribute only opens the test escape hatch.
+// Cargo.toml sets the deny level through [lints.clippy]. The level applies to
+// this target too. This attribute only opens the test escape hatch.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 use std::{
@@ -58,11 +58,13 @@ enum Command {
     },
 }
 
-/// Resolves capability-token signing keys from `[capability]`.
+/// Resolves the signing keys of the capability token from `[capability]`.
 ///
-/// Config validation already rejected malformed hex; a missing secret
-/// falls back to an ephemeral OS-RNG key with a warning (tokens die
-/// with the process — acceptable for dev, a misconfiguration in prod).
+/// The check of the config already refused a secret that is not hex. A
+/// secret that is absent falls back to a key from the OS random number
+/// generator. That key lives only in this run of the process. The server
+/// writes a warning. The tokens die with the process, which is fine in
+/// development and a mistake in production.
 fn resolve_token_keys(config: &config::Config) -> anyhow::Result<TokenKeys> {
     match &config.capability.secret {
         Some(current) => TokenKeys::from_hex(current, config.capability.previous_secret.as_deref())
@@ -76,35 +78,39 @@ fn resolve_token_keys(config: &config::Config) -> anyhow::Result<TokenKeys> {
     }
 }
 
-/// Policy-store management actions (S3-only).
+/// Actions that manage the policy store. The store must be S3.
 #[derive(Subcommand, Debug)]
 enum PolicyAction {
-    /// Write every stored policy rule to a JSON file (S3 prefix from --config).
+    /// Writes every stored policy rule to a JSON file. The S3 prefix comes
+    /// from `--config`.
     Export {
-        /// Path of the TOML config file (provides [s3] + [database].prefix).
+        /// Path of the TOML config file. It provides `[s3]` and
+        /// `[database].prefix`.
         #[arg(short, long)]
         config: PathBuf,
-        /// Output JSON file.
+        /// Path of the output JSON file.
         #[arg(long)]
         out: PathBuf,
     },
-    /// Load policy rules from a JSON file into a store (S3 prefix from --config).
+    /// Reads policy rules from a JSON file and loads them into a store. The
+    /// S3 prefix comes from `--config`.
     Import {
-        /// Path of the TOML config file (provides [s3] + [database].prefix).
+        /// Path of the TOML config file. It provides `[s3]` and
+        /// `[database].prefix`.
         #[arg(short, long)]
         config: PathBuf,
-        /// Input JSON file.
+        /// Path of the input JSON file.
         #[arg(long)]
         input: PathBuf,
     },
 }
 
-/// Projects the config's `[s3]` section into the storage-agnostic
-/// [`S3ClientConfig`] the engine and store factory consume.
+/// Turns the `[s3]` section of the config into the [`S3ClientConfig`] that
+/// the engine and the store factory use.
 ///
-/// The binary keeps its own [`config::S3Config`] so the library stays
-/// decoupled from the config file format; this is the single place the
-/// two are translated.
+/// The binary keeps its own [`config::S3Config`]. That keeps the library
+/// separate from the format of the config file. This function is the only
+/// place where the code translates between the two.
 fn s3_client_config(cfg: &config::Config) -> S3ClientConfig {
     S3ClientConfig {
         bucket: cfg.s3.bucket.clone(),
@@ -116,19 +122,20 @@ fn s3_client_config(cfg: &config::Config) -> S3ClientConfig {
     }
 }
 
-/// Object prefix for one domain under the configured `[database].prefix`.
+/// Object prefix for one domain, under the `[database].prefix` of the config.
 ///
-/// `db_prefix` is the already-trimmed root prefix. Every store the server
-/// builds is `{db_prefix}/{domain}` in the single configured bucket:
-/// `policy`, `fs`, `wal`, and (under
-/// [`SnapshotManager`](rust_api::sync::snapshot::SnapshotManager))
-/// `u/{sha256-hex(sub)}` per user.
+/// `db_prefix` is the root prefix, already trimmed. Every store that the
+/// server builds is `{db_prefix}/{domain}` in the one configured bucket.
+/// The domains are `policy`, `fs`, and `wal`. For each user, the domain is
+/// `u/{sha256-hex(sub)}`. The user domains come from
+/// [`SnapshotManager`](rust_api::sync::snapshot::SnapshotManager).
 fn domain_prefix(db_prefix: &str, domain: &str) -> String {
     format!("{db_prefix}/{domain}")
 }
 
-/// Bootstraps the server: loads configuration, initializes the OIDC client
-/// and policy engine, registers their API modules, and starts listening.
+/// Starts the server. The function loads the configuration. It starts the
+/// OIDC client and the policy engine. It registers their API modules. It
+/// starts the listener.
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -139,8 +146,8 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-/// One-line description of what is asking for the lease, for the failure
-/// message when it is already held.
+/// One line that names the action which asks for the lease. The line goes
+/// into the failure message when another process already holds the lease.
 fn policy_action_name(action: &PolicyAction) -> &'static str {
     match action {
         PolicyAction::Export { .. } => "policy export",
@@ -148,30 +155,32 @@ fn policy_action_name(action: &PolicyAction) -> &'static str {
     }
 }
 
-/// Runs `policy export` / `policy import` against the configured prefix.
+/// Runs `policy export` or `policy import` on the configured prefix.
 ///
-/// Both subcommands build an `OxKvStore`, and building one CAS-bumps
-/// `ownership.json` and takes an epoch. That is the same operation the
-/// server performs at startup, and against a running server it *fences*
-/// it. The server only finds out at its next policy write, which fails
-/// `StoreError::Fenced`, trips `note_primary_loss`, and sets a latch that
-/// nothing resets -- so `/ready`, which gates on `!fencing::primary_loss()`,
-/// goes 503 and the instance stays out of rotation. A backup that exits 0
-/// had drained the primary.
+/// Both subcommands build an `OxKvStore`. Building a store does a CAS bump
+/// on `ownership.json` and takes an epoch. The server does the same
+/// operation at startup. So the command *fences* a running server. The
+/// server finds out at its next write to the policy. That write fails
+/// with `StoreError::Fenced`. The write calls `note_primary_loss`, which
+/// sets a latch that nothing clears. Then `/ready`, which checks
+/// `!fencing::primary_loss()`, returns 503. The instance stays out of the
+/// rotation. So a backup that finished with status 0 took the primary
+/// out of service.
 ///
-/// The README warns about this for `import` and says nothing for `export`,
-/// which is the worse half: export is read-only and reads like the safe
-/// direction of the documented backup procedure.
+/// The README warns about this for `import`. It says nothing about
+/// `export`. That is the worse half. The `export` command only reads. It
+/// looks like the safe direction of the documented backup procedure.
 ///
-/// So both claim the writer lease first, before any store is built, exactly
-/// as `serve` does. When a live server holds it, the command refuses and
-/// the operator is told which prefix and which instance, instead of
-/// silently displacing a healthy writer.
+/// So both subcommands claim the writer lease first. They do it before
+/// they build any store, in the same way as `serve`. When a live server
+/// holds the lease, the command refuses. The message then names the prefix
+/// and the instance. That replaces a quiet displacement of a healthy
+/// writer.
 async fn run_policy_command(action: PolicyAction) -> anyhow::Result<()> {
     let purpose = policy_action_name(&action);
-    // Both halves pulled out before the match that consumes the action, so
-    // each branch below works from the path it was handed rather than from
-    // an `Option` rebuilt out of the enum.
+    // Both values come out before the match that takes the action. So
+    // each branch below uses the path that it was given, instead of an
+    // `Option` that the code builds again from the enum.
     let file = match &action {
         PolicyAction::Export { out, .. } => out.clone(),
         PolicyAction::Import { input, .. } => input.clone(),
@@ -184,9 +193,11 @@ async fn run_policy_command(action: PolicyAction) -> anyhow::Result<()> {
     let s3_cfg = s3_client_config(&cfg);
     let db_prefix = cfg.database.prefix.trim_matches('/').to_string();
 
-    // BEFORE any store: opening one takes an epoch, so checking afterwards
-    // would already have fenced the incumbent. No renewer is spawned -- this
-    // process is short-lived, and the lease is handed straight back below.
+    // This happens BEFORE the code builds any store. Opening a store
+    // takes an epoch. So a check after that point would already have
+    // fenced the process that holds the lease. No renewer task starts here.
+    // This process ends soon. The function below gives the lease straight
+    // back.
     let (_lost, guard) = claim_writer_lease(
         &s3_cfg,
         &db_prefix,
@@ -200,8 +211,8 @@ async fn run_policy_command(action: PolicyAction) -> anyhow::Result<()> {
         PolicyAction::Import { .. } => import_policy(&s3_cfg, &db_prefix, &file).await,
     };
 
-    // Hand the prefix back even when the work failed, so a failed export
-    // does not leave the next one waiting out a TTL.
+    // Give the prefix back, even when the work failed. Otherwise a
+    // failed export makes the next one wait out the TTL.
     if let Some(guard) = guard {
         guard.release().await;
     }
@@ -225,8 +236,8 @@ async fn export_policy(s3_cfg: &S3ClientConfig, db_prefix: &str, out: &Path) -> 
     Ok(())
 }
 
-/// Loads policy rules from `input` into the store, announcing them on the
-/// change feed so running replicas converge.
+/// Loads the policy rules from `input` into the store. The function announces
+/// them on the change feed, so that the replicas that run converge.
 async fn import_policy(
     s3_cfg: &S3ClientConfig,
     db_prefix: &str,
@@ -249,8 +260,8 @@ async fn import_policy(
 /// Runs the HTTP listener until stopped.
 async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
     let config = config::Config::try_from(config_path)?;
-    // Resolve everything that borrows `config` before it is partially moved
-    // into the module configs below.
+    // Resolve every value that borrows `config`, before the code moves
+    // parts of `config` into the configs of the modules below.
     let token_keys = resolve_token_keys(&config)?;
     let s3_client_config = s3_client_config(&config);
     let db_prefix = config.database.prefix.trim_matches('/').to_string();
@@ -279,18 +290,20 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
     .await?;
     let oidc_api_module = OidcApiModule::<Claims>::init(oidc_client).await?;
 
-    // Claim the prefix BEFORE building any store: opening an OxKvStore
-    // takes an epoch, so a check afterwards would already have displaced
-    // the incumbent. Every prefix-scoped store built below (policy, fs,
-    // wal, and each per-user replica) then lives under this one lease.
+    // Claim the prefix BEFORE the code builds any store. Opening an
+    // OxKvStore takes an epoch. So a check after that point would already
+    // have displaced the process that holds the lease. Every store that is
+    // built below, which covers policy, fs, wal, and each replica of a user,
+    // then lives under this one lease.
     //
-    // `lease_guard` is held for the rest of `serve`, so the lease is
-    // renewed while serving, and released explicitly on the way out -- see
-    // the await after `start` below.
+    // `serve` holds `lease_guard` until the function returns. So the lease
+    // renews while the server serves traffic. The function also releases it
+    // at the end. See the await after `start` below.
     let (lease_lost, lease_guard) =
         claim_writer_lease(&s3_client_config, &db_prefix, lease_ttl, "serve").await?;
 
-    // Single bucket, prefix-scoped OxKvStores per domain (scalable, no local files).
+    // One bucket. The OxKVStores use one prefix per domain, so they can
+    // grow. The server keeps no local files.
     let policy_store =
         rust_api::db::build_s3_store(&s3_client_config, &domain_prefix(&db_prefix, "policy"))
             .await
@@ -313,20 +326,23 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
     let fs_engine = FsEngine::init(
         fs_s3_store.clone(),
         &s3_client_config,
-        // `fs` only ever reads policy, so it gets the read-only handle --
-        // the same one the replica snapshot manager already takes.
+        // `fs` only reads the policy, so it gets the read-only handle. It
+        // is the same handle that the manager of the replica snapshots
+        // already takes.
         policy_engine.authorizer(),
     )
     .await?
     .with_token_keys(token_keys)
     .with_change_sink(Arc::new(wal.clone()));
-    // GC: expire abandoned multipart uploads every hour (24h TTL)
+    // Garbage collection. The server removes multipart uploads that
+    // were never finished, every hour. The TTL is 24 hours.
     rust_api::fs::gc::spawn(std::sync::Arc::new(fs_engine.clone()));
     let fs_api_module = FsApiModule::new(fs_engine, oidc_api_module.middleware());
 
-    // Per-user replica snapshots: master stays the write path, versioned
-    // `{prefix}/u/{sub}/{seq}` prefixes are filtered read replicas served
-    // over `/sync/db/` for oxkv readers (see `sync::snapshot`).
+    // Snapshots of the replica of each user. The master stays the write
+    // path. The versioned prefixes `{prefix}/u/{sub}/{seq}` are read replicas
+    // that filter the data. The server serves them through `/sync/db/` for
+    // the oxkv readers. See `sync::snapshot`.
     let replica_objects: Arc<dyn object_store::ObjectStore> = Arc::new(
         rust_api::fs::object_store::s3_builder(&s3_client_config)
             .build()
@@ -339,16 +355,18 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
     } else {
         FsStore::new(fs_s3_store.clone())
     };
-    // The rebuild queue is created here so the receiving end can be drained by
-    // a worker pool. `POST /sync/sync` runs bounded incremental replays inline
-    // and *queues* full rebuilds, so without the pool a subject that needs a
-    // recalc would report `pending` forever and never converge.
+    // The function creates the queue of rebuilds here, so that a pool
+    // of workers can empty it. `POST /sync/sync` runs a bounded set of
+    // incremental replays in the request, and it *queues* the full rebuilds.
+    // Without the pool, a subject that needs a new calculation would report
+    // `pending` forever. It would never converge.
     let (builds, build_jobs) = rust_api::sync::snapshot::BuildQueue::new();
     let snapshot_manager = SnapshotManager::new(
         rust_api::sync::snapshot::SnapshotDeps {
             wal: wal.clone(),
             store: master_store,
-            // Replicas only read policy, so hand over the read-only view.
+            // Replicas only read the policy, so the code gives them the
+            // read-only view.
             policy: policy_engine.authorizer(),
             object_store: replica_objects,
             builds,
@@ -356,9 +374,11 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
         db_prefix,
         rust_api::sync::snapshot::ReplicaBackend::ObjectStore,
     );
-    // Deliberately small: each build streams its diff, so memory tracks the
-    // size of a change rather than a replica, but it still scans the master and
-    // writes to S3. This bounds object-store pressure as much as CPU.
+    // The size is small on purpose. Each build sends its own set of
+    // changes, so the memory use follows the size of a change and not the
+    // size of a replica. The build still reads the master and writes to S3.
+    // So this size limits the load on the object store as much as it limits
+    // the use of the CPU.
     rust_api::sync::snapshot::BuildPool::new(build_jobs)
         .spawn(std::sync::Arc::new(snapshot_manager.clone()), 2);
     let sync_api_module = SyncApiModule::with_download_gate(
@@ -368,33 +388,37 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
     );
 
     let listen_addr = SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), config.listen_port);
-    // Readiness fails when the policy lock is wedged (a writer stuck
-    // holding it) or when the single-writer lease is lost, which means a
-    // successor now owns the prefix and this process must stop taking
-    // traffic. Startup itself already gates on S3/OIDC/JWKS/lease.
+    // The readiness check fails when the policy lock is stuck, which
+    // happens when a writer still holds it. It also fails when the
+    // single-writer lease is lost. A lost lease means that a successor now
+    // owns the prefix. This process must stop taking traffic. The startup of
+    // the server already checks S3, OIDC, JWKS, and the lease.
     let readiness: rust_api::http::health::ReadyCheck = Arc::new({
         let policy_engine = policy_engine.clone();
         move || {
-            // Three independent reasons this instance cannot serve writes,
-            // any one of which is enough to take it out of rotation:
+            // Three separate reasons mean that this instance cannot serve
+            // writes. Any one of them is enough to take it out of the
+            // rotation:
             //
-            // - the policy lock is held, so reads would block;
-            // - the single-writer lease was lost, meaning a peer took the
-            //   prefix cooperatively;
-            // - a primary prefix was fenced outright, which is the same
-            //   condition arriving without cooperation (an older build, a
-            //   `writer_lease_ttl_secs = 0` deployment, an operator running
-            //   `policy import` against a live prefix). The lease check
-            //   cannot see that, so `fencing` reports it separately.
+            // - The policy lock is held, so reads would block.
+            // - The single-writer lease was lost. A peer took the prefix
+            //   with the agreement of both sides.
+            // - A primary prefix was fenced without agreement. This is the
+            //   same condition in another form. An older build causes it. So
+            //   does a deployment with `writer_lease_ttl_secs = 0`. So does
+            //   an operator who runs `policy import` against a prefix that
+            //   is live. The check of the lease cannot see this, so
+            //   `fencing` reports it on its own.
             policy_engine.is_unlocked()
                 && !lease_lost.load(std::sync::atomic::Ordering::Relaxed)
                 && !rust_api::fencing::primary_loss()
         }
     });
-    // Built first so the listener can be started as the last fallible step:
-    // anything that fails after the lease is claimed but before the server
-    // is listening takes the early-error path, where the guard's `Drop`
-    // best-effort release is all there is.
+    // The function builds the server first, so that it can start the
+    // listener as the last step that can fail. Anything that fails after
+    // the lease is claimed and before the server listens takes the path of
+    // the early error. On that path, the best-effort release of the `Drop`
+    // of the guard is all that there is.
     let served = ApiService::new()
         .with_cors_origins(config.http.allowed_origins.clone())
         .with_rate_limit(rust_api::limits::TokenBucket::new(
@@ -410,37 +434,41 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
         .start(listen_addr.into())
         .await;
 
-    // The orderly release, awaited. `start` returns on SIGTERM (the drain
-    // path), so this is where the lease has to go back: dropping the guard
-    // only *makes* the release runnable, and the runtime that would poll it
-    // is about to be dropped too. Skipping this left the record in place,
-    // so a replacement pod read it as a live lease and CrashLoopBackOffs
-    // until the TTL expired -- on every graceful shutdown, and defeating
-    // the rolling-restart handover this lease exists for.
+    // This is the orderly release, and the code awaits it. `start` returns
+    // on SIGTERM, which is the path that drains the server. So this is the
+    // place where the lease must go back. Dropping the guard only *makes*
+    // the release runnable. The runtime that would poll the release is about
+    // to be dropped too. Code that skipped this left the record in place. So
+    // a replacement pod read it as a live lease. The pod then entered
+    // CrashLoopBackOff until the TTL expired. That happened on every clean
+    // shutdown. It also defeated the handover on a rolling restart, which is
+    // the one thing that this lease exists for.
     //
-    // Before the telemetry flush, so the release's own log lines reach the
-    // collector.
+    // This runs before the flush of the telemetry, so that the log lines of
+    // the release reach the collector.
     if let Some(guard) = lease_guard {
         guard.release().await;
     }
 
     served?;
 
-    // Explicit flush on the normal exit path: pending spans and metric
-    // points are delivered, and failures are surfaced instead of silently
-    // dropped (the Drop fallback remains for early-error paths).
+    // This flushes the telemetry on the normal exit path. The spans and
+    // the metric points that are still pending are then delivered. A
+    // failure is reported, instead of being dropped without a word. The
+    // `Drop` fallback remains, for the paths that end in an error.
     telemetry.shutdown()?;
 
     Ok(())
 }
 
-/// Why the writer lease could not be claimed, for the operator running
-/// `purpose` against a prefix a live server already owns.
+/// Why the writer lease could not be claimed. The text goes to the operator
+/// who runs `purpose` against a prefix that a live server already owns.
 ///
-/// The failure being prevented is invisible from the CLI: the command
-/// opens a second writer handle, the server is fenced, and it drains on
-/// its next policy write via a latch nothing resets. A command that exits
-/// non-zero with this text has changed nothing.
+/// The failure that the message prevents is invisible from the command
+/// line. The command opens a second writer handle. The server is fenced.
+///    The server drains on its next write to the policy, through a latch that
+/// nothing clears. A command that exits with a status that is not zero and
+/// prints this text has changed nothing.
 fn lease_refused_message(purpose: &str, db_prefix: &str) -> String {
     format!(
         "cannot run `{purpose}`: it opens a second writer handle on \
@@ -450,23 +478,24 @@ fn lease_refused_message(purpose: &str, db_prefix: &str) -> String {
     )
 }
 
-/// Claims the single-writer lease for `db_prefix` and starts renewing it.
+/// Claims the single-writer lease for `db_prefix` and starts the renewal.
 ///
-/// Returns the flag to gate `/ready` on plus a guard that must be held for
-/// the server's lifetime: the guard stops renewal when released, and
-/// [`LeaseGuard::release`](rust_api::lease::LeaseGuard::release) hands the
-/// prefix back, which is what makes a rolling restart hand over without a
-/// TTL wait. Callers must await the release rather than drop the guard --
-/// see the guard's docs for what dropping actually achieves at process
-/// exit.
+/// The function returns the flag for the check of `/ready`. It also
+/// returns a guard that the caller must hold for the run of the server.
+/// Releasing the guard stops the renewal.
+/// [`LeaseGuard::release`](rust_api::lease::LeaseGuard::release) gives the
+/// prefix back. That is what lets a rolling restart hand the prefix over
+/// without a wait for the TTL. A caller must await the release. It must
+/// not drop the guard. The docs of the guard say what dropping does at the
+/// end of the process.
 ///
-/// A `ttl_secs` of `0` disables the lease (documented single-node escape
-/// hatch) and yields a flag that is never set.
+/// A `ttl_secs` of `0` disables the lease. That is the documented way to
+/// run one node. The flag that the function returns then never gets set.
 ///
 /// `purpose` names the caller in the failure message. Both policy
-/// subcommands pass their own name, because "another writer holds
-/// `oxkv`" is a confusing thing to read while running a backup and a
-/// confusing thing to read while serving traffic.
+/// subcommands pass their own name. The text "another writer holds
+/// `oxkv`" is hard to read while a backup runs. It is also hard to read
+/// while the server serves traffic.
 async fn claim_writer_lease(
     s3_cfg: &S3ClientConfig,
     db_prefix: &str,
@@ -496,8 +525,9 @@ async fn claim_writer_lease(
         ttl_secs,
         "holding single-writer lease for {db_prefix:?}"
     );
-    // Renew at a third of the TTL: two consecutive missed renewals still
-    // leave a full TTL of headroom before a peer would consider us stale.
+    // Renew at one third of the TTL. Two renewals that fail in a row
+    // still leave a whole TTL of time before a peer sees this process
+    // as stale.
     let (lost, guard) = rust_api::lease::spawn_renewer(
         lease,
         std::time::Duration::from_secs(ttl_secs / 3).max(std::time::Duration::from_secs(1)),
@@ -505,8 +535,9 @@ async fn claim_writer_lease(
     Ok((lost, Some(guard)))
 }
 
-/// The composition root was untestable, so these three pure functions were
-/// the parts most likely to rot unnoticed and had no coverage at all.
+/// The main code of the crate had no test, so the code most likely to fail
+/// without a report was in the three pure functions here. Those three
+/// functions had no test at all.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -514,27 +545,29 @@ mod tests {
 
     /// Builds a `Config` from a TOML document.
     ///
-    /// Parsing the real document rather than assembling a struct literal
-    /// means these tests also cover the deserialization path the binary
-    /// actually uses -- every field name, every `#[serde(default)]`, and
-    /// the validation that refuses to start on a bad value.
+    /// The function parses the real document. It does not build a struct in
+    /// the code. So these tests also cover the path of the deserialization
+    /// that the binary uses. That covers every field name, every
+    /// `#[serde(default)]`, and the check that refuses to start on a bad
+    /// value.
     ///
-    /// Through [`Config::parse_toml`] rather than `Config::try_from`, which
-    /// is the one deliberate exception: `try_from` overlays the
-    /// `RUST_API_*` process environment, and `cargo test` inherits the
-    /// developer's shell. The README's own run instructions export
-    /// `RUST_API_CLIENT_SECRET`, so `capability_keys_prefer_the_configured_
-    /// secret` and `s3_config_projection_carries_every_field` both failed
-    /// for anyone who followed them -- the configured-secret assertion
-    /// resolved the environment's secret instead of the fixture's, and the
-    /// S3 projection read `env-ak` where the fixture said `key`. (Verified:
-    /// under `RUST_API_S3_ACCESS_KEY_ID=env-ak` both fail on the old
-    /// fixture and pass on this one.)
+    /// The function calls [`Config::parse_toml`], not `Config::try_from`.
+    /// That is the one deliberate exception. `try_from` overlays the
+    /// process environment variables `RUST_API_*`, and `cargo test` inherits
+    /// the shell of the developer. The run instructions in the README export
+    /// `RUST_API_CLIENT_SECRET`. So `capability_keys_prefer_the_configured_
+    /// secret` and `every_s3_field_reaches_the_store_config` both failed for
+    /// anyone who followed those instructions. The check of the configured
+    /// secret then read the secret of the environment instead of the secret
+    /// of the test data. The check of the projection then read `env-ak`
+    /// instead of the `key` of the test data. This was checked. With
+    /// `RUST_API_S3_ACCESS_KEY_ID=env-ak`, both tests fail with the old test
+    /// data and pass with the new test data.
     ///
-    /// The loader itself is still covered, in
-    /// `config::tests::the_loader_reads_a_file_and_applies_the_overlay`,
-    /// which asserts only on fields with no environment override so it
-    /// holds whatever the shell carries.
+    /// The loader itself still has a test. That test is
+    /// `config::tests::the_loader_reads_a_file_and_applies_the_overlay`. It
+    /// checks only the fields that have no environment variable, so it
+    /// applies whatever the shell holds.
     fn config_from(toml: &str) -> Config {
         Config::parse_toml(toml).expect("config parses")
     }
@@ -559,24 +592,27 @@ force_path_style = true
 
     /// Every store is `{db_prefix}/{domain}` in one bucket.
     ///
-    /// Worth pinning because a stray slash produces a *different* prefix
-    /// rather than an error: the server would open a fresh, empty policy or
-    /// file store and appear to have lost all data.
+    /// The test pins this because a slash in the wrong place makes a
+    /// *different* prefix instead of an error. The server would then open a
+    /// new policy store or file store that is empty. It would appear to have
+    /// lost all data.
     #[test]
-    fn domain_prefixes_are_namespaced_under_the_configured_root() {
+    fn every_store_prefix_starts_with_the_configured_root() {
         assert_eq!(domain_prefix("oxkv", "policy"), "oxkv/policy");
         assert_eq!(domain_prefix("oxkv", "fs"), "oxkv/fs");
         assert_eq!(domain_prefix("oxkv", "wal"), "oxkv/wal");
     }
 
-    /// The config file's `[s3]` is projected onto the engine's own type.
+    /// The `[s3]` section of the config file becomes the type that the engine
+    /// uses.
     ///
-    /// This is the single translation point, so a field added to one side and
-    /// forgotten on the other shows up here as a silent default rather than as
-    /// a compile error. `endpoint_url` and `force_path_style` matter most in
-    /// practice: a MinIO deployment that loses them points at real AWS instead.
+    /// This is the only point of the translation. So a field that is added on
+    /// one side and left out on the other shows up here. It shows up as a
+    /// default value instead of as an error at compile time. The fields
+    /// `endpoint_url` and `force_path_style` matter most in practice. A MinIO
+    /// deployment that loses them points at the AWS service.
     #[test]
-    fn s3_config_projection_carries_every_field() {
+    fn every_s3_field_reaches_the_store_config() {
         let projected = s3_client_config(&config_from(BASE));
         assert_eq!(projected.bucket, "my-bucket");
         assert_eq!(projected.region, "eu-west-1");
@@ -589,42 +625,45 @@ force_path_style = true
         assert_eq!(projected.secret_access_key.as_deref(), Some("secret"));
     }
 
-    /// A configured secret is the one the resolved keys actually sign with,
-    /// and an absent one falls back to an ephemeral key rather than refusing
-    /// to start.
+    /// A secret from the config is the secret that the keys sign with. A secret
+    /// that is absent falls back to a key that lives for one run of the
+    /// process. The server does not refuse to start.
     ///
-    /// The fallback is a real behaviour, not an oversight: a laptop with no
-    /// `[capability].secret` should run, at the cost of invalidating tokens
-    /// on restart.
+    /// The fallback is a real behaviour, not a mistake. A laptop with no
+    /// `[capability].secret` must run. The cost is that the tokens stop
+    /// working after a restart.
     ///
-    /// What this used to assert was `resolve_token_keys(...).is_ok()` in both
-    /// cases, which cannot fail in the way its name claims. `TokenKeys` has
-    /// no accessor for its `kid` or `secret`, so there was nothing to
-    /// compare -- and the failure is not exotic. Replacing the whole body of
-    /// `resolve_token_keys` with
+    /// The test used to check `resolve_token_keys(...).is_ok()` in both cases.
+    /// That call cannot fail in the way that the name of the test claims.
+    /// `TokenKeys` has no accessor for its `kid` or for its `secret`. So there
+    /// was nothing to compare. The failure is not rare. Replace the whole
+    /// body of `resolve_token_keys` with this:
     ///
     ///     Ok(TokenKeys::ephemeral())
     ///
-    /// drops the configured secret AND the rotation `previous_secret` on the
-    /// floor, and both `is_ok()` assertions still pass. Every deployment's
-    /// capability tokens would then be signed with a fresh random key per
-    /// boot, so every delegated file URL handed out before a restart stops
-    /// validating after it -- silently, because the tokens carry no error
-    /// until a client tries to use one.
+    /// That change drops the configured secret. It also drops the rotation
+    /// value `previous_secret`. Both `is_ok()` checks still pass. Every
+    /// deployment then signs its capability tokens with a new random key on
+    /// each start. So every delegated file URL that the server gave out before
+    /// a restart stops verifying after the restart. Nothing reports the
+    /// failure, because the tokens carry no error until a client tries to
+    /// use one.
     ///
-    /// So the property is asserted BEHAVIOURALLY: mint a token through the
-    /// keys `resolve_token_keys` returned and verify it against
-    /// independently-constructed keys built from the configured secret. A
-    /// token that only the configured secret validates is the observable
-    /// form of "the configured secret was preferred".
+    /// So the test checks a behaviour instead. It makes a token with the keys
+    /// that `resolve_token_keys` returned. It checks that token against keys
+    /// that it builds itself from the configured secret. A token that only
+    /// the configured secret verifies is the observable form of "the
+    /// configured secret was used".
     ///
-    /// Note what is *not* tested here: a malformed secret. `Config::parse`
-    /// validates it, so this function never sees a bad one -- enforced at the
-    /// loader and covered by `config::tests::validate_rejects_bad_values`.
-    /// Asserting it here would pin a path that cannot execute, and the failure
-    /// it guards against (a bad secret silently downgraded to an ephemeral
-    /// key, turning a config error into tokens that mysteriously stop
-    /// validating) is actually prevented upstream.
+    /// The test does not check one case. A secret with the wrong form is not
+    /// tested here. `Config::parse` checks it. So this function never sees a
+    /// bad secret. The loader enforces the rule. The test
+    /// `config::tests::validate_rejects_bad_values` covers it. A check here
+    /// would pin a path that cannot run. The failure that the check would
+    /// guard against is already prevented at the loader. That failure is a
+    /// bad secret that the server accepts as an ephemeral key. It would turn
+    /// an error in the config into tokens that stop verifying for no clear
+    /// reason.
     #[test]
     fn capability_keys_prefer_the_configured_secret() {
         use rust_api::fs::TokenKeys as Keys;
@@ -640,9 +679,10 @@ force_path_style = true
             config_from(&toml)
         };
 
-        // A token minted by the resolved keys is one the configured secret
-        // validates. An ephemeral key would produce a token no configured
-        // secret accepts.
+        // A token that the resolved keys made is a token that the
+        // configured secret verifies. A key that lives for one run of
+        // the process would make a token that no configured secret
+        // accepts.
         let keys = resolve_token_keys(&with_secrets(&configured, None))
             .expect("a configured secret resolves");
         let expected = Keys::from_hex(&configured, None).expect("the same secret, built directly");
@@ -655,7 +695,8 @@ force_path_style = true
              ephemeral key here invalidates every capability token on restart"
         );
 
-        // And it is specifically that secret, not any well-formed one.
+        // The token must use that exact secret, not any secret that has
+        // the right form.
         let other = Keys::from_hex(&rotated_away, None).expect("a different valid secret");
         assert!(
             other.verify(&minted, "file-1", Action::Read).is_err(),
@@ -663,9 +704,10 @@ force_path_style = true
              assertion above proves nothing"
         );
 
-        // Rotation: the PREVIOUS secret is wired for verification, so a token
-        // minted before the rotation still works. `previous_secret` being
-        // dropped is the other half of the same silent breakage.
+        // During a rotation, the PREVIOUS secret is wired for the check. So
+        // a token that was made before the rotation still works. The
+        // loss of `previous_secret` is the other half of the same quiet
+        // failure.
         let rotating = resolve_token_keys(&with_secrets(&configured, Some(&rotated_away)))
             .expect("rotation resolves");
         let old_token = Keys::from_hex(&rotated_away, None)
@@ -677,7 +719,7 @@ force_path_style = true
             "previous_secret must verify during rotation, or every delegated \
              URL minted before the deploy stops working"
         );
-        // ...and the new secret still mints.
+        // The new secret still makes tokens.
         let new_token = rotating
             .mint("alice", "file-3", Action::Read)
             .expect("mint under the current secret");
@@ -689,9 +731,10 @@ force_path_style = true
             "the current secret mints through a rotating key set too"
         );
 
-        // The absent-secret fallback still boots -- and really is ephemeral,
-        // so a token from one resolution does not survive another. That is
-        // the documented cost, asserted rather than assumed.
+        // The fallback for an absent secret still starts the server. The key
+        // really lives for one run of the process. So a token from one
+        // resolution does not survive the next. That is the documented
+        // cost. The test checks it instead of assuming it.
         let ephemeral = resolve_token_keys(&config_from(BASE))
             .expect("an absent secret still boots, on an ephemeral key");
         let boot_one = ephemeral
@@ -712,33 +755,34 @@ force_path_style = true
         );
     }
 
-    /// Both policy subcommands must claim the writer lease before opening a
+    /// Both policy subcommands must claim the writer lease before they open a
     /// store.
     ///
-    /// Building an `OxKvStore` CAS-bumps `ownership.json` and takes an
-    /// epoch. That is what `serve` does at startup, so running either
-    /// subcommand against a live prefix *fences the server* -- which the
-    /// server discovers at its next policy write, as
-    /// `StoreError::Fenced`, and answers by latching `note_primary_loss`
-    /// forever. `/ready` gates on `!fencing::primary_loss()`, so a
-    /// successful `policy export` permanently drains the instance. Export
-    /// is read-only, which is exactly why this was missed: it looks like
-    /// the safe direction of the documented backup procedure, and the
-    /// README only warns about `import`.
+    /// Building an `OxKvStore` does a CAS bump on `ownership.json` and takes
+    /// an epoch. That is what `serve` does at startup. So either subcommand
+    /// against a prefix that is live *fences the server*. The server finds
+    /// out at its next write to the policy. The write fails with
+    /// `StoreError::Fenced`. The server then sets `note_primary_loss` and
+    /// never clears it. The check of `/ready` uses
+    /// `!fencing::primary_loss()`. So a successful `policy export` takes the
+    /// instance out of service for good. The `export` command only reads.
+    /// That is why the problem was not found. It looks like the safe
+    /// direction of the documented backup procedure. The README warns only
+    /// about `import`.
     ///
-    /// Pinned by reading the source rather than by calling the command,
-    /// because the failure needs a second live `OxKvStore` over one prefix
-    /// and a network to reach. What matters is the *ordering*: the claim
-    /// has to come before the first `build_s3_store`, since checking
-    /// afterwards means the incumbent has already been fenced. The
-    /// assertion is on both halves -- the claim is present, and it precedes
-    /// every store build in the function.
+    /// The test reads the source. It does not call the command. The failure
+    /// needs a second live `OxKvStore` over one prefix, and it needs a
+    /// network. The *order* of the steps is what matters. The claim must come
+    /// before the first `build_s3_store`. A check after that point means that
+    /// the process which held the lease was already fenced. The test checks
+    /// both parts. The claim must be there. The claim must come before every
+    /// store build in the function.
     #[test]
     fn both_policy_subcommands_claim_the_lease_before_opening_a_store() {
         let src = std::fs::read_to_string("src/main.rs").expect("readable");
 
-        // Isolate `run_policy_command`: the function both subcommands
-        // delegate to, so one assertion covers both.
+        // Take only the body of `run_policy_command`. Both subcommands call
+        // that function. So one check covers both.
         let body = src
             .split_once("async fn run_policy_command")
             .expect("run_policy_command exists")
@@ -750,8 +794,8 @@ force_path_style = true
         let claim = body
             .find("claim_writer_lease(")
             .expect("the policy path must claim the writer lease");
-        // The store builds live in the helpers this function calls, so
-        // "before any store" means "before dispatching to them".
+        // The store builds live in the helpers that this function calls.
+        // So "before any store" means "before the call to a helper".
         let dispatch = ["export_policy(", "import_policy("]
             .iter()
             .filter_map(|name| body.find(name).map(|at| (name, at)))
@@ -766,8 +810,8 @@ force_path_style = true
             dispatch.1,
         );
 
-        // And each helper really does open a store -- otherwise the claim
-        // would be guarding nothing.
+        // Each helper must also really open a store. Otherwise the claim
+        // guards nothing.
         for helper in ["async fn export_policy", "async fn import_policy"] {
             let body = src
                 .split_once(helper)
@@ -788,13 +832,14 @@ force_path_style = true
         }
     }
 
-    /// A refusal has to name the prefix and say what to do about it.
+    /// A refusal must name the prefix. It must also say what to do about it.
     ///
-    /// The whole cost of this fix is moving a silent drain into a visible
-    /// failure, so a message that does not say *which* prefix is contested
-    /// or *what* to stop leaves the operator where they started. The held
-    /// instance comes from `LeaseError::Held` beneath this context, so the
-    /// two compose into one operator-facing string.
+    /// The whole cost of this change is the move from a quiet drain to a
+    /// message that the operator sees. So a message that does not say
+    /// *which* prefix is in dispute, and *what* to stop, leaves the operator
+    /// where the operator started. The instance that holds the lease comes
+    /// from `LeaseError::Held` under this context. So the two parts join into
+    /// one message for the operator.
     #[test]
     fn a_refused_policy_command_says_which_prefix_and_what_to_stop() {
         let message = lease_refused_message("policy export", "prod/data");
@@ -805,8 +850,8 @@ force_path_style = true
             "must say what the command would do to the live writer: {message}",
         );
 
-        // Composes with the lease's own Held error, which carries the
-        // holder's identity and how long to wait.
+        // The message joins with the Held error of the lease. That error
+        // carries the identity of the holder and the time to wait.
         let held = rust_api::lease::LeaseError::Held {
             prefix: "prod/data".to_string(),
             instance: "host-b:0192...".to_string(),
@@ -820,8 +865,8 @@ force_path_style = true
         assert!(rendered.contains("wait 57s"), "{rendered}");
     }
 
-    /// Each subcommand is named in the failure, so "another writer" is not
-    /// ambiguous between serving traffic and taking a backup.
+    /// Each subcommand names itself in the failure, so that "another writer" is
+    /// not unclear between serving traffic and taking a backup.
     #[test]
     fn each_policy_subcommand_names_itself() {
         let export = PolicyAction::Export {

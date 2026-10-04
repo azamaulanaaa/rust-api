@@ -1,4 +1,4 @@
-//! Actix routes for the S3-backed FS module.
+//! Actix routes for the S3 backed FS module.
 
 use std::sync::Arc;
 
@@ -11,7 +11,7 @@ use crate::fs::model::{CompleteRequest, InitRequest, InitResponse};
 use crate::http::middleware::jwt::{Claims, JwtClaimsMiddleware, Validated};
 use crate::http::{ApiModule, logged_body};
 
-/// API module exposing `/fs` routes, protected by JWT validation.
+/// The API module that exposes the `/fs` routes. The module requires JWT validation.
 pub struct FsApiModule {
     engine: Arc<FsEngine>,
     jwt: JwtClaimsMiddleware<Claims>,
@@ -71,7 +71,8 @@ async fn upload_part(
     req: actix_web::HttpRequest,
 ) -> Result<HttpResponse, FsError> {
     let (id, idx) = path.into_inner();
-    // Checksum passthrough: S3 validates, we just forward base64 SHA256 if provided
+    // The code passes the checksum through. S3 validates the checksum. The
+    // code only forwards the base64 SHA256 value if the request has one.
     let checksum_sha256 = req
         .headers()
         .get("x-checksum-sha256")
@@ -83,8 +84,9 @@ async fn upload_part(
                 .and_then(|v| v.to_str().ok())
                 .map(|s| s.to_string())
         });
-    // Declared length lets the engine reject mismatches before reading
-    // a single body byte; garbage values fall back to chunk counting.
+    // The declared length lets the engine reject a mismatch before the engine
+    // reads one byte of the body. A value that is not a number falls back to
+    // counting the chunks.
     let declared_len = req
         .headers()
         .get("content-length")
@@ -160,8 +162,9 @@ async fn get_file(
     use actix_web::http::header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, RANGE};
 
     let id = path.into_inner();
-    // Metadata first: one cheap cached read gives auth plus the total
-    // the range validates against, so exactly one S3 call follows.
+    // The code reads the metadata first. One cheap cached read gives the
+    // authorization result and the total that the range check uses. Therefore
+    // exactly one S3 call follows.
     let meta = engine.get_metadata(&id, &claims.sub).await?;
     let header = req.headers().get(RANGE).and_then(|v| v.to_str().ok());
     match parse_range(header, meta.size) {
@@ -181,8 +184,9 @@ async fn get_file(
             let (rec, obj) = engine
                 .get_object_range(&id, &claims.sub, r.start..r.end_inclusive + 1)
                 .await?;
-            // Headers describe what is actually streamed, not just what
-            // was asked: identical in every non-adversarial case.
+            // The headers describe what the code streams. They do not only
+            // describe what the client asked for. The values are the same in
+            // every case without an adversary.
             let end = r.start + obj.size.saturating_sub(1);
             Ok(HttpResponse::PartialContent()
                 .content_type(rec.mimetype)
@@ -206,28 +210,31 @@ async fn get_file(
     }
 }
 
-/// A satisfiable single byte range (inclusive end).
+/// A byte range that the server can send. The end value is inclusive.
 struct ByteRange {
     start: u64,
     end_inclusive: u64,
 }
 
-/// Outcome of interpreting a `Range` header against a known total.
+/// The result of comparing a `Range` header with a known total size.
 enum RangeOutcome {
-    /// No (usable) header: serve the whole object (200).
+    /// The header is missing or not usable. The server sends the whole object
+    /// with status 200.
     Full,
-    /// Serve `start..=end_inclusive` (206).
+    /// The server sends `start..=end_inclusive` with status 206.
     Ranged(ByteRange),
-    /// Valid syntax past the end of the object (416).
+    /// The syntax is valid but the range is past the end of the object. The
+    /// server returns status 416.
     Unsatisfiable,
 }
 
-/// Interprets a `Range` header against `total`.
+/// Compares a `Range` header with the total size `total`.
 ///
-/// Single `bytes=` ranges only; anything else (missing header, foreign
-/// unit, multi-range, malformed syntax, reversed bounds) falls back to a
-/// full 200 response per RFC 9110 §14.2. An empty object satisfies
-/// nothing, so any range on it is 416.
+/// The function accepts one `bytes=` range only. Every other input falls
+/// back to a full 200 response, as RFC 9110 §14.2 requires. The other
+/// inputs are a missing header, a foreign unit, a multi range value, bad
+/// syntax, and bounds in reverse order. An empty object satisfies no
+/// range, so any range on it returns 416.
 fn parse_range(header: Option<&str>, total: u64) -> RangeOutcome {
     let Some(spec) = header.map(str::trim).and_then(|h| h.strip_prefix("bytes=")) else {
         return RangeOutcome::Full;
@@ -277,13 +284,14 @@ fn parse_range(header: Option<&str>, total: u64) -> RangeOutcome {
     })
 }
 
-/// Sanitizes a user-supplied filename for `Content-Disposition`.
+/// Sanitizes a filename from the user for the `Content-Disposition` header.
 ///
-/// `name` arrives from `CompleteRequest` (only non-empty validated), so it
-/// may carry quotes, backslashes, path segments, or control characters —
-/// each a header-injection or traversal vector. Keeps the basename,
-/// replaces `"`/`\` with `_`, drops control characters, truncates to 100
-/// chars, and falls back to `"file"` when nothing safe remains.
+/// `name` arrives from `CompleteRequest`. That request only checks that the
+/// value is not empty. Therefore `name` may carry quotes, backslashes, path
+/// segments, or control characters. Each of these is a header injection
+/// vector or a traversal vector. The function keeps the base name. It
+/// replaces `"` and `\` with `_`. It removes the control characters. It cuts
+/// the name to 100 characters. It returns `"file"` when no safe name remains.
 fn sanitize_filename(name: &str) -> String {
     let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
     let cleaned: String = base
@@ -381,21 +389,23 @@ mod tests {
         })
     }
 
-    /// Every route the OpenAPI document lists for `/fs` is actually mounted.
+    /// Every route that the OpenAPI document lists for `/fs` is mounted.
     ///
-    /// This module's `configure` is one of five near-identical builder
-    /// chains, each listing its own services, and a service left out of one
-    /// of them is invisible: it compiles, the spec still lists the path, and
-    /// the only symptom is a `404` on a documented endpoint. That is the
-    /// same failure mode as the `/auth` shadowing bug, and this module had
-    /// the widest exposure -- seven of its eight routes had no route-level
-    /// test, so a forgotten `.service(...)` would have shipped unnoticed.
+    /// The `configure` function of this module is one of five builder chains
+    /// that are almost the same. Each chain lists its own services. A service
+    /// that one chain leaves out is invisible. The code compiles. The
+    /// specification still lists the path. The only symptom is a `404` on a
+    /// documented endpoint. This is the same failure as the `/auth`
+    /// shadowing bug. This module had the widest exposure to that bug. Seven
+    /// of its eight routes had no route level test. Therefore a forgotten
+    /// `.service(...)` call would have reached production unnoticed.
     ///
-    /// The discriminator cannot be the status. These handlers are asked for
-    /// resources that do not exist, and a mounted one answers `404` with the
-    /// uniform envelope, while actix's default service answers `404` with a
-    /// bare text body. So the assertion is on the body: a routed request is
-    /// always answered by this crate's own error rendering.
+    /// The status code cannot tell the two cases apart. The test asks these
+    /// handlers for resources that do not exist. A mounted handler answers
+    /// `404` with the uniform envelope. The default service of actix answers
+    /// `404` with a bare text body. Therefore the assertion checks the body.
+    /// A routed request is always answered by the error rendering of this
+    /// crate.
     #[actix_web::test]
     async fn every_documented_route_is_mounted() {
         let fx = fixture(true).await.expect("fixture");
@@ -409,11 +419,11 @@ mod tests {
             .await
             .expect("middleware"),
         );
-        // `apply_limits` is part of the real composition (`wired_app!` applies
-        // it before the modules), and it is what installs the uniform
-        // envelope for a malformed JSON body. Without it actix answers with
-        // a bare text 400, which is what two of these routes return when the
-        // request has no body at all.
+        // The real composition includes `apply_limits`. The macro `wired_app!`
+        // applies it before the modules. It installs the uniform envelope for
+        // a body with bad JSON. Without it, actix answers with a bare text
+        // 400. Two of these routes return that status when the request has
+        // no body.
         let app = test::init_service(
             crate::http::apply_limits(App::new()).configure(|cfg| module.configure(cfg)),
         )
@@ -453,7 +463,7 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn sanitize_filename_blocks_injection() {
+    async fn sanitize_filename_removes_injection_characters() {
         assert_eq!(sanitize_filename("hello.txt"), "hello.txt");
         assert_eq!(sanitize_filename("../../etc/passwd"), "passwd");
         assert_eq!(sanitize_filename("a\\b\"c"), "b_c");
@@ -474,7 +484,8 @@ mod tests {
 
     #[actix_web::test]
     async fn parse_range_covers_http_semantics() {
-        // No header or foreign/multi/malformed units fall back to full.
+        // A missing header, a foreign unit, a multi range value, and bad
+        // syntax each select the full object.
         assert_eq!(ranged(None, 1000), (0, 0, false, false));
         assert_eq!(ranged(Some("items=0-99"), 1000), (0, 0, false, false));
         assert_eq!(
@@ -490,17 +501,18 @@ mod tests {
         assert_eq!(ranged(Some("bytes=0-99"), 1000), (0, 99, true, false));
         assert_eq!(ranged(Some("bytes=900-"), 1000), (900, 999, true, false));
         assert_eq!(ranged(Some("bytes=0-9999"), 1000), (0, 999, true, false));
-        // Suffix: last N bytes, capped at the total.
+        // A suffix range gives the last N bytes. The total size caps the result.
         assert_eq!(ranged(Some("bytes=-100"), 1000), (900, 999, true, false));
         assert_eq!(ranged(Some("bytes=-5000"), 1000), (0, 999, true, false));
-        // Past-the-end starts are unsatisfiable, including on empty files.
+        // A start past the end of the object is not satisfiable. This applies
+        // to an empty file too.
         assert_eq!(ranged(Some("bytes=1000-"), 1000), (0, 0, false, true));
         assert_eq!(ranged(Some("bytes=2000-3000"), 1000), (0, 0, false, true));
         assert_eq!(ranged(Some("bytes=0-0"), 0), (0, 0, false, true));
     }
 
     #[actix_web::test]
-    async fn unauthenticated_is_401() -> anyhow::Result<()> {
+    async fn request_without_a_token_returns_401() -> anyhow::Result<()> {
         let fx = fixture(true).await?;
         let mw = JwtClaimsMiddleware::<Claims>::new_with_jks(
             &format!("{}/jwks", fx.server.uri()),
@@ -524,7 +536,7 @@ mod tests {
 
     #[actix_web::test]
     async fn temp_upload_allowed_without_policy() -> anyhow::Result<()> {
-        let fx = fixture(false).await?; // no fs policy needed for temp uploads
+        let fx = fixture(false).await?; // A temp upload needs no fs policy.
         let mw = JwtClaimsMiddleware::<Claims>::new_with_jks(
             &format!("{}/jwks", fx.server.uri()),
             AUD,
@@ -582,7 +594,7 @@ mod tests {
         let module = FsApiModule::new(fx.engine.clone(), mw);
         let app = test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
         let token = fx.token("alice")?;
-        // init
+        // The test starts the upload.
         let res = test::call_service(
             &app,
             test::TestRequest::post()
@@ -595,7 +607,7 @@ mod tests {
         assert_eq!(res.status(), http::StatusCode::CREATED);
         let body: serde_json::Value = test::read_body_json(res).await;
         let file_id = body["file_id"].as_str().unwrap().to_string();
-        // upload part with x-checksum-sha256 header
+        // The test uploads the part with the x-checksum-sha256 header.
         let res = test::call_service(
             &app,
             test::TestRequest::put()
@@ -607,7 +619,7 @@ mod tests {
         )
         .await;
         assert_eq!(res.status(), http::StatusCode::NO_CONTENT);
-        // progress
+        // The test reads the progress.
         let res = test::call_service(
             &app,
             test::TestRequest::get()
@@ -619,7 +631,7 @@ mod tests {
         assert_eq!(res.status(), http::StatusCode::OK);
         let prog: serde_json::Value = test::read_body_json(res).await;
         assert_eq!(prog["uploaded_parts"], json!([0]));
-        // complete
+        // The test completes the upload.
         let res = test::call_service(
             &app,
             test::TestRequest::post()
@@ -630,7 +642,7 @@ mod tests {
         )
         .await;
         assert_eq!(res.status(), http::StatusCode::OK);
-        // get metadata
+        // The test reads the metadata.
         let res = test::call_service(
             &app,
             test::TestRequest::get()
@@ -642,7 +654,7 @@ mod tests {
         assert_eq!(res.status(), http::StatusCode::OK);
         let meta: serde_json::Value = test::read_body_json(res).await;
         assert_eq!(meta["name"], "hello.txt");
-        // get file body + headers
+        // The test reads the file body and the headers.
         let res = test::call_service(
             &app,
             test::TestRequest::get()
@@ -663,7 +675,7 @@ mod tests {
         );
         let body = test::read_body(res).await;
         assert_eq!(body.len(), 1024);
-        // delete file
+        // The test deletes the file.
         let res = test::call_service(
             &app,
             test::TestRequest::delete()
@@ -673,7 +685,7 @@ mod tests {
         )
         .await;
         assert_eq!(res.status(), http::StatusCode::NO_CONTENT);
-        // multi-part cancel path also
+        // The test also checks the cancel path for a multipart upload.
         let res = test::call_service(
             &app,
             test::TestRequest::post()
@@ -720,7 +732,7 @@ mod tests {
         .await;
         let body: serde_json::Value = test::read_body_json(res).await;
         let file_id = body["file_id"].as_str().unwrap();
-        // use legacy alias checksum-sha256
+        // The test uses the legacy alias checksum-sha256.
         let res = test::call_service(
             &app,
             test::TestRequest::put()
@@ -758,7 +770,7 @@ mod tests {
         .await;
         let body: serde_json::Value = test::read_body_json(res).await;
         let file_id = body["file_id"].as_str().unwrap();
-        // empty name -> 400
+        // An empty name returns 400.
         let res = test::call_service(
             &app,
             test::TestRequest::post()
@@ -769,7 +781,7 @@ mod tests {
         )
         .await;
         assert_eq!(res.status(), http::StatusCode::BAD_REQUEST);
-        // not all parts uploaded -> 400
+        // A request that does not list every part returns 400.
         let res = test::call_service(
             &app,
             test::TestRequest::post()
@@ -904,7 +916,7 @@ mod tests {
                 .to_string()
         };
 
-        // Full download advertises ranges.
+        // A full download advertises the range support.
         let res = get(None).await;
         assert_eq!(res.status(), http::StatusCode::OK);
         assert_eq!(header(&res, "accept-ranges"), "bytes");
@@ -924,12 +936,14 @@ mod tests {
             assert_eq!(test::read_body(res).await.to_vec(), expected);
         }
 
-        // Past-the-end range: 416 with the total for retries.
+        // A range past the end of the object returns 416. The response gives
+        // the total size so that the client can retry.
         let res = get(Some("bytes=9000-9999")).await;
         assert_eq!(res.status(), http::StatusCode::RANGE_NOT_SATISFIABLE);
         assert_eq!(header(&res, "content-range"), "bytes */8192");
 
-        // Malformed range: ignored per RFC, full body.
+        // A range with bad syntax is ignored, as the RFC requires. The response
+        // contains the full body.
         let res = get(Some("bananas")).await;
         assert_eq!(res.status(), http::StatusCode::OK);
         assert_eq!(test::read_body(res).await.to_vec(), body);
@@ -960,8 +974,9 @@ mod tests {
         .await;
         let init: serde_json::Value = test::read_body_json(res).await;
         let file_id = init["file_id"].as_str().unwrap();
-        // Twice the declared part size: the declared Content-Length
-        // already exceeds it, so this fails without streaming the body.
+        // The payload is twice the declared part size. The declared Content-Length
+        // already exceeds the limit. Therefore the request fails before the
+        // server streams the body.
         let res = test::call_service(
             &app,
             test::TestRequest::put()

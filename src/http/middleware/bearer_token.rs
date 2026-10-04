@@ -1,10 +1,11 @@
-//! Actix middleware extracting the `Authorization: Bearer <token>` header.
+//! Actix middleware that extracts the `Authorization: Bearer <token>`
+//! header.
 //!
-//! Runs globally and is deliberately permissive: it only parses the header
-//! and stashes the raw string in request extensions, leaving every
-//! accept/reject decision to the downstream
+//! The middleware runs globally, and it is deliberately permissive. It
+//! parses the header and puts the raw string into the request extensions.
+//! It leaves every accept or reject decision to the downstream
 //! [`JwtClaimsMiddleware`](crate::http::middleware::jwt::JwtClaimsMiddleware).
-//! A request that presents no header passes through untouched.
+//! A request that sends no header passes through unchanged.
 
 use std::{
     future::{Ready, ready},
@@ -18,9 +19,9 @@ use actix_web::{
 };
 use futures_util::future::LocalBoxFuture;
 
-/// Actix transform that extracts a Bearer token from the
-/// `Authorization: Bearer <token>` header and stores it in request
-/// extensions for downstream services to consume.
+/// The Actix transform that extracts a bearer token from the
+/// `Authorization: Bearer <token>` header. The transform puts the token
+/// into the request extensions, so a downstream service can use it.
 pub struct BearerTokenMiddleware;
 
 impl<S, B> Transform<S, ServiceRequest> for BearerTokenMiddleware
@@ -35,8 +36,8 @@ where
     type InitError = ();
     type Future = Ready<Result<Self::Transform, Self::InitError>>;
 
-    /// Wraps `service` so every request passing through it gets its Bearer
-    /// token extracted into extensions.
+    /// Wraps `service` so that every request that passes through it has its
+    /// bearer token extracted into the extensions.
     fn new_transform(&self, service: S) -> Self::Future {
         ready(Ok(BearerTokenMiddlewareService {
             service: Rc::new(service),
@@ -44,13 +45,14 @@ where
     }
 }
 
-/// Newtype around the raw Bearer token string, inserted into request
-/// extensions by [`BearerTokenMiddleware`].
+/// A newtype around the raw bearer token string.
+/// [`BearerTokenMiddleware`] puts this value into the request
+/// extensions.
 #[derive(Debug, Clone)]
 pub struct BearerToken(pub String);
 
-/// The instantiated per-worker middleware service produced by
-/// [`BearerTokenMiddleware`].
+/// The middleware service for one worker, which
+/// [`BearerTokenMiddleware`] creates.
 pub struct BearerTokenMiddlewareService<S> {
     service: Rc<S>,
 }
@@ -78,10 +80,12 @@ where
     }
 }
 
-/// Pulls the `Authorization` header's bearer token, if it parses as one.
+/// Reads the bearer token from the `Authorization` header, if the header
+/// contains one.
 ///
-/// Returns `None` for a missing header, a non-UTF-8 value, or a scheme
-/// other than `Bearer` — the same cases [`parse_bearer_token`] rejects.
+/// The function returns `None` for a missing header, for a value that is not
+/// UTF-8, and for a scheme other than `Bearer`. [`parse_bearer_token`]
+/// rejects the same cases.
 fn extract_bearer_token(req: &ServiceRequest) -> Option<BearerToken> {
     req.headers()
         .get(header::AUTHORIZATION)?
@@ -90,12 +94,13 @@ fn extract_bearer_token(req: &ServiceRequest) -> Option<BearerToken> {
         .and_then(parse_bearer_token)
 }
 
-/// Splits `auth_str` into its scheme and token, accepting any casing of
-/// `Bearer` per RFC 7235.
+/// Splits `auth_str` into its scheme and its token. The function accepts
+/// any casing of `Bearer`, as RFC 7235 requires.
 ///
-/// The token is returned verbatim (not trimmed): a value that decoded as
-/// `"Bearer  abc"` keeps its leading space, and deciding whether that is
-/// acceptable belongs to the validator, not the extractor.
+/// The function returns the token exactly as it received it, and does not
+/// trim it. Therefore a value such as `"Bearer  abc"` keeps its leading
+/// space. Only the validator can decide whether such a value is acceptable,
+/// not the extractor.
 fn parse_bearer_token(auth_str: &str) -> Option<BearerToken> {
     let mut parts = auth_str.splitn(2, ' ');
     match (parts.next(), parts.next()) {
@@ -115,7 +120,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_bearer_token_accepts_valid() {
+    fn parse_bearer_token_accepts_a_valid_value() {
         assert_eq!(parse_bearer_token("Bearer abc123").unwrap().0, "abc123");
         assert_eq!(parse_bearer_token("bearer XYZ").unwrap().0, "XYZ");
         assert_eq!(
@@ -125,7 +130,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_bearer_token_rejects_invalid() {
+    fn parse_bearer_token_rejects_an_invalid_value() {
         assert!(parse_bearer_token("Basic abc123").is_none());
         assert!(parse_bearer_token("Bearer").is_none());
         assert!(parse_bearer_token("Bearer ").is_none());
@@ -135,8 +140,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_bearer_token_preserves_raw_token() {
-        // Token is stored verbatim (no trim) — downstream validation decides.
+    fn parse_bearer_token_keeps_the_raw_token() {
+        // The code keeps the token exactly as it received it and does not
+        // trim it. The downstream validation decides.
         assert_eq!(parse_bearer_token("Bearer  abc").unwrap().0, " abc");
     }
 }

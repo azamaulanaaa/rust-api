@@ -1,4 +1,4 @@
-//! Operational tooling for policy stores: JSON export/import on S3.
+//! Operational tooling for policy stores. It exports and imports JSON on S3.
 
 use casbin::{CoreApi, DefaultModel, Enforcer, MgmtApi};
 use serde::{Deserialize, Serialize};
@@ -15,8 +15,9 @@ pub struct PolicyDump {
     pub g: Vec<Vec<String>>,
 }
 
-/// Result of an import: how many rules/groups were newly written and how
-/// many were skipped because they already existed (imports are idempotent).
+/// The result of an import. It counts the rules and groups that the import
+/// wrote for the first time. It also counts the entries that the import
+/// skipped, because the entry already existed. An import is idempotent.
 #[derive(Debug, PartialEq, Eq)]
 pub struct ImportReport {
     /// Newly written permission rules.
@@ -42,10 +43,12 @@ pub async fn export_s3(s3_store: oxkv::OxKvStore) -> anyhow::Result<PolicyDump> 
     })
 }
 
-/// Writes `dump`'s rules into an S3 store. Idempotent.
+/// Writes the rules of `dump` into an S3 store. Running the function
+/// again does not change the result.
 ///
-/// Newly added rules are announced to `feed` when wired, so replicas can
-/// replay the import instead of only discovering it via full recalc.
+/// The function announces the new rules to `feed` when the feed is wired.
+/// A replica can therefore replay the import instead of discovering it only
+/// through a full recalculation.
 pub async fn import_s3(
     s3_store: oxkv::OxKvStore,
     dump: &PolicyDump,
@@ -122,9 +125,9 @@ mod tests {
         import_s3(src_store, &dump, Some(Arc::new(wal.clone()))).await?;
         assert_eq!(wal.head().await?, 2);
 
-        // Fresh handle, hence a new fencing session over the same prefix
-        // (superseding the previous session via epoch fencing); the previous
-        // handle is dead by now.
+        // The code uses a fresh handle. The handle starts a new fencing
+        // session over the same prefix. Epoch fencing supersedes the
+        // previous session, so the previous handle is dead by now.
         let src_store2 = build_test_store_new_session(shared.clone(), &src_prefix).await;
         let dump = export_s3(src_store2).await?;
         let dump_bytes = serde_json::to_vec_pretty(&dump)?;
@@ -145,9 +148,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn import_rejects_invalid_entries_via_validation_hook() {
+    async fn import_rejects_invalid_entries_through_the_validator() {
         // The adapter enforces PolicyRuleValidator on every write path
-        // itself (see encode_rule), so an invalid dump fails the import
+        // itself (see encode_rule). The dump therefore fails the import
         // instead of being persisted.
         let store = build_test_store(&crate::db::test_prefix("admin-invalid")).await;
         let dump = PolicyDump {

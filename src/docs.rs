@@ -1,4 +1,4 @@
-//! OpenAPI specification composed from `utoipa::path` handlers.
+//! OpenAPI specification, composed from the `utoipa::path` handlers.
 
 use utoipa::OpenApi;
 
@@ -68,13 +68,15 @@ mod tests {
     use super::*;
     use serde_json::Value;
 
-    /// Guards the PWA contract: every served route the SPA codegen depends
-    /// on must appear in the spec, so drift breaks this test instead of the
-    /// frontend at runtime.
+    /// Guards the PWA contract. Every served route that the SPA code generator
+    /// uses must appear in the specification. Drift therefore breaks this
+    /// test instead of the front end at run time.
     ///
-    /// The list is exhaustive by hand: it must be updated whenever a route
-    /// is added to a module's `configure`, not only when a new
-    /// `utoipa::path` handler is written.
+    /// Maintain this list by hand:
+    ///
+    /// 1. Update the list when you add a route to a module's `configure`.
+    /// 2. Do not wait for a new `utoipa::path` handler before you update
+    ///    the list.
     #[test]
     fn spec_covers_all_served_routes() {
         let spec: Value =

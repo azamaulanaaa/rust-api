@@ -1,8 +1,9 @@
-//! S3 client abstraction for s3-compatible backends (AWS, MinIO, R2).
+//! An S3 client for S3-compatible backends such as AWS, MinIO, and R2.
 //!
-//! Production implementation is backed by `object_store::aws::AmazonS3` via
-//! [`crate::fs::object_store`]. The trait remains the seam so `FsEngine`
-//! stays storage-agnostic and tests can inject `InMemory`.
+//! The production implementation uses `object_store::aws::AmazonS3` through
+//! [`crate::fs::object_store`].
+//! The trait keeps `FsEngine` independent of the storage type.
+//! A test can inject `InMemory`.
 
 use std::{pin::Pin, sync::Arc};
 
@@ -11,20 +12,23 @@ use bytes::Bytes;
 
 use crate::fs::error::FsError;
 
-/// Streaming download body: object chunks that never materialize the whole
-/// file in memory at once.
+/// A download body stream. The stream yields object chunks and never holds
+/// the whole file in memory at once.
 pub type ByteStream = Pin<Box<dyn futures_util::Stream<Item = Result<Bytes, FsError>> + Send>>;
 
 /// A streaming object body with its length.
 pub struct ObjectStream {
-    /// Bytes carried by [`ObjectStream::stream`] (range length, or full
-    /// size for whole-object downloads), for `Content-Length`.
+    /// The number of bytes in [`ObjectStream::stream`].
+    /// The value is the range length, or the full size for a whole-object
+    /// download.
+    /// A route uses the value for `Content-Length`.
     pub size: u64,
-    /// Byte chunks in order; a mid-stream failure ends the download.
+    /// The byte chunks in order. A failure in the middle of the stream ends
+    /// the download.
     pub stream: ByteStream,
 }
 
-/// Abstraction over S3 operations used by [`crate::fs::FsEngine`].
+/// An abstraction over the S3 operations that [`crate::fs::FsEngine`] uses.
 #[async_trait]
 pub trait S3Client: Send + Sync {
     /// Starts a multipart upload and returns the upload id.
@@ -35,7 +39,8 @@ pub trait S3Client: Send + Sync {
         content_type: Option<String>,
     ) -> Result<String, FsError>;
 
-    /// Uploads a single part (1-indexed `part_number`) and returns its ETag.
+    /// Uploads one part and returns its ETag. The count `part_number`
+    /// starts at 1.
     async fn upload_part(
         &self,
         bucket: &str,
@@ -63,16 +68,19 @@ pub trait S3Client: Send + Sync {
         upload_id: &str,
     ) -> Result<(), FsError>;
 
-    /// Returns the backend (S3-side) upload id for an engine-side alias,
-    /// when the client tracks one (used to persist resumable state).
-    /// Defaults to `None` for stateless test doubles.
+    /// Returns the upload id that the backend, which is S3, uses for an
+    /// engine-side alias.
+    /// The method returns a value only when the client tracks that id.
+    /// The engine then uses the value to persist resumable state.
+    /// A stateless test double returns `None`.
     async fn backend_upload_id(&self, upload_id: &str) -> Option<String> {
         let _ = upload_id;
         None
     }
 
-    /// Rehydrates in-RAM multipart state from a persisted record after a
-    /// restart. Defaults to a no-op for stateless test doubles.
+    /// Loads the multipart state in RAM from a persisted record after a
+    /// restart.
+    /// A stateless test double does nothing.
     async fn restore_multipart(
         &self,
         record: &crate::fs::store::PersistedMultipart,
@@ -81,7 +89,8 @@ pub trait S3Client: Send + Sync {
         Ok(())
     }
 
-    /// Single-part put (used when `total_parts == 1`).
+    /// Uploads the object in one part. The engine calls this method when
+    /// `total_parts == 1`.
     async fn put_object(
         &self,
         bucket: &str,
@@ -96,9 +105,10 @@ pub trait S3Client: Send + Sync {
 
     /// Streams an object body with its length.
     ///
-    /// Downloads must not buffer whole files: the default impl collects
-    /// through [`S3Client::get_object`] (keeps test doubles working),
-    /// production overrides with true streaming from the object store.
+    /// A download must not buffer the whole file.
+    /// The default implementation collects the body through
+    /// [`S3Client::get_object`], so that test doubles keep working.
+    /// The production implementation streams from the object store.
     async fn get_object_stream(&self, bucket: &str, key: &str) -> Result<ObjectStream, FsError> {
         let body = self.get_object(bucket, key).await?;
         let size = body.len() as u64;
@@ -111,10 +121,13 @@ pub trait S3Client: Send + Sync {
 
     /// Streams one absolute byte range (`end` exclusive).
     ///
-    /// Callers validate against metadata size first (unsatisfiable ranges
-    /// are a 416 decided without touching S3); backends clamp defensively.
-    /// The default impl slices through [`S3Client::get_object`] for test
-    /// doubles, production streams the range from the object store.
+    /// The caller validates the range against the metadata size first.
+    /// An unsatisfiable range returns a 416 without touching S3.
+    /// The backend clamps the range again as a safety measure.
+    /// The default implementation slices the body through
+    /// [`S3Client::get_object`] for test doubles.
+    /// The production implementation streams the range from the object
+    /// store.
     async fn get_object_range(
         &self,
         bucket: &str,
@@ -137,15 +150,17 @@ pub trait S3Client: Send + Sync {
 
     /// Lists keys under `prefix` with last-modified times.
     ///
-    /// Backs the GC orphan-byte pass: keys the metadata no longer
-    /// references are unreachable and safe to reap once aged.
+    /// The GC orphan-byte pass uses this method.
+    /// A key that the metadata no longer references is unreachable.
+    /// GC can delete the key after it reaches the age limit.
     async fn list_keys(&self, bucket: &str, prefix: &str) -> Result<Vec<ListedKey>, FsError>;
 }
 
 /// A listed object key with its last-modified time (unix seconds).
 ///
-/// Keys use the same relative form as `put/get/delete_object` (e.g.
-/// `"files/{id}"`), so listings compare directly against record keys.
+/// A key uses the same relative form as `put/get/delete_object`, for
+/// example `"files/{id}"`.
+/// A caller can then compare a listed key directly with a record key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListedKey {
     /// Object key in relative form.
@@ -154,11 +169,13 @@ pub struct ListedKey {
     pub last_modified: i64,
 }
 
-/// Configuration for the object-store client, mirroring `config::S3Config`
-/// but decoupled from the binary config crate.
+/// Configuration for the object-store client.
+/// It mirrors `config::S3Config`.
+/// It is independent of the binary config crate.
 #[derive(Debug, Clone)]
 pub struct S3ClientConfig {
-    /// Bucket name — used as `AmazonS3` bucket, prefixed to the path for `InMemory`.
+    /// The bucket name. `AmazonS3` uses it as the bucket.
+    /// `InMemory` uses it as a path prefix.
     pub bucket: String,
     /// AWS region.
     pub region: String,
@@ -172,7 +189,8 @@ pub struct S3ClientConfig {
     pub secret_access_key: Option<String>,
 }
 
-/// Builds an `Arc<dyn S3Client>` from [`S3ClientConfig`] via `object_store`.
+/// Builds an `Arc<dyn S3Client>` from [`S3ClientConfig`] through
+/// `object_store`.
 pub async fn build_s3_client(
     config: &S3ClientConfig,
 ) -> Result<Arc<dyn S3Client>, object_store::Error> {

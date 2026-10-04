@@ -2,38 +2,45 @@
 //!
 //! # Why this is not an `oxkv` concern
 //!
-//! `oxkv` owns a prefix through `ownership.json`, and acquiring it is a
-//! CAS-bump of a monotonic epoch: whoever builds a handle last wins and
-//! fences the previous one at write time ([`StoreError::Fenced`](oxkv::StoreError::Fenced),
-//! which `oxkv` documents as "the current process must stop writing and
-//! restart"). That is a correct *takeover* protocol and a useless
-//! *detection* protocol: nothing in it can distinguish "my predecessor is
-//! still serving traffic" from "my predecessor crashed", so a second
-//! replica pointed at the same prefix starts cleanly, serves writes that
-//! silently diverge, and only fails later and elsewhere.
+//! `oxkv` owns a prefix through `ownership.json`. Acquiring it is a CAS bump
+//! of a monotonic epoch. The last process to build a handle wins. That
+//! process fences the earlier one at write time
+//! ([`StoreError::Fenced`](oxkv::StoreError::Fenced)). The `oxkv` docs call
+//! that condition "the current process must stop writing and restart". That
+//! is a correct *takeover* protocol and a useless *detection* protocol.
 //!
-//! Telling those two cases apart needs a liveness signal, which needs a
-//! lease. This module is that signal: one small object in the same bucket,
-//! written with a conditional create, renewed on a timer, and released on a
-//! clean shutdown.
+//! Nothing in the protocol tells the two cases apart:
+//!
+//! - The earlier process still serves traffic.
+//! - The earlier process crashed.
+//!
+//! A second replica that uses the same prefix therefore starts cleanly. It
+//! then serves writes that diverge in a way that no tool reports. The failure
+//! appears later and elsewhere.
+//!
+//! Telling the two cases apart needs a liveness signal. A liveness signal
+//! needs a lease. This module is that signal. The lease is one small object
+//! in the same bucket. The holder creates it with a conditional create. A
+//! timer renews it. A clean shutdown releases it.
 //!
 //! # What it guarantees
 //!
-//! - Two processes racing to start on the same prefix: the loser refuses to
-//!   start and names the winner. No split brain.
-//! - A crashed predecessor: the lease goes stale after `ttl_secs` and the
-//!   next start takes over automatically. No manual cleanup.
-//! - Two predecessors crashing together and two replicas starting together:
-//!   the stale record is replaced under a compare-and-set, so exactly one
-//!   of them wins and the other is told who.
-//! - A predecessor that stalls (GC pause, node partition) past the TTL: the
-//!   successor takes over, and the predecessor notices on its next renewal
-//!   and reports itself unready. Divergence is bounded to the stall window
-//!   rather than being silent forever.
+//! - Two processes that start at the same time on one prefix: the loser
+//!   refuses to start and names the winner. There is no split brain.
+//! - A predecessor that crashed: the lease goes stale after `ttl_secs`, and
+//!   the next start takes it over. There is no manual cleanup.
+//! - Two predecessors that crash together, and two replicas that start
+//!   together: the stale record is replaced under a compare-and-set. So
+//!   exactly one of them wins, and the other is told who won.
+//! - A predecessor that stops for longer than the TTL, for example during a
+//!   GC pause or a node partition: the successor takes over. The predecessor
+//!   finds out on its next renewal, and reports itself unready. Divergence
+//!   stays inside the length of the stop, instead of being silent forever.
 //!
-//! It cannot prevent a network partition from splitting the prefix; nothing
-//! lease-based can. What it buys is that the losing side *finds out*, and
-//! stops taking traffic, instead of discovering it through corrupted data.
+//! The lease cannot stop a network partition from splitting the prefix.
+//! Nothing that uses a lease can. What the lease does give is that the losing
+//! side *finds out* and stops taking traffic, instead of finding out through
+//! data that is corrupt.
 
 use std::sync::{
     Arc,
@@ -43,48 +50,52 @@ use std::sync::{
 use object_store::{ObjectStore, PutMode, PutPayload, UpdateVersion, path::Path as ObjectPath};
 use serde::{Deserialize, Serialize};
 
-/// Object key holding the lease record, relative to the bucket root.
+/// Object key that holds the lease record, relative to the root of the
+/// bucket.
 ///
-/// Deliberately *not* under any `oxkv` prefix: it has to be readable through
-/// a raw [`ObjectStore`] before any store is built (building one takes an
-/// epoch, which is the thing being guarded), and it must never collide with
-/// a transactional key. The leading underscore keeps it out of the
-/// `{prefix}/policy`, `/fs`, `/wal`, `/u/...` namespace.
+/// The key is deliberately not under any `oxkv` prefix. The lease must be
+/// readable through a raw [`ObjectStore`] before any store is built. Building
+/// a store takes an epoch, and that epoch is the thing the lease guards. The
+/// key must also never collide with a transactional key. The leading
+/// underscore keeps it out of the `{prefix}/policy`, `/fs`, `/wal`, and
+/// `/u/...` namespace.
 const LEASE_KEY: &str = "_rust-api-writer-lease.json";
 
-/// Default lease TTL: long enough to ride out a GC pause or a slow S3
-/// request, short enough that a crashed node is replaced promptly.
+/// Default lease TTL. The value is long enough to survive a GC pause or a
+/// slow S3 request. It is short enough that a node that crashed is replaced
+/// soon.
 pub const DEFAULT_LEASE_TTL_SECS: u64 = 60;
 
-/// The lease record as stored in the bucket.
+/// The lease record, as stored in the bucket.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct LeaseRecord {
-    /// Identity of the holder, `{hostname}:{uuid}`.
+    /// Identity of the holder, in the form `{hostname}:{uuid}`.
     instance: String,
-    /// Unix seconds when this process first claimed the lease.
+    /// Unix seconds at which this process first claimed the lease.
     claimed_at: i64,
     /// Unix seconds of the most recent renewal.
     renewed_at: i64,
-    /// TTL the holder is operating under.
+    /// TTL that the holder operates under.
     ttl_secs: u64,
-    /// Holder's pid, for an operator reading the object by hand.
+    /// Process ID of the holder. The field is here for an operator who
+    /// reads the object by hand.
     pid: u32,
 }
 
 impl LeaseRecord {
     /// True while this record is still a live lease at `now`.
     ///
-    /// Unsigned on purpose. The comparison used to be `age < ttl_secs as
-    /// i64`, and a TTL at or above 2^63 casts to a *negative* `i64` -- so
-    /// `age < negative` is false for every live holder, every second
-    /// writer was told the lease was stale and took over, and the only
-    /// symptom was a `warn!` nobody reads.
-    /// `[database].writer_lease_ttl_secs` is an unvalidated `u64`, so that
-    /// value was one keystroke away.
+    /// The subtraction is unsigned on purpose. The comparison used to be
+    /// `age < ttl_secs as i64`. A TTL at or above 2^63 casts to a
+    /// *negative* `i64`. The test `age < negative` is then false for every
+    /// live holder. Every second writer was told the lease was stale, and it
+    /// took over. The only trace was a `warn!` that nobody reads.
+    /// `[database].writer_lease_ttl_secs` is a `u64` that no check reads, so
+    /// that value was one keystroke away.
     ///
-    /// `checked_sub` yields `None` when the holder's clock is behind ours,
-    /// which reads as live. A negative age from clock skew is the safe
-    /// direction to get wrong here.
+    /// `checked_sub` yields `None` when the clock of the holder is behind
+    /// ours. The function reads that case as live. A negative age from clock
+    /// skew is the safe direction in which to be wrong here.
     fn is_live_at(&self, now: i64) -> bool {
         match now.checked_sub(self.renewed_at) {
             Some(age) => u64::try_from(age).is_ok_and(|age| age < self.ttl_secs),
@@ -106,13 +117,13 @@ pub enum LeaseError {
     Held {
         /// The contested prefix.
         prefix: String,
-        /// Identity recorded by the holder.
+        /// Identity that the holder recorded.
         instance: String,
-        /// Holder's pid.
+        /// Process ID of the holder.
         pid: u32,
         /// Seconds since the holder last renewed.
         age: i64,
-        /// TTL the holder is operating under.
+        /// TTL that the holder operates under.
         ttl: u64,
         /// Seconds until the lease goes stale.
         wait: i64,
@@ -139,27 +150,28 @@ pub enum LeaseError {
 
 /// A held single-writer lease.
 ///
-/// Dropping the guard does *not* release the lease: an orderly release is an
-/// explicit [`release`](Self::release) so that shutdown ordering is visible at
-/// the call site. A dropped lease simply goes stale after its TTL, which is
-/// the crash path working as intended.
+/// Dropping the guard does *not* release the lease. An orderly release is an
+/// explicit [`release`](Self::release), so that the order of the steps at
+/// shutdown stays visible at the call site. A dropped lease goes stale after
+/// its TTL. That is the crash path working as intended.
 #[derive(Debug)]
 pub struct WriterLease {
     store: Arc<dyn ObjectStore>,
     path: ObjectPath,
     record: LeaseRecord,
-    /// Set when a renewal finds another instance holding the lease. Drives
-    /// `/ready`, so the orchestrator drains and replaces this process.
+    /// Set when a renewal finds that another instance holds the lease. The
+    /// flag drives `/ready`, so the orchestrator drains this process and
+    /// replaces it.
     lost: Arc<AtomicBool>,
 }
 
 impl WriterLease {
     /// Claims the lease for `db_prefix`, or explains who holds it.
     ///
-    /// Must be called *before* any
-    /// [`build_s3_store`](crate::db::build_s3_store) for the same scope:
-    /// building a store takes an epoch, so checking afterwards would mean
-    /// having already displaced the incumbent.
+    /// The function must be called *before* any
+    /// [`build_s3_store`](crate::db::build_s3_store) for the same scope.
+    /// Building a store takes an epoch, so a check after that would report
+    /// that the function had already displaced the current holder.
     pub async fn acquire(
         store: Arc<dyn ObjectStore>,
         db_prefix: &str,
@@ -176,7 +188,7 @@ impl WriterLease {
             pid: std::process::id(),
         };
 
-        // Fast path: nobody has ever written the record.
+        // Fast path. No process has ever written the record.
         if write_record(&*store, &path, &record, WriteMode::Create)
             .await
             .is_ok()
@@ -189,7 +201,8 @@ impl WriterLease {
             return Ok(Self::new(store, path, record));
         }
 
-        // Someone holds it. Stale means crashed; fresh means alive.
+        // Another process holds the lease. A stale lease means a crash. A
+        // fresh lease means the holder is alive.
         let held = fetch(&*store, &path, &prefix)
             .await?
             .ok_or_else(|| LeaseError::Io {
@@ -212,10 +225,10 @@ impl WriterLease {
             ttl_secs = held.record.ttl_secs,
             "taking over an expired single-writer lease (previous holder stopped renewing)"
         );
-        // Conditional on the exact record we judged stale. A racing
-        // take-over that got there first changes the object, so this write
-        // fails its precondition and the loser reports the winner instead
-        // of confirming a record it clobbered.
+        // The write is conditional on the exact record that we judged to be
+        // stale. A racing take-over that arrived first changes the object. So
+        // this write fails its precondition, and the loser reports the winner
+        // instead of confirming a record that it replaced.
         if let Err(source) =
             write_record(&*store, &path, &record, WriteMode::Unchanged(held.version)).await
         {
@@ -252,43 +265,45 @@ impl WriterLease {
         }
     }
 
-    /// Identity recorded in the lease, for logs and operator tooling.
+    /// Identity that the lease records, for logs and operator tools.
     pub fn instance(&self) -> &str {
         &self.record.instance
     }
 
-    /// Flag flipped once another instance is observed holding the lease.
+    /// Flag that is set once another instance holds the lease.
     ///
-    /// Share the `Arc` with the `/ready` check: losing the lease means this
-    /// process must stop taking traffic, because a successor now owns the
-    /// prefix.
+    /// Share the `Arc` with the `/ready` check. Losing the lease means that
+    /// this process must stop taking traffic, because a successor now owns
+    /// the prefix.
     pub fn lost_flag(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.lost)
     }
 
-    /// Renews the lease. Returns `false` once another instance holds it.
+    /// Renews the lease. The function returns `false` once another instance
+    /// holds the lease.
     ///
-    /// Read-before-write, and deliberately so: a renewal that wrote first
-    /// would overwrite a successor's record and then read back its *own*
-    /// write, concluding it still held the lease. That is the exact
-    /// split brain this module exists to prevent -- the displaced process
-    /// would keep re-claiming the record it had already lost.
+    /// The function reads before it writes, and that order is deliberate. A
+    /// renewal that wrote first would replace the record of a successor. It
+    /// would then read back its *own* write, and conclude that it still held
+    /// the lease. That is the exact split brain that this module exists to
+    /// prevent. The displaced process would keep taking the record back that
+    /// it had already lost.
     ///
-    /// A renewal that cannot confirm ownership (S3 blip, unparseable
-    /// record) also returns `false`: treating transient I/O as "still
-    /// fine" would let a partitioned node keep serving after its lease
-    /// expired elsewhere.
+    /// A renewal that cannot confirm ownership also returns `false`. The
+    /// causes are an S3 error and an unreadable record. Treating a
+    /// temporary I/O error as "still fine" would let a node on a partition
+    /// keep serving after its lease expired somewhere else.
     ///
-    /// A successor may still slip in between the read and the write, but
-    /// only one that already considered us stale (past the TTL). The
-    /// residual window is one round trip inside a TTL violation, not a
-    /// standing condition.
+    /// A successor can still get the record between the read and the write.
+    /// That successor must have judged us to be stale, which means the TTL
+    /// had passed. The remaining window is one round trip inside a TTL
+    /// violation. It is not a condition that lasts.
     ///
-    /// The write here stays unconditional, unlike the take-over in
-    /// [`WriterLease::acquire`]: this process has already established it is
-    /// the holder, and making the renewal itself a compare-and-set would
-    /// only convert a benign overwrite into a spurious "lease lost" the
-    /// first time a successor took over.
+    /// The write in this function stays unconditional, unlike the take-over
+    /// in [`WriterLease::acquire`]. This process has already established that
+    /// it is the holder. A compare-and-set on the renewal would only turn a
+    /// harmless replace into a false "lease lost" the first time a successor
+    /// took over.
     pub async fn renew(&mut self) -> bool {
         if self.lost.load(Ordering::Relaxed) {
             return false;
@@ -330,11 +345,12 @@ impl WriterLease {
         true
     }
 
-    /// Releases the lease if we still hold it, so a replacement can start
-    /// immediately instead of waiting out the TTL.
+    /// Releases the lease if this process still holds it. A replacement can
+    /// then start at once, instead of waiting out the TTL.
     ///
-    /// Best effort: a failure here only costs the next start `ttl_secs`, so
-    /// it is logged rather than propagated.
+    /// The function makes a best effort. A failure here costs the next start
+    /// only `ttl_secs`, so the function logs the failure instead of passing
+    /// it on.
     pub async fn release(&mut self) {
         match fetch(&*self.store, &self.path, "").await {
             Ok(Some(current)) if current.record.instance != self.record.instance => {
@@ -367,57 +383,61 @@ impl WriterLease {
     }
 }
 
-/// Keeps a renewal task alive and releases the lease when dropped.
+/// Keeps a renewal task alive and releases the lease when the guard drops.
 ///
-/// Dropping this guard ends the renewal loop and lets the release run, but
-/// *nothing waits for it*. A `Drop` impl cannot await, and the task it
-/// wakes only becomes runnable -- it is not run. At process exit the Tokio
-/// runtime drops spawned tasks without polling them, so a shutdown that
-/// relies on the drop never deletes the record and the replacement waits
-/// out the whole TTL.
+/// Dropping this guard ends the renewal loop and lets the release run.
+/// *Nothing waits for the release.* A `Drop` implementation cannot await. The
+/// task that it wakes only becomes runnable, and the runtime does not run
+/// it. At process exit, the Tokio runtime drops tasks that it spawned
+/// without polling them. So a shutdown that relies on the drop never deletes
+/// the record, and the replacement waits out the whole TTL.
 ///
-/// [`release`](Self::release) is the orderly path and the one the server
-/// takes. Drop remains a best-effort backstop for the early-error exits
-/// that cannot await.
+/// [`release`](Self::release) is the orderly path, and it is the path that
+/// the server takes. Drop remains a backstop that tries but cannot promise.
+/// It covers the early error exits that cannot await.
 ///
-/// `#[must_use]`: dropping it early silently disables renewal, and the
-/// release it would have triggered is the part that does not run.
+/// `#[must_use]`: dropping the guard early stops the renewal without a
+/// guarantee. The release that it would have started is the part that does
+/// not run.
 #[must_use = "dropping the guard stops renewal and releases the lease on a best-effort basis"]
 #[derive(Debug)]
 pub struct LeaseGuard {
-    /// Ends the renewal task's shutdown future. `None` once [`release`](Self::release)
-    /// has taken it, so a released guard does not signal twice.
+    /// Ends the shutdown future of the renewal task. The field is `None`
+    /// once [`release`](Self::release) has taken it, so a released guard
+    /// does not signal twice.
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
-    /// The renewal task, which owns the lease and releases it on the way
-    /// out. `None` once [`release`](Self::release) has taken it.
+    /// The renewal task. It owns the lease and releases it on the way out.
+    /// The field is `None` once [`release`](Self::release) has taken it.
     task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl LeaseGuard {
-    /// Stops renewal and waits for the lease to be released.
+    /// Stops the renewal and waits for the lease to be released.
     ///
     /// This is what makes a rolling restart hand the prefix over without a
-    /// TTL wait, and the reason the shutdown path in `main.rs` awaits it
-    /// rather than dropping the guard.
+    /// wait for the TTL. It is also why the shutdown path in `main.rs`
+    /// awaits the function instead of dropping the guard.
     ///
-    /// Bounded by [`RELEASE_TIMEOUT`]: a release is best effort (it only
-    /// costs the next start one TTL), so an unreachable object store must
-    /// not hold the process open forever. On timeout this returns and the
-    /// lease expires on its own, which is the crash path working as
-    /// intended. The renewal task is left running rather than aborted --
-    /// its release is a single `get` plus a `delete`, so aborting mid-call
-    /// buys nothing and the runtime will drop it on exit anyway.
+    /// [`RELEASE_TIMEOUT`] sets the bound. A release is a best effort, and it
+    /// costs the next start only one TTL. So an object store that does not
+    /// answer must not hold the process open forever. On a timeout, the
+    /// function returns and the lease expires on its own. That is the crash
+    /// path working as intended. The renewal task keeps running instead of
+    /// being aborted. Its release is one `get` and one `delete`, so aborting
+    /// it during the call gains nothing. The runtime drops the task at exit
+    /// in any case.
     ///
-    /// Consumes the guard, so the `Drop` backstop does not fire behind it
-    /// and release twice.
+    /// The function takes the guard, so the `Drop` backstop does not fire
+    /// behind it and release the lease a second time.
     pub async fn release(mut self) {
         self.release_within(RELEASE_TIMEOUT).await
     }
 
-    /// [`release`](Self::release), bounded by `timeout` instead.
+    /// [`release`](Self::release), with `timeout` as the bound instead.
     pub async fn release_within(&mut self, timeout: std::time::Duration) {
-        // Both fields are `Option` so this is idempotent: a guard released
-        // twice signals once, and the second call finds nothing to await.
+        // Both fields are `Option`, so the function is idempotent. A guard
+        // that is released twice signals once. The second call finds nothing
+        // to await.
         self.shutdown.take();
         let Some(task) = self.task.take() else {
             return;
@@ -442,36 +462,36 @@ impl LeaseGuard {
 }
 
 impl Drop for LeaseGuard {
-    /// Stops renewal and lets the release run, without waiting for it.
+    /// Stops the renewal and lets the release run, without waiting for it.
     ///
-    /// Only the best-effort half: the task is detached rather than awaited,
-    /// so at process exit the runtime drops it unpolled and the record
-    /// survives until the TTL expires. Callers that can await should call
-    /// [`release`](Self::release) instead -- see the type docs for why
-    /// dropping is not equivalent.
+    /// This function only does the best-effort half. The task is detached
+    /// instead of awaited. At process exit, the runtime drops the task
+    /// without polling it, and the record survives until the TTL expires.
+    /// A caller that can await should call [`release`](Self::release)
+    /// instead. The type docs explain why dropping is not the same.
     fn drop(&mut self) {
         self.shutdown.take();
     }
 }
 
 /// How long [`LeaseGuard::release`] waits for the record to be deleted
-/// before giving up and letting the TTL expire it.
+/// before it gives up and lets the TTL expire the lease.
 ///
-/// A release is a single `get` plus a `delete` on the lease key, so a
-/// correct store answers in well under a second. The bound is generous
-/// because its only job is to stop a wedged store from holding the process
-/// open indefinitely, and the cost of firing is bounded and known: the
-/// replacement waits one TTL.
+/// A release is one `get` and one `delete` on the lease key, so a store that
+/// works answers in much less than a second. The bound is generous because
+/// its only purpose is to stop a stuck store from holding the process open.
+/// The cost of reaching the bound is known and bounded: the replacement waits
+/// one TTL.
 pub const RELEASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Spawns a renewal task, returning the `/ready` flag and the guard that
-/// keeps it running.
+/// Starts a renewal task. The function returns the `/ready` flag and the
+/// guard that keeps the task running.
 ///
-/// The task releases the lease when the guard drops, and when
-/// [`LeaseGuard::release`] tells it to. It keeps ticking after a lost
-/// lease rather than exiting: a later successful renewal cannot un-fence
-/// us, and the flag must stay set so the process is never re-admitted to
-/// traffic, so there is nothing useful left to do.
+/// The task releases the lease when the guard drops. It also releases the
+/// lease when [`LeaseGuard::release`] tells it to. The task keeps running
+/// after a lost lease instead of exiting. A later renewal that succeeds
+/// cannot un-fence us. The flag must stay set, so that the process never
+/// takes traffic again. Nothing useful is left for the task to do.
 pub fn spawn_renewer(
     mut lease: WriterLease,
     interval: std::time::Duration,
@@ -480,9 +500,9 @@ pub fn spawn_renewer(
     let (tx, rx) = tokio::sync::oneshot::channel();
     let task = tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
-        ticker.tick().await; // the first tick completes immediately
-        // Pinned outside the loop: `select!` would otherwise move the
-        // shutdown future on the first iteration.
+        ticker.tick().await; // the first tick completes at once
+        // Pinned outside the loop. A `select!` would otherwise move the
+        // shutdown future during the first pass.
         tokio::pin!(rx);
         loop {
             tokio::select! {
@@ -491,8 +511,8 @@ pub fn spawn_renewer(
                         tracing::error!("single-writer lease lost; /ready reports 503");
                     }
                 }
-                // Fires when the guard drops (sender closed) or on an
-                // explicit send.
+                // The channel fires when the guard drops, because the
+                // sender closed. It also fires on an explicit send.
                 _ = &mut rx => break,
             }
         }
@@ -514,7 +534,7 @@ fn instance_id() -> String {
     format!("{host}:{}", uuid::Uuid::now_v7())
 }
 
-/// Object path of the lease record for a (already trimmed) prefix.
+/// Object path of the lease record for a prefix that is already trimmed.
 fn lease_path(prefix: &str) -> ObjectPath {
     if prefix.is_empty() {
         ObjectPath::from(LEASE_KEY)
@@ -524,11 +544,11 @@ fn lease_path(prefix: &str) -> ObjectPath {
 }
 
 impl LeaseError {
-    /// Builds the "someone else holds it" error for a lease we read.
+    /// Builds the "another process holds it" error for a lease that was read.
     fn held(prefix: &str, record: &LeaseRecord, age: i64) -> Self {
-        // Unsigned subtraction, not `ttl as i64 - age`: a TTL at or above
-        // 2^63 casts negative, so the old form produced a negative `wait`
-        // (clamped to 0) for a lease that was nowhere near stale.
+        // The subtraction is unsigned, not `ttl as i64 - age`. A TTL at or
+        // above 2^63 casts negative, so the old form gave a negative `wait`
+        // for a lease that was nowhere near stale. The cast clamped it to 0.
         let wait = u64::try_from(age)
             .ok()
             .and_then(|age| record.ttl_secs.checked_sub(age))
@@ -544,20 +564,22 @@ impl LeaseError {
     }
 }
 
-/// A lease record read off the store, with the version that read observed.
+/// A lease record that was read from the store, with the version that the
+/// read observed.
 ///
-/// The version is what makes a take-over a compare-and-set: it is the token
-/// `PutMode::Update` checks, so the write can only land if nobody changed
-/// the record between this read and that write.
+/// The version is what makes a take-over a compare-and-set. The version is
+/// the token that `PutMode::Update` checks. So the write can only land if
+/// nobody changed the record between this read and that write.
 #[derive(Debug)]
 struct Fetched {
     record: LeaseRecord,
     version: UpdateVersion,
 }
 
-/// Reads the lease record, mapping a decode failure to [`LeaseError::Corrupt`]
-/// rather than a generic I/O error: an unparseable record must not look
-/// like a transient blip, because the safe response to it is to refuse.
+/// Reads the lease record. The function maps a decode failure to
+/// [`LeaseError::Corrupt`] instead of a general I/O error. A record that
+/// cannot be parsed must not look like a temporary error, because the safe
+/// response to that record is to refuse.
 async fn fetch(
     store: &dyn ObjectStore,
     path: &ObjectPath,
@@ -591,13 +613,13 @@ async fn fetch(
     Ok(Some(Fetched { record, version }))
 }
 
-/// How a record write may land.
+/// How a write of a record may land.
 enum WriteMode {
     /// Only if the object does not exist.
     Create,
-    /// Replace whatever is there.
+    /// Replaces whatever is there.
     Overwrite,
-    /// Replace only the exact version observed.
+    /// Replaces only the exact version that was observed.
     Unchanged(UpdateVersion),
 }
 
@@ -642,8 +664,8 @@ mod tests {
     const TTL: u64 = 60;
 
     /// A fresh lease blocks a second writer, and the error names the holder.
-    /// This is the case the whole module exists for: without it, a second
-    /// replica starts cleanly and the two diverge silently.
+    /// This is the case that the whole module exists for. Without this case,
+    /// a second replica starts cleanly and the two diverge with no report.
     #[tokio::test]
     async fn second_writer_is_refused_while_the_lease_is_live() {
         let store = mem();
@@ -667,27 +689,27 @@ mod tests {
         assert_eq!(instance, first.instance());
         assert_eq!(*pid, std::process::id());
         assert!(*wait > 0, "error should say how long to wait: {err}");
-        // The message has to be actionable for an operator reading logs.
+        // The message must be useful to an operator who reads the logs.
         let text = err.to_string();
         assert!(text.contains(prefix), "unhelpful message: {text}");
         assert!(text.contains(first.instance()), "unhelpful message: {text}");
     }
 
-    /// A TTL too large for the comparison must not make a live lease look
-    /// stale.
+    /// A TTL that is too large for the comparison must not make a live lease
+    /// look stale.
     ///
-    /// The check was `age < ttl_secs as i64`, and a TTL at or above 2^63
-    /// casts to a negative `i64`, so the comparison is false for every
-    /// live holder: the second writer is told the lease expired, takes the
-    /// prefix from a running server, and the only trace is a `warn!`.
+    /// The check was `age < ttl_secs as i64`. A TTL at or above 2^63 casts
+    /// to a negative `i64`, so the comparison is false for every live
+    /// holder. The second writer is told the lease expired, and it takes the
+    /// prefix from a running server. The only trace is a `warn!`.
     /// `[database].writer_lease_ttl_secs` is a `u64`, so that value was
     /// reachable.
     ///
-    /// This claims with a huge TTL rather than backdating: the record is
-    /// milliseconds old, so under the old comparison it read as stale and
-    /// the take-over would have succeeded. The lease must refuse.
+    /// The test claims with a huge TTL instead of going back in time. The
+    /// record is milliseconds old. Under the old comparison, it read as
+    /// stale, and the take-over would have succeeded. The lease must refuse.
     #[tokio::test]
-    async fn a_lease_too_long_to_compare_is_still_live() {
+    async fn a_lease_with_a_huge_ttl_is_still_live() {
         let store = mem();
         let prefix = "lease-test-huge-ttl";
         const HUGE: u64 = i64::MAX as u64 + 1;
@@ -702,18 +724,19 @@ mod tests {
             panic!("expected Held, got {err:?}");
         };
         assert_eq!(instance, first.instance());
-        // The operator-facing `wait` was a by-product of the same cast and
-        // came out 0 for a lease with centuries left, so it is asserted
-        // too: a number that says "no wait needed" on a live lease is as
-        // misleading as the comparison itself.
+        // The `wait` value in the operator message came from the same
+        // cast, and it came out as 0 for a lease with centuries left. So the
+        // test asserts it here. A number that says "no wait needed" on a
+        // live lease is as misleading as the comparison itself.
         assert!(
             *wait > 0,
             "the error must still say how long to wait: {err}",
         );
     }
 
-    /// A holder that stops renewing (crash) must not block recovery: past
-    /// the TTL the next start takes over, and says who it displaced.
+    /// A holder that stops renewing, such as after a crash, must not block
+    /// recovery. After the TTL passes, the next start takes over, and it
+    /// says which holder it displaced.
     #[tokio::test]
     async fn expired_lease_is_taken_over() {
         let store = mem();
@@ -722,8 +745,8 @@ mod tests {
             .await
             .expect("first writer claims");
 
-        // Backdate the record instead of sleeping: this is what a crashed
-        // holder looks like on disk.
+        // Go back in time in the record instead of sleeping. This is what a
+        // holder that crashed looks like on disk.
         let path = lease_path(prefix);
         let mut stale: LeaseRecord =
             serde_json::from_slice(&store.get(&path).await.unwrap().bytes().await.unwrap())
@@ -738,35 +761,35 @@ mod tests {
             .expect("stale lease is takeable");
         assert_ne!(second.instance(), first.instance());
 
-        // And the record on disk is now the new holder's.
+        // The record on disk now holds the identity of the new holder.
         let current: LeaseRecord =
             serde_json::from_slice(&store.get(&path).await.unwrap().bytes().await.unwrap())
                 .unwrap();
         assert_eq!(current.instance, second.instance());
     }
 
-    /// Two processes may not both take over the *same* stale lease.
+    /// Two processes must not both acquire the *same* stale lease.
     ///
-    /// A crashed holder plus two replicas starting together is the ordinary
-    /// case, not an exotic one: it is what a node failure and a rolling
-    /// restart both look like. The take-over used to be write-then-verify:
-    /// both replicas read the stale record, both overwrote it
-    /// unconditionally, and each confirm-read landed after its *own* write,
-    /// so both returned `Ok`. The check caught only the interleaving that
-    /// does not produce two winners, while the comment over it claimed to
-    /// catch the racing process.
+    /// A holder that crashed together with two replicas that start at the
+    /// same time is the ordinary case. A node failure looks that way. A
+    /// rolling restart looks that way. The take-over used to write and then
+    /// check. Both replicas read the stale record. Both replaced it without
+    /// a condition. The check of each replica then came after its *own*
+    /// write, so both returned `Ok`. The check caught only the order of
+    /// operations that cannot give two winners. The comment above the check
+    /// claimed that it caught the racing process.
     ///
-    /// The damage was bounded -- the second `build_s3_store` epoch-fences
-    /// the first, whose next `renew()` notices within one tick and latches
-    /// `lost` -- but for up to `ttl/3` both are in rotation and one 500s on
-    /// every write.
+    /// The damage was bounded. The second `build_s3_store` fences the first
+    /// through the epoch. The next `renew()` of the first finds out within
+    /// one tick, and it sets `lost`. For up to `ttl/3`, though, both are in
+    /// rotation and one returns 500 for every write.
     ///
-    /// `RaceStore` performs a competing writer's overwrite in the window
-    /// between our read and our write, which is exactly the interleaving a
-    /// real second process produces. With the take-over as a compare-and-set
-    /// on the observed version, the write fails its precondition and the
-    /// loser is told who won; with the unconditional overwrite it lands and
-    /// both processes believe they hold the prefix.
+    /// `RaceStore` performs the replace of a competing writer in the gap
+    /// between the read and the write. That gap is the exact one that a real
+    /// second process creates. With the take-over as a compare-and-set on
+    /// the observed version, the write fails its precondition, and the loser
+    /// is told who won. With the unconditional replace, the write lands, and
+    /// both processes believe that they hold the prefix.
     #[tokio::test]
     async fn a_takeover_that_loses_the_race_reports_the_winner_instead_of_claiming_it() {
         let store = mem();
@@ -826,7 +849,7 @@ mod tests {
         );
     }
 
-    /// Identity the racing winner in the test above claims to be.
+    /// Identity that the racing winner in the test above claims to have.
     fn winner_record() -> LeaseRecord {
         let now = chrono::Utc::now().timestamp();
         LeaseRecord {
@@ -838,8 +861,9 @@ mod tests {
         }
     }
 
-    /// A record that looks like a crashed holder's: present but past its
-    /// TTL, which is the precondition for a take-over.
+    /// A record that looks like the record of a holder that crashed. The record
+    /// is present but past its TTL. That is the condition that a take-over
+    /// requires.
     async fn seed_stale_lease(
         store: &Arc<dyn ObjectStore>,
         prefix: &str,
@@ -859,23 +883,24 @@ mod tests {
         record
     }
 
-    /// An [`ObjectStore`] that runs a competing write in the window between
-    /// the caller's read and its write.
+    /// An [`ObjectStore`] that runs a competing write in the gap between the
+    /// read of the caller and its write.
     ///
-    /// The interleaving is the whole point and cannot be produced by
-    /// timing: `acquire` reads the record, decides it is stale, then writes.
-    /// A real second process lands its write in that gap. This injects one
-    /// there, deterministically, so the assertion is about the
-    /// compare-and-set rather than about a race that may or may not happen
-    /// to resolve this way on this run.
+    /// That order of operations is the whole point, and timing cannot create
+    /// it. `acquire` reads the record, decides that it is stale, then writes.
+    /// A real second process lands its write in that gap. This store injects
+    /// one write there, in a fixed way. So the assertion tests the
+    /// compare-and-set. It does not test a race that may or may not end this
+    /// way in one run.
     #[derive(Debug)]
     struct RaceStore {
         inner: Arc<dyn ObjectStore>,
         before_put: RaceHook,
     }
 
-    /// A boxed competing write. Newtype so it can carry a [`Debug`] impl, which
-    /// the store it feeds requires and a boxed future does not have.
+    /// A competing write in a box. The function is a new type so that it can
+    /// carry a [`Debug`] implementation. The store that it feeds needs that
+    /// implementation. A boxed future does not have one.
     #[derive(Clone)]
     struct RaceHook(Arc<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>);
 
@@ -914,7 +939,7 @@ mod tests {
             payload: PutPayload,
             opts: object_store::PutOptions,
         ) -> object_store::Result<object_store::PutResult> {
-            // Only the conditional write is the contended one; the initial
+            // Only the conditional write has a competitor. The initial
             // `PutMode::Create` fast path has nothing to race against.
             if matches!(opts.mode, PutMode::Update(_)) {
                 self.before_put.run().await;
@@ -969,9 +994,9 @@ mod tests {
         }
     }
 
-    /// The displaced writer must find out on its next renewal and latch
-    /// itself unready -- this is the half that makes the lease a lease
-    /// rather than a startup assertion.
+    /// The displaced writer must find out on its next renewal, and it must set
+    /// itself unready. That is the half that makes this a lease instead of
+    /// an assertion at startup.
     #[tokio::test]
     async fn renewal_detects_takeover_and_latches_unready() {
         let store = mem();
@@ -982,7 +1007,8 @@ mod tests {
         let lost = first.lost_flag();
         assert!(!lost.load(Ordering::Relaxed));
 
-        // A successor backdates the record past its TTL and takes over.
+        // A successor goes back in time in the record, past its TTL, and
+        // then takes over.
         let path = lease_path(prefix);
         let mut stale: LeaseRecord =
             serde_json::from_slice(&store.get(&path).await.unwrap().bytes().await.unwrap())
@@ -997,12 +1023,13 @@ mod tests {
 
         assert!(!first.renew().await, "renewal must notice the takeover");
         assert!(lost.load(Ordering::Relaxed), "lost flag must latch");
-        // Latched: a later renewal must not "recover" and re-admit traffic.
+        // The flag stays set. A later renewal must not "recover" and let
+        // traffic in again.
         assert!(!first.renew().await);
     }
 
-    /// Renewal keeps a live lease alive, so a long-running process is never
-    /// displaced by a peer that sees a stale record.
+    /// Renewal keeps a live lease alive, so a process that runs for a long
+    /// time is never displaced by a peer that saw a stale record.
     #[tokio::test]
     async fn renewal_keeps_a_healthy_lease() {
         let store = mem();
@@ -1015,11 +1042,11 @@ mod tests {
         assert!(!lost.load(Ordering::Relaxed));
     }
 
-    /// A displaced process must not overwrite the record on its way out.
-    /// This is the failure the read-before-write ordering in `renew`
-    /// prevents: writing first would make the loser clobber the winner's
-    /// lease on every tick, and read back its own write to conclude it
-    /// still held it.
+    /// A displaced process must not replace the record on its way out.
+    /// This is the failure that the read before write in `renew` prevents. If
+    /// the write came first, the loser would replace the lease of the winner
+    /// on every tick. It would then read back its own write, and conclude
+    /// that it still held the lease.
     #[tokio::test]
     async fn displaced_writer_does_not_clobber_its_successor() {
         let store = mem();
@@ -1051,8 +1078,8 @@ mod tests {
         );
     }
 
-    /// An orderly release hands the prefix over without a TTL wait, which is
-    /// what makes a rolling restart fast.
+    /// An orderly release hands the prefix over without a wait for the TTL. That
+    /// is what makes a rolling restart fast.
     #[tokio::test]
     async fn release_allows_immediate_reacquisition() {
         let store = mem();
@@ -1068,27 +1095,30 @@ mod tests {
         assert_ne!(next.instance(), lease.instance());
     }
 
-    /// Shutting the guard down must actually delete the lease record, before
-    /// the caller returns.
+    /// A shutdown of the guard must delete the lease record before the caller
+    /// returns.
     ///
-    /// This is the property the whole orderly-release path rests on, and it
-    /// was not true. `serve` held the guard in a plain `_lease_guard`
-    /// binding and relied on its `Drop` to run `lease.release()`. Dropping
-    /// the `oneshot::Sender` only *made* the detached task runnable; `serve`
-    /// then returned to `#[tokio::main] main`, which returned and dropped
-    /// the runtime, and Tokio drops spawned tasks without polling them. A
-    /// `Drop` impl cannot compensate because it cannot await.
+    /// The whole orderly release path rests on this property, and the
+    /// property was not true. `serve` held the guard in a plain
+    /// `_lease_guard` binding. The function relied on its `Drop` to run
+    /// `lease.release()`. Dropping the `oneshot::Sender` only *made* the
+    /// detached task runnable. `serve` then returned to `#[tokio::main]
+    /// main`, which returned and dropped the runtime. Tokio drops tasks that
+    /// it spawned without polling them. A `Drop` implementation cannot
+    /// compensate, because it cannot await.
     ///
-    /// So `DELETE _rust-api-writer-lease.json` never executed on *any*
-    /// graceful shutdown. A replacement pod read the still-present record
-    /// with `age < ttl_secs`, got `LeaseError::Held`, propagated it out of
-    /// `serve`, and CrashLoopBackOffs until the TTL expired -- defeating
-    /// the rolling-restart handover the lease exists to provide.
+    /// So `DELETE _rust-api-writer-lease.json` never ran on *any* graceful
+    /// shutdown. A replacement pod read the record that was still there,
+    /// found `age < ttl_secs`, and got `LeaseError::Held`. It passed the
+    /// error out of `serve`, and it entered CrashLoopBackOff until the TTL
+    /// expired. That defeated the handover on a rolling restart, which is
+    /// the one thing that the lease exists to provide.
     ///
-    /// Awaiting the guard's `release` is what makes it happen, so the test
-    /// awaits it and asserts the record is gone on return. Confirmed to
-    /// fail if the guard is dropped instead: the record survives, and the
-    /// reacquisition below returns `Held`.
+    /// Awaiting the `release` of the guard is what makes the delete happen.
+    /// So the test awaits it, and it checks that the record is gone when the
+    /// function returns. The test was confirmed to fail when the guard drops
+    /// instead. The record survives in that case, and the claim below returns
+    /// `Held`.
     #[tokio::test]
     async fn awaiting_the_guard_release_deletes_the_record_before_returning() {
         let store = mem();
@@ -1112,20 +1142,21 @@ mod tests {
             "awaiting the release returned without deleting the lease record; \
              a replacement waits out the whole TTL",
         );
-        // And the practical consequence: the prefix is immediately
-        // claimable, with no TTL wait.
+        // The practical result. The prefix can be claimed at once, with
+        // no wait for the TTL.
         let next = WriterLease::acquire(Arc::clone(&store), prefix, TTL)
             .await
             .expect("an orderly shutdown must hand the prefix over immediately");
         assert_ne!(next.instance(), instance);
     }
 
-    /// The renewal task must stop when the guard shuts down.
+    /// The renewal task must stop when the guard stops it.
     ///
-    /// A renewal that kept ticking after shutdown would overwrite the
-    /// successor's record and read back its own write, concluding it still
-    /// held the lease -- the split brain `renew`'s read-before-write
-    /// ordering exists to prevent, reachable from the other direction.
+    /// A renewal that kept running after the shutdown would replace the
+    /// record of the successor. It would then read back its own write, and
+    /// conclude that it still held the lease. That is the split brain that
+    /// the read before write in `renew` prevents. The same split brain is
+    /// also reachable from this direction.
     #[tokio::test]
     async fn releasing_the_guard_stops_renewal() {
         let store = mem();
@@ -1136,8 +1167,8 @@ mod tests {
         let (_lost, mut guard) = spawn_renewer(lease, std::time::Duration::from_millis(10));
         let path = lease_path(prefix);
 
-        // `release_within` awaits the task, so a stop is observable once it
-        // returns: nothing else can write the record afterwards.
+        // `release_within` awaits the task, so a stop is visible once it
+        // returns. Nothing else can write the record after that.
         guard
             .release_within(std::time::Duration::from_secs(5))
             .await;
@@ -1147,8 +1178,8 @@ mod tests {
             .await
             .expect("released lease is claimable");
 
-        // Several renewal intervals with room to spare. If the task were
-        // still ticking it would have clobbered the successor's record.
+        // Many renewal intervals pass, with time to spare. If the task
+        // still ran, it would have replaced the record of the successor.
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         let on_disk: LeaseRecord =
             serde_json::from_slice(&store.get(&path).await.unwrap().bytes().await.unwrap())
@@ -1160,12 +1191,12 @@ mod tests {
         );
     }
 
-    /// Releasing twice must not release twice.
+    /// A release must not run twice when the guard is released twice.
     ///
-    /// `release` consumes the guard, but `release_within` takes `&mut self`
-    /// so the shutdown ordering can be exercised directly. A second call
-    /// finds the task already taken and does nothing, rather than awaiting
-    /// a `JoinHandle` it no longer owns.
+    /// `release` takes the guard. `release_within` takes `&mut self`, so a
+    /// test can set the order of the shutdown steps directly. The second
+    /// call finds that the task has already been taken, and it does nothing.
+    /// It does not await a `JoinHandle` that it no longer owns.
     #[tokio::test]
     async fn releasing_a_guard_twice_is_a_no_op() {
         let store = mem();
@@ -1181,19 +1212,20 @@ mod tests {
             .await;
         assert!(store.get(&path).await.is_err());
 
-        // Must not hang or panic; there is nothing left to await.
+        // The call must not hang or panic. There is nothing left to await.
         guard
             .release_within(std::time::Duration::from_secs(5))
             .await;
     }
 
-    /// An unreachable store must not hold shutdown open forever.
+    /// An object store that does not answer must not hold the shutdown open
+    /// forever.
     ///
-    /// The release is best effort: failing to delete the record costs the
-    /// next start one TTL, while blocking shutdown costs a rolling restart
-    /// entirely and, on an orchestrator with a termination grace period,
-    /// a SIGKILL. So the wait is bounded, and the bound is what the test
-    /// exercises -- `StuckStore` never answers `get`, which is what an
+    /// The release is a best effort. A failure to delete the record costs
+    /// the next start one TTL. Holding the shutdown costs a rolling restart
+    /// in full. On an orchestrator with a termination grace period, it costs
+    /// a SIGKILL. So the function sets a bound, and the test exercises that
+    /// bound. `StuckStore` never answers `get`. That is what an
     /// unreachable S3 looks like from here.
     #[tokio::test]
     async fn a_stalled_release_gives_up_rather_than_blocking_shutdown() {
@@ -1206,13 +1238,14 @@ mod tests {
             ttl_secs: TTL,
             pid: std::process::id(),
         };
-        // Built directly rather than acquired: `acquire` needs a store that
-        // answers, and the whole point is a store that does not.
+        // Build the lease directly instead of claiming it. `acquire` needs a
+        // store that answers, and the whole point of the test is a store
+        // that does not answer.
         let lease = WriterLease::new(Arc::new(StuckStore), lease_path(prefix), record);
         let (_lost, mut guard) = spawn_renewer(lease, std::time::Duration::from_secs(3600));
 
-        // The release reads the record before deleting it, so a store that
-        // hangs on `get` stalls the whole release.
+        // The release reads the record before it deletes it, so a store
+        // that stops on `get` stops the whole release.
         let started = std::time::Instant::now();
         guard
             .release_within(std::time::Duration::from_millis(100))
@@ -1222,16 +1255,18 @@ mod tests {
             started.elapsed() < std::time::Duration::from_secs(30),
             "the release was not bounded; shutdown would hang on the store",
         );
-        // Bounded, not skipped: the wait really ran, just not forever.
-        // Without the `timeout` this future never resolves at all, which is
-        // the property the assertion below cannot express and this one can.
+        // The wait is bounded, not skipped. The wait really ran, but it
+        // did not run forever. Without the `timeout`, the future never
+        // completes at all. The assertion below cannot express that
+        // property. This assertion can.
         assert!(
             started.elapsed() >= std::time::Duration::from_millis(50),
             "the release gave up before even trying; the bound is a no-op",
         );
     }
 
-    /// A store that never answers, so a shutdown's release cannot complete.
+    /// A store that never answers, so that the release of a shutdown cannot
+    /// complete.
     #[derive(Debug)]
     struct StuckStore;
 
@@ -1299,8 +1334,8 @@ mod tests {
         }
     }
 
-    /// A release must not delete a lease someone else now owns, or a
-    /// displaced process would un-fence its own successor on the way out.
+    /// A release must not delete a lease that another process now owns. A
+    /// displaced process must not un-fence its own successor on the way out.
     #[tokio::test]
     async fn release_leaves_a_successors_lease_alone() {
         let store = mem();
@@ -1328,8 +1363,9 @@ mod tests {
         );
     }
 
-    /// An unparseable record must be refused, never guessed at: silently
-    /// overwriting it is exactly the split brain this module prevents.
+    /// A record that cannot be parsed must be refused, never guessed at. A
+    /// silent replace of that record is the exact split brain that this
+    /// module prevents.
     #[tokio::test]
     async fn corrupt_lease_is_refused_not_overwritten() {
         let store = mem();
@@ -1348,8 +1384,9 @@ mod tests {
         );
     }
 
-    /// The record must sit outside every oxkv prefix, or it would collide
-    /// with transactional keys and be swept by prefix scans.
+    /// The record must sit outside every oxkv prefix. Otherwise it would
+    /// collide with transactional keys, and a scan of the prefix would
+    /// delete it.
     #[tokio::test]
     async fn lease_lives_outside_the_oxkv_prefixes() {
         for prefix in ["oxkv", "custom/prefix", ""] {

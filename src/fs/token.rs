@@ -1,7 +1,9 @@
-//! Capability token for scoped file access.
+//! A capability token for scoped file access.
 //!
-//! Minted after row authorization; verified on `PUT`/`GET` without
-//! additional policy checks. Short-lived (5m) HMAC.
+//! The engine mints the token after row authorization.
+//! The engine verifies the token on `PUT` and `GET` without further policy
+//! checks.
+//! The token is an HMAC that expires after 5 minutes.
 
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use serde::{Deserialize, Serialize};
@@ -25,11 +27,13 @@ pub struct FsClaims {
 /// Default TTL for tokens.
 const DEFAULT_TTL_SECS: u64 = 300;
 
-/// Parses a capability secret from config/env: 64 hex chars (32 bytes).
+/// Parses a capability secret from config or env. The secret must be 64 hex
+/// chars (32 bytes).
 ///
-/// Hex keeps secrets copy-pasteable through TOML and env vars without
-/// quoting hazards; the length check rejects truncated UUIDs and
-/// passphrases at startup instead of minting under weak material.
+/// The hex form lets a caller copy secrets into TOML and env vars without
+/// quoting problems.
+/// The length check rejects truncated UUIDs and passphrases at startup.
+/// Without the check, the engine mints tokens under weak material.
 pub fn parse_secret_hex(s: &str) -> Result<Vec<u8>, String> {
     if s.len() != 64 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(format!(
@@ -43,9 +47,11 @@ pub fn parse_secret_hex(s: &str) -> Result<Vec<u8>, String> {
         .collect()
 }
 
-/// Derives a stable `kid` from a secret: the first 4 SHA-256 bytes as
-/// hex. Deterministic, so rotated deployments agree on kids without
-/// extra config, and distinct per secret so verifiers can tell key
+/// Derives a stable `kid` from a secret. The `kid` is the first 4 SHA-256
+/// bytes as hex.
+/// The same secret always gives the same `kid`, so deployments that rotate
+/// keys agree on their kids without extra config.
+/// Each secret gives a different `kid`, so a verifier can tell key
 /// generations apart.
 pub fn kid_for(secret: &[u8]) -> String {
     use sha2::{Digest, Sha256};
@@ -79,9 +85,12 @@ pub fn mint(
         .map_err(|e| FsError::Internal(e.to_string()))
 }
 
-/// Verify token grants `act` on `file_id`, trying each known secret in
-/// order (current first, previous during rotation). A signature that
-/// verifies decides: matching claims accept, mismatched claims reject
+/// Checks that the token grants `act` on `file_id`.
+/// The function tries each known secret in order.
+/// It tries the current secret first, and the previous secret during a
+/// rotation.
+/// A signature that verifies decides the result.
+/// Claims that match are accepted. Claims that do not match are rejected
 /// without consulting older keys.
 pub fn verify(
     token: &str,
@@ -114,7 +123,7 @@ mod tests {
     use crate::policy::Action;
 
     #[test]
-    fn round_trip() {
+    fn mint_then_verify_returns_the_same_claims() {
         let secret = b"test-secret-32-bytes-long-xxxxxx";
         let token = mint("alice", "file1", Action::Read, "k1", secret, Some(60)).unwrap();
         let claims = verify(&token, "file1", Action::Read, &[secret]).unwrap();
@@ -154,7 +163,8 @@ mod tests {
         let old = b"old-secret-32-bytes-long-xxxxxxxx";
         let new = b"new-secret-32-bytes-long-xxxxxxxx";
         let token = mint("alice", "file1", Action::Read, "k-old", old, Some(60)).unwrap();
-        // Current tried first, previous still verifies during rotation.
+        // The current secret is tried first. The previous secret still
+        // verifies during a rotation.
         let claims = verify(&token, "file1", Action::Read, &[new, old]).unwrap();
         assert_eq!(claims.sub, "alice");
         // Unknown keys verify nothing.

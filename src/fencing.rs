@@ -2,44 +2,49 @@
 //!
 //! # What this is for
 //!
-//! `oxkv` acquires a prefix by CAS-bumping `ownership.json`: last writer
-//! wins, and the loser discovers it only at write time, as
-//! `StoreError::Fenced`. `oxkv` documents that condition as terminal -- "the
-//! current process must stop writing and restart via `ownership.json` CAS".
+//! `oxkv` takes a prefix by doing a CAS bump on `ownership.json`. The last
+//! writer wins. The loser finds out only at write time, as
+//! `StoreError::Fenced`. The `oxkv` docs call that condition final. They say
+//! "the current process must stop writing and restart via `ownership.json`
+//! CAS".
 //!
-//! This process was already handling the *cooperative* half of that: the
-//! single-writer lease on `[database].prefix` (see [`crate::lease`]) gates
-//! `/ready` when it cannot be renewed, so a replaced writer stops
-//! advertising itself. What was missing is the uncooperative half. A second
-//! writer that never took the lease -- an older build, a `writer_lease_ttl_secs
-//! = 0` deployment, an operator running the `policy import` subcommand
-//! against a live prefix -- can still fence this process, and then the lease
-//! check keeps reporting healthy while every master write fails.
+//! This process already handled the *cooperative* half of that. The
+//! single-writer lease on `[database].prefix` (see [`crate::lease`]) makes
+//! `/ready` report unready when it cannot renew the lease. So a writer that
+//! was replaced stops advertising itself. The uncooperative half was
+//! missing. A second writer can still fence this process without ever taking
+//! the lease. An older build can do it. A deployment with
+//! `writer_lease_ttl_secs = 0` can do it. An operator who runs the
+//! `policy import` subcommand against a prefix that is live can do it. After
+//! that, the lease check keeps reporting healthy while every write to the
+//! master fails.
 //!
-//! So a fencing loss is latched here as a second, independent signal for the
-//! same condition, and `/ready` reports on both.
+//! So this module records a fencing loss on a latch. That latch is a second
+//! signal, independent of the lease, for the same condition. `/ready` checks
+//! both signals.
 //!
 //! # Why the process is not terminated
 //!
-//! The obvious alternative is to exit. That makes the outage worse rather
-//! than better: a fenced primary is already read-only, so it can no longer
-//! diverge, and killing it immediately means zero healthy writers if the
-//! successor is not serving yet. Marking the instance unready lets the load
-//! balancer drain it while the replacement takes over, and leaves the
-//! decision to restart with the operator, who has the log line saying the
-//! handle is terminal.
+//! The obvious alternative is to exit. That makes the failure worse. A
+//! fenced primary is already read-only, so it can no longer diverge. Killing
+//! it at once means zero healthy writers, if the successor is not serving
+//! yet. Marking the instance unready lets the load balancer drain it while
+//! the replacement takes over. The decision to restart stays with the
+//! operator. The operator has the log line that says the handle is final.
 //!
 //! # Replica fencing is not this
 //!
-//! Losing a replica *build* race is routine: two workers building the same
-//! user's prefix, resolved by adopting the winner's coverage. Only the
-//! primary prefixes -- `{db}/fs`, `{db}/policy`, `{db}/wal` -- are terminal,
-//! so the trip points are chosen to exclude replica writes.
+//! Losing a race to build a *replica* is routine. Two workers build the
+//! prefix of the same user, and the result resolves by adopting the
+//! coverage of the winner. Only the primary prefixes are final. Those are
+//! `{db}/fs`, `{db}/policy`, and `{db}/wal`. So the points that call the
+//! latch leave out replica writes.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// One latch. The process-wide instance is the module's `static`; tests use
-/// their own so they cannot observe each other's trips.
+/// One latch. The instance for the whole process is the `static` of the
+/// module. Each test uses its own latch, so the tests cannot see each other's
+/// losses.
 #[derive(Debug)]
 pub struct Latch {
     tripped: AtomicBool,
@@ -52,20 +57,20 @@ impl Default for Latch {
 }
 
 impl Latch {
-    /// A latch that has not tripped.
+    /// A latch that has not recorded a loss.
     pub const fn new() -> Self {
         Self {
             tripped: AtomicBool::new(false),
         }
     }
 
-    /// Records a loss, logging the first one at `error` and the rest at
-    /// `debug`.
+    /// Records a loss. The function logs the first loss at `error`. It logs
+    /// every later loss at `debug`.
     ///
-    /// Idempotent on the state, noisy only once. Every subsequent write on a
-    /// fenced handle fails the same way, so a per-request `error!` would
-    /// bury the first occurrence -- the one that matters -- under the
-    /// symptom.
+    /// The function does not change the state again after the first loss. It
+    /// is noisy only once. Every later write on a fenced handle fails in the
+    /// same way. So an `error!` for each request would bury the first loss,
+    /// which is the one that matters, under the symptom.
     pub fn trip(&self, source: &str, reason: &str) {
         if self.tripped.swap(true, Ordering::SeqCst) {
             tracing::debug!("fencing loss repeated on {source}: {reason}");
@@ -78,7 +83,7 @@ impl Latch {
         );
     }
 
-    /// True once any primary write has been fenced.
+    /// True after the server fences a primary write.
     pub fn is_tripped(&self) -> bool {
         self.tripped.load(Ordering::SeqCst)
     }
@@ -87,26 +92,27 @@ impl Latch {
 /// The process-wide primary-fencing latch.
 static PRIMARY_LOSS: Latch = Latch::new();
 
-/// The latch a primary prefix's fencing losses are recorded on.
+/// The latch on which the fencing losses of a primary prefix are recorded.
 ///
-/// The owner of the master store holds this rather than calling
-/// [`note_primary_loss`] directly, so the latch travels with the ownership
-/// that decides whether a loss is terminal. That also makes it
-/// substitutable: a test can point a store at its own [`Latch`] and observe
-/// the trip, which the process-wide one cannot support -- it is one-way and
-/// every other test in the binary would trip it first.
+/// The owner of the master store holds this latch, instead of calling
+/// [`note_primary_loss`] directly. So the latch moves with the ownership that
+/// decides whether a loss is final. That also makes the latch replaceable. A
+/// test can point a store at its own [`Latch`] and see the loss. The latch
+/// for the whole process cannot support that. It only works in one direction,
+/// and every other test in the binary would set it first.
 pub fn process_latch() -> &'static Latch {
     &PRIMARY_LOSS
 }
 
-/// Records a lost epoch on a primary prefix. See the module docs for which
-/// prefixes qualify and why the process is not terminated.
+/// Records a lost epoch on a primary prefix. The module docs list the
+/// prefixes that qualify. They also explain why the process is not
+/// terminated.
 pub fn note_primary_loss(source: &str, reason: &str) {
     PRIMARY_LOSS.trip(source, reason);
 }
 
-/// True once a primary write has been fenced, i.e. this instance should stop
-/// advertising readiness.
+/// True after the server fences a primary write. So this instance must stop
+/// advertising that it is ready.
 pub fn primary_loss() -> bool {
     PRIMARY_LOSS.is_tripped()
 }
@@ -115,8 +121,8 @@ pub fn primary_loss() -> bool {
 mod tests {
     use super::*;
 
-    /// The first report is the one an operator needs; the rest are the same
-    /// condition repeating.
+    /// The first report is the one that an operator needs. The later reports
+    /// are the same condition again.
     #[test]
     fn trip_is_idempotent_and_observable() {
         let latch = Latch::new();
@@ -125,14 +131,14 @@ mod tests {
         latch.trip("{db}/fs", "epoch 2 superseded");
         assert!(latch.is_tripped());
 
-        // A second, different prefix still trips the same latch, and does
-        // not reset it.
+        // A second prefix that is different also sets the same latch. It
+        // does not clear it.
         latch.trip("{db}/policy", "epoch 2 superseded");
         assert!(latch.is_tripped());
     }
 
-    /// Two latches are independent, which is what keeps a test that trips one
-    /// from making the process-wide signal flap.
+    /// Two latches do not share state. That is what keeps a test that sets
+    /// one latch from making the signal of the whole process change.
     #[test]
     fn latches_do_not_share_state() {
         let a = Latch::new();
@@ -142,14 +148,15 @@ mod tests {
         assert!(!b.is_tripped());
     }
 
-    /// The signal is reachable from outside this module, which is what lets
-    /// `main.rs` gate `/ready` on it.
+    /// Code outside this module can read the signal. That is what lets
+    /// `main.rs` use it in the check for `/ready`.
     ///
-    /// One-directional on purpose: the latch is process-wide, so other tests
-    /// in this binary trip it too and asserting "not tripped" would be
-    /// order-dependent. The assertion that matters in the other direction --
-    /// that a *replica* write must not trip it -- needs no global state and
-    /// lives in `fs::store::tests::only_a_fenced_master_write_latches`.
+    /// The signal only works in one direction, on purpose. The latch belongs
+    /// to the whole process, so other tests in this binary also set it. An
+    /// assertion that it is not set would depend on the order of the tests.
+    /// The assertion that matters in the other direction is that a write to
+    /// a *replica* must not set it. That assertion needs no global state. It
+    /// is in `fs::store::tests::only_a_fenced_master_write_latches`.
     #[test]
     fn the_process_wide_signal_is_readable() {
         note_primary_loss("{db}/test", "epoch 2");

@@ -1,6 +1,8 @@
 //! `oxkv` persistence for upload sessions, file records, and relations.
-//! Backed by [`oxkv::OxKvStore`] (LSM on S3). Keys: `fs:uploads:{id}:meta`, `fs:files:{id}:meta`, `fs:rel:{type}:{id}:{file}`, `fs:files:{id}:refs`.
-//! Scales per-user: each OxKvStore is prefix-scoped (e.g. `oxkv/fs`) on the shared `ObjectStore`.
+//! The store uses [`oxkv::OxKvStore`], which is an LSM tree on S3.
+//! Keys: `fs:uploads:{id}:meta`, `fs:files:{id}:meta`, `fs:rel:{type}:{id}:{file}`, `fs:files:{id}:refs`.
+//! The store scales per user. Each `OxKvStore` uses its own key prefix,
+//! for example `oxkv/fs`, on the shared `ObjectStore`.
 
 use std::sync::Arc;
 
@@ -47,23 +49,25 @@ pub struct UploadSession {
 }
 
 impl UploadSession {
-    /// True when the session is older than `ttl_secs` at `now`.
+    /// True when the session is older than `ttl_secs` at the time `now`.
     ///
-    /// Takes the TTL as an argument so the retention policy stays with the
-    /// sweeper ([`crate::fs::gc::TTL_SECS`]) rather than being baked into
-    /// the record type.
+    /// The function takes the TTL as an argument.
+    /// The retention policy then stays with the sweeper
+    /// ([`crate::fs::gc::TTL_SECS`]) and not in the record type.
     pub fn is_expired(&self, now: i64, ttl_secs: i64) -> bool {
         now - self.created_at > ttl_secs
     }
 }
 
-/// Durable S3-side multipart state: mirrors the client RAM map so
-/// uploads survive restarts. The object-store `MultipartId` is a plain
-/// string and staged `PartId`s rebuild from their content ids, so a
-/// fresh client rehydrates purely from this record (see
-/// `S3Client::restore_multipart`). Records live and die with their
-/// session: created at init, updated per part, deleted on
-/// complete/cancel/expiry via `delete_session` cascade.
+/// Durable S3 state for a multipart upload.
+/// It mirrors the client RAM map, so that uploads survive a restart.
+/// The object-store `MultipartId` is a plain string, and the staged
+/// `PartId`s rebuild from their content ids.
+/// A new client loads this record only (see `S3Client::restore_multipart`).
+/// A record lives and dies with its session.
+/// The engine creates the record at init and updates it for each part.
+/// The `delete_session` cascade deletes the record on complete, cancel, or
+/// expiry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistedMultipart {
     /// Engine-side alias (`ostore-…`, what sessions reference).
@@ -83,49 +87,54 @@ pub struct PersistedMultipart {
 
 /// Persisted file record after `CompleteUpload`.
 ///
-/// Re-exported from [`crate::records`], where it lives because
-/// [`WalOp::FileCreate`](crate::records::WalOp::FileCreate) carries one and
-/// `sync` has to read it without importing the whole `fs` module.
+/// The type is re-exported from [`crate::records`].
+/// It lives there because [`WalOp::FileCreate`](crate::records::WalOp::FileCreate)
+/// carries one, and `sync` must read it without importing the whole `fs`
+/// module.
 pub use crate::records::FileRecord;
 
-/// What a metadata scan read, and what it could not read.
+/// What a metadata scan read and what it could not read.
 ///
-/// `fs:files:`/`fs:uploads:` is the only map from S3 bytes back to the rows
-/// that reference them, so a row that fails to decode is not a harmless gap.
-/// Any caller that reads "no record mentions this key" as "these bytes are
-/// garbage" will delete the object of a record it merely could not parse,
-/// and nothing else in the store can repair that: the metadata row survives
-/// and every download 404s forever.
+/// `fs:files:` and `fs:uploads:` are the only map from S3 bytes back to
+/// the rows that reference them.
+/// A row that fails to decode is therefore not a harmless gap.
+/// A caller that reads "no record mentions this key" as "these bytes are
+/// garbage" deletes the object of a record that it cannot parse.
+/// Nothing else in the store can repair that.
+/// The metadata row survives, and every download then returns 404 for ever.
 ///
-/// So the unread keys are carried out of the scan instead of being dropped
-/// inside it. A caller that deletes based on absence can then refuse to act
-/// while the set is non-empty.
+/// The scan therefore carries the unread keys out instead of dropping them
+/// inside.
+/// A caller that deletes on absence can then refuse to act while the set is
+/// not empty.
 #[derive(Debug, Clone)]
 pub struct RecordScan<T> {
     /// Every record in the key family that decoded, in scan order.
     pub records: Vec<T>,
     /// Keys in the family whose value did not decode, in scan order.
     ///
-    /// Already logged at `warn!`; kept here so a sweeper can act on the
-    /// fact that the scan was incomplete.
+    /// The engine already logged these keys at `warn!`.
+    /// The scan keeps them so that a sweeper can act on the fact that the
+    /// scan was incomplete.
     pub undecodable: Vec<String>,
 }
 
-/// One step of a paged `fs:files:` walk: the paged counterpart of
-/// [`RecordScan`].
+/// One step of a paged `fs:files:` walk.
+/// This type is the paged counterpart of [`RecordScan`].
 ///
-/// [`FsStore::next_file`] pages rather than collects, so it cannot hand back
-/// the whole family's result in one value -- but it owes its caller the same
-/// thing [`RecordScan`] owes the sweeper, which is the difference between
-/// "this walk read everything" and "this walk stopped early".
+/// [`FsStore::next_file`] pages instead of collecting, so it cannot return
+/// the result for the whole key family in one value.
+/// It still owes its caller what [`RecordScan`] owes the sweeper.
+/// That duty is the difference between "this walk read everything" and
+/// "this walk stopped early".
 pub(crate) struct FileScan {
     /// The next file record in key order, or `None` at the end of the walk.
     pub record: Option<FileRecord>,
     /// Keys skipped in this step because their value did not decode.
     ///
-    /// Already logged at `warn!`; a caller that deletes based on absence has
-    /// to sum these across the whole walk and refuse to act while they are
-    /// non-empty.
+    /// The function already logs each key at `warn!`. A caller that deletes
+    /// on absence must sum these keys across the whole walk. The caller must
+    /// refuse to act while they are non-empty.
     pub undecodable: Vec<String>,
 }
 
@@ -133,31 +142,40 @@ pub(crate) struct FileScan {
 #[derive(Clone)]
 pub struct FsStore {
     inner: Arc<RwLock<OxKvStore>>,
-    /// Lazily-warmed RAM mirror over the same handle (prototype).
+    /// A RAM mirror over the same handle. The engine warms it lazily. This
+    /// mirror is a prototype.
     ///
-    /// Reads route through the mirror when present; writes always go to
-    /// `inner`. The mirror never takes an epoch (it wraps a clone that
-    /// shares the session), so it cannot fence the writer.
+    /// A read uses the mirror when the mirror exists.
+    /// A write always goes to `inner`.
+    /// The mirror never takes an epoch.
+    /// It wraps a clone that shares the session, so it cannot fence the
+    /// writer.
     mirror: Option<CachedOxKvStore>,
     /// True when this store is the master `{db}/fs` prefix.
     ///
-    /// Decides whether a lost epoch latches the process-wide fencing signal.
-    /// The same `FsStore` type also backs per-user *replica* prefixes during
-    /// a sync build, where losing a race is routine and resolved by adopting
-    /// the winner's coverage -- so latching there would take a healthy server
-    /// out of rotation over a non-event. Marking it explicitly at the one
-    /// place that owns the master store ([`FsEngine::init`](crate::fs::FsEngine::init))
-    /// keeps the distinction with the ownership rather than inferred from a
-    /// key prefix.
+    /// This flag decides whether a lost epoch latches the process-wide
+    /// fencing signal.
+    /// The same `FsStore` type also backs a per-user *replica* prefix
+    /// during a sync build.
+    /// In a replica, a lost race is normal.
+    /// The engine resolves it by adopting the coverage of the winner.
+    /// A latch in a replica would take a healthy server out of rotation
+    /// for an event that does not matter.
+    /// The engine sets the flag at the one place that owns the master store
+    /// ([`FsEngine::init`](crate::fs::FsEngine::init)).
+    /// The flag therefore stays with the ownership, and is not inferred
+    /// from a key prefix.
     primary: bool,
-    /// Where this store's fencing losses are recorded.
+    /// Where this store records its fencing losses.
     ///
-    /// The process-wide latch in production (see
-    /// [`process_latch`](crate::fencing::process_latch)); a store's own in
-    /// tests. Held as a field rather than reached for through
-    /// [`note_primary_loss`](crate::fencing::note_primary_loss) because the
-    /// process-wide latch is one-way and global: a test that tripped it
-    /// could not tell its own write from any other test's.
+    /// In production the store uses the process-wide latch (see
+    /// [`process_latch`](crate::fencing::process_latch)).
+    /// A test uses the latch of its own store.
+    /// The store holds the latch as a field instead of reaching it through
+    /// [`note_primary_loss`](crate::fencing::note_primary_loss).
+    /// The process-wide latch is one-way and global.
+    /// A test that tripped it could not tell its own write from the write
+    /// of another test.
     latch: &'static Latch,
 }
 
@@ -165,27 +183,30 @@ impl FsStore {
     /// The master `{db}/fs` prefix, named in the fencing-loss log line.
     const FS_PREFIX: &str = "{db}/fs";
 
-    /// Whether a failure on this store should latch the process-wide
+    /// True when a failure on this store must latch the process-wide
     /// fencing signal.
     ///
-    /// The rule is: only the master prefix, and only a lost epoch. Both
-    /// halves are load-bearing and neither is obvious from the call site, so
-    /// they live in one predicate.
+    /// The rule covers only the master prefix, and only a lost epoch.
+    /// Both halves of the rule carry weight, and neither is clear from the
+    /// call site.
+    /// The two halves therefore live in one predicate.
     fn latches(&self, err: &FsError) -> bool {
-        // A replica write that loses a build race is recovered from by
-        // `sync` (adopting the winner's coverage), and latching it would
-        // take a healthy server out of rotation over a non-event.
+        // `sync` recovers a replica write that loses a build race by
+        // adopting the coverage of the winner.
+        // A latch in that case would take a healthy server out of
+        // rotation for an event that does not matter.
         self.primary && err.is_fencing_loss()
     }
 
-    /// Maps oxkv errors into [`FsError`], latching a fencing loss when this
-    /// store owns the master prefix.
+    /// Maps an oxkv error into [`FsError`].
+    /// The store latches a fencing loss when it owns the master prefix.
     ///
-    /// Latching here rather than in [`FsError`]'s own conversion is the whole
-    /// point. The same `FsError` carries replica-write failures, and `sync`
-    /// recovers from those by design. A mark on the one store that owns the
-    /// primary prefix keeps the distinction with the ownership rather than
-    /// inferred from a key prefix.
+    /// The latch belongs here and not in the conversion in [`FsError`].
+    /// The same `FsError` also carries replica write failures, and `sync`
+    /// recovers from those by design.
+    /// A mark on the one store that owns the primary prefix keeps the
+    /// distinction with the ownership.
+    /// The store does not infer the distinction from a key prefix.
     fn store_err(&self, e: oxkv::StoreError) -> FsError {
         let err = FsError::from(e);
         if self.latches(&err) {
@@ -194,9 +215,10 @@ impl FsStore {
         err
     }
 
-    /// Creates an FS store from an [`OxKvStore`] (per-user S3, scalable).
+    /// Creates an FS store from an [`OxKvStore`].
+    /// The store uses a per-user S3 LSM store, and it scales per user.
     ///
-    /// Not the master store: see [`FsStore::primary`].
+    /// This store is not the master store. See [`FsStore::primary`].
     pub fn new(s3_store: OxKvStore) -> Self {
         Self {
             inner: Arc::new(RwLock::new(s3_store)),
@@ -206,8 +228,8 @@ impl FsStore {
         }
     }
 
-    /// Creates the master `{db}/fs` store, whose fencing losses are terminal
-    /// for this process.
+    /// Creates the master `{db}/fs` store.
+    /// A fencing loss in this store ends the process.
     pub fn primary(s3_store: OxKvStore) -> Self {
         Self {
             primary: true,
@@ -215,13 +237,15 @@ impl FsStore {
         }
     }
 
-    /// The master store, recording fencing losses on `latch` instead of the
-    /// process-wide one.
+    /// Creates the master store.
+    /// The store records fencing losses on `latch` instead of the
+    /// process-wide latch.
     ///
-    /// The latch is a one-way flag with no reset, so a test that wants to
-    /// prove a write *trips* it cannot share the process-wide one: anything
-    /// another test tripped first would satisfy the assertion whether or not
-    /// the code under test latched at all.
+    /// The latch is a one-way flag with no reset.
+    /// A test that must prove that a write *trips* the latch cannot share
+    /// the process-wide latch.
+    /// Anything that another test tripped first would satisfy the
+    /// assertion, whether or not the code under test latched.
     #[cfg(test)]
     pub(crate) fn primary_with_latch(s3_store: OxKvStore, latch: &'static Latch) -> Self {
         Self {
@@ -231,14 +255,20 @@ impl FsStore {
         }
     }
 
-    /// Creates an FS store with a lazily-warmed RAM mirror (prototype).
+    /// Creates an FS store with a lazily warmed RAM mirror.
+    /// The mirror is a prototype.
     ///
-    /// The mirror wraps a clone of `s3_store` (shared session/state, no
-    /// new epoch), warms key-by-key on read misses, and stays correct on
-    /// misses by falling through to the durable core. Call
-    /// [`refresh_mirror`](Self::refresh_mirror) before bulk scans so one
-    /// incremental WAL replay converges it instead of per-key misses.
-    /// Measure with `RUST_LOG=debug` (refresh counts are logged).
+    /// The mirror wraps a clone of `s3_store`.
+    /// The clone shares the session and the state, and it takes no new
+    /// epoch.
+    /// The mirror warms one key at a time on a read miss.
+    /// On a miss it falls through to the durable core, so that it stays
+    /// correct.
+    /// Call [`refresh_mirror`](Self::refresh_mirror) before a bulk scan.
+    /// Then one incremental WAL replay converges the mirror, and the code
+    /// avoids one miss per key.
+    /// Set `RUST_LOG=debug` to measure this.
+    /// The engine logs the refresh counts.
     pub async fn new_mirrored(s3_store: OxKvStore) -> Result<Self, FsError> {
         let mirror = CachedOxKvStore::open_with_mode(s3_store.clone(), WarmMode::Lazy)
             .await
@@ -251,17 +281,22 @@ impl FsStore {
         })
     }
 
-    /// Test-only: mirror over a clone of this handle (shares session).
+    /// Test only.
+    /// Creates a mirror over a clone of this handle.
+    /// The clone shares the session.
     #[cfg(test)]
     pub(crate) async fn mirrored_clone(&self) -> Result<Self, FsError> {
         Self::new_mirrored(self.inner.read().await.clone()).await
     }
 
-    /// Converges the mirror with master writes since the last call.
+    /// Converges the mirror with the master writes since the last call.
     ///
-    /// No-op without a mirror. Returns replayed entries: 0 means already
-    /// converged (no I/O beyond the manifest check); a full re-warm only
-    /// happens on epoch/SST-set change, never on steady writes.
+    /// The function does nothing when the store has no mirror.
+    /// The function returns the number of replayed entries.
+    /// The value 0 means the mirror is already converged.
+    /// The engine then does no I/O except the manifest check.
+    /// A full re-warm happens only when the epoch or the SST set changes,
+    /// and never for steady writes.
     pub async fn refresh_mirror(&self) -> Result<usize, FsError> {
         let Some(mirror) = &self.mirror else {
             return Ok(0);
@@ -271,7 +306,8 @@ impl FsStore {
         Ok(applied)
     }
 
-    /// Point read through the single shared handle (mirror first).
+    /// Reads one key through the single shared handle.
+    /// The function reads from the mirror first.
     async fn get_one(&self, key: &str) -> Result<Option<Vec<u8>>, FsError> {
         if let Some(mirror) = &self.mirror {
             return mirror.get_bytes(key).await.map_err(FsError::from);
@@ -280,11 +316,12 @@ impl FsStore {
         g.get_bytes(key).await.map_err(FsError::from)
     }
 
-    /// Range scan bounded to keys under `prefix:`.
+    /// Scans a key range that stops at the end of the `prefix:` family.
     ///
-    /// Full-store scans (`(None, None)` cursors) materialize every key;
-    /// bounding to the key-space prefix keeps each scan proportional to
-    /// its own key family instead of the whole store.
+    /// A full-store scan (`(None, None)` cursors) loads every key into
+    /// memory.
+    /// Bounding the scan to a key prefix keeps the size of each scan
+    /// proportional to its own key family, and not to the whole store.
     async fn scan_prefix(&self, prefix: &str) -> Result<Vec<KeyValue>, FsError> {
         let cursor = (Some(prefix.to_string()), Some(prefix_scan_end(prefix)));
         if let Some(mirror) = &self.mirror {
@@ -334,22 +371,28 @@ impl FsStore {
     }
 
     /// Deletes an upload session, the staged parts of its single-part chunks,
-    /// and its multipart record, in one transaction.
+    /// and its multipart record in one transaction.
     ///
-    /// Order is the contract: the cascade rows go first and the session key
-    /// goes last. The session row is the only thing that makes this cascade
-    /// reachable again -- `list_sessions` scans the `fs:uploads:` family and
-    /// nothing anywhere scans `fs:mp:` -- so a session key deleted first
-    /// with a cascade delete after it turns any failure, or any crash
-    /// between the two statements, into permanent KV garbage holding a live
-    /// backend `s3_upload_id`, with no record anywhere that the multipart
-    /// record was supposed to live and die with.
+    /// The order of the deletes is the contract.
+    /// The cascade rows go first. The session key goes last.
+    /// The session row is the only thing that makes this cascade reachable
+    /// again.
+    /// `list_sessions` scans the `fs:uploads:` family.
+    /// Nothing in the crate scans `fs:mp:`.
+    /// If the engine deletes the session key first and a cascade delete
+    /// fails, no later scan can find the record.
+    /// A crash between the two deletes then leaves permanent KV garbage.
+    /// That garbage holds a live backend `s3_upload_id`.
+    /// No record anywhere says that the multipart record must live and die
+    /// with its session.
     ///
-    /// One transaction because half a cascade is the same failure as none:
-    /// the deletes are staged together and land together, so the window in
-    /// which the session row is gone and a cascade row survives does not
-    /// exist. Every cascade error is mapped like every other write here --
-    /// discarding them is what made this lossy in the first place.
+    /// The function uses one transaction because half a cascade fails like
+    /// no cascade.
+    /// The transaction stages the deletes together, and they land together.
+    /// The window in which the session row is gone and a cascade row
+    /// survives does not exist.
+    /// The function maps every cascade error like every other write here.
+    /// Discarding those errors is what made this operation lossy.
     pub async fn delete_session(&self, id: &str) -> Result<(), FsError> {
         let session = self.get_session(id).await?;
         let g = self.inner.write().await;
@@ -359,15 +402,17 @@ impl FsStore {
                 let k = Self::staged_key(id, idx);
                 tx.delete(&k).await.map_err(|e| self.store_err(e))?;
             }
-            // Cascade: the multipart record lives and dies with its
-            // session, so expiry/GC can never strand one.
+            // The multipart record lives and dies with its
+            // session, so expiry and GC cannot strand one.
             if let Some(upload_id) = &s.s3_upload_id {
                 let k = Self::multipart_key(upload_id);
                 tx.delete(&k).await.map_err(|e| self.store_err(e))?;
             }
         }
-        // Last, so a cascade failure above leaves the session row in place
-        // and the whole delete is retried rather than half-applied.
+        // The session key goes last.
+        // A cascade failure above then leaves the session row in place,
+        // and the engine retries the whole delete instead of applying
+        // half of it.
         let key = Self::session_key(id);
         tx.delete(&key).await.map_err(|e| self.store_err(e))?;
         tx.commit().await.map_err(|e| self.store_err(e))?;
@@ -444,8 +489,8 @@ impl FsStore {
     }
 
     /// Deletes a finalized file record, its ref-count entry, and every
-    /// relation marker pointing at it, atomically. Markers left behind
-    /// would otherwise accumulate as garbage once the record is gone.
+    /// relation marker that points at it in one transaction.
+    /// Markers that remain accumulate as garbage after the record is gone.
     pub async fn delete_file(&self, id: &str) -> Result<(), FsError> {
         let key = Self::file_key(id);
         let refs = refs_key(id);
@@ -481,10 +526,11 @@ impl FsStore {
         Ok(info)
     }
 
-    /// Attaches a file to a row; idempotent.
+    /// Attaches a file to a row. The function is idempotent.
     ///
-    /// The relation marker and the ref-count update commit in one
-    /// transaction: a crash can never leave one without the other.
+    /// The transaction commits the relation marker and the ref-count update
+    /// together.
+    /// A crash can never leave one without the other.
     pub async fn attach(
         &self,
         row_type: &str,
@@ -519,9 +565,9 @@ impl FsStore {
         Ok(info.count)
     }
 
-    /// Detaches a file from a row; idempotent.
+    /// Detaches a file from a row. The function is idempotent.
     ///
-    /// Same atomicity contract as [`FsStore::attach`].
+    /// The atomicity contract is the same as for [`FsStore::attach`].
     pub async fn detach(
         &self,
         row_type: &str,
@@ -574,10 +620,13 @@ impl FsStore {
         Ok(out)
     }
 
-    /// Lists files attached to one row via a bounded `fs:rel:{type}:{id}:` scan.
+    /// Lists the files attached to one row.
+    /// The scan stays inside `fs:rel:{type}:{id}:`.
     ///
-    /// Used by incremental policy replay to resync only the row a rule
-    /// changed, instead of scanning the whole store for a full rebuild.
+    /// Incremental policy replay uses this method to resync only the row
+    /// that a rule changed.
+    /// The method then avoids a scan of the whole store for a full
+    /// rebuild.
     pub async fn files_for_row(
         &self,
         row_type: &str,
@@ -599,14 +648,17 @@ impl FsStore {
         Ok(out)
     }
 
-    /// Lists all finalized file records (scan bounded to `fs:files:`).
+    /// Lists all finalized file records. The scan stays inside `fs:files:`.
     ///
-    /// A row that will not decode is skipped rather than fatal: one bad
-    /// record must not stop a rebuild for every other file the user can
-    /// see. It is *reported* rather than dropped, because the skip is
-    /// invisible everywhere else -- a record missing from this list looks
-    /// exactly like a record that was never written, and the orphan-byte
-    /// sweeper deletes objects on precisely that inference.
+    /// A row that does not decode is skipped.
+    /// One bad record must not stop a rebuild for every other file of the
+    /// user.
+    /// The scan *reports* a skipped record instead of dropping it.
+    /// No other place shows the skip.
+    /// A record that is missing from this list looks exactly like a record
+    /// that was never written.
+    /// The orphan-byte sweeper deletes objects on exactly that
+    /// assumption.
     pub async fn list_files(&self) -> Result<RecordScan<FileRecord>, FsError> {
         let kvs = self.scan_prefix(FILES_PREFIX).await?;
         let mut out = RecordScan {
@@ -628,11 +680,12 @@ impl FsStore {
         Ok(out)
     }
 
-    /// Lists all upload sessions (scan bounded to `fs:uploads:`).
+    /// Lists all upload sessions. The scan stays inside `fs:uploads:`.
     ///
-    /// Skips and reports undecodable rows under the same contract as
-    /// [`FsStore::list_files`]: a session that cannot be listed is a
-    /// session the sweeper will never expire.
+    /// The scan skips and reports rows that do not decode.
+    /// It uses the same contract as [`FsStore::list_files`].
+    /// A session that the scan cannot list is a session that the sweeper
+    /// never expires.
     pub async fn list_sessions(&self) -> Result<RecordScan<UploadSession>, FsError> {
         let kvs = self.scan_prefix("fs:uploads:").await?;
         let mut out = RecordScan {
@@ -654,37 +707,46 @@ impl FsStore {
         Ok(out)
     }
 
-    /// Dumps every raw key-value pair for verbatim replica copies.
+    /// Reads every raw key-value pair for verbatim replica copies.
     ///
-    /// The caller owns filtering: everything present is returned as-is.
-    /// One step of the walk: the next finalized file record in key order,
-    /// plus whatever that step had to skip.
+    /// The function returns one step of the walk.
+    /// The step holds the next finalized file record in key order, and the
+    /// keys that the step had to skip.
+    /// The caller owns the filtering, and everything present is returned
+    /// as-is.
     ///
-    /// Takes the walk rather than creating one so a caller can page through
-    /// the whole keyspace while holding at most [`SCAN_PAGE`] records -- the
-    /// replica rebuild filters records one at a time and keeps none of them.
-    /// The prefix stays private here so the key layout has one owner.
+    /// The function takes the walk instead of creating one.
+    /// The caller can then page through the whole keyspace and hold at
+    /// most [`SCAN_PAGE`] records.
+    /// The replica rebuild filters the records one at a time and keeps
+    /// none of them.
+    /// The prefix stays private here, so the key layout has one owner.
     ///
-    /// The unread keys are reported rather than dropped inside the walk,
-    /// for the reason [`RecordScan`] documents: a rebuild diffs this walk
-    /// against the live replica, so a key the walk could not decode is a
-    /// key the desired side does not have, and the merge-join reads that as
-    /// "the master no longer has it" and DELETES it from the replica. The
-    /// caller cannot act on a walk that silently lost rows.
+    /// The unread keys are reported instead of dropped inside the walk,
+    /// for the reason that [`RecordScan`] documents.
+    /// A rebuild compares this walk with the live replica.
+    /// A key that the walk cannot decode is then a key that the desired
+    /// side does not have.
+    /// The merge join reads that as "the master no longer has it", and it
+    /// deletes the key from the replica.
+    /// The caller cannot act on a walk that lost rows without saying so.
     pub(crate) async fn next_file(&self, scan: &mut KvPages) -> Result<FileScan, FsError> {
         let mut undecodable = Vec::new();
         while let Some(kv) = scan.next().await? {
             if !kv.key.starts_with(FILES_PREFIX) || !kv.key.ends_with(FILE_META_SUFFIX) {
                 continue;
             }
-            // A record that will not decode is skipped rather than fatal, the
-            // same as `list_files`: one bad row must not stop a rebuild for
-            // every other file the user can see. Logged for the same reason --
-            // a skipped record is missing from the replica that this walk
-            // builds, and nothing downstream can tell that from one that was
-            // never written. Handed back for the same reason: the one caller
-            // that acts on ABSENCE cannot afford to act on a walk that lost
-            // rows without saying so.
+            // A record that does not decode is skipped.
+            // This is the same rule as in `list_files`.
+            // One bad row must not stop a rebuild for every other file of
+            // the user.
+            // The engine logs the row for the same reason.
+            // A skipped record is missing from the replica that this walk
+            // builds, and nothing downstream can tell that from a record
+            // that was never written.
+            // The function returns the key for the same reason.
+            // The one caller that acts on ABSENCE cannot act on a walk
+            // that lost rows without saying so.
             match serde_json::from_slice::<FileRecord>(&kv.value) {
                 Ok(rec) => {
                     return Ok(FileScan {
@@ -708,11 +770,12 @@ impl FsStore {
         })
     }
 
-    /// The underlying handle, for a paged scan of the whole keyspace.
+    /// Returns the underlying handle, for a paged scan of the whole keyspace.
     ///
-    /// [`FsStore::pages`] needs the store itself rather than the `FsStore`
-    /// wrapper so that a walk can outlive a method call -- the rebuild diff
-    /// holds two walks open at once, one per side.
+    /// [`FsStore::pages`] needs the store itself, and not the `FsStore`
+    /// wrapper.
+    /// Then a walk can outlive a method call.
+    /// The rebuild diff holds two walks open at once, one for each side.
     pub(crate) fn kv_handle(&self) -> Arc<RwLock<OxKvStore>> {
         Arc::clone(&self.inner)
     }
@@ -723,28 +786,34 @@ impl FsStore {
     }
 }
 
-/// Keys fetched per round trip during a [`KvPages`] walk.
+/// The number of keys that a [`KvPages`] walk fetches per round trip.
 ///
-/// The memory ceiling of a paged walk is this, not the keyspace. Large enough
-/// that the inclusive-cursor resume below can never be handed back a page
-/// containing only the duplicate key, small enough that a full scan of a large
-/// replica is not one enormous allocation.
+/// This number is the memory ceiling of a paged walk, and not the
+/// keyspace.
+/// The value is large enough that the inclusive cursor resume below never
+/// receives a page that holds only the duplicate key.
+/// The value is small enough that a full scan of a large replica is not
+/// one large allocation.
 const SCAN_PAGE: u32 = 512;
 
-/// A key-ordered walk over an oxkv store that holds one page at a time.
+/// A key-ordered walk over an oxkv store. The walk holds one page at a
+/// time.
 ///
-/// `gets_bytes` with a `None` limit returns the entire keyspace, so anything
-/// built on it is O(keyspace) in memory no matter how carefully the caller
-/// iterates. That is what made the replica rebuild hold roughly three copies
-/// of a user's data: the master file list, the freshly-built scratch replica,
-/// and the live replica it was diffed against, all as collections.
+/// `gets_bytes` with a `None` limit returns the whole keyspace.
+/// Anything built on that call uses memory that grows with the keyspace,
+/// however carefully the caller iterates.
+/// The replica rebuild therefore held about three copies of the data of
+/// one user.
+/// The copies were the master file list, the new scratch replica, and the
+/// live replica that the code compared them with. Each copy was a
+/// collection.
 ///
-/// This walks in pages instead. The two sides of a rebuild diff are both
-/// key-ordered by construction, so they can be merged in lockstep and compared
-/// a record at a time.
+/// This walk uses pages instead.
+/// Both sides of a rebuild diff are key-ordered, so the engine can merge
+/// them together and compare them one record at a time.
 pub(crate) struct KvPages {
     store: Arc<RwLock<OxKvStore>>,
-    /// Inclusive resume point; `None` until the first page.
+    /// Inclusive resume point. The value is `None` until the first page.
     cursor: Option<String>,
     buffer: std::vec::IntoIter<KeyValue>,
     exhausted: bool,
@@ -761,8 +830,9 @@ impl KvPages {
         }
     }
 
-    /// Starts a walk over a handle this walk exclusively owns, for the replica
-    /// side, which is not wrapped in an [`FsStore`].
+    /// Starts a walk over a handle that only this walk owns.
+    /// The replica side uses this call, because it is not wrapped in an
+    /// [`FsStore`].
     pub(crate) fn owned(handle: OxKvStore) -> Self {
         Self::new(Arc::new(RwLock::new(handle)))
     }
@@ -789,12 +859,13 @@ impl KvPages {
             .collect()
         };
 
-        // `gets_bytes` bounds are inclusive, so a resumed page comes back with
-        // the resume key as its first entry. Dropping exactly that entry --
-        // and nothing else -- is what stops the walk revisiting one key
-        // forever. Nudging the key instead is not an option: keys are
-        // arbitrary byte strings and "the next key after X" is not
-        // expressible.
+        // The bounds of `gets_bytes` are inclusive, so a page that
+        // resumes returns the resume key as its first entry.
+        // The walk drops exactly that entry, and nothing else, so that it
+        // does not visit one key again.
+        // The code cannot nudge the key instead.
+        // Keys are arbitrary byte strings, and "the next key after X" is
+        // not a key that the store can return.
         if self
             .cursor
             .as_ref()
@@ -804,10 +875,13 @@ impl KvPages {
         }
 
         if page.is_empty() {
-            // Either the keyspace is empty, or the previous page's last key was
-            // the final one. `SCAN_PAGE > 1` is what makes that safe: a page
-            // holding nothing but the resume key means there is nothing after
-            // it, never that the limit clipped the result to a single entry.
+            // The keyspace is empty, or the last key of the previous page
+            // was the final key.
+            // `SCAN_PAGE > 1` makes this case safe.
+            // A page that holds only the resume key means that no key comes
+            // after it.
+            // The page never means that the limit cut the result to one
+            // entry.
             self.exhausted = true;
             return Ok(None);
         }
@@ -818,12 +892,14 @@ impl KvPages {
     }
 }
 
-/// Reads ref-count info through any [`GetSet`] handle (store or
-/// transaction); absent entries mean "never attached".
+/// Reads the ref-count info through any [`GetSet`] handle, which is a
+/// store or a transaction.
+/// An absent entry means "never attached".
 ///
-/// `primary` carries the owning store's mark, because a transaction is not
-/// an `FsStore` and a fencing loss on this read still has to reach the
-/// latch when the read is part of a master mutation.
+/// `primary` carries the mark of the owning store, because a transaction
+/// is not an `FsStore`.
+/// A fencing loss on this read must still reach the latch when the read is
+/// part of a master mutation.
 async fn read_ref_info<T: GetSet>(
     tx: &T,
     file_id: &str,
@@ -844,11 +920,12 @@ async fn read_ref_info<T: GetSet>(
     serde_json::from_slice(&bytes).map_err(|e| FsError::Internal(e.to_string()))
 }
 
-/// Exclusive upper bound for a `prefix:` range scan (`:` -> `;`).
+/// The exclusive upper bound for a `prefix:` range scan (`:` -> `;`).
 ///
-/// Every key starting with `prefix:` sorts strictly below the bound, so
-/// the engine can stop at the key family instead of walking the rest of
-/// the store. No stored key ever equals the bare prefix itself.
+/// Every key that starts with `prefix:` sorts strictly below the bound.
+/// The engine can then stop at the end of the key family, instead of
+/// walking the rest of the store.
+/// No stored key is ever equal to the bare prefix.
 fn prefix_scan_end(prefix: &str) -> String {
     debug_assert!(prefix.ends_with(':'));
     let mut end = prefix.to_string();
@@ -867,12 +944,15 @@ mod tests {
 
     /// Which failures take this process out of rotation.
     ///
-    /// The master/replica split is the whole point of the latch, and it is
-    /// the half that can be asserted without touching the process-wide
-    /// signal: a replica write that loses a build race is recovered from by
-    /// `sync`, so latching it would pull a healthy server out of rotation
-    /// over a non-event. A non-fencing failure on the master is a plain 500
-    /// and must not latch either, or a flaky S3 would read as a lost lease.
+    /// The master and replica split is the whole point of the latch.
+    /// This test checks the half that a test can assert without the
+    /// process-wide signal.
+    /// `sync` recovers a replica write that loses a build race, so a latch
+    /// would pull a healthy server out of rotation for an event that does
+    /// not matter.
+    /// A failure on the master that is not a fencing loss is a plain 500.
+    /// That failure must not latch either.
+    /// Otherwise a flaky S3 would read as a lost lease.
     #[tokio::test]
     async fn only_a_fenced_master_write_latches() {
         use crate::fs::error::FsError;
@@ -891,32 +971,39 @@ mod tests {
         assert!(!replica.latches(&other));
     }
 
-    /// One write method, boxed so the table below can hold closures of
-    /// different bodies.
+    /// One write method.
+    /// The type boxes the method, so that the table below can hold closures
+    /// with different bodies.
     type WriteFn =
         fn(&FsStore) -> futures_util::future::BoxFuture<'_, Result<(), crate::fs::error::FsError>>;
 
-    /// A master write that loses its epoch must latch, whatever method it
-    /// went through.
+    /// A master write that loses its epoch must latch, whichever method
+    /// performs the write.
     ///
-    /// The predicate above is not enough, and that is the whole point of
-    /// this one. Six of the nine write methods converted the `oxkv` error
-    /// with a bare `map_err(FsError::from)`, so the classification was
-    /// correct and the *report* never happened: `POST /fs/{id}/complete`
-    /// 500'd on `save_file` before the WAL announce ran, while
-    /// `fencing::primary_loss()` stayed false and `/ready` returned 200. The
-    /// instance served traffic it could not write and no signal said so.
+    /// The predicate above is not enough, and this test proves it.
+    /// Six of the nine write methods converted the `oxkv` error with a
+    /// bare `map_err(FsError::from)`.
+    /// The classification was correct, and the *report* never happened.
+    /// `POST /fs/{id}/complete` returned 500 on `save_file`, before the WAL
+    /// announce ran.
+    /// At the same time, `fencing::primary_loss()` stayed false and
+    /// `/ready` returned 200.
+    /// The instance served traffic that it could not write, and no signal
+    /// reported it.
     ///
-    /// This drives a real `oxkv` handle into `StoreError::Fenced` -- a second
-    /// session over the same prefix takes the epoch -- and asserts each
-    /// write's latch, on a private latch rather than the process-wide one.
-    /// Asserting against the process-wide flag would pass vacuously: it is
-    /// one-way with no reset, so `fencing::tests` tripping it first would
-    /// satisfy this test even with every call site removed.
+    /// This test drives a real `oxkv` handle into `StoreError::Fenced`.
+    /// A second session over the same prefix takes the epoch.
+    /// The test then checks the latch of each write on a private latch,
+    /// and not on the process-wide latch.
+    /// An assertion against the process-wide flag would pass with no code at
+    /// all.
+    /// The flag is one-way and has no reset, so `fencing::tests` trips it
+    /// first.
+    /// That would satisfy this test even if every call site were removed.
     #[tokio::test]
-    async fn a_fenced_master_write_latches_whatever_method_it_went_through() {
-        // Every write method that persists or removes a key, named so a
-        // failure says which one stopped reporting.
+    async fn every_master_write_latches_on_a_lost_epoch() {
+        // Every write method that stores or removes a key. The
+        // name in the table says which method stopped reporting.
         let writes: Vec<(&str, WriteFn)> = vec![
             ("save_session", |s| {
                 Box::pin(async move { s.save_session(&sample_session("latch-sess")).await })
@@ -941,9 +1028,10 @@ mod tests {
             ("delete_file", |s| {
                 Box::pin(async move { s.delete_file("latch-file").await })
             }),
-            // `attach` on the row the seed already linked takes its idempotent
-            // read-back path and never writes, so it gets a row of its
-            // own; `detach` uses the seeded one.
+            // `attach` on the row that the seed already linked takes its
+            // idempotent read-back path and never writes.
+            // The test therefore gives `attach` a row of its own.
+            // `detach` uses the seeded row.
             ("attach", |s| {
                 Box::pin(async move { s.attach("invoice", "2", "latch-file").await.map(|_| ()) })
             }),
@@ -953,11 +1041,13 @@ mod tests {
         ];
 
         for (name, write) in writes {
-            // A fresh latch per method, or the first one to trip would
-            // satisfy every assertion after it and the list would only
-            // prove its own head entry. `Box::leak` because the field is a
-            // `&'static`, matching how a production store holds the
-            // process-wide one.
+            // Each method uses a new latch.
+            // Otherwise the first latch that trips would satisfy every
+            // assertion after it.
+            // The list would then prove only its own first entry.
+            // The code uses `Box::leak` because the field is a `&'static`.
+            // This matches a production store that holds the process-wide
+            // latch.
             let latch: &'static Latch = Box::leak(Box::new(Latch::new()));
             let (store, _holder) = fenced_store("latch-site", latch, true).await;
             let err = write(&store)
@@ -973,10 +1063,13 @@ mod tests {
 
     /// A replica write that loses its build race must NOT latch.
     ///
-    /// The other direction of the master/replica split, and the one that
-    /// decides whether this mechanism is usable at all: `sync` recovers a
-    /// replica race by adopting the winner's coverage, so latching it would
-    /// take a healthy server out of rotation over a non-event.
+    /// This test checks the other direction of the master and replica
+    /// split.
+    /// This direction decides whether the mechanism is usable at all.
+    /// `sync` recovers a replica race by adopting the coverage of the
+    /// winner.
+    /// A latch would take a healthy server out of rotation for an event
+    /// that does not matter.
     #[tokio::test]
     async fn a_fenced_replica_write_does_not_latch() {
         let latch: &'static Latch = Box::leak(Box::new(Latch::new()));
@@ -993,19 +1086,22 @@ mod tests {
         );
     }
 
-    /// A store that a second session has fenced, holding the keys every write
-    /// above targets.
+    /// A store that a second session has fenced.
+    /// The store holds the keys that every write above targets.
     ///
-    /// The seeding comes first and matters: `oxkv`'s `delete` of a missing
-    /// key is a read that returns `Ok(false)` without consulting
-    /// `ownership.json`, so a delete against an empty store would succeed on
-    /// a fenced handle and the test would be asserting nothing. A delete
-    /// that has something to delete reaches the WAL put and is fenced
-    /// there, as it is in production.
+    /// The seeding comes first, and the order matters.
+    /// The `delete` of `oxkv` on a missing key is a read.
+    /// That read returns `Ok(false)` without consulting `ownership.json`.
+    /// A delete against an empty store would then succeed on a fenced
+    /// handle, and the test would assert nothing.
+    /// A delete that has something to delete reaches the WAL put, and it is
+    /// fenced there, as it is in production.
     ///
-    /// Returns the fenced store and the session that fenced it. The holder
-    /// has to outlive the store: an `oxkv` handle only fences another while
-    /// it is alive, so dropping it would make the test assert nothing.
+    /// The function returns the fenced store and the session that fenced
+    /// it.
+    /// The holder must outlive the store.
+    /// An `oxkv` handle fences another handle only while it is alive.
+    /// Dropping the holder would make the test assert nothing.
     async fn fenced_store(
         name: &str,
         latch: &'static Latch,
@@ -1015,12 +1111,13 @@ mod tests {
         let inner =
             Arc::new(object_store::memory::InMemory::new()) as Arc<dyn object_store::ObjectStore>;
         let handle = crate::db::build_test_store_new_session(Arc::clone(&inner), &prefix).await;
-        // A clone shares the session, so seeding through it is a write by
-        // the handle under test.
+        // A clone shares the session, so a seed write through the
+        // clone is a write by the handle under test.
         seed_delete_targets(&FsStore::primary(handle.clone())).await;
 
-        // A second session over the same prefix CAS-bumps the epoch and
-        // fences the first: exactly what an uncooperative second writer does.
+        // A second session over the same prefix runs a CAS on the
+        // epoch and fences the first session.
+        // This is exactly what an uncooperative second writer does.
         let holder = crate::db::build_test_store_new_session(inner, &prefix).await;
 
         let store = if primary {
@@ -1034,8 +1131,8 @@ mod tests {
         (store, holder)
     }
 
-    /// Writes a session, a multipart record and an attached file, so the
-    /// delete and detach paths have something to act on.
+    /// Writes a session, a multipart record, and an attached file.
+    /// The delete and detach paths then have something to act on.
     async fn seed_delete_targets(store: &FsStore) {
         store
             .save_session(&sample_session("latch-sess"))
@@ -1057,20 +1154,24 @@ mod tests {
 
     /// A paged walk must visit every key exactly once.
     ///
-    /// `gets_bytes` takes *inclusive* cursor bounds, so resuming from the last
-    /// key of a page hands that same key back as the first entry of the next
-    /// one. Get that wrong and the walk either loops forever on one key or --
-    /// worse, if the dedup is too eager -- silently skips keys, which for the
-    /// replica rebuild means a user's file quietly never appears in their
-    /// replica with no error anywhere.
+    /// `gets_bytes` takes *inclusive* cursor bounds.
+    /// A walk that resumes from the last key of a page gets that same key
+    /// back as the first entry of the next page.
+    /// A wrong implementation then loops for ever on one key.
+    /// If the removal of the duplicate is too eager, the walk skips keys
+    /// instead.
+    /// In the replica rebuild, a skipped key means that a file of the user
+    /// never appears in the replica, and no error reports it.
     ///
-    /// Spans several pages deliberately: the boundary is the only place the
-    /// inclusive-cursor handling is exercised, and a single-page walk would
-    /// pass with the dedup removed entirely.
+    /// The test spans several pages on purpose.
+    /// A page boundary is the only place that the inclusive cursor
+    /// handling is tested.
+    /// A single page walk would pass even with the removal of the
+    /// duplicate gone.
     #[tokio::test]
     async fn paged_walk_visits_every_key_exactly_once() {
-        /// More keys than `SCAN_PAGE`, so at least one page boundary falls
-        /// strictly inside the keyspace.
+        /// The test uses more keys than `SCAN_PAGE`, so at least one page
+        /// boundary falls strictly inside the keyspace.
         const KEYS: usize = SCAN_PAGE as usize * 3 + 7;
 
         let store = test_store().await;
@@ -1108,7 +1209,8 @@ mod tests {
     }
 
     /// A keyspace of exactly one page, and one page plus one, are the two
-    /// sizes where an off-by-one in the boundary handling hides.
+    /// sizes where an off-by-one error in the boundary handling stays
+    /// hidden.
     #[tokio::test]
     async fn paged_walk_handles_exact_page_multiples() {
         for size in [
@@ -1242,15 +1344,18 @@ mod tests {
         Ok(())
     }
 
-    /// One `delete_session` takes the session, its staged parts and its
-    /// multipart record, and leaves nothing behind in the raw keyspace.
+    /// One `delete_session` deletes the session, its staged parts, and its
+    /// multipart record.
+    /// The raw keyspace then holds none of them.
     ///
-    /// The raw reads matter because the point of the ordering is what a
-    /// *later* scan can still find. `list_sessions` walks `fs:uploads:`
-    /// and nothing in the crate walks `fs:mp:` at all, so the only thing
-    /// that makes a stranded multipart record reachable again is a session
-    /// row that has not been deleted yet -- which is why the row goes last
-    /// and why the cascade has to succeed before it does.
+    /// The raw reads matter because the order decides what a *later* scan
+    /// can still find.
+    /// `list_sessions` walks `fs:uploads:`.
+    /// Nothing in the crate walks `fs:mp:`.
+    /// A session row that is not deleted yet is then the only thing that
+    /// makes a stranded multipart record reachable again.
+    /// For that reason the row goes last, and the cascade must succeed
+    /// before it goes.
     #[tokio::test]
     async fn one_delete_session_clears_the_row_and_every_cascade_row() -> anyhow::Result<()> {
         let store = test_store().await;
@@ -1291,26 +1396,31 @@ mod tests {
 
     /// Every delete in `delete_file` reports its error.
     ///
-    /// The doc above promises the record, its ref-count entry and every
-    /// relation marker are removed "atomically". Five of the six deletes
-    /// in the transaction mapped their error through `store_err`; the
-    /// ref-count one read `let _ = tx.delete(&refs).await`, so a failure
-    /// committed the transaction anyway and left `fs:files:{id}:refs`
-    /// holding `count > 0` for a file whose record and relation markers
-    /// were already gone.
+    /// The doc above promises that the record, its ref-count entry, and
+    /// every relation marker are removed "atomically".
+    /// Five of the six deletes in the transaction mapped their error
+    /// through `store_err`.
+    /// The delete of the ref-count entry read `let _ = tx.delete(&refs).await`.
+    /// A failure of that delete then committed the transaction anyway.
+    /// `fs:files:{id}:refs` then held `count > 0` for a file whose record
+    /// and relation markers were already gone.
     ///
-    /// Bounded today -- ids are uuidv7 and never reused, and `attach`
-    /// requires the record to exist -- so this is a latent inconsistency
-    /// rather than live corruption. It is still a swallowed error on the
-    /// exact invariant a previous commit claimed to have made atomic, and
-    /// the cost of noticing it later is that the claim was false.
+    /// The damage is limited today.
+    /// The ids are uuidv7 and are never reused, and `attach` requires the
+    /// record to exist.
+    /// The problem is therefore a possible inconsistency, and not current
+    /// corruption.
+    /// It is still an error that the code discards, and it affects the
+    /// exact rule that an earlier commit claimed to be atomic.
+    /// The cost of finding this later is that the claim was false.
     ///
-    /// Read from the source because the failure needs a delete that fails
-    /// while its siblings in the same transaction succeed, which a
-    /// concrete `OxKvStore` will not do on demand. The shape is what
-    /// regressed; the behaviour is not observable single-threaded.
+    /// The test reads the source because the failure needs a delete that
+    /// fails while its siblings in the same transaction succeed.
+    /// A concrete `OxKvStore` does not do that on demand.
+    /// The shape of the code is what regressed.
+    /// A single-threaded test cannot observe the behaviour.
     #[test]
-    fn delete_file_does_not_swallow_a_delete() {
+    fn delete_file_reports_every_delete_error() {
         let src = std::fs::read_to_string("src/fs/store.rs").expect("read store.rs");
         let body = src
             .split_once("pub async fn delete_file")
@@ -1338,23 +1448,26 @@ mod tests {
         assert_eq!(deletes, 3, "the record, the refs and the markers");
     }
 
-    /// The cascade rows go first, the session key last, in one transaction,
-    /// with no result discarded.
+    /// The cascade rows go first, and the session key last, in one
+    /// transaction, and no result is discarded.
     ///
-    /// Read from the source because the failure it guards needs a delete
-    /// that fails partway through, and there is no way to arrange one: the
-    /// store is a concrete `OxKvStore` over an in-memory backend, and
-    /// `oxkv`'s `HookStore` validators reject `set_bytes` only, never a
-    /// `delete`. Fencing fails the first write, whichever order these run
-    /// in, so it cannot tell the two apart either. The old body is
-    /// distinguishable only by its shape -- one cascade key written before
-    /// the session key, inside a transaction, with no `let _ =` in it --
-    /// and shape is what regressed.
+    /// The test reads the source because the failure that it guards needs a
+    /// delete that fails partway through.
+    /// A test cannot arrange such a failure.
+    /// The store is a concrete `OxKvStore` over an in-memory backend.
+    /// The validators of `HookStore` in `oxkv` reject `set_bytes` only,
+    /// and never a `delete`.
+    /// Fencing fails the first write, whatever the order.
+    /// Fencing cannot tell the two orders apart.
+    /// The old body is different only in its shape.
+    /// The shape was one cascade key written before the session key,
+    /// inside a transaction, with no `let _ =` in it.
+    /// The shape is what regressed.
     ///
-    /// The behavioural half is `one_delete_session_clears_the_row_and_
-    /// every_cascade_row`; this pins the ordering that a passing
-    /// single-threaded test cannot observe, because it only exists on the
-    /// failure path.
+    /// The test `one_delete_session_clears_the_row_and_every_cascade_row`
+    /// checks the behaviour.
+    /// This test pins the order that a single-threaded test cannot
+    /// observe, because the order matters only on the failure path.
     #[test]
     fn delete_session_cascades_before_the_row_and_discards_nothing() {
         let src = std::fs::read_to_string("src/fs/store.rs").expect("read store.rs");
@@ -1432,7 +1545,7 @@ mod tests {
 
         store.delete_file("rel-file").await?;
         assert!(store.get_file("rel-file").await?.is_none());
-        // No dangling markers or ref-count left behind.
+        // No marker and no ref-count entry stays behind.
         assert!(store.rows_for_file("rel-file").await?.is_empty());
         assert_eq!(store.get_ref_info("rel-file").await?.count, 0);
         Ok(())
@@ -1440,8 +1553,9 @@ mod tests {
 
     #[tokio::test]
     async fn mirrored_store_serves_reads() -> anyhow::Result<()> {
-        // Writes land before and after the mirror opens: pre-existing
-        // keys arrive via fall-through/warm, later ones via refresh.
+        // The writes land before and after the mirror opens.
+        // A key that already exists arrives through fall-through and warm.
+        // A later key arrives through refresh.
         let plain = test_store().await;
         let rec = FileRecord {
             id: "mirror-1".to_string(),
@@ -1456,8 +1570,9 @@ mod tests {
         plain.attach("invoice", "7", "mirror-1").await?;
 
         let mirrored = FsStore::new_mirrored(clone_handle(&plain).await).await?;
-        // First refresh converges the pre-existing writes (WAL replay or
-        // warm, depending on what compacted); reads then serve correctly.
+        // The first refresh converges the writes that already existed.
+        // The engine uses WAL replay or warm, depending on what compacted.
+        // The reads then give correct results.
         assert!(mirrored.refresh_mirror().await? > 0);
         assert_eq!(mirrored.get_file("mirror-1").await?.unwrap().name, "m.txt");
         assert_eq!(mirrored.list_files().await?.records.len(), 1);
@@ -1467,8 +1582,9 @@ mod tests {
         );
         assert_eq!(mirrored.get_ref_info("mirror-1").await?.count, 1);
 
-        // A write through the plain handle converges on refresh, and a
-        // second refresh with no writes is a manifest-check no-op.
+        // A write through the plain handle converges on the next refresh.
+        // A second refresh with no writes does nothing except check the
+        // manifest.
         plain.detach("invoice", "7", "mirror-1").await?;
         mirrored.refresh_mirror().await?;
         assert!(mirrored.rows_for_file("mirror-1").await?.is_empty());
@@ -1477,7 +1593,8 @@ mod tests {
         Ok(())
     }
 
-    /// Clones the underlying handle out for mirror tests (shares session).
+    /// Clones the underlying handle for the mirror tests.
+    /// The clone shares the session.
     async fn clone_handle(store: &FsStore) -> oxkv::OxKvStore {
         store.inner.read().await.clone()
     }

@@ -1,10 +1,10 @@
-//! Durable change feed on S3: the [`ChangeSink`] implementation behind
-//! every replica.
+//! Durable change feed on S3. This module provides the [`ChangeSink`]
+//! implementation behind every replica.
 //!
 //! The op vocabulary ([`WalOp`], [`WalEntry`],
 //! [`FileRecord`](crate::records::FileRecord)) lives in
-//! [`crate::records`] so that `fs` and `policy` can announce changes
-//! without depending on this module. Only the storage lives here.
+//! [`crate::records`]. That way `fs` and `policy` announce changes without
+//! depending on this module. Only the storage lives here.
 
 use std::sync::Arc;
 
@@ -16,31 +16,32 @@ use crate::fencing::Latch;
 use crate::fs::error::FsError;
 use crate::records::{ChangeSink, WalEntry, WalOp};
 
-/// The master change-feed prefix this store writes to, named in the
-/// fencing-loss log line so an operator can tell which prefix died.
+/// The master change-feed prefix. The store writes to this prefix. The
+/// fencing-loss log line names it so that an operator can tell which prefix
+/// died.
 const WAL_PREFIX: &str = "{db}/wal";
 
-/// WAL stored in an [`OxKvStore`] (per-user S3, scalable).
+/// WAL stored in an [`OxKvStore`]. The store is per-user on S3 and scales.
 ///
-/// Clones share the append mutex: concurrent appends from any handle
-/// serialize, so sequence numbers stay gap-free and no entry is lost.
+/// Clones share the append mutex. Appends from any handle run one at a
+/// time. Sequence numbers stay gap-free, and no entry is lost.
 #[derive(Clone)]
 pub struct Wal {
     store: Arc<RwLock<OxKvStore>>,
     append_lock: Arc<tokio::sync::Mutex<()>>,
     /// Where a lost epoch on the master change-feed prefix is recorded.
     ///
-    /// The process-wide latch in production (see
-    /// [`process_latch`](crate::fencing::process_latch)); a test can point
-    /// its own WAL at a private [`Latch`](crate::fencing::Latch) via
+    /// In production the WAL uses the process-wide latch (see
+    /// [`process_latch`](crate::fencing::process_latch)). A test can point
+    /// its own WAL at a private [`Latch`](crate::fencing::Latch) through
     /// [`with_latch`](Self::with_latch).
     ///
-    /// Held rather than reached through the free
-    /// [`note_primary_loss`](crate::fencing::note_primary_loss) so the latch
-    /// travels with the feed that owns the prefix -- the same reasoning as
-    /// `FsStore`'s field. `PRIMARY_LOSS` is one-way with no reset, so an
-    /// assertion against it is satisfied by whichever test tripped it
-    /// first, which is every test binary this crate runs.
+    /// This field holds the latch instead of calling the free
+    /// [`note_primary_loss`](crate::fencing::note_primary_loss), so the latch
+    /// travels with the feed that owns the prefix. The `FsStore` field uses
+    /// the same reasoning. `PRIMARY_LOSS` is one-way and has no reset. The
+    /// first test to trip it then satisfies any assertion against it. Every
+    /// test binary this crate runs trips it.
     latch: &'static Latch,
 }
 
@@ -56,10 +57,10 @@ impl Wal {
 
     /// Records fencing losses on `latch` instead of the process-wide one.
     ///
-    /// Mirrors `FsStore::primary_with_latch` and `PolicyEngine::with_latch`
-    /// for the same reason: the process latch is one-way and global, so an
-    /// assertion against it passes whether or not the code under test
-    /// latched at all.
+    /// This method mirrors `FsStore::primary_with_latch` and
+    /// `PolicyEngine::with_latch`. The process latch is one-way and global.
+    /// An assertion against it passes even if the code under test never
+    /// latched.
     #[cfg(test)]
     pub(crate) fn with_latch(mut self, latch: &'static Latch) -> Self {
         self.latch = latch;
@@ -74,22 +75,22 @@ impl Wal {
         format!("wal:{seq:020}")
     }
 
-    /// Append an operation, returns the new sequence.
+    /// Appends an operation and returns the new sequence.
     ///
-    /// Serialized against concurrent appends on any clone sharing this
-    /// handle's mutex. The entry and the head pointer commit in one
-    /// transaction, so a crash can never leave an entry without its head
-    /// (or a head without its entry): the next append reuses the same
+    /// Appends from any clone that shares this handle mutex run one at a
+    /// time. The entry and the head pointer commit in one transaction. A
+    /// crash cannot leave an entry without its head, and it cannot leave a
+    /// head without its entry. The next append then reuses the same
     /// sequence instead of skipping it.
     async fn append_entry(&self, op: WalOp) -> Result<u64, FsError> {
         let result = self.append_entry_locked(op).await;
         if let Err(e) = &result
             && e.is_fencing_loss()
         {
-            // The WAL lives on the master change-feed prefix, so losing it is
-            // terminal for this process -- the same condition `fs` and
-            // `policy` report. Replica build races land on a per-user prefix
-            // and are not fenced through here.
+            // The WAL lives on the master change-feed prefix, so losing it
+            // stops this process. The `fs` and `policy` modules report the
+            // same condition. Replica build races land on a per-user prefix
+            // and are not fenced here.
             self.latch.trip(WAL_PREFIX, e.detail());
         }
         result
@@ -98,14 +99,13 @@ impl Wal {
     async fn append_entry_locked(&self, op: WalOp) -> Result<u64, FsError> {
         let _guard = self.append_lock.lock().await;
         let g = self.store.write().await;
-        // Absent means the feed is empty, and only absent means that. A
-        // value that is present and will not decode is a damaged head
-        // pointer, and treating it as "empty" is not a recovery: the next
-        // sequence becomes 1 and `set_bytes` OVERWRITES `wal:{...001}`,
-        // the first entry the feed has. Every replica that had applied
-        // 1..N then reads `range(1, 1)`, gets one op, and mis-applies it,
-        // while `head()` -- the only other reader of this key -- is the
-        // one that complains, and only after the damage.
+        // An absent head means an empty feed, and only absence means that. A
+        // present value that will not decode means a damaged head pointer.
+        // Treating it as "empty" is not a recovery. The next sequence becomes
+        // 1. Then `set_bytes` overwrites `wal:{...001}`, the first entry of
+        // the feed. Every replica that applied 1..N reads `range(1, 1)` and
+        // gets one op. It then applies the wrong op. Only `head()` reads this
+        // key, and it complains after the damage.
         let cur = match g.get_bytes(Self::seq_key()).await.map_err(FsError::from)? {
             None => 0,
             Some(b) => serde_json::from_slice::<u64>(&b)
@@ -139,22 +139,23 @@ impl Wal {
         serde_json::from_slice(&b).map_err(|e| FsError::Internal(e.to_string()))
     }
 
-    /// Range `from..=to` inclusive.
+    /// Returns the entries from `from` to `to`. The range includes both ends.
     ///
-    /// Missing or undecodable entries are corruption: atomic appends keep
-    /// `1..=head` fully populated, so a gap means entries were lost, not
-    /// merely delayed. Gaps error instead of being skipped — replaying
-    /// past them would silently drop mutations — and callers fall back to
-    /// a full rebuild.
+    /// A missing or undecodable entry means corruption. Atomic appends keep
+    /// `1..=head` complete, so a gap means that the store lost entries. A
+    /// delay cannot make a gap. A gap returns an error instead of a skip,
+    /// because a replay past it drops mutations without a trace. The caller
+    /// then falls back to a full rebuild.
     ///
-    /// So does `from > to`. That range is empty for exactly one reason --
-    /// the head is behind where the reader already is -- and reporting it
-    /// as `Ok(vec![])` reports "no new mutations" for a feed that has lost
-    /// the ones this reader depends on, leaving it permanently stale with
-    /// nothing logged and no rebuild triggered. Every other inconsistency
-    /// in this function is loud; this one used to be the exception. A
-    /// caller that has nothing to read has `from == to + 1` only when the
-    /// feed is empty, and should read nothing rather than guess.
+    /// `from > to` returns an error for the same reason. That range is empty
+    /// for exactly one condition. The head sits behind the position that the
+    /// reader already applied. `Ok(vec![])` would report "no new mutations"
+    /// for a feed that lost the mutations this reader needs. The reader then
+    /// stays stale for the life of the process. Nothing logs the fault, and
+    /// no rebuild starts. Every other inconsistency in this function returns
+    /// an error loudly. This one used to be the exception. A caller with
+    /// nothing to read uses `from == to + 1`. That value means the feed is
+    /// empty. The caller must read nothing and must not guess.
     pub async fn range(&self, from: u64, to: u64) -> Result<Vec<WalEntry>, FsError> {
         if from > to {
             return Err(FsError::Store(format!(
@@ -186,22 +187,22 @@ impl Wal {
     }
 }
 
-/// The only reason `fs` and `policy` know anything about replicas.
+/// The only reason `fs` and `policy` know about replicas.
 ///
-/// `ChangeSink` is one method, so a producer can be handed this trait
+/// `ChangeSink` declares one method, so a producer receives this trait
 /// object without a compile-time path to `sync::wal`, `sync::snapshot`,
 /// or anything else in `sync`.
 ///
-/// The sequence number is dropped here. No caller used it, and handing
-/// one out would invite a producer to treat its own append as a
+/// The sequence number is dropped here. No caller used it. Handing the
+/// number to a producer would let the producer treat its own append as a
 /// replication guarantee. A caller that needs the head can ask
-/// [`Wal::head`] — that is the value replicas compare coverage against.
+/// [`Wal::head`]. Replicas compare their coverage against that value.
 #[async_trait]
 impl ChangeSink for Wal {
     async fn append(&self, op: WalOp) -> anyhow::Result<()> {
-        // `FsError`'s `Display` is already the sanitized text, so a fencing
-        // loss reaches the producer as an opaque cause it has no way to act
-        // on.
+        // `FsError` uses `Display` to produce sanitized text. A fencing loss
+        // reaches the producer as an opaque cause. The producer has no way to
+        // act on that cause.
         self.append_entry(op)
             .await
             .map(|_| ())
@@ -254,14 +255,15 @@ mod tests {
         wal.append(op()).await?;
         assert_eq!(wal.range(1, 2).await?.len(), 2);
 
-        // Deleted entry: gap errors instead of silently replaying past it.
+        // A deleted entry makes the range return an error. The range does
+        // not skip past it.
         let key1 = format!("wal:{:020}", 1);
         wal.store.write().await.delete(&key1).await?;
         assert!(wal.range(1, 2).await.is_err());
-        // Untouched suffix still reads.
+        // The untouched suffix still reads.
         assert_eq!(wal.range(2, 2).await?.len(), 1);
 
-        // Corrupt payload errors as well.
+        // A corrupt payload also returns an error.
         let key2 = format!("wal:{:020}", 2);
         wal.store
             .write()
@@ -296,32 +298,33 @@ mod tests {
         assert!(!entries[0].op.is_legacy_policy_mark());
         assert!(entries[2].op.is_legacy_policy_mark());
 
-        // Legacy payload (object only) still deserializes.
+        // A legacy payload names only an object. It still deserializes.
         let legacy = serde_json::to_vec(&WalOp::PolicyAdd { obj: "x".into() })?;
         let back: WalOp = serde_json::from_slice(&legacy)?;
         assert!(back.is_legacy_policy_mark());
         Ok(())
     }
 
-    /// A damaged head pointer must fail the append, not rewind the feed.
+    /// A damaged head pointer must fail the append and not rewind the feed.
     ///
-    /// The head was read with `.and_then(|b| from_slice(&b).ok()).unwrap_or(0)`,
-    /// which folds "no head pointer" and "head pointer is garbage" into the
-    /// same value. The second is not an empty feed: the next append takes
-    /// `seq = 1` and `set_bytes` overwrites `wal:{...001}`. A replica that
-    /// had applied 1..N then reads `range(1, 1)`, applies one op, and moves
-    /// on believing it is current.
+    /// The old code read the head with
+    /// `.and_then(|b| from_slice(&b).ok()).unwrap_or(0)`. That expression maps
+    /// "no head pointer" and "head pointer is garbage" to one value. The
+    /// second case is not an empty feed. The next append takes `seq = 1`, and
+    /// `set_bytes` overwrites `wal:{...001}`. A replica that applied 1..N then
+    /// reads `range(1, 1)`, applies one op, and moves on. The replica then
+    /// believes that it is current.
     ///
-    /// Every other reader of this key treats a decode failure as an error --
-    /// `head()` returns `Err(FsError::Internal)` for exactly this value --
-    /// so after the rewind `head()` and the entries on disk disagree and
-    /// only `head()` complains. The append path was the one place that
-    /// could not tell them apart.
+    /// Every other reader of this key treats a decode failure as an error.
+    /// `head()` returns `Err(FsError::Internal)` for exactly this value. After
+    /// a rewind, `head()` and the entries on disk disagree, and only `head()`
+    /// complains. The append path was the only place that could not tell them
+    /// apart.
     ///
-    /// Asserts both halves: the append is refused, and entry 1 is still the
-    /// op that was written first.
+    /// The test checks both halves. The append is refused. Entry 1 still holds
+    /// the op that the code wrote first.
     #[tokio::test]
-    async fn a_corrupt_head_pointer_fails_the_append_instead_of_rewinding() -> anyhow::Result<()> {
+    async fn a_corrupt_head_pointer_refuses_the_append() -> anyhow::Result<()> {
         let wal = test_wal().await;
         let op = |tag: &str| WalOp::Attach {
             row_type: "t".into(),
@@ -355,8 +358,8 @@ mod tests {
             first[0].op
         );
 
-        // Once the pointer is repaired the feed resumes where it left off,
-        // rather than having lost entries 1..=2.
+        // Once the code repairs the pointer, the feed resumes where it
+        // stopped. It did not lose entries 1..=2.
         wal.store.write().await.set_bytes("wal:seq", b"2").await?;
         wal.append(op("third"))
             .await
@@ -369,21 +372,22 @@ mod tests {
 
     /// `range(from, to)` with `from > to` is corruption, not an empty feed.
     ///
-    /// This is the shape a replica asks for once the head has gone
-    /// backwards: it has applied up to N, `range(N+1, head)` comes back
-    /// empty, and it concludes nothing happened. The module doc promises
-    /// gaps "error instead of being skipped" precisely so the caller
-    /// falls back to a full rebuild; this path returned `Ok(vec![])` and
-    /// reported corruption as success, silently and with no log.
+    /// This is the range that a replica asks for after the head moves
+    /// backwards. The replica applied entries up to N. Then `range(N+1, head)`
+    /// returns an empty result. The replica then concludes that nothing
+    /// changed. The module doc states that gaps "error instead of being
+    /// skipped", so that the caller falls back to a full rebuild. This path
+    /// returned `Ok(vec![])` instead. It reported corruption as success, with
+    /// no log line.
     #[tokio::test]
-    async fn a_range_past_the_head_is_an_error_not_an_empty_feed() -> anyhow::Result<()> {
+    async fn a_backwards_range_is_an_error() -> anyhow::Result<()> {
         let wal = test_wal().await;
         wal.append(WalOp::GroupDelete { group: "g".into() }).await?;
         wal.append(WalOp::GroupDelete { group: "h".into() }).await?;
         assert_eq!(wal.head().await?, 2);
 
-        // A replica that applied 1..=2 asking for what is left of the feed
-        // after the head rewound to 1.
+        // A replica that applied 1..=2 asks for the rest of the feed. The
+        // head has rewound to 1.
         let err = wal
             .range(3, 1)
             .await
@@ -393,8 +397,8 @@ mod tests {
             "unhelpful error: {err}"
         );
 
-        // The feed itself is untouched by the refusal, so a repaired head
-        // still reads back the whole thing.
+        // The refusal does not touch the feed. A repaired head still reads
+        // the whole feed.
         assert_eq!(wal.range(1, 2).await?.len(), 2);
         Ok(())
     }
@@ -429,36 +433,38 @@ mod tests {
         Ok(())
     }
 
-    /// A change-feed write that loses the epoch must latch, not just fail.
+    /// A change-feed write that loses the epoch must latch. It must not
+    /// only fail.
     ///
-    /// This is the third of the three primary fencing trip points (`fs` at
-    /// `FsStore`, `policy` at `PolicyEngine`, `sync` here) and the only one
-    /// with no test at all. The trip was reachable only through
-    /// `note_primary_loss`, which nothing here called.
+    /// This module holds the third of the three primary fencing trip
+    /// points. The other two are `fs` at `FsStore` and `policy` at
+    /// `PolicyEngine`. This trip point had no test at all. Only
+    /// `note_primary_loss` reached the trip, and nothing here called it.
     ///
-    /// The failure it guards is the one `fencing`'s module docs describe:
-    /// a fenced change-feed write keeps failing as a 500 while `/ready`
-    /// stays 200, because the lease cannot see an uncooperative second
-    /// writer. Replicas then silently stop receiving mutations on a server
+    /// The failure that this test guards is the one the `fencing` module
+    /// docs describe. A fenced change-feed write keeps failing as a 500
+    /// while `/ready` stays 200. The lease cannot see an uncooperative
+    /// second writer. Replicas then stop receiving mutations on a server
     /// that reports itself healthy.
     ///
-    /// The store is a real `OxKvStore` driven into `StoreError::Fenced` by
-    /// opening a second session over the same prefix, which CAS-bumps
-    /// `ownership.json` and fences the first -- the same technique as
-    /// `fs::store::tests::fenced_store`, and the only one available here:
-    /// `Wal::new` takes a concrete `OxKvStore`, so
-    /// `policy::adapter::tests::FencedStore` (which wraps a `BTreeStore`)
-    /// cannot be handed to it. Going through a real handle rather than a
-    /// hand-built error is the point: the test has to prove the real commit
-    /// path classifies as a fencing loss, not that a mock can be made to.
+    /// The test drives a real `OxKvStore` into `StoreError::Fenced`. It
+    /// opens a second session over the same prefix. That session CAS-bumps
+    /// `ownership.json` and fences the first session. The `fs::store::tests::fenced_store`
+    /// test uses the same technique. It is the only technique available
+    /// here. `Wal::new` takes a concrete `OxKvStore`, so the code cannot
+    /// take `policy::adapter::tests::FencedStore`, which wraps a
+    /// `BTreeStore`. Using a real handle instead of a hand-built error is
+    /// the point. The test proves that the real commit path classifies the
+    /// error as a fencing loss.
     ///
-    /// The seeding write comes first and matters: `oxkv` treats a write to a
-    /// store with no keys as a no-op in some paths, and the fencing check
-    /// only fires once there is something to commit against.
+    /// The seeding write comes first, and it matters. In some paths
+    /// `oxkv` treats a write to a store with no keys as a no-op. The
+    /// fencing check fires only after the code has something to commit.
     ///
-    /// The latch is a PRIVATE one. `PRIMARY_LOSS` is one-way with no reset
-    /// and `fencing::tests` trips it unconditionally, so asserting against
-    /// the global would pass whether or not this code latched at all.
+    /// The latch is a private latch. `PRIMARY_LOSS` is one-way and has no
+    /// reset. `fencing::tests` trips it without a condition. An assertion
+    /// against the global latch would then pass even if this code never
+    /// latched.
     #[tokio::test]
     async fn a_fenced_change_feed_write_latches() {
         let prefix = crate::db::test_prefix("wal-fenced");
@@ -469,8 +475,8 @@ mod tests {
         let latch: &'static Latch = Box::leak(Box::new(Latch::new()));
         let wal = Wal::new(handle).with_latch(latch);
 
-        // Seed through the handle under test, so the fenced commit below has
-        // a real entry to lose.
+        // Write through the handle under test first. The fenced commit
+        // below needs a real entry to lose.
         wal.append(WalOp::Attach {
             row_type: "invoice".into(),
             row_id: "1".into(),
@@ -480,18 +486,19 @@ mod tests {
         .expect("the unfenced feed accepts an append");
         assert!(!latch.is_tripped(), "a live feed must not latch");
 
-        // A second session over the same prefix takes the epoch: exactly
+        // A second session over the same prefix takes the epoch. This is
         // what an uncooperative second writer does. The holder must outlive
-        // the assertion -- `oxkv` only fences another handle while alive.
+        // the assertion. `oxkv` fences another handle only while the holder
+        // is alive.
         let _holder =
             crate::db::build_test_store_new_session(std::sync::Arc::clone(&inner), &prefix).await;
 
-        // Drive `append_entry` rather than the `ChangeSink` impl: that impl
+        // Drive `append_entry` instead of the `ChangeSink` impl. That impl
         // flattens `FsError` into an opaque `anyhow` message for the
-        // producer, which by design carries no classification -- so the
+        // producer. The message carries no classification by design. The
         // sanitized text cannot show whether this was a fencing loss or a
-        // flaky store. `append_entry` is the layer that decides, and it is
-        // what the latch check below reads.
+        // flaky store. `append_entry` is the layer that decides, and the
+        // latch check below reads it.
         let err = wal
             .append_entry(WalOp::Attach {
                 row_type: "invoice".into(),
@@ -501,23 +508,22 @@ mod tests {
             .await
             .expect_err("a fenced commit cannot succeed");
 
-        // The classification, which the producer turns into a 500 ...
+        // The classification comes first. The producer turns it into a 500.
         assert!(
             err.is_fencing_loss(),
             "a fenced change-feed write must be typed as a fencing loss, got: {err:?}"
         );
-        // ... on the store's own reason, which `detail()` keeps and `Display`
-        // deliberately sanitizes to "internal server error" -- the
-        // classification is what the producer acts on, the detail is what
-        // the log line carries.
+        // The 500 carries the store reason. `detail()` keeps that reason.
+        // `Display` sanitizes it to "internal server error". The producer
+        // acts on the classification. The log line keeps the detail.
         assert!(
             err.detail().contains("fenced") || err.detail().contains("epoch"),
             "the store's fencing reason must survive to the log: {:?}",
             err.detail()
         );
-        // ... and the latch, which is what takes the instance out of
-        // rotation. Without it the write fails forever while `/ready` keeps
-        // reporting 200.
+        // The latch comes last. The latch takes the instance out of
+        // rotation. Without the latch, the write fails forever. Meanwhile,
+        // `/ready` keeps reporting 200.
         assert!(
             latch.is_tripped(),
             "a fenced change-feed write must latch the fencing signal; \

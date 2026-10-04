@@ -1,21 +1,22 @@
-//! Request middleware shared by the server and by every
-//! [`ApiModule`](crate::http::ApiModule).
+//! The request middleware that the server and every
+//! [`ApiModule`] share.
 //!
 //! [`bearer_token`](crate::http::middleware::bearer_token) runs globally
-//! and only extracts the `Authorization` header;
-//! [`jwt`](crate::http::middleware::jwt) does the actual validation and is
-//! applied per module scope, since its claims type is module-specific.
-//! [`jwks`](crate::http::middleware::jwks) backs it with a
-//! refresh-on-rotation key store, and
-//! [`request_tracing`](crate::http::middleware::request_tracing) wraps
-//! every request in a server span.
+//! and only extracts the `Authorization` header.
+//! [`jwt`](crate::http::middleware::jwt) does the validation, and the code
+//! applies it per module scope, because its claims type is specific to one
+//! module. [`jwks`](crate::http::middleware::jwks) backs the validation with
+//! a key store that refreshes after a key rotation, and
+//! [`request_tracing`](crate::http::middleware::request_tracing) puts every
+//! request inside a server span.
 
-/// Bearer-token request authentication middleware.
+/// The middleware that extracts a bearer token for request authentication.
 pub mod bearer_token;
-/// JWKS-backed signing key store with refresh-on-rotation.
+/// The signing key store that uses JWKS and refreshes after a key rotation.
 pub mod jwks;
 
-/// JWKS-backed JWT claims validation middleware.
+/// The middleware that validates JWT claims against a JWKS key store.
 pub mod jwt;
-/// Per-request OpenTelemetry-compatible tracing spans.
+/// The tracing span that the code creates for each request. The spans work
+/// with OpenTelemetry.
 pub mod request_tracing;
