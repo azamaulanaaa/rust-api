@@ -347,33 +347,116 @@ impl WriterLease {
 
 /// Keeps a renewal task alive and releases the lease when dropped.
 ///
-/// Dropping this guard ends the renewal loop and releases the lease, so a
-/// replacement process can claim the prefix immediately instead of waiting
-/// out the TTL. The happy path for a rolling restart.
+/// Dropping this guard ends the renewal loop and lets the release run, but
+/// *nothing waits for it*. A `Drop` impl cannot await, and the task it
+/// wakes only becomes runnable -- it is not run. At process exit the Tokio
+/// runtime drops spawned tasks without polling them, so a shutdown that
+/// relies on the drop never deletes the record and the replacement waits
+/// out the whole TTL.
 ///
-/// `#[must_use]`: dropping it early silently disables both renewal and
-/// release, which is the opposite of what a caller usually wants.
-#[must_use = "dropping the guard stops renewal and releases the lease"]
+/// [`release`](Self::release) is the orderly path and the one the server
+/// takes. Drop remains a best-effort backstop for the early-error exits
+/// that cannot await.
+///
+/// `#[must_use]`: dropping it early silently disables renewal, and the
+/// release it would have triggered is the part that does not run.
+#[must_use = "dropping the guard stops renewal and releases the lease on a best-effort basis"]
 #[derive(Debug)]
 pub struct LeaseGuard {
-    /// Dropping the sender completes the renewal task's shutdown future.
-    _shutdown: tokio::sync::oneshot::Sender<()>,
+    /// Ends the renewal task's shutdown future. `None` once [`release`](Self::release)
+    /// has taken it, so a released guard does not signal twice.
+    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    /// The renewal task, which owns the lease and releases it on the way
+    /// out. `None` once [`release`](Self::release) has taken it.
+    task: Option<tokio::task::JoinHandle<()>>,
 }
+
+impl LeaseGuard {
+    /// Stops renewal and waits for the lease to be released.
+    ///
+    /// This is what makes a rolling restart hand the prefix over without a
+    /// TTL wait, and the reason the shutdown path in `main.rs` awaits it
+    /// rather than dropping the guard.
+    ///
+    /// Bounded by [`RELEASE_TIMEOUT`]: a release is best effort (it only
+    /// costs the next start one TTL), so an unreachable object store must
+    /// not hold the process open forever. On timeout this returns and the
+    /// lease expires on its own, which is the crash path working as
+    /// intended. The renewal task is left running rather than aborted --
+    /// its release is a single `get` plus a `delete`, so aborting mid-call
+    /// buys nothing and the runtime will drop it on exit anyway.
+    ///
+    /// Consumes the guard, so the `Drop` backstop does not fire behind it
+    /// and release twice.
+    pub async fn release(mut self) {
+        self.release_within(RELEASE_TIMEOUT).await
+    }
+
+    /// [`release`](Self::release), bounded by `timeout` instead.
+    pub async fn release_within(&mut self, timeout: std::time::Duration) {
+        // Both fields are `Option` so this is idempotent: a guard released
+        // twice signals once, and the second call finds nothing to await.
+        self.shutdown.take();
+        let Some(task) = self.task.take() else {
+            return;
+        };
+        let timed_out = tokio::time::timeout(timeout, task).await;
+        match timed_out {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) if e.is_cancelled() => {
+                tracing::warn!("single-writer lease renewal task was cancelled before releasing");
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "single-writer lease renewal task panicked");
+            }
+            Err(_) => {
+                tracing::warn!(
+                    timeout_secs = timeout.as_secs(),
+                    "timed out releasing the single-writer lease; it will expire instead"
+                );
+            }
+        }
+    }
+}
+
+impl Drop for LeaseGuard {
+    /// Stops renewal and lets the release run, without waiting for it.
+    ///
+    /// Only the best-effort half: the task is detached rather than awaited,
+    /// so at process exit the runtime drops it unpolled and the record
+    /// survives until the TTL expires. Callers that can await should call
+    /// [`release`](Self::release) instead -- see the type docs for why
+    /// dropping is not equivalent.
+    fn drop(&mut self) {
+        self.shutdown.take();
+    }
+}
+
+/// How long [`LeaseGuard::release`] waits for the record to be deleted
+/// before giving up and letting the TTL expire it.
+///
+/// A release is a single `get` plus a `delete` on the lease key, so a
+/// correct store answers in well under a second. The bound is generous
+/// because its only job is to stop a wedged store from holding the process
+/// open indefinitely, and the cost of firing is bounded and known: the
+/// replacement waits one TTL.
+pub const RELEASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Spawns a renewal task, returning the `/ready` flag and the guard that
 /// keeps it running.
 ///
-/// The task releases the lease when the guard is dropped. It keeps ticking
-/// after a lost lease rather than exiting: a later successful renewal
-/// cannot un-fence us, and the flag must stay set so the process is never
-/// re-admitted to traffic, so there is nothing useful left to do.
+/// The task releases the lease when the guard drops, and when
+/// [`LeaseGuard::release`] tells it to. It keeps ticking after a lost
+/// lease rather than exiting: a later successful renewal cannot un-fence
+/// us, and the flag must stay set so the process is never re-admitted to
+/// traffic, so there is nothing useful left to do.
 pub fn spawn_renewer(
     mut lease: WriterLease,
     interval: std::time::Duration,
 ) -> (Arc<AtomicBool>, LeaseGuard) {
     let lost = lease.lost_flag();
     let (tx, rx) = tokio::sync::oneshot::channel();
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
         ticker.tick().await; // the first tick completes immediately
         // Pinned outside the loop: `select!` would otherwise move the
@@ -393,7 +476,13 @@ pub fn spawn_renewer(
         }
         lease.release().await;
     });
-    (lost, LeaseGuard { _shutdown: tx })
+    (
+        lost,
+        LeaseGuard {
+            shutdown: Some(tx),
+            task: Some(task),
+        },
+    )
 }
 
 fn instance_id() -> String {
@@ -910,6 +999,237 @@ mod tests {
             .await
             .expect("released lease must be immediately claimable");
         assert_ne!(next.instance(), lease.instance());
+    }
+
+    /// Shutting the guard down must actually delete the lease record, before
+    /// the caller returns.
+    ///
+    /// This is the property the whole orderly-release path rests on, and it
+    /// was not true. `serve` held the guard in a plain `_lease_guard`
+    /// binding and relied on its `Drop` to run `lease.release()`. Dropping
+    /// the `oneshot::Sender` only *made* the detached task runnable; `serve`
+    /// then returned to `#[tokio::main] main`, which returned and dropped
+    /// the runtime, and Tokio drops spawned tasks without polling them. A
+    /// `Drop` impl cannot compensate because it cannot await.
+    ///
+    /// So `DELETE _rust-api-writer-lease.json` never executed on *any*
+    /// graceful shutdown. A replacement pod read the still-present record
+    /// with `age < ttl_secs`, got `LeaseError::Held`, propagated it out of
+    /// `serve`, and CrashLoopBackOffs until the TTL expired -- defeating
+    /// the rolling-restart handover the lease exists to provide.
+    ///
+    /// Awaiting the guard's `release` is what makes it happen, so the test
+    /// awaits it and asserts the record is gone on return. Confirmed to
+    /// fail if the guard is dropped instead: the record survives, and the
+    /// reacquisition below returns `Held`.
+    #[tokio::test]
+    async fn awaiting_the_guard_release_deletes_the_record_before_returning() {
+        let store = mem();
+        let prefix = "lease-test-guard-release";
+        let lease = WriterLease::acquire(Arc::clone(&store), prefix, TTL)
+            .await
+            .expect("claims");
+        let instance = lease.instance().to_string();
+        let (_lost, guard) = spawn_renewer(lease, std::time::Duration::from_secs(3600));
+        let path = lease_path(prefix);
+        assert!(
+            store.get(&path).await.is_ok(),
+            "precondition: the lease record exists while held",
+        );
+
+        // The orderly shutdown path.
+        guard.release().await;
+
+        assert!(
+            store.get(&path).await.is_err(),
+            "awaiting the release returned without deleting the lease record; \
+             a replacement waits out the whole TTL",
+        );
+        // And the practical consequence: the prefix is immediately
+        // claimable, with no TTL wait.
+        let next = WriterLease::acquire(Arc::clone(&store), prefix, TTL)
+            .await
+            .expect("an orderly shutdown must hand the prefix over immediately");
+        assert_ne!(next.instance(), instance);
+    }
+
+    /// The renewal task must stop when the guard shuts down.
+    ///
+    /// A renewal that kept ticking after shutdown would overwrite the
+    /// successor's record and read back its own write, concluding it still
+    /// held the lease -- the split brain `renew`'s read-before-write
+    /// ordering exists to prevent, reachable from the other direction.
+    #[tokio::test]
+    async fn releasing_the_guard_stops_renewal() {
+        let store = mem();
+        let prefix = "lease-test-stop-renew";
+        let lease = WriterLease::acquire(Arc::clone(&store), prefix, TTL)
+            .await
+            .expect("claims");
+        let (_lost, mut guard) = spawn_renewer(lease, std::time::Duration::from_millis(10));
+        let path = lease_path(prefix);
+
+        // `release_within` awaits the task, so a stop is observable once it
+        // returns: nothing else can write the record afterwards.
+        guard
+            .release_within(std::time::Duration::from_secs(5))
+            .await;
+
+        // A successor takes the prefix.
+        let next = WriterLease::acquire(Arc::clone(&store), prefix, TTL)
+            .await
+            .expect("released lease is claimable");
+
+        // Several renewal intervals with room to spare. If the task were
+        // still ticking it would have clobbered the successor's record.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let on_disk: LeaseRecord =
+            serde_json::from_slice(&store.get(&path).await.unwrap().bytes().await.unwrap())
+                .unwrap();
+        assert_eq!(
+            on_disk.instance,
+            next.instance(),
+            "a stopped renewal task overwrote its successor's lease",
+        );
+    }
+
+    /// Releasing twice must not release twice.
+    ///
+    /// `release` consumes the guard, but `release_within` takes `&mut self`
+    /// so the shutdown ordering can be exercised directly. A second call
+    /// finds the task already taken and does nothing, rather than awaiting
+    /// a `JoinHandle` it no longer owns.
+    #[tokio::test]
+    async fn releasing_a_guard_twice_is_a_no_op() {
+        let store = mem();
+        let prefix = "lease-test-double-release";
+        let lease = WriterLease::acquire(Arc::clone(&store), prefix, TTL)
+            .await
+            .expect("claims");
+        let (_lost, mut guard) = spawn_renewer(lease, std::time::Duration::from_secs(3600));
+        let path = lease_path(prefix);
+
+        guard
+            .release_within(std::time::Duration::from_secs(5))
+            .await;
+        assert!(store.get(&path).await.is_err());
+
+        // Must not hang or panic; there is nothing left to await.
+        guard
+            .release_within(std::time::Duration::from_secs(5))
+            .await;
+    }
+
+    /// An unreachable store must not hold shutdown open forever.
+    ///
+    /// The release is best effort: failing to delete the record costs the
+    /// next start one TTL, while blocking shutdown costs a rolling restart
+    /// entirely and, on an orchestrator with a termination grace period,
+    /// a SIGKILL. So the wait is bounded, and the bound is what the test
+    /// exercises -- `StuckStore` never answers `get`, which is what an
+    /// unreachable S3 looks like from here.
+    #[tokio::test]
+    async fn a_stalled_release_gives_up_rather_than_blocking_shutdown() {
+        let prefix = "lease-test-stalled-release";
+        let now = chrono::Utc::now().timestamp();
+        let record = LeaseRecord {
+            instance: "holder-1".to_string(),
+            claimed_at: now,
+            renewed_at: now,
+            ttl_secs: TTL,
+            pid: std::process::id(),
+        };
+        // Built directly rather than acquired: `acquire` needs a store that
+        // answers, and the whole point is a store that does not.
+        let lease = WriterLease::new(Arc::new(StuckStore), lease_path(prefix), record);
+        let (_lost, mut guard) = spawn_renewer(lease, std::time::Duration::from_secs(3600));
+
+        // The release reads the record before deleting it, so a store that
+        // hangs on `get` stalls the whole release.
+        let started = std::time::Instant::now();
+        guard
+            .release_within(std::time::Duration::from_millis(100))
+            .await;
+
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(30),
+            "the release was not bounded; shutdown would hang on the store",
+        );
+        // Bounded, not skipped: the wait really ran, just not forever.
+        // Without the `timeout` this future never resolves at all, which is
+        // the property the assertion below cannot express and this one can.
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(50),
+            "the release gave up before even trying; the bound is a no-op",
+        );
+    }
+
+    /// A store that never answers, so a shutdown's release cannot complete.
+    #[derive(Debug)]
+    struct StuckStore;
+
+    impl std::fmt::Display for StuckStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("StuckStore")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for StuckStore {
+        async fn put_opts(
+            &self,
+            _location: &ObjectPath,
+            _payload: PutPayload,
+            _opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            unreachable!("the release never writes")
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            _location: &ObjectPath,
+            _opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            unreachable!("the release never uses multipart")
+        }
+
+        async fn get_opts(
+            &self,
+            _location: &ObjectPath,
+            _options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            std::future::pending().await
+        }
+
+        async fn delete(&self, _location: &ObjectPath) -> object_store::Result<()> {
+            std::future::pending().await
+        }
+
+        fn list(
+            &self,
+            _prefix: Option<&ObjectPath>,
+        ) -> BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+            unreachable!("the release never lists")
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            _prefix: Option<&ObjectPath>,
+        ) -> object_store::Result<object_store::ListResult> {
+            unreachable!("the release never lists")
+        }
+
+        async fn copy(&self, _from: &ObjectPath, _to: &ObjectPath) -> object_store::Result<()> {
+            unreachable!("the release never copies")
+        }
+
+        async fn copy_if_not_exists(
+            &self,
+            _from: &ObjectPath,
+            _to: &ObjectPath,
+        ) -> object_store::Result<()> {
+            unreachable!("the release never copies")
+        }
     }
 
     /// A release must not delete a lease someone else now owns, or a

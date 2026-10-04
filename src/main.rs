@@ -221,9 +221,11 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
     // takes an epoch, so a check afterwards would already have displaced
     // the incumbent. Every prefix-scoped store built below (policy, fs,
     // wal, and each per-user replica) then lives under this one lease.
-    // `_lease_guard` is held for the rest of `serve`, so the lease is
-    // renewed while serving and released on the way out.
-    let (lease_lost, _lease_guard) =
+    //
+    // `lease_guard` is held for the rest of `serve`, so the lease is
+    // renewed while serving, and released explicitly on the way out -- see
+    // the await after `start` below.
+    let (lease_lost, lease_guard) =
         claim_writer_lease(&s3_client_config, &db_prefix, lease_ttl).await?;
 
     // Single bucket, prefix-scoped OxKvStores per domain (scalable, no local files).
@@ -325,7 +327,11 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
                 && !rust_api::fencing::primary_loss()
         }
     });
-    ApiService::new()
+    // Built first so the listener can be started as the last fallible step:
+    // anything that fails after the lease is claimed but before the server
+    // is listening takes the early-error path, where the guard's `Drop`
+    // best-effort release is all there is.
+    let served = ApiService::new()
         .with_cors_origins(config.http.allowed_origins.clone())
         .with_rate_limit(rust_api::limits::TokenBucket::new(
             config.limits.burst_or_rate(),
@@ -338,7 +344,23 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
         .register_module(Box::new(fs_api_module))
         .register_module(Box::new(sync_api_module))
         .start(listen_addr.into())
-        .await?;
+        .await;
+
+    // The orderly release, awaited. `start` returns on SIGTERM (the drain
+    // path), so this is where the lease has to go back: dropping the guard
+    // only *makes* the release runnable, and the runtime that would poll it
+    // is about to be dropped too. Skipping this left the record in place,
+    // so a replacement pod read it as a live lease and CrashLoopBackOffs
+    // until the TTL expired -- on every graceful shutdown, and defeating
+    // the rolling-restart handover this lease exists for.
+    //
+    // Before the telemetry flush, so the release's own log lines reach the
+    // collector.
+    if let Some(guard) = lease_guard {
+        guard.release().await;
+    }
+
+    served?;
 
     // Explicit flush on the normal exit path: pending spans and metric
     // points are delivered, and failures are surfaced instead of silently
@@ -351,9 +373,12 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
 /// Claims the single-writer lease for `db_prefix` and starts renewing it.
 ///
 /// Returns the flag to gate `/ready` on plus a guard that must be held for
-/// the server's lifetime: dropping the guard stops renewal and releases the
-/// lease, which is what makes a rolling restart hand the prefix over without
-/// a TTL wait.
+/// the server's lifetime: the guard stops renewal when released, and
+/// [`LeaseGuard::release`](rust_api::lease::LeaseGuard::release) hands the
+/// prefix back, which is what makes a rolling restart hand over without a
+/// TTL wait. Callers must await the release rather than drop the guard --
+/// see the guard's docs for what dropping actually achieves at process
+/// exit.
 ///
 /// A `ttl_secs` of `0` disables the lease (documented single-node escape
 /// hatch) and yields a flag that is never set.
