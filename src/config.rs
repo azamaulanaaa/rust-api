@@ -199,6 +199,16 @@ impl Config {
                 self.database.prefix
             );
         }
+        if self.database.writer_lease_ttl_secs > i64::MAX as u64 {
+            anyhow::bail!(
+                "database.writer_lease_ttl_secs is {}, which is above i64::MAX. \
+                 The lease compares a record's age against its TTL, and a TTL \
+                 that large would read as already stale, so every second writer \
+                 would take the prefix over from a live holder and the \
+                 single-writer guarantee would be silently off.",
+                self.database.writer_lease_ttl_secs
+            );
+        }
         if self.s3.bucket.trim().is_empty() {
             anyhow::bail!("s3.bucket must not be empty");
         }
@@ -328,6 +338,10 @@ pub struct DatabaseConfig {
     /// Set to `0` to disable the lease entirely. Only safe when exactly one
     /// process can ever reach the bucket, e.g. a laptop; a disabled lease
     /// puts split brain back on the operator.
+    ///
+    /// Must fit in the signed range the lease compares in: a TTL above
+    /// `i64::MAX` reads as already stale, which silently disables
+    /// single-writer enforcement. Rejected at validation.
     #[serde(default = "default_writer_lease_ttl_secs")]
     pub writer_lease_ttl_secs: u64,
 }
@@ -712,6 +726,45 @@ mod tests {
         );
         let path = tmp_toml(&ok);
         assert!(Config::try_from(path.as_path()).is_ok());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A TTL too large for the comparison the lease performs must be
+    /// refused at startup, not discovered later.
+    ///
+    /// `[database].writer_lease_ttl_secs` is an unvalidated `u64` and the
+    /// lease compared `age < ttl_secs as i64`. A TTL at or above 2^63 casts
+    /// to a negative `i64`, so `age < negative` is false for *every* live
+    /// holder: every second writer is told the lease is stale and takes the
+    /// prefix over from a running server, and the only symptom is a
+    /// `warn!` nobody reads. The single-writer guard is silently off, which
+    /// is the one thing this crate exists to prevent.
+    #[test]
+    fn a_lease_ttl_too_large_for_the_comparison_is_refused() {
+        // One past the signed range: the exact value that casts negative.
+        let too_large = minimal_toml().replace(
+            "prefix = \"oxkv\"",
+            "prefix = \"oxkv\"\nwriter_lease_ttl_secs = 9223372036854775808",
+        );
+        let err = validation_error(&too_large);
+        assert!(
+            err.contains("writer_lease_ttl_secs"),
+            "an out-of-range lease TTL must be rejected, got: {err}"
+        );
+        assert!(
+            err.contains("single-writer"),
+            "the message must say what it costs, not just what failed: {err}",
+        );
+
+        // The largest accepted value still starts: the bound is at the
+        // comparison's limit, not an arbitrary round number below it.
+        let at_limit = minimal_toml().replace(
+            "prefix = \"oxkv\"",
+            "prefix = \"oxkv\"\nwriter_lease_ttl_secs = 9223372036854775807",
+        );
+        let path = tmp_toml(&at_limit);
+        let cfg = Config::try_from(path.as_path()).expect("i64::MAX is a valid TTL");
+        assert_eq!(cfg.database.writer_lease_ttl_secs, i64::MAX as u64);
         let _ = std::fs::remove_file(&path);
     }
 
