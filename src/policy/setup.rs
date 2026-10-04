@@ -160,6 +160,7 @@ mod tests {
             PolicyEngine {
                 enforcer: fx.engine.enforcer.clone(),
                 feed: None,
+                latch: fx.engine.latch,
             },
             middleware,
         ))
@@ -265,6 +266,7 @@ mod tests {
         let engine_clone = PolicyEngine {
             enforcer: reopened.enforcer.clone(),
             feed: None,
+            latch: reopened.latch,
         };
         let middleware =
             JwtClaimsMiddleware::<Claims>::new_with_jks(&jwks_url, AUDIENCE, &issuer).await?;
