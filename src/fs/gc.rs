@@ -34,6 +34,12 @@ pub fn spawn(engine: Arc<FsEngine>) {
 }
 
 /// Single sweep: sessions, orphaned files, and orphan S3 bytes.
+///
+/// The session pass runs under the SAME per-session lock that
+/// `merge_part` and `complete_upload` take, and re-reads each row under it.
+/// The listing is a snapshot taken before the loop starts, so on its own it
+/// says nothing about what the row holds by the time the sweeper reaches it
+/// -- see the note inside the loop.
 #[tracing::instrument(skip(engine), err)]
 pub async fn sweep_once(engine: &FsEngine) -> Result<usize, crate::fs::error::FsError> {
     let now = chrono::Utc::now().timestamp();
@@ -49,7 +55,50 @@ pub async fn sweep_once(engine: &FsEngine) -> Result<usize, crate::fs::error::Fs
     } = engine.store.list_files().await?;
 
     // sessions
-    for s in &sessions {
+    for listed in &sessions {
+        // The lock the upload path already uses for this session's rows.
+        // Taking it here is what makes the sweeper a fourth serialized
+        // writer rather than a fifth racy one: `merge_part` re-reads the
+        // session under this lock and writes the copy back, so a sweep that
+        // does not take it can land between that read and that write.
+        //
+        // The failure that produced is not a lost update, it is a destroyed
+        // file. A client opens a session and stalls; nothing refreshes
+        // `created_at`, so after the TTL the sweep considers it expired.
+        // The client resumes and `upload_part` PUTs the bytes, then folds
+        // them into the row. If the sweep's `delete_object` and
+        // `delete_session` land inside that fold, the write resurrects the
+        // row with the etag set -- and `complete_upload` then takes the
+        // single-part branch, skips the multipart block (there is no S3
+        // upload to complete, the object was already deleted), and commits
+        // `save_file` -> `announce` -> `delete_session` and returns `Ok`.
+        // The file is in the feed and answers `GET /fs/{id}`; every
+        // download 404s forever, because the bytes went in the sweep and
+        // nothing anywhere looks for a record whose object is missing.
+        //
+        // Under this lock the two orderings are the only ones left. Sweep
+        // first: the row goes, so the fold re-reads `None` and the client
+        // gets a 404 -- the bytes it wrote are unreferenced and the
+        // orphan-byte pass reaps them. Fold first: the row is written, and
+        // this pass deletes it moments later, so there is still no record
+        // for `complete_upload` to commit. Neither ends with a file whose
+        // bytes are gone.
+        //
+        // Declaration order matters and matches the call sites: the guard
+        // is dropped before the claim is released, so a new claim can never
+        // mint a second mutex while this guard is still live.
+        let session_lock = engine.session_locks.acquire(&listed.id).await;
+        let _held = session_lock.acquire().await;
+        // Re-read under the lock rather than trusting the listing. A
+        // session listed here may since have been completed -- which saves
+        // the file record pointing at exactly these bytes -- or cancelled,
+        // in which case deleting on the stale copy would reap a live
+        // file's bytes and leave the same permanently-404 record this lock
+        // exists to prevent.
+        let Some(s) = engine.store.get_session(&listed.id).await? else {
+            tracing::debug!("fs gc skipping upload {}: no longer a session", listed.id);
+            continue;
+        };
         if !s.is_expired(now, TTL_SECS) {
             continue;
         }
@@ -61,7 +110,7 @@ pub async fn sweep_once(engine: &FsEngine) -> Result<usize, crate::fs::error::Fs
         // S3 first via the engine (restores post-restart state, tolerates
         // already-gone): on failure the session is kept so the next
         // sweep retries instead of leaking bytes no record points at.
-        if engine.abort_session_upload(s).await.is_err() {
+        if engine.abort_session_upload(&s).await.is_err() {
             tracing::warn!("fs gc keeping upload {} for retry", s.id);
             continue;
         }
@@ -919,6 +968,139 @@ mod tests {
         // ...and the one whose ref-count could not be read is retained,
         // rather than deleted on a guess or allowed to stall the rest.
         assert!(engine.store.get_file("aaa-bad-refs").await?.is_some());
+        Ok(())
+    }
+
+    /// An in-flight part fold must not be deleted out from under by the
+    /// sweeper, and the file that follows it must not commit with no bytes.
+    ///
+    /// This is the interleaving the session lock exists for. A client opens
+    /// an upload and stalls; `created_at` never refreshes, so after the TTL
+    /// the hourly sweep calls the session expired. The client resumes and
+    /// PUTs the bytes, and `merge_part` -- which re-reads the session under
+    /// the lock and writes that copy back -- is mid read-modify-write when
+    /// the sweep runs. A sweep that does not take the same lock can land
+    /// between the read and the write: it deletes the object, deletes the
+    /// row, and the fold's write puts the row back with `etags[0]` set.
+    /// `complete_upload` then sees a complete single-part session, skips the
+    /// multipart block entirely -- there is no S3 upload left to complete,
+    /// the object was already deleted -- and commits, returning `Ok`. The
+    /// file is announced and answers `GET /fs/{id}`, and every download 404s
+    /// forever.
+    ///
+    /// No adversary is needed: stalling past a 24-hour TTL and resuming
+    /// during a sweep tick is an ordinary thing for a resumable upload
+    /// client to do.
+    ///
+    /// The window is between two store calls inside `merge_part` with
+    /// nothing to hang a double on, so the fold is stood in for: the test
+    /// holds the engine's own session lock and performs the same
+    /// read-then-write `merge_part` performs. What is asserted is the
+    /// property that matters, from the outside: while the fold holds the
+    /// lock the sweep cannot complete, and afterwards there is no record
+    /// whose object is missing.
+    #[tokio::test]
+    async fn a_sweep_cannot_expire_a_session_under_an_in_flight_part_fold() -> anyhow::Result<()> {
+        let engine = make_engine().await;
+        let file_id = engine
+            .init_upload(
+                crate::fs::model::InitRequest {
+                    file_size: 1024,
+                    part_size: 1024,
+                    file_total_parts: 1,
+                },
+                "alice",
+            )
+            .await?;
+        // The client's part has landed: bytes on the object store, etag in
+        // the row. What is left is the fold, held open below.
+        engine
+            .upload_part(&file_id, 0, once_body(vec![9u8; 1024]), None, None, "alice")
+            .await?;
+        // Age it past the TTL, which is the whole of "stalled": nothing
+        // refreshes `created_at`, so an in-progress upload is indistinguishable
+        // from an abandoned one to the sweeper.
+        let mut session = engine
+            .store
+            .get_session(&file_id)
+            .await?
+            .expect("session exists");
+        session.created_at -= TTL_SECS + 100;
+        engine.store.save_session(&session).await?;
+
+        // `merge_part`'s critical section: the session lock is held, and the
+        // row has been read. The write is the next statement.
+        let claim = engine.session_locks.acquire(&file_id).await;
+        let _guard = claim.acquire().await;
+        let mut folded = engine
+            .store
+            .get_session(&file_id)
+            .await?
+            .expect("session still exists");
+
+        let swept = engine.clone();
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let _ = tx.send(sweep_once(&swept).await);
+        });
+
+        // The sweep cannot be allowed to finish here. Its abort deletes the
+        // object and its row delete removes the row `merge_part` is about to
+        // write back; under the old lock-free sweep this window is where the
+        // file is lost. The bound is only here so the test cannot hang if the
+        // property regresses -- on the old code the sweep finishes in
+        // microseconds, well inside it.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), &mut rx)
+                .await
+                .is_err(),
+            "the sweep completed while a part fold held the session lock"
+        );
+        assert!(
+            engine.store.get_session(&file_id).await?.is_some(),
+            "the sweep deleted a session whose rows were being merged"
+        );
+
+        // Finish the fold, then let go in the order the production sites do:
+        // the guard drops before the claim is released.
+        folded.checksums[0] = Some("sha256:x".into());
+        engine.store.save_session(&folded).await?;
+        drop(_guard);
+        drop(claim);
+
+        assert_eq!(rx.await.expect("sweep reported")?, 1);
+        assert!(engine.store.get_session(&file_id).await?.is_none());
+        assert!(
+            engine
+                .s3
+                .get_object("test-bucket", &format!("files/{file_id}"))
+                .await
+                .is_err(),
+            "the sweep did not reap the bytes of the session it expired"
+        );
+
+        // The client's completion. Whether the sweep went first (404) or the
+        // fold did (the sweep then expired the session), there must be no
+        // `Ok` here: the old behaviour was a committed record for an object
+        // that no longer existed.
+        let committed = engine
+            .complete_upload(
+                &file_id,
+                crate::fs::model::CompleteRequest {
+                    name: "report.pdf".into(),
+                    mimetype: "application/pdf".into(),
+                },
+                "alice",
+            )
+            .await;
+        assert!(
+            committed.is_err(),
+            "complete_upload reported success for a session the sweeper had already expired"
+        );
+        assert!(
+            engine.store.get_file(&file_id).await?.is_none(),
+            "a file record was committed with no bytes behind it"
+        );
         Ok(())
     }
 
