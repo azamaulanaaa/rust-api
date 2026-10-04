@@ -511,26 +511,32 @@ async fn claim_writer_lease(
 mod tests {
     use super::*;
     use crate::config::Config;
-    use std::io::Write;
 
-    /// Builds a `Config` from a real TOML file, the only way one exists.
+    /// Builds a `Config` from a TOML document.
     ///
-    /// Going through the loader rather than a struct literal means these tests
-    /// also cover the deserialization path the binary actually uses.
+    /// Parsing the real document rather than assembling a struct literal
+    /// means these tests also cover the deserialization path the binary
+    /// actually uses -- every field name, every `#[serde(default)]`, and
+    /// the validation that refuses to start on a bad value.
+    ///
+    /// Through [`Config::parse_toml`] rather than `Config::try_from`, which
+    /// is the one deliberate exception: `try_from` overlays the
+    /// `RUST_API_*` process environment, and `cargo test` inherits the
+    /// developer's shell. The README's own run instructions export
+    /// `RUST_API_CLIENT_SECRET`, so `capability_keys_prefer_the_configured_
+    /// secret` and `s3_config_projection_carries_every_field` both failed
+    /// for anyone who followed them -- the configured-secret assertion
+    /// resolved the environment's secret instead of the fixture's, and the
+    /// S3 projection read `env-ak` where the fixture said `key`. (Verified:
+    /// under `RUST_API_S3_ACCESS_KEY_ID=env-ak` both fail on the old
+    /// fixture and pass on this one.)
+    ///
+    /// The loader itself is still covered, in
+    /// `config::tests::the_loader_reads_a_file_and_applies_the_overlay`,
+    /// which asserts only on fields with no environment override so it
+    /// holds whatever the shell carries.
     fn config_from(toml: &str) -> Config {
-        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-        let path = std::env::temp_dir().join(format!(
-            "rust-api-main-{}-{}.toml",
-            std::process::id(),
-            URL_SAFE_NO_PAD.encode(rand::random::<[u8; 8]>())
-        ));
-        std::fs::File::create(&path)
-            .expect("create temp toml")
-            .write_all(toml.as_bytes())
-            .expect("write toml");
-        let cfg = Config::try_from(path.as_path()).expect("config parses");
-        let _ = std::fs::remove_file(&path);
-        cfg
+        Config::parse_toml(toml).expect("config parses")
     }
 
     const BASE: &str = r#"
