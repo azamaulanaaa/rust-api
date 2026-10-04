@@ -411,7 +411,11 @@ impl SnapshotManager {
     ///
     /// Three outcomes, in the order they are tried:
     ///
-    /// 1. Already covered. Nothing to do.
+    /// 1. Already covered -- and covered means `applied == head`, not
+    ///    `applied >= head`. A replica claiming coverage AHEAD of the head is
+    ///    not caught up; it is corruption or a rewound feed, and it falls
+    ///    through to [`replay`](Self::replay), which declines it into a
+    ///    rebuild. See the note there.
     /// 2. A bounded incremental [`replay`](Self::replay) succeeds. Run inline,
     ///    because it is milliseconds of work and the caller wants the result
     ///    now.
@@ -434,11 +438,9 @@ impl SnapshotManager {
     pub async fn advance(&self, sub: &str) -> Result<AdvanceOutcome, FsError> {
         let head = self.wal.head().await?;
         let applied = self.load_applied(sub).await?;
-        if let Some(covered) = applied
-            && covered >= head
-        {
+        if applied == Some(head) {
             return Ok(AdvanceOutcome {
-                applied_seq: covered,
+                applied_seq: head,
                 pending: false,
             });
         }
@@ -643,16 +645,33 @@ impl SnapshotManager {
     /// Ops apply in order with visibility re-checked against current master
     /// state, then the coverage marker advances: re-applying converges, so a
     /// crash between ops heals on the next poll. Legacy policy marks (object
-    /// only), ranges over `MAX_REPLAY_OPS` entries, and a delta that cannot
-    /// be replayed within the fan-out budget all return
-    /// [`ReplayOutcome::NeedsFullRebuild`]; a store failure is still `Err`.
-    /// Rich rule/group ops resync only the affected user/row (irrelevant
-    /// users/objects skip).
+    /// only), ranges over `MAX_REPLAY_OPS` entries, a delta that cannot be
+    /// replayed within the fan-out budget, and a replica claiming coverage
+    /// AHEAD of the head all return [`ReplayOutcome::NeedsFullRebuild`]; a
+    /// store failure is still `Err`. Rich rule/group ops resync only the
+    /// affected user/row (irrelevant users/objects skip).
     pub async fn replay(&self, head: u64, sub: &str) -> Result<ReplayOutcome, FsError> {
         let Some(applied) = self.load_applied(sub).await? else {
             return Ok(ReplayOutcome::NeedsFullRebuild);
         };
-        if applied >= head {
+        // `>` and not `>=`, and the distinction is the point. A head only
+        // moves forward, so a replica whose applied sequence is ahead of it
+        // is not "caught up": it is a rewound feed, a restored-from-backup
+        // object store, or a coverage marker that outlived the entries it
+        // claims to cover. Reporting `Advanced` there leaves the replica
+        // serving data derived from entries the feed no longer has, with a
+        // marker claiming those entries were applied.
+        //
+        // The only correct answer is to rebuild from the master, which is
+        // what a `NeedsFullRebuild` queues. This is also the case that makes
+        // `Wal::range`'s `from > to` error reachable from here: Wave 3 made
+        // that a loud `Err`, and the caller that was supposed to reach it is
+        // this one.
+        if applied > head {
+            return Ok(ReplayOutcome::NeedsFullRebuild);
+        }
+        // Genuinely caught up: nothing to replay, and nothing to rebuild.
+        if applied == head {
             return Ok(ReplayOutcome::Advanced(applied));
         }
         let entries = self.wal.range(applied + 1, head).await?;
@@ -1641,6 +1660,72 @@ mod tests {
             mgr.builds.claim("alice").is_some(),
             "a released slot is reusable"
         );
+        Ok(())
+    }
+
+    /// A replica claiming coverage AHEAD of the WAL head must rebuild, and the
+    /// genuinely-caught-up case must stay a no-op.
+    ///
+    /// Wave 3 made `Wal::range(from > to)` a loud `Err` on the grounds that
+    /// a rewound head must reach the full-rebuild fallback, and its author
+    /// flagged the gap this closes: `range` cannot tell "caught up" from
+    /// "head rewound" from inside itself -- it does not know the caller's
+    /// applied sequence -- so the loud error only helps a caller that
+    /// actually reaches it. `replay` short-circuited on `applied >= head`
+    /// and never passed `from > to`, and `advance` short-circuited on the
+    /// same condition before `replay` was called at all. Both reported
+    /// success for a replica whose coverage the feed can no longer justify.
+    ///
+    /// A head only moves forward, so `applied > head` means a rewound feed,
+    /// a restored-from-backup object store, or a marker that outlived the
+    /// entries it claims. The only correct answer is to rebuild from the
+    /// master.
+    ///
+    /// The applied marker is driven directly here rather than by rewinding a
+    /// real head: `Wal` has no rewind, and 130841e made a corrupt head fail
+    /// the append rather than rewind it, so a backwards head cannot be
+    /// produced through the public API at all. Writing the marker over a
+    /// built replica reproduces the state a rewind leaves behind, which is
+    /// the state this has to recognise.
+    #[tokio::test]
+    async fn an_applied_sequence_ahead_of_the_head_triggers_a_rebuild() -> anyhow::Result<()> {
+        let (mgr, _, _) = test_manager_with_queue().await;
+        mgr.store.save_file(&file_record("f1", "alice")).await?;
+        mgr.build_full("alice").await?;
+        assert_eq!(mgr.load_applied("alice").await?, Some(0));
+
+        // The replica now claims three entries the feed at head 0 cannot have
+        // handed it.
+        let ahead = 3u64;
+        mgr.open_writer("alice")
+            .await?
+            .set_bytes(super::APPLIED_KEY, &serde_json::to_vec(&ahead)?)
+            .await?;
+        assert_eq!(mgr.load_applied("alice").await?, Some(3));
+
+        // Not "caught up": a rebuild is required.
+        assert_eq!(
+            mgr.replay(0, "alice").await?,
+            ReplayOutcome::NeedsFullRebuild,
+            "coverage ahead of the head is corruption, not convergence"
+        );
+
+        // And the same through `advance`, whose own short-circuit used to
+        // return `pending: false` before `replay` was ever reached.
+        let out = mgr.advance("alice").await?;
+        assert!(
+            out.pending,
+            "a replica ahead of the head must queue a rebuild: {out:?}"
+        );
+
+        // The legitimate case is untouched: covered exactly is a no-op.
+        mgr.build_full("alice").await?;
+        let up_to_date = mgr.advance("alice").await?;
+        assert!(
+            !up_to_date.pending,
+            "applied == head is genuinely caught up: {up_to_date:?}"
+        );
+        assert_eq!(up_to_date.applied_seq, mgr.wal.head().await?);
         Ok(())
     }
 
