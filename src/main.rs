@@ -135,53 +135,115 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Command::Serve { config, verbose } => serve(&config, verbose).await,
-        Command::Policy { action } => match action {
-            PolicyAction::Export { config, out } => {
-                let cfg = config::Config::try_from(config.as_path())?;
-                let db_prefix = cfg.database.prefix.trim_matches('/').to_string();
-                let store = rust_api::db::build_s3_store(
-                    &s3_client_config(&cfg),
-                    &domain_prefix(&db_prefix, "policy"),
-                )
-                .await?;
-                let dump = admin::export_s3(store).await?;
-                std::fs::write(
-                    &out,
-                    serde_json::to_vec_pretty(&dump).context("serialize policy dump")?,
-                )?;
-                println!(
-                    "exported {} permission rules and {} group memberships to {}",
-                    dump.p.len(),
-                    dump.g.len(),
-                    out.display()
-                );
-                Ok(())
-            }
-            PolicyAction::Import { config, input } => {
-                let cfg = config::Config::try_from(config.as_path())?;
-                let s3_cfg = s3_client_config(&cfg);
-                let db_prefix = cfg.database.prefix.trim_matches('/').to_string();
-                let store =
-                    rust_api::db::build_s3_store(&s3_cfg, &domain_prefix(&db_prefix, "policy"))
-                        .await?;
-                let wal_store =
-                    rust_api::db::build_s3_store(&s3_cfg, &domain_prefix(&db_prefix, "wal"))
-                        .await?;
-                let wal_for_import = rust_api::sync::wal::Wal::new(wal_store);
-                let bytes =
-                    std::fs::read(&input).with_context(|| format!("read {}", input.display()))?;
-                let dump: rust_api::policy::admin::PolicyDump =
-                    serde_json::from_slice(&bytes).context("parse policy dump")?;
-                let report = admin::import_s3(store, &dump, Some(Arc::new(wal_for_import))).await?;
-                println!(
-                    "imported {} rules and {} group memberships \
-                     ({} duplicates skipped) into {}",
-                    report.rules_added, report.groups_added, report.duplicates, cfg.database.prefix
-                );
-                Ok(())
-            }
-        },
+        Command::Policy { action } => run_policy_command(action).await,
     }
+}
+
+/// One-line description of what is asking for the lease, for the failure
+/// message when it is already held.
+fn policy_action_name(action: &PolicyAction) -> &'static str {
+    match action {
+        PolicyAction::Export { .. } => "policy export",
+        PolicyAction::Import { .. } => "policy import",
+    }
+}
+
+/// Runs `policy export` / `policy import` against the configured prefix.
+///
+/// Both subcommands build an `OxKvStore`, and building one CAS-bumps
+/// `ownership.json` and takes an epoch. That is the same operation the
+/// server performs at startup, and against a running server it *fences*
+/// it. The server only finds out at its next policy write, which fails
+/// `StoreError::Fenced`, trips `note_primary_loss`, and sets a latch that
+/// nothing resets -- so `/ready`, which gates on `!fencing::primary_loss()`,
+/// goes 503 and the instance stays out of rotation. A backup that exits 0
+/// had drained the primary.
+///
+/// The README warns about this for `import` and says nothing for `export`,
+/// which is the worse half: export is read-only and reads like the safe
+/// direction of the documented backup procedure.
+///
+/// So both claim the writer lease first, before any store is built, exactly
+/// as `serve` does. When a live server holds it, the command refuses and
+/// the operator is told which prefix and which instance, instead of
+/// silently displacing a healthy writer.
+async fn run_policy_command(action: PolicyAction) -> anyhow::Result<()> {
+    let purpose = policy_action_name(&action);
+    // Both halves pulled out before the match that consumes the action, so
+    // each branch below works from the path it was handed rather than from
+    // an `Option` rebuilt out of the enum.
+    let file = match &action {
+        PolicyAction::Export { out, .. } => out.clone(),
+        PolicyAction::Import { input, .. } => input.clone(),
+    };
+    let cfg = match &action {
+        PolicyAction::Export { config, .. } | PolicyAction::Import { config, .. } => {
+            config::Config::try_from(config.as_path())?
+        }
+    };
+    let s3_cfg = s3_client_config(&cfg);
+    let db_prefix = cfg.database.prefix.trim_matches('/').to_string();
+
+    // BEFORE any store: opening one takes an epoch, so checking afterwards
+    // would already have fenced the incumbent. No renewer is spawned -- this
+    // process is short-lived, and the lease is handed straight back below.
+    let (_lost, guard) = claim_writer_lease(
+        &s3_cfg,
+        &db_prefix,
+        cfg.database.writer_lease_ttl_secs,
+        purpose,
+    )
+    .await?;
+
+    let result = match action {
+        PolicyAction::Export { .. } => export_policy(&s3_cfg, &db_prefix, &file).await,
+        PolicyAction::Import { .. } => import_policy(&s3_cfg, &db_prefix, &file).await,
+    };
+
+    // Hand the prefix back even when the work failed, so a failed export
+    // does not leave the next one waiting out a TTL.
+    if let Some(guard) = guard {
+        guard.release().await;
+    }
+    result
+}
+
+/// Writes every stored policy rule to `out` as JSON.
+async fn export_policy(s3_cfg: &S3ClientConfig, db_prefix: &str, out: &Path) -> anyhow::Result<()> {
+    let store = rust_api::db::build_s3_store(s3_cfg, &domain_prefix(db_prefix, "policy")).await?;
+    let dump = admin::export_s3(store).await?;
+    std::fs::write(
+        out,
+        serde_json::to_vec_pretty(&dump).context("serialize policy dump")?,
+    )?;
+    println!(
+        "exported {} permission rules and {} group memberships to {}",
+        dump.p.len(),
+        dump.g.len(),
+        out.display()
+    );
+    Ok(())
+}
+
+/// Loads policy rules from `input` into the store, announcing them on the
+/// change feed so running replicas converge.
+async fn import_policy(
+    s3_cfg: &S3ClientConfig,
+    db_prefix: &str,
+    input: &Path,
+) -> anyhow::Result<()> {
+    let store = rust_api::db::build_s3_store(s3_cfg, &domain_prefix(db_prefix, "policy")).await?;
+    let wal_store = rust_api::db::build_s3_store(s3_cfg, &domain_prefix(db_prefix, "wal")).await?;
+    let wal_for_import = rust_api::sync::wal::Wal::new(wal_store);
+    let bytes = std::fs::read(input).with_context(|| format!("read {}", input.display()))?;
+    let dump: rust_api::policy::admin::PolicyDump =
+        serde_json::from_slice(&bytes).context("parse policy dump")?;
+    let report = admin::import_s3(store, &dump, Some(Arc::new(wal_for_import))).await?;
+    println!(
+        "imported {} rules and {} group memberships ({} duplicates skipped) into {}",
+        report.rules_added, report.groups_added, report.duplicates, db_prefix
+    );
+    Ok(())
 }
 
 /// Runs the HTTP listener until stopped.
@@ -226,7 +288,7 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
     // renewed while serving, and released explicitly on the way out -- see
     // the await after `start` below.
     let (lease_lost, lease_guard) =
-        claim_writer_lease(&s3_client_config, &db_prefix, lease_ttl).await?;
+        claim_writer_lease(&s3_client_config, &db_prefix, lease_ttl, "serve").await?;
 
     // Single bucket, prefix-scoped OxKvStores per domain (scalable, no local files).
     let policy_store =
@@ -370,6 +432,22 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Why the writer lease could not be claimed, for the operator running
+/// `purpose` against a prefix a live server already owns.
+///
+/// The failure being prevented is invisible from the CLI: the command
+/// opens a second writer handle, the server is fenced, and it drains on
+/// its next policy write via a latch nothing resets. A command that exits
+/// non-zero with this text has changed nothing.
+fn lease_refused_message(purpose: &str, db_prefix: &str) -> String {
+    format!(
+        "cannot run `{purpose}`: it opens a second writer handle on \
+         [database].prefix {db_prefix:?}, which fences the process already \
+         writing there until it restarts. Stop it first, or wait for its \
+         lease to go stale."
+    )
+}
+
 /// Claims the single-writer lease for `db_prefix` and starts renewing it.
 ///
 /// Returns the flag to gate `/ready` on plus a guard that must be held for
@@ -382,10 +460,16 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
 ///
 /// A `ttl_secs` of `0` disables the lease (documented single-node escape
 /// hatch) and yields a flag that is never set.
+///
+/// `purpose` names the caller in the failure message. Both policy
+/// subcommands pass their own name, because "another writer holds
+/// `oxkv`" is a confusing thing to read while running a backup and a
+/// confusing thing to read while serving traffic.
 async fn claim_writer_lease(
     s3_cfg: &S3ClientConfig,
     db_prefix: &str,
     ttl_secs: u64,
+    purpose: &str,
 ) -> anyhow::Result<(
     std::sync::Arc<std::sync::atomic::AtomicBool>,
     Option<rust_api::lease::LeaseGuard>,
@@ -404,7 +488,7 @@ async fn claim_writer_lease(
         .context("build object store for the single-writer lease")?;
     let lease = rust_api::lease::WriterLease::acquire(store, db_prefix, ttl_secs)
         .await
-        .with_context(|| format!("claim single-writer lease for prefix {db_prefix:?}"))?;
+        .with_context(|| lease_refused_message(purpose, db_prefix))?;
     tracing::info!(
         instance = lease.instance(),
         ttl_secs,
@@ -523,5 +607,129 @@ force_path_style = true
             "ab".repeat(32)
         ));
         assert!(resolve_token_keys(&good).is_ok());
+    }
+
+    /// Both policy subcommands must claim the writer lease before opening a
+    /// store.
+    ///
+    /// Building an `OxKvStore` CAS-bumps `ownership.json` and takes an
+    /// epoch. That is what `serve` does at startup, so running either
+    /// subcommand against a live prefix *fences the server* -- which the
+    /// server discovers at its next policy write, as
+    /// `StoreError::Fenced`, and answers by latching `note_primary_loss`
+    /// forever. `/ready` gates on `!fencing::primary_loss()`, so a
+    /// successful `policy export` permanently drains the instance. Export
+    /// is read-only, which is exactly why this was missed: it looks like
+    /// the safe direction of the documented backup procedure, and the
+    /// README only warns about `import`.
+    ///
+    /// Pinned by reading the source rather than by calling the command,
+    /// because the failure needs a second live `OxKvStore` over one prefix
+    /// and a network to reach. What matters is the *ordering*: the claim
+    /// has to come before the first `build_s3_store`, since checking
+    /// afterwards means the incumbent has already been fenced. The
+    /// assertion is on both halves -- the claim is present, and it precedes
+    /// every store build in the function.
+    #[test]
+    fn both_policy_subcommands_claim_the_lease_before_opening_a_store() {
+        let src = std::fs::read_to_string("src/main.rs").expect("readable");
+
+        // Isolate `run_policy_command`: the function both subcommands
+        // delegate to, so one assertion covers both.
+        let body = src
+            .split_once("async fn run_policy_command")
+            .expect("run_policy_command exists")
+            .1
+            .split_once("\nasync fn ")
+            .expect("run_policy_command is terminated by the next fn")
+            .0;
+
+        let claim = body
+            .find("claim_writer_lease(")
+            .expect("the policy path must claim the writer lease");
+        // The store builds live in the helpers this function calls, so
+        // "before any store" means "before dispatching to them".
+        let dispatch = ["export_policy(", "import_policy("]
+            .iter()
+            .filter_map(|name| body.find(name).map(|at| (name, at)))
+            .min_by_key(|(_, at)| *at)
+            .expect("run_policy_command dispatches to a helper that opens a store");
+        assert!(
+            claim < dispatch.1,
+            "the lease is claimed at offset {claim} but `{}` runs at {}: \
+             checking after opening a store means the live writer is \
+             already fenced",
+            dispatch.0,
+            dispatch.1,
+        );
+
+        // And each helper really does open a store -- otherwise the claim
+        // would be guarding nothing.
+        for helper in ["async fn export_policy", "async fn import_policy"] {
+            let body = src
+                .split_once(helper)
+                .expect("helper exists")
+                .1
+                .split_once("\nasync fn ")
+                .expect("helper is terminated by the next fn")
+                .0;
+            assert!(
+                body.contains("build_s3_store("),
+                "{helper} opens no store, so it cannot fence anything",
+            );
+            assert!(
+                !body.contains("claim_writer_lease("),
+                "{helper} claims the lease itself; the claim belongs once, \
+                 in run_policy_command, before any store is opened",
+            );
+        }
+    }
+
+    /// A refusal has to name the prefix and say what to do about it.
+    ///
+    /// The whole cost of this fix is moving a silent drain into a visible
+    /// failure, so a message that does not say *which* prefix is contested
+    /// or *what* to stop leaves the operator where they started. The held
+    /// instance comes from `LeaseError::Held` beneath this context, so the
+    /// two compose into one operator-facing string.
+    #[test]
+    fn a_refused_policy_command_says_which_prefix_and_what_to_stop() {
+        let message = lease_refused_message("policy export", "prod/data");
+        assert!(message.contains("policy export"), "{message}");
+        assert!(message.contains("prod/data"), "{message}");
+        assert!(
+            message.contains("fences"),
+            "must say what the command would do to the live writer: {message}",
+        );
+
+        // Composes with the lease's own Held error, which carries the
+        // holder's identity and how long to wait.
+        let held = rust_api::lease::LeaseError::Held {
+            prefix: "prod/data".to_string(),
+            instance: "host-b:0192...".to_string(),
+            pid: 4242,
+            age: 3,
+            ttl: 60,
+            wait: 57,
+        };
+        let rendered = format!("{message}\n{held}");
+        assert!(rendered.contains("host-b:0192..."), "{rendered}");
+        assert!(rendered.contains("wait 57s"), "{rendered}");
+    }
+
+    /// Each subcommand is named in the failure, so "another writer" is not
+    /// ambiguous between serving traffic and taking a backup.
+    #[test]
+    fn each_policy_subcommand_names_itself() {
+        let export = PolicyAction::Export {
+            config: PathBuf::from("c.toml"),
+            out: PathBuf::from("b.json"),
+        };
+        let import = PolicyAction::Import {
+            config: PathBuf::from("c.toml"),
+            input: PathBuf::from("b.json"),
+        };
+        assert_eq!(policy_action_name(&export), "policy export");
+        assert_eq!(policy_action_name(&import), "policy import");
     }
 }
