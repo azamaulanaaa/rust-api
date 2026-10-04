@@ -454,6 +454,16 @@ mod tests {
         }
     }
 
+    /// The idle window drops entries, and ONLY the idle ones.
+    ///
+    /// Two separate properties, and the halves have to pin both. Deleting
+    /// the `retain` in `evict_idle` entirely leaves a map that grows
+    /// without bound, which is the property in this test's name -- so the
+    /// aged half below is what makes it mean anything. And an implementation
+    /// that dropped EVERY entry whenever any one was idle would satisfy both
+    /// halves while throwing away live peers' budgets on every request,
+    /// handing unlimited fresh tokens to anyone who lets a bucket go quiet
+    /// for ten minutes. That is the case only the mixed half catches.
     #[test]
     fn idle_buckets_are_evicted_so_the_map_cannot_grow_without_bound() {
         let bucket = TokenBucket::new(10, 60);
@@ -478,6 +488,55 @@ mod tests {
             bucket.tracked(),
             0,
             "entries untouched for longer than the window must be dropped"
+        );
+    }
+
+    /// Eviction is per-entry: an idle peer goes, an active one keeps its
+    /// budget.
+    ///
+    /// The sibling test proves entries past the window are dropped and that
+    /// a wholly-fresh map is left alone, which together are also satisfied
+    /// by `buckets.clear()`. That implementation is not merely wasteful --
+    /// `evict_idle` runs on EVERY request (`RateLimitMiddleware::call`), so
+    /// clearing would reset every tracked peer's tokens to a full bucket
+    /// roughly once per request, and the limiter would rate-limit nothing
+    /// at all for a client spread thin enough to never touch two keys
+    /// inside ten minutes.
+    ///
+    /// `last` is moved directly rather than sleeping, as in the siblings.
+    #[test]
+    fn eviction_drops_the_idle_peers_and_leaves_the_active_ones_alone() {
+        let bucket = TokenBucket::new(2, 60);
+        // Drain both to refusal, so a full bucket cannot be mistaken for a
+        // kept one. The refill is real (1/sec) but the loop finishes in
+        // microseconds, well inside the window it would need to refill from.
+        for key in ["active", "quiet"] {
+            while bucket.take(key) {}
+            assert!(
+                bucket.available(key) < 2.0,
+                "{key} is over budget to begin with"
+            );
+        }
+        let drained_active = bucket.available("active");
+
+        {
+            let mut buckets = bucket.buckets.lock().unwrap();
+            buckets.get_mut("quiet").expect("bucket exists").last -=
+                IDLE_EVICT + Duration::from_secs(1);
+        }
+
+        bucket.evict_idle();
+
+        assert_eq!(
+            bucket.tracked(),
+            1,
+            "exactly the idle peer is dropped, not the whole map"
+        );
+        assert_eq!(
+            bucket.available("active"),
+            drained_active,
+            "an active peer must keep the budget it had, not be handed a \
+             fresh full bucket because some other key went quiet"
         );
     }
 
