@@ -315,25 +315,44 @@ impl FsStore {
         Ok(Some(s))
     }
 
-    /// Deletes an upload session and any staged single-part chunks.
+    /// Deletes an upload session, the staged parts of its single-part chunks,
+    /// and its multipart record, in one transaction.
+    ///
+    /// Order is the contract: the cascade rows go first and the session key
+    /// goes last. The session row is the only thing that makes this cascade
+    /// reachable again -- `list_sessions` scans the `fs:uploads:` family and
+    /// nothing anywhere scans `fs:mp:` -- so a session key deleted first
+    /// with a cascade delete after it turns any failure, or any crash
+    /// between the two statements, into permanent KV garbage holding a live
+    /// backend `s3_upload_id`, with no record anywhere that the multipart
+    /// record was supposed to live and die with.
+    ///
+    /// One transaction because half a cascade is the same failure as none:
+    /// the deletes are staged together and land together, so the window in
+    /// which the session row is gone and a cascade row survives does not
+    /// exist. Every cascade error is mapped like every other write here --
+    /// discarding them is what made this lossy in the first place.
     pub async fn delete_session(&self, id: &str) -> Result<(), FsError> {
         let session = self.get_session(id).await?;
-        let key = Self::session_key(id);
-        {
-            let g = self.inner.write().await;
-            g.delete(&key).await.map_err(|e| self.store_err(e))?;
-            if let Some(s) = session {
-                for idx in 0..s.file_total_parts {
-                    let k = Self::staged_key(id, idx);
-                    let _ = g.delete(&k).await;
-                }
-                // Cascade: the multipart record lives and dies with its
-                // session, so expiry/GC can never strand one.
-                if let Some(upload_id) = s.s3_upload_id {
-                    let _ = g.delete(&Self::multipart_key(&upload_id)).await;
-                }
+        let g = self.inner.write().await;
+        let tx = g.begin_tx().map_err(|e| self.store_err(e))?;
+        if let Some(s) = &session {
+            for idx in 0..s.file_total_parts {
+                let k = Self::staged_key(id, idx);
+                tx.delete(&k).await.map_err(|e| self.store_err(e))?;
+            }
+            // Cascade: the multipart record lives and dies with its
+            // session, so expiry/GC can never strand one.
+            if let Some(upload_id) = &s.s3_upload_id {
+                let k = Self::multipart_key(upload_id);
+                tx.delete(&k).await.map_err(|e| self.store_err(e))?;
             }
         }
+        // Last, so a cascade failure above leaves the session row in place
+        // and the whole delete is retried rather than half-applied.
+        let key = Self::session_key(id);
+        tx.delete(&key).await.map_err(|e| self.store_err(e))?;
+        tx.commit().await.map_err(|e| self.store_err(e))?;
         Ok(())
     }
 
@@ -1185,6 +1204,106 @@ mod tests {
         assert!(store.get_staged_part("sess-2", 1).await?.is_none());
         assert!(store.get_staged_part("sess-2", 99).await?.is_none());
         Ok(())
+    }
+
+    /// One `delete_session` takes the session, its staged parts and its
+    /// multipart record, and leaves nothing behind in the raw keyspace.
+    ///
+    /// The raw reads matter because the point of the ordering is what a
+    /// *later* scan can still find. `list_sessions` walks `fs:uploads:`
+    /// and nothing in the crate walks `fs:mp:` at all, so the only thing
+    /// that makes a stranded multipart record reachable again is a session
+    /// row that has not been deleted yet -- which is why the row goes last
+    /// and why the cascade has to succeed before it does.
+    #[tokio::test]
+    async fn one_delete_session_clears_the_row_and_every_cascade_row() -> anyhow::Result<()> {
+        let store = test_store().await;
+        let mut sess = sample_session("sess-cascade");
+        sess.file_total_parts = 2;
+        sess.etags = vec![None, None];
+        sess.checksums = vec![None, None];
+        sess.s3_upload_id = Some("up-cascade".into());
+        store.save_session(&sess).await?;
+        store
+            .save_multipart(&sample_multipart("up-cascade"))
+            .await?;
+        store
+            .save_staged_part("sess-cascade", 0, b"a".to_vec())
+            .await?;
+        store
+            .save_staged_part("sess-cascade", 1, b"b".to_vec())
+            .await?;
+
+        store.delete_session("sess-cascade").await?;
+
+        assert!(store.get_session("sess-cascade").await?.is_none());
+        assert!(store.load_multipart("up-cascade").await?.is_none());
+        let handle = store.inner.read().await;
+        for key in [
+            "fs:uploads:sess-cascade:meta",
+            "fs:uploads:sess-cascade:part:0",
+            "fs:uploads:sess-cascade:part:1",
+            "fs:mp:up-cascade",
+        ] {
+            assert!(
+                handle.get_bytes(key).await?.is_none(),
+                "{key} survived the session delete"
+            );
+        }
+        Ok(())
+    }
+
+    /// The cascade rows go first, the session key last, in one transaction,
+    /// with no result discarded.
+    ///
+    /// Read from the source because the failure it guards needs a delete
+    /// that fails partway through, and there is no way to arrange one: the
+    /// store is a concrete `OxKvStore` over an in-memory backend, and
+    /// `oxkv`'s `HookStore` validators reject `set_bytes` only, never a
+    /// `delete`. Fencing fails the first write, whichever order these run
+    /// in, so it cannot tell the two apart either. The old body is
+    /// distinguishable only by its shape -- one cascade key written before
+    /// the session key, inside a transaction, with no `let _ =` in it --
+    /// and shape is what regressed.
+    ///
+    /// The behavioural half is `one_delete_session_clears_the_row_and_
+    /// every_cascade_row`; this pins the ordering that a passing
+    /// single-threaded test cannot observe, because it only exists on the
+    /// failure path.
+    #[test]
+    fn delete_session_cascades_before_the_row_and_discards_nothing() {
+        let src = std::fs::read_to_string("src/fs/store.rs").expect("read store.rs");
+        let body = src
+            .split_once("pub async fn delete_session")
+            .expect("delete_session exists")
+            .1
+            .split_once("\n    /// ")
+            .expect("the next doc comment ends the body")
+            .0;
+        let at = |needle: &str| {
+            body.find(needle)
+                .unwrap_or_else(|| panic!("`{needle}` is not in delete_session:\n{body}"))
+        };
+
+        assert!(
+            body.contains("begin_tx") && body.contains("tx.commit()"),
+            "the cascade and the session key must commit together:\n{body}"
+        );
+        assert!(
+            !body.contains("let _ ="),
+            "a cascade result is still discarded:\n{body}"
+        );
+        for cascade in ["Self::staged_key", "Self::multipart_key"] {
+            assert!(
+                at(cascade) < at("Self::session_key"),
+                "{cascade} must be deleted before the session key, which is what makes the \
+                 cascade findable again:\n{body}"
+            );
+        }
+        assert!(
+            at("Self::session_key") < at("tx.commit()"),
+            "the session key must be staged last, before the single commit:\n{body}"
+        );
     }
 
     #[tokio::test]
