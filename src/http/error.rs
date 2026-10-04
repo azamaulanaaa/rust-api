@@ -120,14 +120,19 @@ mod tests {
     use super::*;
     use crate::test_support::production_source;
 
-    /// Reads a source file's production code: everything before the
-    /// column-0 `#[cfg(test)]` module, with comment lines dropped.
+    /// Reads a source file's production code, dropping comment lines, with
+    /// [`crate::test_support::production_source`] -- the one helper every
+    /// such guard shares, rather than a copy per file.
     ///
-    /// Matched at column 0, not after `trim_start`: an indented
-    /// `#[cfg(test)]` gates a single test-only item and does not open the
-    /// file's test module, and this walk reads every file under `src`. The
-    /// `trim_start` variant stopped at the first such item -- `limits.rs`
-    /// carries two, at `:171` and `:203`, so the whole `RateLimit`
+    /// The walk stops at a `#[cfg(test)]` that opens a `mod`, not at the
+    /// attribute alone: the attribute also annotates test-only ITEMS, and
+    /// this walk reads every file under `src`, so matching it after
+    /// `trim_start` would stop at the first indented one (`limits.rs`
+    /// carries two) and matching it at column 0 alone would stop at a
+    /// column-0 item attribute (`src/db.rs` has three before its real test
+    /// module). The helper is tested directly against a fixture carrying
+    /// both shapes.
+    ///
     /// The error envelope is built in exactly one place.
     ///
     /// This crate has two `ResponseError` implementations -- `ApiError` for
