@@ -635,9 +635,49 @@ mod tests {
 
     /// The envelope is the same one every other error uses, so a client that
     /// parses errors does not need a special case for being limited.
-    #[test]
-    fn the_limit_response_uses_the_uniform_envelope() {
-        let res = too_many("test");
-        assert_eq!(res.status(), actix_web::http::StatusCode::TOO_MANY_REQUESTS);
+    ///
+    /// The status code alone does not establish that, and this test used to
+    /// assert nothing else. `too_many` was free to return
+    /// `HttpResponse::TooManyRequests().finish()` -- a bare 429 with no body
+    /// at all -- and this stayed green, which is exactly the duplication
+    /// `http::error::tests::the_envelope_has_one_construction_site` exists
+    /// to rule out. That guard is structural: it counts files that build the
+    /// envelope, so a 429 built outside it is invisible to it, and this is
+    /// the behavioural half.
+    ///
+    /// `RateLimitMiddleware` is the path that matters, so the response is
+    /// read through the middleware rather than off `too_many` directly: a
+    /// hand-built 429 inside the transform that is not the one `too_many`
+    /// returns is the regression worth catching, and only a request can
+    /// catch it. `sync::route`'s `FsError::TooManyRequests` path is the
+    /// other one, and is asserted there.
+    #[actix_web::test]
+    async fn the_limit_response_uses_the_uniform_envelope() {
+        use actix_web::{App, http::StatusCode, test};
+
+        // Capacity 1: the first request spends the token and the second is
+        // over budget. No peer address on an in-process request, so both
+        // land in the same bucket via `peer_key(None)`.
+        let app = test::init_service(
+            App::new()
+                .wrap(RateLimit::new(TokenBucket::new(1, 60)))
+                .route("/", actix_web::web::get().to(|| async { "served" })),
+        )
+        .await;
+        let request = || test::TestRequest::get().uri("/").to_request();
+
+        // The control first: it proves this app serves, so the 429 below is
+        // the limiter and not a route that never matched.
+        let served = test::call_service(&app, request()).await;
+        assert_eq!(served.status(), StatusCode::OK);
+
+        let res = test::call_service(&app, request()).await;
+        assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
+        let parsed: crate::http::error::ErrorBody =
+            serde_json::from_slice(&test::read_body(res).await).expect(
+                "the 429 body must deserialize as ErrorBody, i.e. it is the \
+                 uniform envelope and not a bare or hand-rolled response",
+            );
+        assert_eq!(parsed.error, "too many requests");
     }
 }
