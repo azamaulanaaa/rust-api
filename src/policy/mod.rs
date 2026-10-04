@@ -716,6 +716,7 @@ impl Authorizer {
 mod tests {
     use super::*;
     use crate::sync::wal::Wal;
+    use crate::test_support::production_source;
 
     async fn engine() -> PolicyEngine {
         let s3 = crate::db::build_test_store(&crate::db::test_prefix("policy")).await;
@@ -1022,22 +1023,6 @@ mod tests {
     /// the walk partway through the files the assertions are about. All
     /// three now match at column 0 and each is tested directly against a
     /// fixture carrying an indented attribute mid-file.
-    fn production_source(path: &str) -> String {
-        let src = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
-        let mut out = String::new();
-        for line in src.lines() {
-            if line.trim_start().starts_with("//") {
-                continue;
-            }
-            if line == "#[cfg(test)]" {
-                break;
-            }
-            out.push_str(line);
-            out.push('\n');
-        }
-        out
-    }
-
     /// The body of `fn <name>` inside an `impl` block: everything from the
     /// signature to the method's closing brace at one indent level.
     fn method_body(impl_src: &str, name: &str) -> String {

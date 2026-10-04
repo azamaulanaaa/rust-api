@@ -31,6 +31,9 @@ pub mod policy;
 /// InMemory for tests) with multipart upload over REST.
 pub mod fs;
 
+#[cfg(test)]
+mod test_support;
+
 /// OpenAPI specification composed from all `utoipa::path` modules.
 pub mod docs;
 
