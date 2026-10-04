@@ -589,4 +589,149 @@ mod tests {
 
         Ok(())
     }
+
+    /// The `Authorization` header wins over the `auth_token` cookie.
+    ///
+    /// The precedence rule is three lines in
+    /// `JwtClaimsMiddlewareService::call`:
+    ///
+    ///     let bearer = req.extensions().get::<BearerToken>().cloned().map(|v| v.0);
+    ///     let cookie_token = req.cookie("auth_token").map(|c| c.value().to_string());
+    ///     let token = bearer.or(cookie_token);
+    ///
+    /// and before this test NOTHING in the crate exercised it. Every
+    /// request in the suite authenticates with
+    /// `insert_header(("Cookie", format!("auth_token={token}")))`; a
+    /// crate-wide grep for `Authorization` finds it only in `cors()`'s
+    /// `allowed_headers` and in `extract_bearer_token`. So `BearerToken`
+    /// was never in extensions, `bearer` was always `None`, and the
+    /// `.or()` was dead code as far as the suite was concerned.
+    ///
+    /// Reverting to the pre-fix `cookie_token.or(bearer)` therefore fails
+    /// ZERO tests -- verified by flipping it: a client presenting a valid
+    /// fresh header alongside a stale cookie is then authenticated as the
+    /// COOKIE's subject, which is the wrong user entirely. That is not a
+    /// nuisance: the header is what an API client sends and the cookie is
+    /// what a browser session leaves behind, so the stale one wins for
+    /// exactly the case the fix was made for.
+    ///
+    /// Both mechanisms are given a DIFFERENT subject, so the test pins
+    /// which one was used rather than merely that the request
+    /// authenticated. The cookie-only request at the end is what makes it
+    /// an ordering assertion rather than "bearer works": without it,
+    /// `bearer.or(cookie)` and a hypothetical "bearer only" would both
+    /// pass.
+    ///
+    /// `BearerTokenMiddleware` is wrapped here for the same reason. It is
+    /// what puts `BearerToken` into extensions in the first place, and it
+    /// had no test at all -- only the pure `parse_bearer_token` string
+    /// parser was covered, leaving the whole
+    /// middleware -> extensions -> JWT handoff unexercised.
+    ///
+    /// The wrap order matters and is the reverse of how it reads: actix
+    /// applies the LAST `.wrap` outermost, so `BearerTokenMiddleware` is
+    /// listed after the validator to run BEFORE it. Written the other way
+    /// round the extractor never sees the request -- which is exactly the
+    /// mistake this test caught while being written, and the reason the
+    /// ordering is called out rather than left to be discovered again.
+    #[actix_web::test]
+    async fn a_bearer_header_outranks_a_stale_cookie() -> anyhow::Result<()> {
+        use super::super::bearer_token::BearerTokenMiddleware;
+        use actix_web::{App, HttpResponse, test};
+
+        let (key, enc) = rsa_key("kid-prec")?;
+        let server = spawn_jwks(json!({ "keys": [key] })).await;
+
+        let mw = JwtClaimsMiddleware::<TestClaims>::new_with_jks(
+            &format!("{}/jwks", server.uri()),
+            "test-aud",
+            "https://idp.test",
+        )
+        .await?;
+
+        // The handler reports the subject the middleware actually resolved,
+        // so the assertion is about authentication rather than about status.
+        async fn whoami(claims: Validated<TestClaims>) -> HttpResponse {
+            HttpResponse::Ok().body(claims.sub.clone())
+        }
+
+        let svc = test::init_service(
+            App::new()
+                .wrap(mw)
+                .wrap(BearerTokenMiddleware)
+                .route("/whoami", actix_web::web::get().to(whoami)),
+        )
+        .await;
+
+        let token_for = |sub: &str| {
+            sign_rs256(
+                &json!({ "sub": sub, "aud": "test-aud", "exp": 2000000000u64 }),
+                "kid-prec",
+                &enc,
+            )
+        };
+        let bearer_token = token_for("bearer-user")?;
+        let cookie_token = token_for("cookie-user")?;
+
+        // Both present, different subjects: the header must win.
+        let res = test::call_service(
+            &svc,
+            test::TestRequest::get()
+                .uri("/whoami")
+                .insert_header((
+                    actix_web::http::header::AUTHORIZATION,
+                    format!("Bearer {bearer_token}"),
+                ))
+                .insert_header(("Cookie", format!("auth_token={cookie_token}")))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), 200);
+        let sub = String::from_utf8(test::read_body(res).await.to_vec()).expect("utf-8 body");
+        assert_eq!(
+            sub, "bearer-user",
+            "a stale auth_token cookie must not shadow an explicitly \
+             presented Authorization header"
+        );
+
+        // The cookie path still works, so the test pins the ORDER rather
+        // than "bearer is the only thing accepted".
+        let res = test::call_service(
+            &svc,
+            test::TestRequest::get()
+                .uri("/whoami")
+                .insert_header(("Cookie", format!("auth_token={cookie_token}")))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), 200);
+        let sub = String::from_utf8(test::read_body(res).await.to_vec()).expect("utf-8 body");
+        assert_eq!(
+            sub, "cookie-user",
+            "a browser session with no Authorization header must still \
+             authenticate from its cookie"
+        );
+
+        // ...and an unparseable header does not silently fall through to
+        // the cookie. The extractor is permissive by design and leaves the
+        // accept/reject decision to the validator, so with a malformed
+        // header present there is no token in extensions AND no cookie to
+        // fall back to: the request must be a 401, not a cookie session.
+        let res = test::call_service(
+            &svc,
+            test::TestRequest::get()
+                .uri("/whoami")
+                .insert_header(("Authorization", "Basic dXNlcjpwYXNz"))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(
+            res.status(),
+            401,
+            "a non-Bearer Authorization header is not a credential, and \
+             must not authenticate the request"
+        );
+
+        Ok(())
+    }
 }
