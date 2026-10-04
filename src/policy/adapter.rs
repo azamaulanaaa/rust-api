@@ -368,6 +368,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fencing::Latch;
     use crate::policy::RBAC_MODEL;
     use casbin::{CoreApi, DefaultModel, Enforcer, MgmtApi};
     use oxkv::BTreeStore;
@@ -460,7 +461,8 @@ mod tests {
         }
     }
 
-    /// A policy write that loses the epoch has to be recognisable as such.
+    /// A policy write that loses the epoch has to be recognisable as such,
+    /// AND it has to latch this instance out of rotation.
     ///
     /// Before this, every policy failure reached the client as a 500 with
     /// the fencing reason buried inside casbin's adapter wrapper, so a
@@ -469,12 +471,31 @@ mod tests {
     /// `FsError::Fenced` -- and the classification is a downcast of the box
     /// casbin hands back, so if casbin ever stops preserving it this test is
     /// what notices.
+    ///
+    /// The latch half is asserted against a PRIVATE latch, not
+    /// `fencing::primary_loss()`. The global is a one-way `AtomicBool` with
+    /// no reset, and `fencing::tests::the_process_wide_signal_is_readable`
+    /// trips it unconditionally; cargo runs tests in parallel threads in one
+    /// binary, so the `note_primary_loss` call could be deleted from the casbin
+    /// `From` impl entirely and this assertion would still pass whenever the
+    /// fencing test won the race. A test that cannot fail is worse than a
+    /// missing one, because it reads as coverage.
+    ///
+    /// `Box::leak` because the field is a `&'static`, matching how a
+    /// production engine holds the process-wide one.
     #[tokio::test]
     async fn a_fenced_policy_write_is_typed_as_a_fencing_loss() {
+        let latch: &'static Latch = Box::leak(Box::new(Latch::new()));
+        assert!(
+            !latch.is_tripped(),
+            "a fresh latch starts untripped, or this asserts nothing"
+        );
+
         let engine =
             crate::policy::PolicyEngine::init_with_store(FencedStore(BTreeStore::default()))
                 .await
-                .expect("engine loads from a readable store");
+                .expect("engine loads from a readable store")
+                .with_latch(latch);
 
         let err = engine
             .add_rule(
@@ -501,8 +522,9 @@ mod tests {
         // latch, and before it existed a fenced policy write was a 500 on a
         // server that still claimed to be healthy.
         assert!(
-            crate::fencing::primary_loss(),
-            "a fenced policy write must latch the process-wide signal"
+            latch.is_tripped(),
+            "a fenced policy write must latch the fencing signal, or /ready \
+             keeps reporting 200 while every master policy write fails"
         );
     }
 

@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::RwLock;
 
+use crate::fencing::Latch;
 use crate::records::{ChangeSink, WalOp};
 
 /// Casbin storage adapter persisting policies to an embedded oxkv store.
@@ -138,18 +139,37 @@ impl From<casbin::Error> for PolicyError {
     ///
     /// Matching on the downcast rather than the message text means a
     /// reworded `oxkv` error cannot silently degrade the classification.
+    ///
+    /// The latch is the process-wide one. Callers that own a
+    /// [`PolicyEngine`] use [`PolicyEngine::classify`] instead, so a test
+    /// can point the engine at a private [`Latch`](crate::fencing::Latch)
+    /// and observe the trip; see that method for why the assertion needs
+    /// one.
     fn from(e: casbin::Error) -> Self {
-        if let casbin::Error::AdapterError(adapter) = &e
-            && let Some(oxkv::StoreError::Fenced(reason)) =
-                adapter.0.downcast_ref::<oxkv::StoreError>()
-        {
-            // Casbin backs only the master policy store, so a lost epoch here
-            // is always a primary loss and never a recoverable race.
-            crate::fencing::note_primary_loss(POLICY_PREFIX, reason);
-            return Self::Fenced(reason.clone());
-        }
-        Self::Casbin(e)
+        classify_with(crate::fencing::process_latch(), e)
     }
+}
+
+/// Classifies a casbin failure, recording a lost epoch on `latch`.
+///
+/// Split out of the [`From`] impl because that impl has nowhere to hang a
+/// per-instance latch: it is a conversion between two error types and is
+/// called from every `?` in the module, including ones with no engine in
+/// scope. `PRIMARY_LOSS` is a one-way flag with no reset, so an assertion
+/// against it is satisfied by whichever test in the binary tripped it
+/// first -- `fencing::tests::the_process_wide_signal_is_readable` does so
+/// unconditionally, and cargo runs the threads in parallel. That makes
+/// "did THIS write latch?" unanswerable against the global.
+fn classify_with(latch: &crate::fencing::Latch, e: casbin::Error) -> PolicyError {
+    if let casbin::Error::AdapterError(adapter) = &e
+        && let Some(oxkv::StoreError::Fenced(reason)) = adapter.0.downcast_ref::<oxkv::StoreError>()
+    {
+        // Casbin backs only the master policy store, so a lost epoch here
+        // is always a primary loss and never a recoverable race.
+        latch.trip(POLICY_PREFIX, reason);
+        return PolicyError::Fenced(reason.clone());
+    }
+    PolicyError::Casbin(e)
 }
 
 /// Central authorization engine: a Casbin RBAC enforcer persisted to a
@@ -180,6 +200,20 @@ pub struct PolicyEngine {
     /// Typed as [`ChangeSink`] rather than a concrete WAL so this module
     /// has no compile-time path to `sync` — see [`crate::records`].
     feed: Option<Arc<dyn ChangeSink>>,
+    /// Where a lost epoch on the master policy prefix is recorded.
+    ///
+    /// The process-wide latch in production (see
+    /// [`process_latch`](crate::fencing::process_latch)); an engine in a
+    /// test can be given its own [`Latch`](crate::fencing::Latch) via
+    /// [`with_latch`](Self::with_latch).
+    ///
+    /// Held rather than reached through the free
+    /// [`note_primary_loss`](crate::fencing::note_primary_loss) so the latch
+    /// travels with the engine that owns the prefix. That makes it
+    /// substitutable: `PRIMARY_LOSS` is one-way with no reset, so a test
+    /// asserting against it is satisfied by whichever test tripped it
+    /// first, and a fenced write here would prove nothing.
+    latch: &'static Latch,
 }
 
 /// The built-in role granted by the one-time bootstrap endpoint; holders
@@ -241,7 +275,31 @@ impl PolicyEngine {
         Ok(Self {
             enforcer: Arc::new(RwLock::new(enforcer)),
             feed: None,
+            latch: crate::fencing::process_latch(),
         })
+    }
+
+    /// Records fencing losses on `latch` instead of the process-wide one.
+    ///
+    /// Mirrors `FsStore::primary_with_latch`, and for the same reason: the
+    /// process latch is one-way and global, so an assertion against it
+    /// passes whether or not the code under test latched at all. Every
+    /// other test in this binary — `fencing::tests` alone — trips it.
+    #[cfg(test)]
+    pub(crate) fn with_latch(mut self, latch: &'static Latch) -> Self {
+        self.latch = latch;
+        self
+    }
+
+    /// Classifies a casbin failure against THIS engine's latch.
+    ///
+    /// Every casbin call in this module goes through here rather than
+    /// `?`-ing straight into [`PolicyError::from`], because the `From` impl
+    /// has no engine in scope and so can only reach the process-wide latch.
+    /// Production behaviour is identical: the engine's latch *is*
+    /// [`process_latch`](crate::fencing::process_latch).
+    fn classify(&self, e: casbin::Error) -> PolicyError {
+        classify_with(self.latch, e)
     }
 
     /// Attaches a [`ChangeSink`] for replica sync; ops are announced after
@@ -282,7 +340,8 @@ impl PolicyEngine {
         let mut ef = self.enforcer.write().await;
         let success = ef
             .add_policy(vec![sub.clone(), obj.clone(), act_str.clone()])
-            .await?;
+            .await
+            .map_err(|e| self.classify(e))?;
         drop(ef);
         if success {
             self.announce(WalOp::PolicyRuleAdd {
@@ -306,7 +365,8 @@ impl PolicyEngine {
         let mut ef = self.enforcer.write().await;
         let success = ef
             .remove_policy(vec![sub.clone(), obj.clone(), act_str.clone()])
-            .await?;
+            .await
+            .map_err(|e| self.classify(e))?;
         drop(ef);
         if success {
             self.announce(WalOp::PolicyRuleRemove {
@@ -324,7 +384,8 @@ impl PolicyEngine {
         let mut ef = self.enforcer.write().await;
         let success = ef
             .add_grouping_policy(vec![user_id.clone(), group.clone()])
-            .await?;
+            .await
+            .map_err(|e| self.classify(e))?;
         drop(ef);
         if success {
             self.announce(WalOp::GroupAdd {
@@ -350,7 +411,7 @@ impl PolicyEngine {
     pub async fn claim_superadmin(&self, user_id: &str) -> Result<bool, PolicyError> {
         let mut ef = self.enforcer.write().await;
         if !ef.get_users_for_role(SUPERADMIN_ROLE, None).is_empty() {
-            let repaired = Self::ensure_superadmin_rules(&mut ef).await?;
+            let repaired = Self::ensure_superadmin_rules(self.latch, &mut ef).await?;
             drop(ef);
             for (obj, act) in repaired {
                 self.announce(WalOp::PolicyRuleAdd {
@@ -363,8 +424,9 @@ impl PolicyEngine {
             return Ok(false);
         }
         ef.add_grouping_policy(vec![user_id.to_string(), SUPERADMIN_ROLE.to_string()])
-            .await?;
-        let seeded = Self::ensure_superadmin_rules(&mut ef).await?;
+            .await
+            .map_err(|e| self.classify(e))?;
+        let seeded = Self::ensure_superadmin_rules(self.latch, &mut ef).await?;
         drop(ef);
         self.announce(WalOp::GroupAdd {
             user: user_id.to_string(),
@@ -386,7 +448,12 @@ impl PolicyEngine {
     /// policy rules and group membership. Returns the newly added
     /// `(obj, act)` pairs. Caller must hold the enforcer write lock so
     /// the bootstrap check and the seed share one critical section.
+    ///
+    /// Takes the latch rather than reaching for the process-wide one,
+    /// because it is an associated function with no `&self` to read a
+    /// per-engine latch from.
     async fn ensure_superadmin_rules(
+        latch: &Latch,
         ef: &mut Enforcer,
     ) -> Result<Vec<(String, Action)>, PolicyError> {
         let mut added = Vec::new();
@@ -402,7 +469,8 @@ impl PolicyEngine {
                     obj.to_string(),
                     act.to_string(),
                 ])
-                .await?
+                .await
+                .map_err(|e| classify_with(latch, e))?
             {
                 added.push((obj.to_string(), act));
             }
@@ -419,7 +487,8 @@ impl PolicyEngine {
         let mut ef = self.enforcer.write().await;
         let success = ef
             .remove_grouping_policy(vec![user_id.clone(), group.clone()])
-            .await?;
+            .await
+            .map_err(|e| self.classify(e))?;
         drop(ef);
         if success {
             self.announce(WalOp::GroupRemove {
@@ -476,7 +545,8 @@ impl PolicyEngine {
         let mut ef = self.enforcer.write().await;
         let removed = ef
             .remove_filtered_grouping_policy(1, vec![group.to_string()])
-            .await?;
+            .await
+            .map_err(|e| self.classify(e))?;
         drop(ef);
         if removed {
             self.announce(WalOp::GroupDelete {
