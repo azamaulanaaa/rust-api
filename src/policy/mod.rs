@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::RwLock;
 
-use crate::records::{ChangeError, ChangeSink, WalOp};
+use crate::records::{ChangeSink, WalOp};
 
 /// Casbin storage adapter persisting policies to an embedded oxkv store.
 pub mod adapter;
@@ -260,7 +260,7 @@ impl PolicyEngine {
         if let Some(feed) = &self.feed {
             feed.append(op)
                 .await
-                .map_err(|e: ChangeError| PolicyError::ChangeFeed(e.detail().to_string()))?;
+                .map_err(|e| PolicyError::ChangeFeed(e.to_string()))?;
         }
         Ok(())
     }

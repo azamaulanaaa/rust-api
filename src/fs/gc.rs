@@ -785,11 +785,8 @@ mod tests {
 
     #[async_trait::async_trait]
     impl crate::records::ChangeSink for DeadFeed {
-        async fn append(
-            &self,
-            _: crate::records::WalOp,
-        ) -> Result<(), crate::records::ChangeError> {
-            Err(crate::records::ChangeError::new("feed down"))
+        async fn append(&self, _: crate::records::WalOp) -> anyhow::Result<()> {
+            Err(anyhow::anyhow!("feed down"))
         }
     }
 

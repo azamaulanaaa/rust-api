@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use crate::policy::row::RowAuthorizer;
 use crate::policy::{Action, Authorizer};
-use crate::records::{ChangeError, ChangeSink, WalOp};
+use crate::records::{ChangeSink, WalOp};
 
 use error::FsError;
 use model::{CompleteRequest, FileMetadata, InitRequest};
@@ -56,11 +56,11 @@ fn part_slots(len: u64) -> Result<Vec<Option<String>>, FsError> {
 /// Maps a rejected feed append back onto an [`FsError`].
 ///
 /// The feed reports failures opaquely (it may not be a store at all), and
-/// the producer only has two things to say about it: it is not the
-/// client's fault, and the reason belongs in the server log. Both hold
-/// for every sink.
-fn feed_error(e: ChangeError) -> FsError {
-    FsError::Internal(e.detail().to_string())
+/// the producer only has two things to say about it: it is not the client's
+/// fault, and the reason belongs in the server log. Both hold for every
+/// sink.
+fn feed_error(e: anyhow::Error) -> FsError {
+    FsError::Internal(e.to_string())
 }
 
 /// Core file-system engine with temp per-user scope and row delegation.
@@ -1778,11 +1778,8 @@ mod tests {
 
     #[async_trait::async_trait]
     impl crate::records::ChangeSink for DeadFeed {
-        async fn append(
-            &self,
-            _: crate::records::WalOp,
-        ) -> Result<(), crate::records::ChangeError> {
-            Err(crate::records::ChangeError::new("feed down"))
+        async fn append(&self, _: crate::records::WalOp) -> anyhow::Result<()> {
+            Err(anyhow::anyhow!("feed down"))
         }
     }
 

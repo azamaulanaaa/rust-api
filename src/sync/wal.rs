@@ -13,7 +13,7 @@ use oxkv::{GetSet, OxKvStore, Store as _, Transaction as _};
 use tokio::sync::RwLock;
 
 use crate::fs::error::FsError;
-use crate::records::{ChangeError, ChangeSink, WalEntry, WalOp};
+use crate::records::{ChangeSink, WalEntry, WalOp};
 
 /// The master change-feed prefix this store writes to, named in the
 /// fencing-loss log line so an operator can tell which prefix died.
@@ -170,14 +170,14 @@ impl Wal {
 /// [`Wal::head`] — that is the value replicas compare coverage against.
 #[async_trait]
 impl ChangeSink for Wal {
-    async fn append(&self, op: WalOp) -> Result<(), ChangeError> {
-        // `ChangeError` is a string, so a fencing loss survives the trip
-        // back to the producer intact -- which is the only thing that
-        // matters, since the producer has no way to classify the cause.
+    async fn append(&self, op: WalOp) -> anyhow::Result<()> {
+        // `FsError`'s `Display` is already the sanitized text, so a fencing
+        // loss reaches the producer as an opaque cause it has no way to act
+        // on.
         self.append_entry(op)
             .await
             .map(|_| ())
-            .map_err(ChangeError::new)
+            .map_err(anyhow::Error::msg)
     }
 }
 
