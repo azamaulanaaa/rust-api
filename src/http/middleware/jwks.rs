@@ -36,6 +36,10 @@ static JWKS_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
 
 /// Minimum interval between two JWKS fetches triggered by unknown-key misses.
 /// Prevents a flood of junk tokens from hammering the identity provider.
+///
+/// The window is consumed when a refresh is ATTEMPTED, not when it succeeds,
+/// so the bound holds against a provider that is down as firmly as against one
+/// that is healthy.
 const JWKS_REFRESH_DEBOUNCE: Duration = Duration::from_secs(5);
 
 /// A single verification key resolved from the provider's JWKS, paired
@@ -135,15 +139,52 @@ impl JwksKeys {
         }
     }
 
+    /// Refetches at most once per debounce window, and drops the previous
+    /// keys rather than emptying the cache on a failure.
+    ///
+    /// The timestamp is advanced BEFORE the fetch, in the same critical
+    /// section that decides whether to fetch, so a failure consumes the
+    /// window exactly like a success. It previously advanced only in the
+    /// success arm, which meant the bound this module documents -- "at most
+    /// once per `JWKS_REFRESH_DEBOUNCE`" -- held only while the provider was
+    /// reachable. Against a slow or down IdP, `elapsed()` kept growing past
+    /// the window on every request, and each miss issued a fresh outbound
+    /// GET: the exact flood the module doc claims is prevented, amplified at
+    /// the provider rather than at this process.
+    ///
+    /// The guard is also released before the fetch rather than held across
+    /// it. It used to be held across a round trip with a ten-second client
+    /// timeout, so one slow GET parked every other worker's unknown-`kid`
+    /// miss behind it. Scoping the claim to its own critical section keeps
+    /// the mutual exclusion that matters -- see below -- without holding a
+    /// lock over I/O.
+    ///
+    /// Two concurrent misses still produce ONE fetch: the winner is the one
+    /// that finds the timestamp stale and rewrites it, and every other caller
+    /// then reads a fresh one and returns without fetching. The loser does
+    /// not wait for the winner's result -- it does not need to, because the
+    /// lookup it performs afterwards is against the shared cache, which the
+    /// winner updates when it lands. So the concurrency is bounded to one
+    /// in-flight refresh process-wide, not one per worker.
+    ///
+    /// The trade is that the window is measured from the START of an attempt,
+    /// so a fetch that outlives the debounce leaves it already elapsed and
+    /// the next miss may refresh again immediately. That is still the
+    /// documented bound -- one refresh per `JWKS_REFRESH_DEBOUNCE` -- and it
+    /// is the right direction: a provider slow enough for the fetch to
+    /// exceed the window is exactly the one where re-checking for a rotation
+    /// is worth more than waiting.
     async fn maybe_refresh(&self) {
-        let mut last_refresh = self.inner.last_refresh.lock().await;
-        if last_refresh.elapsed() < self.inner.refresh_debounce {
-            return;
+        {
+            let mut last_refresh = self.inner.last_refresh.lock().await;
+            if last_refresh.elapsed() < self.inner.refresh_debounce {
+                return;
+            }
+            *last_refresh = Instant::now();
         }
 
         match fetch_keys(&self.inner.url).await {
             Ok(keys) if !keys.is_empty() => {
-                *last_refresh = Instant::now();
                 *self.inner.keys.write().await = Arc::new(keys);
             }
             Ok(_) => tracing::warn!(
@@ -268,6 +309,15 @@ mod tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    /// Requests the mock provider has served so far.
+    ///
+    /// `received_requests` is `None` when recording is disabled, which the
+    /// pooled servers this crate starts do not do -- but a zero default keeps
+    /// the assertions below reading as counts rather than as `Option` arms.
+    async fn served_requests(server: &MockServer) -> usize {
+        server.received_requests().await.map_or(0, |r| r.len())
+    }
+
     #[tokio::test]
     async fn loads_keys_and_resolves_kid() -> anyhow::Result<()> {
         let (key_a, _) = rsa_key("kid-a")?;
@@ -333,6 +383,203 @@ mod tests {
         let decoded = decode::<TestClaims>(&token, &signing_key.decoding_key, &validation)?;
         assert_eq!(decoded.claims.sub, "u2");
 
+        Ok(())
+    }
+
+    /// A FAILED refresh must consume the debounce window.
+    ///
+    /// The regression: `last_refresh` advanced only in the
+    /// success-with-keys arm, so against an unreachable or broken provider
+    /// `elapsed()` kept growing past the window and every subsequent miss
+    /// issued a fresh outbound GET -- the flood the module doc claims is
+    /// prevented, aimed at the identity provider. Nothing here is an authz
+    /// question: the lookup still fails closed and the previous keys are
+    /// kept. It is availability, at a third party, amplified by unauthenticated
+    /// junk tokens.
+    ///
+    /// The assertion is on the provider's request count rather than on a
+    /// returned value, because the returned value is `None` either way and
+    /// cannot distinguish "debounced" from "refetched and failed again".
+    ///
+    /// Both failure arms are covered -- a transport/parse error and an empty
+    /// key set -- because they are separate branches and either one alone
+    /// would reintroduce the flood for a provider that hits it.
+    ///
+    /// The debounce is a real 500ms with a sleep past it, rather than the
+    /// `Duration::ZERO` the other tests use: the window has to be over for
+    /// the FIRST miss to fetch, and then closed again for the second. 500ms
+    /// is orders of magnitude longer than the two lookups either side of it,
+    /// so this is not a timing race.
+    #[tokio::test]
+    async fn a_failed_refresh_still_consumes_the_debounce_window() -> anyhow::Result<()> {
+        let (key_a, _) = rsa_key("kid-a")?;
+        let server = MockServer::start().await;
+
+        let serve = |status: u16, body: String| {
+            let server = &server;
+            async move {
+                server.reset().await;
+                Mock::given(method("GET"))
+                    .and(path("/jwks"))
+                    .respond_with(ResponseTemplate::new(status).set_body_string(body))
+                    .mount(server)
+                    .await;
+            }
+        };
+
+        // Healthy to start, so the cache is populated and `kid-a` resolves.
+        serve(200, json!({ "keys": [key_a] }).to_string()).await;
+        let debounce = Duration::from_millis(500);
+        let keys =
+            JwksKeys::with_refresh_debounce(format!("{}/jwks", server.uri()), debounce).await?;
+        assert!(keys.get(Some("kid-a")).await.is_some());
+        let after_construction = served_requests(&server).await;
+
+        // The provider starts failing in both ways in turn.
+        for (status, body) in [(503u16, "upstream unavailable".to_string())] {
+            tokio::time::sleep(debounce).await;
+            serve(status, body).await;
+            let before = served_requests(&server).await;
+
+            assert!(
+                keys.get(Some("kid-unknown")).await.is_none(),
+                "an unresolvable kid must fail closed"
+            );
+            let after_first = served_requests(&server).await;
+            assert_eq!(
+                after_first,
+                before + 1,
+                "the first miss inside an elapsed window must fetch once"
+            );
+
+            // The next miss, well inside the window the failure just
+            // consumed, must not reach the provider at all.
+            assert!(keys.get(Some("kid-unknown")).await.is_none());
+            assert_eq!(
+                served_requests(&server).await,
+                after_first,
+                "a FAILED refresh must consume the debounce window; the old \
+                 timestamp advanced only on success, so every junk token \
+                 issued its own GET at the identity provider"
+            );
+        }
+
+        // Same window, different failure arm: a 200 whose body carries no
+        // usable key. It took the `Ok(_)` branch before, and the old code
+        // advanced `last_refresh` in neither failure path.
+        tokio::time::sleep(debounce).await;
+        serve(200, json!({ "keys": [] }).to_string()).await;
+        let before = served_requests(&server).await;
+        assert!(keys.get(Some("kid-unknown")).await.is_none());
+        let after_first = served_requests(&server).await;
+        assert_eq!(after_first, before + 1, "the first miss fetches once");
+        assert!(keys.get(Some("kid-unknown")).await.is_none());
+        assert_eq!(
+            served_requests(&server).await,
+            after_first,
+            "an empty key set must consume the window too"
+        );
+
+        assert!(
+            after_construction >= 1,
+            "the fixture itself must have fetched, or the counts above prove nothing"
+        );
+        Ok(())
+    }
+
+    /// The refresh mutex is not held across the network call, and concurrent
+    /// misses still collapse into ONE fetch.
+    ///
+    /// These are one change, so they are one test. The guard used to be held
+    /// for the whole `fetch_keys` await, whose client timeout is ten
+    /// seconds: one slow GET parked every other worker's unknown-`kid` miss
+    /// behind it. Narrowing the lock is only safe if the mutual exclusion it
+    /// provided survives, so both halves are asserted: the parked fetch does
+    /// not block the second miss, and the second miss does not start a
+    /// second fetch.
+    ///
+    /// The miss that loses the race answers `None` rather than waiting for
+    /// the winner's result -- it re-reads the shared cache, which the winner
+    /// updates when it lands, and fails closed until then. That is the
+    /// intended behaviour and it is asserted, not left implied: this is an
+    /// authentication path, so "concurrent misses may miss" must be a
+    /// deliberate, pinned property.
+    ///
+    /// Deterministic rather than a race: the mock delays its response for
+    /// longer than the whole test's patience for the second miss, so the
+    /// first fetch is provably still in flight when the second runs.
+    #[tokio::test]
+    async fn concurrent_misses_collapse_into_one_unblocked_fetch() -> anyhow::Result<()> {
+        let (key_a, _) = rsa_key("kid-a")?;
+        let (key_b, _) = rsa_key("kid-new")?;
+        let server = MockServer::start().await;
+
+        // Healthy and fast to begin with, so the fixture caches kid-a.
+        server.reset().await;
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "keys": [key_a] })))
+            .mount(&server)
+            .await;
+
+        // Short but real: long enough that the second miss below is inside
+        // the window the first one consumes, short enough that the window has
+        // elapsed by the time the first miss runs. `Duration::ZERO` would let
+        // both fetch and prove nothing.
+        let debounce = Duration::from_millis(500);
+        let keys =
+            JwksKeys::with_refresh_debounce(format!("{}/jwks", server.uri()), debounce).await?;
+        assert!(keys.get(Some("kid-a")).await.is_some(), "fixture cache");
+
+        // The provider rotates AND gets slow: the refresh the miss below
+        // triggers takes five seconds to come back.
+        server.reset().await;
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_secs(5))
+                    .set_body_json(json!({ "keys": [key_b] })),
+            )
+            .mount(&server)
+            .await;
+
+        tokio::time::sleep(debounce).await;
+        let first = tokio::spawn({
+            let keys = keys.clone();
+            async move { keys.get(Some("kid-new")).await }
+        });
+        // Let the winner claim the window and enter the fetch.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let before = served_requests(&server).await;
+        assert_eq!(before, 1, "the winner must have started exactly one fetch");
+
+        let second =
+            tokio::time::timeout(Duration::from_millis(500), keys.get(Some("kid-new"))).await;
+        assert!(
+            second.is_ok(),
+            "a miss must not block behind an in-flight refresh; the mutex is \
+             held across the fetch's ten-second client timeout"
+        );
+        assert!(
+            second.expect("timeout did not fire").is_none(),
+            "the losing miss fails closed rather than waiting for the winner"
+        );
+        assert_eq!(
+            served_requests(&server).await,
+            before,
+            "two concurrent misses must produce ONE refresh, not one each"
+        );
+
+        // The winner eventually lands the rotated key.
+        let resolved = tokio::time::timeout(Duration::from_secs(20), first)
+            .await
+            .expect("the parked fetch must finish")
+            .expect("task must not panic");
+        assert!(
+            resolved.is_some(),
+            "and the winner's fetch must still install the rotated key"
+        );
         Ok(())
     }
 
