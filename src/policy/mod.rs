@@ -492,38 +492,31 @@ impl PolicyEngine {
     /// The object accepts anything string-like (`&str`, `String`, or your
     /// own typed enum implementing `AsRef<str>`), so business modules can
     /// pass IDE-completable variants without `.into()` ceremony.
-    #[tracing::instrument(skip(self, obj), fields(sub = %sub, obj = %obj.as_ref(), act = %act), err)]
+    ///
+    /// The body lives on [`Authorizer`]; this forwards to it.
+    ///
+    /// No `tracing::instrument` here: the delegated call opens the span, so
+    /// instrumenting both would emit two spans with identical fields per
+    /// check instead of the one this path used to produce.
     pub async fn authorize<S: AsRef<str>>(
         &self,
         sub: &str,
         obj: S,
         act: Action,
     ) -> Result<bool, PolicyError> {
-        let ef = self.enforcer.read().await;
-
-        // Casbin check
-        let allowed = ef.enforce((sub, obj.as_ref(), &act.to_string()))?;
-
-        Ok(allowed)
+        self.authorizer().authorize(sub, obj, act).await
     }
 
     /// Like [`PolicyEngine::authorize`], but returns
     /// [`PolicyError::AccessDenied`] instead of a boolean when the subject
     /// lacks the permission.
-    #[tracing::instrument(skip(self, obj), fields(sub = %sub, obj = %obj.as_ref(), act = %act), err)]
     pub async fn require<S: AsRef<str>>(
         &self,
         sub: &str,
         obj: S,
         act: Action,
     ) -> Result<(), PolicyError> {
-        let allowed = self.authorize(sub, obj, act).await?;
-
-        if allowed {
-            Ok(())
-        } else {
-            Err(PolicyError::AccessDenied)
-        }
+        self.authorizer().require(sub, obj, act).await
     }
 
     /// Returns `(obj, act)` pairs granted to `sub` by `p` rules.
@@ -531,29 +524,17 @@ impl PolicyEngine {
     /// Used by incremental replica replay to find rows a group membership
     /// change can affect, without scanning the whole policy.
     pub async fn rules_for_subject(&self, sub: &str) -> Vec<(String, String)> {
-        let ef = self.enforcer.read().await;
-        ef.get_filtered_policy(0, vec![sub.to_string()])
-            .into_iter()
-            .filter_map(|r| {
-                let obj = r.get(1)?.clone();
-                let act = r.get(2)?.clone();
-                Some((obj, act))
-            })
-            .collect()
+        self.authorizer().rules_for_subject(sub).await
     }
 
     /// Returns a list of all users that belong to a specific group
     pub async fn get_users_in_group(&self, group: &str) -> Vec<String> {
-        let ef = self.enforcer.read().await;
-        // RbacApi provides `get_users_for_role` to fetch all subjects 'sub' for a given 'group'
-        ef.get_users_for_role(group, None)
+        self.authorizer().get_users_in_group(group).await
     }
 
     /// Returns a list of all groups assigned to a specific user
     pub async fn get_groups_of_user(&self, user_id: &str) -> Vec<String> {
-        let ef = self.enforcer.read().await;
-        // RbacApi provides `get_roles_for_user` to fetch all 'groups' for a given 'sub'
-        ef.get_roles_for_user(user_id, None)
+        self.authorizer().get_groups_of_user(user_id).await
     }
 
     /// Returns a safe, read-only client that can be passed to other services
@@ -572,13 +553,20 @@ impl PolicyEngine {
     /// here means a writer is holding the lock — normally a policy write
     /// in flight, pathologically a wedged one.
     pub fn is_unlocked(&self) -> bool {
-        self.enforcer.try_read().is_ok()
+        self.authorizer().is_unlocked()
     }
 }
 
 /// A capability-limited handle to the policy engine exposing only read and
 /// enforcement operations; safe to share with modules that must never mutate
 /// policies.
+///
+/// This type owns the read method bodies. [`PolicyEngine`] holds the same
+/// `Arc` and used to carry a byte-identical copy of each one, which meant
+/// every casbin behaviour change had to be made twice and neither copy was
+/// distinguishable by a test — including the `rules_for_subject` body, which
+/// reads casbin's policy tuple by index and so silently depends on its field
+/// order. The engine's versions delegate here.
 #[derive(Clone)]
 pub struct Authorizer {
     // Private! Consumers cannot access the RwLock or call write().
@@ -848,6 +836,149 @@ mod tests {
         );
         // And it is the read side of the same enforcer, not a copy.
         assert!(auth.is_unlocked());
+    }
+
+    /// The read methods have exactly one body, on `Authorizer`.
+    ///
+    /// `PolicyEngine` and `Authorizer` hold the same `Arc<RwLock<Enforcer>>`
+    /// and used to carry byte-identical copies of six read methods. Nothing
+    /// about the types required that: a casbin behaviour change had to be
+    /// applied twice, and the `rules_for_subject` copy read casbin's policy
+    /// tuple by index, so it depended on casbin's field ORDER in two places
+    /// at once with no test able to tell the copies apart.
+    ///
+    /// The duplication is checked structurally, like `http::error`'s
+    /// `the_envelope_has_one_construction_site`: a behavioural test cannot
+    /// distinguish two identical bodies, and writing one anyway would read
+    /// as coverage of a property it does not have.
+    #[test]
+    fn the_read_methods_have_one_body_and_the_engine_delegates() {
+        const DELEGATED: [&str; 6] = [
+            "authorize",
+            "require",
+            "get_users_in_group",
+            "get_groups_of_user",
+            "rules_for_subject",
+            "is_unlocked",
+        ];
+
+        let src = production_source("src/policy/mod.rs");
+        let (engine, authorizer) = src
+            .split_once("\nimpl Authorizer {")
+            .expect("both impls are in this file");
+        let engine = engine
+            .split_once("\nimpl PolicyEngine {")
+            .map(|(_, tail)| tail)
+            .expect("the engine impl comes first");
+
+        for name in DELEGATED {
+            let body = method_body(engine, name);
+            assert!(
+                body.contains(&format!("self.authorizer().{name}(")),
+                "PolicyEngine::{name} must delegate to Authorizer::{name}; it holds \
+                 this line instead:\n{body}\nA second copy of a read method is a place a \
+                 casbin behaviour change must be applied twice."
+            );
+            // The delegation is the whole body: anything that reaches the
+            // enforcer directly is a second implementation forming.
+            assert!(
+                !body.contains("self.enforcer"),
+                "PolicyEngine::{name} touches the enforcer directly, so it is no \
+                 longer a delegation:\n{body}"
+            );
+
+            // And the body still exists on the side that owns it, so this
+            // cannot be satisfied by deleting both.
+            assert!(
+                !method_body(authorizer, name).is_empty(),
+                "Authorizer::{name} lost its body; there is now no implementation"
+            );
+        }
+    }
+
+    /// The index-addressed casbin policy read exists once in the crate.
+    ///
+    /// `rules_for_subject` maps a `p` rule row to `(obj, act)` by index, so
+    /// it is correct only while casbin's tuple is `(sub, obj, act)`. That is
+    /// an assumption about a dependency's internals, and the copy that this
+    /// commit deleted had to be corrected alongside the surviving one; a
+    /// reordering would have left one of the two silently wrong rather than
+    /// failing. One site means one edit and one place to blame.
+    #[test]
+    fn the_index_addressed_policy_read_has_one_site() {
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap_or_else(|e| panic!("{dir:?}: {e}")) {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                    out.push(path);
+                }
+            }
+        }
+
+        let mut files = Vec::new();
+        walk(std::path::Path::new("src"), &mut files);
+
+        let mut sites: Vec<(String, usize)> = Vec::new();
+        for path in &files {
+            let rel = path.to_string_lossy().replace('\\', "/");
+            let hits = production_source(&rel)
+                .matches("get_filtered_policy(0,")
+                .count();
+            if hits > 0 {
+                sites.push((rel, hits));
+            }
+        }
+        sites.sort();
+        assert_eq!(
+            sites,
+            vec![("src/policy/mod.rs".to_string(), 1)],
+            "`get_filtered_policy(0, ..)` reads casbin's policy tuple by \
+             position, so it is coupled to the `p = sub, obj, act` field \
+             order. It must have exactly one site, counted per occurrence: a \
+             second copy inside one file is precisely the case this guards, \
+             and counting files would let it through."
+        );
+    }
+
+    /// Reads a source file's production code: everything before the
+    /// column-0 `#[cfg(test)]` module, with comment lines dropped.
+    ///
+    /// The attribute is matched at column 0 rather than after `trim_start`,
+    /// unlike the copies in `http::error` and `records`. Those stop at the
+    /// first *indented* `#[cfg(test)]`, which several files carry on an
+    /// inner item; scanning `src` with that variant would truncate the walk
+    /// partway through the files the assertions are about.
+    fn production_source(path: &str) -> String {
+        let src = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+        let mut out = String::new();
+        for line in src.lines() {
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            if line == "#[cfg(test)]" {
+                break;
+            }
+            out.push_str(line);
+            out.push('\n');
+        }
+        out
+    }
+
+    /// The body of `fn <name>` inside an `impl` block: everything from the
+    /// signature to the method's closing brace at one indent level.
+    fn method_body(impl_src: &str, name: &str) -> String {
+        let needle = format!("fn {name}");
+        let start = impl_src
+            .find(&needle)
+            .unwrap_or_else(|| panic!("no `{name}` in this impl block"))
+            + needle.len();
+        let rest = &impl_src[start..];
+        let end = rest
+            .find("\n    }")
+            .unwrap_or_else(|| panic!("`{name}` has no closing brace"));
+        rest[..end].to_string()
     }
 
     #[tokio::test]
