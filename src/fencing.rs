@@ -87,6 +87,18 @@ impl Latch {
 /// The process-wide primary-fencing latch.
 static PRIMARY_LOSS: Latch = Latch::new();
 
+/// The latch a primary prefix's fencing losses are recorded on.
+///
+/// The owner of the master store holds this rather than calling
+/// [`note_primary_loss`] directly, so the latch travels with the ownership
+/// that decides whether a loss is terminal. That also makes it
+/// substitutable: a test can point a store at its own [`Latch`] and observe
+/// the trip, which the process-wide one cannot support -- it is one-way and
+/// every other test in the binary would trip it first.
+pub fn process_latch() -> &'static Latch {
+    &PRIMARY_LOSS
+}
+
 /// Records a lost epoch on a primary prefix. See the module docs for which
 /// prefixes qualify and why the process is not terminated.
 pub fn note_primary_loss(source: &str, reason: &str) {
