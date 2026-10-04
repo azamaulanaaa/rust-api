@@ -119,10 +119,39 @@ pub struct SyncAdvanceResponse {
     pub pending: bool,
 }
 
-/// Quoted `ETag` for a coverage point (coverage only moves forward, so the
-/// sequence alone identifies the content).
-fn snapshot_etag(applied: u64) -> String {
-    format!("\"snap-{applied}\"")
+/// Quoted `ETag` for a `GET /sync/status` body.
+///
+/// Covers every field the body exposes: coverage (`applied`), the never-
+/// built case (`none`), and `head`. `head` was the omission that mattered --
+/// the WAL is shared across subjects (`snapshot.rs` reads one
+/// `manager.wal.head()`), so it moves for reasons that have nothing to do
+/// with the caller, and the 304 fired exactly when there was new work.
+///
+/// `Option` rather than a sentinel so "never built" cannot collide with a
+/// real sequence, the way an `applied.unwrap_or(0)` would.
+fn status_etag(applied: Option<u64>, head: u64) -> String {
+    match applied {
+        Some(a) => format!("\"snap-{a}-h{head}\""),
+        None => format!("\"snap-none-h{head}\""),
+    }
+}
+
+/// Quoted `ETag` for a `POST /sync/sync` body.
+///
+/// Covers `applied_seq` and `pending`, because `pending` is how a client
+/// learns a rebuild was queued, and a validator that omitted it made the
+/// documented recovery loop unreachable.
+///
+/// The failure this closes: the replica is at `applied_seq 0` and the
+/// client caches `200 {applied_seq: 0, pending: false}` with ETag
+/// `"snap-0"`. A legacy policy mark lands, so the replica now needs a full
+/// rebuild -- a state this module documents, where `applied_seq` "may be
+/// below the WAL head even on a 200". The client re-POSTs with
+/// `If-None-Match: "snap-0"`. Coverage did not move, so the validator is
+/// byte-identical, the server answers 304 and suppresses the body, and the
+/// client still believes `pending: false` and never polls again.
+fn advance_etag(applied_seq: u64, pending: bool) -> String {
+    format!("\"snap-{applied_seq}-p{}\"", u8::from(pending))
 }
 
 /// True when `If-None-Match` permits skipping the body (weak comparison,
@@ -160,9 +189,7 @@ async fn status_handler(
     let sub = &claims.sub;
     let head = manager.wal.head().await?;
     let applied = manager.load_applied(sub).await?;
-    let etag = applied
-        .map(snapshot_etag)
-        .unwrap_or_else(|| "\"snap-none\"".to_string());
+    let etag = status_etag(applied, head);
     if let Some(header) = req
         .headers()
         .get(IF_NONE_MATCH)
@@ -198,7 +225,7 @@ async fn sync_handler(
 ) -> Result<HttpResponse, FsError> {
     let sub = &claims.sub;
     let outcome = manager.advance(sub).await?;
-    let etag = snapshot_etag(outcome.applied_seq);
+    let etag = advance_etag(outcome.applied_seq, outcome.pending);
     if let Some(header) = req
         .headers()
         .get(IF_NONE_MATCH)
@@ -494,9 +521,33 @@ mod tests {
         );
     }
 
+    /// The validators are quoted, stable, and cover every field the body
+    /// exposes.
+    ///
+    /// Each function is paired with the route that serves it because the
+    /// bodies carry DIFFERENT fields: `GET /sync/status` reports `head`, and
+    /// `POST /sync/sync` reports `pending`. A single validator built from
+    /// `applied_seq` alone was correct for neither once either of those
+    /// moved -- see the functions' docs for the two failure paths. The two
+    /// assertions that would have caught it are the cross-route ones: the
+    /// same coverage at a different head, and the same coverage with a
+    /// different `pending`, must NOT share a validator.
     #[test]
-    fn snapshot_etag_is_quoted_and_stable() {
-        assert_eq!(snapshot_etag(3), "\"snap-3\"");
+    fn snapshot_etags_cover_every_field_the_body_exposes() {
+        assert_eq!(status_etag(Some(3), 9), "\"snap-3-h9\"");
+        assert_eq!(status_etag(None, 9), "\"snap-none-h9\"");
+
+        assert_eq!(advance_etag(3, false), "\"snap-3-p0\"");
+        assert_eq!(advance_etag(3, true), "\"snap-3-p1\"");
+
+        // `head` moves for reasons unrelated to this caller, so it must be in
+        // the status validator.
+        assert_ne!(status_etag(Some(3), 9), status_etag(Some(3), 10));
+        // A never-built replica is not coverage zero.
+        assert_ne!(status_etag(None, 9), status_etag(Some(0), 9));
+        // `pending` is how a client learns a rebuild was queued, so it must
+        // be in the sync validator even when coverage did not move.
+        assert_ne!(advance_etag(0, false), advance_etag(0, true));
     }
 
     #[test]
@@ -573,7 +624,7 @@ mod tests {
             .and_then(|v| v.to_str().ok())
             .unwrap_or_default()
             .to_string();
-        assert_eq!(etag, "\"snap-0\"");
+        assert_eq!(etag, "\"snap-0-h0\"");
         let body = actix_web::test::read_body(res).await;
         let json: serde_json::Value = serde_json::from_slice(&body)?;
         assert_eq!(json["applied_seq"], 0);
@@ -704,6 +755,94 @@ mod tests {
         assert_eq!(
             json["applied_seq"], 0,
             "coverage reported is from before the rebuild: {json}"
+        );
+        Ok(())
+    }
+
+    /// A transition INTO `pending` must answer 200 with the body, never 304.
+    ///
+    /// The regression this pins: the validator was built from `applied_seq`
+    /// alone, so a client that cached `200 {applied_seq: 0, pending: false}`
+    /// and then re-POSTed with that ETag got a byte-identical validator back
+    /// -- coverage did not move, only `pending` did. The server answered 304
+    /// and suppressed the body, and the client kept believing `pending:
+    /// false`, so it never polled again. The module's documented recovery
+    /// loop ("keep polling `GET /sync/status` and advancing until this is
+    /// false") was unreachable for any client using the ETag the endpoint
+    /// hands it.
+    ///
+    /// Asserted in both directions: the repeat poll that changes nothing is
+    /// still a 304, so the fix is not "stop sending validators".
+    #[actix_web::test]
+    async fn a_pending_transition_returns_the_body_not_304() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        let module = SyncApiModule::new(fx.manager.clone(), setup(&fx).await?);
+        let app =
+            actix_web::test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+        let sync = |if_none_match: Option<String>| async {
+            let mut req = actix_web::test::TestRequest::post()
+                .uri("/sync/sync")
+                .insert_header(("Cookie", format!("auth_token={token}")));
+            if let Some(tag) = if_none_match {
+                req = req.insert_header((IF_NONE_MATCH, tag));
+            }
+            actix_web::test::call_service(&app, req.to_request()).await
+        };
+
+        // The replica is already built and the feed is empty, so this is the
+        // settled state a client caches.
+        let res = sync(None).await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let settled = res
+            .headers()
+            .get(ETAG)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+            .expect("every sync response carries a validator");
+        let json: serde_json::Value =
+            serde_json::from_slice(&actix_web::test::read_body(res).await)?;
+        assert_eq!(json["pending"], false, "nothing to rebuild yet: {json}");
+
+        // A legacy policy mark makes the replica need a full rebuild --
+        // exactly the state whose doc says `applied_seq` may be below the
+        // head even on a 200.
+        fx.manager
+            .wal
+            .append(WalOp::PolicyAdd {
+                obj: "invoice:1".into(),
+            })
+            .await?;
+
+        // Coverage is still 0. Only `pending` changed.
+        let res = sync(Some(settled.clone())).await;
+        assert_eq!(
+            res.status(),
+            http::StatusCode::OK,
+            "a transition into pending must not be suppressed as not-modified"
+        );
+        let again = res
+            .headers()
+            .get(ETAG)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+            .expect("the 200 carries its own validator");
+        let json: serde_json::Value =
+            serde_json::from_slice(&actix_web::test::read_body(res).await)?;
+        assert_eq!(
+            json["pending"], true,
+            "the client must be told a rebuild was queued: {json}"
+        );
+
+        // A repeat poll that changes nothing is still a 304.
+        assert_ne!(
+            again, settled,
+            "the validator must move when pending does, or the 304 above was \
+             a coincidence of a different bug"
+        );
+        assert_eq!(
+            sync(Some(again)).await.status(),
+            http::StatusCode::NOT_MODIFIED
         );
         Ok(())
     }
