@@ -71,7 +71,26 @@ pub async fn sweep_once(engine: &FsEngine) -> Result<usize, crate::fs::error::Fs
 
     // orphaned / temp files
     for f in &files {
-        let info = engine.store.get_ref_info(&f.id).await?;
+        // One unreadable row costs one file, not the sweep. The order is
+        // sessions, then files, then orphan bytes, so propagating here
+        // would strand every file listed after this one and skip the
+        // orphan pass entirely -- on every subsequent sweep, because
+        // nothing in the sweeper repairs the key. The result is an
+        // unbounded leak of expired sessions, orphaned rows and orphan
+        // bytes, with one `warn!` an hour as the only sign.
+        //
+        // This is the same call the sibling branch below already declines
+        // to propagate, for the same reason: one bad item is retained and
+        // the sweep continues. Retaining is also the safe direction here.
+        // The orphan-byte pass keys off `f.s3_key`, which this row does
+        // not affect, so skipping the file leaks it rather than losing it.
+        let info = match engine.store.get_ref_info(&f.id).await {
+            Ok(info) => info,
+            Err(e) => {
+                tracing::warn!("fs gc skipping file {}: ref-count unreadable: {e}", f.id);
+                continue;
+            }
+        };
         if info.count != 0 {
             continue;
         }
@@ -845,6 +864,64 @@ mod tests {
             "the delete was never announced: {:?}",
             entries[0].op
         );
+        Ok(())
+    }
+
+    /// One undecodable ref-count row must not stall every sweep.
+    ///
+    /// `get_ref_info` maps a decode failure to `Err`, and the `?` that
+    /// consumed it aborted `sweep_once` inside the file loop. Because the
+    /// sweep runs sessions, then files, then orphan bytes, every file
+    /// listed *after* the bad row stopped being cleaned and the orphan
+    /// pass stopped running -- on every subsequent hourly sweep, because
+    /// nothing in the sweeper repairs that key. One undecodable
+    /// `fs:refs:{id}` value was therefore an unbounded leak of expired
+    /// sessions, orphaned rows and orphan bytes, reported as a single
+    /// `warn!` an hour.
+    ///
+    /// The ids are chosen so the bad row sorts first, because the scan is
+    /// key-ordered: under the old behaviour nothing after it was reached
+    /// at all.
+    ///
+    /// `RefInfo` has no `#[serde(default)]` either, so any field added to
+    /// it turns this into a whole-store stall rather than a one-row one.
+    /// That is deliberately left alone -- a default for `count` is `0`, and
+    /// `0` is what makes a file eligible for collection, so the default
+    /// would fail toward deleting live bytes instead of toward a leak.
+    /// Confining the damage to one row is the fix for it.
+    #[tokio::test]
+    async fn one_unreadable_ref_count_row_costs_one_file_not_the_sweep() -> anyhow::Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        let s3 = Arc::new(FakeS3::new(Vec::new(), true));
+        let prefix = crate::db::test_prefix("gc-refs");
+        let store = FsStore::new(build_test_store(&prefix).await);
+        let policy = PolicyEngine::init_s3(build_test_store(&format!("{prefix}-p")).await).await?;
+        let engine = FsEngine::from_parts(store, s3.clone(), "b".into(), policy.authorizer());
+
+        // `aaa-` sorts before `zzz-`, so the bad row is reached first.
+        for id in ["aaa-bad-refs", "zzz-good"] {
+            engine
+                .store
+                .save_file(&FileRecord {
+                    id: id.into(),
+                    name: "f.txt".into(),
+                    mimetype: "text/plain".into(),
+                    size: 1,
+                    s3_key: format!("files/{id}"),
+                    owner_sub: "alice".into(),
+                    created_at: now - TTL_SECS - 10,
+                })
+                .await?;
+        }
+        put_raw(&engine.store, "fs:files:aaa-bad-refs:refs", b"{\"count\":").await;
+
+        // The file behind the bad row is still cleaned...
+        assert_eq!(sweep_once(&engine).await?, 1);
+        assert_eq!(s3.deleted(), vec!["files/zzz-good".to_string()]);
+        assert!(engine.store.get_file("zzz-good").await?.is_none());
+        // ...and the one whose ref-count could not be read is retained,
+        // rather than deleted on a guess or allowed to stall the rest.
+        assert!(engine.store.get_file("aaa-bad-refs").await?.is_some());
         Ok(())
     }
 
