@@ -167,9 +167,38 @@ impl FsEngine {
         })
     }
 
-    /// Attaches a [`ChangeSink`] for replica sync; ops are announced after
-    /// each mutation (fail-closed: a logging failure fails the whole
-    /// operation so the feed never silently misses a committed write).
+    /// Attaches a [`ChangeSink`] for replica sync.
+    ///
+    /// Ops are announced so the feed does not silently miss a mutation, but
+    /// NOT fail-closed. This comment used to claim the opposite --
+    /// "a logging failure fails the whole operation so the feed never
+    /// silently misses a committed write" -- and it was false in both
+    /// directions: `complete_upload` and `delete_file` committed first and
+    /// announced last, and nothing was rolled back, so a WAL failure lost
+    /// the mutation *and* the session or row the retry needed.
+    ///
+    /// What actually holds now, and is what each mutation is written to
+    /// keep:
+    ///
+    /// * An announce happens before the step that makes a mutation
+    ///   unretryable ([`delete_file`](Self::delete_file) announces before
+    ///   the row goes, like [`gc`](crate::fs::gc)), or immediately after
+    ///   it with the handle for the retry deliberately left in place
+    ///   ([`complete_upload`](Self::complete_upload) commits the record,
+    ///   announces, and only then drops the session).
+    /// * Every announce failure therefore leaves something a *later
+    ///   request* can replay it from, and every entry point is idempotent
+    ///   on that retry -- so the retry converges instead of 404ing.
+    /// * A failed append is re-announced at most once per failure, because
+    ///   the retry's own cleanup removes the handle. A client looping
+    ///   `complete` cannot grow the feed.
+    ///
+    /// What this does NOT give: a client that never retries loses the
+    /// announce for good. The committed record is on master, so a replica
+    /// running a full rebuild picks the file up from the KV regardless, but
+    /// incremental replay does not learn of it. That window is logged, not
+    /// closed -- closing it needs a replayable outbox, which this crate has
+    /// no storage for.
     ///
     /// Takes a trait object so this module never names `sync`. The
     /// concrete implementation is [`sync::wal::Wal`](crate::sync::wal::Wal).
@@ -573,6 +602,12 @@ impl FsEngine {
     }
 
     /// Finalizes an upload session; only the owner may complete.
+    ///
+    /// Idempotent from the client's side: a retry after a failed announce
+    /// finds the committed record *and* the session the failure left
+    /// behind, re-announces, and converges. See
+    /// [`with_change_sink`](Self::with_change_sink) for what that does and
+    /// does not guarantee.
     #[tracing::instrument(skip(self, req), fields(file_id = %file_id, caller_sub = %caller_sub), err)]
     pub async fn complete_upload(
         &self,
@@ -580,11 +615,34 @@ impl FsEngine {
         req: CompleteRequest,
         caller_sub: &str,
     ) -> Result<(), FsError> {
-        let session = self
-            .store
-            .get_session(file_id)
-            .await?
-            .ok_or_else(|| FsError::NotFound("upload session not found".into()))?;
+        // The record is read first because it is the committed half: a
+        // session that outlived its own commit is the retry handle, and a
+        // record with no session is an upload that already converged.
+        let committed = self.store.get_file(file_id).await?;
+        let session = self.store.get_session(file_id).await?;
+        if let Some(rec) = &committed {
+            if rec.owner_sub != caller_sub {
+                return Err(FsError::Forbidden);
+            }
+            let Some(_session) = session else {
+                // Announced and cleaned up by an earlier attempt: only this
+                // module drops the session, and only after the append
+                // returned, so there is nothing left to announce. Success
+                // WITHOUT an append, which is what stops a client looping
+                // `complete` on a file id from growing the feed.
+                return Ok(());
+            };
+            // Committed, session still here: the announce (or the cleanup
+            // after it) failed. Re-announce from the committed record --
+            // the exact op that was lost -- then drop the handle so the
+            // bound holds for the next retry too.
+            self.announce(WalOp::FileCreate { rec: rec.clone() })
+                .await?;
+            self.store.delete_session(file_id).await?;
+            return Ok(());
+        }
+        let session =
+            session.ok_or_else(|| FsError::NotFound("upload session not found".into()))?;
         if session.owner_sub != caller_sub {
             return Err(FsError::Forbidden);
         }
@@ -626,9 +684,14 @@ impl FsEngine {
             owner_sub: session.owner_sub.clone(),
             created_at: chrono::Utc::now().timestamp(),
         };
+        // Commit, announce, and only then release the retry handle. The
+        // old order deleted the session before the append, so an append
+        // that failed left a committed file with no session and no op --
+        // the client's retry 404'd on `get_session` and every replica
+        // applying the feed incrementally never learned the file existed.
         self.store.save_file(&record).await?;
-        self.store.delete_session(file_id).await?;
         self.announce(WalOp::FileCreate { rec: record }).await?;
+        self.store.delete_session(file_id).await?;
         Ok(())
     }
 
@@ -680,9 +743,18 @@ impl FsEngine {
 
     /// Deletes a finalized file; allowed when caller has row `Delete` or owns temp unreferenced file.
     ///
-    /// Metadata goes first, then S3 bytes: a crash between the two leaks
-    /// an unreachable object (converges on retry, S3 delete is idempotent)
-    /// instead of a dangling record that serves errors.
+    /// The announce comes FIRST, for the same reason [`gc`](crate::fs::gc)
+    /// puts it before the row delete: the row is the only thing left that
+    /// knows this deletion still has to be announced, so an append that
+    /// fails has to retain it. The old order deleted the row and the bytes
+    /// and announced last, which turned a WAL blip into a 500 whose retry
+    /// 404'd (`get_file` -> `None`) -- every replica kept serving a record
+    /// for bytes that were already gone, and nothing re-announced it.
+    ///
+    /// Metadata still goes before S3 bytes: a failure between them leaks an
+    /// unreachable object, which gc's orphan pass provably reaps after the
+    /// TTL, rather than leaving a record that 404s every download. A retry
+    /// of THAT case finds no row and 404s, which is why the bytes are last.
     #[tracing::instrument(skip(self), fields(file_id = %file_id, caller_sub = %caller_sub), err)]
     pub async fn delete_file(&self, file_id: &str, caller_sub: &str) -> Result<(), FsError> {
         let rec = self
@@ -699,12 +771,22 @@ impl FsEngine {
         } else if !self.can_access(caller_sub, file_id, Action::Delete).await? {
             return Err(FsError::Forbidden);
         }
-        self.store.delete_file(file_id).await?;
-        self.s3.delete_object(&self.bucket, &rec.s3_key).await?;
+        // Announced before the row goes, not after: an append that fails
+        // here leaves the row, and the client's retry re-runs this whole
+        // authorized path and converges. Re-announcing is free -- replaying
+        // `FileDelete` is a `delete_file` on the replica, idempotent on a
+        // file that is already gone.
+        //
+        // Deliberately NOT extended to "no record means already deleted,
+        // announce anyway": that would turn every 404 into a permanent feed
+        // entry, and the feed is append-only with nothing to authorize
+        // against once the record is gone.
         self.announce(WalOp::FileDelete {
             file_id: file_id.to_string(),
         })
         .await?;
+        self.store.delete_file(file_id).await?;
+        self.s3.delete_object(&self.bucket, &rec.s3_key).await?;
         Ok(())
     }
 
@@ -1212,6 +1294,189 @@ mod tests {
         assert!(matches!(&ops[1], WalOp::Attach { file_id, .. } if file_id == &id));
         assert!(matches!(&ops[2], WalOp::Detach { file_id, .. } if file_id == &id));
         assert!(matches!(&ops[3], WalOp::FileDelete { file_id } if file_id == &id));
+        Ok(())
+    }
+
+    /// [`ChangeSink`] double that refuses every append.
+    ///
+    /// Stands in for the one failure both fixes here exist for: the
+    /// mutation commits and the feed does not take it.
+    struct DeadFeed;
+
+    #[async_trait::async_trait]
+    impl crate::records::ChangeSink for DeadFeed {
+        async fn append(
+            &self,
+            _: crate::records::WalOp,
+        ) -> Result<(), crate::records::ChangeError> {
+            Err(crate::records::ChangeError::new("feed down"))
+        }
+    }
+
+    /// A complete that committed but could not announce must be repairable
+    /// by the client's retry, and only by one.
+    ///
+    /// The old order was `save_file`, `delete_session`, `announce`. A WAL
+    /// failure at the announce returned 500 with the record COMMITTED on
+    /// master, and the client's retry then read `get_session` as `None`
+    /// and 404'd "upload session not found" -- for good. The file was
+    /// downloadable on master while every replica applying the feed
+    /// incrementally never learned it existed, and no other code path
+    /// re-announces a `FileCreate`.
+    ///
+    /// Asserting the first call returning 500 proves none of that, so the
+    /// test drives the retry, which is where the loss happened: it must
+    /// converge and the lost op must reach the feed.
+    #[tokio::test]
+    async fn a_complete_whose_announce_failed_is_repaired_by_the_retry() -> anyhow::Result<()> {
+        use crate::records::WalOp;
+        use crate::sync::wal::Wal;
+
+        let (engine, _policy) = make_engine_and_policy("alice").await;
+        let dead = engine.clone().with_change_sink(Arc::new(DeadFeed));
+
+        let id = dead.init_upload(valid_single(), "alice").await?;
+        dead.upload_part(&id, 0, once_body(vec![3u8; 1024]), None, None, "alice")
+            .await?;
+        dead.complete_upload(
+            &id,
+            CompleteRequest {
+                name: "retry.txt".into(),
+                mimetype: "text/plain".into(),
+            },
+            "alice",
+        )
+        .await
+        .expect_err("a feed that refuses every append must fail the complete");
+
+        // Committed, and the session is deliberately still there: that is
+        // the handle the retry replays the announce from.
+        assert!(
+            engine.store.get_file(&id).await?.is_some(),
+            "the record did not commit, so this test is not exercising the window"
+        );
+        assert!(
+            engine.store.get_session(&id).await?.is_some(),
+            "the session must survive a failed announce, or the retry has nothing to converge on"
+        );
+
+        // Feed repaired: the client retries, and this time it converges.
+        let wal = Wal::new(
+            crate::db::build_test_store(&crate::db::test_prefix("fs-complete-retry")).await,
+        );
+        let engine = engine.with_change_sink(Arc::new(wal.clone()));
+        engine
+            .complete_upload(
+                &id,
+                CompleteRequest {
+                    name: "retry.txt".into(),
+                    mimetype: "text/plain".into(),
+                },
+                "alice",
+            )
+            .await?;
+        let entries = wal.range(1, wal.head().await?).await?;
+        assert_eq!(
+            entries.len(),
+            1,
+            "the lost FileCreate never reached the feed"
+        );
+        assert!(
+            matches!(&entries[0].op, WalOp::FileCreate { rec } if rec.id == id),
+            "the retry announced something else: {:?}",
+            entries[0].op
+        );
+        assert!(engine.store.get_session(&id).await?.is_none());
+
+        // Bounded: the retry consumed the handle, so a client looping
+        // `complete` cannot append forever against a converged upload.
+        engine
+            .complete_upload(
+                &id,
+                CompleteRequest {
+                    name: "retry.txt".into(),
+                    mimetype: "text/plain".into(),
+                },
+                "alice",
+            )
+            .await?;
+        assert_eq!(
+            wal.head().await?,
+            1,
+            "a repeat complete appended to the feed again"
+        );
+
+        // And the file is the committed one, not a re-upload.
+        assert_eq!(engine.get_metadata(&id, "alice").await?.name, "retry.txt");
+        Ok(())
+    }
+
+    /// A delete that could not announce must leave the row for the retry.
+    ///
+    /// The old order was `delete_file`, `s3.delete_object`, `announce`. A
+    /// WAL failure at the announce returned 500 with the row GONE, so the
+    /// retry took `get_file` -> `None` and 404'd, while replicas kept
+    /// serving a record for bytes that were already deleted -- the same
+    /// stranding gc fixed in a4e40f9, one layer up.
+    ///
+    /// The row surviving the failed announce is the assertion that
+    /// distinguishes the two orders; the retry converging is the one that
+    /// matters to the client.
+    #[tokio::test]
+    async fn a_delete_whose_announce_failed_is_retried_rather_than_stranded() -> anyhow::Result<()>
+    {
+        use crate::records::WalOp;
+        use crate::sync::wal::Wal;
+
+        let (engine, _policy) = make_engine_and_policy("alice").await;
+        let wal =
+            Wal::new(crate::db::build_test_store(&crate::db::test_prefix("fs-delete-retry")).await);
+        let engine = engine.with_change_sink(Arc::new(wal.clone()));
+
+        let id = engine.init_upload(valid_single(), "alice").await?;
+        engine
+            .upload_part(&id, 0, once_body(vec![4u8; 1024]), None, None, "alice")
+            .await?;
+        engine
+            .complete_upload(
+                &id,
+                CompleteRequest {
+                    name: "gone.txt".into(),
+                    mimetype: "text/plain".into(),
+                },
+                "alice",
+            )
+            .await?;
+
+        let dead = engine.clone().with_change_sink(Arc::new(DeadFeed));
+        dead.delete_file(&id, "alice")
+            .await
+            .expect_err("a feed that refuses every append must fail the delete");
+        assert!(
+            engine.store.get_file(&id).await?.is_some(),
+            "the row was deleted while its delete could not be announced"
+        );
+
+        // Feed repaired: the client's retry re-runs the authorized path.
+        engine.delete_file(&id, "alice").await?;
+        assert!(engine.store.get_file(&id).await?.is_none());
+        let entries = wal.range(1, wal.head().await?).await?;
+        assert_eq!(entries.len(), 2, "expected the create and one delete");
+        assert!(
+            matches!(&entries[1].op, WalOp::FileDelete { file_id } if file_id == &id),
+            "the retry announced something else: {:?}",
+            entries[1].op
+        );
+
+        // An id that never existed stays a 404 and appends nothing: the
+        // feed is append-only, so turning every 404 into a `FileDelete`
+        // would be permanent growth any authenticated caller could force.
+        let err = engine
+            .delete_file("never-existed", "alice")
+            .await
+            .expect_err("an unknown file id must stay a 404");
+        assert!(matches!(err, FsError::NotFound(_)), "got {err:?}");
+        assert_eq!(wal.head().await?, 2, "a 404 appended to the feed");
         Ok(())
     }
 }
