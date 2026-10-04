@@ -212,6 +212,7 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
             .join("auth/callback")
             .context("Failed to build redirect URL")?
             .to_string(),
+        allowed_tenants: config.authorization.allowed_tenants.clone(),
     })
     .await?;
     let oidc_api_module = OidcApiModule::<Claims>::init(oidc_client).await?;

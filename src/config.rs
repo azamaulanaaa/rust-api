@@ -167,6 +167,24 @@ impl Config {
                 "authorization.client_secret must not be empty (or set RUST_API_CLIENT_SECRET)"
             );
         }
+        if self.authorization.issuer_url.contains("{tenantid}") {
+            if self
+                .authorization
+                .allowed_tenants
+                .iter()
+                .any(|t| t.trim().is_empty())
+            {
+                anyhow::bail!("authorization.allowed_tenants must not contain empty entries");
+            }
+            if self.authorization.allowed_tenants.is_empty() {
+                anyhow::bail!(
+                    "authorization.issuer_url is a multi-tenant template, so \
+                     authorization.allowed_tenants must list every tenant this deployment \
+                     trusts; without it the expected issuer is derived from the token's own tid \
+                     claim and any consenting tenant would be accepted"
+                );
+            }
+        }
         if self.database.prefix.trim().is_empty() {
             anyhow::bail!("database.prefix must not be empty");
         }
@@ -223,6 +241,23 @@ pub struct ConfigAuthorization {
     pub client_secret: String,
     /// Base URL of the provider's OIDC discovery document.
     pub issuer_url: String,
+    /// Tenant identifiers this deployment accepts, required when
+    /// `issuer_url` is a multi-tenant template such as
+    /// `https://login.microsoftonline.com/{tenantid}/v2.0`.
+    ///
+    /// A templated issuer cannot be pinned statically: the expected issuer has
+    /// to be derived from each token's own `tid` claim, which proves nothing
+    /// about *which* tenant minted it. A multi-tenant app registration also
+    /// publishes one JWKS covering every consenting tenant, so an unknown
+    /// tenant's token verifies against keys this server already trusts, and
+    /// `aud` is the shared client ID rather than a tenant discriminator. This
+    /// list is therefore the only tenant gate, and validation below refuses to
+    /// start a templated issuer without it.
+    ///
+    /// Ignored for a single-tenant issuer, where the issuer is pinned
+    /// statically.
+    #[serde(default)]
+    pub allowed_tenants: Vec<String>,
 }
 
 /// Telemetry/observability settings.
@@ -549,6 +584,61 @@ mod tests {
             region = "us-east-1"
         "#
         .to_string()
+    }
+
+    /// A templated issuer cannot be pinned statically, so the expected issuer
+    /// has to come from each token's own `tid`. Without an allowlist that is
+    /// no gate at all: any tenant that consented to a multi-tenant app
+    /// registration mints a token that verifies against the shared JWKS and
+    /// carries our client ID as `aud`. Refuse to start instead.
+    #[test]
+    fn a_templated_issuer_requires_an_allowed_tenant() {
+        let templated = minimal_toml().replace(
+            "issuer_url = \"https://idp.test\"",
+            "issuer_url = \"https://login.test/{tenantid}/v2.0\"",
+        );
+        let err = validation_error(&templated);
+        assert!(
+            err.contains("allowed_tenants"),
+            "a templated issuer without an allowlist must be rejected, got: {err}"
+        );
+
+        // With an allowlist the same config starts. The key belongs to the
+        // [authorization] table, so it goes next to client_secret rather
+        // than at the end of the file.
+        let allowed = templated.replace(
+            "client_secret = \"csecret\"",
+            "client_secret = \"csecret\"\n            allowed_tenants = [\"tenant-a\"]",
+        );
+        let path = tmp_toml(&allowed);
+        let cfg = Config::try_from(path.as_path()).expect("an allowlisted tenant should validate");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(cfg.authorization.allowed_tenants, vec!["tenant-a"]);
+    }
+
+    /// An entry that is present but blank would resolve an issuer to the
+    /// placeholder's surroundings with nothing substituted, so reject it
+    /// rather than silently accept a degenerate tenant id.
+    #[test]
+    fn a_templated_issuer_rejects_a_blank_allowed_tenant() {
+        let templated = minimal_toml().replace(
+            "issuer_url = \"https://idp.test\"",
+            "issuer_url = \"https://login.test/{tenantid}/v2.0\"\n            allowed_tenants = [\"tenant-a\", \"\"]",
+        );
+        let err = validation_error(&templated);
+        assert!(
+            err.contains("empty entries"),
+            "a blank allowlist entry must be rejected, got: {err}"
+        );
+    }
+
+    /// The allowlist only means something for a templated issuer, and a
+    /// single-tenant issuer must still start without one.
+    #[test]
+    fn a_single_tenant_issuer_needs_no_allowlist() {
+        let path = tmp_toml(&minimal_toml());
+        Config::try_from(path.as_path()).expect("single-tenant issuer needs no allowlist");
+        let _ = std::fs::remove_file(&path);
     }
 
     fn validation_error(toml: &str) -> String {

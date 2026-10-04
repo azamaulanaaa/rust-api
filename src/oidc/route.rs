@@ -55,7 +55,8 @@ where
             oidc_client.client_id().as_str(),
             oidc_client.issuer(),
         )
-        .await?;
+        .await?
+        .with_allowed_tenants(oidc_client.allowed_tenants().to_vec());
 
         // Same provider, same keys, different claims type. Loading the JWKS
         // twice costs one extra request at startup and keeps `/auth/me`
@@ -66,7 +67,8 @@ where
             oidc_client.client_id().as_str(),
             oidc_client.issuer(),
         )
-        .await?;
+        .await?
+        .with_allowed_tenants(oidc_client.allowed_tenants().to_vec());
 
         Ok(Self {
             oidc_client: Arc::new(oidc_client),
@@ -392,6 +394,7 @@ mod tests {
                 client_secret: "test-secret".to_string(),
                 issuer_url: server.uri(),
                 redirect_url: "http://localhost/callback".to_string(),
+                allowed_tenants: Vec::new(),
             })
             .await?;
 
