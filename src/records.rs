@@ -183,20 +183,6 @@ pub enum WalOp {
 }
 
 impl WalOp {
-    /// True for any policy-shape op (legacy or rich).
-    pub fn is_policy_op(&self) -> bool {
-        matches!(
-            self,
-            Self::PolicyAdd { .. }
-                | Self::PolicyRemove { .. }
-                | Self::PolicyRuleAdd { .. }
-                | Self::PolicyRuleRemove { .. }
-                | Self::GroupAdd { .. }
-                | Self::GroupRemove { .. }
-                | Self::GroupDelete { .. }
-        )
-    }
-
     /// True for legacy object-only marks that cannot replay incrementally.
     pub fn is_legacy_policy_mark(&self) -> bool {
         matches!(self, Self::PolicyAdd { .. } | Self::PolicyRemove { .. })
@@ -287,17 +273,31 @@ mod tests {
         }
     }
 
+    /// Replay classifies ops, and the classification has to be exhaustive:
+    /// an op this does not name takes the wrong branch in `replay`.
+    ///
+    /// `is_legacy_policy_mark` is the only classifier left, and it is
+    /// load-bearing -- `SnapshotManager::replay` rejects a range containing
+    /// one before it opens a writer, because a legacy mark names an object
+    /// and no rule, so nothing can be applied incrementally.
     #[test]
     fn op_classification_is_exhaustive() {
-        assert!(WalOp::PolicyAdd { obj: "x".into() }.is_policy_op());
         assert!(WalOp::PolicyAdd { obj: "x".into() }.is_legacy_policy_mark());
-        assert!(WalOp::GroupDelete { group: "g".into() }.is_policy_op());
+        assert!(WalOp::PolicyRemove { obj: "x".into() }.is_legacy_policy_mark());
         assert!(!WalOp::GroupDelete { group: "g".into() }.is_legacy_policy_mark());
+        assert!(
+            !WalOp::PolicyRuleAdd {
+                sub: "s".into(),
+                obj: "o".into(),
+                act: "read".into(),
+            }
+            .is_legacy_policy_mark()
+        );
         assert!(
             !WalOp::FileDelete {
                 file_id: "f".into()
             }
-            .is_policy_op()
+            .is_legacy_policy_mark()
         );
     }
 
