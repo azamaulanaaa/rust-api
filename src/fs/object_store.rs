@@ -157,21 +157,58 @@ impl S3Client for ObjectStoreClient {
             return Err(FsError::BadRequest("part_number must be >= 1".into()));
         }
         let part_idx = (part_number - 1) as usize;
-        let mut states = self.states.lock().await;
-        let state = states
-            .get_mut(upload_id)
-            .ok_or_else(|| FsError::Internal(format!("unknown upload_id {upload_id}")))?;
-        if state.bucket != bucket || state.key != key {
-            return Err(FsError::Internal("bucket/key mismatch".into()));
-        }
+        // Only the two fields the backend call needs are taken under the
+        // lock, and the guard dies with this block. It used to live across
+        // `put_part` itself -- and had to, because `state.parts.insert`
+        // needed the same borrow -- so one slow PUT, or one hung
+        // connection with no client-side timeout at this layer, blocked
+        // every other multipart part upload in the PROCESS, including
+        // unrelated users' uploads, for the full round trip. The map needs
+        // microseconds of exclusion.
+        let (path, id) = {
+            let states = self.states.lock().await;
+            let state = states
+                .get(upload_id)
+                .ok_or_else(|| FsError::Internal(format!("unknown upload_id {upload_id}")))?;
+            if state.bucket != bucket || state.key != key {
+                return Err(FsError::Internal("bucket/key mismatch".into()));
+            }
+            (state.path.clone(), state.id.clone())
+        };
         let payload = PutPayload::from_bytes(body);
         let part_id = self
             .multipart
-            .put_part(&state.path, &state.id, part_idx, payload)
+            .put_part(&path, &id, part_idx, payload)
             .await
             .map_err(Self::map_err)?;
         let etag = part_id.content_id.clone();
-        state.parts.insert(part_idx, part_id);
+        // Re-locked only to record the id. The entry can legitimately be
+        // GONE by now: `complete_multipart_upload` removes it before its
+        // own backend call, and a backend that has already assembled the
+        // object rejects this part too, so there is nothing to attach the
+        // id to and dropping it is the outcome the backend already chose.
+        //
+        // That is the whole lost-update surface this creates, and it is
+        // closed upstream rather than here: every engine entry point takes
+        // the session lock across "are all parts present?" and the
+        // complete, so a part whose id has not been recorded yet cannot
+        // reach this function's `complete` at all. What remains is a
+        // client re-uploading a part it already has WHILE completing it,
+        // whose interleaving was equally arbitrary when the guard was held
+        // across the call.
+        let mut states = self.states.lock().await;
+        match states.get_mut(upload_id) {
+            Some(state) => {
+                state.parts.insert(part_idx, part_id);
+            }
+            None => {
+                tracing::debug!(
+                    upload_id,
+                    part_idx,
+                    "multipart state gone while a part was in flight"
+                );
+            }
+        }
         Ok(etag)
     }
 
@@ -182,10 +219,15 @@ impl S3Client for ObjectStoreClient {
         upload_id: &str,
         etags: Vec<String>,
     ) -> Result<(), FsError> {
-        let mut states = self.states.lock().await;
-        let state = states
-            .remove(upload_id)
-            .ok_or_else(|| FsError::Internal(format!("unknown upload_id {upload_id}")))?;
+        // `remove` hands ownership out, so nothing below needs the guard --
+        // it only stayed alive to the end of the function, across the
+        // backend call, for the same reason `upload_part` held it.
+        let state = {
+            let mut states = self.states.lock().await;
+            states
+                .remove(upload_id)
+                .ok_or_else(|| FsError::Internal(format!("unknown upload_id {upload_id}")))?
+        };
         if state.bucket != bucket || state.key != key {
             return Err(FsError::Internal("bucket/key mismatch".into()));
         }
@@ -225,13 +267,21 @@ impl S3Client for ObjectStoreClient {
         key: &str,
         upload_id: &str,
     ) -> Result<(), FsError> {
-        let mut states = self.states.lock().await;
-        if let Some(state) = states.get(upload_id)
-            && (state.bucket != bucket || state.key != key)
-        {
-            return Err(FsError::Internal("bucket/key mismatch".into()));
-        }
-        if let Some(state) = states.remove(upload_id) {
+        // Checked under the lock, applied outside it. `remove` already made
+        // the state unreachable, so a concurrent caller cannot see a
+        // half-aborted upload either way, and the abort is no longer able
+        // to hold the map against every other multipart call while it
+        // waits on the backend.
+        let state = {
+            let mut states = self.states.lock().await;
+            if let Some(state) = states.get(upload_id)
+                && (state.bucket != bucket || state.key != key)
+            {
+                return Err(FsError::Internal("bucket/key mismatch".into()));
+            }
+            states.remove(upload_id)
+        };
+        if let Some(state) = state {
             // Propagate: the engine retries (restored from the persisted
             // record), and GC retains the session until S3 confirms.
             self.multipart
@@ -474,6 +524,157 @@ pub async fn build_s3_client(
 mod tests {
     use super::*;
     use bytes::Bytes;
+
+    /// [`MultipartStore`] that parks the FIRST `put_part` until released.
+    ///
+    /// Everything else delegates to a real in-memory backend, so the
+    /// upload still genuinely completes; only WHEN one backend call is
+    /// outstanding is controlled, which is what turns "the state map is
+    /// held across a network call" from an argument into an observation.
+    #[derive(Debug)]
+    struct GateMultipart {
+        inner: Arc<InMemory>,
+        parked: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl MultipartStore for GateMultipart {
+        async fn create_multipart(&self, path: &ObjectPath) -> object_store::Result<MultipartId> {
+            self.inner.create_multipart(path).await
+        }
+
+        async fn put_part(
+            &self,
+            path: &ObjectPath,
+            id: &MultipartId,
+            part_idx: usize,
+            data: PutPayload,
+        ) -> object_store::Result<PartId> {
+            let gate = self.parked.lock().expect("gate").take();
+            if let Some(tx) = gate {
+                let _ = tx.send(());
+                self.release.notified().await;
+            }
+            self.inner.put_part(path, id, part_idx, data).await
+        }
+
+        async fn complete_multipart(
+            &self,
+            path: &ObjectPath,
+            id: &MultipartId,
+            parts: Vec<PartId>,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.inner.complete_multipart(path, id, parts).await
+        }
+
+        async fn abort_multipart(
+            &self,
+            path: &ObjectPath,
+            id: &MultipartId,
+        ) -> object_store::Result<()> {
+            self.inner.abort_multipart(path, id).await
+        }
+    }
+
+    /// One slow backend call must not block the whole process.
+    ///
+    /// `upload_part` took `states.lock()` and held the guard across
+    /// `MultipartStore::put_part` -- it needed the same borrow for the
+    /// `state.parts.insert` on the next line -- so the process-global map
+    /// was pinned for the full round trip. A single slow PUT, or a hung
+    /// connection with no client-side timeout at this layer, stalled every
+    /// other concurrent part upload in the process: unrelated users,
+    /// unrelated buckets, uploads that share nothing with the slow one.
+    ///
+    /// Asserted two ways. `states.try_lock()` is the direct structural
+    /// claim -- the map is free while a backend call is outstanding -- and
+    /// the second upload completing is the same thing as the client would
+    /// experience. The first fails on the old code with
+    /// "the mutex is held across a backend call".
+    #[tokio::test]
+    async fn the_multipart_state_map_is_not_held_across_a_backend_call() -> anyhow::Result<()> {
+        let inner = Arc::new(InMemory::new());
+        let (tx, parked) = tokio::sync::oneshot::channel();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let multipart = Arc::new(GateMultipart {
+            inner: inner.clone(),
+            parked: std::sync::Mutex::new(Some(tx)),
+            release: Arc::clone(&release),
+        });
+        let client = Arc::new(ObjectStoreClient::new(
+            Arc::clone(&inner) as Arc<dyn ObjectStore>,
+            multipart,
+        ));
+
+        let up_slow = client
+            .create_multipart_upload("b", "files/slow", None)
+            .await?;
+        let up_other = client
+            .create_multipart_upload("b", "files/other", None)
+            .await?;
+
+        let slow = tokio::spawn({
+            let client = client.clone();
+            let upload_id = up_slow.clone();
+            async move {
+                client
+                    .upload_part(
+                        "b",
+                        "files/slow",
+                        &upload_id,
+                        1,
+                        Bytes::from_static(b"slow"),
+                        None,
+                    )
+                    .await
+            }
+        });
+        parked
+            .await
+            .expect("the first put_part parked, or the gate never fired");
+
+        assert!(
+            client.states.try_lock().is_ok(),
+            "the multipart state mutex is held across a backend call"
+        );
+
+        // A different upload, sharing nothing with the parked one, runs to
+        // completion while it is still in flight.
+        let etag = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.upload_part(
+                "b",
+                "files/other",
+                &up_other,
+                1,
+                Bytes::from_static(b"other"),
+                None,
+            ),
+        )
+        .await
+        .expect("a second upload was blocked by the first one's backend call")?;
+        client
+            .complete_multipart_upload("b", "files/other", &up_other, vec![etag])
+            .await?;
+        assert_eq!(
+            client.get_object("b", "files/other").await?,
+            Bytes::from_static(b"other")
+        );
+
+        release.notify_one();
+        // The parked part still lands in the state a complete will read:
+        // it was copied out under the lock, not carried by it.
+        let slow_etag = slow.await.expect("slow task")?;
+        client
+            .complete_multipart_upload("b", "files/slow", &up_slow, vec![slow_etag])
+            .await?;
+        assert_eq!(
+            client.get_object("b", "files/slow").await?,
+            Bytes::from_static(b"slow")
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     async fn list_keys_returns_relative_form() -> anyhow::Result<()> {
