@@ -39,19 +39,46 @@ use serde::{Deserialize, Serialize};
 /// Lives here rather than in [`fs::store`](crate::fs::store) because it is
 /// part of the feed contract: [`WalOp::FileCreate`] carries a full record
 /// so a replica can re-apply the op without reading the master.
+///
+/// **Schema changes.** This is decoded from rows already on disk, so an
+/// added field makes every pre-existing row undecodable unless the field
+/// defaults -- and an undecodable row is not a missing row as far as the
+/// sweeper is concerned: it disappears from `list_files`, and the
+/// orphan-byte pass would then delete the object that row still describes.
+/// Fields whose absence can be given an honest value therefore carry
+/// `#[serde(default)]`, and the ones whose absence would mean the record
+/// points somewhere wrong or has aged past collection deliberately do not:
+///
+/// - `id` and `s3_key` identify the row and the bytes it owns. `id` is
+///   already in the key, but a default of `""` would be a record about no
+///   object, and `s3_key` is the only pointer from the metadata to the
+///   data -- a wrong one is data loss in the making.
+/// - `size` feeds `Content-Length`. A `0` would be a plausible-looking
+///   wrong answer, truncating a download rather than failing it.
+/// - `created_at` is the GC clock. A `0` reads as "created at the epoch",
+///   which makes the record instantly collectable.
+///
+/// So a row that cannot decode stays a loud, visible condition -- `list_files`
+/// names the key and the sweeper refuses its orphan-byte pass -- rather than
+/// being papered over with a default that deletes the file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileRecord {
     /// File identifier.
     pub id: String,
-    /// Original filename.
+    /// Original filename. Empty when the field is absent from an older row:
+    /// a name is presentation, and there is no wrong answer for it.
+    #[serde(default)]
     pub name: String,
-    /// MIME type.
+    /// MIME type. Empty when absent, for the same reason as `name`.
+    #[serde(default)]
     pub mimetype: String,
     /// Size in bytes.
     pub size: u64,
     /// S3 key.
     pub s3_key: String,
-    /// Owner subject.
+    /// Owner subject. Empty when absent, which matches no caller: an
+    /// unattributed record is read by nobody rather than by everyone.
+    #[serde(default)]
     pub owner_sub: String,
     /// Creation timestamp.
     pub created_at: i64,
@@ -278,6 +305,48 @@ mod tests {
             }
             .is_policy_op()
         );
+    }
+
+    /// An added field must not undecode every row already on disk.
+    ///
+    /// `FileRecord` has no version marker, so the only thing standing
+    /// between "add a field" and "every stored record is unreadable" is a
+    /// default on that field. An unreadable file row is not inert: it drops
+    /// out of `list_files`, and the sweeper then reads its object as
+    /// unreferenced and deletes the bytes for a file the metadata still
+    /// describes. That is why the defaulted set is deliberate rather than
+    /// blanket -- `id`, `s3_key`, `size` and `created_at` stay required,
+    /// because a default there points at the wrong object, reports the
+    /// wrong length, or ages the record into immediate collection.
+    #[test]
+    fn an_added_field_does_not_orphan_an_existing_row() {
+        // A row as an older version wrote it: no `name`, `mimetype`, or
+        // `owner_sub`.
+        let old = br#"{"id":"f1","size":7,"s3_key":"files/f1","created_at":42}"#;
+        let rec: FileRecord = serde_json::from_slice(old).expect("an old row still decodes");
+        assert_eq!(rec.id, "f1");
+        assert_eq!(rec.s3_key, "files/f1");
+        assert_eq!(rec.size, 7);
+        assert_eq!(rec.created_at, 42);
+        // An unattributed record is read by nobody, not by everyone.
+        assert_eq!(rec.owner_sub, "");
+        assert_eq!(rec.name, "");
+        assert_eq!(rec.mimetype, "");
+
+        // The fields with no honest default are still required, so a row
+        // missing one stays a *visible* corruption rather than becoming a
+        // plausible wrong answer.
+        for field in [
+            &br#"{"size":7,"s3_key":"files/f1","created_at":42}"#[..],
+            &br#"{"id":"f1","size":7,"created_at":42}"#[..],
+            &br#"{"id":"f1","s3_key":"files/f1","created_at":42}"#[..],
+            &br#"{"id":"f1","size":7,"s3_key":"files/f1"}"#[..],
+        ] {
+            assert!(
+                serde_json::from_slice::<FileRecord>(field).is_err(),
+                "a row missing a load-bearing field decoded to a guess"
+            );
+        }
     }
 
     #[test]
