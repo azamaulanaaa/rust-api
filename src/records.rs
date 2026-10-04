@@ -214,29 +214,6 @@ pub struct WalEntry {
     pub ts: i64,
 }
 
-/// A change feed rejected an append.
-///
-/// Deliberately opaque: the producer is `fs` or `policy`, which has no
-/// business knowing whether the failure was a store error, a fencing loss,
-/// or a serialization problem. [`Wal`](crate::sync::wal::Wal) maps its own
-/// [`FsError`](crate::fs::error::FsError) into this, and `fs`/`policy` map
-/// it back on the way out. The detail is carried as a string for logs.
-#[derive(Debug, Clone, thiserror::Error)]
-#[error("change feed append failed: {0}")]
-pub struct ChangeError(String);
-
-impl ChangeError {
-    /// Wraps a store-layer error for the producer.
-    pub fn new(detail: impl std::fmt::Display) -> Self {
-        Self(detail.to_string())
-    }
-
-    /// The underlying detail, for server-side logs.
-    pub fn detail(&self) -> &str {
-        &self.0
-    }
-}
-
 /// Where committed mutations are announced.
 ///
 /// The seam that keeps `fs` and `policy` out of `sync`. Producers append
@@ -247,10 +224,27 @@ impl ChangeError {
 /// Implementations must serialize concurrent appends so sequence numbers
 /// stay gap-free. The durable implementation is
 /// [`Wal`](crate::sync::wal::Wal).
+///
+/// The failure is deliberately an opaque `anyhow::Error`: the producer is
+/// `fs` or `policy`, which has no business knowing whether the failure was a
+/// store error, a fencing loss, or a serialization problem, and
+/// [`Wal`](crate::sync::wal::Wal) has no business exposing
+/// [`FsError`](crate::fs::error::FsError) either. Both flatten at the
+/// boundary and neither classifies the cause on the way back.
+///
+/// A boxed error rather than a crate-defined newtype: it carries the same
+/// information (nothing past the message, which is the sink's own sanitized
+/// `Display`) without a wrapper that only `fs` and `policy` would have had to
+/// unwrap again on the way out. `anyhow` is a leaf dependency, so this
+/// module's "depends on nothing in the crate" property is unaffected.
 #[async_trait]
 pub trait ChangeSink: Send + Sync {
     /// Appends one operation, returning only once it is durable.
-    async fn append(&self, op: WalOp) -> Result<(), ChangeError>;
+    ///
+    /// On failure the message is for server-side logs. It is the sink's own
+    /// `Display`, which is already the sanitized text, not the underlying
+    /// cause.
+    async fn append(&self, op: WalOp) -> anyhow::Result<()>;
 }
 
 #[cfg(test)]
@@ -347,13 +341,6 @@ mod tests {
                 "a row missing a load-bearing field decoded to a guess"
             );
         }
-    }
-
-    #[test]
-    fn change_error_keeps_detail_for_logs() {
-        let err = ChangeError::new("epoch 7 superseded");
-        assert!(err.to_string().contains("epoch 7 superseded"));
-        assert_eq!(err.detail(), "epoch 7 superseded");
     }
 
     /// Reads a source file's *production* code: everything before the
