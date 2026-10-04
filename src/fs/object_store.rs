@@ -50,17 +50,6 @@ pub struct ObjectStoreClient {
 }
 
 impl ObjectStoreClient {
-    /// Creates a client wrapping an arbitrary [`ObjectStore`] that also
-    /// implements [`MultipartStore`].
-    pub fn new(store: Arc<dyn ObjectStore>, multipart: Arc<dyn MultipartStore>) -> Self {
-        Self {
-            store,
-            multipart,
-            states: Mutex::new(HashMap::new()),
-            is_memory: false,
-        }
-    }
-
     /// Creates a client from a single `Arc` that implements both traits.
     pub fn new_combined<T>(inner: Arc<T>) -> Self
     where
@@ -535,12 +524,17 @@ mod tests {
         release: Arc<tokio::sync::Notify>,
     }
 
+    impl std::fmt::Display for GateMultipart {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "GateMultipart")
+        }
+    }
+
     #[async_trait]
     impl MultipartStore for GateMultipart {
         async fn create_multipart(&self, path: &ObjectPath) -> object_store::Result<MultipartId> {
             self.inner.create_multipart(path).await
         }
-
         async fn put_part(
             &self,
             path: &ObjectPath,
@@ -574,6 +568,79 @@ mod tests {
         }
     }
 
+    /// The gate also has to be an [`ObjectStore`], because
+    /// `ObjectStoreClient::new_combined` takes one `Arc` that is both halves
+    /// of the client. Everything except `put_part` delegates straight to the
+    /// real in-memory backend, so the upload this test parks still genuinely
+    /// completes once released.
+    #[async_trait]
+    impl ObjectStore for GateMultipart {
+        async fn put_opts(
+            &self,
+            location: &ObjectPath,
+            payload: PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &ObjectPath,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &ObjectPath,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        async fn delete(&self, location: &ObjectPath) -> object_store::Result<()> {
+            self.inner.delete(location).await
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> futures_util::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy(&self, from: &ObjectPath, to: &ObjectPath) -> object_store::Result<()> {
+            self.inner.copy(from, to).await
+        }
+
+        async fn copy_if_not_exists(
+            &self,
+            from: &ObjectPath,
+            to: &ObjectPath,
+        ) -> object_store::Result<()> {
+            self.inner.copy_if_not_exists(from, to).await
+        }
+
+        fn list_with_offset(
+            &self,
+            prefix: Option<&ObjectPath>,
+            offset: &ObjectPath,
+        ) -> futures_util::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list_with_offset(prefix, offset)
+        }
+    }
+
     /// One slow backend call must not block the whole process.
     ///
     /// `upload_part` took `states.lock()` and held the guard across
@@ -594,15 +661,11 @@ mod tests {
         let inner = Arc::new(InMemory::new());
         let (tx, parked) = tokio::sync::oneshot::channel();
         let release = Arc::new(tokio::sync::Notify::new());
-        let multipart = Arc::new(GateMultipart {
+        let client = Arc::new(ObjectStoreClient::new_combined(Arc::new(GateMultipart {
             inner: inner.clone(),
             parked: std::sync::Mutex::new(Some(tx)),
             release: Arc::clone(&release),
-        });
-        let client = Arc::new(ObjectStoreClient::new(
-            Arc::clone(&inner) as Arc<dyn ObjectStore>,
-            multipart,
-        ));
+        })));
 
         let up_slow = client
             .create_multipart_upload("b", "files/slow", None)
