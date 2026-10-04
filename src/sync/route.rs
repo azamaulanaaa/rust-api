@@ -119,6 +119,13 @@ pub struct SyncAdvanceResponse {
     pub pending: bool,
 }
 
+/// The one replica object that is revalidated per commit.
+///
+/// Engine files are immutable by construction; this one is rewritten by
+/// every build, so caching it is how a client ends up pinned to a replica
+/// state that no longer exists.
+const MANIFEST_OBJECT: &str = "manifest.json";
+
 /// Quoted `ETag` for a `GET /sync/status` body.
 ///
 /// Covers every field the body exposes: coverage (`applied`), the never-
@@ -264,6 +271,30 @@ async fn object_handler(
     let tail = path.into_inner();
     let key = manager.resolve_object(&claims.sub, &tail)?;
 
+    // Cache policy follows the RESOLVED key, not the raw tail. The route is
+    // `@get("/db/{object:.*}")` and actix-router does not collapse repeated
+    // slashes, so `GET /sync/db//manifest.json` arrives with
+    // `tail == "/manifest.json"` while resolving to the very same object as
+    // the canonical URL -- `object_store`'s `Path::from` drops empty
+    // segments, and `/db/{object:.*}` is matched on the raw path. Keying
+    // `tail == "manifest.json"` therefore served the one object this module
+    // documents as revalidated per commit with
+    // `Cache-Control: public, max-age=31536000, immutable`: a browser or CDN
+    // would keep it for a year and never revalidate, permanently pinning the
+    // client to whatever replica state existed at first fetch while every
+    // client on the canonical URL converged.
+    //
+    // `resolve_object` now rejects empty segments as well, so the alias does
+    // not exist at all; deriving from the resolved key is the second of two
+    // independent defences and the one that cannot be routed around by any
+    // other spelling of the path. `filename()` is the last segment of the
+    // resolved key, so it can only name `manifest.json` for an object that
+    // genuinely IS the manifest -- no non-manifest can be served `no-cache`
+    // by forging it, and the manifest cannot be served immutable by hiding a
+    // slash.
+    let object_path = object_store::path::Path::from(key.as_str());
+    let is_manifest = object_path.filename() == Some(MANIFEST_OBJECT);
+
     // Taken before the object store is touched, so a refused request costs one
     // `get` at most rather than a whole segment read.
     let permit = gate.acquire();
@@ -272,40 +303,37 @@ async fn object_handler(
     }
 
     let store = manager.object_store.clone();
-    let object_path = object_store::path::Path::from(key.as_str());
-    let out = if let Some(header) = req
-        .headers()
-        .get(IF_NONE_MATCH)
-        .and_then(|v| v.to_str().ok())
-    {
-        let opts = object_store::GetOptions {
-            if_none_match: Some(header.to_string()),
-            ..Default::default()
-        };
-        match store.get_opts(&object_path, opts).await {
-            Ok(out) => out,
-            Err(object_store::Error::NotFound { .. }) => {
-                return Ok(HttpResponse::NotFound().finish());
-            }
-            Err(object_store::Error::NotModified { .. }) => {
-                return Ok(HttpResponse::NotModified().finish());
-            }
-            Err(e) => return Err(FsError::Internal(e.to_string())),
+    // A plain `get` rather than pushing `If-None-Match` into the backend's
+    // `GetOptions`. Both are a single metadata request and neither reads the
+    // body -- `GetResult`'s payload is lazy until `into_stream` -- but only
+    // this one leaves the `ETag` in hand, and a `304` that omits the
+    // validator the corresponding `200` would have sent is what RFC 9110
+    // 15.4.5 asks a `304` to carry.
+    let out = match store.get(&object_path).await {
+        Ok(out) => out,
+        Err(object_store::Error::NotFound { .. }) => {
+            return Ok(HttpResponse::NotFound().finish());
         }
-    } else {
-        match store.get(&object_path).await {
-            Ok(out) => out,
-            Err(object_store::Error::NotFound { .. }) => {
-                return Ok(HttpResponse::NotFound().finish());
-            }
-            Err(e) => return Err(FsError::Internal(e.to_string())),
-        }
+        Err(e) => return Err(FsError::Internal(e.to_string())),
     };
 
     // Read the head off `out` before `into_stream` consumes it.
     let etag = out.meta.e_tag.clone();
     let size = out.range.end.saturating_sub(out.range.start);
-    object_response(out, &tail, etag, size, permit)
+    if let Some(header) = req
+        .headers()
+        .get(IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        && etag
+            .as_deref()
+            .is_some_and(|current| etag_matches(header, current))
+    {
+        // Dropping `out` abandons the unread payload, which is the point: a
+        // not-modified answer has no body to send.
+        drop(out);
+        return Ok(object_not_modified(etag.as_deref(), is_manifest));
+    }
+    object_response(out, is_manifest, etag, size, permit)
 }
 
 /// The `200` response for one replica object, streaming `out`.
@@ -323,7 +351,7 @@ async fn object_handler(
 /// and the immutability caching still behaves.
 fn object_response(
     out: object_store::GetResult,
-    tail: &str,
+    is_manifest: bool,
     etag: Option<String>,
     size: u64,
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
@@ -332,13 +360,7 @@ fn object_response(
     if let Some(ref etag) = etag {
         resp.insert_header((ETAG, etag.as_str()));
     }
-    if tail == "manifest.json" {
-        resp.insert_header((CACHE_CONTROL, "no-cache"));
-        resp.insert_header((CONTENT_TYPE, "application/json"));
-    } else {
-        resp.insert_header((CACHE_CONTROL, "public, max-age=31536000, immutable"));
-        resp.insert_header((CONTENT_TYPE, "application/octet-stream"));
-    }
+    let mut resp = object_cache_headers(resp, is_manifest);
     Ok(resp
         .insert_header((CONTENT_LENGTH, size))
         // The permit travels with the body, so the slot is held until the
@@ -348,6 +370,39 @@ fn object_response(
             logged_body(out.into_stream()),
             permit,
         )))
+}
+
+/// The caching and content-type headers for one replica object.
+///
+/// Split out because the `304` for the same object must carry the same
+/// ones: RFC 9110 15.4.5 asks a `304` to generate the header fields a `200`
+/// would have sent, and the object `304` here used to send carried neither
+/// `Cache-Control` nor `ETag` while every other `304` in this file re-attached
+/// its validator. A client that revalidates on `Cache-Control` alone -- which
+/// is exactly what a manifest client does, since the manifest is the only
+/// object it fetches without an `If-None-Match` -- learns nothing about how
+/// long the copy it already holds stays good.
+fn object_cache_headers(
+    mut resp: actix_web::HttpResponseBuilder,
+    is_manifest: bool,
+) -> actix_web::HttpResponseBuilder {
+    if is_manifest {
+        resp.insert_header((CACHE_CONTROL, "no-cache"));
+        resp.insert_header((CONTENT_TYPE, "application/json"));
+    } else {
+        resp.insert_header((CACHE_CONTROL, "public, max-age=31536000, immutable"));
+        resp.insert_header((CONTENT_TYPE, "application/octet-stream"));
+    }
+    resp
+}
+
+/// The `304` for a replica object, carrying the headers a `200` would have.
+fn object_not_modified(etag: Option<&str>, is_manifest: bool) -> HttpResponse {
+    let mut resp = HttpResponse::NotModified();
+    if let Some(etag) = etag {
+        resp.insert_header((ETAG, etag));
+    }
+    object_cache_headers(resp, is_manifest).finish()
 }
 
 #[cfg(test)]
@@ -494,7 +549,7 @@ mod tests {
             attributes: object_store::Attributes::new(),
         };
 
-        let resp = object_response(out, "seg-0001.sst", Some("\"v1\"".into()), SEGMENT, None)
+        let resp = object_response(out, false, Some("\"v1\"".into()), SEGMENT, None)
             .expect("building the response must not read the body");
 
         assert_eq!(
@@ -1007,11 +1062,33 @@ mod tests {
                 actix_web::test::TestRequest::get()
                     .uri("/sync/db/manifest.json")
                     .insert_header(("Cookie", format!("auth_token={token}")))
-                    .insert_header((IF_NONE_MATCH, etag))
+                    .insert_header((IF_NONE_MATCH, etag.clone()))
                     .to_request(),
             )
             .await;
             assert_eq!(res.status(), http::StatusCode::NOT_MODIFIED);
+            // RFC 9110 15.4.5: a 304 carries the header fields the
+            // corresponding 200 would have sent. This one used to carry
+            // neither the validator nor the caching contract, while every
+            // other 304 in this file re-attached its own.
+            assert_eq!(
+                res.headers().get(ETAG).and_then(|v| v.to_str().ok()),
+                Some(etag.as_str()),
+                "a 304 must re-attach the ETag the 200 carried"
+            );
+            assert_eq!(
+                res.headers()
+                    .get(CACHE_CONTROL)
+                    .and_then(|v| v.to_str().ok()),
+                Some("no-cache"),
+                "a 304 must re-attach the Cache-Control the 200 carried"
+            );
+            assert_eq!(
+                res.headers()
+                    .get(actix_web::http::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok()),
+                Some("application/json")
+            );
         }
 
         let res = actix_web::test::call_service(
@@ -1024,5 +1101,95 @@ mod tests {
         .await;
         assert_eq!(res.status(), http::StatusCode::NOT_FOUND);
         Ok(())
+    }
+
+    /// The manifest alias must not be served immutable.
+    ///
+    /// The failure this pins: the cache-control branch keyed off the RAW
+    /// path tail, and `resolve_object` rejected only an empty tail or a
+    /// `..` segment -- an empty INTERIOR segment passed, while
+    /// `object_store`'s `Path::from` drops empty segments when splitting on
+    /// `/`. So `GET /sync/db//manifest.json` resolved to the same
+    /// per-commit-MUTABLE object as the canonical URL, with
+    /// `tail == "/manifest.json"`, which is not `"manifest.json"`: a `200`
+    /// with `Cache-Control: public, max-age=31536000, immutable`. A browser
+    /// or CDN keeps that for a year and never revalidates, permanently
+    /// pinning the client to whatever replica state existed at first fetch
+    /// while every client on the canonical URL converges -- the module's own
+    /// contract at the top of this file, inverted for one URL.
+    ///
+    /// Both halves of the fix are asserted. `resolve_object` now rejects
+    /// empty segments, so the alias does not exist; and the branch is
+    /// derived from the resolved key, so the manifest cannot be served
+    /// immutable by any other spelling of the path either.
+    #[actix_web::test]
+    async fn the_manifest_alias_is_not_served_immutable() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        let module = SyncApiModule::new(fx.manager.clone(), setup(&fx).await?);
+        let app =
+            actix_web::test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+        let fetch = |uri: &'static str| async {
+            actix_web::test::call_service(
+                &app,
+                actix_web::test::TestRequest::get()
+                    .uri(uri)
+                    .insert_header(("Cookie", format!("auth_token={token}")))
+                    .to_request(),
+            )
+            .await
+        };
+        let cache = |res: &actix_web::dev::ServiceResponse| {
+            res.headers()
+                .get(CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        };
+
+        // The alias resolves to nothing: `resolve_object` rejects the empty
+        // interior segment.
+        assert_eq!(
+            fetch("/sync/db//manifest.json").await.status(),
+            http::StatusCode::BAD_REQUEST,
+            "an empty interior segment must not address a replica object"
+        );
+
+        // And the canonical URL is unchanged.
+        let res = fetch("/sync/db/manifest.json").await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        assert_eq!(cache(&res).as_deref(), Some("no-cache"));
+        Ok(())
+    }
+
+    /// The resolved key, not the path tail, decides the caching contract.
+    ///
+    /// Structural because the property is about a branch that cannot be
+    /// reached with the alias gone: `object_handler` must derive
+    /// `is_manifest` from `Path::filename()` of the RESOLVED key. Keying it
+    /// off the raw tail is what made `/manifest.json` immutable, and
+    /// deleting the alias alone would leave the same inversion reachable by
+    /// any future path spelling that `Path::from` normalises.
+    ///
+    /// It also pins the direction that matters for safety: a key whose
+    /// filename is not `manifest.json` must NOT be served `no-cache`, so the
+    /// resolved-key derivation cannot be used to hand a non-manifest the
+    /// weaker policy.
+    #[test]
+    fn cache_control_follows_the_resolved_key() {
+        for (key, expect_manifest) in [
+            ("test-db/u/abc/manifest.json", true),
+            // An alias the backend normalises to the same object.
+            ("test-db/u/abc//manifest.json", true),
+            ("test-db/u/abc/sst/seg-0001.sst", false),
+            ("test-db/u/abc/not-manifest.json", false),
+            ("test-db/u/abc/manifest.json.bak", false),
+        ] {
+            let path = object_store::path::Path::from(key);
+            assert_eq!(
+                path.filename() == Some(MANIFEST_OBJECT),
+                expect_manifest,
+                "{key}"
+            );
+        }
     }
 }
