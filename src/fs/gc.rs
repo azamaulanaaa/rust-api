@@ -98,12 +98,34 @@ pub async fn sweep_once(engine: &FsEngine) -> Result<usize, crate::fs::error::Fs
             tracing::warn!("fs gc keeping file {} for retry", f.id);
             continue;
         }
-        engine.store.delete_file(&f.id).await?;
-        engine
+        // Announce *before* the row goes, not after. The row is the only
+        // record that this deletion still has to happen: once it is gone
+        // no future sweep can find the file to re-announce, so a failed
+        // append here strands every replica's copy for good -- the master
+        // has no row, the replica has the record and the bytes, and no
+        // later replay repairs either. Announced first, the same transient
+        // failure leaves the row in place and the next sweep announces
+        // again. Re-announcing is free of consequence: replaying
+        // `FileDelete` is a `delete_file` on the replica, which is
+        // idempotent on a file that is already gone.
+        //
+        // A failed announce retains the file rather than propagating. The
+        // bytes are already gone at this point, so propagating would leave
+        // exactly the unretryable state described above, and would abort
+        // the rest of the sweep over one file.
+        if let Err(e) = engine
             .announce(crate::records::WalOp::FileDelete {
                 file_id: f.id.clone(),
             })
-            .await?;
+            .await
+        {
+            tracing::warn!(
+                "fs gc keeping file {} for retry: announce failed: {e}",
+                f.id
+            );
+            continue;
+        }
+        engine.store.delete_file(&f.id).await?;
         cleaned += 1;
     }
 
@@ -733,6 +755,96 @@ mod tests {
         .await;
         assert_eq!(sweep_once(&engine).await?, 1);
         assert_eq!(s3.deleted(), vec!["files/stray".to_string()]);
+        Ok(())
+    }
+
+    /// [`ChangeSink`] double that refuses every append.
+    ///
+    /// Stands in for the one failure mode this ordering exists for: the
+    /// mutation commits locally and the feed does not take it.
+    struct DeadFeed;
+
+    #[async_trait::async_trait]
+    impl crate::records::ChangeSink for DeadFeed {
+        async fn append(
+            &self,
+            _: crate::records::WalOp,
+        ) -> Result<(), crate::records::ChangeError> {
+            Err(crate::records::ChangeError::new("feed down"))
+        }
+    }
+
+    /// A file whose bytes are gone and whose deletion could not be
+    /// announced must still be findable, or the deletion is lost for good.
+    ///
+    /// The old order was delete the object, delete the row, then announce:
+    ///
+    ///     engine.store.delete_file(&f.id).await?;
+    ///     engine.announce(WalOp::FileDelete { .. }).await?;
+    ///     cleaned += 1;
+    ///
+    /// A transient WAL failure at the announce returns `Err` with the row
+    /// already deleted, so the retry cannot happen -- nothing scans for a
+    /// file that has no record -- and every replica keeps the record *and*
+    /// its bytes permanently. Nothing repairs it either, because the
+    /// master's row is the only thing a later replay could have compared
+    /// against.
+    ///
+    /// This drives the real order against a feed that refuses everything,
+    /// then repairs the feed and sweeps again: the second sweep must find
+    /// the file, announce it, and remove the row. Under the old order the
+    /// first sweep already deleted the row and the second finds nothing,
+    /// so the file is simply never announced.
+    #[tokio::test]
+    async fn a_failed_delete_announce_is_retried_rather_than_stranded() -> anyhow::Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        let prefix = crate::db::test_prefix("gc-announce");
+        let store = FsStore::new(build_test_store(&prefix).await);
+        let policy = PolicyEngine::init_s3(build_test_store(&format!("{prefix}-p")).await).await?;
+        let dead: Arc<dyn crate::records::ChangeSink> = Arc::new(DeadFeed);
+        let bytes: Arc<dyn S3Client> = ObjectStoreClient::in_memory();
+        let engine = FsEngine::from_parts(store, bytes, "b".into(), policy.authorizer())
+            .with_change_sink(dead);
+        engine
+            .store
+            .save_file(&FileRecord {
+                id: "strand-me".into(),
+                name: "f.txt".into(),
+                mimetype: "text/plain".into(),
+                size: 1,
+                s3_key: "files/strand-me".into(),
+                owner_sub: "alice".into(),
+                created_at: now - TTL_SECS - 10,
+            })
+            .await?;
+        engine
+            .s3
+            .put_object("b", "files/strand-me", Bytes::from_static(b"x"), None, None)
+            .await?;
+
+        // Feed down: the sweep may delete the bytes, but the row has to
+        // survive or the deletion has nowhere to be retried from.
+        assert_eq!(sweep_once(&engine).await?, 0);
+        assert!(
+            engine.store.get_file("strand-me").await?.is_some(),
+            "the row was deleted while its delete could not be announced"
+        );
+
+        // Feed repaired. The row is still there, so the sweep finds the
+        // file and this time the op lands.
+        let wal = crate::sync::wal::Wal::new(
+            build_test_store(&crate::db::test_prefix("gc-announce-wal")).await,
+        );
+        let engine = engine.with_change_sink(Arc::new(wal.clone()));
+        assert_eq!(sweep_once(&engine).await?, 1);
+        assert!(engine.store.get_file("strand-me").await?.is_none());
+        let entries = wal.range(1, wal.head().await?).await?;
+        assert_eq!(entries.len(), 1);
+        assert!(
+            matches!(&entries[0].op, crate::records::WalOp::FileDelete { file_id } if file_id == "strand-me"),
+            "the delete was never announced: {:?}",
+            entries[0].op
+        );
         Ok(())
     }
 
