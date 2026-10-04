@@ -10,6 +10,7 @@ use oxkv::{
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
+use crate::fencing::Latch;
 use crate::fs::error::FsError;
 use crate::fs::relation::{REL_PREFIX, RefInfo, refs_key, rel_key};
 
@@ -108,6 +109,15 @@ pub struct FsStore {
     /// keeps the distinction with the ownership rather than inferred from a
     /// key prefix.
     primary: bool,
+    /// Where this store's fencing losses are recorded.
+    ///
+    /// The process-wide latch in production (see
+    /// [`process_latch`](crate::fencing::process_latch)); a store's own in
+    /// tests. Held as a field rather than reached for through
+    /// [`note_primary_loss`](crate::fencing::note_primary_loss) because the
+    /// process-wide latch is one-way and global: a test that tripped it
+    /// could not tell its own write from any other test's.
+    latch: &'static Latch,
 }
 
 impl FsStore {
@@ -138,7 +148,7 @@ impl FsStore {
     fn store_err(&self, e: oxkv::StoreError) -> FsError {
         let err = FsError::from(e);
         if self.latches(&err) {
-            crate::fencing::note_primary_loss(Self::FS_PREFIX, err.detail());
+            self.latch.trip(Self::FS_PREFIX, err.detail());
         }
         err
     }
@@ -151,6 +161,7 @@ impl FsStore {
             inner: Arc::new(RwLock::new(s3_store)),
             mirror: None,
             primary: false,
+            latch: crate::fencing::process_latch(),
         }
     }
 
@@ -159,6 +170,22 @@ impl FsStore {
     pub fn primary(s3_store: OxKvStore) -> Self {
         Self {
             primary: true,
+            ..Self::new(s3_store)
+        }
+    }
+
+    /// The master store, recording fencing losses on `latch` instead of the
+    /// process-wide one.
+    ///
+    /// The latch is a one-way flag with no reset, so a test that wants to
+    /// prove a write *trips* it cannot share the process-wide one: anything
+    /// another test tripped first would satisfy the assertion whether or not
+    /// the code under test latched at all.
+    #[cfg(test)]
+    pub(crate) fn primary_with_latch(s3_store: OxKvStore, latch: &'static Latch) -> Self {
+        Self {
+            primary: true,
+            latch,
             ..Self::new(s3_store)
         }
     }
@@ -179,6 +206,7 @@ impl FsStore {
             inner: Arc::new(RwLock::new(s3_store)),
             mirror: Some(mirror),
             primary: false,
+            latch: crate::fencing::process_latch(),
         })
     }
 
@@ -248,7 +276,9 @@ impl FsStore {
         let key = Self::session_key(&s.id);
         let val = serde_json::to_vec(s).map_err(|e| FsError::Internal(e.to_string()))?;
         let g = self.inner.write().await;
-        g.set_bytes(&key, &val).await.map_err(FsError::from)?;
+        g.set_bytes(&key, &val)
+            .await
+            .map_err(|e| self.store_err(e))?;
         Ok(())
     }
 
@@ -268,7 +298,7 @@ impl FsStore {
         let key = Self::session_key(id);
         {
             let g = self.inner.write().await;
-            g.delete(&key).await.map_err(FsError::from)?;
+            g.delete(&key).await.map_err(|e| self.store_err(e))?;
             if let Some(s) = session {
                 for idx in 0..s.file_total_parts {
                     let k = Self::staged_key(id, idx);
@@ -289,7 +319,9 @@ impl FsStore {
         let key = Self::multipart_key(&m.upload_id);
         let val = serde_json::to_vec(m).map_err(|e| FsError::Internal(e.to_string()))?;
         let g = self.inner.write().await;
-        g.set_bytes(&key, &val).await.map_err(FsError::from)?;
+        g.set_bytes(&key, &val)
+            .await
+            .map_err(|e| self.store_err(e))?;
         Ok(())
     }
 
@@ -310,7 +342,7 @@ impl FsStore {
     pub async fn delete_multipart(&self, upload_id: &str) -> Result<(), FsError> {
         let key = Self::multipart_key(upload_id);
         let g = self.inner.write().await;
-        g.delete(&key).await.map_err(FsError::from)?;
+        g.delete(&key).await.map_err(|e| self.store_err(e))?;
         Ok(())
     }
 
@@ -318,7 +350,9 @@ impl FsStore {
     pub async fn save_staged_part(&self, id: &str, idx: u64, data: Vec<u8>) -> Result<(), FsError> {
         let key = Self::staged_key(id, idx);
         let g = self.inner.write().await;
-        g.set_bytes(&key, &data).await.map_err(FsError::from)?;
+        g.set_bytes(&key, &data)
+            .await
+            .map_err(|e| self.store_err(e))?;
         Ok(())
     }
 
@@ -333,7 +367,9 @@ impl FsStore {
         let key = Self::file_key(&rec.id);
         let val = serde_json::to_vec(rec).map_err(|e| FsError::Internal(e.to_string()))?;
         let g = self.inner.write().await;
-        g.set_bytes(&key, &val).await.map_err(FsError::from)?;
+        g.set_bytes(&key, &val)
+            .await
+            .map_err(|e| self.store_err(e))?;
         Ok(())
     }
 
@@ -405,11 +441,11 @@ impl FsStore {
             .map_err(|e| self.store_err(e))?
             .is_some()
         {
-            let info = read_ref_info(&tx, file_id, self.primary).await?;
+            let info = read_ref_info(&tx, file_id, self.latch, self.primary).await?;
             tx.rollback().await.map_err(|e| self.store_err(e))?;
             return Ok(info.count);
         }
-        let mut info = read_ref_info(&tx, file_id, self.primary).await?;
+        let mut info = read_ref_info(&tx, file_id, self.latch, self.primary).await?;
         info.count = info.count.saturating_add(1);
         info.orphan_since = None;
         tx.set_bytes(&rel, b"1")
@@ -442,11 +478,11 @@ impl FsStore {
             .map_err(|e| self.store_err(e))?
             .is_none()
         {
-            let info = read_ref_info(&tx, file_id, self.primary).await?;
+            let info = read_ref_info(&tx, file_id, self.latch, self.primary).await?;
             tx.rollback().await.map_err(|e| self.store_err(e))?;
             return Ok(info.count);
         }
-        let mut info = read_ref_info(&tx, file_id, self.primary).await?;
+        let mut info = read_ref_info(&tx, file_id, self.latch, self.primary).await?;
         tx.delete(&rel).await.map_err(|e| self.store_err(e))?;
         info.count = info.count.saturating_sub(1);
         if info.count == 0 {
@@ -680,13 +716,14 @@ impl KvPages {
 async fn read_ref_info<T: GetSet>(
     tx: &T,
     file_id: &str,
+    latch: &Latch,
     primary: bool,
 ) -> Result<RefInfo, FsError> {
     let key = refs_key(file_id);
     let bytes = tx.get_bytes(&key).await.map_err(|e| {
         let err = FsError::from(e);
         if primary && err.is_fencing_loss() {
-            crate::fencing::note_primary_loss(FsStore::FS_PREFIX, err.detail());
+            latch.trip(FsStore::FS_PREFIX, err.detail());
         }
         err
     })?;
@@ -713,7 +750,9 @@ fn prefix_scan_end(prefix: &str) -> String {
 mod tests {
     use super::{FileRecord, FsStore, PersistedMultipart, SCAN_PAGE, UploadSession};
     use crate::db::build_test_store;
+    use crate::fencing::Latch;
     use oxkv::GetSet as _;
+    use std::sync::Arc;
 
     /// Which failures take this process out of rotation.
     ///
@@ -739,6 +778,170 @@ mod tests {
         assert!(!replica.latches(&fenced), "a replica build race is not");
         assert!(!master.latches(&other), "a flaky store is not a lost epoch");
         assert!(!replica.latches(&other));
+    }
+
+    /// One write method, boxed so the table below can hold closures of
+    /// different bodies.
+    type WriteFn =
+        fn(&FsStore) -> futures_util::future::BoxFuture<'_, Result<(), crate::fs::error::FsError>>;
+
+    /// A master write that loses its epoch must latch, whatever method it
+    /// went through.
+    ///
+    /// The predicate above is not enough, and that is the whole point of
+    /// this one. Six of the nine write methods converted the `oxkv` error
+    /// with a bare `map_err(FsError::from)`, so the classification was
+    /// correct and the *report* never happened: `POST /fs/{id}/complete`
+    /// 500'd on `save_file` before the WAL announce ran, while
+    /// `fencing::primary_loss()` stayed false and `/ready` returned 200. The
+    /// instance served traffic it could not write and no signal said so.
+    ///
+    /// This drives a real `oxkv` handle into `StoreError::Fenced` -- a second
+    /// session over the same prefix takes the epoch -- and asserts each
+    /// write's latch, on a private latch rather than the process-wide one.
+    /// Asserting against the process-wide flag would pass vacuously: it is
+    /// one-way with no reset, so `fencing::tests` tripping it first would
+    /// satisfy this test even with every call site removed.
+    #[tokio::test]
+    async fn a_fenced_master_write_latches_whatever_method_it_went_through() {
+        // Every write method that persists or removes a key, named so a
+        // failure says which one stopped reporting.
+        let writes: Vec<(&str, WriteFn)> = vec![
+            ("save_session", |s| {
+                Box::pin(async move { s.save_session(&sample_session("latch-sess")).await })
+            }),
+            ("delete_session", |s| {
+                Box::pin(async move { s.delete_session("latch-sess").await })
+            }),
+            ("save_multipart", |s| {
+                Box::pin(async move { s.save_multipart(&sample_multipart("latch-mp")).await })
+            }),
+            ("delete_multipart", |s| {
+                Box::pin(async move { s.delete_multipart("latch-mp").await })
+            }),
+            ("save_staged_part", |s| {
+                Box::pin(
+                    async move { s.save_staged_part("latch-sess", 0, b"chunk".to_vec()).await },
+                )
+            }),
+            ("save_file", |s| {
+                Box::pin(async move { s.save_file(&sample_file("latch-file")).await })
+            }),
+            ("delete_file", |s| {
+                Box::pin(async move { s.delete_file("latch-file").await })
+            }),
+            // `attach` on the row the seed already linked takes its idempotent
+            // read-back path and never writes, so it gets a row of its
+            // own; `detach` uses the seeded one.
+            ("attach", |s| {
+                Box::pin(async move { s.attach("invoice", "2", "latch-file").await.map(|_| ()) })
+            }),
+            ("detach", |s| {
+                Box::pin(async move { s.detach("invoice", "1", "latch-file").await.map(|_| ()) })
+            }),
+        ];
+
+        for (name, write) in writes {
+            // A fresh latch per method, or the first one to trip would
+            // satisfy every assertion after it and the list would only
+            // prove its own head entry. `Box::leak` because the field is a
+            // `&'static`, matching how a production store holds the
+            // process-wide one.
+            let latch: &'static Latch = Box::leak(Box::new(Latch::new()));
+            let (store, _holder) = fenced_store("latch-site", latch, true).await;
+            let err = write(&store)
+                .await
+                .expect_err(&format!("{name} on a fenced epoch must fail"));
+            assert!(
+                err.is_fencing_loss(),
+                "{name} lost the epoch but reported {err:?}",
+            );
+            assert!(latch.is_tripped(), "{name} did not latch a fencing loss");
+        }
+    }
+
+    /// A replica write that loses its build race must NOT latch.
+    ///
+    /// The other direction of the master/replica split, and the one that
+    /// decides whether this mechanism is usable at all: `sync` recovers a
+    /// replica race by adopting the winner's coverage, so latching it would
+    /// take a healthy server out of rotation over a non-event.
+    #[tokio::test]
+    async fn a_fenced_replica_write_does_not_latch() {
+        let latch: &'static Latch = Box::leak(Box::new(Latch::new()));
+        let (store, _holder) = fenced_store("latch-replica-site", latch, false).await;
+
+        let err = store
+            .save_file(&sample_file("replica-fenced"))
+            .await
+            .expect_err("a fenced replica write must fail");
+        assert!(err.is_fencing_loss(), "expected a lost epoch, got {err:?}");
+        assert!(
+            !latch.is_tripped(),
+            "a replica build race must not take a healthy server out of rotation",
+        );
+    }
+
+    /// A store that a second session has fenced, holding the keys every write
+    /// above targets.
+    ///
+    /// The seeding comes first and matters: `oxkv`'s `delete` of a missing
+    /// key is a read that returns `Ok(false)` without consulting
+    /// `ownership.json`, so a delete against an empty store would succeed on
+    /// a fenced handle and the test would be asserting nothing. A delete
+    /// that has something to delete reaches the WAL put and is fenced
+    /// there, as it is in production.
+    ///
+    /// Returns the fenced store and the session that fenced it. The holder
+    /// has to outlive the store: an `oxkv` handle only fences another while
+    /// it is alive, so dropping it would make the test assert nothing.
+    async fn fenced_store(
+        name: &str,
+        latch: &'static Latch,
+        primary: bool,
+    ) -> (FsStore, oxkv::OxKvStore) {
+        let prefix = crate::db::test_prefix(name);
+        let inner =
+            Arc::new(object_store::memory::InMemory::new()) as Arc<dyn object_store::ObjectStore>;
+        let handle = crate::db::build_test_store_new_session(Arc::clone(&inner), &prefix).await;
+        // A clone shares the session, so seeding through it is a write by
+        // the handle under test.
+        seed_delete_targets(&FsStore::primary(handle.clone())).await;
+
+        // A second session over the same prefix CAS-bumps the epoch and
+        // fences the first: exactly what an uncooperative second writer does.
+        let holder = crate::db::build_test_store_new_session(inner, &prefix).await;
+
+        let store = if primary {
+            FsStore::primary_with_latch(handle, latch)
+        } else {
+            FsStore {
+                latch,
+                ..FsStore::new(handle)
+            }
+        };
+        (store, holder)
+    }
+
+    /// Writes a session, a multipart record and an attached file, so the
+    /// delete and detach paths have something to act on.
+    async fn seed_delete_targets(store: &FsStore) {
+        store
+            .save_session(&sample_session("latch-sess"))
+            .await
+            .expect("seed session");
+        store
+            .save_multipart(&sample_multipart("latch-mp"))
+            .await
+            .expect("seed multipart");
+        store
+            .save_file(&sample_file("latch-file"))
+            .await
+            .expect("seed file");
+        store
+            .attach("invoice", "1", "latch-file")
+            .await
+            .expect("seed relation");
     }
 
     /// A paged walk must visit every key exactly once.
@@ -850,6 +1053,18 @@ mod tests {
             key: "files/f".to_string(),
             s3_upload_id: "real-backend-id".to_string(),
             parts: [(0usize, "etag-0".to_string())].into_iter().collect(),
+            created_at: chrono::Utc::now().timestamp(),
+        }
+    }
+
+    fn sample_file(id: &str) -> FileRecord {
+        FileRecord {
+            id: id.to_string(),
+            name: "h.txt".to_string(),
+            mimetype: "text/plain".to_string(),
+            size: 1,
+            s3_key: format!("files/{id}"),
+            owner_sub: "bob".to_string(),
             created_at: chrono::Utc::now().timestamp(),
         }
     }
