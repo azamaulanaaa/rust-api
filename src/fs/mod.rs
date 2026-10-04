@@ -15,6 +15,7 @@ pub mod store;
 /// Capability token for scoped file access.
 pub mod token;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::policy::row::RowAuthorizer;
@@ -87,6 +88,117 @@ pub struct FsEngine {
     /// Typed as [`ChangeSink`] rather than a concrete WAL so this module
     /// has no compile-time path to `sync` — see [`crate::records`].
     feed: Option<Arc<dyn ChangeSink>>,
+    /// Serializes the read-modify-write of one upload's rows.
+    session_locks: SessionLocks,
+}
+
+/// Per-upload serialization for the rows one upload owns.
+///
+/// An `UploadSession` and the `PersistedMultipart` record behind it are two
+/// separate KV keys holding the same fact — how many parts have landed —
+/// and every part upload read BOTH, merged its own index into its own copy
+/// and wrote both back. `FsStore` takes `inner.write()` per call and never
+/// across the pair, `FsEngine` is shared across workers as `web::Data`,
+/// and the handler adds no serialization, so parallel part uploads — the
+/// normal multipart client pattern — each wrote back a whole session built
+/// from a snapshot taken before the other part's write.
+///
+/// The entry is keyed by file id, which is also the session id: uploads of
+/// different files never contend, and the key is dropped when the last
+/// holder goes so the map cannot grow with abandoned sessions.
+#[derive(Clone, Default)]
+struct SessionLocks {
+    inner: Arc<std::sync::Mutex<HashMap<String, Arc<SessionEntry>>>>,
+}
+
+/// One session's lock, and how many claims are outstanding on it.
+struct SessionEntry {
+    /// Held across the read-modify-write of this upload's rows.
+    lock: tokio::sync::Mutex<()>,
+    /// Claims taken on `lock`, including one still waiting for it.
+    ///
+    /// The map entry may only be dropped when this reaches zero. A claim
+    /// that has registered but has not run yet still owns the mutex, and if
+    /// the entry vanished under it the NEXT caller would mint a second
+    /// mutex for the same session -- two claims, two critical sections, and
+    /// exactly the lost update this type exists to prevent.
+    claims: std::sync::atomic::AtomicUsize,
+}
+
+/// A held-or-pending claim on one session's lock.
+///
+/// Owning one is what keeps the map entry alive; dropping it gives the claim
+/// back, so two sequential parts of one upload do not leave a mutex behind
+/// forever.
+struct SessionLock<'a> {
+    map: &'a std::sync::Mutex<HashMap<String, Arc<SessionEntry>>>,
+    key: String,
+    entry: Arc<SessionEntry>,
+}
+
+impl SessionLock<'_> {
+    /// Waits for exclusive access to the session's rows.
+    async fn acquire(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.entry.lock.lock().await
+    }
+}
+
+impl Drop for SessionLock<'_> {
+    fn drop(&mut self) {
+        // A poisoned map means a holder panicked mid-registration; leave
+        // the entry rather than drop somebody else's lock on the way out.
+        let Ok(mut map) = self.map.lock() else {
+            return;
+        };
+        if !map
+            .get(&self.key)
+            .is_some_and(|held| Arc::ptr_eq(held, &self.entry))
+        {
+            return;
+        }
+        // Under the map lock, so a claim registering right now cannot slip
+        // between the last claim leaving and the entry disappearing.
+        if self
+            .entry
+            .claims
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst)
+            == 1
+        {
+            map.remove(&self.key);
+        }
+    }
+}
+
+impl SessionLocks {
+    /// Claims `key`, waiting for any other holder of the same session.
+    ///
+    /// The map is a `std::sync::Mutex` and is never held across an await:
+    /// registering is microseconds, and the per-key async mutex below is
+    /// what actually waits, so a slow part upload cannot stall registration
+    /// for every other session.
+    async fn acquire(&self, key: &str) -> SessionLock<'_> {
+        let entry = {
+            let mut map = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let entry = Arc::clone(map.entry(key.to_string()).or_insert_with(|| {
+                Arc::new(SessionEntry {
+                    lock: tokio::sync::Mutex::new(()),
+                    claims: std::sync::atomic::AtomicUsize::new(0),
+                })
+            }));
+            entry
+                .claims
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            entry
+        };
+        SessionLock {
+            map: &self.inner,
+            key: key.to_string(),
+            entry,
+        }
+    }
 }
 
 /// One capability-token signing key: `kid` goes in the JWT header.
@@ -164,6 +276,7 @@ impl FsEngine {
             policy,
             token_keys: Arc::new(TokenKeys::ephemeral()),
             feed: None,
+            session_locks: SessionLocks::default(),
         })
     }
 
@@ -237,6 +350,7 @@ impl FsEngine {
             policy,
             token_keys: Arc::new(TokenKeys::ephemeral()),
             feed: None,
+            session_locks: SessionLocks::default(),
         }
     }
 
@@ -419,6 +533,14 @@ impl FsEngine {
     /// S3 SigV4 must hash the full part before sending, so zero-buffer
     /// uploads are protocol-blocked; the bound is now the part size
     /// (≤10 MiB by init validation), not the 16 MiB blanket cap.
+    ///
+    /// The session's two rows are merged under its lock *after* the bytes
+    /// are staged, never before: the body stream and the S3 round trip are
+    /// the slow part and are per-part, so holding the lock across them
+    /// would serialize a client's own parallel part uploads — the pattern
+    /// this exists to support. Everything that can lose an entry is in the
+    /// merge ([`merge_part`](Self::merge_part)), which re-reads under the
+    /// lock instead of trusting the copy read here.
     #[tracing::instrument(skip(self, body, checksum_sha256), fields(file_id = %file_id, part_index, declared_len = declared_len, caller_sub = %caller_sub), err)]
     pub async fn upload_part<S>(
         &self,
@@ -437,7 +559,7 @@ impl FsEngine {
     {
         use futures_util::StreamExt as _;
 
-        let mut session = self
+        let session = self
             .store
             .get_session(file_id)
             .await?
@@ -494,13 +616,16 @@ impl FsEngine {
                     checksum_sha256.clone(),
                 )
                 .await?;
-            session.etags[part_index as usize] = Some("put".into());
-            if session.checksums.len() != session.etags.len() {
-                session.checksums.resize(session.etags.len(), None);
-            }
-            session.checksums[part_index as usize] = checksum_sha256;
-            self.store.save_session(&session).await?;
-            return Ok(());
+            return self
+                .merge_part(
+                    file_id,
+                    part_index,
+                    None,
+                    "put".into(),
+                    checksum_sha256,
+                    caller_sub,
+                )
+                .await;
         }
         let upload_id = session
             .s3_upload_id
@@ -519,18 +644,79 @@ impl FsEngine {
                 checksum_sha256.clone(),
             )
             .await?;
-        session.etags[part_index as usize] = Some(etag.clone());
+        self.merge_part(
+            file_id,
+            part_index,
+            Some(&upload_id),
+            etag,
+            checksum_sha256,
+            caller_sub,
+        )
+        .await
+    }
+
+    /// Folds one uploaded part into the session row and its durable
+    /// multipart record, under the session's lock.
+    ///
+    /// Everything that can lose a concurrent part's entry is here: the
+    /// session and the record are separate KV keys, so a merge that
+    /// wrote only one of them — or read them at different instants than
+    /// the sibling that was interleaved with — dropped a part that the
+    /// client had already been told was uploaded.
+    ///
+    /// The session is re-read under the lock rather than reused from the
+    /// caller's copy, which was taken before the body was streamed and
+    /// before the S3 round trip. That copy is still what the size and
+    /// bounds checks ran against, which is sound because `file_size`,
+    /// `part_size` and `file_total_parts` are fixed at init and the id is
+    /// a fresh uuid, so no other request can resize the session; the
+    /// re-read still re-checks the index and the owner.
+    ///
+    /// The record is written FIRST. A crash between the two keys must
+    /// leave the session short an etag, never the record short a part:
+    /// the first is a 400 "not all parts uploaded" that the client repairs
+    /// by re-uploading the part `GET /fs/uploads/{id}` shows missing, while
+    /// the second is the unwedgeable "etag count N != part count N-1" that
+    /// looks complete in every response the client can see. It is the same
+    /// ordering `FsStore::delete_session` uses, cascade rows before the
+    /// row that makes them reachable.
+    async fn merge_part(
+        &self,
+        file_id: &str,
+        part_index: u64,
+        upload_id: Option<&str>,
+        etag: String,
+        checksum_sha256: Option<String>,
+        caller_sub: &str,
+    ) -> Result<(), FsError> {
+        let session_lock = self.session_locks.acquire(file_id).await;
+        let _held = session_lock.acquire().await;
+        let mut session = self
+            .store
+            .get_session(file_id)
+            .await?
+            .ok_or_else(|| FsError::NotFound("upload session not found".into()))?;
+        if session.owner_sub != caller_sub {
+            return Err(FsError::Forbidden);
+        }
+        let slot = part_index as usize;
+        if slot >= session.etags.len() {
+            return Err(FsError::BadRequest("part index out of bounds".into()));
+        }
+        // Mirror staged content ids into the durable record so a
+        // restarted client can still complete this upload.
+        if let Some(upload_id) = upload_id
+            && let Some(mut record) = self.store.load_multipart(upload_id).await?
+        {
+            record.parts.insert(slot, etag.clone());
+            self.store.save_multipart(&record).await?;
+        }
+        session.etags[slot] = Some(etag);
         if session.checksums.len() != session.etags.len() {
             session.checksums.resize(session.etags.len(), None);
         }
-        session.checksums[part_index as usize] = checksum_sha256;
+        session.checksums[slot] = checksum_sha256;
         self.store.save_session(&session).await?;
-        // Mirror staged content ids into the durable record so a
-        // restarted client can still complete this upload.
-        if let Some(mut record) = self.store.load_multipart(&upload_id).await? {
-            record.parts.insert(part_index as usize, etag);
-            self.store.save_multipart(&record).await?;
-        }
         Ok(())
     }
 
@@ -615,6 +801,13 @@ impl FsEngine {
         req: CompleteRequest,
         caller_sub: &str,
     ) -> Result<(), FsError> {
+        // Held across the whole completion, S3 round trip included: a
+        // complete that interleaved with a part upload is the same lost
+        // write as two parts interleaving with each other, and unlike two
+        // parts it is not the client's normal pattern. This is per session,
+        // so it costs nothing to a client uploading several files at once.
+        let session_lock = self.session_locks.acquire(file_id).await;
+        let _held = session_lock.acquire().await;
         // The record is read first because it is the committed half: a
         // session that outlived its own commit is the retry handle, and a
         // record with no session is an upload that already converged.
@@ -703,6 +896,11 @@ impl FsEngine {
     /// points at.
     #[tracing::instrument(skip(self), fields(file_id = %file_id, caller_sub = %caller_sub), err)]
     pub async fn cancel_upload(&self, file_id: &str, caller_sub: &str) -> Result<(), FsError> {
+        // Same lock as completion: a cancel that interleaved with a part
+        // upload's merge would let that merge write the session back
+        // underneath it, resurrecting an upload whose S3 side is gone.
+        let session_lock = self.session_locks.acquire(file_id).await;
+        let _held = session_lock.acquire().await;
         let session = self
             .store
             .get_session(file_id)
@@ -924,6 +1122,281 @@ mod tests {
     /// Wraps one buffered part as the chunk stream the engine now takes.
     fn once_body(body: Vec<u8>) -> impl futures_util::Stream<Item = Result<Bytes, FsError>> {
         futures_util::stream::once(async move { Ok(Bytes::from(body)) })
+    }
+
+    /// Engine over an explicit byte backend, for the tests that need to
+    /// control when the backend answers.
+    async fn engine_with_s3(sub: &str, s3: Arc<dyn S3Client>) -> FsEngine {
+        let prefix = format!("{}-{sub}", crate::db::test_prefix("fs-engine"));
+        let store = FsStore::primary(crate::db::build_test_store(&prefix).await);
+        let policy_prefix = format!("{prefix}-policy");
+        let policy = PolicyEngine::init_s3(crate::db::build_test_store(&policy_prefix).await)
+            .await
+            .unwrap();
+        FsEngine::from_parts(store, s3, "test-bucket".to_string(), policy.authorizer())
+    }
+
+    /// [`S3Client`] that parks ONE chosen `upload_part` until released.
+    ///
+    /// Everything else delegates to a real in-memory backend, so
+    /// `complete_upload` genuinely assembles the object; only WHEN one part
+    /// upload reaches the backend is controlled. That is what makes the
+    /// interleaving a regression test rather than a race the scheduler has
+    /// to lose: the parked part is inside the backend call while the other
+    /// parts run their whole read-merge-write.
+    struct GateS3 {
+        inner: Arc<dyn S3Client>,
+        /// The 1-indexed part number to park. It has to be the LAST one:
+        /// the in-memory backend only accepts parts in ascending order.
+        gate_part: i32,
+        parked: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    impl GateS3 {
+        /// The client, a "parked" signal fired from inside the `gate_part`
+        /// upload, and the handle that lets it go.
+        fn new(
+            inner: Arc<dyn S3Client>,
+            gate_part: i32,
+        ) -> (
+            Self,
+            tokio::sync::oneshot::Receiver<()>,
+            Arc<tokio::sync::Notify>,
+        ) {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let release = Arc::new(tokio::sync::Notify::new());
+            (
+                Self {
+                    inner,
+                    gate_part,
+                    parked: std::sync::Mutex::new(Some(tx)),
+                    release: Arc::clone(&release),
+                },
+                rx,
+                release,
+            )
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl S3Client for GateS3 {
+        async fn create_multipart_upload(
+            &self,
+            bucket: &str,
+            key: &str,
+            content_type: Option<String>,
+        ) -> Result<String, FsError> {
+            self.inner
+                .create_multipart_upload(bucket, key, content_type)
+                .await
+        }
+
+        async fn upload_part(
+            &self,
+            bucket: &str,
+            key: &str,
+            upload_id: &str,
+            part_number: i32,
+            body: Bytes,
+            checksum_sha256: Option<String>,
+        ) -> Result<String, FsError> {
+            if part_number == self.gate_part {
+                if let Some(tx) = self.parked.lock().expect("gate").take() {
+                    let _ = tx.send(());
+                }
+                self.release.notified().await;
+            }
+            self.inner
+                .upload_part(bucket, key, upload_id, part_number, body, checksum_sha256)
+                .await
+        }
+
+        async fn complete_multipart_upload(
+            &self,
+            bucket: &str,
+            key: &str,
+            upload_id: &str,
+            etags: Vec<String>,
+        ) -> Result<(), FsError> {
+            self.inner
+                .complete_multipart_upload(bucket, key, upload_id, etags)
+                .await
+        }
+
+        async fn abort_multipart_upload(
+            &self,
+            bucket: &str,
+            key: &str,
+            upload_id: &str,
+        ) -> Result<(), FsError> {
+            self.inner
+                .abort_multipart_upload(bucket, key, upload_id)
+                .await
+        }
+
+        async fn backend_upload_id(&self, upload_id: &str) -> Option<String> {
+            self.inner.backend_upload_id(upload_id).await
+        }
+
+        async fn restore_multipart(
+            &self,
+            record: &crate::fs::store::PersistedMultipart,
+        ) -> Result<(), FsError> {
+            self.inner.restore_multipart(record).await
+        }
+
+        async fn put_object(
+            &self,
+            bucket: &str,
+            key: &str,
+            body: Bytes,
+            content_type: Option<String>,
+            checksum_sha256: Option<String>,
+        ) -> Result<(), FsError> {
+            self.inner
+                .put_object(bucket, key, body, content_type, checksum_sha256)
+                .await
+        }
+
+        async fn get_object(&self, bucket: &str, key: &str) -> Result<Bytes, FsError> {
+            self.inner.get_object(bucket, key).await
+        }
+
+        async fn delete_object(&self, bucket: &str, key: &str) -> Result<(), FsError> {
+            self.inner.delete_object(bucket, key).await
+        }
+
+        async fn list_keys(
+            &self,
+            bucket: &str,
+            prefix: &str,
+        ) -> Result<Vec<crate::fs::s3::ListedKey>, FsError> {
+            self.inner.list_keys(bucket, prefix).await
+        }
+    }
+
+    /// Two parts of one upload, uploaded in parallel, must both survive.
+    ///
+    /// `upload_part` read the session, streamed the body, called the
+    /// backend, and then wrote the ENTIRE session back:
+    ///
+    ///     session.etags[part_index as usize] = Some(etag.clone());
+    ///     self.store.save_session(&session).await?;
+    ///     if let Some(mut record) = self.store.load_multipart(&upload_id).await? {
+    ///         record.parts.insert(part_index as usize, etag);
+    ///         self.store.save_multipart(&record).await?;
+    ///     }
+    ///
+    /// Nothing held the read-modify-write: `FsStore` takes `inner.write()`
+    /// per call, and `FsEngine` is shared across workers as `web::Data`.
+    /// Parallel part upload is the normal multipart client pattern, so part
+    /// 1 writing back the session it read before part 0's save dropped part
+    /// 0's etag, and `GET /fs/uploads/{id}` reported it as never uploaded
+    /// even though the bytes were staged.
+    ///
+    /// The worse interleaving dropped only the RECORD: both session etags
+    /// present, record short a part, `complete_upload` passing its
+    /// `any(is_none)` gate and failing in the backend with "etag count 2
+    /// != part count 1" -- a failure no client response hints at and no
+    /// retry can clear.
+    ///
+    /// Deterministic by construction: part 0 is parked inside the backend
+    /// call while part 1 runs start to finish, so the sibling that must
+    /// interleave is guaranteed to interleave. Before the fix part 1's
+    /// stale copy is written back over part 0's etag and the session is
+    /// left `[Some, None]`.
+    #[tokio::test]
+    async fn concurrent_part_uploads_keep_every_etag_and_record_part() -> anyhow::Result<()> {
+        const PARTS: u64 = 3;
+        // The LAST part parks: parts must reach the backend in ascending
+        // order, so the parked one has to be the one whose siblings ran
+        // first.
+        let (gate, parked, release) = GateS3::new(ObjectStoreClient::in_memory(), PARTS as i32);
+        let engine = engine_with_s3("alice-parallel", Arc::new(gate)).await;
+        let id = engine
+            .init_upload(
+                InitRequest {
+                    file_size: PARTS * 1024,
+                    part_size: 1024,
+                    file_total_parts: PARTS,
+                },
+                "alice",
+            )
+            .await?;
+
+        // The last part parks inside the backend; the earlier two then run
+        // their whole read-merge-write while it waits.
+        let last = tokio::spawn({
+            let engine = engine.clone();
+            let id = id.clone();
+            async move {
+                engine
+                    .upload_part(
+                        &id,
+                        PARTS - 1,
+                        once_body(vec![9u8; 1024]),
+                        None,
+                        None,
+                        "alice",
+                    )
+                    .await
+            }
+        });
+        parked
+            .await
+            .expect("the last part parked in the backend, or the gate never fired");
+        for part in 0..PARTS - 1 {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                engine.upload_part(&id, part, once_body(vec![part as u8; 1024]), None, None, "alice"),
+            )
+            .await
+            .expect("a part was blocked behind a SIBLING's backend call: the session lock is held too wide")?;
+        }
+        release.notify_one();
+        last.await.expect("last part task")?;
+
+        let session = engine
+            .store
+            .get_session(&id)
+            .await?
+            .expect("session survives an incomplete upload");
+        assert_eq!(session.etags.len(), PARTS as usize);
+        assert!(
+            session.etags.iter().all(|e| e.is_some()),
+            "a concurrent part's etag was dropped: {:?}",
+            session.etags
+        );
+        let upload_id = session.s3_upload_id.clone().expect("multipart session");
+        let record = engine
+            .store
+            .load_multipart(&upload_id)
+            .await?
+            .expect("multipart record");
+        assert_eq!(
+            record.parts.len(),
+            PARTS as usize,
+            "a concurrent part's record entry was dropped: {:?}",
+            record.parts
+        );
+
+        // The whole point: an upload whose client has been told every part
+        // is present must actually complete.
+        engine
+            .complete_upload(
+                &id,
+                CompleteRequest {
+                    name: "parallel.bin".into(),
+                    mimetype: "application/octet-stream".into(),
+                },
+                "alice",
+            )
+            .await?;
+        let (rec, obj) = engine.get_object(&id, "alice").await?;
+        assert_eq!(rec.size, PARTS * 1024);
+        assert_eq!(obj.size, PARTS * 1024);
+        Ok(())
     }
 
     #[tokio::test]
