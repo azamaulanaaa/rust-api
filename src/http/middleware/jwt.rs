@@ -14,6 +14,7 @@ use std::{
 use actix_web::{
     Error, FromRequest, HttpMessage, HttpRequest,
     dev::{Payload, Service, ServiceRequest, ServiceResponse, Transform, forward_ready},
+    http::header::SET_COOKIE,
 };
 use futures_util::future::LocalBoxFuture;
 use jsonwebtoken::decode;
@@ -336,6 +337,11 @@ where
         // live extensions() borrow held across an array literal.
         let bearer = req.extensions().get::<BearerToken>().cloned().map(|v| v.0);
         let cookie_token = req.cookie(AUTH_COOKIE).map(|c| c.value().to_string());
+        // Which source the CHOSEN token came from, not merely that one was
+        // chosen. Only a stale cookie is worth clearing; a bad `Authorization`
+        // header says nothing about the cookie, and clearing on it would
+        // destroy a working session.
+        let chosen_from_cookie = bearer.is_none() && cookie_token.is_some();
         let token = bearer.or(cookie_token);
         Box::pin(async move {
             // An unusable credential is NOT the same as a missing one, and
@@ -427,10 +433,35 @@ where
             }
 
             let mut resp = svc.call(req).await?;
-            if unusable.is_some() {
-                // Clear the stale cookie on the way out. Without this the
-                // browser keeps replaying an expired JWT on every request
-                // until the next successful login overwrites it.
+
+            // Clear the stale cookie on the way out, so the browser stops
+            // replaying an expired JWT until the next successful login.
+            //
+            // Both conditions below are load-bearing.
+            //
+            // Only when the CHOSEN credential was the cookie: a request whose
+            // token came from an `Authorization` header has told us nothing
+            // about the cookie, and clearing it would delete a working session
+            // the client never asked us to touch.
+            //
+            // And never when the handler has already SET `auth_token`. This
+            // middleware wraps `/auth/callback`, which sets a fresh session
+            // cookie with `max_age` 7 days. Appending our own
+            // `auth_token=; Max-Age=0` after it puts two `Set-Cookie` headers
+            // with the same (name, domain, path) on one response, and browsers
+            // apply them in order with the LAST write winning -- so the callback
+            // would complete having DELETED the session it had just established.
+            // The user would see a 200 and a token, and be anonymous on the
+            // next request: the exact lockout this change exists to remove,
+            // reached through the endpoint meant to cure it.
+            let clears_session = unusable.is_some() && chosen_from_cookie;
+            let handler_set_session = resp.headers().get_all(SET_COOKIE).any(|value| {
+                value.to_str().is_ok_and(|v| {
+                    v.starts_with(&format!("{AUTH_COOKIE}="))
+                        && !v.starts_with(&format!("{AUTH_COOKIE}=;"))
+                })
+            });
+            if clears_session && !handler_set_session {
                 resp.headers_mut().append(
                     actix_web::http::header::SET_COOKIE,
                     actix_web::http::header::HeaderValue::from_static(
@@ -918,6 +949,167 @@ mod tests {
         let err = res.expect_err("a token from an untrusted tenant must not degrade to anonymous");
         assert_eq!(err.as_response_error().status_code(), 401);
 
+        Ok(())
+    }
+
+    /// Regression for the BLOCKER the second review caught: the cookie-clear
+    /// must not destroy the session cookie `/auth/callback` just SET.
+    ///
+    /// `/auth/callback` sets `auth_token=<fresh>; Max-Age=7d`. This middleware
+    /// wants to clear the stale cookie it found on the request. Both end up as
+    /// `Set-Cookie` on one response with the same (name, domain, path)
+    /// identity; browsers apply them in order and the LAST write wins, so an
+    /// appended `auth_token=; Max-Age=0` left the callback having deleted the
+    /// session it had just established. The user saw a 200 and a token, and was
+    /// anonymous on the next request -- the exact lockout the degradation exists
+    /// to remove, reached through the endpoint meant to cure it.
+    ///
+    /// A top-level GET redirect carries cookies (`SameSite=Lax` allows it), so a
+    /// stale cookie really does arrive on a callback, not only in theory.
+    #[tokio::test]
+    async fn a_fresh_session_cookie_survives_the_middleware_cookie_clear() -> anyhow::Result<()> {
+        use actix_web::{HttpResponse, cookie::Cookie};
+
+        let (key, enc) = rsa_key("kid-t")?;
+        let server = spawn_jwks(json!({ "keys": [key] })).await;
+
+        let mw = JwtClaimsMiddleware::<TestClaims>::new_with_jks(
+            &format!("{}/jwks", server.uri()),
+            "test-aud",
+            &format!("{}/{{tenantid}}/v2.0", server.uri()),
+        )
+        .await?
+        .with_allowed_tenants(vec!["tenant-guid".to_string()]);
+
+        // Stands in for the callback: the same shape, a handler that SETS the
+        // session cookie on its way out.
+        let svc = actix_web::test::init_service(actix_web::App::new().wrap(mw).service(
+            actix_web::web::resource("/auth/callback").to(|| async {
+                HttpResponse::Ok()
+                    .cookie(
+                        Cookie::build(AUTH_COOKIE, "fresh-session-token")
+                            .path("/")
+                            .http_only(true)
+                            .max_age(actix_web::cookie::time::Duration::days(7))
+                            .finish(),
+                    )
+                    .finish()
+            }),
+        ))
+        .await;
+
+        let expired = sign_rs256(
+            &json!({
+                "sub": "u9",
+                "aud": "test-aud",
+                "iss": format!("{}/tenant-guid/v2.0", server.uri()),
+                "tid": "tenant-guid",
+                "exp": 1_000_000u64,
+            }),
+            "kid-t",
+            &enc,
+        )?;
+
+        let res = actix_web::test::try_call_service(
+            &svc,
+            actix_web::test::TestRequest::get()
+                .uri("/auth/callback")
+                .insert_header(("Cookie", format!("auth_token={expired}")))
+                .to_request(),
+        )
+        .await
+        .expect("the callback runs; a stale cookie does not refuse it");
+
+        assert_eq!(res.status(), 200);
+
+        let set_cookies: Vec<String> = res
+            .headers()
+            .get_all(SET_COOKIE)
+            .map(|v| v.to_str().expect("utf-8 cookie header").to_string())
+            .filter(|v| v.starts_with(&format!("{AUTH_COOKIE}=")))
+            .collect();
+
+        assert!(
+            !set_cookies.is_empty(),
+            "the callback must still set the session cookie"
+        );
+        for cookie in &set_cookies {
+            assert!(
+                !cookie.contains("Max-Age=0"),
+                "a later header deletes the cookie the callback set: {cookie:?} (all: \
+                 {set_cookies:?})"
+            );
+        }
+        assert!(
+            set_cookies
+                .iter()
+                .any(|c| c.contains("fresh-session-token")),
+            "the fresh session must be the cookie that survives: {set_cookies:?}"
+        );
+        Ok(())
+    }
+
+    /// A bad `Authorization` header says nothing about the cookie, so it must
+    /// not delete a working one.
+    ///
+    /// `bearer.or(cookie_token)` means the expired header is the token that gets
+    /// classified while the valid cookie sits untouched on the request.
+    /// Clearing on that basis logs the client out of a session it never asked us
+    /// to end.
+    #[tokio::test]
+    async fn an_expired_bearer_header_does_not_clear_a_valid_cookie() -> anyhow::Result<()> {
+        let (key, enc) = rsa_key("kid-t")?;
+        let server = spawn_jwks(json!({ "keys": [key] })).await;
+
+        let mw = JwtClaimsMiddleware::<TestClaims>::new_with_jks(
+            &format!("{}/jwks", server.uri()),
+            "test-aud",
+            &format!("{}/{{tenantid}}/v2.0", server.uri()),
+        )
+        .await?
+        .with_allowed_tenants(vec!["tenant-guid".to_string()]);
+
+        let svc = actix_web::test::init_service(
+            actix_web::App::new()
+                // Needed so the Authorization header becomes the BearerToken
+                // extension the precedence rule actually reads.
+                .wrap(mw)
+                .wrap(crate::http::middleware::bearer_token::BearerTokenMiddleware)
+                .service(actix_web::web::resource("/protected").to(|| async { "ok" })),
+        )
+        .await;
+
+        let expired = sign_rs256(
+            &json!({
+                "sub": "u9",
+                "aud": "test-aud",
+                "iss": format!("{}/tenant-guid/v2.0", server.uri()),
+                "tid": "tenant-guid",
+                "exp": 1_000_000u64,
+            }),
+            "kid-t",
+            &enc,
+        )?;
+
+        let res = actix_web::test::try_call_service(
+            &svc,
+            actix_web::test::TestRequest::get()
+                .uri("/protected")
+                .insert_header(("Authorization", format!("Bearer {expired}")))
+                .insert_header(("Cookie", "auth_token=still-valid"))
+                .to_request(),
+        )
+        .await
+        .expect("an unusable header degrades rather than erroring");
+
+        let cleared = res.headers().get_all(SET_COOKIE).any(|v| {
+            v.to_str()
+                .is_ok_and(|v| v.starts_with(&format!("{AUTH_COOKIE}=;")))
+        });
+        assert!(
+            !cleared,
+            "a bad Authorization header must not delete an unrelated session cookie"
+        );
         Ok(())
     }
 }
