@@ -111,6 +111,24 @@ pub struct RecordScan<T> {
     pub undecodable: Vec<String>,
 }
 
+/// One step of a paged `fs:files:` walk: the paged counterpart of
+/// [`RecordScan`].
+///
+/// [`FsStore::next_file`] pages rather than collects, so it cannot hand back
+/// the whole family's result in one value -- but it owes its caller the same
+/// thing [`RecordScan`] owes the sweeper, which is the difference between
+/// "this walk read everything" and "this walk stopped early".
+pub(crate) struct FileScan {
+    /// The next file record in key order, or `None` at the end of the walk.
+    pub record: Option<FileRecord>,
+    /// Keys skipped in this step because their value did not decode.
+    ///
+    /// Already logged at `warn!`; a caller that deletes based on absence has
+    /// to sum these across the whole walk and refuse to act while they are
+    /// non-empty.
+    pub undecodable: Vec<String>,
+}
+
 /// Thin wrapper around an `oxkv` LSM store for FS keys.
 #[derive(Clone)]
 pub struct FsStore {
@@ -639,17 +657,22 @@ impl FsStore {
     /// Dumps every raw key-value pair for verbatim replica copies.
     ///
     /// The caller owns filtering: everything present is returned as-is.
-    /// The next finalized file record in key order, or `None` at the end of
-    /// `fs:files:`.
+    /// One step of the walk: the next finalized file record in key order,
+    /// plus whatever that step had to skip.
     ///
     /// Takes the walk rather than creating one so a caller can page through
     /// the whole keyspace while holding at most [`SCAN_PAGE`] records -- the
     /// replica rebuild filters records one at a time and keeps none of them.
     /// The prefix stays private here so the key layout has one owner.
-    pub(crate) async fn next_file(
-        &self,
-        scan: &mut KvPages,
-    ) -> Result<Option<FileRecord>, FsError> {
+    ///
+    /// The unread keys are reported rather than dropped inside the walk,
+    /// for the reason [`RecordScan`] documents: a rebuild diffs this walk
+    /// against the live replica, so a key the walk could not decode is a
+    /// key the desired side does not have, and the merge-join reads that as
+    /// "the master no longer has it" and DELETES it from the replica. The
+    /// caller cannot act on a walk that silently lost rows.
+    pub(crate) async fn next_file(&self, scan: &mut KvPages) -> Result<FileScan, FsError> {
+        let mut undecodable = Vec::new();
         while let Some(kv) = scan.next().await? {
             if !kv.key.starts_with(FILES_PREFIX) || !kv.key.ends_with(FILE_META_SUFFIX) {
                 continue;
@@ -659,17 +682,30 @@ impl FsStore {
             // every other file the user can see. Logged for the same reason --
             // a skipped record is missing from the replica that this walk
             // builds, and nothing downstream can tell that from one that was
-            // never written.
+            // never written. Handed back for the same reason: the one caller
+            // that acts on ABSENCE cannot afford to act on a walk that lost
+            // rows without saying so.
             match serde_json::from_slice::<FileRecord>(&kv.value) {
-                Ok(rec) => return Ok(Some(rec)),
-                Err(e) => tracing::warn!(
-                    key = %kv.key,
-                    error = %e,
-                    "fs file metadata did not decode"
-                ),
+                Ok(rec) => {
+                    return Ok(FileScan {
+                        record: Some(rec),
+                        undecodable,
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        key = %kv.key,
+                        error = %e,
+                        "fs file metadata did not decode"
+                    );
+                    undecodable.push(kv.key);
+                }
             }
         }
-        Ok(None)
+        Ok(FileScan {
+            record: None,
+            undecodable,
+        })
     }
 
     /// The underlying handle, for a paged scan of the whole keyspace.

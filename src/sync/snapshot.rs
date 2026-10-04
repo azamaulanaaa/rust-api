@@ -16,7 +16,7 @@
 //! an `OxKvReader` over the prefix and follow the live manifest.
 
 use crate::fs::error::FsError;
-use crate::fs::store::{FsStore, KvPages};
+use crate::fs::store::{FileScan, FsStore, KvPages};
 use crate::policy::row::RowAuthorizer;
 use crate::policy::{Action, Authorizer};
 use crate::records::WalOp;
@@ -553,6 +553,17 @@ impl SnapshotManager {
     ///
     /// See the module docs for the atomicity contract. Returns the covered
     /// WAL head.
+    ///
+    /// A master file row that does not decode REFUSES the build. The
+    /// filtered walk cannot see it, the merge-join below therefore sees the
+    /// key on the live side only, and takes it as "the master no longer has
+    /// this file" -- so committing would delete that file's metadata row and
+    /// its relation rows from this replica while the master still holds it.
+    /// The gc orphan-byte pass declines to act on the same evidence for the
+    /// same reason ([`crate::fs::gc`]); this is the same input in the
+    /// destructive direction. The replica is left exactly as it was, which
+    /// costs a stale file the user can already see rather than an
+    /// unrecoverable one.
     pub async fn build_full(&self, sub: &str) -> Result<u64, FsError> {
         let head = self.wal.head().await?;
         // Converge the RAM mirror before the bulk scan (no-op unless
@@ -565,7 +576,23 @@ impl SnapshotManager {
             &uuid::Uuid::now_v7().to_string()[..8]
         );
         let scratch = FsStore::new(crate::db::build_scratch_store(&snap_prefix).await);
-        self.copy_filtered(sub, &scratch).await?;
+        let undecodable = self.copy_filtered(sub, &scratch).await?;
+        if !undecodable.is_empty() {
+            // Before anything on the live side is opened, so "refuse" really
+            // does leave the replica alone.
+            tracing::error!(
+                replica = %self.user_prefix(sub),
+                rows = undecodable.len(),
+                "sync refusing to commit a full rebuild: {} master file metadata rows did not \
+                 decode (each is named at WARN), so their keys are absent from the filtered set \
+                 and the diff would delete those files from this replica",
+                undecodable.len()
+            );
+            return Err(FsError::Internal(format!(
+                "full rebuild refused: {} file metadata rows did not decode",
+                undecodable.len()
+            )));
+        }
 
         // One writer, used for three jobs: the live side of the diff, the
         // transaction the diff is staged in, and the handle the commit runs on.
@@ -1064,14 +1091,27 @@ impl SnapshotManager {
     /// visibility check and the attach loop. Previously each file cost
     /// a re-read plus two full-store scans (one inside `can_read`, one
     /// for attach) on top of the listing itself.
-    async fn copy_filtered(&self, sub: &str, dst: &FsStore) -> Result<(), FsError> {
+    ///
+    /// Returns the keys the walk could not decode, which is the caller's
+    /// cue to refuse the diff: `dst` is deliberately INCOMPLETE when this
+    /// is non-empty, and `build_full` diffs it against a live replica.
+    async fn copy_filtered(&self, sub: &str, dst: &FsStore) -> Result<Vec<String>, FsError> {
         // Paged, not collected. `list_files` returns every record in the
         // master as a `Vec<FileRecord>`, which for a large master is the
         // single largest allocation in the rebuild and is entirely
         // unnecessary: the filter below decides per record and keeps none of
         // them. The key layout stays in `fs::store`; this only drives it.
         let mut scan = self.store.pages();
-        while let Some(rec) = self.store.next_file(&mut scan).await? {
+        let mut undecodable = Vec::new();
+        loop {
+            let FileScan {
+                record,
+                undecodable: skipped,
+            } = self.store.next_file(&mut scan).await?;
+            undecodable.extend(skipped);
+            let Some(rec) = record else {
+                break;
+            };
             let rows = self.visible_rows(sub, &rec.id).await?;
             if rec.owner_sub != sub && rows.is_empty() {
                 continue;
@@ -1083,7 +1123,7 @@ impl SnapshotManager {
                 }
             }
         }
-        Ok(())
+        Ok(undecodable)
     }
 
     /// Rows of `file_id` that `sub` may read (each authorized individually).
@@ -1333,6 +1373,101 @@ mod tests {
         assert!(replica_has(&mem, &mgr, "alice", "fs:files:f1:meta").await);
         assert!(!replica_has(&mem, &mgr, "alice", "fs:files:f2:meta").await);
         assert!(replica_has(&mem, &mgr, "alice", "fs:rel:invoice:1:f1").await);
+        Ok(())
+    }
+
+    /// Writes a raw value under `key` in the MASTER store, bypassing every
+    /// typed setter, so a test can plant a row no writer in this crate would
+    /// produce.
+    async fn put_raw(store: &FsStore, key: &str, value: &[u8]) {
+        store
+            .kv_handle()
+            .write()
+            .await
+            .set_bytes(key, value)
+            .await
+            .unwrap();
+    }
+
+    /// An undecodable master row must not delete a file from a replica that
+    /// already has it.
+    ///
+    /// The rebuild is a merge-join: the filtered master walk is the desired
+    /// side, the replica is the live side, and a key present only on the
+    /// live side is deleted. A `fs:files:{id}:meta` row that fails to decode
+    /// is skipped by `next_file`, so the walk cannot see it, so the join
+    /// reads "master no longer has this file" -- and commits the deletion of
+    /// the file's metadata row and its relation rows from the user's replica,
+    /// while the master still holds them. `GET /sync/db/...{id}:meta` then
+    /// 404s for a file the master serves fine.
+    ///
+    /// This is worse than "one file is omitted from one replica": the
+    /// omission is not the outcome, the DELETE is. An earlier lane assessed
+    /// the consequence as an omission, which is right about the master and
+    /// wrong about the replica.
+    ///
+    /// The gc orphan-byte pass reaches the opposite conclusion for the
+    /// identical input and refuses to act on it ("an unreferenced key cannot
+    /// be proven unreferenced", src/fs/gc.rs). `build_full` had no equivalent
+    /// gate and is the destructive direction, so it now refuses the build
+    /// outright: the replica is left exactly as it was.
+    ///
+    /// Reachable without corruption: any field added to `FileRecord` without
+    /// a `#[serde(default)]` undecodes every row the previous version wrote,
+    /// so one ordinary schema change away.
+    ///
+    /// The assertion is both halves. `f1` decodes and is still there, so the
+    /// rebuild is not merely refusing everything; `f2` is the file whose
+    /// master row stopped decoding, and it must survive on the replica. On
+    /// the old behaviour the second build deletes `fs:files:f2:meta` AND
+    /// `fs:rel:invoice:1:f2` from the replica.
+    #[tokio::test]
+    async fn an_undecodable_master_row_cannot_delete_a_file_from_a_replica() -> anyhow::Result<()> {
+        let (mgr, policy, mem) = test_manager().await;
+        policy
+            .add_rule("alice".into(), "invoice:1".into(), Action::Read)
+            .await?;
+        // Both files are alice's and both hang off a row she may read, so
+        // both are in her filtered set on the first build.
+        for id in ["f1", "f2"] {
+            mgr.store.save_file(&file_record(id, "alice")).await?;
+            mgr.store.attach("invoice", "1", id).await?;
+        }
+        assert_eq!(mgr.build_full("alice").await?, 0);
+        assert!(replica_has(&mem, &mgr, "alice", "fs:files:f2:meta").await);
+        assert!(replica_has(&mem, &mgr, "alice", "fs:rel:invoice:1:f2").await);
+
+        // The master row for f2 stops decoding, as it would after a schema
+        // change. The master still HAS the file; only the walk cannot read it.
+        put_raw(&mgr.store, "fs:files:f2:meta", br#"{"id":"f2","size":1"#).await;
+
+        let refused = mgr.build_full("alice").await;
+        assert!(
+            refused.is_err(),
+            "a rebuild over an unreadable master row must not be committed: {refused:?}"
+        );
+        // Nothing was committed, so coverage has not moved...
+        assert_eq!(mgr.load_applied("alice").await?, Some(0));
+        // ...the readable file is still there...
+        assert!(
+            replica_has(&mem, &mgr, "alice", "fs:files:f1:meta").await,
+            "the refusal must not cost the replica the files it CAN read"
+        );
+        // ...and the unreadable one was not deleted from the replica.
+        assert!(
+            replica_has(&mem, &mgr, "alice", "fs:files:f2:meta").await,
+            "the rebuild deleted a file from the replica on the strength of a row it could not read"
+        );
+        assert!(
+            replica_has(&mem, &mgr, "alice", "fs:rel:invoice:1:f2").await,
+            "the rebuild deleted a file's relation rows from the replica as well"
+        );
+
+        // Repaired, the rebuild resumes -- the gate defers, it does not
+        // disable the replica.
+        mgr.store.save_file(&file_record("f2", "alice")).await?;
+        assert_eq!(mgr.build_full("alice").await?, 0);
+        assert!(replica_has(&mem, &mgr, "alice", "fs:files:f2:meta").await);
         Ok(())
     }
 
