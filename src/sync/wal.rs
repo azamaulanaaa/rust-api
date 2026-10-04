@@ -12,6 +12,7 @@ use async_trait::async_trait;
 use oxkv::{GetSet, OxKvStore, Store as _, Transaction as _};
 use tokio::sync::RwLock;
 
+use crate::fencing::Latch;
 use crate::fs::error::FsError;
 use crate::records::{ChangeSink, WalEntry, WalOp};
 
@@ -27,6 +28,20 @@ const WAL_PREFIX: &str = "{db}/wal";
 pub struct Wal {
     store: Arc<RwLock<OxKvStore>>,
     append_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Where a lost epoch on the master change-feed prefix is recorded.
+    ///
+    /// The process-wide latch in production (see
+    /// [`process_latch`](crate::fencing::process_latch)); a test can point
+    /// its own WAL at a private [`Latch`](crate::fencing::Latch) via
+    /// [`with_latch`](Self::with_latch).
+    ///
+    /// Held rather than reached through the free
+    /// [`note_primary_loss`](crate::fencing::note_primary_loss) so the latch
+    /// travels with the feed that owns the prefix -- the same reasoning as
+    /// `FsStore`'s field. `PRIMARY_LOSS` is one-way with no reset, so an
+    /// assertion against it is satisfied by whichever test tripped it
+    /// first, which is every test binary this crate runs.
+    latch: &'static Latch,
 }
 
 impl Wal {
@@ -35,7 +50,20 @@ impl Wal {
         Self {
             store: Arc::new(RwLock::new(s3_store)),
             append_lock: Arc::new(tokio::sync::Mutex::new(())),
+            latch: crate::fencing::process_latch(),
         }
+    }
+
+    /// Records fencing losses on `latch` instead of the process-wide one.
+    ///
+    /// Mirrors `FsStore::primary_with_latch` and `PolicyEngine::with_latch`
+    /// for the same reason: the process latch is one-way and global, so an
+    /// assertion against it passes whether or not the code under test
+    /// latched at all.
+    #[cfg(test)]
+    pub(crate) fn with_latch(mut self, latch: &'static Latch) -> Self {
+        self.latch = latch;
+        self
     }
 
     fn seq_key() -> &'static str {
@@ -62,7 +90,7 @@ impl Wal {
             // terminal for this process -- the same condition `fs` and
             // `policy` report. Replica build races land on a per-user prefix
             // and are not fenced through here.
-            crate::fencing::note_primary_loss(WAL_PREFIX, e.detail());
+            self.latch.trip(WAL_PREFIX, e.detail());
         }
         result
     }
@@ -399,5 +427,102 @@ mod tests {
         seqs.dedup();
         assert_eq!(seqs.len(), 200);
         Ok(())
+    }
+
+    /// A change-feed write that loses the epoch must latch, not just fail.
+    ///
+    /// This is the third of the three primary fencing trip points (`fs` at
+    /// `FsStore`, `policy` at `PolicyEngine`, `sync` here) and the only one
+    /// with no test at all. The trip was reachable only through
+    /// `note_primary_loss`, which nothing here called.
+    ///
+    /// The failure it guards is the one `fencing`'s module docs describe:
+    /// a fenced change-feed write keeps failing as a 500 while `/ready`
+    /// stays 200, because the lease cannot see an uncooperative second
+    /// writer. Replicas then silently stop receiving mutations on a server
+    /// that reports itself healthy.
+    ///
+    /// The store is a real `OxKvStore` driven into `StoreError::Fenced` by
+    /// opening a second session over the same prefix, which CAS-bumps
+    /// `ownership.json` and fences the first -- the same technique as
+    /// `fs::store::tests::fenced_store`, and the only one available here:
+    /// `Wal::new` takes a concrete `OxKvStore`, so
+    /// `policy::adapter::tests::FencedStore` (which wraps a `BTreeStore`)
+    /// cannot be handed to it. Going through a real handle rather than a
+    /// hand-built error is the point: the test has to prove the real commit
+    /// path classifies as a fencing loss, not that a mock can be made to.
+    ///
+    /// The seeding write comes first and matters: `oxkv` treats a write to a
+    /// store with no keys as a no-op in some paths, and the fencing check
+    /// only fires once there is something to commit against.
+    ///
+    /// The latch is a PRIVATE one. `PRIMARY_LOSS` is one-way with no reset
+    /// and `fencing::tests` trips it unconditionally, so asserting against
+    /// the global would pass whether or not this code latched at all.
+    #[tokio::test]
+    async fn a_fenced_change_feed_write_latches() {
+        let prefix = crate::db::test_prefix("wal-fenced");
+        let inner = std::sync::Arc::new(object_store::memory::InMemory::new())
+            as std::sync::Arc<dyn object_store::ObjectStore>;
+        let handle =
+            crate::db::build_test_store_new_session(std::sync::Arc::clone(&inner), &prefix).await;
+        let latch: &'static Latch = Box::leak(Box::new(Latch::new()));
+        let wal = Wal::new(handle).with_latch(latch);
+
+        // Seed through the handle under test, so the fenced commit below has
+        // a real entry to lose.
+        wal.append(WalOp::Attach {
+            row_type: "invoice".into(),
+            row_id: "1".into(),
+            file_id: "f1".into(),
+        })
+        .await
+        .expect("the unfenced feed accepts an append");
+        assert!(!latch.is_tripped(), "a live feed must not latch");
+
+        // A second session over the same prefix takes the epoch: exactly
+        // what an uncooperative second writer does. The holder must outlive
+        // the assertion -- `oxkv` only fences another handle while alive.
+        let _holder =
+            crate::db::build_test_store_new_session(std::sync::Arc::clone(&inner), &prefix).await;
+
+        // Drive `append_entry` rather than the `ChangeSink` impl: that impl
+        // flattens `FsError` into an opaque `anyhow` message for the
+        // producer, which by design carries no classification -- so the
+        // sanitized text cannot show whether this was a fencing loss or a
+        // flaky store. `append_entry` is the layer that decides, and it is
+        // what the latch check below reads.
+        let err = wal
+            .append_entry(WalOp::Attach {
+                row_type: "invoice".into(),
+                row_id: "2".into(),
+                file_id: "f2".into(),
+            })
+            .await
+            .expect_err("a fenced commit cannot succeed");
+
+        // The classification, which the producer turns into a 500 ...
+        assert!(
+            err.is_fencing_loss(),
+            "a fenced change-feed write must be typed as a fencing loss, got: {err:?}"
+        );
+        // ... on the store's own reason, which `detail()` keeps and `Display`
+        // deliberately sanitizes to "internal server error" -- the
+        // classification is what the producer acts on, the detail is what
+        // the log line carries.
+        assert!(
+            err.detail().contains("fenced") || err.detail().contains("epoch"),
+            "the store's fencing reason must survive to the log: {:?}",
+            err.detail()
+        );
+        // ... and the latch, which is what takes the instance out of
+        // rotation. Without it the write fails forever while `/ready` keeps
+        // reporting 200.
+        assert!(
+            latch.is_tripped(),
+            "a fenced change-feed write must latch the fencing signal; \
+             otherwise the lease keeps reporting a healthy master while \
+             every replica stops receiving mutations"
+        );
     }
 }
