@@ -946,10 +946,12 @@ mod tests {
     /// column-0 `#[cfg(test)]` module, with comment lines dropped.
     ///
     /// The attribute is matched at column 0 rather than after `trim_start`,
-    /// unlike the copies in `http::error` and `records`. Those stop at the
-    /// first *indented* `#[cfg(test)]`, which several files carry on an
-    /// inner item; scanning `src` with that variant would truncate the walk
-    /// partway through the files the assertions are about.
+    /// unlike the copies in `http::error` and `records` used to. Those
+    /// stopped at the first *indented* `#[cfg(test)]`, which several files
+    /// carry on an inner item; scanning `src` with that variant truncated
+    /// the walk partway through the files the assertions are about. All
+    /// three now match at column 0 and each is tested directly against a
+    /// fixture carrying an indented attribute mid-file.
     fn production_source(path: &str) -> String {
         let src = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
         let mut out = String::new();
