@@ -512,10 +512,17 @@ impl SnapshotManager {
 
     /// Full object key for `tail` inside the replica.
     ///
-    /// Rejects path traversal (`..`) so the gateway cannot escape the
-    /// replica prefix.
+    /// Rejects path traversal (`..`) and EMPTY path segments. The empty
+    /// interior segment matters because `object_store`'s `Path::from` filters
+    /// empty parts out when it splits on `/` (object_store-0.12.5
+    /// `path/mod.rs`, `from_iter`), so `db/u/{sha}//manifest.json` and
+    /// `db/u/{sha}/manifest.json` are the SAME key to the backend while
+    /// being different strings to this function's caller. Serving the alias
+    /// meant two URLs for one mutable, per-commit object, and the cache
+    /// headers were chosen from the raw tail -- see
+    /// [`crate::sync::route::object_handler`].
     pub fn resolve_object(&self, sub: &str, tail: &str) -> Result<String, FsError> {
-        if tail.is_empty() || tail.split('/').any(|seg| seg == "..") {
+        if tail.split('/').any(|seg| seg.is_empty() || seg == "..") {
             return Err(FsError::BadRequest("invalid object path".into()));
         }
         Ok(format!("{}/{tail}", self.user_prefix(sub)))
@@ -2058,9 +2065,12 @@ mod tests {
         assert_ne!(mgr.user_prefix("a/b"), mgr.user_prefix("a:b"));
         assert_ne!(mgr.user_prefix("a/b"), mgr.user_prefix("a_b"));
         assert_ne!(mgr.user_prefix("alice"), mgr.user_prefix("bob"));
-        // Gateway still confines reads to the replica prefix.
+        // Gateway still confines reads to the replica prefix, and the alias the
+        // empty interior segment created does not exist.
         assert!(mgr.resolve_object("alice", "../escape").is_err());
         assert!(mgr.resolve_object("alice", "a/../../escape").is_err());
         assert!(mgr.resolve_object("alice", "").is_err());
+        assert!(mgr.resolve_object("alice", "/manifest.json").is_err());
+        assert!(mgr.resolve_object("alice", "a//b").is_err());
     }
 }
