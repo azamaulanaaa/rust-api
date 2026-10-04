@@ -74,22 +74,7 @@ impl TryFrom<&Path> for Config {
     /// Reads and parses a TOML config file from `value`, then overlays the
     /// environment onto it.
     fn try_from(value: &Path) -> Result<Self, Self::Error> {
-        if !value.is_file() {
-            return Err(anyhow::anyhow!(
-                "Given path '{:?}' is not a file",
-                value.to_str()
-            ));
-        }
-
-        let content = fs::read_to_string(value).context("Failed to read config file")?;
-        let mut config = Self::parse_toml(&content)?;
-        apply_env_overrides(&mut config);
-        // Re-validate: an environment value reaches the config from outside
-        // the file, and nothing about a `RUST_API_*` variable was checked by
-        // the TOML parser.
-        config.validate().context("Invalid config values")?;
-
-        Ok(config)
+        Self::try_from_with(value, |name| std::env::var(name).ok())
     }
 }
 
@@ -115,20 +100,54 @@ impl Config {
         config.validate().context("Invalid config values")?;
         Ok(config)
     }
+
+    /// The whole loader -- read file, parse, overlay, re-validate -- with the
+    /// environment lookup injected instead of read from the process.
+    ///
+    /// [`TryFrom`] is this with the real environment, and is the only
+    /// production caller. This exists so the loader can be tested end to end
+    /// without `std::env::set_var`, which is process-wide, `unsafe` in Rust
+    /// 2024, and races every other test thread reading the same variable.
+    ///
+    /// The injection matters for MORE than the assertions: re-validation reads
+    /// the overlaid values, so a hostile `RUST_API_*` in the developer's shell
+    /// makes a loader test fail inside `validate()` before any assertion runs.
+    /// See `the_loader_reads_a_file_and_applies_the_overlay`.
+    pub fn try_from_with(
+        value: &Path,
+        var: impl Fn(&str) -> Option<String>,
+    ) -> anyhow::Result<Self> {
+        if !value.is_file() {
+            return Err(anyhow::anyhow!(
+                "Given path '{:?}' is not a file",
+                value.to_str()
+            ));
+        }
+
+        let content = fs::read_to_string(value).context("Failed to read config file")?;
+        let mut config = Self::parse_toml(&content)?;
+        apply_overrides_from(&mut config, var);
+        // Re-validate: an environment value reaches the config from outside
+        // the file, and nothing about a `RUST_API_*` variable was checked by
+        // the TOML parser.
+        config.validate().context("Invalid config values")?;
+
+        Ok(config)
+    }
 }
 
-/// Overlays secret values from the environment onto a parsed config.
+/// Overlays secret values from the environment onto a parsed config, with
+/// the variable lookup supplied by the caller.
 ///
 /// Split from file parsing so precedence is unit-testable without
 /// mutating the process environment (see `prefer_env` tests). The lookup
 /// itself is injected for the same reason: `std::env::set_var` is
 /// process-wide, so a test that sets one races every other test thread
 /// reading the same variable -- and is `unsafe` in Rust 2024 besides.
-fn apply_env_overrides(config: &mut Config) {
-    apply_overrides_from(config, |name| std::env::var(name).ok());
-}
-
-/// [`apply_env_overrides`] with the variable lookup supplied by the caller.
+///
+/// Production reads the real environment through `std::env::var(..).ok()`,
+/// supplied by [`Config::try_from_with`], which is this function's only
+/// call site.
 ///
 /// `var` returns the raw value for `name`, or `None` when unset -- the same
 /// shape `std::env::var(..).ok()` produces.
@@ -957,24 +976,59 @@ mod tests {
         assert_eq!(plain.http.allowed_origins, vec!["https://file.example.com"]);
     }
 
-    /// The overlay is what production reads, and the loader is the only
-    /// caller that goes through the real process environment.
+    /// The overlay is what production reads, so the loader -- read file,
+    /// parse, overlay, re-validate -- is what needs covering.
     ///
-    /// The one test here that still uses `Config::try_from`, deliberately:
-    /// the file-parsing tests above must not, and something has to keep
-    /// covering the loader itself. What it asserts is chosen to be
-    /// environment-INDEPENDENT -- `public_address`, `listen_port` and
-    /// `s3.bucket` have no `RUST_API_*` override -- so it holds whatever the
-    /// developer's shell happens to carry.
+    /// This goes through `try_from_with` rather than `TryFrom`, so the
+    /// environment is injected. That is not only about the assertions: the
+    /// loader RE-VALIDATES after overlaying, so a developer running with
+    /// `RUST_API_CAPABILITY_SECRET` set to anything but 64 hex chars fails
+    /// inside `validate()` before a single assertion executes. Asserting on
+    /// fields with no `RUST_API_*` override is not enough, because validation
+    /// reads the overlaid secret regardless.
     #[test]
     fn the_loader_reads_a_file_and_applies_the_overlay() {
         let path = tmp_toml(&minimal_toml());
-        let cfg = Config::try_from(path.as_path()).expect("the loader accepts a valid file");
-        let _ = std::fs::remove_file(&path);
+        // No variables set: the file's values survive.
+        let plain = Config::try_from_with(path.as_path(), |_| None)
+            .expect("the loader accepts a valid file");
+        assert_eq!(plain.public_address, "https://example.test");
+        assert_eq!(plain.listen_port, 8080);
+        assert_eq!(plain.s3.bucket, "my-bucket");
 
-        assert_eq!(cfg.public_address, "https://example.test");
-        assert_eq!(cfg.listen_port, 8080);
-        assert_eq!(cfg.s3.bucket, "my-bucket");
+        // An overlay wins, and the re-validation sees the overlaid value.
+        let secret = "ab".repeat(32);
+        let overlaid = Config::try_from_with(path.as_path(), |name| match name {
+            ENV_CLIENT_SECRET => Some("from-env".to_string()),
+            ENV_CAPABILITY_SECRET => Some(secret.clone()),
+            _ => None,
+        })
+        .expect("an overlay carrying a valid secret still validates");
+        assert_eq!(overlaid.authorization.client_secret, "from-env");
+        assert_eq!(overlaid.capability.secret.as_deref(), Some(secret.as_str()));
+
+        // An overlay the validator rejects is rejected by the loader, which
+        // is the point of re-validating after the overlay.
+        let rejected = Config::try_from_with(path.as_path(), |name| {
+            (name == ENV_CAPABILITY_SECRET).then(|| "short".to_string())
+        })
+        .expect_err("a bad overlaid secret must not survive validation");
+        assert!(
+            format!("{rejected:?}").contains("capability secret"),
+            "the error names the offending field, got: {rejected:?}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `TryFrom` is the production loader and must still consult the real
+    /// environment; this pins that it delegates rather than inlining a
+    /// different code path.
+    #[test]
+    fn try_from_reads_a_file_that_is_not_there() {
+        let missing = std::path::Path::new("/nonexistent/rust-api-config-test.toml");
+        let err = Config::try_from(missing).expect_err("a missing file is an error");
+        assert!(format!("{err:?}").contains("is not a file"), "got: {err:?}");
     }
 
     #[test]
