@@ -42,11 +42,36 @@ use crate::http::error::ApiError;
 
 /// How long a bucket may go untouched before it is dropped.
 ///
-/// Without this the map grows with every distinct peer address seen, which for
-/// a long-lived process behind IPv6 rotation is a slow leak. Ten minutes is
-/// far longer than any bucket takes to refill, so a dropped bucket is
-/// indistinguishable from a full one.
+/// A background floor, not the bound. Ten minutes is far longer than any
+/// bucket takes to refill, so a dropped bucket is indistinguishable from a
+/// full one -- but an insert path can outrun it: a refused request still
+/// inserts (see [`TokenBucket::take`]), so a client with a routed IPv6
+/// prefix fills the map faster than the window drains it. The hard bound is
+/// [`MAX_TRACKED_PEERS`].
 const IDLE_EVICT: Duration = Duration::from_secs(600);
+
+/// Hard ceiling on how many peers are tracked at once.
+///
+/// The map is keyed by bare peer IP, so its size is chosen by whoever is
+/// sending, and it grows BEFORE any budget check: `take` inserts on the way
+/// to refusing. [`IDLE_EVICT`] cannot be the only bound because the insert
+/// path outruns a ten-minute window with a single burst of distinct source
+/// addresses.
+///
+/// Beyond the cap the LEAST RECENTLY SEEN entry is dropped, rather than the
+/// new one being refused: refusing an unseen peer would let an attacker lock
+/// every legitimate new client out of the limiter for the life of the
+/// process with no way to evict their own entries, and this map exists to
+/// bound cost, not to allocate it. Dropping the coldest entry also preserves
+/// the property [`peer_key`] exists for -- a peer that is still sending keeps
+/// its bucket, and its own budget, instead of being handed a fresh full one
+/// by everyone else's rotation.
+///
+/// A fixed ceiling, not a multiple of the fleet: nothing here can tell a load
+/// balancer's pool of legitimate peers from a rotation, and evicting the
+/// coldest is a better answer to being wrong in either direction than
+/// refusing to track anyone.
+const MAX_TRACKED_PEERS: usize = 4096;
 
 /// A token bucket per key.
 ///
@@ -63,6 +88,27 @@ pub struct TokenBucket {
 struct BucketState {
     tokens: f64,
     last: Instant,
+}
+
+/// Drops the coldest entries until there is room for one more.
+///
+/// Evicts by `last`, so the peer that is still sending keeps its bucket.
+/// Doing this only when a NEW key arrives is what keeps the cost off the
+/// common path: a repeat request from a tracked peer does not scan at all.
+fn make_room(buckets: &mut HashMap<String, BucketState>) {
+    while buckets.len() >= MAX_TRACKED_PEERS {
+        let Some(coldest) = buckets
+            .iter()
+            .min_by_key(|(_, b)| b.last)
+            .map(|(k, _)| k.clone())
+        else {
+            // Unreachable: an empty map is under the cap, and the cap is a
+            // non-zero constant. Written rather than unwrapped because the
+            // crate denies `unwrap`.
+            return;
+        };
+        buckets.remove(&coldest);
+    }
 }
 
 impl TokenBucket {
@@ -86,6 +132,12 @@ impl TokenBucket {
     }
 
     /// Takes one token for `key`, or reports the caller is over budget.
+    ///
+    /// Inserts BEFORE deciding, so a refused request from a never-seen
+    /// address still grows the map. That is deliberate in one direction --
+    /// the alternative lets a client retry into a fresh full bucket -- and
+    /// is exactly why [`MAX_TRACKED_PEERS`] exists rather than a cap on
+    /// spendable tokens.
     pub fn take(&self, key: &str) -> bool {
         if self.is_disabled() {
             return true;
@@ -93,6 +145,12 @@ impl TokenBucket {
         let now = Instant::now();
         let mut buckets = self.buckets.lock().unwrap_or_else(PoisonError::into_inner);
 
+        // Room is made only for a NEW key: an already-tracked entry must keep
+        // its tokens and its `last`, so this must not run for it or every
+        // repeat request would evict a bystander.
+        if !buckets.contains_key(key) {
+            make_room(&mut buckets);
+        }
         let state = buckets.entry(key.to_string()).or_insert(BucketState {
             tokens: self.capacity,
             last: now,
@@ -122,9 +180,12 @@ impl TokenBucket {
     /// Drops buckets untouched for the idle window (ten minutes).
     ///
     /// Called on the request path rather than from a timer: a timer would be
-    /// another background task to own and shut down, and the work is a scan of
-    /// a map that only grows when a *new* peer appears, so amortised over
-    /// requests it is close to free.
+    /// another background task to own and shut down. The scan is bounded by
+    /// [`MAX_TRACKED_PEERS`], because the map cannot be larger than the cap
+    /// -- which is what makes running it per request acceptable, rather than
+    /// the amortisation argument the old comment made. That argument was
+    /// inverted: entries are inserted before the budget check, so the map
+    /// grows with REFUSED requests too, not only with new peers.
     ///
     /// Returns immediately when disabled, which is what makes it acceptable to
     /// leave the middleware installed with a zero limit -- the default -- since
@@ -325,9 +386,12 @@ where
 
     fn call(&self, req: ServiceRequest) -> Self::Future {
         let service = std::rc::Rc::clone(&self.service);
-        // Eviction rides along on the request path: the map only grows when a
-        // *new* peer appears, so it is close to free amortised over requests
-        // and avoids owning another timer to shut down.
+        // Both of these ride along on the request path under the one mutex
+        // `take` also needs, so their cost is paid by every worker in the
+        // process -- including by peers that are over budget and here only
+        // to be refused. The map is capped at `MAX_TRACKED_PEERS` on insert,
+        // and that cap is what bounds both the scan and the eviction it
+        // performs.
         self.bucket.evict_idle();
         if self.bucket.take(&peer_key(req.peer_addr())) {
             let fut = service.call(req);
@@ -397,11 +461,115 @@ mod tests {
             bucket.take(&format!("peer-{i}"));
         }
         assert_eq!(bucket.tracked(), 100);
+        // Nothing has been idle for ten minutes, so eviction must be a no-op
+        // here rather than dropping live buckets on every request.
         bucket.evict_idle();
-        // Nothing has been idle for ten minutes, so eviction is a no-op here.
-        // The point being pinned is that the call exists and is bounded, not
-        // that time passes: a real test would need to age the entries.
         assert_eq!(bucket.tracked(), 100);
+
+        // Age every entry past the window instead of sleeping ten minutes:
+        // `last` is the only thing `evict_idle` reads.
+        let mut buckets = bucket.buckets.lock().unwrap();
+        for state in buckets.values_mut() {
+            state.last -= IDLE_EVICT + Duration::from_secs(1);
+        }
+        drop(buckets);
+        bucket.evict_idle();
+        assert_eq!(
+            bucket.tracked(),
+            0,
+            "entries untouched for longer than the window must be dropped"
+        );
+    }
+
+    /// The map is bounded by COUNT, not only by idle time.
+    ///
+    /// This is the regression: `evict_idle` was the only bound, and its
+    /// amortisation argument was inverted. `take` inserts on the way to
+    /// REFUSING, so a client rotating through a routed IPv6 prefix grows
+    /// the map with every request it is turned away for -- and nothing is
+    /// dropped for ten minutes. Reaching the cap here needs
+    /// `MAX_TRACKED_PEERS + 500` distinct keys rather than a ten-minute
+    /// wait, which is the shape the old code could not survive: it asserted
+    /// only that eviction left a freshly-filled map alone, which is true
+    /// whether or not the map is bounded at all.
+    ///
+    /// Fails on the pre-fix code with `tracked() == MAX_TRACKED_PEERS + 500`.
+    #[test]
+    fn the_map_stays_bounded_when_peers_outrun_the_idle_window() {
+        let bucket = TokenBucket::new(1, 60);
+        for i in 0..MAX_TRACKED_PEERS + 500 {
+            // Most of these are REFUSED: capacity 1, one call per key, so the
+            // first key drains its bucket and the rest are all over budget --
+            // which is the path that inserts and is therefore the one the
+            // bound has to cover.
+            bucket.take(&format!("peer-{i}"));
+            bucket.evict_idle();
+        }
+        assert!(
+            bucket.tracked() <= MAX_TRACKED_PEERS,
+            "tracked {} peers past a cap of {MAX_TRACKED_PEERS}",
+            bucket.tracked(),
+        );
+    }
+
+    /// The cap evicts the COLDEST entry, so an active peer is not punished
+    /// for someone else's rotation.
+    ///
+    /// Refusing the new key instead would hand any attacker who fills the map
+    /// a way to lock every legitimate first-time client out of the limiter for
+    /// the life of the process.
+    #[test]
+    fn the_cap_evicts_the_coldest_peer_not_the_new_one() {
+        let bucket = TokenBucket::new(10, 60);
+        bucket.take("cold");
+        {
+            let mut buckets = bucket.buckets.lock().unwrap();
+            buckets.get_mut("cold").expect("bucket exists").last -= Duration::from_secs(3600);
+        }
+        // Fill to the cap so "cold" is the only candidate, then overflow once.
+        for i in 0..MAX_TRACKED_PEERS - 1 {
+            bucket.take(&format!("peer-{i}"));
+        }
+        assert_eq!(bucket.tracked(), MAX_TRACKED_PEERS);
+        assert!(bucket.take("newcomer"));
+        assert!(
+            bucket.available("newcomer") < 10.0,
+            "the new peer must be tracked, not refused for lack of room"
+        );
+        assert_eq!(
+            bucket.tracked(),
+            MAX_TRACKED_PEERS,
+            "and the map must not have grown past the cap"
+        );
+    }
+
+    /// A peer that is ALREADY tracked is not evicted by its own repeat
+    /// request, and keeps its budget across the overflow.
+    ///
+    /// Room is made before the insert, so an implementation that does not
+    /// check for an existing key evicts a bystander on every single request
+    /// once the map is at the cap -- turning the limiter into a source of
+    /// free budget for anyone sending fast enough.
+    #[test]
+    fn a_tracked_peer_keeps_its_budget_across_the_overflow() {
+        let bucket = TokenBucket::new(10, 60);
+        for i in 0..MAX_TRACKED_PEERS {
+            bucket.take(&format!("peer-{i}"));
+        }
+        assert!(bucket.take("busy"), "first request spends a token");
+        for _ in 0..200 {
+            bucket.take("busy");
+        }
+        assert_eq!(
+            bucket.tracked(),
+            MAX_TRACKED_PEERS,
+            "repeat requests must not evict anything"
+        );
+        assert!(
+            bucket.available("busy") < 10.0,
+            "a tracked peer must keep accruing its own debt, not be handed \
+             fresh tokens by evicting itself"
+        );
     }
 
     #[tokio::test]
