@@ -88,6 +88,29 @@ pub struct PersistedMultipart {
 /// `sync` has to read it without importing the whole `fs` module.
 pub use crate::records::FileRecord;
 
+/// What a metadata scan read, and what it could not read.
+///
+/// `fs:files:`/`fs:uploads:` is the only map from S3 bytes back to the rows
+/// that reference them, so a row that fails to decode is not a harmless gap.
+/// Any caller that reads "no record mentions this key" as "these bytes are
+/// garbage" will delete the object of a record it merely could not parse,
+/// and nothing else in the store can repair that: the metadata row survives
+/// and every download 404s forever.
+///
+/// So the unread keys are carried out of the scan instead of being dropped
+/// inside it. A caller that deletes based on absence can then refuse to act
+/// while the set is non-empty.
+#[derive(Debug, Clone)]
+pub struct RecordScan<T> {
+    /// Every record in the key family that decoded, in scan order.
+    pub records: Vec<T>,
+    /// Keys in the family whose value did not decode, in scan order.
+    ///
+    /// Already logged at `warn!`; kept here so a sweeper can act on the
+    /// fact that the scan was incomplete.
+    pub undecodable: Vec<String>,
+}
+
 /// Thin wrapper around an `oxkv` LSM store for FS keys.
 #[derive(Clone)]
 pub struct FsStore {
@@ -540,30 +563,55 @@ impl FsStore {
     }
 
     /// Lists all finalized file records (scan bounded to `fs:files:`).
-    pub async fn list_files(&self) -> Result<Vec<FileRecord>, FsError> {
+    ///
+    /// A row that will not decode is skipped rather than fatal: one bad
+    /// record must not stop a rebuild for every other file the user can
+    /// see. It is *reported* rather than dropped, because the skip is
+    /// invisible everywhere else -- a record missing from this list looks
+    /// exactly like a record that was never written, and the orphan-byte
+    /// sweeper deletes objects on precisely that inference.
+    pub async fn list_files(&self) -> Result<RecordScan<FileRecord>, FsError> {
         let kvs = self.scan_prefix(FILES_PREFIX).await?;
-        let mut out = Vec::new();
+        let mut out = RecordScan {
+            records: Vec::new(),
+            undecodable: Vec::new(),
+        };
         for kv in kvs {
-            if kv.key.starts_with(FILES_PREFIX)
-                && kv.key.ends_with(FILE_META_SUFFIX)
-                && let Ok(r) = serde_json::from_slice::<FileRecord>(&kv.value)
-            {
-                out.push(r);
+            if !kv.key.starts_with(FILES_PREFIX) || !kv.key.ends_with(FILE_META_SUFFIX) {
+                continue;
+            }
+            match serde_json::from_slice::<FileRecord>(&kv.value) {
+                Ok(r) => out.records.push(r),
+                Err(e) => {
+                    tracing::warn!(key = %kv.key, error = %e, "fs file metadata did not decode");
+                    out.undecodable.push(kv.key);
+                }
             }
         }
         Ok(out)
     }
 
     /// Lists all upload sessions (scan bounded to `fs:uploads:`).
-    pub async fn list_sessions(&self) -> Result<Vec<UploadSession>, FsError> {
+    ///
+    /// Skips and reports undecodable rows under the same contract as
+    /// [`FsStore::list_files`]: a session that cannot be listed is a
+    /// session the sweeper will never expire.
+    pub async fn list_sessions(&self) -> Result<RecordScan<UploadSession>, FsError> {
         let kvs = self.scan_prefix("fs:uploads:").await?;
-        let mut out = Vec::new();
+        let mut out = RecordScan {
+            records: Vec::new(),
+            undecodable: Vec::new(),
+        };
         for kv in kvs {
-            if kv.key.starts_with("fs:uploads:")
-                && kv.key.ends_with(":meta")
-                && let Ok(s) = serde_json::from_slice::<UploadSession>(&kv.value)
-            {
-                out.push(s);
+            if !kv.key.starts_with("fs:uploads:") || !kv.key.ends_with(":meta") {
+                continue;
+            }
+            match serde_json::from_slice::<UploadSession>(&kv.value) {
+                Ok(s) => out.records.push(s),
+                Err(e) => {
+                    tracing::warn!(key = %kv.key, error = %e, "fs upload session did not decode");
+                    out.undecodable.push(kv.key);
+                }
             }
         }
         Ok(out)
@@ -589,9 +637,17 @@ impl FsStore {
             }
             // A record that will not decode is skipped rather than fatal, the
             // same as `list_files`: one bad row must not stop a rebuild for
-            // every other file the user can see.
-            if let Ok(rec) = serde_json::from_slice::<FileRecord>(&kv.value) {
-                return Ok(Some(rec));
+            // every other file the user can see. Logged for the same reason --
+            // a skipped record is missing from the replica that this walk
+            // builds, and nothing downstream can tell that from one that was
+            // never written.
+            match serde_json::from_slice::<FileRecord>(&kv.value) {
+                Ok(rec) => return Ok(Some(rec)),
+                Err(e) => tracing::warn!(
+                    key = %kv.key,
+                    error = %e,
+                    "fs file metadata did not decode"
+                ),
             }
         }
         Ok(None)
@@ -1200,7 +1256,7 @@ mod tests {
         // warm, depending on what compacted); reads then serve correctly.
         assert!(mirrored.refresh_mirror().await? > 0);
         assert_eq!(mirrored.get_file("mirror-1").await?.unwrap().name, "m.txt");
-        assert_eq!(mirrored.list_files().await?.len(), 1);
+        assert_eq!(mirrored.list_files().await?.records.len(), 1);
         assert_eq!(
             mirrored.rows_for_file("mirror-1").await?,
             vec![("invoice".to_string(), "7".to_string())]
@@ -1225,7 +1281,7 @@ mod tests {
     #[tokio::test]
     async fn list_sessions_filters_and_deserializes() -> anyhow::Result<()> {
         let store = test_store().await;
-        assert!(store.list_sessions().await?.is_empty());
+        assert!(store.list_sessions().await?.records.is_empty());
         let s1 = sample_session("list-a");
         let mut s2 = sample_session("list-b");
         s2.file_total_parts = 2;
@@ -1243,7 +1299,7 @@ mod tests {
             created_at: 0,
         };
         store.save_file(&rec).await?;
-        let mut sessions = store.list_sessions().await?;
+        let mut sessions = store.list_sessions().await?.records;
         sessions.sort_by(|a, b| a.id.cmp(&b.id));
         assert_eq!(sessions.len(), 2);
         assert_eq!(sessions[0].id, "list-a");

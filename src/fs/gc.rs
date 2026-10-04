@@ -10,6 +10,7 @@ use std::{collections::HashSet, sync::Arc, time::Duration};
 use tokio::time::interval;
 
 use crate::fs::FsEngine;
+use crate::fs::store::RecordScan;
 
 /// Object prefix holding file bytes (`UploadSession`/`FileRecord` keys
 /// are `files/{id}`); the orphan-byte pass lists exactly this scope so
@@ -38,8 +39,14 @@ pub async fn sweep_once(engine: &FsEngine) -> Result<usize, crate::fs::error::Fs
     let now = chrono::Utc::now().timestamp();
     let mut cleaned = 0;
 
-    let sessions = engine.store.list_sessions().await?;
-    let files = engine.store.list_files().await?;
+    let RecordScan {
+        records: sessions,
+        undecodable: unread_sessions,
+    } = engine.store.list_sessions().await?;
+    let RecordScan {
+        records: files,
+        undecodable: unread_files,
+    } = engine.store.list_files().await?;
 
     // sessions
     for s in &sessions {
@@ -103,40 +110,56 @@ pub async fn sweep_once(engine: &FsEngine) -> Result<usize, crate::fs::error::Fs
     // orphan S3 bytes: listed keys no session or file record references.
     // Crash windows between byte and metadata writes strand such keys;
     // only reap them past the TTL so in-flight uploads always survive.
-    // A listing failure skips just this pass (metadata work above stands).
-    let mut live: HashSet<&str> = HashSet::new();
-    for s in &sessions {
-        live.insert(s.s3_key.as_str());
-    }
-    for f in &files {
-        live.insert(f.s3_key.as_str());
-    }
-    let listed = match engine.s3.list_keys(&engine.bucket, FILE_BYTES_PREFIX).await {
-        Ok(keys) => keys,
-        Err(e) => {
-            tracing::warn!("fs gc orphan-byte listing failed: {e}; skipping pass");
-            Vec::new()
+    //
+    // The liveness set below is built from the two scans above, so a row
+    // either of them could not decode is a key whose bytes *look*
+    // unreferenced when they are not -- the delete is irreversible and the
+    // metadata row stays put, so every later download of that file 404s
+    // forever. Proving a key unreferenced needs a complete scan, so an
+    // incomplete one skips the whole pass: leaking the bytes costs
+    // storage, taking them costs the file.
+    let unread = unread_sessions.len() + unread_files.len();
+    if unread > 0 {
+        tracing::warn!(
+            "fs gc skipping orphan-byte pass: {unread} metadata rows did not decode, so an \
+             unreferenced key cannot be proven unreferenced"
+        );
+    } else {
+        let mut live: HashSet<&str> = HashSet::new();
+        for s in &sessions {
+            live.insert(s.s3_key.as_str());
         }
-    };
-    for entry in listed {
-        if live.contains(entry.key.as_str()) || now - entry.last_modified <= TTL_SECS {
-            continue;
+        for f in &files {
+            live.insert(f.s3_key.as_str());
         }
-        tracing::info!("fs gc expiring orphan bytes {}", entry.key);
-        if engine
-            .s3
-            .delete_object(&engine.bucket, &entry.key)
-            .await
-            .map_err(|e| {
-                tracing::warn!("gc delete {} failed: {e}", entry.key);
-                e
-            })
-            .is_err()
-        {
-            tracing::warn!("fs gc keeping orphan bytes {} for retry", entry.key);
-            continue;
+        // A listing failure skips just this pass (metadata work above stands).
+        let listed = match engine.s3.list_keys(&engine.bucket, FILE_BYTES_PREFIX).await {
+            Ok(keys) => keys,
+            Err(e) => {
+                tracing::warn!("fs gc orphan-byte listing failed: {e}; skipping pass");
+                Vec::new()
+            }
+        };
+        for entry in listed {
+            if live.contains(entry.key.as_str()) || now - entry.last_modified <= TTL_SECS {
+                continue;
+            }
+            tracing::info!("fs gc expiring orphan bytes {}", entry.key);
+            if engine
+                .s3
+                .delete_object(&engine.bucket, &entry.key)
+                .await
+                .map_err(|e| {
+                    tracing::warn!("gc delete {} failed: {e}", entry.key);
+                    e
+                })
+                .is_err()
+            {
+                tracing::warn!("fs gc keeping orphan bytes {} for retry", entry.key);
+                continue;
+            }
+            cleaned += 1;
         }
-        cleaned += 1;
     }
 
     if cleaned > 0 {
@@ -159,6 +182,7 @@ mod tests {
     use crate::fs::store::{FileRecord, FsStore, PersistedMultipart, UploadSession};
     use crate::policy::PolicyEngine;
     use bytes::Bytes;
+    use tracing_subscriber::layer::SubscriberExt as _;
 
     async fn make_engine() -> FsEngine {
         let prefix = crate::db::test_prefix("gc");
@@ -536,6 +560,179 @@ mod tests {
                 .await?
                 .is_none()
         );
+        Ok(())
+    }
+
+    /// Writes a raw value under `key`, bypassing every typed setter, so a
+    /// test can plant a row no writer in this crate would produce.
+    async fn put_raw(store: &FsStore, key: &str, value: &[u8]) {
+        use oxkv::GetSet as _;
+        store
+            .kv_handle()
+            .write()
+            .await
+            .set_bytes(key, value)
+            .await
+            .expect("raw write");
+    }
+
+    /// [`std::io::Write`] sink sharing one buffer with the subscriber.
+    #[derive(Clone)]
+    struct SharedBuf(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for SharedBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("log buffer").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Captures `tracing` output for the body, at `WARN` and above.
+    ///
+    /// Returns the buffer the subscriber writes into and the guard that
+    /// keeps it installed. `set_default` is thread-local, and a
+    /// `#[tokio::test]` runs the sweep on the calling thread, so this sees
+    /// the sweeper's own events.
+    fn capture_warnings() -> (
+        Arc<std::sync::Mutex<Vec<u8>>>,
+        tracing::subscriber::DefaultGuard,
+    ) {
+        let buf = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&buf);
+        let layer = tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer(move || SharedBuf(Arc::clone(&sink)));
+        let guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(layer));
+        (buf, guard)
+    }
+
+    /// A row that will not decode must not cost the file whose bytes it
+    /// describes.
+    ///
+    /// The sweep builds its liveness set from `list_files`/`list_sessions`,
+    /// and an undecodable row is absent from both. Before the fix that made
+    /// its object indistinguishable from a crash-stranded one: aged past the
+    /// TTL, unreferenced by the *scan*, so the orphan-byte pass deleted the
+    /// real S3 object while the metadata row it belongs to stayed put. The
+    /// file was then permanently 404, out of a metadata problem that had a
+    /// one-line fix.
+    ///
+    /// Reachable without corruption too -- any field added to `FileRecord`
+    /// without a `#[serde(default)]` undecodes every row the previous
+    /// version wrote, so this is one ordinary schema change away.
+    ///
+    /// The assertion is that *no* object is deleted. The `files/good` row
+    /// decodes and is fresh, so it is legitimately not collectable either;
+    /// only `files/bad` distinguishes the two behaviours.
+    #[tokio::test]
+    async fn sweep_never_deletes_bytes_of_an_undecodable_metadata_row() -> anyhow::Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        let s3 = Arc::new(FakeS3::new(
+            vec![
+                ListedKey {
+                    key: "files/good".into(),
+                    last_modified: now - TTL_SECS - 3600,
+                },
+                ListedKey {
+                    key: "files/bad".into(),
+                    last_modified: now - TTL_SECS - 3600,
+                },
+            ],
+            true,
+        ));
+        let prefix = crate::db::test_prefix("gc-undecodable");
+        let store = FsStore::new(build_test_store(&prefix).await);
+        let policy = PolicyEngine::init_s3(build_test_store(&format!("{prefix}-p")).await).await?;
+        let engine = FsEngine::from_parts(store, s3.clone(), "b".into(), policy.authorizer());
+
+        // Fresh, unreferenced, unexpired: the sweep has no cause to delete
+        // the bytes this record points at.
+        engine
+            .store
+            .save_file(&FileRecord {
+                id: "good".into(),
+                name: "g.txt".into(),
+                mimetype: "text/plain".into(),
+                size: 4,
+                s3_key: "files/good".into(),
+                owner_sub: "alice".into(),
+                created_at: now,
+            })
+            .await?;
+        // The row whose bytes must survive, with a value nothing decodes.
+        put_raw(
+            &engine.store,
+            "fs:files:bad:meta",
+            br#"{"id":"bad","size":4,"s3_key":"files/bad","created_at":1"#,
+        )
+        .await;
+
+        let (log, _guard) = capture_warnings();
+        assert_eq!(sweep_once(&engine).await?, 0);
+        assert_eq!(
+            s3.deleted(),
+            Vec::<String>::new(),
+            "the sweep deleted an object whose metadata row it could not read"
+        );
+
+        // ...and the skip is visible, so this is diagnosable rather than a
+        // silent leak: both the key and the refused pass are named.
+        let logs = String::from_utf8(log.lock().expect("log buffer").clone()).expect("utf8");
+        assert!(
+            logs.contains("fs:files:bad:meta"),
+            "the undecodable key was never logged:\n{logs}"
+        );
+        assert!(
+            logs.contains("skipping orphan-byte pass"),
+            "the refused pass was not logged:\n{logs}"
+        );
+        Ok(())
+    }
+
+    /// Once every row decodes, the pass resumes -- the fix defers, it does
+    /// not disable the orphan-byte sweep.
+    #[tokio::test]
+    async fn orphan_byte_resumes_after_the_undecodable_row_decodes() -> anyhow::Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        let s3 = Arc::new(FakeS3::new(
+            vec![ListedKey {
+                key: "files/stray".into(),
+                last_modified: now - TTL_SECS - 3600,
+            }],
+            true,
+        ));
+        let prefix = crate::db::test_prefix("gc-undecodable-fixed");
+        let store = FsStore::new(build_test_store(&prefix).await);
+        let policy = PolicyEngine::init_s3(build_test_store(&format!("{prefix}-p")).await).await?;
+        let engine = FsEngine::from_parts(store, s3.clone(), "b".into(), policy.authorizer());
+
+        put_raw(&engine.store, "fs:files:bad:meta", b"not json").await;
+        assert_eq!(sweep_once(&engine).await?, 0);
+        assert!(s3.deleted().is_empty());
+
+        put_raw(&engine.store, "fs:files:bad:meta", b"not json").await;
+        // Repaired: the row decodes again, so the sweep can prove
+        // `files/stray` is unreferenced and reap it on this same pass.
+        let repaired = FileRecord {
+            id: "bad".into(),
+            name: "b.txt".into(),
+            mimetype: "text/plain".into(),
+            size: 1,
+            s3_key: "files/other".into(),
+            owner_sub: "alice".into(),
+            created_at: now,
+        };
+        put_raw(
+            &engine.store,
+            "fs:files:bad:meta",
+            &serde_json::to_vec(&repaired)?,
+        )
+        .await;
+        assert_eq!(sweep_once(&engine).await?, 1);
+        assert_eq!(s3.deleted(), vec!["files/stray".to_string()]);
         Ok(())
     }
 
