@@ -293,7 +293,7 @@ async fn object_handler(
     // by forging it, and the manifest cannot be served immutable by hiding a
     // slash.
     let object_path = object_store::path::Path::from(key.as_str());
-    let is_manifest = object_path.filename() == Some(MANIFEST_OBJECT);
+    let is_manifest = is_manifest_key(&object_path);
 
     // Taken before the object store is touched, so a refused request costs one
     // `get` at most rather than a whole segment read.
@@ -334,6 +334,22 @@ async fn object_handler(
         return Ok(object_not_modified(etag.as_deref(), is_manifest));
     }
     object_response(out, is_manifest, etag, size, permit)
+}
+
+/// Whether this object is the per-subject replica MANIFEST.
+///
+/// Derived from the RESOLVED key rather than the raw request tail. The two
+/// can disagree: `resolve_object` used to accept an empty interior segment,
+/// so `GET /sync/db//manifest.json` reached the real manifest through a
+/// different spelling, and keying the mutable/immutable decision off the raw
+/// tail served that manifest `immutable, max-age=31536000`. `resolve_object`
+/// now rejects empty segments as well, but deriving from the resolved key is
+/// the property that actually holds, and this is the only place it lives.
+///
+/// `Path::from` drops empty segments and normalises separators, so
+/// `filename()` is the last segment of what the backend will actually serve.
+fn is_manifest_key(path: &object_store::path::Path) -> bool {
+    path.filename() == Some(MANIFEST_OBJECT)
 }
 
 /// The `200` response for one replica object, streaming `out`.
@@ -1184,12 +1200,11 @@ mod tests {
             ("test-db/u/abc/not-manifest.json", false),
             ("test-db/u/abc/manifest.json.bak", false),
         ] {
+            // Through the SAME function `object_handler` calls, so
+            // reverting the derivation in production fails this test rather
+            // than leaving it green while the inversion is reintroduced.
             let path = object_store::path::Path::from(key);
-            assert_eq!(
-                path.filename() == Some(MANIFEST_OBJECT),
-                expect_manifest,
-                "{key}"
-            );
+            assert_eq!(is_manifest_key(&path), expect_manifest, "{key}");
         }
     }
 }
