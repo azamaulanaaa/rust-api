@@ -67,7 +67,6 @@ pub struct SnapshotManager {
 }
 
 /// One subject's queued rebuild.
-#[derive(Debug, Clone)]
 pub struct BuildJob {
     /// Stable hash of the OIDC subject; see [`SnapshotManager::user_prefix`].
     sub: String,
@@ -77,6 +76,29 @@ pub struct BuildJob {
     /// building, so a job that waited behind a long build covers *more* than
     /// this rather than less.
     head: u64,
+    /// The in-flight slot, carried with the job.
+    ///
+    /// The slot is released when the job is dropped, so it is held across the
+    /// queue wait, across the build, and through a worker that dies mid-build
+    /// -- none of which can leave the subject permanently marked in flight.
+    /// Underscored because the field is load-bearing only through
+    /// [`BuildClaim`]'s `Drop`, never through access.
+    _claim: BuildClaim,
+}
+
+impl BuildJob {
+    /// Stable hash of the OIDC subject; see [`SnapshotManager::user_prefix`].
+    pub fn sub(&self) -> &str {
+        &self.sub
+    }
+
+    /// WAL head observed when the job was queued.
+    ///
+    /// Advisory: a worker re-reads the head before building, so the returned
+    /// value is what was observed when the job was queued, not what it is now.
+    pub fn head(&self) -> u64 {
+        self.head
+    }
 }
 
 /// Tracks which subjects have a rebuild in flight, and hands work to the
@@ -103,6 +125,41 @@ pub struct BuildQueue {
     jobs: tokio::sync::mpsc::UnboundedSender<BuildJob>,
 }
 
+/// A held in-flight slot, released when dropped.
+///
+/// A `Drop` guard rather than a call every holder must remember, and the
+/// reason is that the holders are droppable futures. `advance` is driven by
+/// `POST /sync/sync`, whose handler future the client may drop at any
+/// `.await` inside `replay` -- `wal.range`, `open_writer`, the per-op
+/// `apply_op` loop. Under a manual `release` on a separate code path, a
+/// disconnect mid-replay left the subject inserted with no release ever
+/// executed, and every subsequent `advance` for it took the `!claim(sub)`
+/// branch: `{applied_seq: <stale>, pending: true}`, the one path that never
+/// re-checks or re-queues. The replica froze at its old coverage for the life
+/// of the process, with no error logged and no recovery short of a restart.
+///
+/// The worker has the same shape for a different reason: `release` ran only
+/// if `build_full` RETURNED, so a panic inside it both leaked the claim and
+/// killed the task holding it. Carrying the guard in the [`BuildJob`]
+/// releases it when the job is dropped, however that happens.
+pub struct BuildClaim {
+    queue: std::sync::Arc<BuildQueue>,
+    sub: String,
+}
+
+impl BuildClaim {
+    /// The subject whose slot this guard holds.
+    fn sub(&self) -> &str {
+        &self.sub
+    }
+}
+
+impl Drop for BuildClaim {
+    fn drop(&mut self) {
+        self.queue.inflight().remove(&self.sub);
+    }
+}
+
 impl BuildQueue {
     /// Creates a queue and the receiving end its pool will drain.
     pub fn new() -> (Self, tokio::sync::mpsc::UnboundedReceiver<BuildJob>) {
@@ -118,14 +175,26 @@ impl BuildQueue {
 
     /// Takes the single in-flight slot for `sub`, or reports it is taken.
     ///
-    /// `false` means another request or worker is already advancing this
-    /// user's replica, which is the coalescing case rather than an error: the
-    /// caller reports current coverage and lets the client poll.
-    fn claim(&self, sub: &str) -> bool {
-        self.inflight().insert(sub.to_string())
+    /// `None` means another request or worker is already advancing this
+    /// user's replica, which is the coalescing case rather than an error:
+    /// the caller reports current coverage and lets the client poll.
+    ///
+    /// Takes `self` by `Arc` so the returned [`BuildClaim`] can keep the
+    /// queue alive in order to release through it; a guard holding a borrow
+    /// would not outlive the call that produced it.
+    fn claim(self: &std::sync::Arc<Self>, sub: &str) -> Option<BuildClaim> {
+        self.inflight().insert(sub.to_string()).then(|| BuildClaim {
+            queue: std::sync::Arc::clone(self),
+            sub: sub.to_string(),
+        })
     }
 
-    /// Releases the slot. The caller must hold a claim from [`Self::claim`].
+    /// Releases the slot for `sub` without holding a guard.
+    ///
+    /// Test-only: every production holder now owns a [`BuildClaim`], which
+    /// releases through `Drop`. This stands in for a worker finishing its job,
+    /// without inventing a guard that is not actually held across anything.
+    #[cfg(test)]
     fn release(&self, sub: &str) {
         self.inflight().remove(sub);
     }
@@ -145,22 +214,24 @@ impl BuildQueue {
 
     /// Hands a claimed subject to the worker pool.
     ///
-    /// Returns `false` if no pool is draining the queue, in which case the
-    /// claim is released so the next request retries rather than leaving the
-    /// subject permanently marked in-flight and never rebuilt.
-    fn dispatch(&self, sub: &str, head: u64) -> bool {
-        if self
-            .jobs
+    /// Takes the [`BuildClaim`] by value and moves it into the job, so the
+    /// slot is held across the queue wait rather than being released the
+    /// moment the request returns -- otherwise a burst of polls between
+    /// `send` and the worker picking the job up would queue duplicates, which
+    /// is the coalescing the in-flight set exists for.
+    ///
+    /// Returns `false` if no pool is draining the queue. The `BuildJob` comes
+    /// back inside the `SendError` and is dropped with it, releasing the
+    /// claim, so the next request retries rather than leaving the subject
+    /// permanently marked in-flight and never rebuilt.
+    fn dispatch(&self, claim: BuildClaim, head: u64) -> bool {
+        self.jobs
             .send(BuildJob {
-                sub: sub.to_string(),
+                sub: claim.sub().to_string(),
                 head,
+                _claim: claim,
             })
             .is_ok()
-        {
-            return true;
-        }
-        self.release(sub);
-        false
     }
 }
 
@@ -204,22 +275,22 @@ impl BuildPool {
                     let Some(job) = job else { break };
                     // The request that queued this has already returned, so the
                     // log is the only remaining channel for a failure. The
-                    // slot is released either way, so the next `advance`
-                    // retries rather than finding the subject wedged.
-                    let result = manager.build_full(&job.sub).await;
+                    // slot travels with `job` and is released when it drops,
+                    // so the next `advance` retries rather than finding the
+                    // subject wedged -- including if this task unwinds.
+                    let result = manager.build_full(job.sub()).await;
                     if let Err(e) = &result {
                         tracing::warn!(
                             "background replica rebuild for {} failed: {e}",
-                            manager.user_prefix(&job.sub)
+                            manager.user_prefix(job.sub())
                         );
                     }
                     tracing::debug!(
                         "rebuild worker {worker} finished {} (queued at head {}, now {})",
-                        job.sub,
-                        job.head,
+                        job.sub(),
+                        job.head(),
                         result.unwrap_or_default()
                     );
-                    manager.builds.release(&job.sub);
                 }
             });
         }
@@ -354,6 +425,12 @@ impl SnapshotManager {
     /// Concurrent calls for the same subject collapse to one: the second
     /// returns the current coverage as `pending` rather than queueing a
     /// duplicate scan. Different subjects are independent.
+    ///
+    /// The claim is a [`BuildClaim`] held for the whole body, so a client
+    /// that disconnects mid-replay releases the slot on the way out. A manual
+    /// `release` on a separate code path leaked it permanently, wedging this
+    /// subject on the `pending: true` short-circuit below for the life of the
+    /// process.
     pub async fn advance(&self, sub: &str) -> Result<AdvanceOutcome, FsError> {
         let head = self.wal.head().await?;
         let applied = self.load_applied(sub).await?;
@@ -367,25 +444,27 @@ impl SnapshotManager {
         }
 
         // No claim means someone else is already advancing this subject.
-        if !self.builds.claim(sub) {
+        let Some(claim) = self.builds.claim(sub) else {
             return Ok(AdvanceOutcome {
                 applied_seq: applied.unwrap_or_default(),
                 pending: true,
             });
-        }
+        };
 
         match self.replay(head, sub).await {
             Ok(ReplayOutcome::Advanced(seq)) => {
-                self.builds.release(sub);
+                drop(claim);
                 Ok(AdvanceOutcome {
                     applied_seq: seq,
                     pending: false,
                 })
             }
             Ok(ReplayOutcome::NeedsFullRebuild) => {
-                // The claim is handed to the pool, which releases it when the
-                // build finishes.
-                if !self.builds.dispatch(sub, head) {
+                // The claim moves into the queue with the job, so the slot
+                // stays held until the pool is finished with it. `dispatch`
+                // takes it by value and drops it with the `SendError` when no
+                // pool is draining, so the release happens on both paths.
+                if !self.builds.dispatch(claim, head) {
                     // No pool is draining the queue, so nothing will ever run
                     // this build and every future poll for this subject queues
                     // another. That is a deployment mistake -- `BuildPool::spawn`
@@ -408,14 +487,14 @@ impl SnapshotManager {
             // same recovery the full-rebuild path used before it moved into
             // the pool.
             Err(e) if e.is_fencing_loss() => {
-                self.builds.release(sub);
+                drop(claim);
                 Ok(AdvanceOutcome {
                     applied_seq: self.load_applied(sub).await?.ok_or(e)?,
                     pending: false,
                 })
             }
             Err(e) => {
-                self.builds.release(sub);
+                drop(claim);
                 Err(e)
             }
         }
@@ -1290,9 +1369,19 @@ mod tests {
     /// discover there was nothing to do -- and because the old guard was a
     /// process-wide mutex, those scans also ran one at a time, so they queued
     /// up behind each other rather than at least being cheap.
+    ///
+    /// The fixture RETAINS the queue receiver. Under the old
+    /// `BuildQueue::new().0` the receiver was dropped, so every `dispatch`
+    /// failed on a closed channel and released the claim on the failure path:
+    /// the in-flight set was empty again before each assertion, and "the claim
+    /// short-circuited the queue" and "nothing was ever claimed" were the same
+    /// observable state. Deleting the whole set left this test green.
+    /// The receiver is deliberately not drained -- a live pool would finish
+    /// the build and release the slot between calls, which is correct but
+    /// exercises nothing. Holding the queued job IS the coalescing window.
     #[tokio::test]
     async fn concurrent_advances_for_one_subject_collapse() -> anyhow::Result<()> {
-        let (mgr, _, _) = test_manager().await;
+        let (mgr, _, mut jobs) = test_manager_with_queue().await;
         mgr.store.save_file(&file_record("f1", "alice")).await?;
 
         // A never-built replica needs a full rebuild, so every call here wants
@@ -1301,7 +1390,8 @@ mod tests {
         assert!(first.pending, "a never-built replica must be queued");
         assert_eq!(first.applied_seq, 0, "nothing has been built yet");
 
-        // The slot is held, so further calls must not queue again.
+        // The slot is held by the queued job, so further calls must not queue
+        // again.
         for _ in 0..3 {
             let again = mgr.advance("alice").await?;
             assert!(
@@ -1312,11 +1402,194 @@ mod tests {
         }
 
         // And only one job ever reached the queue.
-        let (queue, mut rx) = BuildQueue::new();
-        assert!(queue.dispatch("alice", 1), "queue accepts work");
-        let job = rx.try_recv().expect("one job queued");
-        assert_eq!(job.sub, "alice");
-        assert!(rx.try_recv().is_err(), "exactly one job, not four");
+        let job = jobs.try_recv().expect("one job queued");
+        assert_eq!(job.sub(), "alice");
+        assert!(jobs.try_recv().is_err(), "exactly one job, not four");
+        Ok(())
+    }
+
+    /// Drives one `advance` until it parks on an object-store read, then
+    /// drops it there.
+    ///
+    /// `advance` is polled with a no-op waker, so every operation the
+    /// `InMemory` backend can answer synchronously runs to completion
+    /// inside a single poll. The one that cannot is the stalling read this
+    /// arms below, and that suspension point is exactly the state a client
+    /// disconnect abandons: the handler future is dropped with the claim
+    /// inserted and no release executed.
+    ///
+    /// Returns `true` once the future has parked, so the caller knows the
+    /// claim was live at the drop rather than the test asserting against a
+    /// future that ran to the end and released on its own.
+    /// Arms on the first WRITE, not the first read.
+    ///
+    /// `advance` reads the coverage marker (`load_applied`) before it takes
+    /// the claim, so a stall on a read would park with the slot still free
+    /// and prove nothing. Every replica write -- opening the writer, the
+    /// per-op apply, the marker -- happens inside `replay`, after the claim
+    /// is held.
+    #[derive(Debug)]
+    struct StallingStore {
+        inner: std::sync::Arc<dyn object_store::ObjectStore>,
+        /// Armed before the advance so only that read stalls.
+        armed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        /// Set by the stalling read, so the test can prove the future
+        /// suspended at THAT read rather than somewhere else.
+        hit: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl object_store::ObjectStore for StallingStore {
+        async fn put_opts(
+            &self,
+            location: &object_store::path::Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            if self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                self.hit.store(true, std::sync::atomic::Ordering::SeqCst);
+                // Never resolves: the caller is expected to drop the future
+                // it is parked in rather than wait this out.
+                std::future::pending::<()>().await;
+            }
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            _location: &object_store::path::Path,
+            _opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            unimplemented!("replica writes are not multipart")
+        }
+
+        async fn get_opts(
+            &self,
+            location: &object_store::path::Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        async fn delete(&self, location: &object_store::path::Path) -> object_store::Result<()> {
+            self.inner.delete(location).await
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures_util::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+        ) -> object_store::Result<()> {
+            self.inner.copy(from, to).await
+        }
+
+        async fn copy_if_not_exists(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+        ) -> object_store::Result<()> {
+            self.inner.copy_if_not_exists(from, to).await
+        }
+
+        fn list_with_offset(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+            offset: &object_store::path::Path,
+        ) -> futures_util::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list_with_offset(prefix, offset)
+        }
+    }
+
+    impl std::fmt::Display for StallingStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("StallingStore")
+        }
+    }
+
+    /// A future dropped mid-flight must release the subject's slot.
+    ///
+    /// This is the leak the [`BuildClaim`] exists to close. `advance` runs
+    /// inside a request handler future, and the client may disconnect at any
+    /// `.await` in `replay`. The handler is then dropped with the claim
+    /// inserted and no release executed -- and every later `advance` for that
+    /// subject takes the `pending: true` short-circuit forever: the replica is
+    /// frozen at its old coverage for the life of the process, silently, with
+    /// no error logged and no recovery short of a restart.
+    ///
+    /// Driven through a real `advance` future, parked on a real store read, so
+    /// it fails if the guard is ever moved off the path that holds it. The
+    /// stalling store arms AFTER `build_full`, so the setup builds normally
+    /// and only the advance being dropped parks.
+    #[tokio::test]
+    async fn a_future_dropped_mid_replay_releases_the_slot() -> anyhow::Result<()> {
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::task::{Context, Poll};
+
+        let (mut mgr, _, _) = test_manager_with_queue().await;
+        mgr.store.save_file(&file_record("f1", "bob")).await?;
+        mgr.build_full("alice").await?;
+        mgr.wal
+            .append(WalOp::FileCreate {
+                rec: file_record("f2", "alice"),
+            })
+            .await?;
+
+        // Arm the stall only now: `build_full` and the WAL append above must
+        // run for real, and only the advance being dropped may park.
+        let armed = Arc::new(AtomicBool::new(true));
+        let hit = Arc::new(AtomicBool::new(false));
+        let inner = mgr.object_store.clone();
+        mgr.object_store = Arc::new(StallingStore {
+            inner,
+            armed: Arc::clone(&armed),
+            hit: Arc::clone(&hit),
+        });
+
+        let mut advance = Box::pin(mgr.advance("alice"));
+        let waker = futures_util::task::noop_waker_ref();
+        let mut cx = Context::from_waker(waker);
+        // One poll: with the stall armed, everything `InMemory` can answer
+        // synchronously runs to the first replica WRITE and parks there. A
+        // single poll is therefore the whole wait -- and `Ready` here would
+        // mean the write never happened, which the assertion catches.
+        match Pin::new(&mut advance).as_mut().poll(&mut cx) {
+            Poll::Pending => {}
+            Poll::Ready(r) => panic!("the advance finished instead of parking: {r:?}"),
+        }
+        assert!(
+            hit.load(Ordering::SeqCst),
+            "the advance future must park inside replay, with the claim live"
+        );
+
+        // Dropped mid-replay, claim inserted: the slot must not survive.
+        drop(advance);
+        assert!(
+            mgr.builds.claim("alice").is_some(),
+            "a dropped replay future must not leave alice marked in flight"
+        );
+        assert!(
+            !armed.load(Ordering::SeqCst),
+            "the stalling read must have been consumed exactly once"
+        );
         Ok(())
     }
 
@@ -1348,17 +1621,26 @@ mod tests {
         let (mgr, _, _) = test_manager().await;
         mgr.store.save_file(&file_record("f1", "alice")).await?;
 
-        // Alice's rebuild takes the slot.
-        assert!(mgr.builds.claim("alice"));
+        // Alice takes the slot.
+        let alice = mgr.builds.claim("alice").expect("alice's slot is free");
 
         // Bob is unaffected: he is not behind alice in any queue.
-        assert!(mgr.builds.claim("bob"), "bob must not be blocked by alice");
-        mgr.builds.release("bob");
+        let bob = mgr
+            .builds
+            .claim("bob")
+            .expect("bob must not be blocked by alice");
+        drop(bob);
 
         // Alice still cannot be double-built while her first is in flight.
-        assert!(!mgr.builds.claim("alice"));
-        mgr.builds.release("alice");
-        assert!(mgr.builds.claim("alice"), "released slot is reusable");
+        assert!(
+            mgr.builds.claim("alice").is_none(),
+            "the in-flight set must reject a second claim for alice"
+        );
+        drop(alice);
+        assert!(
+            mgr.builds.claim("alice").is_some(),
+            "a released slot is reusable"
+        );
         Ok(())
     }
 
