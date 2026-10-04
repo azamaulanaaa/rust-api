@@ -680,15 +680,48 @@ impl SnapshotManager {
         Ok(())
     }
 
+    /// Every group `sub` is a member of, transitively.
+    ///
+    /// This is the closure the RBAC matcher actually resolves. `g = _, _`
+    /// with `m = g(r.sub, p.sub) && …` walks the whole role hierarchy, and
+    /// `WalOp::GroupAdd { user, group }` puts no constraint on `group`, so
+    /// `alice ∈ editors ∈ staff` is a shape the feed can carry.
+    /// [`Authorizer::get_groups_of_user`] is casbin's
+    /// `RoleManager::get_roles`, which answers with DIRECT roles only, so
+    /// one hop is not the answer to "can this rule subject be `sub`".
+    ///
+    /// Walks the same breadth-first expansion as casbin's
+    /// `get_implicit_roles_for_user` (casbin-2.20.0 `rbac_api.rs:313`)
+    /// rather than delegating to it: that lives on `Enforcer`, which is
+    /// private to [`crate::policy`], and reaching it would mean handing the
+    /// replay path a write-capable engine — the bypass
+    /// `PolicyEngine::enforcer` being private exists to prevent. The hop
+    /// primitive is already on the read-only handle.
+    ///
+    /// Visited-set rather than depth limit: a cycle in the hierarchy (`a ∈ b`
+    /// and `b ∈ a`) must terminate, and a cycle makes the closure the whole
+    /// reachable component rather than something a fixed depth truncates.
+    async fn implicit_groups(&self, sub: &str) -> std::collections::HashSet<String> {
+        let mut found: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut frontier = vec![sub.to_string()];
+        while let Some(name) = frontier.pop() {
+            for g in self.policy.get_groups_of_user(&name).await {
+                if found.insert(g.clone()) {
+                    frontier.push(g);
+                }
+            }
+        }
+        found
+    }
+
     /// Resyncs the single row a permission rule changed.
     ///
     /// Skips fast: non-`read` actions never affect read replicas,
-    /// non-row objects (`rules`, `user_groups`, …) hold no files, direct
-    /// rules for other users cannot match, and group rules skip when `sub`
-    /// holds no current membership. Otherwise every file on the row is
-    /// re-checked via [`Self::resync_file`] (idempotent: converge, never
-    /// over-delete). Fan-out over [`MAX_POLICY_REPLAY_FILES`] falls back
-    /// via `Err`.
+    /// non-row objects (`rules`, `user_groups`, …) hold no files, and a rule
+    /// subject `sub` cannot reach — neither directly nor through nested
+    /// groups — cannot match. Otherwise every file on the row is re-checked
+    /// via [`Self::resync_file`] (idempotent: converge, never over-delete).
+    /// Fan-out over [`MAX_POLICY_REPLAY_FILES`] falls back via `Err`.
     async fn apply_rule_op(
         &self,
         sub: &str,
@@ -703,14 +736,7 @@ impl SnapshotManager {
         let Some((row_type, row_id)) = split_row_obj(obj) else {
             return Ok(());
         };
-        if rule_sub != sub
-            && !self
-                .policy
-                .get_groups_of_user(sub)
-                .await
-                .iter()
-                .any(|g| g == rule_sub)
-        {
+        if rule_sub != sub && !self.implicit_groups(sub).await.contains(rule_sub) {
             return Ok(());
         }
         let files = self.store.files_for_row(row_type, row_id).await?;
@@ -1362,6 +1388,104 @@ mod tests {
         assert_eq!(mgr.replay(3, "alice").await?, ReplayOutcome::Advanced(3));
         assert!(!replica_has(&mem, &mgr, "alice", "fs:files:f1:meta").await);
         assert!(!replica_has(&mem, &mgr, "alice", "fs:rel:invoice:1:f1").await);
+        Ok(())
+    }
+
+    /// A revocation through a NESTED group must still reach the replica.
+    ///
+    /// The regression this pins: `apply_rule_op` decided "this replayed op
+    /// cannot affect this subject" from `get_groups_of_user`, which is
+    /// casbin's `RoleManager::get_roles` — DIRECT roles only. Here `alice ∈
+    /// editors ∈ staff`, so a removal of `p, staff, invoice:1, read`
+    /// returned `Ok(())` without calling `resync_file`: the filter and the
+    /// `authorize_row` it stands in for disagreed about whether the rule
+    /// applied. The file stayed in alice's replica and stayed served by
+    /// `GET /sync/db/{object}` under a coverage marker that had already
+    /// advanced past the revocation — over-inclusion of data the subject was
+    /// just denied, not staleness.
+    ///
+    /// The replica is seeded by the full rebuild, which routes every file
+    /// through `visible_rows` -> `authorize_row` and is reviewed as
+    /// correct. That matters for what the assertion means: the file is
+    /// PROVABLY present before the replayed revocation, so "it is gone
+    /// afterwards" can only be the replay's doing. A grant that was itself
+    /// skipped would make it pass for the wrong reason.
+    #[tokio::test]
+    async fn a_revoke_through_a_nested_group_reaches_the_replica() -> anyhow::Result<()> {
+        let (mgr, policy, mem) = test_manager().await;
+        // Two hops: alice is in editors, editors is in staff, and the rule
+        // names staff. `get_groups_of_user("alice")` answers ["editors"].
+        policy
+            .assign_group("alice".into(), "editors".into())
+            .await?;
+        policy
+            .assign_group("editors".into(), "staff".into())
+            .await?;
+        policy
+            .add_rule("staff".into(), "invoice:1".into(), Action::Read)
+            .await?;
+        mgr.store.save_file(&file_record("f1", "bob")).await?;
+        mgr.store.attach("invoice", "1", "f1").await?;
+        mgr.build_full("alice").await?;
+        assert!(replica_has(&mem, &mgr, "alice", "fs:files:f1:meta").await);
+
+        // Revoke through the OUTER group, as the policy engine announces it.
+        policy
+            .remove_rule("staff".into(), "invoice:1".into(), Action::Read)
+            .await?;
+        mgr.wal
+            .append(WalOp::PolicyRuleRemove {
+                sub: "staff".into(),
+                obj: "invoice:1".into(),
+                act: "read".into(),
+            })
+            .await?;
+        assert_eq!(mgr.replay(1, "alice").await?, ReplayOutcome::Advanced(1));
+        assert!(
+            !replica_has(&mem, &mgr, "alice", "fs:files:f1:meta").await,
+            "revoking through a nested group must REMOVE the file; the \
+             direct-roles filter skipped the op and left revoked data \
+             readable under an advanced coverage marker"
+        );
+        Ok(())
+    }
+
+    /// The mirror case: a grant through a nested group must not be skipped.
+    ///
+    /// The filter was wrong in both directions, and testing only the revoke
+    /// half would let the grant half regress silently. Here the replica is
+    /// built while the rule does NOT exist, so the only way `f1` appears is
+    /// if the replayed `PolicyRuleAdd` reached it — skipping it leaves a
+    /// file an `enforce` authorizes silently absent.
+    #[tokio::test]
+    async fn a_grant_through_a_nested_group_reaches_the_replica() -> anyhow::Result<()> {
+        let (mgr, policy, mem) = test_manager().await;
+        policy
+            .assign_group("alice".into(), "editors".into())
+            .await?;
+        policy
+            .assign_group("editors".into(), "staff".into())
+            .await?;
+        mgr.store.save_file(&file_record("f1", "bob")).await?;
+        mgr.store.attach("invoice", "1", "f1").await?;
+        mgr.build_full("alice").await?;
+        assert!(!replica_has(&mem, &mgr, "alice", "fs:files:f1:meta").await);
+
+        policy
+            .add_rule("staff".into(), "invoice:1".into(), Action::Read)
+            .await?;
+        mgr.wal
+            .append(WalOp::PolicyRuleAdd {
+                sub: "staff".into(),
+                obj: "invoice:1".into(),
+                act: "read".into(),
+            })
+            .await?;
+        assert_eq!(mgr.replay(1, "alice").await?, ReplayOutcome::Advanced(1));
+        assert!(
+            replica_has(&mem, &mgr, "alice", "fs:files:f1:meta").await,
+            "a grant an `enforce` would authorize must not be silently absent"
+        );
         Ok(())
     }
 
