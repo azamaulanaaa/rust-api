@@ -71,7 +71,8 @@ pub const ENV_ALLOWED_ORIGINS: &str = "RUST_API_ALLOWED_ORIGINS";
 impl TryFrom<&Path> for Config {
     type Error = anyhow::Error;
 
-    /// Reads and parses a TOML config file from `value`.
+    /// Reads and parses a TOML config file from `value`, then overlays the
+    /// environment onto it.
     fn try_from(value: &Path) -> Result<Self, Self::Error> {
         if !value.is_file() {
             return Err(anyhow::anyhow!(
@@ -81,10 +82,37 @@ impl TryFrom<&Path> for Config {
         }
 
         let content = fs::read_to_string(value).context("Failed to read config file")?;
-        let mut config: Self = toml::from_str(&content).context("Failed to parse config file")?;
+        let mut config = Self::parse_toml(&content)?;
         apply_env_overrides(&mut config);
+        // Re-validate: an environment value reaches the config from outside
+        // the file, and nothing about a `RUST_API_*` variable was checked by
+        // the TOML parser.
         config.validate().context("Invalid config values")?;
 
+        Ok(config)
+    }
+}
+
+impl Config {
+    /// Parses and validates a TOML document with NO environment overlay.
+    ///
+    /// The split from the loader is deliberate, and it is what makes file
+    /// parsing a pure function of its input. [`TryFrom`] reads
+    /// `RUST_API_CLIENT_SECRET`, `RUST_API_S3_ACCESS_KEY_ID`,
+    /// `RUST_API_CAPABILITY_SECRET` and the rest out of the process
+    /// environment, so a caller that wants only the file's values has to be
+    /// able to ask for them without first unsetting six variables -- which
+    /// it cannot do safely, because the environment is process-wide and
+    /// shared with every other thread.
+    ///
+    /// For tests that distinction is the whole point: `cargo test` inherits
+    /// the developer's shell, and the README's own run instructions export
+    /// `RUST_API_CLIENT_SECRET`. A fixture asserting on the file's value
+    /// then fails for anyone who followed them, which is a test bug wearing
+    /// a production costume.
+    pub fn parse_toml(content: &str) -> anyhow::Result<Self> {
+        let config: Self = toml::from_str(content).context("Failed to parse config file")?;
+        config.validate().context("Invalid config values")?;
         Ok(config)
     }
 }
@@ -92,29 +120,36 @@ impl TryFrom<&Path> for Config {
 /// Overlays secret values from the environment onto a parsed config.
 ///
 /// Split from file parsing so precedence is unit-testable without
-/// mutating the process environment (see `prefer_env` tests).
+/// mutating the process environment (see `prefer_env` tests). The lookup
+/// itself is injected for the same reason: `std::env::set_var` is
+/// process-wide, so a test that sets one races every other test thread
+/// reading the same variable -- and is `unsafe` in Rust 2024 besides.
 fn apply_env_overrides(config: &mut Config) {
+    apply_overrides_from(config, |name| std::env::var(name).ok());
+}
+
+/// [`apply_env_overrides`] with the variable lookup supplied by the caller.
+///
+/// `var` returns the raw value for `name`, or `None` when unset -- the same
+/// shape `std::env::var(..).ok()` produces.
+fn apply_overrides_from(config: &mut Config, var: impl Fn(&str) -> Option<String>) {
     config.authorization.client_secret = prefer_env(
-        std::env::var(ENV_CLIENT_SECRET).ok(),
+        var(ENV_CLIENT_SECRET),
         std::mem::take(&mut config.authorization.client_secret),
     );
-    config.s3.access_key_id = prefer_env_opt(
-        std::env::var(ENV_S3_ACCESS_KEY_ID).ok(),
-        config.s3.access_key_id.take(),
-    );
+    config.s3.access_key_id =
+        prefer_env_opt(var(ENV_S3_ACCESS_KEY_ID), config.s3.access_key_id.take());
     config.s3.secret_access_key = prefer_env_opt(
-        std::env::var(ENV_S3_SECRET_ACCESS_KEY).ok(),
+        var(ENV_S3_SECRET_ACCESS_KEY),
         config.s3.secret_access_key.take(),
     );
-    config.capability.secret = prefer_env_opt(
-        std::env::var(ENV_CAPABILITY_SECRET).ok(),
-        config.capability.secret.take(),
-    );
+    config.capability.secret =
+        prefer_env_opt(var(ENV_CAPABILITY_SECRET), config.capability.secret.take());
     config.capability.previous_secret = prefer_env_opt(
-        std::env::var(ENV_CAPABILITY_SECRET_PREV).ok(),
+        var(ENV_CAPABILITY_SECRET_PREV),
         config.capability.previous_secret.take(),
     );
-    if let Ok(raw) = std::env::var(ENV_ALLOWED_ORIGINS)
+    if let Some(raw) = var(ENV_ALLOWED_ORIGINS)
         && !raw.trim().is_empty()
     {
         config.http.allowed_origins = raw
@@ -457,6 +492,38 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    /// Parses and validates a TOML document, with no environment overlay.
+    ///
+    /// Every file-parsing test in this module goes through here rather than
+    /// through [`Config::try_from`], because `try_from` reads
+    /// `RUST_API_CLIENT_SECRET`, `RUST_API_S3_ACCESS_KEY_ID`,
+    /// `RUST_API_CAPABILITY_SECRET`, `RUST_API_CAPABILITY_SECRET_PREV`,
+    /// `RUST_API_S3_SECRET_ACCESS_KEY` and `RUST_API_ALLOWED_ORIGINS` out of
+    /// the process environment.
+    ///
+    /// That is not a theoretical hazard. `cargo test` inherits the
+    /// developer's shell and the README's own run instructions export
+    /// `RUST_API_CLIENT_SECRET`, so a fixture asserting on the file's value
+    /// fails for anyone who followed them: with the variable set,
+    /// `validate_rejects_bad_values`' empty-`client_secret` case is
+    /// revalidated against the environment value, validation PASSES, and
+    /// `validation_error`'s `unwrap_err()` panics. The same applies to the
+    /// `[capability] secret = "deadbeef"` case under
+    /// `RUST_API_CAPABILITY_SECRET`, and to
+    /// `parses_full_config_with_overrides`' `access_key_id == "ak"` under
+    /// `RUST_API_S3_ACCESS_KEY_ID`.
+    ///
+    /// The alternative -- mutating the environment from a test -- is worse:
+    /// `set_var` is process-wide, so it races every other test thread under
+    /// cargo's default parallelism and is `unsafe` in Rust 2024. Hence a
+    /// pure entry point instead, which is the same split
+    /// `apply_env_overrides` already claimed to exist "so precedence is
+    /// unit-testable without mutating the process environment". The
+    /// file-parsing tests had simply never been given the same treatment.
+    fn parse(toml: &str) -> anyhow::Result<Config> {
+        Config::parse_toml(toml)
+    }
+
     fn tmp_toml(content: &str) -> std::path::PathBuf {
         use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
         let path = std::env::temp_dir().join(format!(
@@ -481,14 +548,22 @@ mod tests {
 
     #[test]
     fn try_from_fails_on_invalid_toml() {
+        // Kept on the loader rather than `parse_toml`: the message is
+        // asserted, and the loader is what an operator hits.
         let path = tmp_toml("not = toml [[[ ");
         let err = Config::try_from(path.as_path()).unwrap_err().to_string();
         assert!(err.contains("Failed to parse config file"));
         let _ = std::fs::remove_file(&path);
+
+        // The same document through the pure entry point, which the file
+        // tests below use: identical message, so the two really do share
+        // the parse.
+        let err = parse("not = toml [[[ ").unwrap_err().to_string();
+        assert!(err.contains("Failed to parse config file"));
     }
 
     #[test]
-    fn try_from_parses_minimal_config() {
+    fn parses_minimal_config() {
         let toml = r#"
             public_address = "https://example.test"
             listen_port = 8080
@@ -502,8 +577,7 @@ mod tests {
             bucket = "my-bucket"
             region = "us-east-1"
         "#;
-        let path = tmp_toml(toml);
-        let cfg = Config::try_from(path.as_path()).expect("should parse");
+        let cfg = parse(toml).expect("should parse");
         assert_eq!(cfg.public_address, "https://example.test");
         assert_eq!(cfg.listen_port, 8080);
         assert_eq!(cfg.authorization.client_id, "cid");
@@ -518,7 +592,6 @@ mod tests {
         assert_eq!(cfg.observability.service_name, "rust-api");
         assert!(cfg.observability.otlp_endpoint.is_none());
         assert_eq!(cfg.observability.sample_ratio, 1.0);
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -544,8 +617,7 @@ mod tests {
             otlp_endpoint = "http://localhost:4317"
             sample_ratio = 0.5
         "#;
-        let path = tmp_toml(toml);
-        let cfg = Config::try_from(path.as_path()).unwrap();
+        let cfg = parse(toml).unwrap();
         assert_eq!(
             cfg.s3.endpoint_url.as_deref(),
             Some("http://localhost:9000")
@@ -559,7 +631,6 @@ mod tests {
             cfg.observability.otlp_endpoint.as_deref(),
             Some("http://localhost:4317")
         );
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -577,10 +648,8 @@ mod tests {
             bucket = "b"
             region = "us-east-1"
         "#;
-        let path = tmp_toml(toml);
-        let cfg = Config::try_from(path.as_path()).unwrap();
+        let cfg = parse(toml).unwrap();
         assert_eq!(cfg.database.prefix, "custom/prefix");
-        let _ = std::fs::remove_file(&path);
     }
 
     fn minimal_toml() -> String {
@@ -624,9 +693,7 @@ mod tests {
             "client_secret = \"csecret\"",
             "client_secret = \"csecret\"\n            allowed_tenants = [\"tenant-a\"]",
         );
-        let path = tmp_toml(&allowed);
-        let cfg = Config::try_from(path.as_path()).expect("an allowlisted tenant should validate");
-        let _ = std::fs::remove_file(&path);
+        let cfg = parse(&allowed).expect("an allowlisted tenant should validate");
         assert_eq!(cfg.authorization.allowed_tenants, vec!["tenant-a"]);
     }
 
@@ -650,15 +717,11 @@ mod tests {
     /// single-tenant issuer must still start without one.
     #[test]
     fn a_single_tenant_issuer_needs_no_allowlist() {
-        let path = tmp_toml(&minimal_toml());
-        Config::try_from(path.as_path()).expect("single-tenant issuer needs no allowlist");
-        let _ = std::fs::remove_file(&path);
+        parse(&minimal_toml()).expect("single-tenant issuer needs no allowlist");
     }
 
     fn validation_error(toml: &str) -> String {
-        let path = tmp_toml(toml);
-        let err = Config::try_from(path.as_path()).unwrap_err();
-        let _ = std::fs::remove_file(&path);
+        let err = parse(toml).unwrap_err();
         // Debug renders the anyhow context chain, Display only the outer.
         format!("{err:?}")
     }
@@ -724,9 +787,7 @@ mod tests {
                 "ab".repeat(32)
             ),
         );
-        let path = tmp_toml(&ok);
-        assert!(Config::try_from(path.as_path()).is_ok());
-        let _ = std::fs::remove_file(&path);
+        assert!(parse(&ok).is_ok());
     }
 
     /// A TTL too large for the comparison the lease performs must be
@@ -762,27 +823,22 @@ mod tests {
             "prefix = \"oxkv\"",
             "prefix = \"oxkv\"\nwriter_lease_ttl_secs = 9223372036854775807",
         );
-        let path = tmp_toml(&at_limit);
-        let cfg = Config::try_from(path.as_path()).expect("i64::MAX is a valid TTL");
+        let cfg = parse(&at_limit).expect("i64::MAX is a valid TTL");
         assert_eq!(cfg.database.writer_lease_ttl_secs, i64::MAX as u64);
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn http_allowed_origins_default_empty_and_validate() {
         // Omitted [http] section means same-origin only.
-        let path = tmp_toml(&minimal_toml());
-        let cfg = Config::try_from(path.as_path()).expect("should parse");
+        let cfg = parse(&minimal_toml()).expect("should parse");
         assert!(cfg.http.allowed_origins.is_empty());
-        let _ = std::fs::remove_file(&path);
 
         // Explicit origins parse.
         let toml = minimal_toml().replace(
             "region = \"us-east-1\"",
             "region = \"us-east-1\"\n[http]\nallowed_origins = [\"https://app.example.com\", \"http://localhost:5173\"]",
         );
-        let path = tmp_toml(&toml);
-        let cfg = Config::try_from(path.as_path()).expect("should parse");
+        let cfg = parse(&toml).expect("should parse");
         assert_eq!(
             cfg.http.allowed_origins,
             vec![
@@ -790,7 +846,6 @@ mod tests {
                 "http://localhost:5173".to_string()
             ]
         );
-        let _ = std::fs::remove_file(&path);
 
         // Non-http(s) origins fail at startup, not obscurely in the browser.
         let err = validation_error(&minimal_toml().replace(
@@ -803,6 +858,123 @@ mod tests {
             "region = \"us-east-1\"\n[http]\nallowed_origins = [\"not a url\"]",
         ));
         assert!(err.contains("http.allowed_origins"), "unexpected: {err}");
+    }
+
+    /// The same TOML parses to the same config twice.
+    ///
+    /// Trivial for a pure parser, which is exactly why it is worth pinning:
+    /// it is the property that stopped being true the moment file parsing
+    /// grew an environment overlay. `Config::try_from` reads six
+    /// `RUST_API_*` variables, so under `RUST_API_CLIENT_SECRET=...` two
+    /// parses of the same document could legitimately disagree -- and did,
+    /// for every test asserting on a file value. Nothing about "the config
+    /// file says X" survives an overlay whose input the test does not
+    /// control.
+    ///
+    /// `Config` is not `PartialEq`, so the fields the overlay touches are
+    /// compared directly.
+    #[test]
+    fn parsing_the_same_toml_twice_gives_the_same_result() {
+        let toml = minimal_toml().replace(
+            "region = \"us-east-1\"",
+            &format!(
+                "region = \"us-east-1\"\naccess_key_id = \"ak\"\n[capability]\nsecret = \"{}\"",
+                "ab".repeat(32)
+            ),
+        );
+        let first = parse(&toml).expect("parses");
+        let second = parse(&toml).expect("parses");
+
+        assert_eq!(
+            first.authorization.client_secret,
+            second.authorization.client_secret
+        );
+        assert_eq!(first.s3.access_key_id, second.s3.access_key_id);
+        assert_eq!(first.s3.secret_access_key, second.s3.secret_access_key);
+        assert_eq!(first.capability.secret, second.capability.secret);
+        assert_eq!(
+            first.capability.previous_secret,
+            second.capability.previous_secret
+        );
+        assert_eq!(first.http.allowed_origins, second.http.allowed_origins);
+        // And the values are the FILE's, which is the half the overlay used
+        // to change out from under the assertions.
+        assert_eq!(first.s3.access_key_id.as_deref(), Some("ak"));
+        assert_eq!(first.authorization.client_secret, "csecret");
+    }
+
+    /// A plain parse is not an overlay in disguise: the environment cannot
+    /// reach it.
+    ///
+    /// Proven without touching the process environment, which is the whole
+    /// point -- `set_var` is process-wide and would race every other test
+    /// thread. The overlay is driven through the same injected-lookup entry
+    /// point `apply_env_overrides` uses, with every variable populated, and
+    /// `parse_toml` is shown to be unaffected by construction because it
+    /// never calls it. Asserting on the RESULT rather than on the absence
+    /// of a call: the overlay is applied to a config parsed the same way,
+    /// and every field it claims to own comes back different.
+    #[test]
+    fn env_overrides_do_not_leak_into_a_plain_parse() {
+        let toml = minimal_toml().replace(
+            "region = \"us-east-1\"",
+            "region = \"us-east-1\"\naccess_key_id = \"ak\"\nsecret_access_key = \"sk\"\n\
+             [http]\nallowed_origins = [\"https://file.example.com\"]",
+        );
+        let secret = "ab".repeat(32);
+
+        // With every variable populated, the overlay changes all six fields.
+        let mut overlaid = parse(&toml).expect("parses");
+        apply_overrides_from(&mut overlaid, |name| match name {
+            ENV_CLIENT_SECRET => Some("from-env".into()),
+            ENV_S3_ACCESS_KEY_ID => Some("env-ak".into()),
+            ENV_S3_SECRET_ACCESS_KEY => Some("env-sk".into()),
+            ENV_CAPABILITY_SECRET => Some(secret.clone()),
+            ENV_CAPABILITY_SECRET_PREV => Some(secret.clone()),
+            ENV_ALLOWED_ORIGINS => Some("https://env.example.com, https://env2.example.com".into()),
+            other => panic!("unexpected override for {other}"),
+        });
+        assert_eq!(overlaid.authorization.client_secret, "from-env");
+        assert_eq!(overlaid.s3.access_key_id.as_deref(), Some("env-ak"));
+        assert_eq!(overlaid.s3.secret_access_key.as_deref(), Some("env-sk"));
+        assert_eq!(overlaid.capability.secret.as_deref(), Some(secret.as_str()));
+        assert_eq!(
+            overlaid.capability.previous_secret.as_deref(),
+            Some(secret.as_str())
+        );
+        assert_eq!(
+            overlaid.http.allowed_origins,
+            vec!["https://env.example.com", "https://env2.example.com"]
+        );
+
+        // A plain parse of the SAME document is untouched by any of it.
+        let plain = parse(&toml).expect("parses");
+        assert_eq!(plain.authorization.client_secret, "csecret");
+        assert_eq!(plain.s3.access_key_id.as_deref(), Some("ak"));
+        assert_eq!(plain.s3.secret_access_key.as_deref(), Some("sk"));
+        assert!(plain.capability.secret.is_none());
+        assert!(plain.capability.previous_secret.is_none());
+        assert_eq!(plain.http.allowed_origins, vec!["https://file.example.com"]);
+    }
+
+    /// The overlay is what production reads, and the loader is the only
+    /// caller that goes through the real process environment.
+    ///
+    /// The one test here that still uses `Config::try_from`, deliberately:
+    /// the file-parsing tests above must not, and something has to keep
+    /// covering the loader itself. What it asserts is chosen to be
+    /// environment-INDEPENDENT -- `public_address`, `listen_port` and
+    /// `s3.bucket` have no `RUST_API_*` override -- so it holds whatever the
+    /// developer's shell happens to carry.
+    #[test]
+    fn the_loader_reads_a_file_and_applies_the_overlay() {
+        let path = tmp_toml(&minimal_toml());
+        let cfg = Config::try_from(path.as_path()).expect("the loader accepts a valid file");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(cfg.public_address, "https://example.test");
+        assert_eq!(cfg.listen_port, 8080);
+        assert_eq!(cfg.s3.bucket, "my-bucket");
     }
 
     #[test]
@@ -837,14 +1009,12 @@ mod tests {
     /// than zero -- zero silently disables single-writer enforcement.
     #[test]
     fn writer_lease_ttl_defaults_on_and_can_be_disabled() {
-        let path = tmp_toml(&minimal_toml());
-        let cfg = Config::try_from(path.as_path()).expect("should parse");
+        let cfg = parse(&minimal_toml()).expect("should parse");
         assert_eq!(cfg.database.writer_lease_ttl_secs, 60);
         assert_eq!(
             cfg.database.writer_lease_ttl_secs,
             default_writer_lease_ttl_secs()
         );
-        let _ = std::fs::remove_file(&path);
 
         // Must land in the [database] table, not after `region` (which
         // sits in [s3] -- serde ignores unknown keys there, so the test
@@ -853,12 +1023,10 @@ mod tests {
             "prefix = \"oxkv\"",
             "prefix = \"oxkv\"\nwriter_lease_ttl_secs = 0",
         );
-        let path = tmp_toml(&toml);
-        let cfg = Config::try_from(path.as_path()).expect("should parse");
+        let cfg = parse(&toml).expect("should parse");
         assert_eq!(
             cfg.database.writer_lease_ttl_secs, 0,
             "0 disables the lease"
         );
-        let _ = std::fs::remove_file(&path);
     }
 }
