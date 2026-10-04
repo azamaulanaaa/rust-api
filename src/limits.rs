@@ -29,6 +29,7 @@
 use std::{
     collections::HashMap,
     net::IpAddr,
+    sync::atomic::{AtomicU64, Ordering},
     sync::{Arc, Mutex, PoisonError},
     time::{Duration, Instant},
 };
@@ -49,6 +50,17 @@ use crate::http::error::ApiError;
 /// prefix fills the map faster than the window drains it. The hard bound is
 /// [`MAX_TRACKED_PEERS`].
 const IDLE_EVICT: Duration = Duration::from_secs(600);
+
+/// How many requests pass between idle sweeps.
+///
+/// `make_room` already bounds the map on insert, so this sweep is no longer
+/// what keeps the map bounded -- it only reclaims memory early. Running it
+/// unconditionally meant an O(n) walk of up to [`MAX_TRACKED_PEERS`] entries
+/// under the one mutex `take` also needs, on EVERY request, including requests
+/// that are over budget and here only to be refused. Sweeping on a cadence
+/// keeps the reclamation and stops the limiter from being the amplifier it
+/// exists to bound.
+const IDLE_SWEEP_EVERY: u64 = 64;
 
 /// Hard ceiling on how many peers are tracked at once.
 ///
@@ -83,6 +95,9 @@ pub struct TokenBucket {
     capacity: f64,
     refill_per_sec: f64,
     buckets: Arc<Mutex<HashMap<String, BucketState>>>,
+    /// Requests seen since the last idle sweep. A plain atomic rather than a
+    /// field under `buckets`, so the common path never touches the mutex.
+    since_sweep: Arc<AtomicU64>,
 }
 
 struct BucketState {
@@ -123,7 +138,26 @@ impl TokenBucket {
             capacity,
             refill_per_sec: f64::from(per_minute) / 60.0,
             buckets: Arc::new(Mutex::new(HashMap::new())),
+            since_sweep: Arc::new(AtomicU64::new(IDLE_SWEEP_EVERY - 1)),
         }
+    }
+
+    /// Whether the periodic idle sweep is due, without taking the lock.
+    ///
+    /// True once every [`IDLE_SWEEP_EVERY`] requests. `fetch_update` resets
+    /// the counter to zero in the same step that claims the sweep, so two workers
+    /// cannot both believe they are the one due; at worst a racing pair loses
+    /// one sweep, which is harmless for a housekeeping pass. The counter starts
+    /// one short of the threshold so the first call sweeps, which keeps a
+    /// low-traffic process reclaiming rather than never.
+    fn sweep_due(&self) -> bool {
+        let seen = self.since_sweep.fetch_add(1, Ordering::Relaxed);
+        if seen + 1 < IDLE_SWEEP_EVERY {
+            return false;
+        }
+        // Claim the window: drop everything counted since the last sweep.
+        self.since_sweep.fetch_sub(seen + 1, Ordering::Relaxed);
+        true
     }
 
     /// True when the limiter is not doing anything.
@@ -181,11 +215,7 @@ impl TokenBucket {
     ///
     /// Called on the request path rather than from a timer: a timer would be
     /// another background task to own and shut down. The scan is bounded by
-    /// [`MAX_TRACKED_PEERS`], because the map cannot be larger than the cap
-    /// -- which is what makes running it per request acceptable, rather than
-    /// the amortisation argument the old comment made. That argument was
-    /// inverted: entries are inserted before the budget check, so the map
-    /// grows with REFUSED requests too, not only with new peers.
+    /// [`MAX_TRACKED_PEERS`], because the map cannot be larger than the cap.
     ///
     /// Returns immediately when disabled, which is what makes it acceptable to
     /// leave the middleware installed with a zero limit -- the default -- since
@@ -206,6 +236,15 @@ impl TokenBucket {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .len()
+    }
+
+    /// Moves every tracked entry's clock back by `by`, for tests.
+    #[cfg(test)]
+    pub fn age_all_for_test(&self, by: Duration) {
+        let mut buckets = self.buckets.lock().unwrap_or_else(PoisonError::into_inner);
+        for state in buckets.values_mut() {
+            state.last -= by;
+        }
     }
 }
 
@@ -386,13 +425,15 @@ where
 
     fn call(&self, req: ServiceRequest) -> Self::Future {
         let service = std::rc::Rc::clone(&self.service);
-        // Both of these ride along on the request path under the one mutex
-        // `take` also needs, so their cost is paid by every worker in the
-        // process -- including by peers that are over budget and here only
-        // to be refused. The map is capped at `MAX_TRACKED_PEERS` on insert,
-        // and that cap is what bounds both the scan and the eviction it
-        // performs.
-        self.bucket.evict_idle();
+        // The map is capped at `MAX_TRACKED_PEERS` on insert, and that cap is
+        // what bounds it. The idle sweep is only early reclamation, so it
+        // rides along every `IDLE_SWEEP_EVERY` requests rather than on every
+        // one: otherwise each request walked up to the cap under the mutex
+        // `take` also needs, paid by every worker including peers that are
+        // over budget and here only to be refused.
+        if self.bucket.sweep_due() {
+            self.bucket.evict_idle();
+        }
         if self.bucket.take(&peer_key(req.peer_addr())) {
             let fut = service.call(req);
             Box::pin(async move { fut.await.map(ServiceResponse::map_into_left_body) })
@@ -738,5 +779,57 @@ mod tests {
                  uniform envelope and not a bare or hand-rolled response",
             );
         assert_eq!(parsed.error, "too many requests");
+    }
+
+    /// The idle sweep is early reclamation, not the bound -- `make_room` is
+    /// the bound -- so it must not walk the map on every request.
+    ///
+    /// At the cap the sweep is an O(n) walk under the mutex `take` also needs,
+    /// and it used to be paid by every worker on every request, including
+    /// requests over budget that are here only to be refused. That made the
+    /// limiter the amplification point it exists to bound.
+    #[test]
+    fn the_idle_sweep_is_not_walked_on_every_request() {
+        let bucket = TokenBucket::new(1, 60);
+
+        let mut sweeps = 0;
+        for _ in 0..(IDLE_SWEEP_EVERY * 4) {
+            if bucket.sweep_due() {
+                bucket.evict_idle();
+                sweeps += 1;
+            }
+        }
+
+        assert_eq!(
+            sweeps,
+            4,
+            "expected one sweep per {IDLE_SWEEP_EVERY} requests, got {sweeps} in {}",
+            IDLE_SWEEP_EVERY * 4
+        );
+    }
+
+    /// Reclamation still happens: once the cadence comes round, an aged entry
+    /// is dropped. Without this the cadence could degenerate to "never" and
+    /// the test above would still pass.
+    #[test]
+    fn the_cadence_still_reclaims_idle_entries() {
+        let bucket = TokenBucket::new(10, 60);
+        for i in 0..5 {
+            assert!(bucket.take(&format!("peer-{i}")), "peer {i} has budget");
+        }
+        assert_eq!(bucket.tracked(), 5);
+
+        bucket.age_all_for_test(IDLE_EVICT + Duration::from_secs(1));
+        for _ in 0..=IDLE_SWEEP_EVERY {
+            if bucket.sweep_due() {
+                bucket.evict_idle();
+            }
+        }
+
+        assert_eq!(
+            bucket.tracked(),
+            0,
+            "the cadence must not have become 'never': aged entries should be reclaimed"
+        );
     }
 }
