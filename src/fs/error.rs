@@ -33,9 +33,6 @@ pub enum FsError {
     /// Resource not found - 404.
     #[error("{0}")]
     NotFound(String),
-    /// Conflict (e.g. duplicate).
-    #[error("{0}")]
-    Conflict(String),
     /// S3 or store failure - 500. The inner detail is logged server-side
     /// only and never rendered to clients (see `error_response`).
     #[error("internal server error")]
@@ -101,7 +98,6 @@ impl FsError {
         match self {
             Self::BadRequest(d)
             | Self::NotFound(d)
-            | Self::Conflict(d)
             | Self::Internal(d)
             | Self::Store(d)
             | Self::Fenced(d) => d,
@@ -119,7 +115,6 @@ impl FsError {
             Self::BadRequest(_) => "bad request",
             Self::Forbidden => "forbidden",
             Self::NotFound(_) => "not found",
-            Self::Conflict(_) => "conflict",
             Self::PayloadTooLarge => "payload too large",
             Self::Internal(_) | Self::Store(_) | Self::Fenced(_) => "internal server error",
             Self::TooManyRequests => "too many requests",
@@ -134,7 +129,6 @@ impl ResponseError for FsError {
             Self::PayloadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             Self::Forbidden => StatusCode::FORBIDDEN,
             Self::NotFound(_) => StatusCode::NOT_FOUND,
-            Self::Conflict(_) => StatusCode::CONFLICT,
             Self::Internal(_) | Self::Store(_) | Self::Fenced(_) => {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
@@ -160,7 +154,7 @@ impl ResponseError for FsError {
             Self::Internal(detail) | Self::Store(detail) => {
                 tracing::warn!("fs error {}: internal: {detail}", self.status_code());
             }
-            Self::BadRequest(_) | Self::NotFound(_) | Self::Conflict(_) | Self::PayloadTooLarge => {
+            Self::BadRequest(_) | Self::NotFound(_) | Self::PayloadTooLarge => {
                 tracing::debug!("fs error {}: {}", self.status_code(), self);
             }
             Self::TooManyRequests => {
@@ -247,7 +241,6 @@ mod tests {
             FsError::PayloadTooLarge,
             FsError::Forbidden,
             FsError::NotFound("no such file".into()),
-            FsError::Conflict("exists".into()),
             FsError::Internal("dsn".into()),
             FsError::Store("oxkv".into()),
             FsError::Fenced("epoch 2".into()),
@@ -311,11 +304,6 @@ mod tests {
                 FsError::NotFound("file ../../etc/passwd not found".into()),
                 StatusCode::NOT_FOUND,
                 "not found",
-            ),
-            (
-                FsError::Conflict("rule p, ../../x already exists".into()),
-                StatusCode::CONFLICT,
-                "conflict",
             ),
         ] {
             let res = err.error_response();
