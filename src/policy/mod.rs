@@ -1013,16 +1013,21 @@ mod tests {
         );
     }
 
-    /// Reads a source file's production code: everything before the
-    /// column-0 `#[cfg(test)]` module, with comment lines dropped.
+    /// Reads a source file's production code, dropping comment lines, with
+    /// [`crate::test_support::production_source`] -- the one helper every
+    /// such guard shares, rather than a copy per file.
     ///
-    /// The attribute is matched at column 0 rather than after `trim_start`,
-    /// unlike the copies in `http::error` and `records` used to. Those
-    /// stopped at the first *indented* `#[cfg(test)]`, which several files
-    /// carry on an inner item; scanning `src` with that variant truncated
-    /// the walk partway through the files the assertions are about. All
-    /// three now match at column 0 and each is tested directly against a
-    /// fixture carrying an indented attribute mid-file.
+    /// There is one copy, and the previous note here claiming there were
+    /// three that "all match at column 0 and each is tested directly" was
+    /// wrong twice over: the copies in `http::error` and `records` matched
+    /// after `trim_start` and stopped at the first indented item attribute,
+    /// which several files carry, so the walks covered less than they
+    /// claimed. The shared helper does not match at column 0 alone either
+    /// -- it stops only where that attribute is followed by a `mod`, which
+    /// is what distinguishes a test module from a test-only item at any
+    /// indentation -- and it is tested directly against a fixture carrying
+    /// both shapes.
+    ///
     /// The body of `fn <name>` inside an `impl` block: everything from the
     /// signature to the method's closing brace at one indent level.
     fn method_body(impl_src: &str, name: &str) -> String {

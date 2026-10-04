@@ -15,6 +15,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 
 use object_store::ObjectStore;
+#[cfg(test)]
 use object_store::memory::InMemory;
 use object_store::multipart::{MultipartStore, PartId};
 use object_store::path::Path as ObjectPath;
@@ -64,6 +65,16 @@ impl ObjectStoreClient {
     }
 
     /// Creates an in-memory client for unit tests.
+    ///
+    /// Test-only, and deliberately so. `is_memory` is the only thing that
+    /// sets the `InMemory` key layout, where [`Self::path`] prefixes the
+    /// bucket onto every key and [`S3Client::list_keys`] strips it back off
+    /// the listing. That pairing is a simulation of bucket isolation, not
+    /// S3's actual addressing, and the hazard `src/db.rs` documents for the
+    /// store builders -- a client whose key layout disagrees with the
+    /// backend's -- applies to it exactly as much. Gating it here keeps the
+    /// simulation out of production builds, where nothing may obtain one.
+    #[cfg(test)]
     pub fn in_memory() -> Arc<dyn S3Client> {
         let inner = Arc::new(InMemory::new());
         Arc::new(Self {
@@ -495,15 +506,6 @@ pub fn build_object_store(
 ) -> Result<Arc<dyn S3Client>, object_store::Error> {
     let store = s3_builder(config).build()?;
     Ok(Arc::new(ObjectStoreClient::new_combined(Arc::new(store))))
-}
-
-/// Builds an [`S3Client`] using the object-store stack.
-///
-/// This is the object-store replacement for [`crate::fs::s3::build_s3_client`].
-pub async fn build_s3_client(
-    config: &S3ClientConfig,
-) -> Result<Arc<dyn S3Client>, object_store::Error> {
-    build_object_store(config)
 }
 
 #[cfg(test)]
