@@ -1,11 +1,12 @@
-//! Per-request tracing middleware producing OpenTelemetry-compatible
-//! server spans.
+//! Middleware that creates an OpenTelemetry-compatible server span for each
+//! request.
 //!
-//! Each request gets a span named `<METHOD> <route-pattern>` carrying the
-//! HTTP method, path, response status, and latency. Inbound `traceparent`
-//! headers are extracted through the globally registered W3C Trace Context
-//! propagator, so requests from upstream instrumented services continue the
-//! same distributed trace.
+//! Each request gets a span named `<METHOD> <route-pattern>`. The span
+//! holds the HTTP method, the path, the response status, and the latency.
+//! The middleware reads the inbound `traceparent` headers through the
+//! globally registered W3C Trace Context propagator. A request from an
+//! upstream instrumented service therefore continues the same distributed
+//! trace.
 
 use std::{
     future::{Ready, ready},
@@ -26,9 +27,9 @@ use opentelemetry::{
 use tracing::{Instrument, field::Empty};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
-/// Server-side HTTP metrics exported through the global meter provider
-/// (OTLP when an endpoint is configured). Instrument names follow the
-/// OTel HTTP semantic conventions.
+/// The server-side HTTP metrics that the global meter provider exports.
+/// The provider uses OTLP when an endpoint is set. The instrument names
+/// follow the OTel HTTP semantic conventions.
 struct HttpMetrics {
     requests: Counter<u64>,
     duration: Histogram<f64>,
@@ -45,7 +46,8 @@ static HTTP_METRICS: LazyLock<HttpMetrics> = LazyLock::new(|| {
     }
 });
 
-/// Adapter exposing Actix headers to the OpenTelemetry propagator API.
+/// The adapter that gives the Actix headers to the OpenTelemetry
+/// propagator API.
 struct HeaderExtractor<'a>(&'a HeaderMap);
 
 impl opentelemetry::propagation::Extractor for HeaderExtractor<'_> {
@@ -58,10 +60,10 @@ impl opentelemetry::propagation::Extractor for HeaderExtractor<'_> {
     }
 }
 
-/// Middleware factory installing per-request tracing spans.
+/// The middleware factory that installs a tracing span for each request.
 ///
-/// Register outermost so downstream handler and middleware activity nests
-/// inside the request span.
+/// Register it as the outermost middleware, so that the activity of the
+/// downstream handler and middleware nests inside the request span.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct RequestTracingMiddleware;
 
@@ -84,8 +86,8 @@ where
     }
 }
 
-/// The instantiated per-worker middleware produced by
-/// [`RequestTracingMiddleware`].
+/// The middleware service for one worker, which
+/// [`RequestTracingMiddleware`] creates.
 pub struct RequestTracingMiddlewareService<S> {
     service: Rc<S>,
 }
@@ -104,8 +106,9 @@ where
 
     fn call(&self, req: ServiceRequest) -> Self::Future {
         let method = req.method().to_string();
-        // Route template (e.g. /policy/{user_id}) keeps cardinality low in
-        // trace backends; fall back to the raw path when unrouted.
+        // The route template, for example /policy/{user_id}, keeps the
+        // number of values low in the trace backends. The code falls back to
+        // the raw path when the request has no route.
         let route = req
             .match_pattern()
             .unwrap_or_else(|| req.path().to_string());
@@ -137,7 +140,8 @@ where
             let elapsed_ms = start.elapsed().as_millis() as u64;
             span.record("latency.ms", elapsed_ms);
             if status.is_server_error() {
-                // Surface 5xx as error-status spans in trace backends.
+                // Show a 5xx response as an error-status span in the trace
+                // backends.
                 span.record("otel.status_code", "ERROR");
             }
 

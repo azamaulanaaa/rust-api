@@ -1,9 +1,9 @@
-//! Object-store backend for [`crate::fs::s3::S3Client`].
+//! The object store backend for [`crate::fs::s3::S3Client`].
 //!
-//! Provides an [`object_store::ObjectStore`] implementation of the S3 abstraction
-//! so all file bytes live in a generic object store. Production uses
-//! `AmazonS3` (S3, MinIO, R2 via `endpoint_url`) while tests use
-//! `InMemory` — no external service required.
+//! This module implements [`object_store::ObjectStore`] as the S3
+//! abstraction, so all file bytes live in a generic object store. Production
+//! uses `AmazonS3` (S3, MinIO, and R2 through `endpoint_url`). Tests use
+//! `InMemory`. The tests therefore need no external service.
 
 use std::{
     borrow::Cow,
@@ -25,24 +25,26 @@ use tokio::sync::Mutex;
 use crate::fs::error::FsError;
 use crate::fs::s3::{S3Client, S3ClientConfig};
 
-/// Native multipart state streamed via [`MultipartStore`].
+/// The multipart state that [`MultipartStore`] streams.
 #[derive(Debug)]
 struct MultipartState {
     bucket: String,
     key: String,
     path: ObjectPath,
     id: MultipartId,
-    /// Part index (0-based) -> `PartId` returned by `put_part`.
+    /// Part index (0 based) -> the `PartId` that `put_part` returned.
     parts: BTreeMap<usize, PartId>,
 }
 
-/// Object-store backed [`S3Client`] with true streaming multipart.
+/// An object store backed [`S3Client`] with real streaming for multipart
+/// uploads.
 ///
-/// For `AmazonS3` the store is bucket-scoped so `key` alone is the path;
-/// for `InMemory` the bucket is prefixed to simulate isolation. Multipart
-/// uploads are streamed via [`MultipartStore::put_part`] per part and
-/// completed via [`MultipartStore::complete_multipart`], avoiding
-/// buffering the entire object in memory.
+/// For `AmazonS3` the store has one bucket scope. The `key` alone is the
+/// path. For `InMemory` the code prefixes the bucket to simulate bucket
+/// isolation. The client streams each part of a multipart upload with
+/// [`MultipartStore::put_part`]. The client completes the upload with
+/// [`MultipartStore::complete_multipart`]. This design does not buffer
+/// the whole object in memory.
 pub struct ObjectStoreClient {
     store: Arc<dyn ObjectStore>,
     multipart: Arc<dyn MultipartStore>,
@@ -51,7 +53,7 @@ pub struct ObjectStoreClient {
 }
 
 impl ObjectStoreClient {
-    /// Creates a client from a single `Arc` that implements both traits.
+    /// Creates a client from one `Arc` that implements both traits.
     pub fn new_combined<T>(inner: Arc<T>) -> Self
     where
         T: ObjectStore + MultipartStore + 'static,
@@ -66,14 +68,16 @@ impl ObjectStoreClient {
 
     /// Creates an in-memory client for unit tests.
     ///
-    /// Test-only, and deliberately so. `is_memory` is the only thing that
-    /// sets the `InMemory` key layout, where [`Self::path`] prefixes the
-    /// bucket onto every key and [`S3Client::list_keys`] strips it back off
-    /// the listing. That pairing is a simulation of bucket isolation, not
-    /// S3's actual addressing, and the hazard `src/db.rs` documents for the
-    /// store builders -- a client whose key layout disagrees with the
-    /// backend's -- applies to it exactly as much. Gating it here keeps the
-    /// simulation out of production builds, where nothing may obtain one.
+    /// This function is only for tests. That is deliberate. The flag
+    /// `is_memory` alone sets the `InMemory` key layout. In that layout
+    /// [`Self::path`] prefixes the bucket to every key, and
+    /// [`S3Client::list_keys`] removes the prefix from the listing. The two
+    /// functions simulate bucket isolation. They do not use the real
+    /// addressing of S3. The hazard that `src/db.rs` documents for the store
+    /// builders applies here as well. That hazard is a client whose key
+    /// layout does not match the layout of the backend. The `#[cfg(test)]`
+    /// gate keeps the simulation out of production builds. No production
+    /// code can obtain such a client.
     #[cfg(test)]
     pub fn in_memory() -> Arc<dyn S3Client> {
         let inner = Arc::new(InMemory::new());
@@ -157,14 +161,14 @@ impl S3Client for ObjectStoreClient {
             return Err(FsError::BadRequest("part_number must be >= 1".into()));
         }
         let part_idx = (part_number - 1) as usize;
-        // Only the two fields the backend call needs are taken under the
-        // lock, and the guard dies with this block. It used to live across
-        // `put_part` itself -- and had to, because `state.parts.insert`
-        // needed the same borrow -- so one slow PUT, or one hung
-        // connection with no client-side timeout at this layer, blocked
-        // every other multipart part upload in the PROCESS, including
-        // unrelated users' uploads, for the full round trip. The map needs
-        // microseconds of exclusion.
+        // The code copies the two fields that the backend call needs under the
+        // lock. The guard goes out of scope at the end of this block. The
+        // guard used to live across `put_part` itself. It had to, because
+        // `state.parts.insert` needed the same borrow. Therefore one slow
+        // PUT, or one hung connection with no client timeout at this layer,
+        // blocked every other multipart part upload in the PROCESS. That
+        // includes uploads of unrelated users. The block lasted for the full
+        // round trip. The map needs the lock for microseconds only.
         let (path, id) = {
             let states = self.states.lock().await;
             let state = states
@@ -182,20 +186,21 @@ impl S3Client for ObjectStoreClient {
             .await
             .map_err(Self::map_err)?;
         let etag = part_id.content_id.clone();
-        // Re-locked only to record the id. The entry can legitimately be
-        // GONE by now: `complete_multipart_upload` removes it before its
-        // own backend call, and a backend that has already assembled the
-        // object rejects this part too, so there is nothing to attach the
-        // id to and dropping it is the outcome the backend already chose.
+        // The code takes the lock again only to record the id. The entry can be
+        // GONE by now, and that outcome is valid. `complete_multipart_upload`
+        // removes the entry before it calls the backend. A backend that
+        // already assembled the object also rejects this part. Therefore
+        // there is nothing to attach the id to. The code drops the id, which
+        // matches the outcome that the backend already chose.
         //
-        // That is the whole lost-update surface this creates, and it is
-        // closed upstream rather than here: every engine entry point takes
-        // the session lock across "are all parts present?" and the
-        // complete, so a part whose id has not been recorded yet cannot
-        // reach this function's `complete` at all. What remains is a
-        // client re-uploading a part it already has WHILE completing it,
-        // whose interleaving was equally arbitrary when the guard was held
-        // across the call.
+        // This is the only lost update that this change can cause. The
+        // upstream code closes it, and not this function. Every entry point
+        // of the engine takes the session lock across the check for all
+        // parts and the complete call. Therefore a part whose id is not yet
+        // recorded cannot reach the complete call in this function. What
+        // remains is a client that uploads a part again while it completes
+        // the upload. The order of the calls was equally arbitrary before,
+        // when the guard covered the call.
         let mut states = self.states.lock().await;
         match states.get_mut(upload_id) {
             Some(state) => {
@@ -219,9 +224,10 @@ impl S3Client for ObjectStoreClient {
         upload_id: &str,
         etags: Vec<String>,
     ) -> Result<(), FsError> {
-        // `remove` hands ownership out, so nothing below needs the guard --
-        // it only stayed alive to the end of the function, across the
-        // backend call, for the same reason `upload_part` held it.
+        // The call to `remove` gives the ownership to this function. Therefore
+        // no code below needs the guard. The guard only lived until the end
+        // of the function. It covered the backend call for the same reason
+        // that `upload_part` held it.
         let state = {
             let mut states = self.states.lock().await;
             states
@@ -238,7 +244,8 @@ impl S3Client for ObjectStoreClient {
                 state.parts.len()
             )));
         }
-        // Verify etags match stored PartIds in order and collect ordered PartIds.
+        // The code checks that the etags match the stored `PartId` values in
+        // order. The code then collects the `PartId` values in order.
         let mut ordered = Vec::with_capacity(etags.len());
         for (i, etag) in etags.iter().enumerate() {
             let part = state
@@ -267,11 +274,11 @@ impl S3Client for ObjectStoreClient {
         key: &str,
         upload_id: &str,
     ) -> Result<(), FsError> {
-        // Checked under the lock, applied outside it. `remove` already made
-        // the state unreachable, so a concurrent caller cannot see a
-        // half-aborted upload either way, and the abort is no longer able
-        // to hold the map against every other multipart call while it
-        // waits on the backend.
+        // The code checks the state under the lock and applies the abort
+        // outside the lock. The call to `remove` already made the state
+        // unreachable. A concurrent caller therefore cannot see a partly
+        // aborted upload in either order. The abort no longer holds the map
+        // against every other multipart call while it waits for the backend.
         let state = {
             let mut states = self.states.lock().await;
             if let Some(state) = states.get(upload_id)
@@ -282,8 +289,9 @@ impl S3Client for ObjectStoreClient {
             states.remove(upload_id)
         };
         if let Some(state) = state {
-            // Propagate: the engine retries (restored from the persisted
-            // record), and GC retains the session until S3 confirms.
+            // The code propagates the error. The engine retries with the state
+            // that it restores from the persisted record. Garbage collection
+            // retains the session until S3 confirms the abort.
             self.multipart
                 .abort_multipart(&state.path, &state.id)
                 .await
@@ -441,8 +449,8 @@ impl S3Client for ObjectStoreClient {
         let mut stream = self.store.list(Some(&root));
         while let Some(meta) = stream.try_next().await.map_err(Self::map_err)? {
             let full = meta.location.to_string();
-            // InMemory nests keys under the bucket; strip it back to the
-            // relative form the rest of the trait speaks.
+            // InMemory nests the keys under the bucket. The code removes the bucket
+            // to get the relative form that the rest of the trait uses.
             let key = if self.is_memory {
                 full.strip_prefix(&format!("{bucket}/"))
                     .unwrap_or(&full)
@@ -459,16 +467,18 @@ impl S3Client for ObjectStoreClient {
     }
 }
 
-/// Builds the configured `AmazonS3Builder` from [`S3ClientConfig`].
+/// Builds a configured `AmazonS3Builder` from [`S3ClientConfig`].
 ///
-/// Single construction site for the endpoint/region/credential setup:
-/// [`db`](crate::db) reuses this for OxKV `OxKvStore`s so the file-byte
-/// client and the transactional stores cannot drift apart. Each caller
-/// finishes the build itself because the `S3Client` wrapper needs the
-/// concrete `AmazonS3` type (`MultipartStore` is not object-safe).
+/// This is the only construction site for the endpoint, region, and
+/// credential setup. [`db`](crate::db) reuses it for the OxKV `OxKvStore`
+/// instances. The reuse keeps the file byte client and the transactional
+/// stores from drifting apart. Each caller finishes the build itself,
+/// because the `S3Client` wrapper needs the concrete `AmazonS3` type.
+/// `MultipartStore` is not object safe.
 ///
-/// Supports S3-compatible endpoints (MinIO, R2) via `endpoint_url` and
-/// `force_path_style`. For `http` endpoints `allow_http` is enabled.
+/// The builder supports S3 compatible endpoints such as MinIO and R2
+/// through `endpoint_url` and `force_path_style`. The builder enables
+/// `allow_http` for `http` endpoints.
 pub fn s3_builder(config: &S3ClientConfig) -> object_store::aws::AmazonS3Builder {
     use object_store::aws::AmazonS3Builder;
 
@@ -497,10 +507,11 @@ pub fn s3_builder(config: &S3ClientConfig) -> object_store::aws::AmazonS3Builder
     builder
 }
 
-/// Builds an [`ObjectStore`] from [`S3ClientConfig`] and wraps it as [`S3Client`].
+/// Builds an [`ObjectStore`] from [`S3ClientConfig`] and wraps it as
+/// [`S3Client`].
 ///
-/// Shares the [`s3_builder`] setup; only the `S3Client` adapter
-/// wrapping lives here.
+/// The function uses the setup of [`s3_builder`]. Only the `S3Client`
+/// adapter wrapper lives in this function.
 pub fn build_object_store(
     config: &S3ClientConfig,
 ) -> Result<Arc<dyn S3Client>, object_store::Error> {
@@ -513,12 +524,13 @@ mod tests {
     use super::*;
     use bytes::Bytes;
 
-    /// [`MultipartStore`] that parks the FIRST `put_part` until released.
+    /// A [`MultipartStore`] that parks the FIRST `put_part` call until the
+    /// test releases it.
     ///
-    /// Everything else delegates to a real in-memory backend, so the
-    /// upload still genuinely completes; only WHEN one backend call is
-    /// outstanding is controlled, which is what turns "the state map is
-    /// held across a network call" from an argument into an observation.
+    /// Every other call goes to a real in-memory backend, so the upload
+    /// still completes. The test controls only WHEN one backend call is
+    /// outstanding. This control turns the claim that the state map is held
+    /// across a network call into an observation.
     #[derive(Debug)]
     struct GateMultipart {
         inner: Arc<InMemory>,
@@ -570,11 +582,11 @@ mod tests {
         }
     }
 
-    /// The gate also has to be an [`ObjectStore`], because
-    /// `ObjectStoreClient::new_combined` takes one `Arc` that is both halves
-    /// of the client. Everything except `put_part` delegates straight to the
-    /// real in-memory backend, so the upload this test parks still genuinely
-    /// completes once released.
+    /// The gate must also be an [`ObjectStore`]. The function
+    /// `ObjectStoreClient::new_combined` takes one `Arc` that implements
+    /// both traits. Every call except `put_part` goes straight to the real
+    /// in-memory backend. Therefore the upload that this test parks still
+    /// completes after the release.
     #[async_trait]
     impl ObjectStore for GateMultipart {
         async fn put_opts(
@@ -645,19 +657,21 @@ mod tests {
 
     /// One slow backend call must not block the whole process.
     ///
-    /// `upload_part` took `states.lock()` and held the guard across
-    /// `MultipartStore::put_part` -- it needed the same borrow for the
-    /// `state.parts.insert` on the next line -- so the process-global map
-    /// was pinned for the full round trip. A single slow PUT, or a hung
-    /// connection with no client-side timeout at this layer, stalled every
-    /// other concurrent part upload in the process: unrelated users,
-    /// unrelated buckets, uploads that share nothing with the slow one.
+    /// The old `upload_part` took `states.lock()` and held the guard across
+    /// `MultipartStore::put_part`. It needed the same borrow for the
+    /// `state.parts.insert` call on the next line. Therefore the map that
+    /// the whole process shares stayed locked for the full round trip. A
+    /// single slow PUT, or a hung connection with no client timeout at this
+    /// layer, stalled every other part upload in the process. The stalled
+    /// uploads include the uploads of unrelated users, the uploads in
+    /// unrelated buckets, and the uploads that share nothing with the slow
+    /// upload.
     ///
-    /// Asserted two ways. `states.try_lock()` is the direct structural
-    /// claim -- the map is free while a backend call is outstanding -- and
-    /// the second upload completing is the same thing as the client would
-    /// experience. The first fails on the old code with
-    /// "the mutex is held across a backend call".
+    /// The test asserts this in two ways. `states.try_lock()` makes the
+    /// direct structural claim that the map is free while a backend call is
+    /// outstanding. The second upload completing shows the same thing as the
+    /// client sees it. The first assertion fails on the old code with the
+    /// message "the mutex is held across a backend call".
     #[tokio::test]
     async fn the_multipart_state_map_is_not_held_across_a_backend_call() -> anyhow::Result<()> {
         let inner = Arc::new(InMemory::new());
@@ -701,8 +715,8 @@ mod tests {
             "the multipart state mutex is held across a backend call"
         );
 
-        // A different upload, sharing nothing with the parked one, runs to
-        // completion while it is still in flight.
+        // A different upload shares nothing with the parked upload. It runs
+        // to completion while the other upload is still in flight.
         let etag = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             client.upload_part(
@@ -725,8 +739,9 @@ mod tests {
         );
 
         release.notify_one();
-        // The parked part still lands in the state a complete will read:
-        // it was copied out under the lock, not carried by it.
+        // The parked part still lands in the state that a complete call
+        // reads. The code copied the state out under the lock. The lock did
+        // not carry the state.
         let slow_etag = slow.await.expect("slow task")?;
         client
             .complete_multipart_upload("b", "files/slow", &up_slow, vec![slow_etag])
@@ -824,7 +839,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn put_overwrites_and_delete_idempotent() -> anyhow::Result<()> {
+    async fn put_overwrites_and_delete_is_idempotent() -> anyhow::Result<()> {
         let client = ObjectStoreClient::in_memory();
         client
             .put_object("b", "k", Bytes::from_static(b"v1"), None, None)
@@ -863,7 +878,7 @@ mod tests {
                 Some("abc123".into()),
             )
             .await?;
-        // Verify attributes are persisted in the underlying store.
+        // The test checks that the store keeps the attributes.
         let path = ObjectPath::from("b/k-ct");
         let res = inner.get(&path).await?;
         assert_eq!(
@@ -878,8 +893,9 @@ mod tests {
                 .map(|v| v.as_ref()),
             Some("abc123")
         );
-        // Multipart creation on object_store 0.12 does not support attrs via
-        // MultipartStore, so we only verify the upload succeeds.
+        // Multipart creation in object_store 0.12 does not support attributes
+        // through `MultipartStore`. The test therefore only checks that the
+        // upload succeeds.
         let up = client
             .create_multipart_upload("b", "k-mp", Some("application/octet-stream".into()))
             .await?;

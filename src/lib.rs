@@ -1,30 +1,32 @@
-//! A starter-kit REST API server providing pluggable modules for
-//! OIDC authentication, JWT session validation, and Casbin-based
-//! authorization, built on Actix Web.
+//! A REST API server starter kit. It provides plug-in modules for OIDC
+//! authentication, JWT session validation, and Casbin-based authorization.
+//! The modules run on Actix Web.
 //!
-//! The crate is intentionally business-logic free: applications compose
-//! [`http::ApiModule`] implementations onto an [`http::ApiService`]
-//! to build their own API surface on top of the shared auth/policy plumbing.
+//! This crate has no business logic. An application composes
+//! [`http::ApiModule`] implementations onto an [`http::ApiService`] to build
+//! its own API surface on the shared auth and policy plumbing.
 
-// `unwrap_used`/`expect_used` are denied package-wide via [lints.clippy]
-// in Cargo.toml, so the level is declared once and applies to every
-// target. This attribute only opens the test escape hatch, which is why
-// individual `#[cfg(test)]` modules do not need their own `#[allow]`.
+// Cargo.toml denies `unwrap_used` and `expect_used` for the whole package
+// through [lints.clippy], so the level is set once and covers every target.
+// This attribute only opens the test escape hatch. Each `#[cfg(test)]` module
+// therefore needs no `#[allow]` of its own.
 //
-// Public items must carry rustdoc comments; that lint is enforced the
-// same way, via [lints.rust] in Cargo.toml.
+// Every public item needs a rustdoc comment. Cargo.toml enforces this rule
+// in the same way, through [lints.rust].
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
-/// HTTP server scaffolding: modular service registry plus request
-/// middleware (bearer-token extraction, JWKS-backed JWT validation).
+/// HTTP server scaffolding. It has a service registry for modules and
+/// request middleware. The middleware extracts the bearer token and
+/// validates the JWT with JWKS.
 pub mod http;
 
 /// OpenID Connect client and login/callback routes implementing the
 /// authorization-code flow with PKCE, CSRF state, and nonce validation.
 pub mod oidc;
 
-/// Casbin RBAC policy engine backed by prefix-scoped OxKV stores on S3,
-/// with management routes for permission rules and group membership.
+/// Casbin RBAC policy engine. It uses OxKV stores on S3, with one prefix
+/// scope per store. It also has management routes for permission rules and
+/// group membership.
 pub mod policy;
 
 /// Object-store file storage via `object_store` (AmazonS3 for S3/MinIO/R2,
@@ -40,30 +42,33 @@ pub mod docs;
 /// Per-user filtered replicas on stable OxKvStore prefixes.
 pub mod sync;
 
-/// Shared change-feed vocabulary: [`FileRecord`](records::FileRecord),
-/// [`WalOp`](records::WalOp), and the
-/// [`ChangeSink`](records::ChangeSink) seam.
+/// Shared change feed vocabulary: [`FileRecord`](records::FileRecord),
+/// [`WalOp`](records::WalOp), and the [`ChangeSink`](records::ChangeSink)
+/// seam.
 ///
-/// The pivot that lets `fs`/`policy` (which emit changes) and `sync`
-/// (which consumes them) depend on this module instead of on each other.
-/// Depends on nothing else in the crate.
+/// This module is the pivot between the two sides of the feed. `fs` and
+/// `policy` emit changes. `sync` consumes them. Both sides depend on this
+/// module, not on each other. This module depends on nothing else in the
+/// crate.
 pub mod records;
 
-/// OxKV store factory (prefix-scoped inside configured S3 bucket) plus the
-/// single-writer lease that guards a `[database].prefix` scope.
+/// OxKV store factory. The factory is prefix-scoped inside the configured
+/// S3 bucket. It also creates the single-writer lease that guards a
+/// `[database].prefix` scope.
 pub mod db;
 
-/// Single-writer lease: makes a second process on the same
-/// `[database].prefix` observable at startup instead of a silent
+/// Single-writer lease. It makes a second process on the same
+/// `[database].prefix` visible at startup. It also prevents a silent
 /// divergence.
 pub mod lease;
 
-/// Process-wide latch for a lost primary write session, covering the
-/// uncooperative case the lease cannot see.
+/// Process-wide latch for a lost primary write session. It covers the
+/// uncooperative case that the lease cannot see.
 pub mod fencing;
 
-/// Cost controls: a request-rate bucket and a concurrency gate for the
-/// endpoints whose work a single request does not bound.
+/// Cost controls. This module has a request rate bucket and a concurrency
+/// gate. They protect the endpoints whose work a single request does not
+/// bound.
 pub mod limits;
 
 /// Telemetry bootstrap: global [`tracing`] subscriber installation and
@@ -72,34 +77,35 @@ pub mod telemetry;
 
 #[cfg(test)]
 mod tests {
-    /// Every advisory this project suppresses is suppressed on purpose.
+    /// Every advisory this project suppresses has a reason on purpose.
     ///
     /// The `[[advisories.ignore]]` entries in `deny.toml` are all cases
-    /// where the fix is genuinely unreachable -- an upstream crate pins the
-    /// dependency, or no patched version exists at all -- so the only honest
-    /// move is to record the blocker and move on. That makes the list exactly
-    /// the kind of thing that grows without anyone noticing: each addition
-    /// turns the build green, and nothing records why the previous ones were
-    /// acceptable.
+    /// where the fix is unreachable. An upstream crate may pin the
+    /// dependency. No patched version may exist at all. In each case the
+    /// only correct action is to record the blocker and continue.
     ///
-    /// So the reason is required, and required to be substantial: a bare
-    /// `reason = "known"` passes this crate's reviewer and nothing else. A
-    /// `TODO` or a link with no explanation fails.
+    /// Such a list grows without anyone noticing. Each new entry turns the
+    /// build green. Nothing records why the earlier entries were acceptable.
     ///
-    /// Note what this does *not* do: it does not make the list exhaustive or
-    /// correct. A suppression that is unjustified but well written still
-    /// passes. It makes the additions legible, which is the part that
-    /// mechanical checking can do.
+    /// So the test requires a reason. The test also requires the reason to
+    /// be substantial. A bare `reason = "known"` passes this crate's
+    /// reviewer and nothing else. A `TODO` or a link with no explanation
+    /// fails.
+    ///
+    /// This test does not make the list complete. This test does not make
+    /// the list correct. An unjustified suppression still passes when its
+    /// prose is good. The test only makes the additions legible.
     #[test]
     fn every_ignore_is_justified() {
         let deny = std::fs::read_to_string("deny.toml").expect("deny.toml is readable");
 
         /// Splits `deny.toml` into `(id, reason)` pairs.
         ///
-        /// Minimal by design: it recognises `[[advisories.ignore]]` headers and
-        /// the two keys, and handles TOML's `"""` multi-line form because a
-        /// real rationale does not fit on one line. A full TOML parser would be
-        /// a dependency for a test that only needs these three shapes.
+        /// This function is small by design. It recognises the
+        /// `[[advisories.ignore]]` header and the two keys. It also handles
+        /// the TOML `"""` multi-line form, because a real rationale does not
+        /// fit on one line. A full TOML parser would add a dependency to a
+        /// test that needs only these three shapes.
         fn parse(text: &str) -> Vec<(String, String)> {
             let mut entries: Vec<(String, String)> = Vec::new();
             let mut id: Option<String> = None;
@@ -135,7 +141,7 @@ mod tests {
                 if let Some(v) = line.strip_prefix("id = ") {
                     id = Some(v.trim().trim_matches('"').to_string());
                 } else if let Some(v) = line.strip_prefix("reason = \"\"\"") {
-                    // Opening line of a multi-line string; text after the
+                    // Opening line of a multi-line string. Text after the
                     // opening quotes counts.
                     let head = v.trim_end_matches('"').trim();
                     reason = Some(if head.is_empty() {
@@ -178,12 +184,13 @@ mod tests {
                 "{id} is suppressed with a TODO in its reason"
             );
 
-            // The reason has to say *why the fix is not taken*, or a reader
-            // cannot tell "nobody has fixed it" from "we have not picked it up".
-            // Those are very different: the second is a bug.
+            // The reason must say *why the fix is not taken*. Otherwise a
+            // reader cannot tell "nobody has fixed it" from "we have not
+            // started". Those cases are very different. The second one is a
+            // bug.
             let lower = reason.to_lowercase();
             let unavailability = [
-                "fixed in",           // a fix exists; something upstream blocks it
+                "fixed in",           // a fix exists and something upstream blocks it
                 "no patched version", // no fix exists at all
                 "unmaintained",       // not a vulnerability, no fix coming
                 "latest release",     // upstream has nothing newer

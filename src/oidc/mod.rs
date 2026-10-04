@@ -2,9 +2,9 @@
 //! authorization-code flow with PKCE, CSRF state, and nonce validation.
 //!
 //! [`OidcClient`](crate::oidc::OidcClient) wraps the discovered provider
-//! metadata: it builds authorization URLs with fresh PKCE/CSRF/nonce
-//! values and exchanges authorization codes for signature-verified ID
-//! tokens. Multi-tenant providers that publish a `{tenantid}` issuer
+//! metadata. It builds authorization URLs with fresh PKCE/CSRF/nonce values.
+//! It exchanges authorization codes for signature-verified ID tokens.
+//! Multi-tenant providers that publish a `{tenantid}` issuer
 //! placeholder are supported by resolving the expected issuer per token
 //! instead of pinning it statically.
 
@@ -37,8 +37,8 @@ pub struct OidcConfig {
     /// publishes a `{tenantid}` issuer template.
     ///
     /// Empty for a single-tenant issuer, where the issuer is pinned
-    /// statically. Must be non-empty when the discovered issuer is templated;
-    /// [`OidcClient::new`] rejects that combination.
+    /// statically. Must be non-empty when the discovered issuer is
+    /// templated. [`OidcClient::new`] rejects that combination.
     pub allowed_tenants: Vec<String>,
 }
 
@@ -46,7 +46,7 @@ pub struct OidcConfig {
 ///
 /// Display text is lowercase sentence style, matching
 /// [`FsError`](crate::fs::error::FsError) and
-/// [`ApiError`](crate::http::error::ApiError): these strings reach server
+/// [`ApiError`](crate::http::error::ApiError). These strings reach server
 /// logs and startup error output, so they read as one voice.
 #[derive(Error, Debug)]
 pub enum OidcError {
@@ -93,24 +93,25 @@ pub struct OidcClient {
     >,
     http_client: reqwest::Client,
     provider_metadata: CoreProviderMetadata,
-    /// Original discovered issuer; may contain a `{tenantid}` placeholder
+    /// Original discovered issuer. It may contain a `{tenantid}` placeholder
     /// for multi-tenant providers (Azure AD).
     issuer: String,
-    /// Parsed template when [`OidcClient::issuer`] is templated.
+    /// Parsed template when [`OidcClient::issuer`] holds a `{tenantid}`
+    /// placeholder.
     issuer_template: Option<IssuerTemplate>,
     allowed_tenants: Vec<String>,
-    /// Absolute login-callback URL; its scheme decides the `Secure` flag
-    /// on auth cookies (plain-http deployments must still receive them).
+    /// Absolute login-callback URL. Its scheme decides the `Secure` flag on
+    /// auth cookies. Plain-http deployments must still receive the cookies.
     redirect_url: String,
 }
 
-/// Everything a caller needs to start the authorization-code flow: the
-/// provider URL to redirect the user agent to, plus the CSRF/nonce/PKCE
-/// values that must round-trip through temporary cookies.
+/// Everything a caller needs to start the authorization-code flow. It holds
+/// the provider URL to redirect the user agent to. It also holds the
+/// CSRF/nonce/PKCE values that must round-trip through temporary cookies.
 pub struct AuthUrlResponse {
     /// The provider's authorization endpoint URL including query params.
     pub url: String,
-    /// CSRF value; also carried as the OAuth2 `state` parameter.
+    /// CSRF value. The OAuth2 `state` parameter also carries it.
     pub csrf_token: CsrfToken,
     /// Nonce bound into the returned ID token.
     pub nonce: Nonce,
@@ -126,11 +127,12 @@ impl OidcClient {
             .redirect(reqwest::redirect::Policy::none())
             .build()?;
 
-        // Discovery is fetched manually: multi-tenant providers publish an
-        // issuer containing a literal {tenantid} placeholder that can never
-        // equal the requested URL, and openidconnect rejects such metadata.
-        // A sentinel tenant is substituted before parsing; real issuer
-        // enforcement happens per token against the parsed template (see
+        // The client fetches the discovery document by hand. Multi-tenant
+        // providers publish an issuer that contains a literal {tenantid}
+        // placeholder. That placeholder can never equal the requested URL,
+        // and openidconnect rejects such metadata. The client substitutes a
+        // sentinel tenant before it parses the document. The client then
+        // enforces the issuer per token against the parsed template (see
         // `exchange_code` and `JwtClaimsMiddleware`).
         let discovery_url = format!(
             "{}/.well-known/openid-configuration",
@@ -172,9 +174,10 @@ impl OidcClient {
         let provider_metadata: CoreProviderMetadata =
             serde_json::from_str(&body).map_err(|e| OidcError::Discovery(e.to_string()))?;
 
-        // from_provider_metadata seeds the ID-token verifier's keys from the
-        // metadata's embedded JWKS; discover_async normally fetches that
-        // document, so replicate the step for manually parsed metadata.
+        // from_provider_metadata reads the keys of the ID-token verifier
+        // from the JWKS that the metadata embeds. discover_async normally
+        // fetches that document. This call repeats the step for metadata
+        // that the client parsed by hand.
         let jwks = JsonWebKeySet::fetch_async(provider_metadata.jwks_uri(), &http_client)
             .await
             .map_err(|e| OidcError::Discovery(e.to_string()))?;
@@ -246,20 +249,21 @@ impl OidcClient {
         let id_token = token_response.id_token().ok_or(OidcError::MissingIdToken)?;
 
         if let Some(template) = &self.issuer_template {
-            // Multi-tenant provider: the published issuer carries a
-            // {tenantid} placeholder that no real token can match, so the
-            // static issuer check is disabled and the template is enforced
-            // against the token's own tenant identifier instead. Signature,
-            // nonce, audience, and expiry validation are unchanged.
+            // A multi-tenant provider publishes an issuer that carries a
+            // {tenantid} placeholder. No real token can match that
+            // placeholder, so the client disables the static issuer check.
+            // The client then enforces the template against the tenant
+            // identifier of the token itself. Signature, nonce, audience,
+            // and expiry validation do not change.
             let verifier = self.client.id_token_verifier().require_issuer_match(false);
             let _verified_claims = id_token
                 .claims(&verifier, &nonce)
                 .map_err(|e| OidcError::InvalidToken(e.to_string()))?;
 
-            // Signature verification above authenticates this payload, but
-            // an authenticated caller is not an *authorized* tenant: any
-            // tenant that has consented to a multi-tenant app registration
-            // can mint a token that verifies against the shared JWKS. The
+            // The signature verification above authenticates this payload.
+            // An authenticated caller is not an *authorized* tenant. Any
+            // tenant that consented to a multi-tenant app registration can
+            // mint a token that verifies against the shared JWKS. The
             // allowlist is the tenant gate, and it fails closed.
             let raw = id_token.to_string();
             let Some(tenant_id) = extract_unverified_claim(&raw, "tid").filter(|t| !t.is_empty())
@@ -288,14 +292,14 @@ impl OidcClient {
 
     /// Whether auth cookies must carry the `Secure` flag.
     ///
-    /// True for `https://` callbacks; plain-http deployments (local dev)
-    /// opt out so browsers accept the cookies at all. Unparseable URLs
-    /// fail closed to `true`.
+    /// True for `https://` callbacks. Plain-http deployments (local dev)
+    /// opt out, so that browsers accept the cookies at all. Unparseable
+    /// URLs fail closed to `true`.
     pub fn secure_cookies(&self) -> bool {
         secure_scheme(&self.redirect_url)
     }
 
-    /// The provider's discovered issuer URL; may contain a `{tenantid}`
+    /// The provider's discovered issuer URL. It may contain a `{tenantid}`
     /// placeholder for multi-tenant providers.
     pub fn issuer(&self) -> &str {
         &self.issuer
@@ -325,9 +329,9 @@ impl OidcClient {
 
 /// Reports whether `callback_url` uses `https`.
 ///
-/// Drives the `Secure` flag on auth cookies. Unparseable input fails
-/// closed to `true` so a misconfigured URL can only make cookies
-/// stricter, never leak them over plaintext.
+/// It drives the `Secure` flag on auth cookies. Unparseable input fails
+/// closed to `true`. A misconfigured URL can then only make the cookies
+/// stricter, and never leak them over plaintext.
 fn secure_scheme(callback_url: &str) -> bool {
     url::Url::parse(callback_url)
         .map(|u| u.scheme() == "https")
@@ -354,9 +358,10 @@ mod tests {
         assert!(secure_scheme(""));
     }
 
-    /// Every variant renders lowercase sentence style, matching
-    /// `FsError`/`ApiError` so log output reads as one voice. The enum doc
-    /// makes this a contract rather than a coincidence.
+    /// Every variant renders lowercase sentence style, matching the display
+    /// style of `FsError` and `ApiError`, so the log output reads as one
+    /// voice. The enum doc makes this a contract rather than a
+    /// coincidence.
     #[test]
     fn error_display_is_lowercase_sentence_style() {
         for rendered in [
@@ -374,7 +379,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oidc_end_to_end() -> anyhow::Result<()> {
+    async fn auth_url_and_code_exchange_return_signed_id_token() -> anyhow::Result<()> {
         let server = MockServer::start().await;
         let client_id = "test-client";
 

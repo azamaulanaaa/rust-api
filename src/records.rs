@@ -1,22 +1,21 @@
-//! Shared change-feed vocabulary.
+//! Shared vocabulary of the change feed.
 //!
 //! # Why this module exists
 //!
-//! `fs` and `policy` *emit* changes; `sync` *consumes* them. Both sides
-//! need the same types, and there is no third domain that owns them — so
-//! the two arrangements that avoid a new module are both worse:
+//! `fs` and `policy` *emit* changes. `sync` *consumes* them. Both sides need
+//! the same types. No third domain owns them. So both ways to avoid a new
+//! module are worse:
 //!
-//! - `fs` importing `WalOp` from `sync::wal`, while `sync` imports
-//!   `FileRecord` back from `fs::store`, is a dependency cycle. A cycle
-//!   cannot be enforced by the compiler, so "sync is above fs" survives
-//!   only as a comment, and every new cross-domain type has to be placed
-//!   by whoever notices first.
-//! - Putting the feed in `fs` would make "the file store happens to own
-//!   the change log" look intentional, and `sync` would then depend on
-//!   `fs` for two unrelated reasons.
+//! - `fs` imports `WalOp` from `sync::wal`, and `sync` imports `FileRecord`
+//!   back from `fs::store`. That is a cycle. A compiler cannot enforce a
+//!   cycle, so "sync is above fs" survives only as a comment. Every new type
+//!   that crosses a domain then depends on who notices first.
+//! - The feed goes in `fs`. That would make "the file store happens to own
+//!   the change log" look like a decision. `sync` would then depend on `fs`
+//!   for two reasons that have nothing to do with each other.
 //!
-//! So the vocabulary sits here, in a module that depends on nothing inside
-//! the crate. The graph becomes a DAG:
+//! So the vocabulary sits in this module. The module depends on nothing
+//! inside the crate. The result is a directed acyclic graph:
 //!
 //! ```text
 //!        records
@@ -26,164 +25,178 @@
 //!      (fs::store, the write path)
 //! ```
 //!
-//! `fs` and `policy` see only [`ChangeSink`](crate::records::ChangeSink) —
-//! they emit and forget.
-//! `sync` owns the durable implementation ([`Wal`](crate::sync::wal::Wal))
-//! and the replica machinery. Neither has to know the other exists.
+//! `fs` and `policy` see only [`ChangeSink`](crate::records::ChangeSink).
+//! They emit a change and forget it.
+//! `sync` owns the durable implementation
+//! ([`Wal`](crate::sync::wal::Wal)) and the replica machinery. Neither side
+//! has to know that the other side exists.
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-/// Persisted file record after a completed upload.
+/// File record after an upload ends, as it is stored.
 ///
-/// Lives here rather than in [`fs::store`](crate::fs::store) because it is
-/// part of the feed contract: [`WalOp::FileCreate`] carries a full record
-/// so a replica can re-apply the op without reading the master.
+/// The type lives here, not in [`fs::store`](crate::fs::store), because it
+/// is part of the feed contract. [`WalOp::FileCreate`] carries a whole
+/// record. So a replica can apply the operation again without reading the
+/// master.
 ///
-/// **Schema changes.** This is decoded from rows already on disk, so an
-/// added field makes every pre-existing row undecodable unless the field
-/// defaults -- and an undecodable row is not a missing row as far as the
-/// sweeper is concerned: it disappears from `list_files`, and the
-/// orphan-byte pass would then delete the object that row still describes.
-/// Fields whose absence can be given an honest value therefore carry
-/// `#[serde(default)]`, and the ones whose absence would mean the record
-/// points somewhere wrong or has aged past collection deliberately do not:
+/// **Schema changes.** The server reads this type from rows that are already
+/// on disk. So an added field makes every old row unreadable, unless the
+/// field has a default. An unreadable row is not the same as a missing row,
+/// as far as the sweeper is concerned. The row disappears from
+/// `list_files`. The pass for orphan bytes then deletes the object that the
+/// row still describes. So a field whose absence has an honest value carries
+/// `#[serde(default)]`. A field whose absence means that the record points at
+/// the wrong place, or has passed the age for collection on purpose, does
+/// not carry a default:
 ///
-/// - `id` and `s3_key` identify the row and the bytes it owns. `id` is
-///   already in the key, but a default of `""` would be a record about no
-///   object, and `s3_key` is the only pointer from the metadata to the
-///   data -- a wrong one is data loss in the making.
-/// - `size` feeds `Content-Length`. A `0` would be a plausible-looking
-///   wrong answer, truncating a download rather than failing it.
-/// - `created_at` is the GC clock. A `0` reads as "created at the epoch",
-///   which makes the record instantly collectable.
+/// - `id` and `s3_key` identify the row and the bytes that it owns. `id` is
+///   already in the key, but a default of `""` would describe no object.
+///   `s3_key` is the only pointer from the metadata to the data. A wrong
+///   pointer is data loss in the making.
+/// - `size` supplies `Content-Length`. A `0` would look like a valid wrong
+///   answer. It would truncate a download instead of failing it.
+/// - `created_at` is the clock for garbage collection. A `0` reads as "made
+///   at the start of the Unix epoch", which makes the record collectable at
+///   once.
 ///
-/// So a row that cannot decode stays a loud, visible condition -- `list_files`
-/// names the key and the sweeper refuses its orphan-byte pass -- rather than
-/// being papered over with a default that deletes the file.
+/// So a row that cannot decode stays a condition that is loud and visible.
+/// The name of `list_files` shows the key. The sweeper refuses its pass for
+/// orphan bytes. A row is never covered up by a default that deletes the
+/// file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileRecord {
     /// File identifier.
     pub id: String,
-    /// Original filename. Empty when the field is absent from an older row:
-    /// a name is presentation, and there is no wrong answer for it.
+    /// Original file name. The value is empty when the field is missing from an
+    /// older row. A name is only for display, so no value of it is wrong.
     #[serde(default)]
     pub name: String,
-    /// MIME type. Empty when absent, for the same reason as `name`.
+    /// MIME type. The value is empty when the field is missing, for the same
+    /// reason as `name`.
     #[serde(default)]
     pub mimetype: String,
     /// Size in bytes.
     pub size: u64,
     /// S3 key.
     pub s3_key: String,
-    /// Owner subject. Empty when absent, which matches no caller: an
-    /// unattributed record is read by nobody rather than by everyone.
+    /// Subject of the owner. The value is empty when the field is missing.
+    /// An empty value then matches no caller. So a record with no owner is
+    /// read by nobody, not by everyone.
     #[serde(default)]
     pub owner_sub: String,
     /// Creation timestamp.
     pub created_at: i64,
 }
 
-/// Operation recorded in the change feed.
+/// An operation that is stored in the change feed.
 ///
-/// File and relation ops carry enough payload to re-apply against a
-/// replica (`FileCreate` embeds the full record). Rich policy ops carry
-/// the full rule/link so replay can resync only the affected user/row;
-/// legacy `PolicyAdd`/`PolicyRemove` (object only) always fall back to a
+/// The operations on files and on relations carry enough data to apply them
+/// again on a replica. `FileCreate` carries the whole record. A rich policy
+/// operation carries the whole rule or link. So a replay can resync only the
+/// user or the row that the operation affected. The old operations
+/// `PolicyAdd` and `PolicyRemove` carry only an object. They always need a
 /// full rebuild.
 ///
-/// **Wire format.** This is `serde`-encoded into a durable log, so variants
-/// may be added but existing ones must not change shape: an older reader
-/// fails to decode a newer entry, and [`Wal`](crate::sync::wal::Wal)
-/// treats an undecodable entry as corruption rather than skipping it. Add
-/// a variant with `#[serde(default)]` fields where that is safe.
+/// **Wire format.** The server encodes this type with `serde` into a durable
+/// log. So a new variant is safe, but an existing variant must not change
+/// its form. An older reader cannot decode a newer entry, and
+/// [`Wal`](crate::sync::wal::Wal) treats an entry that it cannot decode as
+/// corruption instead of skipping it. Add a variant with
+/// `#[serde(default)]` fields where that is safe.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum WalOp {
-    /// Legacy policy mark (object only, pre-rich WAL).
+    /// An old policy mark that names only an object, from before the rich
+    /// operations existed.
     ///
-    /// Kept for reading WALs written before rich ops existed; new code
-    /// never writes it. Replay treats it as needing a full recalc.
+    /// The variant is kept so that the server can read old WALs. New code
+    /// never writes it. A replay treats it as a need for a full rebuild.
     PolicyAdd {
-        /// Object affected.
+        /// The object that is affected.
         obj: String,
     },
-    /// Legacy policy mark (object only, pre-rich WAL).
+    /// An old policy mark that names only an object, from before the rich
+    /// operations existed.
     ///
-    /// Kept for reading WALs written before rich ops existed; new code
-    /// never writes it. Replay treats it as needing a full recalc.
+    /// The variant is kept so that the server can read old WALs. New code
+    /// never writes it. A replay treats it as a need for a full rebuild.
     PolicyRemove {
-        /// Object affected.
+        /// The object that is affected.
         obj: String,
     },
-    /// Permission rule added (`p = sub, obj, act`).
+    /// A permission rule was added (`p = sub, obj, act`).
     PolicyRuleAdd {
-        /// Rule subject (user or group).
+        /// Subject of the rule, which is a user or a group.
         sub: String,
-        /// Rule object (`{row_type}:{row_id}` for rows).
+        /// Object of the rule. A row uses `{row_type}:{row_id}`.
         obj: String,
-        /// Rule action (`read`/`write`/`delete`/`execute`).
+        /// Action of the rule, which is `read`, `write`, `delete`, or
+        /// `execute`.
         act: String,
     },
-    /// Permission rule removed (`p = sub, obj, act`).
+    /// A permission rule was removed (`p = sub, obj, act`).
     PolicyRuleRemove {
-        /// Rule subject (user or group).
+        /// Subject of the rule, which is a user or a group.
         sub: String,
-        /// Rule object (`{row_type}:{row_id}` for rows).
+        /// Object of the rule. A row uses `{row_type}:{row_id}`.
         obj: String,
-        /// Rule action (`read`/`write`/`delete`/`execute`).
+        /// Action of the rule, which is `read`, `write`, `delete`, or
+        /// `execute`.
         act: String,
     },
-    /// Group membership added (`g = user, group`).
+    /// Group membership was added (`g = user, group`).
     GroupAdd {
-        /// Member subject.
+        /// Subject of the member.
         user: String,
-        /// Group joined.
+        /// The group that the member joined.
         group: String,
     },
-    /// Group membership removed (`g = user, group`).
+    /// Group membership was removed (`g = user, group`).
     GroupRemove {
-        /// Member subject.
+        /// Subject of the member.
         user: String,
-        /// Group left.
+        /// The group that the member left.
         group: String,
     },
-    /// Group deleted (every membership link to `group` removed).
+    /// A group was deleted, which removed every membership link to `group`.
     GroupDelete {
-        /// Group removed.
+        /// The group that was removed.
         group: String,
     },
-    /// File attached to row.
+    /// A file was attached to a row.
     Attach {
-        /// Row type.
+        /// The type of the row.
         row_type: String,
-        /// Row identifier.
+        /// The identifier of the row.
         row_id: String,
-        /// File identifier.
+        /// The identifier of the file.
         file_id: String,
     },
-    /// File detached from row.
+    /// A file was detached from a row.
     Detach {
-        /// Row type.
+        /// The type of the row.
         row_type: String,
-        /// Row identifier.
+        /// The identifier of the row.
         row_id: String,
-        /// File identifier.
+        /// The identifier of the file.
         file_id: String,
     },
-    /// File metadata created (completed upload).
+    /// File metadata was created, which means that an upload ended.
     FileCreate {
-        /// Full record as persisted on master.
+        /// The whole record, as it is stored on the master.
         rec: FileRecord,
     },
-    /// File metadata deleted.
+    /// File metadata was deleted.
     FileDelete {
-        /// File identifier.
+        /// The identifier of the file.
         file_id: String,
     },
 }
 
 impl WalOp {
-    /// True for legacy object-only marks that cannot replay incrementally.
+    /// True for an old mark that names only an object, which cannot replay
+    /// in steps.
     pub fn is_legacy_policy_mark(&self) -> bool {
         matches!(self, Self::PolicyAdd { .. } | Self::PolicyRemove { .. })
     }
@@ -192,44 +205,47 @@ impl WalOp {
 /// One entry in the durable feed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WalEntry {
-    /// Monotonic sequence.
+    /// Sequence number that only increases.
     pub seq: u64,
-    /// Operation.
+    /// The operation.
     pub op: WalOp,
-    /// Timestamp.
+    /// The time stamp.
     pub ts: i64,
 }
 
-/// Where committed mutations are announced.
+/// The place where the server announces changes that it has committed.
 ///
-/// The seam that keeps `fs` and `policy` out of `sync`. Producers append
-/// after a mutation commits and treat a failure as fatal to the mutation
-/// (fail-closed): if the feed misses a write, replicas silently diverge
-/// from the master with nothing to replay.
+/// This trait is the seam that keeps `fs` and `policy` out of `sync`. A
+/// producer appends an operation after a mutation commits. It treats a
+/// failure as fatal to the mutation, so the flow fails closed. If the
+/// feed misses a write, the replicas diverge from the master in a way
+/// that has nothing to replay.
 ///
-/// Implementations must serialize concurrent appends so sequence numbers
-/// stay gap-free. The durable implementation is
-/// [`Wal`](crate::sync::wal::Wal).
+/// An implementation must serialize the appends that run at the same
+/// time. The sequence numbers must then have no gaps. The durable
+/// implementation is [`Wal`](crate::sync::wal::Wal).
 ///
-/// The failure is deliberately an opaque `anyhow::Error`: the producer is
-/// `fs` or `policy`, which has no business knowing whether the failure was a
-/// store error, a fencing loss, or a serialization problem, and
+/// The failure is an opaque `anyhow::Error` on purpose. The producer is
+/// `fs` or `policy`. Neither has any business knowing whether the failure
+/// came from the store, from a fencing loss, or from serialization. The
 /// [`Wal`](crate::sync::wal::Wal) has no business exposing
-/// [`FsError`](crate::fs::error::FsError) either. Both flatten at the
-/// boundary and neither classifies the cause on the way back.
+/// [`FsError`](crate::fs::error::FsError) either. Both flatten the error
+/// at the boundary. Neither classifies the cause on the way back.
 ///
-/// A boxed error rather than a crate-defined newtype: it carries the same
-/// information (nothing past the message, which is the sink's own sanitized
-/// `Display`) without a wrapper that only `fs` and `policy` would have had to
-/// unwrap again on the way out. `anyhow` is a leaf dependency, so this
-/// module's "depends on nothing in the crate" property is unaffected.
+/// The trait uses a boxed error, not a new type that the crate defines.
+/// The boxed error carries the same information. Nothing passes the
+/// message, which is the sanitized `Display` of the sink. The only cost
+/// is a wrapper that `fs` and `policy` would have to unwrap again on the
+/// way out. `anyhow` is a leaf dependency, so this module keeps its
+/// property of depending on nothing in the crate.
 #[async_trait]
 pub trait ChangeSink: Send + Sync {
-    /// Appends one operation, returning only once it is durable.
+    /// Appends one operation. The function returns only after the
+    /// operation is durable.
     ///
-    /// On failure the message is for server-side logs. It is the sink's own
-    /// `Display`, which is already the sanitized text, not the underlying
-    /// cause.
+    /// The message of a failure is for the server logs on the same
+    /// machine. It is the `Display` of the sink, which is already the
+    /// sanitized text. It is not the cause underneath.
     async fn append(&self, op: WalOp) -> anyhow::Result<()>;
 }
 
@@ -238,9 +254,9 @@ mod tests {
     use super::*;
     use crate::test_support::production_source;
 
-    /// The feed is a wire format. A round trip has to preserve the op
-    /// exactly, because `Wal::range` treats any mismatch as corruption
-    /// rather than skipping the entry.
+    /// The feed is a wire format. A round trip must keep the operation exactly.
+    /// `Wal::range` treats any difference as corruption, not as an entry to
+    /// skip.
     #[test]
     fn ops_round_trip_through_the_wire_format() {
         let ops = [
@@ -274,13 +290,14 @@ mod tests {
         }
     }
 
-    /// Replay classifies ops, and the classification has to be exhaustive:
-    /// an op this does not name takes the wrong branch in `replay`.
+    /// A replay classifies the operations, and the classification must list
+    /// every operation. An operation that this does not name takes the wrong
+    /// branch in `replay`.
     ///
-    /// `is_legacy_policy_mark` is the only classifier left, and it is
-    /// load-bearing -- `SnapshotManager::replay` rejects a range containing
-    /// one before it opens a writer, because a legacy mark names an object
-    /// and no rule, so nothing can be applied incrementally.
+    /// `is_legacy_policy_mark` is the only classifier left, and it decides
+    /// the outcome. `SnapshotManager::replay` refuses a range that contains
+    /// one of these operations before it opens a writer. An old mark names an
+    /// object and no rule, so nothing in it can be applied in steps.
     #[test]
     fn op_classification_is_exhaustive() {
         assert!(WalOp::PolicyAdd { obj: "x".into() }.is_legacy_policy_mark());
@@ -302,35 +319,36 @@ mod tests {
         );
     }
 
-    /// An added field must not undecode every row already on disk.
+    /// An added field must not make a row on disk unreadable.
     ///
-    /// `FileRecord` has no version marker, so the only thing standing
-    /// between "add a field" and "every stored record is unreadable" is a
-    /// default on that field. An unreadable file row is not inert: it drops
-    /// out of `list_files`, and the sweeper then reads its object as
-    /// unreferenced and deletes the bytes for a file the metadata still
-    /// describes. That is why the defaulted set is deliberate rather than
-    /// blanket -- `id`, `s3_key`, `size` and `created_at` stay required,
-    /// because a default there points at the wrong object, reports the
-    /// wrong length, or ages the record into immediate collection.
+    /// `FileRecord` has no version marker. So the only thing between "add a
+    /// field" and "no stored record can be read" is a default on that field.
+    /// An unreadable file row does nothing quietly. The row drops out of
+    /// `list_files`. The sweeper then reads the object of that row as one
+    /// that nothing uses, and it deletes the bytes of a file that the
+    /// metadata still describes. So the set of fields with a default is
+    /// deliberate, not a blanket. `id`, `s3_key`, `size`, and `created_at`
+    /// stay required, because a default on one of them points at the wrong
+    /// object, or reports the wrong length, or makes the record old enough
+    /// for collection at once.
     #[test]
     fn an_added_field_does_not_orphan_an_existing_row() {
-        // A row as an older version wrote it: no `name`, `mimetype`, or
-        // `owner_sub`.
+        // A row as an older version wrote it. The row has no `name`, no
+        // `mimetype`, and no `owner_sub`.
         let old = br#"{"id":"f1","size":7,"s3_key":"files/f1","created_at":42}"#;
         let rec: FileRecord = serde_json::from_slice(old).expect("an old row still decodes");
         assert_eq!(rec.id, "f1");
         assert_eq!(rec.s3_key, "files/f1");
         assert_eq!(rec.size, 7);
         assert_eq!(rec.created_at, 42);
-        // An unattributed record is read by nobody, not by everyone.
+        // A record with no owner is read by nobody, not by everyone.
         assert_eq!(rec.owner_sub, "");
         assert_eq!(rec.name, "");
         assert_eq!(rec.mimetype, "");
 
-        // The fields with no honest default are still required, so a row
-        // missing one stays a *visible* corruption rather than becoming a
-        // plausible wrong answer.
+        // The fields with no honest default stay required. So a row
+        // that misses one stays a *visible* failure, instead of
+        // becoming a plausible wrong answer.
         for field in [
             &br#"{"size":7,"s3_key":"files/f1","created_at":42}"#[..],
             &br#"{"id":"f1","size":7,"created_at":42}"#[..],
@@ -344,18 +362,18 @@ mod tests {
         }
     }
 
-    /// The whole point of this module: `fs` and `policy` must not depend on
+    /// The purpose of this module: `fs` and `policy` must not depend on
     /// `sync`.
     ///
-    /// They announce changes through [`ChangeSink`] precisely so the
-    /// dependency does not exist. Without this test the edge creeps back
-    /// one `use` at a time, and once it is back the graph is a cycle again
-    /// -- which no compiler will tell you about, because Rust permits
-    /// cycles between modules freely. Only the layering is at stake, and
-    /// layering is exactly what nothing else enforces.
+    /// They announce changes through [`ChangeSink`] so that the dependency
+    /// does not exist. Without this test, the edge comes back one `use` at a
+    /// time. Once it is back, the graph is a cycle again. No compiler reports
+    /// that, because Rust allows a cycle between modules. Only the order of
+    /// the layers is at stake here. Nothing else enforces that order.
     ///
-    /// Test modules are excluded because they legitimately construct a
-    /// `Wal` to check that announcements are durable.
+    /// The test leaves out the test modules. Tests may reach across the
+    /// boundary to build a `Wal` and check that the announcements are
+    /// durable.
     #[test]
     fn producers_do_not_depend_on_the_consumer() {
         for file in [
@@ -386,9 +404,8 @@ mod tests {
         }
     }
 
-    /// The pivot must stay a leaf. If `records` grew a dependency on
-    /// `fs`, `policy`, or `sync`, the cycle would just move rather than
-    /// disappear.
+    /// This module must stay a leaf. If `records` gained a dependency on `fs`,
+    /// `policy`, or `sync`, the cycle would move instead of disappearing.
     #[test]
     fn this_module_depends_on_nothing_in_the_crate() {
         let src = production_source("src/records.rs");

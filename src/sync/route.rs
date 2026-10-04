@@ -1,14 +1,15 @@
 //! Per-user replica pointer plus the replica object gateway.
 //!
 //! `GET /sync/status` returns the replica pointer (`prefix`, `applied_seq`,
-//! `head`) with an `ETag` so repeat polls are a cheap `304`; it never
-//! builds. `POST /sync/sync` advances the replica toward the WAL head
-//! (short-circuit, replay, or full recalc) and returns the new pointer.
-//! Every object inside the replica prefix is individually addressable at `GET /sync/db/{object}`
-//! with backend `ETag` passthrough and `If-None-Match` support: clients
-//! check for changes through headers and download only what moved.
-//! Engine files are immutable by construction (`Cache-Control: immutable`);
-//! only `manifest.json` is revalidated per commit.
+//! `head`) with an `ETag`, so repeat polls cost a cheap `304`. The route
+//! never builds. `POST /sync/sync` advances the replica toward the WAL
+//! head (short-circuit, replay, or full recalc) and returns the new
+//! pointer. Every object inside the replica prefix has its own address at
+//! `GET /sync/db/{object}`. That route passes the backend `ETag` through
+//! and supports `If-None-Match`. A client then checks for changes through
+//! headers and downloads only the objects that moved. Engine files are
+//! immutable by construction (`Cache-Control: immutable`). Only
+//! `manifest.json` is revalidated per commit.
 
 use actix_web::{
     HttpRequest, HttpResponse, get,
@@ -29,15 +30,16 @@ pub struct SyncApiModule {
     jwt: JwtClaimsMiddleware<Claims>,
     /// Caps concurrent replica downloads.
     ///
-    /// This is the control that matters for this module: `/sync/db/{object}`
-    /// can serve an oxkv SST segment, so N concurrent readers is N segments
-    /// of bandwidth and object-store egress. A request-rate limit does not
-    /// bound that, since the allowed rate can still be in flight all at once.
+    /// This is the control that matters for this module. The route
+    /// `/sync/db/{object}` can serve an oxkv SST segment. Each concurrent
+    /// reader then uses one segment of bandwidth and object-store egress. A
+    /// request-rate limit does not bound that, because the allowed rate can
+    /// be in flight all at once.
     gate: crate::limits::ConcurrencyGate,
 }
 
 impl SyncApiModule {
-    /// Create the module.
+    /// Creates the module.
     pub fn new(manager: SnapshotManager, jwt: JwtClaimsMiddleware<Claims>) -> Self {
         Self {
             manager,
@@ -46,15 +48,16 @@ impl SyncApiModule {
         }
     }
 
-    /// The module's download gate, for a caller that needs to reason about
-    /// the same slots -- tests, or a host app composing its own routes.
+    /// The download gate of the module. A caller uses it to reason about the
+    /// same slots. Such a caller is a test, or a host app that composes its
+    /// own routes.
     pub fn gate(&self) -> crate::limits::ConcurrencyGate {
         self.gate.clone()
     }
 
-    /// Create the module with a cap on concurrent replica downloads.
+    /// Creates the module with a cap on concurrent replica downloads.
     ///
-    /// `max_concurrent` of `0` disables the gate.
+    /// A `max_concurrent` of `0` disables the gate.
     pub fn with_download_gate(
         manager: SnapshotManager,
         jwt: JwtClaimsMiddleware<Claims>,
@@ -109,33 +112,36 @@ pub struct SyncAdvanceResponse {
     /// [`pending`](Self::pending).
     pub applied_seq: u64,
     /// True when a full rebuild is queued or already running, so
-    /// `applied_seq` is what the replica covered *before* it.
+    /// `applied_seq` shows what the replica covered *before* that rebuild.
     ///
-    /// A rebuild scans the whole master, so it is queued rather than run
-    /// inside the request; keep polling `GET /sync/status` and advancing until
-    /// this is false. Additive to the response, so existing clients keep
-    /// working -- but a client that assumed one `POST /sync/sync` always
-    /// converged would now need to read this.
+    /// A rebuild scans the whole master, so the code queues it instead of
+    /// running it inside the request. The client must then keep polling
+    /// `GET /sync/status` and advancing until this field is false. The field
+    /// adds data to the response, so existing clients keep working. A client
+    /// that assumed one `POST /sync/sync` always converged must now read
+    /// this field.
     pub pending: bool,
 }
 
-/// The one replica object that is revalidated per commit.
+/// The one replica object that the code revalidates per commit.
 ///
-/// Engine files are immutable by construction; this one is rewritten by
-/// every build, so caching it is how a client ends up pinned to a replica
-/// state that no longer exists.
+/// Engine files are immutable by construction. Every build rewrites the
+/// manifest. Caching the manifest is how a client ends up pinned to a
+/// replica state that no longer exists.
 const MANIFEST_OBJECT: &str = "manifest.json";
 
 /// Quoted `ETag` for a `GET /sync/status` body.
 ///
-/// Covers every field the body exposes: coverage (`applied`), the never-
-/// built case (`none`), and `head`. `head` was the omission that mattered --
-/// the WAL is shared across subjects (`snapshot.rs` reads one
-/// `manager.wal.head()`), so it moves for reasons that have nothing to do
-/// with the caller, and the 304 fired exactly when there was new work.
+/// The value covers every field that the body exposes: the coverage
+/// (`applied`), the never-built case (`none`), and `head`. The earlier code
+/// left out `head`, and that omission mattered. The WAL is shared across
+/// subjects, because `snapshot.rs` reads one `manager.wal.head()`. The head
+/// then moves for reasons that have nothing to do with the caller, and the
+/// 304 fired exactly when there was new work.
 ///
-/// `Option` rather than a sentinel so "never built" cannot collide with a
-/// real sequence, the way an `applied.unwrap_or(0)` would.
+/// The function uses `Option` instead of a sentinel, so that "never built"
+/// cannot collide with a real sequence the way an `applied.unwrap_or(0)`
+/// would.
 fn status_etag(applied: Option<u64>, head: u64) -> String {
     match applied {
         Some(a) => format!("\"snap-{a}-h{head}\""),
@@ -145,17 +151,17 @@ fn status_etag(applied: Option<u64>, head: u64) -> String {
 
 /// Quoted `ETag` for a `POST /sync/sync` body.
 ///
-/// Covers `applied_seq` and `pending`, because `pending` is how a client
-/// learns a rebuild was queued, and a validator that omitted it made the
-/// documented recovery loop unreachable.
+/// The value covers `applied_seq` and `pending`. A client learns from
+/// `pending` that the code queued a rebuild. A validator that left out
+/// `pending` made the documented recovery loop unreachable.
 ///
-/// The failure this closes: the replica is at `applied_seq 0` and the
-/// client caches `200 {applied_seq: 0, pending: false}` with ETag
+/// The earlier failure that this closes: the replica is at `applied_seq 0`,
+/// and the client caches `200 {applied_seq: 0, pending: false}` with ETag
 /// `"snap-0"`. A legacy policy mark lands, so the replica now needs a full
-/// rebuild -- a state this module documents, where `applied_seq` "may be
-/// below the WAL head even on a 200". The client re-POSTs with
-/// `If-None-Match: "snap-0"`. Coverage did not move, so the validator is
-/// byte-identical, the server answers 304 and suppresses the body, and the
+/// rebuild. The module documents that state, in which `applied_seq` "may be
+/// below the WAL head even on a 200". The client sends a new POST with
+/// `If-None-Match: "snap-0"`. The coverage did not move, so the validator is
+/// byte-identical. The server answers 304 and suppresses the body. The
 /// client still believes `pending: false` and never polls again.
 fn advance_etag(applied_seq: u64, pending: bool) -> String {
     format!("\"snap-{applied_seq}-p{}\"", u8::from(pending))
@@ -171,7 +177,8 @@ fn etag_matches(header: &str, etag: &str) -> bool {
     header.split(',').any(|tag| normalize_etag(tag) == want)
 }
 
-/// Strips weak prefix and quotes for opaque-tag comparison.
+/// Strips the weak prefix and the quotes, so that the code can compare two
+/// opaque tags.
 fn normalize_etag(tag: &str) -> &str {
     let tag = tag.trim();
     let tag = tag.strip_prefix("W/").unwrap_or(tag).trim();
@@ -182,10 +189,10 @@ fn normalize_etag(tag: &str) -> &str {
 
 /// Returns the replica pointer for `sub` without building.
 ///
-/// Pure read: reports the current coverage (`applied_seq`, `None` when the
-/// replica was never built) alongside the WAL `head`, so clients can decide
-/// whether a `POST /sync/sync` is worthwhile. Never touches the replica
-/// beyond the coverage-marker read.
+/// The function only reads. It reports the current coverage (`applied_seq`,
+/// `None` when the replica was never built) next to the WAL `head`, so that
+/// a client can decide whether a `POST /sync/sync` is worthwhile. The
+/// function never touches the replica beyond the coverage-marker read.
 #[utoipa::path(get, path = "/sync/status", tag = "sync", responses((status = 200, body = SyncStatusResponse), (status = 304, description = "not modified"), (status = 401, body = crate::http::error::ErrorBody)))]
 #[get("/status")]
 async fn status_handler(
@@ -218,11 +225,12 @@ async fn status_handler(
 
 /// Advances the replica for `sub` toward the WAL head and returns the pointer.
 ///
-/// Fresh pointers (`applied >= head`) return without touching storage
-/// beyond the marker read. Otherwise small file/relation deltas and rich
-/// rule/group ops replay (irrelevant users/objects skip); legacy policy
-/// marks and oversized ranges fall back to a full rebuild. A lost fencing
-/// race adopts the winner's pointer instead of failing.
+/// A fresh pointer (`applied >= head`) returns without touching storage
+/// beyond the marker read. Otherwise small file and relation deltas and rich
+/// rule or group ops replay. Irrelevant users and objects skip. Legacy
+/// policy marks and oversized ranges select a full rebuild. A lost
+/// fencing race adopts the pointer of the winner instead of returning an
+/// error.
 #[utoipa::path(post, path = "/sync/sync", tag = "sync", responses((status = 200, body = SyncAdvanceResponse), (status = 304, description = "not modified"), (status = 401, body = crate::http::error::ErrorBody)))]
 #[post("/sync")]
 async fn sync_handler(
@@ -254,9 +262,9 @@ async fn sync_handler(
 
 /// Serves one object from the replica with `ETag` passthrough.
 ///
-/// `sub` always comes from the JWT, never the path, so callers can only
-/// read their own replica. Missing objects are `404`; `If-None-Match`
-/// matches are `304` without a body.
+/// The value `sub` always comes from the JWT, never from the path. A caller
+/// can therefore read only its own replica. A missing object returns 404. A
+/// match on `If-None-Match` returns 304 without a body.
 #[utoipa::path(get, path = "/sync/db/{object}", tag = "sync", params(("object" = String, Path, description = "object key inside the replica prefix (e.g. manifest.json)")), responses((status = 200, description = "replica object bytes", content_type = "application/octet-stream"), (status = 304, description = "not modified"), (status = 401, body = crate::http::error::ErrorBody), (status = 404, description = "object not found")))]
 #[get("/db/{object:.*}")]
 async fn object_handler(
@@ -271,44 +279,44 @@ async fn object_handler(
     let tail = path.into_inner();
     let key = manager.resolve_object(&claims.sub, &tail)?;
 
-    // Cache policy follows the RESOLVED key, not the raw tail. The route is
-    // `@get("/db/{object:.*}")` and actix-router does not collapse repeated
-    // slashes, so `GET /sync/db//manifest.json` arrives with
-    // `tail == "/manifest.json"` while resolving to the very same object as
-    // the canonical URL -- `object_store`'s `Path::from` drops empty
-    // segments, and `/db/{object:.*}` is matched on the raw path. Keying
-    // `tail == "manifest.json"` therefore served the one object this module
-    // documents as revalidated per commit with
+    // The cache policy follows the RESOLVED key, not the raw tail. The route
+    // is `@get("/db/{object:.*}")`, and actix-router does not collapse
+    // repeated slashes. So `GET /sync/db//manifest.json` arrives with
+    // `tail == "/manifest.json"` while resolving to the same object as the
+    // canonical URL. `object_store`'s `Path::from` drops empty segments, and
+    // `/db/{object:.*}` matches on the raw path. Keying the cache policy on
+    // `tail == "manifest.json"` therefore served the one object that this
+    // module documents as revalidated per commit with this header:
     // `Cache-Control: public, max-age=31536000, immutable`: a browser or CDN
-    // would keep it for a year and never revalidate, permanently pinning the
-    // client to whatever replica state existed at first fetch while every
-    // client on the canonical URL converged.
+    // would then keep that header for a year and never revalidate. The
+    // client would stay pinned to the replica state at its first fetch, while
+    // every client on the canonical URL converged.
     //
     // `resolve_object` now rejects empty segments as well, so the alias does
-    // not exist at all; deriving from the resolved key is the second of two
-    // independent defences and the one that cannot be routed around by any
-    // other spelling of the path. `filename()` is the last segment of the
-    // resolved key, so it can only name `manifest.json` for an object that
-    // genuinely IS the manifest -- no non-manifest can be served `no-cache`
-    // by forging it, and the manifest cannot be served immutable by hiding a
-    // slash.
+    // not exist. Deriving the cache policy from the resolved key is the second
+    // of two independent defences. It is the defence that no other spelling
+    // of the path can go around. `filename()` returns the last segment of
+    // the resolved key. It can name `manifest.json` only for an object that
+    // genuinely IS the manifest. No non-manifest can receive `no-cache` by
+    // forging a name. The manifest cannot receive the immutable header by
+    // hiding a slash.
     let object_path = object_store::path::Path::from(key.as_str());
     let is_manifest = is_manifest_key(&object_path);
 
-    // Taken before the object store is touched, so a refused request costs one
-    // `get` at most rather than a whole segment read.
+    // The code takes the permit before it touches the object store. A refused
+    // request then costs at most one `get`.
     let permit = gate.acquire();
     if permit.is_none() && !gate.is_disabled() {
         return Err(FsError::TooManyRequests);
     }
 
     let store = manager.object_store.clone();
-    // A plain `get` rather than pushing `If-None-Match` into the backend's
-    // `GetOptions`. Both are a single metadata request and neither reads the
-    // body -- `GetResult`'s payload is lazy until `into_stream` -- but only
-    // this one leaves the `ETag` in hand, and a `304` that omits the
-    // validator the corresponding `200` would have sent is what RFC 9110
-    // 15.4.5 asks a `304` to carry.
+    // The code sends a plain `get` instead of pushing `If-None-Match` into
+    // the `GetOptions` of the backend. Both calls make one metadata request,
+    // and neither one reads the body. The payload of `GetResult` stays lazy
+    // until `into_stream`. Only the plain `get` leaves the `ETag` in hand. A
+    // `304` that omits the validator of the matching `200` would break what
+    // RFC 9110 15.4.5 asks a `304` to carry.
     let out = match store.get(&object_path).await {
         Ok(out) => out,
         Err(object_store::Error::NotFound { .. }) => {
@@ -317,7 +325,7 @@ async fn object_handler(
         Err(e) => return Err(FsError::Internal(e.to_string())),
     };
 
-    // Read the head off `out` before `into_stream` consumes it.
+    // Read the head of `out` before `into_stream` consumes it.
     let etag = out.meta.e_tag.clone();
     let size = out.range.end.saturating_sub(out.range.start);
     if let Some(header) = req
@@ -328,8 +336,8 @@ async fn object_handler(
             .as_deref()
             .is_some_and(|current| etag_matches(header, current))
     {
-        // Dropping `out` abandons the unread payload, which is the point: a
-        // not-modified answer has no body to send.
+        // Dropping `out` abandons the unread payload, and that is the point.
+        // A not-modified answer has no body to send.
         drop(out);
         return Ok(object_not_modified(etag.as_deref(), is_manifest));
     }
@@ -338,33 +346,36 @@ async fn object_handler(
 
 /// Whether this object is the per-subject replica MANIFEST.
 ///
-/// Derived from the RESOLVED key rather than the raw request tail. The two
-/// can disagree: `resolve_object` used to accept an empty interior segment,
-/// so `GET /sync/db//manifest.json` reached the real manifest through a
-/// different spelling, and keying the mutable/immutable decision off the raw
-/// tail served that manifest `immutable, max-age=31536000`. `resolve_object`
-/// now rejects empty segments as well, but deriving from the resolved key is
-/// the property that actually holds, and this is the only place it lives.
+/// The function derives the answer from the RESOLVED key, not from the raw
+/// request tail. The two can disagree. `resolve_object` used to accept an
+/// empty interior segment, so `GET /sync/db//manifest.json` reached the real
+/// manifest through a different spelling. Keying the mutable and immutable
+/// decision on the raw tail then served that manifest with `immutable,
+/// max-age=31536000`. `resolve_object` now rejects empty segments as well.
+/// Deriving from the resolved key is the property that actually holds, and
+/// this function is the only place where that property lives.
 ///
-/// `Path::from` drops empty segments and normalises separators, so
-/// `filename()` is the last segment of what the backend will actually serve.
+/// `Path::from` drops empty segments and normalises separators. Therefore
+/// `filename()` returns the last segment of what the backend will actually
+/// serve.
 fn is_manifest_key(path: &object_store::path::Path) -> bool {
     path.filename() == Some(MANIFEST_OBJECT)
 }
 
 /// The `200` response for one replica object, streaming `out`.
 ///
-/// Split out from [`object_handler`] so the streaming property is testable:
-/// the caller has to hand over a [`GetResult`] it has not read yet, and the
-/// only way to build the response is to consume it as a stream.
+/// The function is separate from [`object_handler`] so that a test can check
+/// the streaming property. The caller must hand over a [`GetResult`] that it
+/// has not read yet. The only way to build the response is to consume the
+/// result as a stream.
 ///
-/// A replica prefix holds oxkv's own files, and an SST segment is sized for
-/// compaction throughput rather than for a browser -- tens to hundreds of
-/// megabytes. Collecting it would put that segment in resident memory once
-/// per in-flight request, on every worker, for a payload the client is
-/// going to buffer anyway. `Content-Length` is taken from the range
-/// `object_store` already resolved, so clients still see the size up front
-/// and the immutability caching still behaves.
+/// A replica prefix holds the files of oxkv itself. The code sizes an SST
+/// segment for compaction throughput, not for a browser. A segment reaches
+/// tens or hundreds of megabytes. Collecting the segment would put it in
+/// resident memory once per in-flight request, on every worker, for a
+/// payload that the client buffers anyway. The code takes `Content-Length`
+/// from the range that `object_store` already resolved. Clients therefore see
+/// the size up front, and the immutability caching still works.
 fn object_response(
     out: object_store::GetResult,
     is_manifest: bool,
@@ -379,9 +390,9 @@ fn object_response(
     let mut resp = object_cache_headers(resp, is_manifest);
     Ok(resp
         .insert_header((CONTENT_LENGTH, size))
-        // The permit travels with the body, so the slot is held until the
-        // download finishes or the client goes away -- not merely until this
-        // handler returns.
+        // The permit travels with the body, so the code holds the slot until
+        // the download finishes or the client goes away. The code does not
+        // release the slot when this handler returns.
         .streaming(crate::limits::GatedStream::new(
             logged_body(out.into_stream()),
             permit,
@@ -390,14 +401,14 @@ fn object_response(
 
 /// The caching and content-type headers for one replica object.
 ///
-/// Split out because the `304` for the same object must carry the same
-/// ones: RFC 9110 15.4.5 asks a `304` to generate the header fields a `200`
-/// would have sent, and the object `304` here used to send carried neither
-/// `Cache-Control` nor `ETag` while every other `304` in this file re-attached
-/// its validator. A client that revalidates on `Cache-Control` alone -- which
-/// is exactly what a manifest client does, since the manifest is the only
-/// object it fetches without an `If-None-Match` -- learns nothing about how
-/// long the copy it already holds stays good.
+/// The function is separate because the `304` for the same object must carry
+/// the same headers. RFC 9110 15.4.5 asks a `304` to generate the header
+/// fields that a `200` would have sent. The `304` for an object used to carry
+/// neither `Cache-Control` nor `ETag`. Every other `304` in this file
+/// re-attaches its validator. A client that revalidates on `Cache-Control`
+/// alone learns nothing about how long the copy it already holds stays good.
+/// A manifest client does exactly that, because the manifest is the only
+/// object that it fetches without an `If-None-Match`.
 fn object_cache_headers(
     mut resp: actix_web::HttpResponseBuilder,
     is_manifest: bool,
@@ -510,17 +521,18 @@ mod tests {
 
     /// The replica object response is built without reading the body.
     ///
-    /// This is the guard for the memory property, and it works because
-    /// [`object_response`] takes a `GetResult` it has not touched. The
-    /// stream handed in yields one chunk and then fails: an implementation
-    /// that collected the body would read past that failure, surface it as
-    /// a handler error instead of a `200`, and record a poll. So a revert
-    /// to `out.bytes()` fails fast here rather than quietly passing.
+    /// This test guards the memory property. It works because
+    /// [`object_response`] takes a `GetResult` that it has not touched. The
+    /// stream handed to the function yields one chunk, then fails. An
+    /// implementation that collects the body would read past that failure.
+    /// That implementation would then surface the failure as a handler error
+    /// instead of a `200`, and would record a poll. So a revert to
+    /// `out.bytes()` fails fast here instead of passing quietly.
     ///
-    /// Resident memory is not directly observable from a unit test. What is
-    /// observable -- and what keeps a 256 MB SST out of the heap once per
-    /// in-flight request -- is that not one byte of the segment is read
-    /// before the response exists.
+    /// A unit test cannot observe resident memory directly. The test can
+    /// observe the property that keeps a 256 MB SST out of the heap once per
+    /// in-flight request. No byte of the segment is read before the response
+    /// exists.
     #[test]
     fn object_response_does_not_read_the_body() {
         use object_store::{GetResult, GetResultPayload, ObjectMeta};
@@ -541,7 +553,7 @@ mod tests {
                             // One good chunk...
                             0 => Ok(bytes::Bytes::from_static(b"partial")),
                             // ...then a mid-stream failure that a collecting
-                            // implementation cannot avoid running into.
+                            // implementation cannot avoid.
                             _ => Err(object_store::Error::NotFound {
                                 path: "seg-0001.sst".into(),
                                 source: "stream aborted".into(),
@@ -592,17 +604,17 @@ mod tests {
         );
     }
 
-    /// The validators are quoted, stable, and cover every field the body
+    /// The validators are quoted, stable, and cover every field that the body
     /// exposes.
     ///
-    /// Each function is paired with the route that serves it because the
-    /// bodies carry DIFFERENT fields: `GET /sync/status` reports `head`, and
+    /// Each function is paired with the route that serves it, because the
+    /// bodies carry DIFFERENT fields. `GET /sync/status` reports `head`, and
     /// `POST /sync/sync` reports `pending`. A single validator built from
-    /// `applied_seq` alone was correct for neither once either of those
-    /// moved -- see the functions' docs for the two failure paths. The two
-    /// assertions that would have caught it are the cross-route ones: the
-    /// same coverage at a different head, and the same coverage with a
-    /// different `pending`, must NOT share a validator.
+    /// `applied_seq` alone was correct for neither route once either field
+    /// moved. See the docs of the functions for the two failure paths. Two
+    /// assertions would have caught that fault. They are the cross-route
+    /// ones. The same coverage at a different head, and the same coverage
+    /// with a different `pending`, must NOT share a validator.
     #[test]
     fn snapshot_etags_cover_every_field_the_body_exposes() {
         assert_eq!(status_etag(Some(3), 9), "\"snap-3-h9\"");
@@ -611,8 +623,8 @@ mod tests {
         assert_eq!(advance_etag(3, false), "\"snap-3-p0\"");
         assert_eq!(advance_etag(3, true), "\"snap-3-p1\"");
 
-        // `head` moves for reasons unrelated to this caller, so it must be in
-        // the status validator.
+        // `head` moves for reasons that are unrelated to this caller, so the
+        // status validator must contain it.
         assert_ne!(status_etag(Some(3), 9), status_etag(Some(3), 10));
         // A never-built replica is not coverage zero.
         assert_ne!(status_etag(None, 9), status_etag(Some(0), 9));
@@ -632,11 +644,11 @@ mod tests {
     }
 
     #[test]
-    fn lost_fencing_race_is_recognised_from_the_typed_variant() {
-        // Regression: this used to be `detail.contains("fenced")`, so a
-        // rewording in oxkv would have turned a recoverable race into a
-        // 500 for every client. Now it is a typed variant produced by
-        // `From<oxkv::StoreError>`.
+    fn lost_fencing_race_is_a_typed_variant() {
+        // The test guards against a past fault. The old code called
+        // `detail.contains("fenced")`. A new wording in oxkv would then turn
+        // a recoverable race into a 500 for every client. The value is now a
+        // typed variant that `From<oxkv::StoreError>` produces.
         assert!(
             FsError::from(oxkv::StoreError::Fenced("epoch 2 superseded".into())).is_fencing_loss()
         );
@@ -724,8 +736,8 @@ mod tests {
     #[actix_web::test]
     async fn status_never_builds() -> anyhow::Result<()> {
         let fx = fixture().await?;
-        // Make the replica stale the way the engines do: master mutation
-        // plus WAL entry, with no advance.
+        // Make the replica stale the way the engines do. The code changes the
+        // master and appends a WAL entry, and no code calls advance.
         let f2 = FileRecord {
             id: "f2".into(),
             name: "b.txt".into(),
@@ -743,7 +755,8 @@ mod tests {
             actix_web::test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
         let token = fx.token("alice")?;
 
-        // Manifest ETag is stable across status polls: no commit runs.
+        // The manifest ETag stays the same across status polls. No commit
+        // runs.
         let fetch_manifest_etag = || async {
             let res = actix_web::test::call_service(
                 &app,
@@ -782,14 +795,14 @@ mod tests {
         Ok(())
     }
 
-    /// A rebuild that cannot be replayed is queued, not run inside the
-    /// request, and the response says so.
+    /// A rebuild that the code cannot replay is queued, and the response says
+    /// so.
     ///
     /// The `200` with `pending: true` is the contract change to be careful
-    /// about: a caller that issued one `POST /sync/sync` and expected to read
-    /// its replica immediately would now see coverage from before the rebuild.
-    /// The field is what makes that visible rather than silent, and
-    /// `GET /sync/status` is the poll that watches it move.
+    /// about. A caller that sent one `POST /sync/sync` and expected to read
+    /// its replica immediately now sees the coverage from before the rebuild.
+    /// The field makes that visible instead of silent. `GET /sync/status` is
+    /// the poll that watches the coverage move.
     #[actix_web::test]
     async fn a_needed_rebuild_is_reported_as_pending() -> anyhow::Result<()> {
         use crate::records::WalOp;
@@ -800,10 +813,10 @@ mod tests {
             actix_web::test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
         let token = fx.token("alice")?;
 
-        // The fixture has already built the replica, so a plain advance is a
-        // no-op. A legacy policy mark is the one delta that cannot be
-        // replayed incrementally -- it carries no rule, only an object name --
-        // and forces the full-recalculate path.
+        // The fixture already built the replica, so a plain advance does
+        // nothing. A legacy policy mark is the one delta that the code cannot
+        // replay incrementally. The mark carries no rule, only an object name.
+        // The mark therefore forces the full-recalculate path.
         fx.manager
             .wal
             .append(WalOp::PolicyAdd {
@@ -832,17 +845,17 @@ mod tests {
 
     /// A transition INTO `pending` must answer 200 with the body, never 304.
     ///
-    /// The regression this pins: the validator was built from `applied_seq`
-    /// alone, so a client that cached `200 {applied_seq: 0, pending: false}`
-    /// and then re-POSTed with that ETag got a byte-identical validator back
-    /// -- coverage did not move, only `pending` did. The server answered 304
-    /// and suppressed the body, and the client kept believing `pending:
-    /// false`, so it never polled again. The module's documented recovery
-    /// loop ("keep polling `GET /sync/status` and advancing until this is
-    /// false") was unreachable for any client using the ETag the endpoint
-    /// hands it.
+    /// The test pins the fault that this fixes. The earlier validator was
+    /// built from `applied_seq` alone. A client that cached `200
+    /// {applied_seq: 0, pending: false}` and then sent a new POST with that
+    /// ETag received a byte-identical validator. The coverage did not move.
+    /// Only `pending` moved. The server answered 304 and suppressed the body.
+    /// The client then kept believing `pending: false`, so it never polled
+    /// again. The documented recovery loop ("keep polling `GET /sync/status`
+    /// and advancing until this is false") was unreachable for any client that
+    /// used the ETag that the endpoint hands it.
     ///
-    /// Asserted in both directions: the repeat poll that changes nothing is
+    /// The test checks both directions. A repeat poll that changes nothing is
     /// still a 304, so the fix is not "stop sending validators".
     #[actix_web::test]
     async fn a_pending_transition_returns_the_body_not_304() -> anyhow::Result<()> {
@@ -862,7 +875,7 @@ mod tests {
         };
 
         // The replica is already built and the feed is empty, so this is the
-        // settled state a client caches.
+        // settled state that a client caches.
         let res = sync(None).await;
         assert_eq!(res.status(), http::StatusCode::OK);
         let settled = res
@@ -875,9 +888,9 @@ mod tests {
             serde_json::from_slice(&actix_web::test::read_body(res).await)?;
         assert_eq!(json["pending"], false, "nothing to rebuild yet: {json}");
 
-        // A legacy policy mark makes the replica need a full rebuild --
-        // exactly the state whose doc says `applied_seq` may be below the
-        // head even on a 200.
+        // A legacy policy mark makes the replica need a full rebuild. This is
+        // exactly the state whose doc says that `applied_seq` may be below
+        // the head even on a 200.
         fx.manager
             .wal
             .append(WalOp::PolicyAdd {
@@ -918,17 +931,18 @@ mod tests {
         Ok(())
     }
 
-    /// The replica gateway refuses rather than reading a segment it has no
-    /// room for.
+    /// The replica gateway refuses a request instead of reading a segment
+    /// that has no room for it.
     ///
-    /// `/sync/db/{object}` can serve an oxkv SST segment, so this is the one
-    /// place in the crate where a single request's cost is unbounded by the
-    /// request. A rate limit does not cover it: a client allowed a hundred
-    /// reads a minute can have a hundred of these in flight at once.
+    /// The route `/sync/db/{object}` can serve an oxkv SST segment. This is
+    /// the only place in the crate where the cost of one request has no
+    /// bound from the request. A rate limit does not cover it. A client that
+    /// the rate limit allows a hundred reads a minute can still have a
+    /// hundred of these in flight at once.
     ///
-    /// The gate shares its semaphore across clones, so the test can hold the
-    /// only slot against the *real* module and then drive the real handler --
-    /// no stand-in route and no hand-built response.
+    /// The gate shares its semaphore across clones. The test can then hold
+    /// the only slot against the *real* module and drive the real handler.
+    /// The test uses no stand-in route and no hand-built response.
     #[actix_web::test]
     async fn a_full_download_gate_refuses_rather_than_reading() -> anyhow::Result<()> {
         let fx = fixture().await?;
@@ -953,11 +967,11 @@ mod tests {
         // A free slot serves.
         assert_eq!(read().await, http::StatusCode::OK);
 
-        // Hold the only slot: the next read must be refused, not served.
+        // Hold the only slot. The next read must be refused, not served.
         let held = gate.acquire().expect("the only slot is free");
         assert_eq!(read().await, http::StatusCode::TOO_MANY_REQUESTS);
 
-        // And the refusal is inside the uniform envelope, not actix's default.
+        // The refusal uses the uniform envelope, not the actix default.
         let res = actix_web::test::call_service(
             &app,
             actix_web::test::TestRequest::get()
@@ -1008,7 +1022,8 @@ mod tests {
         let body = actix_web::test::read_body(res).await;
         let json: serde_json::Value = serde_json::from_slice(&body)?;
         assert_eq!(json["applied_seq"], 1);
-        // A bounded replay runs inline, so the caller is not left pending.
+        // A bounded replay runs inline, so the caller does not wait as
+        // pending.
         assert_eq!(json["pending"], false);
 
         // The replayed prefix is served through the gateway.
@@ -1047,10 +1062,10 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("application/json")
         );
-        // The body is streamed, so its length has to be declared up front.
-        // A chunked response would still be correct for a client, but
-        // `manifest.json` is what a client polls to discover what changed,
-        // and a known length is what lets it fail fast on a truncated read.
+        // The body streams, so the response must declare its length up front.
+        // A chunked response is still correct for a client. But
+        // `manifest.json` is what a client polls to discover what changed. A
+        // known length lets the client fail fast on a truncated read.
         let declared = res
             .headers()
             .get(actix_web::http::header::CONTENT_LENGTH)
@@ -1083,10 +1098,10 @@ mod tests {
             )
             .await;
             assert_eq!(res.status(), http::StatusCode::NOT_MODIFIED);
-            // RFC 9110 15.4.5: a 304 carries the header fields the
-            // corresponding 200 would have sent. This one used to carry
-            // neither the validator nor the caching contract, while every
-            // other 304 in this file re-attached its own.
+            // RFC 9110 15.4.5 requires a 304 to carry the header fields of
+            // the matching 200. This 304 used to carry neither the validator
+            // nor the caching contract, while every other 304 in this file
+            // re-attached its own.
             assert_eq!(
                 res.headers().get(ETAG).and_then(|v| v.to_str().ok()),
                 Some(etag.as_str()),
@@ -1119,25 +1134,26 @@ mod tests {
         Ok(())
     }
 
-    /// The manifest alias must not be served immutable.
+    /// The manifest alias must not receive the immutable cache header.
     ///
-    /// The failure this pins: the cache-control branch keyed off the RAW
-    /// path tail, and `resolve_object` rejected only an empty tail or a
-    /// `..` segment -- an empty INTERIOR segment passed, while
-    /// `object_store`'s `Path::from` drops empty segments when splitting on
-    /// `/`. So `GET /sync/db//manifest.json` resolved to the same
-    /// per-commit-MUTABLE object as the canonical URL, with
-    /// `tail == "/manifest.json"`, which is not `"manifest.json"`: a `200`
-    /// with `Cache-Control: public, max-age=31536000, immutable`. A browser
-    /// or CDN keeps that for a year and never revalidates, permanently
-    /// pinning the client to whatever replica state existed at first fetch
-    /// while every client on the canonical URL converges -- the module's own
-    /// contract at the top of this file, inverted for one URL.
+    /// The test pins the fault that it fixes. The cache-control branch keyed
+    /// on the RAW path tail. `resolve_object` rejected only an empty tail or
+    /// a `..` segment. An empty INTERIOR segment passed, while `object_store`'s
+    /// `Path::from` drops empty segments when it splits on `/`. So `GET
+    /// /sync/db//manifest.json` resolved to the same per-commit-MUTABLE
+    /// object as the canonical URL. The tail at that moment was
+    /// `/manifest.json`, which is not `manifest.json`. The response was then a
+    /// `200` with this header:
+    /// `Cache-Control: public, max-age=31536000, immutable`. A browser or
+    /// CDN keeps that header for a year and never revalidates. The client
+    /// then stays pinned to the replica state at its first fetch, while every
+    /// client on the canonical URL converges. The module contract at the top
+    /// of this file was inverted for one URL.
     ///
-    /// Both halves of the fix are asserted. `resolve_object` now rejects
-    /// empty segments, so the alias does not exist; and the branch is
-    /// derived from the resolved key, so the manifest cannot be served
-    /// immutable by any other spelling of the path either.
+    /// The test checks both halves of the fix. `resolve_object` now rejects
+    /// empty segments, so the alias does not exist. The branch also derives
+    /// its value from the resolved key, so the manifest cannot receive the
+    /// immutable header through any other spelling of the path.
     #[actix_web::test]
     async fn the_manifest_alias_is_not_served_immutable() -> anyhow::Result<()> {
         let fx = fixture().await?;
@@ -1162,7 +1178,7 @@ mod tests {
                 .map(str::to_string)
         };
 
-        // The alias resolves to nothing: `resolve_object` rejects the empty
+        // The alias resolves to nothing. `resolve_object` rejects the empty
         // interior segment.
         assert_eq!(
             fetch("/sync/db//manifest.json").await.status(),
@@ -1170,7 +1186,7 @@ mod tests {
             "an empty interior segment must not address a replica object"
         );
 
-        // And the canonical URL is unchanged.
+        // The canonical URL does not change.
         let res = fetch("/sync/db/manifest.json").await;
         assert_eq!(res.status(), http::StatusCode::OK);
         assert_eq!(cache(&res).as_deref(), Some("no-cache"));
@@ -1179,30 +1195,30 @@ mod tests {
 
     /// The resolved key, not the path tail, decides the caching contract.
     ///
-    /// Structural because the property is about a branch that cannot be
-    /// reached with the alias gone: `object_handler` must derive
-    /// `is_manifest` from `Path::filename()` of the RESOLVED key. Keying it
-    /// off the raw tail is what made `/manifest.json` immutable, and
-    /// deleting the alias alone would leave the same inversion reachable by
-    /// any future path spelling that `Path::from` normalises.
+    /// The test is structural, because the property applies to a branch that
+    /// the alias can no longer reach. `object_handler` must derive
+    /// `is_manifest` from the `Path::filename()` of the RESOLVED key. Keying
+    /// it on the raw tail is what made `/manifest.json` immutable. Deleting
+    /// the alias alone would leave the same inversion reachable through any
+    /// future path spelling that `Path::from` normalises.
     ///
-    /// It also pins the direction that matters for safety: a key whose
-    /// filename is not `manifest.json` must NOT be served `no-cache`, so the
-    /// resolved-key derivation cannot be used to hand a non-manifest the
+    /// The test also pins the direction that matters for safety. A key whose
+    /// filename is not `manifest.json` must NOT receive `no-cache`. The
+    /// derivation from the resolved key must not hand a non-manifest the
     /// weaker policy.
     #[test]
     fn cache_control_follows_the_resolved_key() {
         for (key, expect_manifest) in [
             ("test-db/u/abc/manifest.json", true),
-            // An alias the backend normalises to the same object.
+            // An alias that the backend normalises to the same object.
             ("test-db/u/abc//manifest.json", true),
             ("test-db/u/abc/sst/seg-0001.sst", false),
             ("test-db/u/abc/not-manifest.json", false),
             ("test-db/u/abc/manifest.json.bak", false),
         ] {
-            // Through the SAME function `object_handler` calls, so
-            // reverting the derivation in production fails this test rather
-            // than leaving it green while the inversion is reintroduced.
+            // Through the SAME function that `object_handler` calls, so a
+            // revert of the derivation in production fails this test instead
+            // of leaving it green while the inversion returns.
             let path = object_store::path::Path::from(key);
             assert_eq!(is_manifest_key(&path), expect_manifest, "{key}");
         }

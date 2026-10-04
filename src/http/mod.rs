@@ -1,18 +1,19 @@
-//! HTTP server scaffolding: a modular service registry plus the request
-//! middleware every module builds on (bearer-token extraction, JWKS-backed
-//! JWT validation, per-request tracing) and the shared body-size limits.
+//! HTTP server scaffolding. The crate provides a modular service registry,
+//! the request middleware that every module uses (bearer token extraction,
+//! JWKS-based JWT validation, tracing for each request), and shared body
+//! size limits.
 //!
-//! [`ApiService`](crate::http::ApiService) composes
+//! [`ApiService`](crate::http::ApiService) combines
 //! [`ApiModule`](crate::http::ApiModule) implementations into one Actix
-//! application; [`cors`](crate::http::cors) and
-//! [`health`](crate::http::health) hold the edge settings and probes that
-//! are not module-specific.
+//! application. [`cors`](crate::http::cors) and
+//! [`health`](crate::http::health) hold the edge settings and the probes
+//! that are not specific to one module.
 
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use actix_web::{App, HttpServer, web};
 
-/// OpenAPI JSON + Swagger UI.
+/// OpenAPI JSON and Swagger UI.
 pub mod docs;
 /// Shared error type rendering a uniform JSON error envelope.
 pub mod error;
@@ -23,28 +24,30 @@ pub mod health;
 /// Request middleware for token extraction and validation.
 pub mod middleware;
 
-/// Maximum raw request body: covers 10 MiB single-part uploads plus
-/// headroom. Without this the `Bytes` extractor falls back to actix's
-/// 256 KiB default and rejects every documented part size with 413.
-/// Shared with the FS part intake, which streams `Payload` directly and
-/// must enforce the same absolute ceiling chunk by chunk.
+/// The maximum size of a raw request body. The limit covers 10 MiB
+/// single-part uploads plus headroom. Without this limit, the `Bytes`
+/// extractor uses the actix default of 256 KiB and rejects every documented
+/// part size with 413. The FS part intake shares this limit. That code
+/// streams `Payload` directly, so it enforces the same absolute ceiling
+/// chunk by chunk.
 pub(crate) const MAX_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 
-/// Maximum JSON body: control-plane payloads (policy rules, upload
-/// metadata) are small; anything larger is a misuse or abuse signal.
+/// The maximum size of a JSON body. Control-plane payloads (policy rules,
+/// upload metadata) are small. A larger body is a misuse or abuse signal.
 const MAX_JSON_BYTES: usize = 1024 * 1024;
 
-/// Grace period for in-flight requests to finish during shutdown.
+/// The grace period for in-flight requests to finish during shutdown.
 const SHUTDOWN_TIMEOUT_SECS: u64 = 30;
 
-/// Slow-client guard: time allowed to send request headers/body.
+/// The time a slow client has to send the request headers and body.
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Applies the shared body-size limits to an Actix application.
 ///
-/// Split out so the limits are unit-testable, and public so a host app
-/// mounting the API in its own `App` can apply the same ceilings — see
-/// [`ApiService::configure`] for the full recipe.
+/// The function is separate so that unit tests can check the limits. The
+/// function is public so that a host app that mounts the API in its own
+/// `App` can apply the same limits. See [`ApiService::configure`] for the
+/// full recipe.
 pub fn apply_limits<T>(app: App<T>) -> App<T>
 where
     T: actix_web::dev::ServiceFactory<
@@ -59,30 +62,33 @@ where
             web::JsonConfig::default()
                 .limit(MAX_JSON_BYTES)
                 .error_handler(|err, _| {
-                    // Actix's default for a malformed body is a bare `400 Bad
-                    // Request` in text/plain, which is the one way a documented
-                    // route can answer outside the uniform envelope -- and it is
-                    // reached by any client that sends a truncated or mistyped
-                    // payload, i.e. routinely. The extractor's message names the
-                    // offending field and the expected type, so it is logged and
-                    // not sent, same contract as every other cause in this crate.
+                    // The actix default for a malformed body is a bare
+                    // `400 Bad Request` in text/plain. This is the one way a
+                    // documented route can answer outside the uniform
+                    // envelope. Any client that sends a truncated or mistyped
+                    // payload reaches this path, so it happens often. The
+                    // extractor message names the offending field and the
+                    // expected type. The server logs the message and does not
+                    // send it. This is the same contract as every other cause
+                    // in this crate.
                     tracing::debug!("malformed JSON body: {err}");
                     ApiError::BadRequest.into()
                 }),
         )
 }
 
-/// Logs a mid-stream response body failure server-side.
+/// Logs a failure that occurs during a streamed response body.
 ///
-/// By the time a body chunk fails, the response head is already on the
-/// wire and the status cannot be changed: the client sees a truncated
-/// body and nothing else. This is the only place the operator finds out
-/// why, so every streaming body should pass through it.
+/// The response head is already on the wire when a body chunk fails, so the
+/// server cannot change the status code. The client then sees a truncated
+/// body and nothing else. This is the only place where the operator can
+/// learn the cause. Every streaming body must pass through this function.
 ///
-/// Generic over the error type because the two streaming sources report
-/// different ones -- [`FsError`](crate::fs::error::FsError) for file
-/// downloads, `object_store::Error` for raw replica objects -- and neither
-/// should be translated just to be logged.
+/// The function is generic over the error type because the two streaming
+/// sources report different error types.
+/// [`FsError`](crate::fs::error::FsError) reports the errors of file
+/// downloads. `object_store::Error` reports the errors of raw replica
+/// objects. The function logs both error types without translation.
 pub fn logged_body<S, E>(stream: S) -> impl futures_util::Stream<Item = Result<bytes::Bytes, E>>
 where
     S: futures_util::Stream<Item = Result<bytes::Bytes, E>>,
@@ -103,12 +109,13 @@ pub fn health_routes(cfg: &mut web::ServiceConfig) {
 
 /// Builds the CORS middleware for browser clients.
 ///
-/// Empty `allowed_origins` disables CORS responses (same-origin only).
-/// Each origin must be an exact `http(s)` origin without trailing slash;
-/// credentials are always allowed so the `auth_token` cookie and
-/// `Authorization` bearer header work cross-origin. `ETag` and range
-/// headers are exposed so `/sync/db/*` conditional polls and `/fs`
-/// ranged downloads work from the browser.
+/// An empty `allowed_origins` disables CORS responses. Only same-origin
+/// requests then succeed. Each origin must be an exact `http(s)` origin
+/// without a trailing slash. The function always allows credentials, so the
+/// `auth_token` cookie and the `Authorization` bearer header work across
+/// origins. The function exposes the `ETag` and range headers, so the
+/// `/sync/db/*` conditional polls and the `/fs` ranged downloads work from
+/// the browser.
 pub fn cors(allowed_origins: &[String]) -> actix_cors::Cors {
     use actix_web::http::header;
     let mut cors = actix_cors::Cors::default()
@@ -135,28 +142,27 @@ pub fn cors(allowed_origins: &[String]) -> actix_cors::Cors {
     cors
 }
 
-/// A self-contained unit of the API surface: a set of routes plus its own
-/// app data and middleware. Implement this to plug business functionality
-/// into an [`ApiService`].
+/// A self-contained unit of the API surface. The unit holds a set of routes,
+/// app data, and middleware. Implement this trait to add business functions
+/// to an [`ApiService`].
 pub trait ApiModule: Send + Sync {
-    /// The single route prefix this module owns, e.g. `/fs`.
+    /// The one route prefix that this module owns, for example `/fs`.
     ///
-    /// Declared so [`ApiService::configure`] can refuse to mount two
-    /// modules on the same prefix. Actix matches services in registration
-    /// order and a scope matches its whole prefix rather than the paths it
-    /// declares, so the second module's routes are not merged with the
-    /// first's -- they are unreachable, and the symptom is a `404` on a
-    /// route that is documented, present in the OpenAPI document, and
-    /// covered by a passing unit test that happens to mount the module
-    /// alone.
+    /// [`ApiService::configure`] uses this value to refuse two modules on
+    /// the same prefix. Actix matches services in registration order. A
+    /// scope matches its whole prefix, and not the paths that it declares.
+    /// The first module therefore does not merge the routes of the second
+    /// module. The routes of the second module are unreachable. The result
+    /// is a `404` on a route that the OpenAPI document describes, and that
+    /// a unit test covers when the test mounts only this module.
     ///
     /// Return the empty string for a module that mounts only top-level
-    /// routes (`/health`, `/openapi.json`); such a module still conflicts
-    /// with any other empty-prefix module.
+    /// routes (`/health`, `/openapi.json`). Such a module still conflicts
+    /// with any other module that uses an empty prefix.
     fn prefix(&self) -> &str;
 
-    /// Registers this module's scopes, services, and app data on the Actix
-    /// application configuration.
+    /// Registers the scopes, services, and app data of this module on the
+    /// Actix application configuration.
     fn configure(&self, cfg: &mut web::ServiceConfig);
 }
 
@@ -168,15 +174,15 @@ pub trait ApiModule: Send + Sync {
      are unreachable. Merge them into one module, or give one a different prefix."
 )]
 pub struct DuplicateRoutePrefix {
-    /// The contested prefix.
+    /// The prefix that both modules claim.
     pub prefix: String,
 }
 
 /// Rejects a module set in which two modules claim the same
 /// [`ApiModule::prefix`].
 ///
-/// Called before anything is mounted, so a rejected composition leaves no
-/// half-registered routes behind.
+/// The function runs before anything is mounted, so a rejected composition
+/// leaves no half-registered routes behind.
 fn check_prefixes(modules: &[Box<dyn ApiModule>]) -> Result<(), DuplicateRoutePrefix> {
     let mut seen: Vec<&str> = Vec::with_capacity(modules.len());
     for module in modules {
@@ -191,13 +197,13 @@ fn check_prefixes(modules: &[Box<dyn ApiModule>]) -> Result<(), DuplicateRoutePr
     Ok(())
 }
 
-/// Mounts the modules and readiness probe onto a `ServiceConfig`.
+/// Mounts the modules and the readiness probe onto a `ServiceConfig`.
 ///
-/// Infallible by contract: [`check_prefixes`] has already rejected
+/// The function cannot fail. [`check_prefixes`] has already rejected all
 /// collisions, and both call sites run it first.
 ///
-/// Shared by [`ApiService::configure`] and [`wired_app!`] so the public
-/// composable path and the served path cannot drift.
+/// [`ApiService::configure`] and [`wired_app!`] share this function, so the
+/// public path and the served path cannot differ.
 fn register_modules(
     modules: &[Box<dyn ApiModule>],
     readiness: &Option<health::ReadyCheck>,
@@ -214,30 +220,32 @@ fn register_modules(
 /// Expands the full application wiring at the call site:
 /// `wired_app!(&modules, &readiness, &cors_origins)`.
 ///
-/// A macro rather than a function for one specific reason: actix-web's
-/// assembled `App` has no nameable public type, so a function can only
-/// return an opaque `impl` bound, and `HttpServer::new` rejects that
-/// because the bound is weaker than the `IntoServiceFactory` impl it
-/// needs. Expanding at the call site gives each site the concrete type
-/// inference it requires while keeping a single description of the
-/// middleware order and the registered app data.
+/// The code is a macro, not a function, for one specific reason. The
+/// actix-web `App` type has no nameable public type. A function can
+/// therefore return only an opaque `impl` bound. `HttpServer::new` rejects
+/// that bound, because the bound is weaker than the `IntoServiceFactory`
+/// impl that it needs. Expansion at the call site gives each site the
+/// concrete type inference that it requires. It also keeps one description
+/// of the middleware order and the app data.
 ///
-/// Crate-internal, and the only thing that mounts without threading a
-/// `Result` through actix's `configure` closures, which return `()`. Both
-/// call sites run [`check_prefixes`] first and surface the error properly;
-/// the assertion here is unreachable, and turning it into a startup panic
-/// beats silently shadowing a module.
+/// The macro is internal to this crate. Only this macro mounts the modules
+/// without passing a `Result` through the actix `configure` closures.
+/// Those closures return `()`. Both call sites run [`check_prefixes`]
+/// first, and both report the error correctly. The assertion in this macro
+/// is therefore unreachable. A startup panic is better than a module that
+/// is hidden without a message.
 macro_rules! wired_app {
     ($modules:expr, $readiness:expr, $cors_origins:expr, $bucket:expr) => {{
         apply_limits(App::new())
             .wrap(cors($cors_origins))
             .wrap(middleware::request_tracing::RequestTracingMiddleware)
             .wrap(middleware::bearer_token::BearerTokenMiddleware)
-            // Outermost, so it also bounds the routes a subject-keyed limiter
-            // could not reach -- `/auth/login`, which is an outbound round trip
-            // to the identity provider, and `/health`, which a load balancer
-            // polls hard. A zero limit leaves it installed but inert, costing
-            // one atomic load per request.
+            // Outermost, so it also limits the routes that a limiter keyed on
+            // the subject cannot reach. These routes are `/auth/login`, which
+            // makes an outbound call to the identity provider, and `/health`,
+            // which a load balancer polls often. A zero limit leaves the
+            // limiter installed but inactive. It costs one atomic load for
+            // each request.
             .wrap(crate::limits::RateLimit::new($bucket.clone()))
             .configure(health_routes)
             .configure(|cfg| {
@@ -247,16 +255,17 @@ macro_rules! wired_app {
                 register_modules($modules, $readiness, cfg);
             })
             // Mounted last on purpose. The API modules are the surface that
-            // matters, and anything catch-all mounted ahead of them can
-            // shadow them -- which is exactly what a `web::scope("")`
-            // around the spec routes used to do.
+            // matters. Any catch-all scope that is mounted before them can
+            // hide them. A `web::scope("")` around the spec routes used to
+            // do exactly this.
             .configure(docs::config)
     }};
 }
 
-/// Resolves when the process should shut down: Ctrl-C everywhere, plus
-/// SIGTERM on unix (container orchestrators). Separated for testability
-/// of the wiring in [`ApiService::start`].
+/// Completes when the process must shut down. The signal is Ctrl-C on all
+/// platforms. On unix the signal is also SIGTERM, which container
+/// orchestrators send. The function is separate so that the wiring in
+/// [`ApiService::start`] is testable.
 async fn shutdown_signal() {
     #[cfg(unix)]
     {
@@ -280,8 +289,8 @@ async fn shutdown_signal() {
     }
 }
 
-/// The HTTP server: composes [`ApiModule`]s into a single Actix Web
-/// application and binds it to a socket address.
+/// The HTTP server. The server combines [`ApiModule`] instances into one
+/// Actix Web application and binds the application to a socket address.
 pub struct ApiService {
     modules: Vec<Box<dyn ApiModule>>,
     readiness: Option<health::ReadyCheck>,
@@ -307,75 +316,81 @@ impl ApiService {
         }
     }
 
-    /// Sets the browser origins allowed by CORS (empty = same-origin only).
+    /// Sets the browser origins that CORS allows. An empty list allows
+    /// same-origin requests only.
     ///
-    /// Pass `config.http.allowed_origins`; each entry must be an exact
-    /// `http(s)` origin. Credentials are always allowed.
+    /// Pass `config.http.allowed_origins`. Each entry must be an exact
+    /// `http(s)` origin. The service always allows credentials.
     pub fn with_cors_origins(mut self, origins: Vec<String>) -> Self {
         self.cors_origins = origins;
         self
     }
 
-    /// Adds a module to the service. Modules are mounted in registration
-    /// order; use builder-style chaining to register several.
+    /// Adds a module to the service. The service mounts the modules in
+    /// registration order. Use builder-style chaining to register several
+    /// modules.
     pub fn register_module(mut self, module: Box<dyn ApiModule>) -> Self {
         self.modules.push(module);
         self
     }
 
-    /// Sets the request-rate limit, per peer address.
+    /// Sets the request-rate limit for each peer address.
     ///
-    /// `per_minute == 0` disables it, which is the default. Installed as the
-    /// outermost middleware, so it also bounds the routes a subject-keyed
-    /// limiter could not reach.
+    /// A value of `per_minute == 0` disables the limit, which is the
+    /// default. The middleware is installed as the outermost middleware. It
+    /// therefore also limits the routes that a limiter keyed on the subject
+    /// cannot reach.
     pub fn with_rate_limit(mut self, bucket: crate::limits::TokenBucket) -> Self {
         self.bucket = bucket;
         self
     }
 
-    /// Injects the dependency check backing `GET /ready`. The check runs
-    /// on every probe poll, so it must be cheap and non-blocking. When
-    /// absent `/ready` still returns 200 once startup (which gates on
-    /// S3/OIDC/JWKS) has bound the listener.
+    /// Injects the dependency check that backs `GET /ready`. The server runs
+    /// the check on every probe poll, so the check must be cheap and must not
+    /// block. If no check is present, `/ready` still returns 200 after
+    /// startup has bound the listener. Startup waits for S3/OIDC/JWKS.
     pub fn with_readiness_check(mut self, check: health::ReadyCheck) -> Self {
         self.readiness = Some(check);
         self
     }
 
-    /// Registers this service's modules and readiness probe onto an
-    /// existing `web::ServiceConfig`.
+    /// Registers the modules and the readiness probe of this service onto
+    /// an existing `web::ServiceConfig`.
     ///
-    /// The composable half of [`start`](Self::start), and the piece a host
-    /// app needs to mount this API inside its own `App` rather than giving
-    /// up the listener. Pair it with the global middleware this module
-    /// already exposes — [`cors`],
+    /// This method is the composable half of [`start`](Self::start). A host
+    /// app needs this method to mount this API inside its own `App` instead
+    /// of giving up the listener. Use this method with the global middleware
+    /// that this module already exposes, which is [`cors`],
     /// [`RequestTracingMiddleware`](middleware::request_tracing::RequestTracingMiddleware),
-    /// [`BearerTokenMiddleware`](middleware::bearer_token::BearerTokenMiddleware) —
-    /// plus [`apply_limits`], [`health_routes`], and [`docs::config`], and
-    /// the result is exactly what `start` serves.
+    /// and [`BearerTokenMiddleware`](middleware::bearer_token::BearerTokenMiddleware).
+    /// Add [`apply_limits`], [`health_routes`], and [`docs::config`] as
+    /// well. The result is exactly what `start` serves.
     ///
-    /// Fails with [`DuplicateRoutePrefix`] if two registered modules declare
-    /// the same [`ApiModule::prefix`]. Checked before anything is mounted.
+    /// The method fails with [`DuplicateRoutePrefix`] if two registered
+    /// modules declare the same [`ApiModule::prefix`]. The check runs before
+    /// anything is mounted.
     ///
-    /// Note what is deliberately *not* offered: a method returning the
-    /// assembled `App`. actix-web exposes no nameable public type for it
-    /// (`BoxedHttpServiceFactory` is crate-private), so such a signature
-    /// would either leak an unnameable `impl` bound that `HttpServer::new`
-    /// rejects, or force a dynamic factory per worker. Configuring an `App`
-    /// the caller already owns is both expressible and cheaper.
+    /// The service deliberately does not offer a method that returns the
+    /// assembled `App`. actix-web exposes no nameable public type for it.
+    /// `BoxedHttpServiceFactory` is crate-private. Such a signature would
+    /// therefore expose an unnameable `impl` bound that `HttpServer::new`
+    /// rejects. The other option is one dynamic factory for each worker.
+    /// Configuring an `App` that the caller already owns is possible, and it
+    /// is cheaper.
     pub fn configure(&self, cfg: &mut web::ServiceConfig) -> Result<(), DuplicateRoutePrefix> {
         check_prefixes(&self.modules)?;
         register_modules(&self.modules, &self.readiness, cfg);
         Ok(())
     }
 
-    /// Binds the composed application to `addr` and serves it until a
-    /// shutdown signal (Ctrl-C / SIGTERM) arrives, then drains
-    /// connections within the shutdown timeout before returning.
+    /// Binds the composed application to `addr`. The method serves the
+    /// application until a shutdown signal arrives (Ctrl-C or SIGTERM). The
+    /// method then drains the connections within the shutdown timeout before
+    /// it returns.
     pub async fn start(self, addr: SocketAddr) -> anyhow::Result<()> {
-        // Before the listener exists, so a bad composition is a startup
-        // error naming the prefix rather than a running server with a
-        // module whose routes 404.
+        // The check runs before the listener exists, so a bad composition is
+        // a startup error that names the prefix. Otherwise the server runs
+        // with a module whose routes return 404.
         check_prefixes(&self.modules)?;
 
         let modules = Arc::new(self.modules);
@@ -408,7 +423,7 @@ mod tests {
     use actix_web::{HttpResponse, http::StatusCode, http::header::CONTENT_TYPE, post, test, web};
 
     /// A module that exists only to prove the composition root mounts what
-    /// it is given, in a *scope* — the shape every real module uses.
+    /// it is given, in a *scope*. Every real module uses this shape.
     struct PingModule;
 
     impl ApiModule for PingModule {
@@ -431,17 +446,19 @@ mod tests {
         }
     }
 
-    /// Builds the real served application in-process — no socket, no
-    /// shutdown signal.
+    /// Builds the real served application in-process. There is no socket and
+    /// there is no shutdown signal.
     ///
-    /// This is what `wired_app!` exists for. Before it, the composition
-    /// root (CORS, middleware order, readiness, module mounting) was only
-    /// reachable through `start()`, so none of it could be asserted.
+    /// `wired_app!` exists for this purpose. Before it, only `start()` could
+    /// reach the composition root. The composition root sets CORS, the
+    /// middleware order, readiness, and the mounted modules. No test could
+    /// check any of it.
     ///
-    /// A macro rather than a helper fn because `test::init_service` returns
-    /// a service over actix-http's own `Request` type, which the crate does
-    /// not depend on directly and so cannot name in a signature. Expanding
-    /// here keeps the concrete type inferred at each use.
+    /// The code is a macro, not a helper function. `test::init_service`
+    /// returns a service that uses the `Request` type of actix-http. This
+    /// crate does not depend on actix-http directly, so it cannot name that
+    /// type in a signature. Expansion here keeps the concrete type inferred
+    /// at each use.
     macro_rules! served {
         ($service:expr) => {{
             test::init_service(wired_app!(
@@ -459,18 +476,18 @@ mod tests {
         let service = ApiService::new().register_module(Box::new(PingModule));
         let app = served!(service);
 
-        // Built-in routes survive composition.
+        // The composition keeps the built-in routes.
         let res =
             test::call_service(&app, test::TestRequest::get().uri("/health").to_request()).await;
         assert_eq!(res.status(), 200);
 
-        // And so does a registered module's route.
+        // The composition keeps the route of a registered module too.
         let res =
             test::call_service(&app, test::TestRequest::get().uri("/ping").to_request()).await;
         assert_eq!(res.status(), 200);
         assert_eq!(test::read_body(res).await, "pong");
 
-        // The OpenAPI document is mounted by the same wiring.
+        // The same wiring mounts the OpenAPI document.
         let res = test::call_service(
             &app,
             test::TestRequest::get().uri("/openapi.json").to_request(),
@@ -481,7 +498,8 @@ mod tests {
 
     #[actix_web::test]
     async fn composition_root_applies_cors_and_readiness() {
-        // CORS reaches the composed app, not just a hand-built one.
+        // CORS reaches the composed app, and not only an app that the
+        // test builds by hand.
         let origins = vec!["https://app.example.com".to_string()];
         let service = ApiService::new().with_cors_origins(origins);
         let app = served!(service);
@@ -500,7 +518,7 @@ mod tests {
             Some("https://app.example.com")
         );
 
-        // A failing readiness check must surface through the composed app.
+        // The composed app must report a readiness check that fails.
         let failing: health::ReadyCheck = Arc::new(|| false);
         let service = ApiService::new().with_readiness_check(failing);
         let app = served!(service);
@@ -509,9 +527,9 @@ mod tests {
         assert_eq!(res.status(), 503);
     }
 
-    /// `ApiService::configure` is the documented way for a host app to mount
-    /// the API into its own `App`, so the two paths must produce the same
-    /// routes.
+    /// The documentation names `ApiService::configure` as the way for a host
+    /// app to mount the API into its own `App`. Therefore the two paths must
+    /// produce the same routes.
     #[actix_web::test]
     async fn configure_matches_the_served_wiring() {
         let service = ApiService::new().register_module(Box::new(PingModule));
@@ -528,22 +546,23 @@ mod tests {
         }
     }
 
-    /// A module set that mounts two of the same prefix is a composition
-    /// error, and it has to surface as one.
+    /// A module set that mounts two modules on the same prefix is a
+    /// composition error. The code must report it as an error.
     ///
-    /// Actix does not report it: a scope matches its whole prefix and
-    /// services are tried in registration order, so the second module's
-    /// routes are simply never consulted. The result is a server that
-    /// starts cleanly and 404s a documented route. `OidcApiModule` and
-    /// `OidcSessionModule` both claiming `/auth` is exactly what happened.
+    /// Actix does not report the error. A scope matches its whole prefix.
+    /// The server tries the services in registration order. Therefore the
+    /// server never consults the routes of the second module. The result is
+    /// a server that starts normally and returns 404 for a documented route.
+    /// `OidcApiModule` and `OidcSessionModule` both claimed `/auth`, and
+    /// this is what happened.
     #[actix_web::test]
     async fn two_modules_on_one_prefix_is_rejected() {
         let service = ApiService::new()
             .register_module(Box::new(PingModule))
             .register_module(Box::new(PingModule));
 
-        // Captured out of the closure because actix's `configure` takes an
-        // infallible `FnOnce(&mut ServiceConfig)`.
+        // The result is stored outside the closure, because actix `configure`
+        // takes an infallible `FnOnce(&mut ServiceConfig)`.
         let outcome = std::cell::RefCell::new(None);
         let app = test::init_service(apply_limits(App::new()).configure(|cfg| {
             *outcome.borrow_mut() = Some(service.configure(cfg).err());
@@ -555,21 +574,21 @@ mod tests {
             .expect("configure ran")
             .expect("duplicate /ping should be refused");
         assert_eq!(err.prefix, "/ping");
-        // The message has to name the prefix and say what happened,
-        // because this is the only diagnostic a host app gets.
+        // The message must name the prefix and must describe what happened.
+        // It is the only diagnostic that a host app receives.
         let rendered = err.to_string();
         assert!(rendered.contains("/ping"), "{rendered}");
         assert!(rendered.contains("unreachable"), "{rendered}");
 
-        // Prefixes are checked before anything is mounted, so the refused
-        // set left no half-registered routes behind.
+        // The code checks the prefixes before it mounts anything, so the
+        // refused set left no half-registered routes behind.
         let res =
             test::call_service(&app, test::TestRequest::get().uri("/ping").to_request()).await;
         assert_eq!(res.status(), 404);
     }
 
-    /// The same set through the served path, which is where a bad
-    /// composition would otherwise bind a socket and serve a broken API.
+    /// The code sends the same set through the served path. On that path, a
+    /// bad composition would otherwise bind a socket and serve a broken API.
     #[actix_web::test]
     async fn start_refuses_a_duplicate_prefix_before_binding() {
         let service = ApiService::new()
@@ -583,15 +602,15 @@ mod tests {
         assert!(err.to_string().contains("/ping"), "unexpected error: {err}");
     }
 
-    /// Regression: a `web::scope("")` around the spec routes matched every
-    /// request and shadowed every service registered after it. Because the
-    /// spec was mounted before the API modules, every `/fs`, `/policy`,
-    /// `/auth`, `/sync`, and `/setup` route 404'd in the real server while
-    /// `/health`, `/ready`, and `/openapi.json` still answered — so the
-    /// server looked healthy and served nothing.
+    /// Regression test. A `web::scope("")` around the spec routes matched
+    /// every request. It also hid every service that was registered after
+    /// it. The spec was mounted before the API modules. Therefore every
+    /// `/fs`, `/policy`, `/auth`, `/sync`, and `/setup` route returned 404 on
+    /// the real server. Only `/health`, `/ready`, and `/openapi.json` still
+    /// answered. The server appeared healthy and served nothing.
     ///
-    /// `docs::tests` only ever checked that paths were *declared*; nothing
-    /// asserted they were *mounted*. These two do.
+    /// `docs::tests` only checked that the paths were *declared*. No test
+    /// asserted that the paths were *mounted*. This test asserts it.
     #[actix_web::test]
     async fn spec_routes_do_not_shadow_module_routes() {
         let service = ApiService::new().register_module(Box::new(PingModule));
@@ -603,19 +622,21 @@ mod tests {
         }
     }
 
-    /// Raw-bytes echo handler exercising the `Bytes` extractor limit.
+    /// A handler that echoes raw bytes. The handler tests the limit of the
+    /// `Bytes` extractor.
     async fn echo(body: web::Bytes) -> HttpResponse {
         HttpResponse::Ok().body(body)
     }
 
-    /// A malformed JSON body answers inside the envelope.
+    /// A malformed JSON body returns a response inside the envelope.
     ///
-    /// Actix's default for a body that will not deserialize is a bare
-    /// `400 Bad Request` in `text/plain`, so a documented route could answer
-    /// outside the uniform envelope -- and would, routinely, for any client
-    /// that sends a truncated or mistyped payload. This pins the fix to
-    /// `apply_limits`, which is the one place the `JsonConfig` lives, so a
-    /// host app following the documented recipe inherits it.
+    /// The actix default for a body that cannot be deserialized is a bare
+    /// `400 Bad Request` in `text/plain`. Therefore a documented route can
+    /// answer outside the uniform envelope. Any client that sends a truncated
+    /// or mistyped payload reaches this case, so it happens often. This test
+    /// fixes the behaviour to `apply_limits`. That function holds the only
+    /// `JsonConfig` in the crate. A host app that follows the documented
+    /// recipe therefore inherits the same behaviour.
     #[actix_web::test]
     async fn malformed_json_answers_inside_the_envelope() {
         #[post("/thing")]
@@ -623,7 +644,8 @@ mod tests {
             HttpResponse::Ok().finish()
         }
 
-        // Control: without `apply_limits`, actix's own text 400.
+        // Control case. Without `apply_limits`, actix returns its own text
+        // 400.
         let bare = test::init_service(App::new().service(thing)).await;
         let res = test::call_service(
             &bare,
@@ -641,7 +663,7 @@ mod tests {
             "control: actix's default is not the envelope"
         );
 
-        // With it, the same request is answered by this crate.
+        // With `apply_limits`, this crate answers the same request.
         let wrapped = test::init_service(apply_limits(App::new()).service(thing)).await;
         let res = test::call_service(
             &wrapped,
@@ -658,9 +680,11 @@ mod tests {
         assert_eq!(parsed.error, "bad request");
     }
 
-    /// 300 KiB exceeds actix's 256 KiB `Bytes` default: without the shared
-    /// limits it must 413, with them it must pass. Guards the documented
-    /// 512 KiB parts / 10 MiB single-part uploads against a silent 413.
+    /// A 300 KiB body is larger than the actix default of 256 KiB for
+    /// `Bytes`. Without the shared limits, the request must return 413. With
+    /// the limits, the request must pass. The test protects the documented
+    /// upload sizes of 512 KiB parts and 10 MiB single-part uploads from a
+    /// silent 413.
     #[actix_web::test]
     async fn payload_limit_covers_documented_part_sizes() {
         use actix_web::web::Bytes;
@@ -672,12 +696,12 @@ mod tests {
                 .to_request()
         };
 
-        // Control: actix's 256 KiB default rejects the body.
+        // Control case. The actix default of 256 KiB rejects the body.
         let svc = test::init_service(App::new().route("/echo", web::put().to(echo))).await;
         let res = test::call_service(&svc, payload()).await;
         assert_eq!(res.status(), 413, "control: default limit must reject");
 
-        // With the shared limits the same body passes through untouched.
+        // With the shared limits, the same body passes through unchanged.
         let svc =
             test::init_service(apply_limits(App::new()).route("/echo", web::put().to(echo))).await;
         let res = test::call_service(&svc, payload()).await;
@@ -685,8 +709,10 @@ mod tests {
         assert_eq!(test::read_body(res).await.len(), 300_000);
     }
 
-    /// CORS echoes an explicitly allowed browser origin (with credentials)
-    /// and stays silent otherwise: empty origins mean same-origin only.
+    /// CORS returns the allowed origin for a browser origin that the list
+    /// permits explicitly, and it allows credentials. CORS returns nothing
+    /// for any other origin. An empty list of origins allows same-origin
+    /// requests only.
     #[actix_web::test]
     async fn cors_allows_configured_origin_only() {
         async fn ok() -> HttpResponse {
@@ -714,7 +740,7 @@ mod tests {
             Some("https://app.example.com")
         );
 
-        // Unlisted origin gets no CORS headers.
+        // An origin that is not in the list gets no CORS headers.
         let res = test::call_service(
             &svc,
             test::TestRequest::get()
@@ -725,7 +751,8 @@ mod tests {
         .await;
         assert!(res.headers().get("access-control-allow-origin").is_none());
 
-        // Empty origins: deny-by-default, no CORS headers at all.
+        // An empty list of origins denies the request by default and returns
+        // no CORS headers.
         let svc =
             test::init_service(App::new().wrap(cors(&[])).route("/ping", web::get().to(ok))).await;
         let res = test::call_service(

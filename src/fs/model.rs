@@ -1,5 +1,5 @@
-//! Request/response DTOs and validation mirroring `MetadataUploadSchema.filter`.
-
+//! Request and response types for the FS module.
+/// Their validation mirrors `MetadataUploadSchema.filter`.
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
@@ -14,19 +14,21 @@ pub struct InitRequest {
     pub file_total_parts: u64,
 }
 
-/// Maximum parts in one multipart upload.
+/// The maximum number of parts in one multipart upload.
 ///
-/// S3's own per-upload limit. Enforcing it at init matters three times
-/// over: it turns what would otherwise be an S3 rejection at
-/// `complete_upload` -- *after* the client has uploaded every part -- into
-/// a 400 on the first call; and it bounds the per-session `etags` and
-/// `checksums` vectors the engine allocates from this count, which is what
-/// keeps a 70-byte request body from becoming a multi-terabyte allocation.
+/// This value is the S3 limit for one upload.
+/// The engine enforces the limit when a client starts an upload.
+/// The engine then rejects a larger count with a 400 on the first call.
+/// Without the check, S3 would reject the upload at `complete_upload`,
+/// after the client sent every part.
+/// The check also bounds the per-session `etags` and `checksums` vectors.
+/// Without the check, a 70-byte request body could ask for a
+/// multi-terabyte allocation.
 pub const MAX_MULTIPART_PARTS: u64 = 10_000;
 
 impl InitRequest {
-    /// Validates the same constraints as the TS `Schema.filter`, plus
-    /// [`MAX_MULTIPART_PARTS`].
+    /// Validates the same constraints as the TS `Schema.filter`, and also
+    /// applies [`MAX_MULTIPART_PARTS`].
     pub fn validate(&self) -> Result<(), crate::fs::error::FsError> {
         use crate::fs::error::FsError;
         if self.file_size == 0 {
@@ -52,9 +54,10 @@ impl InitRequest {
                 ));
             }
         } else {
-            // Before the arithmetic checks, because a count this large is
-            // the interesting error: `expected` would otherwise report
-            // something like "must be exactly 18014398509481983 parts".
+            // The engine runs this check before the arithmetic checks.
+            // A count this large is the error that matters here.
+            // Without this check, `expected` reports a message such as
+            // "must be exactly 18014398509481983 parts".
             if self.file_total_parts > MAX_MULTIPART_PARTS {
                 return Err(FsError::BadRequest(format!(
                     "file_total_parts must be at most {MAX_MULTIPART_PARTS} (S3's per-upload part \
@@ -76,13 +79,15 @@ impl InitRequest {
                     self.part_size
                 )));
             }
-            // `checked_mul` is a backstop, not the primary guard: the
-            // `MAX_MULTIPART_PARTS` cap above already makes the product
-            // unreachable-overflow (10,000 x 512 KB is ~5 GB). It stays
-            // because the cost of being wrong here is a debug panic or a
-            // silent release wrap, and the cost of the guard is one line.
-            // `init_request_caps_parts_before_arithmetic` pins that the cap
-            // is what actually rejects these inputs now.
+            // `checked_mul` is a second guard, and not the main one.
+            // The `MAX_MULTIPART_PARTS` cap above already prevents an
+            // overflow of this product. 10,000 parts of 512 KB are about
+            // 5 GB.
+            // The code keeps `checked_mul` because a wrong result here is
+            // a debug panic or a silent wrap in release mode. The guard
+            // costs one line.
+            // The test `init_request_caps_parts_before_arithmetic` proves
+            // that the cap rejects these inputs now.
             let product = self
                 .file_total_parts
                 .checked_mul(self.part_size)
@@ -123,7 +128,7 @@ impl CompleteRequest {
     }
 }
 
-/// Public file metadata (no S3 internals).
+/// Public file metadata. It does not contain S3 internals.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct FileMetadata {
     /// File identifier (uuidv7).
@@ -136,14 +141,15 @@ pub struct FileMetadata {
     pub size: u64,
 }
 
-/// Response for `POST /fs/uploads` (init).
+/// The response for `POST /fs/uploads`. The call starts an upload.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct InitResponse {
     /// Generated file identifier.
     pub file_id: String,
 }
 
-/// Progress response for client-driven polling: `GET /fs/uploads/{id}`.
+/// The progress response for a client poll. The client sends
+/// `GET /fs/uploads/{id}`.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ProgressResponse {
     /// File identifier.
@@ -201,9 +207,11 @@ mod tests {
     }
 
     #[test]
-    fn init_request_single_part_copy_paste_guards() {
-        // Copy-paste risk: single-part branch must check part_size == file_size
-        // and 10 MB cap — swapping into multi-part logic would silently pass.
+    fn init_request_single_part_checks_size_and_cap() {
+        // A copy-paste error is the risk in this test.
+        // The single-part branch must check that part_size == file_size.
+        // The branch must also apply the 10 MB cap.
+        // Without these checks, the multi-part logic accepts the input.
         assert_bad(
             InitRequest {
                 file_size: 1024,
@@ -220,7 +228,7 @@ mod tests {
             },
             "10 MB",
         );
-        // Valid single-part (boundary 10 MB)
+        // Valid single-part upload at the 10 MB boundary.
         InitRequest {
             file_size: 10 * 1024 * 1024,
             part_size: 10 * 1024 * 1024,
@@ -231,8 +239,9 @@ mod tests {
     }
 
     #[test]
-    fn init_request_multi_part_copy_paste_guards() {
-        // part_size must be 1KB multiple and <=512KB — easy to copy wrong bound.
+    fn init_request_multi_part_checks_size_and_count() {
+        // The engine requires part_size to be a multiple of 1 KB and at
+        // most 512 KB. A wrong bound is easy to copy into this test.
         assert_bad(
             InitRequest {
                 file_size: 2048,
@@ -258,7 +267,7 @@ mod tests {
             },
             "must be exactly",
         );
-        // product must equal file_size (exact division required)
+        // The product must equal file_size. The division must be exact.
         assert_bad(
             InitRequest {
                 file_size: 300 * 1024,
@@ -267,7 +276,7 @@ mod tests {
             },
             "must equal",
         );
-        // Valid multi-part: 1 MB split by 256KB = 4 parts
+        // Valid multi-part upload. A 1 MB file with 256 KB parts has 4 parts.
         InitRequest {
             file_size: 1024 * 1024,
             part_size: 262144,
@@ -277,12 +286,14 @@ mod tests {
         .unwrap();
     }
 
-    /// `part_size` is constrained to a 1 KB multiple, not a power of two:
-    /// the error message used to promise "power-of-two" while the check
-    /// accepted any multiple. Pins the behavior the message now describes.
+    /// `part_size` must be a multiple of 1 KB.
+    /// It does not have to be a power of two.
+    /// The error message used to promise "power-of-two", but the check
+    /// accepted any multiple.
+    /// This test pins the behaviour that the message now describes.
     #[test]
     fn init_request_multi_part_allows_any_1kb_multiple() {
-        // 3 KiB is not a power of two but is a valid part size.
+        // 3 KiB is not a power of two, and it is a valid part size.
         InitRequest {
             file_size: 6144,
             part_size: 3072,
@@ -300,21 +311,20 @@ mod tests {
         );
     }
 
-    /// The part count used to be unbounded, and these two inputs are the
-    /// ones that broke it. Both are arithmetically self-consistent
-    /// (`file_total_parts == ceil(file_size / part_size)` and the product
-    /// equals `file_size`), so they sailed through every check and reached
-    /// `vec![None; n]` in the engine:
+    /// The part count used to have no limit. These two inputs broke that.
+    /// Both inputs are correct in arithmetic (`file_total_parts == ceil(file_size / part_size)` and the product equals `file_size`).
+    /// Both inputs passed every check and reached `vec![None; n]` in the engine:
     ///
     /// - 2^54 parts: a 383 TiB allocation, which **aborts** the process.
-    /// - 2^54 parts with an overflowing product: a debug panic / release
-    ///   wrap.
+    /// - 2^54 parts with an overflowing product: a debug panic or a silent
+    ///   wrap in release mode.
     ///
-    /// The `MAX_MULTIPART_PARTS` cap now rejects both, and it is checked
-    /// before the arithmetic so the error names the real problem.
+    /// The `MAX_MULTIPART_PARTS` cap now rejects both inputs.
+    /// The engine checks the cap before the arithmetic, so the error
+    /// message names the real problem.
     #[test]
     fn init_request_caps_parts_before_arithmetic() {
-        // The exact body from the abort: passes every arithmetic check.
+        // This is the exact body from the abort. It passes every arithmetic check.
         assert_bad(
             InitRequest {
                 file_size: u64::MAX - 1023,
@@ -324,7 +334,7 @@ mod tests {
             },
             "at most 10000",
         );
-        // The one that used to overflow the product, also capped now.
+        // This input used to overflow the product. The cap rejects it too.
         assert_bad(
             InitRequest {
                 file_size: u64::MAX - 511,
@@ -333,7 +343,7 @@ mod tests {
             },
             "at most 10000",
         );
-        // One over the limit, with math that also checks out.
+        // One part over the limit. The arithmetic also passes.
         assert_bad(
             InitRequest {
                 file_size: (MAX_MULTIPART_PARTS + 1) * 1024,
@@ -342,7 +352,7 @@ mod tests {
             },
             "at most 10000",
         );
-        // The message has to tell the client what to do about it.
+        // The message must tell the client what to do.
         let err = InitRequest {
             file_size: (MAX_MULTIPART_PARTS + 1) * 1024,
             part_size: 1024,
@@ -354,7 +364,8 @@ mod tests {
         assert!(err.contains("part_size"), "unhelpful message: {err}");
     }
 
-    /// The cap is inclusive: exactly 10,000 parts is a legal upload.
+    /// The cap includes its limit. An upload of exactly 10,000 parts is
+    /// valid.
     #[test]
     fn init_request_accepts_exactly_the_part_limit() {
         InitRequest {

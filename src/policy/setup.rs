@@ -1,12 +1,12 @@
-//! One-time bootstrap endpoint: assigns an authenticated account the
+//! One-time bootstrap endpoint. It assigns an authenticated account the
 //! built-in [`SUPERADMIN_ROLE`] while no other superadmin exists.
 //!
-//! Fresh deployments boot with an empty policy store, so nobody can pass
-//! the self-authorization checks on `/policy` routes. This module closes
-//! that chicken-and-egg gap: the first authenticated user to call
-//! `POST /setup/admin` claims the superadmin role; every later call is a
-//! hard conflict (409), including after restarts, because the claim check
-//! and write share one lock over the persisted enforcer state.
+//! A fresh deployment starts with an empty policy store, so nobody can pass
+//! the self-authorization checks on the `/policy` routes. This module closes
+//! that gap. The first authenticated user that calls `POST /setup/admin`
+//! claims the superadmin role. Every later call is a hard conflict (409),
+//! also after a restart, because the claim check and the write share one
+//! lock over the persisted state of the enforcer.
 
 use std::sync::Arc;
 
@@ -20,17 +20,17 @@ use crate::http::{
     middleware::jwt::{Claims, JwtClaimsMiddleware, Validated},
 };
 
-/// API module exposing the one-time `/setup/admin` bootstrap route,
-/// protected by JWT validation only (authorization would be impossible:
-/// the store starts with no roles at all).
+/// API module exposing the one-time `/setup/admin` bootstrap route. The
+/// module uses JWT validation only, because authorization is impossible.
+/// The store starts with no roles at all.
 pub struct SetupApiModule {
     policy_engine: Arc<PolicyEngine>,
     jwt_middleware: JwtClaimsMiddleware<Claims>,
 }
 
 impl SetupApiModule {
-    /// Wraps a [`PolicyEngine`] with the given JWT middleware. Pass a
-    /// clone of the engine shared with other modules; clones see one
+    /// Wraps a [`PolicyEngine`] with the given JWT middleware. Pass a clone
+    /// of the engine that other modules share, because all clones see one
     /// policy state.
     pub fn new(policy_engine: PolicyEngine, jwt_middleware: JwtClaimsMiddleware<Claims>) -> Self {
         Self {
@@ -146,9 +146,9 @@ mod tests {
         }
     }
 
-    /// Builds the API module against the fixture's JWKS server and shared
-    /// engine state; each test wires it into an inline app so actix service
-    /// types stay concretely inferred.
+    /// Builds the API module against the JWKS server and the shared engine
+    /// state of the fixture. Each test wires the module into an inline app,
+    /// so that actix infers the service types as concrete types.
     async fn setup_module(fx: &Fixture) -> anyhow::Result<SetupApiModule> {
         let middleware = JwtClaimsMiddleware::<Claims>::new_with_jks(
             &format!("{}/jwks", fx.server.uri()),
@@ -174,7 +174,7 @@ mod tests {
             test::init_service(App::new().configure(|cfg| ApiModule::configure(&module, cfg)))
                 .await;
 
-        // First authenticated caller wins.
+        // The first authenticated caller wins.
         let res = test::call_service(
             &app,
             test::TestRequest::post()
@@ -188,7 +188,7 @@ mod tests {
         assert_eq!(body["sub"], "alice");
         assert_eq!(body["role"], SUPERADMIN_ROLE);
 
-        // A different subject arriving afterwards is locked out.
+        // A different subject that arrives afterwards is locked out.
         let res = test::call_service(
             &app,
             test::TestRequest::post()
@@ -251,13 +251,15 @@ mod tests {
             assert_eq!(res.status(), 201);
         }
 
-        // Capture fixture data up front: dropping the engine partially
-        // moves `fx`, so method borrows must happen before it.
+        // Capture the data of the fixture first. Dropping the engine
+        // partially moves `fx`, so the method borrows must happen before
+        // the drop.
         let bob_token = fx.token("bob")?;
         let issuer = fx.issuer();
         let jwks_url = format!("{}/jwks", issuer);
 
-        // Release the first engine, then reopen the same persisted state as a fresh engine.
+        // The first engine is released. The same persisted state then reopens
+        // as a fresh engine.
         let prefix = fx.store_prefix.clone();
         let shared = fx.shared_store.clone();
         drop(fx.engine);

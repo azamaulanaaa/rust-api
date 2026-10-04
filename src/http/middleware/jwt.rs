@@ -1,9 +1,11 @@
-//! Actix middleware validating JWTs against a JWKS-backed key store.
+//! Actix middleware that validates JWTs against a key store that uses
+//! JWKS.
 //!
-//! Validated claims (generic over `C`) are inserted into request extensions
-//! — consume them with [`Validated`](crate::http::middleware::jwt::Validated) —
-//! and requests without any token pass through unmodified so routes decide
-//! their own auth requirements.
+//! The code puts the validated claims (generic over `C`) into the request
+//! extensions. Read the claims with
+//! [`Validated`](crate::http::middleware::jwt::Validated). A request that
+//! sends no token passes through unchanged, so each route decides its own
+//! authentication requirements.
 
 use std::{
     future::{Ready, ready},
@@ -25,54 +27,59 @@ use super::bearer_token::BearerToken;
 use super::jwks::JwksKeys;
 use crate::http::error::ApiError;
 
-// Preserve the public API surface for consumers of this module.
+// Re-exports the public API for the users of this module.
 pub use super::jwks::SigningKey;
 
-/// Literal segment marking a multi-tenant issuer template (Azure AD style:
-/// `https://login.microsoftonline.com/{tenantid}/v2.0`).
+/// The literal segment that marks a template for a multi-tenant issuer.
+/// The format follows Azure AD, for example
+/// `https://login.microsoftonline.com/{tenantid}/v2.0`.
 const TENANT_PLACEHOLDER: &str = "{tenantid}";
 
-/// Path of the browser session cookie this middleware reads.
+/// The browser session cookie that this middleware reads.
 const AUTH_COOKIE: &str = "auth_token";
 
-/// A multi-tenant issuer template: the provider's discovery document
-/// publishes an issuer containing a literal `{tenantid}` placeholder that
-/// each token resolves to its issuing tenant.
+/// A template for a multi-tenant issuer. The discovery document of the
+/// provider publishes an issuer that contains the literal placeholder
+/// `{tenantid}`. Each token resolves the placeholder to the tenant that
+/// issued it.
 ///
 /// # Why the allowlist is not optional
 ///
-/// The expected issuer is necessarily derived from the token's *own*
-/// unverified `tid` claim, because no static issuer can match a placeholder.
-/// That derivation is a tautology over attacker-supplied data: any token
-/// whose `iss` and `tid` agree with each other satisfies it. Signature
-/// validation does not help either — a multi-tenant app registration publishes
-/// one JWKS containing every tenant's keys, so a token minted by a tenant the
-/// operator never intended to trust verifies against keys already cached here.
+/// The expected issuer must come from the `tid` claim of the token itself,
+/// because the claim is not verified. No static issuer can match an issuer
+/// that contains a placeholder. The derivation therefore proves nothing,
+/// because it uses data that an attacker supplied. Any token whose `iss` and
+/// `tid` claims agree satisfies it. Signature validation does not help
+/// either. A multi-tenant app registration publishes one JWKS with the keys
+/// of every tenant. Therefore a token that a tenant the operator never
+/// intended to trust signed verifies against keys that this store already
+/// caches.
 ///
-/// Audience is **not** a substitute: `aud` is the client ID, which is
-/// identical for every tenant that has consented to the app registration. The
-/// tenant gate is therefore the allowlist and nothing else, and it fails
-/// closed — an empty allowlist accepts no tenant at all, and
-/// [`crate::config::Config::validate`] refuses to start a templated issuer
-/// without one.
+/// Audience is **not** a substitute. The `aud` claim is the client ID, and
+/// that ID is the same for every tenant that consented to the app
+/// registration. The allowlist is therefore the only tenant gate, and it
+/// fails closed. An empty allowlist accepts no tenant at all, and
+/// `Config::validate` refuses to start a templated issuer without an
+/// allowlist.
 #[derive(Debug, Clone)]
 pub struct IssuerTemplate {
-    /// Issuer portion before the `{tenantid}` placeholder.
+    /// The issuer part before the `{tenantid}` placeholder.
     prefix: String,
-    /// Issuer portion after the `{tenantid}` placeholder.
+    /// The issuer part after the `{tenantid}` placeholder.
     suffix: String,
-    /// The only tenant identifiers this deployment accepts.
+    /// The only tenant identifiers that this deployment accepts.
     allowed_tenants: Vec<String>,
 }
 
 impl IssuerTemplate {
-    /// Parses a template from a discovered issuer; `None` when the issuer is
-    /// not templated (the common single-tenant case).
+    /// Parses a template from a discovered issuer. The function returns `None`
+    /// when the issuer is not templated, which is the usual single-tenant
+    /// case.
     ///
-    /// `allowed_tenants` is the tenant allowlist and applies only to the
-    /// templated case; it is required to be non-empty by config validation,
-    /// but an empty list is still honoured here as "reject everything" rather
-    /// than "allow everything".
+    /// `allowed_tenants` is the tenant allowlist. It applies only to the
+    /// templated case. The configuration validation requires the list to be
+    /// non-empty. The function still accepts an empty list here, and an
+    /// empty list means "reject everything" instead of "allow everything".
     pub fn parse(issuer: &str, allowed_tenants: Vec<String>) -> Option<Self> {
         let (prefix, suffix) = issuer.split_once(TENANT_PLACEHOLDER)?;
         Some(Self {
@@ -83,19 +90,20 @@ impl IssuerTemplate {
     }
 
     /// Resolves the template for a tenant identifier that is *known* to be
-    /// allowed, without re-checking it.
+    /// allowed. The function does not check the identifier again.
     ///
-    /// Prefer [`IssuerTemplate::resolve_checked`]. This exists for tests and
-    /// for building the set of issuers to accept, not for validating a token.
+    /// Prefer [`IssuerTemplate::resolve_checked`]. Use this function for
+    /// tests, and to build the set of issuers to accept. Do not use it to
+    /// validate a token.
     pub fn resolve(&self, tenant_id: &str) -> String {
         format!("{}{}{}", self.prefix, tenant_id, self.suffix)
     }
 
-    /// Resolves the template for a tenant identifier, rejecting any tenant
+    /// Resolves the template for a tenant identifier, and rejects every tenant
     /// outside the configured allowlist.
     ///
-    /// The error string names the rejected tenant and is safe to log; it is
-    /// never serialized into a client response.
+    /// The error string names the rejected tenant, and it is safe to log. The
+    /// code never serializes the string into a client response.
     pub fn resolve_checked(&self, tenant_id: &str) -> Result<String, String> {
         if !self
             .allowed_tenants
@@ -109,7 +117,7 @@ impl IssuerTemplate {
         Ok(self.resolve(tenant_id))
     }
 
-    /// The tenant identifiers this deployment accepts.
+    /// The tenant identifiers that this deployment accepts.
     pub fn allowed_tenants(&self) -> &[String] {
         &self.allowed_tenants
     }
@@ -117,9 +125,10 @@ impl IssuerTemplate {
 
 /// Extracts a top-level string field from an unverified JWT payload.
 ///
-/// Used only to *derive validation inputs* (e.g. the expected issuer from
-/// `tid`) before the verified decode; every security decision still goes
-/// through the signature-checked decode afterwards.
+/// The function only serves to *derive validation inputs*, for example the
+/// expected issuer from `tid`, before the verified decode. Every security
+/// decision still goes through the decode that checks the signature
+/// afterwards.
 pub(crate) fn extract_unverified_claim(token: &str, field: &str) -> Option<String> {
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 
@@ -129,45 +138,48 @@ pub(crate) fn extract_unverified_claim(token: &str, field: &str) -> Option<Strin
     value.get(field)?.as_str().map(str::to_string)
 }
 
-/// Audience (`aud`) claim values: providers emit either a single string or
-/// an array of strings, both of which deserialize into this enum.
+/// The values of the audience (`aud`) claim. A provider sends either one
+/// string or an array of strings, and this enum accepts both.
 #[derive(Debug, Deserialize, Clone)]
 #[serde(untagged)]
 pub enum Audience {
-    /// A single audience value.
+    /// One audience value.
     Single(String),
     /// Multiple audience values.
     Multi(Vec<String>),
 }
 
-/// Standard ID-token claims extracted from a validated JWT and inserted
-/// into request extensions.
+/// The standard ID-token claims that the code takes from a validated JWT
+/// and puts into the request extensions.
 #[allow(dead_code)]
 #[derive(Debug, Deserialize, Clone)]
 pub struct Claims {
-    /// Issuer: the identity provider that issued the token.
+    /// The issuer, which is the identity provider that signed the token.
     pub iss: String,
-    /// Subject: the stable user identifier.
+    /// The subject, which is the stable user identifier.
     pub sub: String,
-    /// Audience(s) the token was issued for.
+    /// The audience that the token was issued for.
     pub aud: Audience,
-    /// Expiration time (unix seconds); validated on every request.
+    /// The expiration time in unix seconds. The code checks it on every
+    /// request.
     pub exp: u64,
-    /// Not-before time (unix seconds), when present.
+    /// The not-before time in unix seconds. The field is optional.
     pub nbf: Option<u64>,
-    /// Issued-at time (unix seconds), when present.
+    /// The issued-at time in unix seconds. The field is optional.
     pub iat: Option<u64>,
-    /// Nonce echoed back by the provider during the OIDC flow.
+    /// The nonce that the provider sends back during the OIDC flow. The
+    /// field is optional.
     pub nonce: Option<String>,
-    /// Unique token identifier; usable as a revocation key.
+    /// The unique token identifier. A server can use it as a revocation
+    /// key. The field is optional.
     pub jti: Option<String>,
 }
 
-/// Actix middleware validating JWTs against a [`JwksKeys`] store before the
-/// request reaches the wrapped service. Validated claims (generic over `C`)
-/// are inserted into request extensions — consume them with [`Validated`] —
-/// and requests without any token pass through unmodified so routes decide
-/// their own auth requirements.
+/// The Actix middleware that validates JWTs against a [`JwksKeys`] store
+/// before the request reaches the wrapped service. The code puts the
+/// validated claims (generic over `C`) into the request extensions. Read the
+/// claims with [`Validated`]. A request that sends no token passes through
+/// unchanged, so each route decides its own authentication requirements.
 #[derive(Clone)]
 pub struct JwtClaimsMiddleware<C>
 where
@@ -183,8 +195,8 @@ impl<C> JwtClaimsMiddleware<C>
 where
     C: DeserializeOwned,
 {
-    /// Assembles the middleware from an existing key store and base
-    /// validation config (audience/issuer/leeway).
+    /// Builds the middleware from an existing key store and the base
+    /// validation configuration (audience, issuer, and leeway).
     pub fn new(keys: JwksKeys, validation: Validation) -> Self {
         Self {
             keys,
@@ -194,9 +206,9 @@ where
         }
     }
 
-    /// Fetches the JWKS document from `jwks_url` and builds the middleware,
-    /// pinning `audience` and `issuer` validation. See [`JwksKeys`] for the
-    /// refresh behavior.
+    /// Fetches the JWKS document from `jwks_url` and builds the middleware.
+    /// The function pins the `audience` and `issuer` checks. See
+    /// [`JwksKeys`] for the refresh behavior.
     pub async fn new_with_jks(
         jwks_url: &str,
         audience: &str,
@@ -204,11 +216,12 @@ where
     ) -> anyhow::Result<Self> {
         let keys = JwksKeys::new(jwks_url).await?;
 
-        // Base validation carries the audience/issuer checks; the expected
-        // algorithm is re-pinned per request from the selected signing key.
-        // A templated issuer ({tenantid}) cannot be pinned statically — the
-        // middleware resolves it per request from the token's tid claim, and
-        // checks that claim against the allowlist.
+        // The base validation holds the audience and issuer checks. The
+        // middleware sets the expected algorithm again for each request,
+        // from the selected signing key. A templated issuer ({tenantid})
+        // cannot be pinned statically. The middleware resolves it for each
+        // request from the `tid` claim of the token, and checks that claim
+        // against the allowlist.
         let issuer_template = IssuerTemplate::parse(issuer, Vec::new());
         let mut validation = Validation::new(Algorithm::RS256);
         validation.set_audience(&[audience]);
@@ -226,11 +239,13 @@ where
 
     /// Sets the tenant allowlist for a templated (`{tenantid}`) issuer.
     ///
-    /// Required for such an issuer and ignored for a single-tenant one,
-    /// where the issuer is pinned statically. Left unset, the allowlist is
-    /// empty, which **rejects every tenant** — fail closed by construction,
-    /// so forgetting this cannot silently open the deployment to every tenant
-    /// that has consented to a multi-tenant app registration.
+    /// A templated issuer requires this allowlist. A single-tenant issuer
+    /// does not need it, because the code pins that issuer statically. If
+    /// the caller leaves the allowlist unset, the list is empty. An empty
+    /// list **rejects every tenant**, so the function fails closed. A
+    /// caller who forgets this call therefore cannot silently open the
+    /// deployment to every tenant that consented to a multi-tenant app
+    /// registration.
     ///
     /// [`crate::oidc::OidcClient::new`] rejects a templated issuer with an
     /// empty allowlist, so a served app cannot reach the unset state.
@@ -266,12 +281,12 @@ where
     }
 }
 
-/// Extractor for claims validated by [`JwtClaimsMiddleware`].
+/// The extractor for the claims that [`JwtClaimsMiddleware`] validated.
 ///
-/// Unlike `web::ReqData`, which fails extraction with a 500 when the
-/// middleware did not run or no token was presented, this resolves to a
-/// **401 Unauthorized** — anonymous hits on protected routes must not look
-/// like server faults.
+/// `web::ReqData` fails the extraction with a 500 when the middleware did
+/// not run, or when the client sent no token. This extractor returns a
+/// **401 Unauthorized** instead. An anonymous request to a protected route
+/// must not look like a server fault.
 #[derive(Debug)]
 pub struct Validated<C>(pub C);
 
@@ -301,8 +316,9 @@ where
     }
 }
 
-/// The per-worker instantiated middleware produced by
-/// [`JwtClaimsMiddleware::new_transform`]. Not constructed directly.
+/// The middleware service for one worker, which
+/// [`JwtClaimsMiddleware::new_transform`] creates. The code does not build
+/// this type directly.
 pub struct JwtClaimsMiddlewareService<S, C> {
     service: Rc<S>,
     keys: JwksKeys,
@@ -330,54 +346,60 @@ where
         let validation = self.validation.clone();
         let issuer_template = self.issuer_template.clone();
 
-        // Bearer header wins over the auth cookie: a stale/expired browser
-        // session cookie must not shadow an explicitly presented header.
-        // NOTE: these must be separate statements — `cookie()` mutates the
-        // request's extension-based parse cache, which would collide with a
-        // live extensions() borrow held across an array literal.
+        // The bearer header wins over the authentication cookie. A stale or
+        // expired browser session cookie must not hide a header that the
+        // client sent explicitly.
+        // NOTE: the code must keep these as separate statements. `cookie()`
+        // changes the parse cache in the request extensions, which would
+        // conflict with a live `extensions()` borrow that is held across an
+        // array literal.
         let bearer = req.extensions().get::<BearerToken>().cloned().map(|v| v.0);
         let cookie_token = req.cookie(AUTH_COOKIE).map(|c| c.value().to_string());
-        // Which source the CHOSEN token came from, not merely that one was
-        // chosen. Only a stale cookie is worth clearing; a bad `Authorization`
-        // header says nothing about the cookie, and clearing on it would
-        // destroy a working session.
+        // The code records the source of the CHOSEN token. It does not
+        // record only that one token was chosen. Only a stale cookie is
+        // worth clearing. A bad `Authorization` header says nothing about
+        // the cookie, and clearing it would destroy a working session.
         let chosen_from_cookie = bearer.is_none() && cookie_token.is_some();
         let token = bearer.or(cookie_token);
         Box::pin(async move {
-            // An unusable credential is NOT the same as a missing one, and
-            // this middleware is wrapped over the whole /auth scope --
-            // including /auth/login, /auth/callback and /auth/logout, none of
-            // which take a `Validated<C>`. Hard-failing here made the cookie's
-            // own lifetime the lockout: `callback` sets it with a 7-day
-            // max_age while the token's `exp` is provider-controlled and
-            // typically ~1h, so an hour after login every browser request
-            // carried an expired JWT, `/auth/login` 401'd before its handler
-            // ran, and the user could neither re-authenticate nor clear the
-            // cookie.
+            // An unusable credential is NOT the same as a missing one. The
+            // code wraps this middleware over the whole /auth scope. That
+            // scope includes /auth/login, /auth/callback, and /auth/logout.
+            // None of them takes a `Validated<C>`. An earlier version
+            // refused the request here, so the lifetime of the cookie became
+            // the lockout. `callback` sets the cookie with a max_age of 7
+            // days, but the `exp` of the token is set by the provider and is
+            // usually about 1 hour. An hour after the login, every browser
+            // request therefore carried an expired JWT, and `/auth/login`
+            // returned 401 before its handler ran. The user could neither log
+            // in again nor clear the cookie.
             //
-            // So an unusable credential now degrades to anonymous and the
-            // request proceeds. Routes that need a subject still 401, because
-            // `Validated<C>` is what produces that 401 -- not this
-            // middleware. An invalid token is evidence of an expired session,
-            // not a reason to refuse to serve the endpoints whose entire job
-            // is to establish a new one.
+            // Now an unusable credential changes to anonymous, and the
+            // request proceeds. A route that needs a subject still returns
+            // 401, because `Validated<C>` produces that 401, and not this
+            // middleware. An invalid token shows that a session has expired.
+            // It is not a reason to refuse the endpoints whose only task is
+            // to establish a new session.
             //
-            // The precedence above is unaffected: a valid header still wins,
-            // and a stale cookie still cannot shadow it.
+            // The precedence above is unchanged. A valid header still wins,
+            // and a stale cookie still cannot hide it.
             let mut unusable: Option<String> = None;
 
             if let Some(token) = token {
-                // `Ok` inserts the claims. `Err((reason, true))` is a security decision
-                // and stays a hard 401 -- see the line table below. `Err((reason, false))` is an
-                // unusable *session* and degrades to anonymous below.
+                // `Ok` inserts the claims. `Err((reason, true))` is a
+                // security decision and stays a hard 401, as the line table
+                // below shows. `Err((reason, false))` is an unusable
+                // *session*, and it changes to anonymous below.
                 //
-                // The distinction is load-bearing. A token from a tenant the
-                // allowlist rejects is an attack, and Blocker 1's whole point
-                // is that it fails CLOSED -- so it must not quietly become "no
-                // credential", which would serve every unauthenticated route
-                // with a forged token in hand. An expired `exp` is the opposite:
-                // it is a browser replaying its own dead cookie, and refusing it
-                // locks the user out of the very endpoints that would fix it.
+                // The difference matters. A token from a tenant that the
+                // allowlist rejects is an attack, and Blocker 1 exists so
+                // that it fails CLOSED. Therefore the code must not quietly
+                // treat it as "no credential", because that state would
+                // serve every unauthenticated route with a forged token in
+                // hand. An expired `exp` is the opposite case. It is a
+                // browser that replays its own dead cookie, and refusing it
+                // locks the user out of the very endpoints that would fix
+                // it.
                 let claims = async {
                     let header = jsonwebtoken::decode_header(&token)
                         .map_err(|e| (format!("undecodable header: {e}"), true))?;
@@ -387,19 +409,21 @@ where
                         .await
                         .ok_or_else(|| ("no signing key matches kid".to_string(), true))?;
 
-                    // Pin validation to the selected key's own algorithm so a
-                    // token cannot downgrade to an unexpected algorithm. For
-                    // multi-tenant providers, derive the exact expected issuer
-                    // from the token's tid claim first.
+                    // The code pins the validation to the algorithm of the
+                    // selected key, so a token cannot change to an unexpected
+                    // algorithm. For a multi-tenant provider, the code derives
+                    // the exact expected issuer from the `tid` claim of the
+                    // token first.
                     let mut validation = validation.clone();
                     validation.algorithms = vec![signing_key.algorithm];
                     if let Some(template) = &issuer_template {
                         let tenant_id = extract_unverified_claim(&token, "tid")
                             .filter(|t| !t.is_empty())
                             .ok_or_else(|| ("token has no tenant identifier".to_string(), true))?;
-                        // The issuer is derived from the token's own `tid`, so
-                        // resolving it proves nothing on its own. This check is
-                        // the tenant gate and it fails closed.
+                        // The issuer comes from the `tid` claim of the token
+                        // itself, so resolving the template proves nothing on
+                        // its own. This check is the tenant gate, and it fails
+                        // closed.
                         let expected = template
                             .resolve_checked(&tenant_id)
                             .map_err(|cause| (cause, true))?;
@@ -417,8 +441,8 @@ where
                         req.extensions_mut().insert(claims);
                     }
                     Err((reason, hard)) if hard => {
-                        // Fail closed: a token the tenant gate rejects never
-                        // reaches a handler.
+                        // Fail closed. A token that the tenant gate rejects
+                        // never reaches a handler.
                         return Err(ApiError::InvalidCredentials(reason.into()).into());
                     }
                     Err((reason, _)) => {
@@ -434,26 +458,28 @@ where
 
             let mut resp = svc.call(req).await?;
 
-            // Clear the stale cookie on the way out, so the browser stops
-            // replaying an expired JWT until the next successful login.
+            // Clear the stale cookie on the way out, so the browser
+            // stops replaying an expired JWT until the next successful login.
             //
-            // Both conditions below are load-bearing.
+            // Both conditions below matter.
             //
-            // Only when the CHOSEN credential was the cookie: a request whose
-            // token came from an `Authorization` header has told us nothing
-            // about the cookie, and clearing it would delete a working session
-            // the client never asked us to touch.
+            // The code clears the cookie only when the CHOSEN credential was
+            // the cookie. A request whose token came from an `Authorization`
+            // header has told the server nothing about the cookie, and
+            // clearing it would delete a working session that the client
+            // never asked the server to touch.
             //
-            // And never when the handler has already SET `auth_token`. This
-            // middleware wraps `/auth/callback`, which sets a fresh session
-            // cookie with `max_age` 7 days. Appending our own
+            // The code never clears the cookie when the handler has already
+            // SET `auth_token`. This middleware wraps `/auth/callback`, which
+            // sets a new session cookie with a `max_age` of 7 days. Appending
             // `auth_token=; Max-Age=0` after it puts two `Set-Cookie` headers
-            // with the same (name, domain, path) on one response, and browsers
-            // apply them in order with the LAST write winning -- so the callback
-            // would complete having DELETED the session it had just established.
-            // The user would see a 200 and a token, and be anonymous on the
-            // next request: the exact lockout this change exists to remove,
-            // reached through the endpoint meant to cure it.
+            // with the same (name, domain, path) on one response. Browsers
+            // apply them in order, and the LAST write wins. Therefore the
+            // callback would complete after it DELETED the session that it
+            // had just established. The user would see a 200 and a token, and
+            // would be anonymous on the next request. That is exactly the
+            // lockout that this change removes, reached through the endpoint
+            // that is meant to cure it.
             let clears_session = unusable.is_some() && chosen_from_cookie;
             let handler_set_session = resp.headers().get_all(SET_COOKIE).any(|value| {
                 value.to_str().is_ok_and(|v| {
@@ -481,7 +507,7 @@ mod tests {
     use serde_json::json;
 
     #[tokio::test]
-    async fn loads_keys_and_decodes_token() -> anyhow::Result<()> {
+    async fn loads_keys_and_decodes_a_token() -> anyhow::Result<()> {
         let (key_a, enc_a) = rsa_key("kid-a")?;
         let server = spawn_jwks(json!({ "keys": [key_a] })).await;
 
@@ -516,7 +542,7 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn validated_extractor_resolves_inserted_claims() {
+    async fn validated_extractor_reads_the_inserted_claims() {
         use actix_web::test::TestRequest;
 
         let (req, mut payload) = TestRequest::default().to_http_parts();
@@ -525,11 +551,11 @@ mod tests {
         let extracted = Validated::<Claims>::from_request(&req, &mut payload)
             .await
             .expect("claims present");
-        assert_eq!(extracted.sub, "u1"); // Deref to the inner claims
+        assert_eq!(extracted.sub, "u1"); // The extractor reads the inner claims.
     }
 
     #[actix_web::test]
-    async fn validated_extractor_is_unauthorized_when_missing() {
+    async fn validated_extractor_returns_401_when_claims_are_missing() {
         use actix_web::test::TestRequest;
 
         let (req, mut payload) = TestRequest::default().to_http_parts();
@@ -539,7 +565,7 @@ mod tests {
     }
 
     #[test]
-    fn issuer_template_parses_and_resolves() {
+    fn issuer_template_parses_a_template_and_resolves_it() {
         let tpl = IssuerTemplate::parse(
             "https://login.test/{tenantid}/v2.0",
             vec!["abc-123".to_string()],
@@ -549,9 +575,9 @@ mod tests {
         assert!(IssuerTemplate::parse("https://plain.test/v2.0", Vec::new()).is_none());
     }
 
-    /// The allowlist is the only real gate on a templated issuer: the
-    /// expected issuer is derived from the token's own `tid`, and `aud` is
-    /// the shared client ID, so neither can distinguish tenants.
+    /// The allowlist is the only real gate on a templated issuer. The expected
+    /// issuer comes from the `tid` claim of the token, and `aud` is the
+    /// shared client ID. Neither value can tell one tenant from another.
     #[test]
     fn templated_issuer_rejects_a_tenant_outside_the_allowlist() {
         let tpl = IssuerTemplate::parse(
@@ -573,8 +599,9 @@ mod tests {
         );
     }
 
-    /// Fail closed: an unset allowlist accepts nobody, so forgetting to
-    /// configure one cannot open the deployment to every consenting tenant.
+    /// Fail closed. An unset allowlist accepts nobody, so a caller who forgets
+    /// to configure one cannot open the deployment to every consenting
+    /// tenant.
     #[test]
     fn templated_issuer_with_no_allowlist_rejects_every_tenant() {
         let tpl = IssuerTemplate::parse("https://login.test/{tenantid}/v2.0", Vec::new())
@@ -620,7 +647,7 @@ mod tests {
             )
         };
 
-        // Matching tid/iss pair resolves through the template.
+        // A matching tid and iss pair resolves through the template.
         let good = sign_for(
             format!("{}/{}/v2.0", server.uri(), tenant_guid),
             tenant_guid,
@@ -635,8 +662,8 @@ mod tests {
         .await;
         assert_eq!(res.status(), 200);
 
-        // tid pointing at another tenant while iss names ours must bind them
-        // together and fail.
+        // The tid claim points at another tenant while iss names the
+        // first tenant. The code must bind them together and fail.
         let forged = sign_for(
             format!("{}/{}/v2.0", server.uri(), tenant_guid),
             "99999999-9999-9999-9999-999999999999",
@@ -686,43 +713,44 @@ mod tests {
     ///     let cookie_token = req.cookie(AUTH_COOKIE).map(|c| c.value().to_string());
     ///     let token = bearer.or(cookie_token);
     ///
-    /// and before this test NOTHING in the crate exercised it. Every
+    /// Before this test, NOTHING in the crate exercised that rule. Every
     /// request in the suite authenticates with
-    /// `insert_header(("Cookie", format!("auth_token={token}")))`; a
-    /// crate-wide grep for `Authorization` finds it only in `cors()`'s
-    /// `allowed_headers` and in `extract_bearer_token`. So `BearerToken`
-    /// was never in extensions, `bearer` was always `None`, and the
-    /// `.or()` was dead code as far as the suite was concerned.
+    /// `insert_header(("Cookie", format!("auth_token={token}")))`. A
+    /// crate-wide search for `Authorization` finds it only in the
+    /// `allowed_headers` of `cors()` and in `extract_bearer_token`.
+    /// Therefore `BearerToken` was never in the extensions, `bearer` was
+    /// always `None`, and the `.or()` was dead code as far as the suite was
+    /// concerned.
     ///
-    /// Reverting to the pre-fix `cookie_token.or(bearer)` therefore fails
-    /// ZERO tests -- verified by flipping it: a client presenting a valid
-    /// fresh header alongside a stale cookie is then authenticated as the
-    /// COOKIE's subject, which is the wrong user entirely. That is not a
-    /// nuisance: the header is what an API client sends and the cookie is
-    /// what a browser session leaves behind, so the stale one wins for
-    /// exactly the case the fix was made for.
+    /// Therefore going back to the pre-fix `cookie_token.or(bearer)` fails
+    /// ZERO tests, and the author confirmed this by making the change. A
+    /// client that presents a valid fresh header next to a stale cookie
+    /// then authenticates as the subject of the COOKIE, which is the wrong
+    /// user entirely. That is not a nuisance. The header is what an API
+    /// client sends, and the cookie is what a browser session leaves behind,
+    /// so the stale one wins in exactly the case that the fix addresses.
     ///
-    /// Both mechanisms are given a DIFFERENT subject, so the test pins
-    /// which one was used rather than merely that the request
-    /// authenticated. The cookie-only request at the end is what makes it
-    /// an ordering assertion rather than "bearer works": without it,
-    /// `bearer.or(cookie)` and a hypothetical "bearer only" would both
-    /// pass.
+    /// The test gives both mechanisms a DIFFERENT subject, so the test pins
+    /// which mechanism was used. The test does more than check that the
+    /// request authenticated. The cookie-only request at the end makes it an
+    /// ordering assertion instead of a "bearer works" assertion. Without
+    /// that request, `bearer.or(cookie)` and a hypothetical "bearer only"
+    /// would both pass.
     ///
-    /// `BearerTokenMiddleware` is wrapped here for the same reason. It is
-    /// what puts `BearerToken` into extensions in the first place, and it
-    /// had no test at all -- only the pure `parse_bearer_token` string
-    /// parser was covered, leaving the whole
-    /// middleware -> extensions -> JWT handoff unexercised.
+    /// The test wraps `BearerTokenMiddleware` for the same reason. That
+    /// middleware puts `BearerToken` into the extensions, and it had no test
+    /// at all. Only the pure `parse_bearer_token` string parser had a test.
+    /// The step from middleware to extensions to JWT therefore had no test.
     ///
-    /// The wrap order matters and is the reverse of how it reads: actix
-    /// applies the LAST `.wrap` outermost, so `BearerTokenMiddleware` is
-    /// listed after the validator to run BEFORE it. Written the other way
-    /// round the extractor never sees the request -- which is exactly the
-    /// mistake this test caught while being written, and the reason the
-    /// ordering is called out rather than left to be discovered again.
+    /// The wrap order matters, and it is the reverse of the order that it
+    /// reads. actix applies the LAST `.wrap` as the outermost one, so the
+    /// code lists `BearerTokenMiddleware` after the validator to make it run
+    /// BEFORE the validator. In the other order the extractor never sees the
+    /// request. That is exactly the mistake that this test found while
+    /// someone was writing it, and it is why the code names the order here
+    /// instead of leaving the next reader to discover it again.
     #[actix_web::test]
-    async fn a_bearer_header_outranks_a_stale_cookie() -> anyhow::Result<()> {
+    async fn a_bearer_header_wins_over_a_stale_cookie() -> anyhow::Result<()> {
         use super::super::bearer_token::BearerTokenMiddleware;
         use actix_web::{App, HttpResponse, test};
 
@@ -736,8 +764,9 @@ mod tests {
         )
         .await?;
 
-        // The handler reports the subject the middleware actually resolved,
-        // so the assertion is about authentication rather than about status.
+        // The handler returns the subject that the middleware actually
+        // resolved, so the assertion checks the authentication rather than
+        // the status code.
         async fn whoami(claims: Validated<TestClaims>) -> HttpResponse {
             HttpResponse::Ok().body(claims.sub.clone())
         }
@@ -760,7 +789,8 @@ mod tests {
         let bearer_token = token_for("bearer-user")?;
         let cookie_token = token_for("cookie-user")?;
 
-        // Both present, different subjects: the header must win.
+        // Both credentials are present, and the subjects differ, so the
+        // header must win.
         let res = test::call_service(
             &svc,
             test::TestRequest::get()
@@ -781,8 +811,8 @@ mod tests {
              presented Authorization header"
         );
 
-        // The cookie path still works, so the test pins the ORDER rather
-        // than "bearer is the only thing accepted".
+        // The cookie path still works, so the test pins the ORDER instead
+        // of only checking that the bearer token is the accepted value.
         let res = test::call_service(
             &svc,
             test::TestRequest::get()
@@ -799,11 +829,12 @@ mod tests {
              authenticate from its cookie"
         );
 
-        // ...and an unparseable header does not silently fall through to
-        // the cookie. The extractor is permissive by design and leaves the
-        // accept/reject decision to the validator, so with a malformed
-        // header present there is no token in extensions AND no cookie to
-        // fall back to: the request must be a 401, not a cookie session.
+        // ...and a header that the extractor cannot parse does not
+        // silently fall through to the cookie. The extractor is permissive
+        // by design, and it leaves the accept or reject decision to the
+        // validator. So with a malformed header there is no token in the
+        // extensions AND no cookie to use as a fallback. The request must
+        // return 401, and it must not become a cookie session.
         let res = test::call_service(
             &svc,
             test::TestRequest::get()
@@ -821,21 +852,24 @@ mod tests {
 
         Ok(())
     }
-    /// Regression for the lockout: an unusable credential must degrade to
-    /// anonymous rather than 401, or the cookie becomes the lockout.
+    /// Regression test for the lockout. An unusable credential must change to
+    /// anonymous instead of returning 401, or the cookie becomes the cause
+    /// of the lockout.
     ///
-    /// `callback` sets `auth_token` with a 7-day `max_age` while the token's own
-    /// `exp` is provider-controlled and typically ~1h. So an hour after login a
-    /// browser sends an expired JWT on *every* request, and because this middleware
-    /// is wrapped over the whole `/auth` scope — including `/auth/login`,
-    /// `/auth/callback` and `/auth/logout`, none of which take a `Validated<C>` —
-    /// a hard 401 there meant the user could neither re-authenticate nor clear the
-    /// cookie. Recovery required deleting cookies by hand.
+    /// `callback` sets `auth_token` with a 7-day `max_age` while the `exp`
+    /// of the token is set by the provider and is typically ~1h. An hour
+    /// after the login, a browser sends an expired JWT on *every* request.
+    /// The code wraps this middleware over the whole `/auth` scope. That
+    /// scope includes `/auth/login`, `/auth/callback` and `/auth/logout`,
+    /// and none of them takes a `Validated<C>`. A hard 401 there meant that
+    /// the user could neither log in again nor clear the cookie. The user
+    /// had to delete the cookies by hand.
     ///
-    /// The degraded request reaches a handler that needs no subject, and carries a
-    /// `Set-Cookie` that clears the dead cookie so the browser stops replaying it.
+    /// The degraded request reaches a handler that needs no subject, and it
+    /// carries a `Set-Cookie` that clears the dead cookie, so the browser
+    /// stops replaying it.
     #[tokio::test]
-    async fn an_expired_cookie_does_not_lock_out_the_public_auth_routes() -> anyhow::Result<()> {
+    async fn an_expired_cookie_does_not_block_the_public_auth_routes() -> anyhow::Result<()> {
         let (key, enc) = rsa_key("kid-t")?;
         let server = spawn_jwks(json!({ "keys": [key] })).await;
 
@@ -856,8 +890,9 @@ mod tests {
         )
         .await;
 
-        // exp in the past, but signed by the key the middleware trusts, so this is
-        // an EXPIRED SESSION rather than a forged token.
+        // The exp claim is in the past, but the provider signed the token
+        // with a key that the middleware trusts. Therefore this is an
+        // EXPIRED SESSION rather than a forged token.
         let expired = sign_rs256(
             &json!({
                 "sub": "u9",
@@ -886,7 +921,8 @@ mod tests {
             "an expired session cookie must not 401 the route that re-authenticates"
         );
 
-        // And the dead cookie is cleared, so the browser stops replaying it.
+        // The response also clears the dead cookie, so the browser stops
+        // replaying it.
         let cleared = res
             .headers()
             .get(actix_web::http::header::SET_COOKIE)
@@ -901,12 +937,12 @@ mod tests {
         Ok(())
     }
 
-    /// The degradation is scoped to an expired SESSION. A forged tenant binding is
-    /// an attack, and Blocker 1 exists so it fails CLOSED — it must not become
-    /// "no credential", which would serve unauthenticated routes with a forged
-    /// token in hand.
+    /// The degradation applies only to an expired SESSION. A forged tenant
+    /// binding is an attack, and Blocker 1 exists so that it fails CLOSED.
+    /// It must not become "no credential", which would serve the
+    /// unauthenticated routes with a forged token in hand.
     #[tokio::test]
-    async fn a_forged_tenant_still_fails_closed_rather_than_degrading() -> anyhow::Result<()> {
+    async fn a_forged_tenant_still_fails_closed_and_does_not_degrade() -> anyhow::Result<()> {
         let (key, enc) = rsa_key("kid-t")?;
         let server = spawn_jwks(json!({ "keys": [key] })).await;
 
@@ -952,20 +988,24 @@ mod tests {
         Ok(())
     }
 
-    /// Regression for the BLOCKER the second review caught: the cookie-clear
-    /// must not destroy the session cookie `/auth/callback` just SET.
+    /// Regression test for the BLOCKER that the second review found: the
+    /// cookie clear must not destroy the session cookie that
+    /// `/auth/callback` has just SET.
     ///
-    /// `/auth/callback` sets `auth_token=<fresh>; Max-Age=7d`. This middleware
-    /// wants to clear the stale cookie it found on the request. Both end up as
-    /// `Set-Cookie` on one response with the same (name, domain, path)
-    /// identity; browsers apply them in order and the LAST write wins, so an
-    /// appended `auth_token=; Max-Age=0` left the callback having deleted the
-    /// session it had just established. The user saw a 200 and a token, and was
-    /// anonymous on the next request -- the exact lockout the degradation exists
-    /// to remove, reached through the endpoint meant to cure it.
+    /// `/auth/callback` sets `auth_token=<fresh>; Max-Age=7d`. This
+    /// middleware wants to clear the stale cookie that it found on the
+    /// request. Both become `Set-Cookie` headers on one response with the same
+    /// (name, domain, path) identity. Browsers apply them in order, and
+    /// the LAST write wins. Therefore an appended `auth_token=; Max-Age=0`
+    /// left the callback having deleted the session that it had just
+    /// established. The user saw a 200 and a token, and was anonymous on
+    /// the next request. That is exactly the lockout that the degradation
+    /// exists to remove, reached through the endpoint that is meant to cure
+    /// it.
     ///
-    /// A top-level GET redirect carries cookies (`SameSite=Lax` allows it), so a
-    /// stale cookie really does arrive on a callback, not only in theory.
+    /// A redirect on a top-level GET carries cookies (`SameSite=Lax` allows
+    /// it), so a stale cookie really does arrive on a callback, and not
+    /// only in theory.
     #[tokio::test]
     async fn a_fresh_session_cookie_survives_the_middleware_cookie_clear() -> anyhow::Result<()> {
         use actix_web::{HttpResponse, cookie::Cookie};
@@ -981,8 +1021,8 @@ mod tests {
         .await?
         .with_allowed_tenants(vec!["tenant-guid".to_string()]);
 
-        // Stands in for the callback: the same shape, a handler that SETS the
-        // session cookie on its way out.
+        // Stands in for the callback: the same shape, a handler that SETS
+        // the session cookie on its way out.
         let svc = actix_web::test::init_service(actix_web::App::new().wrap(mw).service(
             actix_web::web::resource("/auth/callback").to(|| async {
                 HttpResponse::Ok()
@@ -1052,10 +1092,10 @@ mod tests {
     /// A bad `Authorization` header says nothing about the cookie, so it must
     /// not delete a working one.
     ///
-    /// `bearer.or(cookie_token)` means the expired header is the token that gets
-    /// classified while the valid cookie sits untouched on the request.
-    /// Clearing on that basis logs the client out of a session it never asked us
-    /// to end.
+    /// `bearer.or(cookie_token)` means that the expired header is the token
+    /// that gets classified, while the valid cookie stays untouched on the
+    /// request. Clearing it on that basis signs the client out of a session
+    /// that it never asked the server to end.
     #[tokio::test]
     async fn an_expired_bearer_header_does_not_clear_a_valid_cookie() -> anyhow::Result<()> {
         let (key, enc) = rsa_key("kid-t")?;
@@ -1072,7 +1112,7 @@ mod tests {
         let svc = actix_web::test::init_service(
             actix_web::App::new()
                 // Needed so the Authorization header becomes the BearerToken
-                // extension the precedence rule actually reads.
+                // extension that the precedence rule actually reads.
                 .wrap(mw)
                 .wrap(crate::http::middleware::bearer_token::BearerTokenMiddleware)
                 .service(actix_web::web::resource("/protected").to(|| async { "ok" })),

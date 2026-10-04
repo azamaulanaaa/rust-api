@@ -1,19 +1,24 @@
-//! Error type for the FS module, mapped to the uniform `{"error":...}` envelope.
+//! Error type for the FS module. Every error maps to the uniform
+//! `{"error":...}` envelope.
 //!
-//! # `Display` is not the client-facing message
+//! # `Display` is not the client message
 //!
-//! [`ApiError`](crate::http::error::ApiError)'s `#[error]` text *is* the
-//! response body, and no variant of it carries a `String` so that cannot
-//! leak. This type is the other way round: the 4xx variants hold
-//! request-derived detail (a filename, a key, a size) and their `Display` is
-//! that detail, which is for logs only. The wire gets a fixed string per
-//! status instead.
+//! The `#[error]` text of [`ApiError`](crate::http::error::ApiError) *is*
+//! the response body.
+//! No variant of that type carries a `String`, so that text cannot leak.
+//! `FsError` works the other way round.
+//! Its 4xx variants hold request detail such as a filename, a key, or a
+//! size.
+//! Their `Display` is that detail, and the detail is for logs only.
+//! The wire receives a fixed string for each status instead.
 //!
-//! The two contracts are opposites for the same trait method, which is worth
-//! stating at both types: reaching for `to_string()` when building a response
-//! from an `FsError` sends user input to the client. Both render through
+//! The two types use the same trait method in opposite ways.
+//! This fact matters for both types.
+//! If you call `to_string()` when you build a response from an `FsError`,
+//! you send user input to the client.
+//! Both types render through
 //! [`ApiError::envelope`](crate::http::error::ApiError), so the body is
-//! `ErrorBody` either way.
+//! `ErrorBody` in both cases.
 
 use actix_web::{HttpResponse, ResponseError, http::StatusCode};
 use thiserror::Error;
@@ -21,57 +26,68 @@ use thiserror::Error;
 /// Errors raised by the FS engine and routes.
 #[derive(Debug, Error)]
 pub enum FsError {
-    /// Validation failure - 400.
+    /// Validation failure. The status is 400.
     #[error("{0}")]
     BadRequest(String),
-    /// Request body exceeds the declared part size - 413.
+    /// The request body is larger than the declared part size. The status
+    /// is 413.
     #[error("payload too large")]
     PayloadTooLarge,
-    /// Caller lacks permission - 403.
+    /// The caller does not have permission. The status is 403.
     #[error("forbidden")]
     Forbidden,
-    /// Resource not found - 404.
+    /// The resource does not exist. The status is 404.
     #[error("{0}")]
     NotFound(String),
-    /// S3 or store failure - 500. The inner detail is logged server-side
-    /// only and never rendered to clients (see `error_response`).
+    /// S3 or store failure. The status is 500. The engine logs the inner
+    /// detail on the server side only. The engine never renders it to
+    /// clients (see `error_response`).
     #[error("internal server error")]
     Internal(String),
-    /// Oxkv store error - 500. Same sanitization contract as `Internal`.
+    /// Oxkv store error. The status is 500. This variant uses the same
+    /// sanitization contract as `Internal`.
     #[error("internal server error")]
     Store(String),
-    /// A cost limit refused the request - 429.
+    /// A cost limit refused the request. The status is 429.
     ///
-    /// Raised when no concurrency slot was free for a replica download. A
-    /// request *rate* limit would not catch the shape that matters here: a
-    /// client allowed a hundred reads a minute can still have a hundred
-    /// multi-hundred-megabyte segments in flight at once.
+    /// The engine raises this error when no concurrency slot was free for
+    /// a replica download.
+    /// A request *rate* limit does not catch the case that matters here.
+    /// A client can be allowed a hundred reads a minute and still have a
+    /// hundred segments of several hundred megabytes in flight at once.
     #[error("too many requests")]
     TooManyRequests,
 
-    /// The store's epoch was lost to another writer - 500.    ///
-    /// Split out from [`Store`](Self::Store) because it is *actionable*:
-    /// `oxkv` documents `StoreError::Fenced` as terminal ("the current
-    /// process must stop writing and restart via `ownership.json` CAS"),
-    /// and a caller that can recover from losing a fencing race — such as
-    /// adopting a concurrent builder's coverage instead of failing — has to
-    /// be able to recognise the condition.
+    /// The store lost its epoch to another writer. The status is 500.
     ///
-    /// It used to detect that by searching the flattened detail for the
-    /// substring `"fenced"`, which silently degraded to a 500 for every
-    /// client if `oxkv` ever reworded the message. Same sanitization
-    /// contract as `Store`: the reason is logged, never sent.
+    /// This variant is separate from [`Store`](Self::Store) because the
+    /// condition is *actionable*.
+    /// `oxkv` documents `StoreError::Fenced` as terminal.
+    /// The quote in that documentation is "the current process must stop
+    /// writing and restart via `ownership.json` CAS".
+    /// A caller that can recover from a lost fencing race must be able to
+    /// recognise the condition.
+    /// Such a caller may adopt the coverage of a concurrent builder
+    /// instead of failing.
+    ///
+    /// The code used to detect this condition by searching the flattened
+    /// detail for the substring `"fenced"`.
+    /// If `oxkv` ever reworded the message, every client would get a 500
+    /// without any report.
+    /// The sanitization contract is the same as for `Store`.
+    /// The engine logs the reason and never sends it.
     #[error("internal server error")]
     Fenced(String),
 }
 
 impl From<oxkv::StoreError> for FsError {
-    /// The single place an `oxkv` error is classified.
+    /// The only place that classifies an `oxkv` error.
     ///
-    /// Every conversion into `FsError` must go through here — including
-    /// the `store_err` helpers in `fs::store` and `sync::snapshot` — or a
-    /// fencing loss gets flattened into [`Store`](Self::Store) and becomes
-    /// undetectable again.
+    /// Every conversion into `FsError` must go through here.
+    /// The `store_err` helpers in `fs::store` and `sync::snapshot` are
+    /// part of this rule.
+    /// Without this rule, a fencing loss becomes [`Store`](Self::Store)
+    /// and stays undetectable.
     fn from(e: oxkv::StoreError) -> Self {
         match e {
             oxkv::StoreError::Fenced(reason) => Self::Fenced(reason),
@@ -81,19 +97,22 @@ impl From<oxkv::StoreError> for FsError {
 }
 
 impl FsError {
-    /// True when this is a lost epoch, i.e. another writer took the prefix.
+    /// True when the store lost its epoch, which means that another writer
+    /// took the prefix.
     ///
-    /// The detection point for recoverable fencing races. Distinct from a
-    /// generic store failure: a fencing loss can be raced and retried,
-    /// while a corrupt or missing store cannot.
+    /// Use this method to detect a recoverable fencing race.
+    /// A fencing loss is not a normal store failure.
+    /// A caller can retry a fencing loss, but a corrupt or missing store
+    /// cannot be retried.
     pub fn is_fencing_loss(&self) -> bool {
         matches!(self, Self::Fenced(_))
     }
 
-    /// The store's own reason for a failure, for server-side logs.
+    /// The reason for the failure, for server-side logs.
     ///
-    /// Never rendered to a client: every variant's `Display` is the fixed
-    /// sanitized text, and only this reaches an operator.
+    /// The engine never renders this reason to a client.
+    /// Each variant has fixed sanitized text in `Display`.
+    /// Only this reason reaches an operator.
     pub fn detail(&self) -> &str {
         match self {
             Self::BadRequest(d)
@@ -105,11 +124,13 @@ impl FsError {
         }
     }
 
-    /// Stable client-facing message: never carries request input.
+    /// The fixed message for the client. This message never carries
+    /// request input.
     ///
-    /// The inner detail stays in `Display` for server-side logs; the
-    /// wire body only gets this fixed string, so filenames, keys, and
-    /// sizes from the request can never reflect back to clients.
+    /// The inner detail stays in `Display` for server-side logs.
+    /// The wire body receives this fixed string only.
+    /// A filename, a key, or a size from the request can never reach a
+    /// client.
     fn client_message(&self) -> &'static str {
         match self {
             Self::BadRequest(_) => "bad request",
@@ -137,13 +158,16 @@ impl ResponseError for FsError {
     }
 
     fn error_response(&self) -> HttpResponse {
-        // Internal/store causes carry sensitive detail (S3 errors, store
-        // paths): log them here so call sites can't forget, never
-        // serialize them — the body only carries the stable Display text.
+        // Internal and store causes carry sensitive detail, such as S3
+        // errors and store paths.
+        // The engine logs them here so that a call site does not forget.
+        // The engine never serializes them.
+        // The body carries only the stable Display text.
         match self {
-            // A lost epoch is not a transient blip: every subsequent write
-            // on this handle will fail the same way. `error` so it stands
-            // out in a log tail and is not lost among store warnings.
+            // A lost epoch is not a transient failure.
+            // Every later write on this handle fails in the same way.
+            // The engine logs at `error` level, so the event stands out in
+            // a log tail and does not disappear among store warnings.
             Self::Fenced(detail) => {
                 tracing::error!(
                     "fs error {}: store epoch lost to another writer ({detail}); \
@@ -162,11 +186,13 @@ impl ResponseError for FsError {
             }
             Self::Forbidden => {}
         }
-        // Rendered through `ApiError` so the served body is literally the
-        // `ErrorBody` the OpenAPI document names, not a hand-built value
-        // that happens to have the same shape. This type exists because the
-        // FS engine's errors are richer than the API's, not because the
-        // envelope needed a second implementation.
+        // This code renders through `ApiError`, so the served body is the
+        // `ErrorBody` that the OpenAPI document names.
+        // The code does not build a value that only has the same shape.
+        // This type exists because the errors of the FS engine carry more
+        // detail than the errors of the API.
+        // The type does not exist because the envelope needed a second
+        // implementation.
         crate::http::error::ApiError::envelope(self.status_code(), self.client_message())
     }
 }
@@ -176,7 +202,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn internal_detail_never_reaches_clients() {
+    fn display_of_internal_variants_hides_the_detail() {
         let err = FsError::Internal("secret bucket DSN".to_string());
         assert_eq!(err.to_string(), "internal server error");
         let store = FsError::Store("raw oxkv dump".to_string());
@@ -185,8 +211,8 @@ mod tests {
         assert_eq!(fenced.to_string(), "internal server error");
     }
 
-    /// `From<oxkv::StoreError>` is the only place fencing is classified, so
-    /// the split has to hold for every other oxkv error too.
+    /// `From<oxkv::StoreError>` is the only place that classifies fencing.
+    /// The split must also hold for every other oxkv error.
     #[test]
     fn oxkv_fencing_is_classified_and_others_are_not() {
         assert!(FsError::from(oxkv::StoreError::Fenced("epoch 2".into())).is_fencing_loss());
@@ -204,27 +230,30 @@ mod tests {
         }
     }
 
-    /// `/fs` and `/sync` bodies are the documented `ErrorBody`, not a value
-    /// that merely resembles it.
+    /// `/fs` and `/sync` bodies are the documented `ErrorBody`, and not a
+    /// value that only looks like it.
     ///
-    /// The OpenAPI document names `ErrorBody` for this crate's errors, and
-    /// `FsError` used to build its body with a bare `json!` macro -- so the
-    /// served shape for every `/fs` and `/sync` failure was an anonymous
-    /// value that matched the schema only by convention, in a second
+    /// The OpenAPI document names `ErrorBody` for the errors of this crate.
+    /// `FsError` used to build its body with a bare `json!` macro.
+    /// The served shape for every `/fs` and `/sync` failure was then an
+    /// anonymous value.
+    /// That value matched the schema only by convention, in a second
     /// `ResponseError` impl that could drift from the first.
     ///
-    /// What this checks is the contract half: every variant renders a body
-    /// that deserializes as `ErrorBody` and carries the sanitized message.
-    /// It deliberately does *not* claim to detect the duplication -- a
-    /// hand-built `json!` with the same keys serializes to the same bytes,
-    /// which is exactly why the duplication was invisible. That is
-    /// `http::error::tests::the_envelope_has_one_construction_site`.
+    /// This test checks the contract half.
+    /// Every variant must render a body that deserializes as `ErrorBody`
+    /// and carries the sanitized message.
+    /// The test does not detect the duplication.
+    /// A hand-built `json!` with the same keys serializes to the same
+    /// bytes, which is why the duplication was invisible.
+    /// The test `http::error::tests::the_envelope_has_one_construction_site`
+    /// checks that.
     ///
-    /// The expected message is `client_message()` and not `Display`, which is
-    /// the opposite of `ApiError`, where `#[error]` *is* the body. `FsError`
-    /// keeps request-derived text in its variants and out of the wire, so the
-    /// two types have opposite contracts for the same trait method and a
-    /// refactor that confuses them leaks input.
+    /// The expected message is `client_message()` and not `Display`.
+    /// `ApiError` does the opposite, because there `#[error]` *is* the body.
+    /// `FsError` keeps request text in its variants and out of the wire.
+    /// The two types use the same trait method in opposite ways, so a
+    /// refactor that mixes them leaks input.
     #[actix_web::test]
     async fn fs_and_api_errors_render_one_envelope() {
         use crate::http::error::{ApiError, ErrorBody};
@@ -254,8 +283,8 @@ mod tests {
             );
         }
 
-        // And the two types agree wherever their statuses overlap, despite
-        // the opposite `Display` contracts.
+        // The two types agree on every status that both of them use.
+        // Their `Display` contracts are opposite.
         for (api, expected) in [
             (ApiError::Forbidden, "forbidden"),
             (ApiError::Internal("dsn".into()), "internal server error"),
@@ -292,8 +321,8 @@ mod tests {
 
     #[actix_web::test]
     async fn client_errors_never_echo_request_input() {
-        // Each body carries attacker-controlled input in its detail;
-        // the wire must only see the stable per-status message.
+        // Each body carries attacker-controlled input in its detail.
+        // The wire must receive only the fixed message for the status.
         for (err, status, message) in [
             (
                 FsError::BadRequest("blob size mismatch: got <script>alert(1)</script>".into()),

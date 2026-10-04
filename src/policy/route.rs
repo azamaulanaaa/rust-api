@@ -1,9 +1,9 @@
 //! Actix routes for `/policy` rule and group management.
 //!
-//! Every handler is self-authorizing: it first requires the caller to hold
+//! Every handler authorizes itself. It first requires the caller to hold
 //! Casbin permission on the [`Resource`](crate::policy::route::Resource) it
-//! touches (`rules` for rule endpoints, `user_groups` for membership and
-//! listing endpoints), so a merely valid token is not enough.
+//! touches. Rule endpoints use `rules`. Membership and listing endpoints
+//! use `user_groups`. A valid token alone is therefore not enough.
 
 use std::sync::Arc;
 
@@ -17,16 +17,16 @@ use crate::http::{
     middleware::jwt::{Claims, JwtClaimsMiddleware, Validated},
 };
 
-/// API module exposing `/policy` management routes (rules and group
-/// membership), protected by JWT validation and self-authorizing checks.
+/// API module exposing the `/policy` management routes for rules and group
+/// membership. The module uses JWT validation and a self-authorizing check.
 pub struct PolicyApiModule {
     policy_engine: Arc<PolicyEngine>,
     jwt_middleware: JwtClaimsMiddleware<Claims>,
 }
 
 impl PolicyApiModule {
-    /// Wraps a [`PolicyEngine`] with the given JWT middleware; every route
-    /// in this module requires validated claims before enforcing policies.
+    /// Wraps a [`PolicyEngine`] with the given JWT middleware. Every route
+    /// in this module requires validated claims before it enforces policies.
     pub fn new(policy_engine: PolicyEngine, jwt_middleware: JwtClaimsMiddleware<Claims>) -> Self {
         Self {
             policy_engine: Arc::new(policy_engine),
@@ -62,8 +62,9 @@ impl ApiModule for PolicyApiModule {
     }
 }
 
-/// The policy-managed objects routes operate on; used as the Casbin
-/// object (`obj`) value when authorizing management operations.
+/// The objects that the policy manages and that the routes operate on. The
+/// value is the Casbin object (`obj`) when the module authorizes a
+/// management operation.
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Resource {
@@ -74,7 +75,7 @@ pub enum Resource {
 }
 
 impl Resource {
-    /// The canonical wire/Casbin string for this resource.
+    /// The canonical wire string and Casbin string for this resource.
     pub fn as_str(&self) -> &'static str {
         match self {
             Resource::UserGroups => "user_groups",
@@ -97,7 +98,7 @@ pub struct PolicyRequest {
 /// Body for assigning/unassigning group membership.
 #[derive(Deserialize, utoipa::ToSchema)]
 pub struct GroupRequest {
-    /// Subject to add to/remove from the group.
+    /// Subject to add to the group, or to remove from it.
     pub user_id: String,
     /// Target group name.
     pub group: String,
@@ -132,15 +133,16 @@ pub struct RuleListResponse {
 
 /// Query parameters shared by every `/policy` listing endpoint.
 ///
-/// `limit`/`offset` are optional and resolved by [`Page`], which is the
-/// single place the `DEFAULT_PAGE_SIZE`/`MAX_PAGE_SIZE` bounds live.
-/// Private to this module: the OpenAPI surface declares the two params
-/// inline on each route.
+/// `limit` and `offset` are optional. [`Page`] resolves them, and it is the
+/// single place where the bounds `DEFAULT_PAGE_SIZE` and `MAX_PAGE_SIZE`
+/// live.
+/// The type is private to this module, because the OpenAPI surface declares
+/// the two parameters inline on each route.
 #[derive(Debug, Deserialize)]
 struct RulesQuery {
-    /// Page size; defaults to 100 and is capped at 1000.
+    /// Page size. The default is 100, and the cap is 1000.
     pub limit: Option<usize>,
-    /// Number of items to skip; defaults to 0.
+    /// Number of items to skip. The default is 0.
     pub offset: Option<usize>,
 }
 
@@ -152,9 +154,10 @@ pub(crate) const MAX_PAGE_SIZE: usize = 1000;
 
 /// A resolved pagination window.
 ///
-/// Every listing endpoint resolves its `limit`/`offset` through this so
-/// they cannot drift apart: the cap, the default, and the value echoed
-/// back in the response all come from the same computation.
+/// Every listing endpoint resolves its `limit` and `offset` through this
+/// type. The endpoints therefore cannot drift apart. The cap, the default,
+/// and the value that the response echoes back all come from the same
+/// computation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Page {
     /// Effective page size, after the [`MAX_PAGE_SIZE`] cap.
@@ -172,9 +175,9 @@ impl Page {
         }
     }
 
-    /// Slices `items` to this window. An offset past the end yields an
-    /// empty page rather than panicking. Consumes the collection so
-    /// callers do not need `Clone` on their response types.
+    /// Slices `items` down to this window. An offset past the end returns an
+    /// empty page instead of panicking. The function consumes the
+    /// collection, so callers do not need `Clone` on their response types.
     fn apply<T>(&self, items: impl IntoIterator<Item = T>) -> Vec<T> {
         items
             .into_iter()
@@ -184,19 +187,20 @@ impl Page {
     }
 }
 
-/// Maps domain policy failures onto the uniform API error envelope:
-/// `AccessDenied` becomes 403 Forbidden; store/engine failures become 500
-/// with their cause attached for server-side logging.
+/// Maps the failures of the policy domain onto the uniform API error
+/// envelope. `AccessDenied` becomes 403 Forbidden. A store failure or an
+/// engine failure becomes 500, with the cause attached for logging on the
+/// server.
 impl From<PolicyError> for ApiError {
     fn from(value: PolicyError) -> Self {
         match value {
             PolicyError::AccessDenied => ApiError::Forbidden,
-            // The fencing case is handed over whole rather than unwrapped,
-            // so its `Display` reaches the log line that `ApiError` writes
-            // for a 500. `error!` is the wrong verb to place here, and a
-            // `tracing::error!` inside a `From` would be a side effect in a
-            // conversion; the distinguishable text is the mechanism, and
-            // its wording matches `FsError::Fenced` so one query finds both.
+            // The code hands the fencing case over whole, and not unwrapped,
+            // so that its `Display` reaches the log line that `ApiError`
+            // writes for a 500. The verb `error!` is wrong here. A
+            // `tracing::error!` inside a `From` would add a side effect to
+            // a conversion. The distinguishable text is the mechanism, and
+            // its wording matches `FsError::Fenced`. One query finds both.
             other => ApiError::Internal(Box::new(other)),
         }
     }
@@ -458,17 +462,17 @@ mod tests {
     const KID: &str = "policy-route-test-kid";
     const AUD: &str = "test-aud";
 
-    /// A fencing loss is a 500 that says so in the log and nothing in the
+    /// A fencing loss is a 500 that says so in the log and says nothing in the
     /// body.
     ///
-    /// Both halves matter. The client must not learn the store's reason --
-    /// `ApiError::Internal` only ever renders its fixed `Display`. The
-    /// operator must be able to tell this apart from any other 500, which
-    /// is the entire point of lifting the variant out of casbin: the text
-    /// `ApiError` logs for a cause is the only thing that reaches a log
-    /// line, so the wording is the mechanism.
+    /// Both halves matter. The client must not learn the reason from the
+    /// store, because `ApiError::Internal` only ever renders its fixed
+    /// `Display`. The operator must be able to tell this apart from any
+    /// other 500. Lifting the variant out of casbin exists for that reason.
+    /// The text that `ApiError` logs for a cause is the only thing that
+    /// reaches a log line, so the wording is the mechanism.
     #[test]
-    fn fencing_loss_is_a_sanitized_500_with_a_distinguishable_log_line() {
+    fn a_fencing_loss_is_a_500_with_a_sanitized_body() {
         use crate::http::error::ApiError;
         use actix_web::ResponseError as _;
         use actix_web::body::MessageBody as _;
@@ -489,8 +493,8 @@ mod tests {
             "the fencing reason must not be serialized to the client"
         );
 
-        // But the log line is searchable, and matches the `fs` wording so
-        // one query finds a fencing loss on either store.
+        // The log line is searchable, and it matches the `fs` wording. One
+        // query therefore finds a fencing loss on either store.
         let logged = api
             .source()
             .expect("the cause is retained for logging")
@@ -555,7 +559,8 @@ mod tests {
     fn page_slices_caps_and_defaults() {
         let rules: Vec<Vec<String>> = (0..10).map(|i| rule(&format!("u{i}"))).collect();
 
-        // Default limit (100) exceeds this list, so the whole set returns.
+        // The default limit of 100 is larger than this list, so the function
+        // returns the whole set.
         assert_eq!(
             Page::from_query(&RulesQuery {
                 limit: None,
@@ -565,15 +570,15 @@ mod tests {
             rules
         );
 
-        // Offset slices from the right position.
+        // The offset slices the list at the right position.
         let page = Page::from_query(&RulesQuery {
             limit: Some(3),
             offset: Some(4),
         });
         assert_eq!(page.apply(rules.clone()), rules[4..7].to_vec());
 
-        // Limit above MAX_PAGE_SIZE gets capped, and the capped value is
-        // what the response echoes back.
+        // A limit above MAX_PAGE_SIZE is capped. The response
+        // echoes back the capped value.
         let big: Vec<Vec<String>> = (0..(MAX_PAGE_SIZE + 50)).map(|_| rule("x")).collect();
         let capped = Page::from_query(&RulesQuery {
             limit: Some(MAX_PAGE_SIZE * 2),
@@ -582,7 +587,7 @@ mod tests {
         assert_eq!(capped.limit, MAX_PAGE_SIZE);
         assert_eq!(capped.apply(big.clone()).len(), MAX_PAGE_SIZE);
 
-        // Offset past the end yields an empty page, not a panic.
+        // An offset past the end returns an empty page, not a panic.
         let past_end = Page::from_query(&RulesQuery {
             limit: Some(3),
             offset: Some(99),
@@ -638,7 +643,7 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn rules_crud_via_http() -> anyhow::Result<()> {
+    async fn rule_crud_over_http() -> anyhow::Result<()> {
         let fx = fixture(true).await?;
         let mw = JwtClaimsMiddleware::<Claims>::new_with_jks(
             &format!("{}/jwks", fx.server.uri()),
@@ -650,7 +655,7 @@ mod tests {
         let app =
             actix_web::test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
         let token = fx.token("alice")?;
-        // add rule
+        // The function adds a rule.
         let res = actix_web::test::call_service(
             &app,
             actix_web::test::TestRequest::post()
@@ -663,7 +668,7 @@ mod tests {
         assert_eq!(res.status(), http::StatusCode::OK);
         let body: serde_json::Value = actix_web::test::read_body_json(res).await;
         assert_eq!(body["success"], true);
-        // duplicate add returns false
+        // A duplicate add returns false.
         let res = actix_web::test::call_service(
             &app,
             actix_web::test::TestRequest::post()
@@ -675,7 +680,7 @@ mod tests {
         .await;
         let body: serde_json::Value = actix_web::test::read_body_json(res).await;
         assert_eq!(body["success"], false);
-        // get rules with pagination
+        // The function reads the rules with pagination.
         let res = actix_web::test::call_service(
             &app,
             actix_web::test::TestRequest::get()
@@ -688,7 +693,7 @@ mod tests {
         let body: serde_json::Value = actix_web::test::read_body_json(res).await;
         assert!(body["total"].as_u64().unwrap_or(0) >= 1);
         assert_eq!(body["rules"].as_array().map(|a| a.len()).unwrap_or(0), 1);
-        // remove rule
+        // The function removes the rule.
         let res = actix_web::test::call_service(
             &app,
             actix_web::test::TestRequest::delete()
@@ -705,7 +710,7 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn groups_crud_via_http() -> anyhow::Result<()> {
+    async fn group_crud_over_http() -> anyhow::Result<()> {
         let fx = fixture(true).await?;
         let mw = JwtClaimsMiddleware::<Claims>::new_with_jks(
             &format!("{}/jwks", fx.server.uri()),
@@ -717,7 +722,7 @@ mod tests {
         let app =
             actix_web::test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
         let token = fx.token("alice")?;
-        // assign group
+        // The function assigns a group.
         let res = actix_web::test::call_service(
             &app,
             actix_web::test::TestRequest::post()
@@ -728,7 +733,7 @@ mod tests {
         )
         .await;
         assert_eq!(res.status(), http::StatusCode::OK);
-        // get user groups
+        // The function reads the groups of a user.
         let res = actix_web::test::call_service(
             &app,
             actix_web::test::TestRequest::get()
@@ -746,7 +751,7 @@ mod tests {
                 .iter()
                 .any(|v| v == "editors")
         );
-        // get group users
+        // The function reads the users of a group.
         let res = actix_web::test::call_service(
             &app,
             actix_web::test::TestRequest::get()
@@ -764,7 +769,7 @@ mod tests {
                 .iter()
                 .any(|v| v == "carol")
         );
-        // list groups
+        // The function lists the groups.
         let res = actix_web::test::call_service(
             &app,
             actix_web::test::TestRequest::get()
@@ -774,7 +779,7 @@ mod tests {
         )
         .await;
         assert_eq!(res.status(), http::StatusCode::OK);
-        // list users
+        // The function lists the users.
         let res = actix_web::test::call_service(
             &app,
             actix_web::test::TestRequest::get()
@@ -784,7 +789,7 @@ mod tests {
         )
         .await;
         assert_eq!(res.status(), http::StatusCode::OK);
-        // remove from group
+        // The function removes a user from a group.
         let res = actix_web::test::call_service(
             &app,
             actix_web::test::TestRequest::delete()
@@ -796,7 +801,8 @@ mod tests {
         assert_eq!(res.status(), http::StatusCode::OK);
         let body: serde_json::Value = actix_web::test::read_body_json(res).await;
         assert_eq!(body["success"], true);
-        // delete group (non-existent -> false but 200)
+        // The function deletes a group. A group that does not exist
+        // returns false, but the status is still 200.
         let res = actix_web::test::call_service(
             &app,
             actix_web::test::TestRequest::delete()
@@ -812,7 +818,9 @@ mod tests {
     #[actix_web::test]
     async fn delete_group_authorized() -> anyhow::Result<()> {
         let fx = fixture(true).await?;
-        // create a group with member via engine directly to test delete_group handler pagination branches
+        // The engine creates a group with one member directly. The test
+        // then covers the branches of pagination in the delete_group
+        // handler.
         fx.engine.assign_group("dave".into(), "temp".into()).await?;
         let mw = JwtClaimsMiddleware::<Claims>::new_with_jks(
             &format!("{}/jwks", fx.server.uri()),
@@ -835,7 +843,8 @@ mod tests {
         assert_eq!(res.status(), http::StatusCode::OK);
         let body: serde_json::Value = actix_web::test::read_body_json(res).await;
         assert_eq!(body["success"], true);
-        // offset/limit cap branches for groups/users
+        // The functions check the offset and limit caps for groups and
+        // users.
         let res = actix_web::test::call_service(
             &app,
             actix_web::test::TestRequest::get()

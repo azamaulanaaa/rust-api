@@ -1,67 +1,73 @@
-//! Shared API error type rendering a uniform JSON error envelope.
+//! The shared API error type that renders one uniform JSON error envelope.
 //!
-//! Every API failure serializes as `{"error": "<message>"}` where the
-//! message is a stable, non-sensitive description. Underlying causes are
-//! attached via [`std::error::Error::source`] and logged server-side by the
-//! response renderer — they are never sent to clients.
+//! Every API failure serializes as `{"error": "<message>"}`, where the
+//! message is a stable description that contains no sensitive data. The
+//! response renderer attaches the underlying causes through
+//! [`std::error::Error::source`] and logs them on the server. The renderer
+//! never sends the causes to a client.
 
 use actix_web::{HttpResponse, ResponseError, http::StatusCode};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-/// Wire format for every API error: `{"error": "<message>"}`.
+/// The wire format for every API error: `{"error": "<message>"}`.
 ///
-/// `Deserialize` as well as `Serialize` so tests can assert on the served
-/// body through this type rather than through an anonymous
-/// `serde_json::Value` -- the point being to check that what is on the wire
-/// really is this shape.
+/// The type also derives `Deserialize`, so a test can check the served body
+/// through this type instead of an anonymous `serde_json::Value`. That way a
+/// test confirms that the wire format really has this shape.
 #[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ErrorBody {
-    /// Stable, non-sensitive description of the failure.
+    /// A stable description of the failure. The description contains no
+    /// sensitive data.
     pub error: String,
 }
 
-/// Application-wide API error.
+/// The API error for the whole application.
 ///
-/// The `Display` text (via `#[error]`) doubles as the client-facing body,
-/// while any `#[source]` cause is reserved for server-side logging. That
-/// split is why no variant carries a `String`: a payload here would be
-/// request-derived text on the wire. Detail belongs in a `#[source]`
-/// cause, which is logged and never serialized. This mirrors the
+/// The `Display` text (via `#[error]`) also forms the body that the server
+/// sends to the client. Any `#[source]` cause is only for server-side logs.
+/// This split is why no variant carries a `String`. A payload here would put
+/// request text on the wire. Detailed information belongs in a `#[source]`
+/// cause, which the server logs and never serializes. This rule matches the
 /// sanitization contract in [`FsError`](crate::fs::error::FsError).
 #[derive(Debug, Error)]
 pub enum ApiError {
-    /// Request carried no credential at all. HTTP 401.
+    /// The request carried no credential at all. HTTP 401.
     #[error("authentication required")]
     MissingCredentials,
 
-    /// The request body could not be parsed into the handler's type. HTTP
-    /// 400.
+    /// The server could not parse the request body into the type of the
+    /// handler. HTTP 400.
     ///
-    /// Exists because actix's own JSON-extractor failure is a bare
-    /// `400 Bad Request` in `text/plain` -- the one way a documented route
-    /// answers outside the uniform envelope, reached by any client that
-    /// sends a truncated or mistyped payload. [`apply_limits`](crate::http::apply_limits)
-    /// installs this as the extractor's error handler; the extractor's
-    /// message names the offending field and is logged, never sent.
+    /// This variant exists because the actix JSON extractor fails with a
+    /// bare `400 Bad Request` in `text/plain`. That is the one way a
+    /// documented route answers outside the uniform envelope, and any
+    /// client that sends a truncated or mistyped payload reaches it.
+    /// [`apply_limits`](crate::http::apply_limits) installs this variant as
+    /// the error handler of the extractor. The extractor message names the
+    /// offending field. The server logs the message and never sends it.
     #[error("bad request")]
     BadRequest,
 
-    /// Credential was present but failed verification; the source holds the
-    /// rejection detail for logs only. HTTP 401.
+    /// The request carried a credential, but the credential failed
+    /// verification. The source holds the rejection detail for the log
+    /// only. HTTP 401.
     #[error("invalid credentials")]
     InvalidCredentials(#[source] Box<dyn std::error::Error + Send + Sync>),
 
-    /// Authenticated subject lacks the required permission. HTTP 403.
+    /// The authenticated subject does not have the required permission.
+    /// HTTP 403.
     #[error("forbidden")]
     Forbidden,
 
-    /// Unexpected failure; the source is logged server-side only. HTTP 500.
+    /// The request failed for an unexpected reason. The server logs the
+    /// source only. HTTP 500.
     #[error("internal server error")]
     Internal(#[source] Box<dyn std::error::Error + Send + Sync>),
 
-    /// The request conflicts with already-established state; used by the
-    /// one-time bootstrap route once setup has been completed. HTTP 409.
+    /// The request conflicts with state that already exists. The one-time
+    /// bootstrap route uses this variant after setup has finished. HTTP
+    /// 409.
     #[error("conflict")]
     Conflict,
 
@@ -82,16 +88,16 @@ impl ApiError {
         }
     }
 
-    /// Renders the uniform envelope for an arbitrary status and message.
+    /// Renders the uniform envelope for any status and message.
     ///
-    /// The single place the body is constructed, so a status cannot end up
-    /// paired with a differently-shaped body. [`FsError`] renders through
-    /// here too: it is a second `ResponseError` implementation in this crate
-    /// with its own status table, and while it built its body with a bare
-    /// `json!` macro the served shape for `/fs` and `/sync` was an anonymous
-    /// value that the OpenAPI document described as
-    /// [`ErrorBody`] only by convention. Now it is
-    /// [`ErrorBody`] by construction.
+    /// The function is the only place that builds the body, so a status
+    /// cannot receive a body of a different shape. [`FsError`] renders
+    /// through this function too. `FsError` is a second `ResponseError`
+    /// implementation in this crate with its own status table. It used to
+    /// build its body with a bare `json!` macro, so the served shape for
+    /// `/fs` and `/sync` was an anonymous value. The OpenAPI document
+    /// described that value as [`ErrorBody`] by convention only. The
+    /// function now builds an [`ErrorBody`] directly.
     pub(crate) fn envelope(status: StatusCode, message: &str) -> HttpResponse {
         HttpResponse::build(status).json(ErrorBody {
             error: message.to_string(),
@@ -105,8 +111,9 @@ impl ResponseError for ApiError {
     }
 
     fn error_response(&self) -> HttpResponse {
-        // Causes carry sensitive internals (DB errors, provider responses):
-        // log them here so call sites can't forget, never serialize them.
+        // The causes carry sensitive internal data (database errors,
+        // provider responses). The server logs them here, so a call site
+        // cannot forget to log them. The server never serializes them.
         if let Some(cause) = std::error::Error::source(self) {
             tracing::warn!("API {} {}: {cause}", self.status(), self);
         }
@@ -120,32 +127,34 @@ mod tests {
     use super::*;
     use crate::test_support::production_source;
 
-    /// Reads a source file's production code, dropping comment lines, with
-    /// [`crate::test_support::production_source`] -- the one helper every
-    /// such guard shares, rather than a copy per file.
+    /// Reads the production code of a source file and drops the comment
+    /// lines, with [`crate::test_support::production_source`]. Every such
+    /// guard shares this one helper, and no file needs a copy of it.
     ///
-    /// The walk stops at a `#[cfg(test)]` that opens a `mod`, not at the
-    /// attribute alone: the attribute also annotates test-only ITEMS, and
-    /// this walk reads every file under `src`, so matching it after
-    /// `trim_start` would stop at the first indented one (`limits.rs`
-    /// carries two) and matching it at column 0 alone would stop at a
-    /// column-0 item attribute (`src/db.rs` has three before its real test
-    /// module). The helper is tested directly against a fixture carrying
-    /// both shapes.
+    /// The walk stops at a `#[cfg(test)]` that opens a `mod`, and not at the
+    /// attribute alone. The attribute also marks test-only items, and this
+    /// walk reads every file under `src`. Therefore, matching the attribute
+    /// after `trim_start` would stop at the first indented one. `limits.rs`
+    /// carries two. Matching the attribute at column 0 alone would stop at
+    /// a column-0 item attribute. `src/db.rs` carries three before its real
+    /// test module. Another test calls the helper directly with a fixture
+    /// that has both shapes.
     ///
     /// The error envelope is built in exactly one place.
     ///
-    /// This crate has two `ResponseError` implementations -- `ApiError` for
-    /// control-plane failures and `FsError` for the file engine's richer set
-    /// -- and `FsError` used to assemble its own body with a bare `json!`
-    /// macro. The two produced identical bytes, which is precisely the
-    /// problem: the OpenAPI document described every error as `ErrorBody`,
-    /// `/fs` and `/sync` served an anonymous value that only matched the
-    /// schema by convention, and no test could tell the difference.
+    /// This crate has two `ResponseError` implementations. `ApiError` serves
+    /// control-plane failures. `FsError` serves the larger set of errors of
+    /// the file engine. `FsError` used to build its own body with a bare
+    /// `json!` macro. Both types then produced identical bytes, and that is
+    /// exactly the problem. The OpenAPI document described every error as
+    /// `ErrorBody`, but `/fs` and `/sync` served an anonymous value that
+    /// matched the schema only by convention. No test could tell the two
+    /// apart.
     ///
-    /// So the duplication is checked structurally instead. A behavioural
-    /// test cannot work here, and writing one anyway would be worse than
-    /// none: it would read as coverage of a property it does not have.
+    /// The test therefore checks the duplication in the source structure
+    /// instead. A test of the behavior cannot work here. Writing such a
+    /// test would be worse than no test, because it would read as coverage
+    /// of a property that it does not have.
     #[test]
     fn the_envelope_has_one_construction_site() {
         fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
@@ -167,8 +176,8 @@ mod tests {
             let rel = path.to_string_lossy().replace('\\', "/");
             let src = production_source(&rel);
             for line in src.lines() {
-                // A hand-rolled body: either the struct literal or a
-                // `json!` that emits the envelope's key.
+                // A hand-built body: either the struct literal, or a
+                // `json!` that emits the envelope key.
                 if line.contains("ErrorBody {")
                     || (line.contains("json!") && line.contains("\"error\""))
                 {
@@ -188,7 +197,7 @@ mod tests {
     }
 
     #[test]
-    fn statuses_map_to_expected_codes() {
+    fn status_codes_map_to_the_expected_values() {
         assert_eq!(ApiError::MissingCredentials.status(), 401);
         assert_eq!(
             ApiError::InvalidCredentials("kid mismatch".into()).status(),
@@ -201,14 +210,14 @@ mod tests {
 
     #[test]
     fn display_messages_are_stable_and_sanitized() {
-        // Display must never embed a cause or caller-supplied text: it
-        // becomes the client body.
+        // The `Display` text must never contain a cause or text that the
+        // caller supplied, because it becomes the body for the client.
         let internal = ApiError::Internal("secret db DSN".into());
         assert_eq!(internal.to_string(), "internal server error");
 
         let invalid = ApiError::InvalidCredentials("raw jwks dump".into());
         assert_eq!(invalid.to_string(), "invalid credentials");
-        // Source chain still exposes the cause for logging.
+        // The source chain still gives the cause for the log.
         assert_eq!(
             std::error::Error::source(&invalid)
                 .expect("cause retained")
@@ -218,8 +227,9 @@ mod tests {
     }
 
     /// Every variant renders a fixed string, so no request-derived payload
-    /// can reach the wire through the envelope. The FS engine holds the
-    /// same line (see `FsError::client_message`); this pins the API side.
+    /// can reach the wire through the envelope. The file engine holds the
+    /// same rule. See `FsError::client_message`. This test fixes the API
+    /// side.
     #[test]
     fn every_variant_has_a_fixed_client_message() {
         for (err, message) in [
@@ -237,7 +247,8 @@ mod tests {
         let res = err.error_response();
         assert_eq!(res.status(), 401);
 
-        // Re-render through a full request cycle to exercise serialization.
+        // The function renders the response again through a full request
+        // cycle, so the test covers the serialization as well.
         let body = actix_web::body::to_bytes(res.into_body()).await.unwrap();
         assert_eq!(&body[..], br#"{"error":"authentication required"}"#);
     }

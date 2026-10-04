@@ -1,17 +1,19 @@
-//! File-to-row relations with reference counting.
+//! Relations between files and rows, with reference counting.
 //!
-//! A file is `Temp` when `refs==0` and becomes `Owned` when attached to
-//! one or more rows. Editing a row detaches the old file and attaches a
-//! new one without deleting the underlying S3 object immediately.
+//! A file is `Temp` when `refs==0`. It becomes `Owned` when a row attaches
+//! to it.
+//! When a caller edits a row, the engine detaches the old file and
+//! attaches a new one.
+//! The engine does not delete the S3 object at once.
 
 use serde::{Deserialize, Serialize};
 
 /// Reference-count metadata for a file.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct RefInfo {
-    /// Number of rows referencing the file.
+    /// The number of rows that reference the file.
     pub count: u32,
-    /// When `count` dropped to `0`, the timestamp for GC.
+    /// The timestamp for GC. The engine sets it when `count` drops to `0`.
     pub orphan_since: Option<i64>,
 }
 
@@ -25,7 +27,7 @@ pub fn refs_key(file_id: &str) -> String {
     format!("fs:files:{file_id}:refs")
 }
 
-/// Prefix for scanning relations of a row.
+/// Prefix for a scan of the relations of one row.
 pub fn rel_prefix_for_row(row_type: &str, row_id: &str) -> String {
     format!("fs:rel:{row_type}:{row_id}:")
 }

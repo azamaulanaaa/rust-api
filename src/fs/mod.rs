@@ -1,7 +1,8 @@
-//! S3-backed file storage with row-level relations.
+//! File storage on S3, with relations to rows.
 //!
-//! Temp files are owned by `owner_sub` with `refs==0`. Attaching to a row
-//! increments refcount; detaching decrements and marks orphan for GC.
+//! A temp file has `refs==0` and belongs to `owner_sub`.
+//! An attach to a row increases the ref-count.
+//! A detach decreases it and marks the file for GC.
 
 pub mod error;
 pub mod gc;
@@ -27,25 +28,28 @@ use model::{CompleteRequest, FileMetadata, InitRequest};
 use s3::S3Client;
 use store::{FileRecord, FsStore, UploadSession};
 
-/// Allocates `len` empty per-part slots without risking a process abort.
+/// Allocates `len` empty part slots without any risk of a process abort.
 ///
-/// `vec![None; len]` *aborts* the process when the allocation fails, and
-/// `len` is a field straight off the wire. Before this existed, a 70-byte
-/// `POST /fs/uploads` declaring `2^54` parts allocated 383 TiB and killed
-/// the server — a hard abort, not a catchable panic, so no handler could
-/// have contained it.
+/// `vec![None; len]` *aborts* the process when the allocation fails.
+/// `len` is a field that comes straight from the wire.
+/// Before this function existed, a 70-byte `POST /fs/uploads` request with
+/// `2^54` parts allocated 383 TiB and stopped the server.
+/// That failure was a hard abort, and not a catchable panic, so no handler
+/// could contain it.
 ///
 /// [`InitRequest::validate`] caps the count at
-/// [`MAX_MULTIPART_PARTS`](model::MAX_MULTIPART_PARTS), so this should not
-/// fire. It exists because the failure mode of getting that cap wrong is
-/// an uncatchable process death, which is worth a second layer: a bad
-/// count has to degrade to a 4xx either way.
+/// [`MAX_MULTIPART_PARTS`](model::MAX_MULTIPART_PARTS), so this function
+/// should not run.
+/// The function stays because a wrong cap ends the process with no catch,
+/// and that failure deserves a second layer.
+/// A bad count must always become a 4xx.
 fn part_slots(len: u64) -> Result<Vec<Option<String>>, FsError> {
     let len = usize::try_from(len)
         .map_err(|_| FsError::BadRequest("file_total_parts does not fit in memory".into()))?;
     let mut slots: Vec<Option<String>> = Vec::new();
-    // `try_reserve_exact` then `resize`: after the reservation succeeds,
-    // `resize` only fills the reserved capacity and cannot reallocate.
+    // The code calls `try_reserve_exact` and then `resize`.
+    // After the reservation succeeds, `resize` only fills the reserved
+    // capacity, and it cannot allocate again.
     slots.try_reserve_exact(len).map_err(|_| {
         FsError::BadRequest("file_total_parts is too large to track upload state".into())
     })?;
@@ -53,83 +57,99 @@ fn part_slots(len: u64) -> Result<Vec<Option<String>>, FsError> {
     Ok(slots)
 }
 
-/// Maps a rejected feed append back onto an [`FsError`].
+/// Maps a rejected feed append onto an [`FsError`].
 ///
-/// The feed reports failures opaquely (it may not be a store at all), and
-/// the producer only has two things to say about it: it is not the client's
-/// fault, and the reason belongs in the server log. Both hold for every
-/// sink.
+/// The feed reports each failure in an unclear way, because the feed may
+/// not be a store at all.
+/// The producer can then say only two things.
+/// The failure is not the fault of the client.
+/// The reason belongs in the server log.
+/// Both statements are true for every sink.
 fn feed_error(e: anyhow::Error) -> FsError {
     FsError::Internal(e.to_string())
 }
 
-/// Core file-system engine with temp per-user scope and row delegation.
+/// The core file system engine.
+/// It uses a temp scope per user, and a row check for each row.
 #[derive(Clone)]
 pub struct FsEngine {
     pub(crate) store: FsStore,
     pub(crate) s3: Arc<dyn S3Client>,
     pub(crate) bucket: String,
-    /// Row-level checks only, so this is the read-only
-    /// [`Authorizer`](crate::policy::Authorizer) and not the whole engine.
+    /// The engine runs row-level checks only.
+    /// The field is therefore the read-only
+    /// [`Authorizer`](crate::policy::Authorizer), and not the whole engine.
     ///
     /// Every use of `self.policy` in production is `require_row` or
-    /// `authorize_row`, so handing the engine over granted `fs` a write
-    /// capability nothing here should have: `fs` has no change feed for
-    /// policy mutations, so a rule added through this field would reach
-    /// replicas' policy state with no WAL op and no way to replay it.
-    /// `sync::SnapshotManager` already holds the same handle for the same
-    /// reason.
+    /// `authorize_row`.
+    /// A whole engine would grant `fs` a write capability that nothing here
+    /// should have.
+    /// `fs` has no change feed for policy mutations.
+    /// A rule added through this field would then reach the policy state
+    /// of the replicas with no WAL op, and with no way to replay it.
+    /// `sync::SnapshotManager` holds the same handle for the same reason.
     policy: Authorizer,
     token_keys: Arc<TokenKeys>,
-    /// Change feed for replica sync; `None` disables logging (tests).
-    /// Production must wire it: without appends the feed head never
-    /// advances and replicas freeze at their last snapshot.
+    /// The change feed for the replica sync.
+    /// `None` disables logging. A test uses `None`.
+    /// Production must set the feed.
+    /// Without appends, the feed head never advances, and the replicas stay
+    /// at their last snapshot.
     ///
-    /// Typed as [`ChangeSink`] rather than a concrete WAL so this module
-    /// has no compile-time path to `sync` — see [`crate::records`].
+    /// The type is [`ChangeSink`] and not a concrete WAL, so that this
+    /// module has no compile-time path to `sync`.
+    /// See [`crate::records`].
     feed: Option<Arc<dyn ChangeSink>>,
     /// Serializes the read-modify-write of one upload's rows.
     session_locks: SessionLocks,
 }
 
-/// Per-upload serialization for the rows one upload owns.
+/// Serialization for the rows that one upload owns.
 ///
 /// An `UploadSession` and the `PersistedMultipart` record behind it are two
-/// separate KV keys holding the same fact — how many parts have landed —
-/// and every part upload read BOTH, merged its own index into its own copy
-/// and wrote both back. `FsStore` takes `inner.write()` per call and never
-/// across the pair, `FsEngine` is shared across workers as `web::Data`,
-/// and the handler adds no serialization, so parallel part uploads — the
-/// normal multipart client pattern — each wrote back a whole session built
-/// from a snapshot taken before the other part's write.
+/// separate KV keys.
+/// Both keys store the same fact, which is how many parts have landed.
+/// Every part upload read both keys. Then it merged its own index into its
+/// own copy, and it wrote both keys back.
+/// `FsStore` takes `inner.write()` for each call, and never for the pair
+/// of keys.
+/// `FsEngine` is shared across the workers as `web::Data`, and the handler
+/// adds no serialization.
+/// Parallel part uploads, which are the normal multipart client pattern,
+/// therefore each wrote back a whole session.
+/// Each of those sessions came from a snapshot that the other part write
+/// took before it.
 ///
-/// The entry is keyed by file id, which is also the session id: uploads of
-/// different files never contend, and the key is dropped when the last
-/// holder goes so the map cannot grow with abandoned sessions.
+/// The map key is the file id, which is also the session id.
+/// Uploads of different files never wait for each other.
+/// The code removes the key when the last holder leaves, so that the map
+/// cannot grow with abandoned sessions.
 #[derive(Clone, Default)]
 struct SessionLocks {
     inner: Arc<std::sync::Mutex<HashMap<String, Arc<SessionEntry>>>>,
 }
 
-/// One session's lock, and how many claims are outstanding on it.
+/// One session's lock, and the number of claims on it.
 struct SessionEntry {
     /// Held across the read-modify-write of this upload's rows.
     lock: tokio::sync::Mutex<()>,
-    /// Claims taken on `lock`, including one still waiting for it.
+    /// The number of claims on `lock`, including a claim that still waits for
+    /// it.
     ///
-    /// The map entry may only be dropped when this reaches zero. A claim
-    /// that has registered but has not run yet still owns the mutex, and if
-    /// the entry vanished under it the NEXT caller would mint a second
-    /// mutex for the same session -- two claims, two critical sections, and
-    /// exactly the lost update this type exists to prevent.
+    /// The code may drop the map entry only when this count reaches zero.
+    /// A claim that registered but has not run yet still owns the mutex.
+    /// If the entry then vanished, the NEXT caller would create a second
+    /// mutex for the same session.
+    /// Two claims and two critical sections give exactly the lost update
+    /// that this type prevents.
     claims: std::sync::atomic::AtomicUsize,
 }
 
-/// A held-or-pending claim on one session's lock.
+/// A claim on the lock of one session. The claim is held or pending.
 ///
-/// Owning one is what keeps the map entry alive; dropping it gives the claim
-/// back, so two sequential parts of one upload do not leave a mutex behind
-/// forever.
+/// Owning the claim keeps the map entry alive.
+/// Dropping the claim returns it, so that two parts of one upload that run
+/// one after the other do not leave a mutex behind for ever.
 struct SessionLock<'a> {
     map: &'a std::sync::Mutex<HashMap<String, Arc<SessionEntry>>>,
     key: String,
@@ -145,8 +165,9 @@ impl SessionLock<'_> {
 
 impl Drop for SessionLock<'_> {
     fn drop(&mut self) {
-        // A poisoned map means a holder panicked mid-registration; leave
-        // the entry rather than drop somebody else's lock on the way out.
+        // A poisoned map means that a holder panicked during registration.
+        // The code leaves the entry in place, and does not remove the lock
+        // of another holder.
         let Ok(mut map) = self.map.lock() else {
             return;
         };
@@ -156,8 +177,9 @@ impl Drop for SessionLock<'_> {
         {
             return;
         }
-        // Under the map lock, so a claim registering right now cannot slip
-        // between the last claim leaving and the entry disappearing.
+        // The code runs this under the map lock.
+        // A claim that registers now cannot then slip between the last
+        // claim that leaves and the entry that disappears.
         if self
             .entry
             .claims
@@ -170,12 +192,14 @@ impl Drop for SessionLock<'_> {
 }
 
 impl SessionLocks {
-    /// Claims `key`, waiting for any other holder of the same session.
+    /// Claims `key` and waits for any other holder of the same session.
     ///
-    /// The map is a `std::sync::Mutex` and is never held across an await:
-    /// registering is microseconds, and the per-key async mutex below is
-    /// what actually waits, so a slow part upload cannot stall registration
-    /// for every other session.
+    /// The map is a `std::sync::Mutex`, and the code never holds it across
+    /// an await.
+    /// Registering takes microseconds.
+    /// The async mutex for each key below is the part that waits, so a
+    /// slow part upload cannot stop the registration of every other
+    /// session.
     async fn acquire(&self, key: &str) -> SessionLock<'_> {
         let entry = {
             let mut map = self
@@ -201,17 +225,21 @@ impl SessionLocks {
     }
 }
 
-/// One capability-token signing key: `kid` goes in the JWT header.
+/// One capability-token signing key.
+/// The `kid` goes in the JWT header.
 #[derive(Clone)]
 struct TokenKey {
     kid: String,
     secret: Vec<u8>,
 }
 
-/// Capability-token signing keys: current mints, previous verifies only.
+/// The signing keys for the capability tokens.
+/// The current key signs new tokens.
+/// The previous key verifies old tokens only.
 ///
-/// Token IDs stay UUIDv7 (oxkv sorts by creation time); only the HMAC
-/// material needs real entropy, so IDs and secrets evolve independently.
+/// The token IDs stay UUIDv7, because oxkv sorts by creation time.
+/// Only the HMAC material needs real entropy, so the IDs and the secrets
+/// change independently.
 #[derive(Clone)]
 pub struct TokenKeys {
     current: TokenKey,
@@ -219,9 +247,10 @@ pub struct TokenKeys {
 }
 
 impl TokenKeys {
-    /// Ephemeral 256-bit key from the OS RNG: for tests and unconfigured
-    /// runs. Tokens die with the process — production must configure a
-    /// stable secret (see `CapabilityConfig`).
+    /// Creates an ephemeral 256-bit key from the OS RNG.
+    /// A test and an unconfigured run use this call.
+    /// The tokens end with the process.
+    /// Production must set a stable secret (see `CapabilityConfig`).
     pub fn ephemeral() -> Self {
         use rand::RngCore as _;
 
@@ -236,8 +265,11 @@ impl TokenKeys {
         }
     }
 
-    /// Configured keys from hex: current mints, previous (if any)
-    /// verifies during rotation. Rejects weak/truncated material.
+    /// Creates the configured keys from hex.
+    /// The current key signs new tokens.
+    /// The previous key, if the caller sets one, verifies tokens during a
+    /// rotation.
+    /// The function rejects weak or truncated material.
     pub fn from_hex(current: &str, previous: Option<&str>) -> Result<Self, FsError> {
         let current_bytes = token::parse_secret_hex(current).map_err(FsError::BadRequest)?;
         let current = TokenKey {
@@ -257,17 +289,21 @@ impl TokenKeys {
         Ok(Self { current, previous })
     }
 
-    /// Mint a capability token for `file_id` and `act`, signed by the
-    /// current key.
+    /// Mints a capability token for `file_id` and `act`.
+    /// The current key signs the token.
     ///
-    /// Lives here rather than only on [`FsEngine`] so a caller holding the
-    /// keys can produce a token without an engine -- which is also the only
-    /// way to observe WHICH secret a resolved [`TokenKeys`] carries.
-    /// `TokenKeys` deliberately exposes nothing about its material (no
-    /// accessor for `secret` or `kid`), and that is the right default: the
-    /// keys are a signing capability, and "read the secret back out" is not
-    /// an operation anything legitimate needs. Verification by round trip
-    /// answers the same question without one.
+    /// The method lives here, and not only on [`FsEngine`].
+    /// A caller that holds the keys can then create a token without an
+    /// engine.
+    /// The method is also the only way to see WHICH secret a resolved
+    /// [`TokenKeys`] carries.
+    /// `TokenKeys` on purpose exposes nothing about its material.
+    /// It has no accessor for `secret` or `kid`.
+    /// That is the correct default.
+    /// The keys are a signing capability, and no legitimate caller needs to
+    /// read the secret back.
+    /// Verification by round trip answers the same question without an
+    /// accessor.
     pub fn mint(&self, sub: &str, file_id: &str, act: Action) -> Result<String, FsError> {
         token::mint(
             sub,
@@ -279,11 +315,12 @@ impl TokenKeys {
         )
     }
 
-    /// Verify a capability token against the current key, then the previous
-    /// one if a rotation is in progress.
+    /// Verifies a capability token with the current key, and then with the
+    /// previous key if a rotation is in progress.
     ///
-    /// The same shape [`FsEngine::verify_token`] uses, exposed here so both
-    /// sides of a mint/verify round trip are reachable from the keys alone.
+    /// The method uses the same shape as [`FsEngine::verify_token`].
+    /// It is public here, so that both sides of a mint and verify round trip
+    /// are reachable from the keys alone.
     pub fn verify(&self, token: &str, file_id: &str, act: Action) -> Result<(), FsError> {
         let mut secrets = vec![self.current.secret.as_slice()];
         if let Some(prev) = &self.previous {
@@ -294,7 +331,8 @@ impl TokenKeys {
 }
 
 impl FsEngine {
-    /// Creates the engine from an `OxKvStore` (per-user S3, scalable).
+    /// Creates the engine from an `OxKvStore`.
+    /// The store uses a per-user S3 LSM store, and it scales per user.
     pub async fn init(
         s3_store: oxkv::OxKvStore,
         s3_config: &s3::S3ClientConfig,
@@ -315,47 +353,54 @@ impl FsEngine {
         })
     }
 
-    /// Attaches a [`ChangeSink`] for replica sync.
+    /// Attaches a [`ChangeSink`] for the replica sync.
     ///
-    /// Ops are announced so the feed does not silently miss a mutation, but
-    /// NOT fail-closed. This comment used to claim the opposite --
-    /// "a logging failure fails the whole operation so the feed never
-    /// silently misses a committed write" -- and it was false in both
-    /// directions: `complete_upload` and `delete_file` committed first and
-    /// announced last, and nothing was rolled back, so a WAL failure lost
-    /// the mutation *and* the session or row the retry needed.
+    /// The engine announces each op, so that the feed does not miss a
+    /// mutation without saying so.
+    /// The code does not fail closed.
+    /// This doc used to claim the opposite, that "a logging failure fails
+    /// the whole operation so the feed never silently misses a committed
+    /// write".
+    /// That claim was false in both directions.
+    /// `complete_upload` and `delete_file` committed first and announced
+    /// last, and nothing rolled back.
+    /// A WAL failure therefore lost the mutation and the session or row
+    /// that the retry needed.
     ///
-    /// What actually holds now, and is what each mutation is written to
-    /// keep:
+    /// These points hold now, and each mutation is written to keep them:
     ///
-    /// * An announce happens before the step that makes a mutation
-    ///   unretryable ([`delete_file`](Self::delete_file) announces before
-    ///   the row goes, like [`gc`](crate::fs::gc)), or immediately after
-    ///   it with the handle for the retry deliberately left in place
-    ///   ([`complete_upload`](Self::complete_upload) commits the record,
-    ///   announces, and only then drops the session).
-    /// * Every announce failure therefore leaves something a *later
-    ///   request* can replay it from, and every entry point is idempotent
-    ///   on that retry -- so the retry converges instead of 404ing.
-    /// * A failed append is re-announced at most once per failure, because
-    ///   the retry's own cleanup removes the handle. A client looping
-    ///   `complete` cannot grow the feed.
+    /// * The engine announces before the step that makes a mutation
+    ///   impossible to retry. [`delete_file`](Self::delete_file) announces
+    ///   before the row goes, as [`gc`] does. The engine also announces
+    ///   immediately after the step, and it leaves the handle for the retry
+    ///   on purpose.
+    ///   [`complete_upload`](Self::complete_upload) commits the record,
+    ///   announces, and only then drops the session.
+    /// * Every announce failure therefore leaves something that a *later
+    ///   request* can replay it from. Every entry point is idempotent on
+    ///   that retry, so the retry converges instead of returning 404.
+    /// * The code announces a failed append again at most once per
+    ///   failure, because the cleanup of the retry removes the handle. A
+    ///   client that repeats `complete` cannot grow the feed.
     ///
-    /// What this does NOT give: a client that never retries loses the
-    /// announce for good. The committed record is on master, so a replica
-    /// running a full rebuild picks the file up from the KV regardless, but
-    /// incremental replay does not learn of it. That window is logged, not
-    /// closed -- closing it needs a replayable outbox, which this crate has
-    /// no storage for.
+    /// This contract does NOT give one thing.
+    /// A client that never retries loses the announce for good.
+    /// The committed record is on the master, so a replica that runs a full
+    /// rebuild finds the file in the KV.
+    /// Incremental replay does not find the file.
+    /// The engine logs that window, and does not close it.
+    /// Closing the window needs a replayable outbox, and this crate has no
+    /// storage for one.
     ///
-    /// Takes a trait object so this module never names `sync`. The
-    /// concrete implementation is [`sync::wal::Wal`](crate::sync::wal::Wal).
+    /// The method takes a trait object, so this module never names `sync`.
+    /// The concrete implementation is
+    /// [`sync::wal::Wal`](crate::sync::wal::Wal).
     pub fn with_change_sink(mut self, feed: Arc<dyn ChangeSink>) -> Self {
         self.feed = Some(feed);
         self
     }
 
-    /// Announces `op` when a feed is wired; no-op otherwise.
+    /// Announces `op` when a feed is wired. The call does nothing otherwise.
     async fn announce(&self, op: WalOp) -> Result<(), FsError> {
         if let Some(feed) = &self.feed {
             feed.append(op).await.map_err(feed_error)?;
@@ -365,13 +410,14 @@ impl FsEngine {
 
     /// Creates an engine from an explicit [`FsStore`] and [`S3Client`].
     ///
-    /// The injection point behind the `S3Client` "seam so `FsEngine` stays
-    /// storage-agnostic" contract: production goes through
-    /// [`init`](Self::init), while this lets a host app (or a test) supply
-    /// a different byte backend or metadata store. Callers own
-    /// [`with_change_sink`](Self::with_change_sink) and
-    /// [`with_token_keys`](Self::with_token_keys) separately, exactly as
-    /// `init` leaves them.
+    /// The method is the injection point for the `S3Client` contract,
+    /// which keeps `FsEngine` independent of the storage type.
+    /// Production goes through [`init`](Self::init).
+    /// A host app or a test uses this method to supply another byte backend
+    /// or another metadata store.
+    /// The caller sets [`with_change_sink`](Self::with_change_sink) and
+    /// [`with_token_keys`](Self::with_token_keys) separately, as `init`
+    /// also does.
     pub fn from_parts(
         store: FsStore,
         s3: Arc<dyn S3Client>,
@@ -389,24 +435,25 @@ impl FsEngine {
         }
     }
 
-    /// Overrides the capability-token signing keys (production wires
-    /// the configured secret; tests keep the ephemeral default).
+    /// Sets the signing keys for the capability tokens.
+    /// Production sets the configured secret.
+    /// A test keeps the ephemeral default.
     pub fn with_token_keys(mut self, keys: TokenKeys) -> Self {
         self.token_keys = Arc::new(keys);
         self
     }
 
-    /// Mint a capability token for `file_id` and `act`.
+    /// Mints a capability token for `file_id` and `act`.
     pub fn mint_token(&self, sub: &str, file_id: &str, act: Action) -> Result<String, FsError> {
         self.token_keys.mint(sub, file_id, act)
     }
 
-    /// Verify a capability token.
+    /// Verifies a capability token.
     pub fn verify_token(&self, token: &str, file_id: &str, act: Action) -> Result<(), FsError> {
         self.token_keys.verify(token, file_id, act)
     }
 
-    /// Attach a file to a row; caller must have `Write` on the row.
+    /// Attach a file to a row. The caller must have `Write` on the row.
     pub async fn attach(
         &self,
         row_type: &str,
@@ -421,7 +468,7 @@ impl FsEngine {
                 crate::policy::PolicyError::AccessDenied => FsError::Forbidden,
                 other => FsError::Internal(other.to_string()),
             })?;
-        // ensure file exists
+        // The file must exist.
         if self.store.get_file(file_id).await?.is_none() {
             return Err(FsError::NotFound("file not found".into()));
         }
@@ -435,7 +482,7 @@ impl FsEngine {
         Ok(count)
     }
 
-    /// Detach a file from a row; caller must have `Write` on the row.
+    /// Detach a file from a row. The caller must have `Write` on the row.
     pub async fn detach(
         &self,
         row_type: &str,
@@ -471,18 +518,22 @@ impl FsEngine {
         };
         let rows = self.store.rows_for_file(file_id).await?;
         if rows.is_empty() {
-            // An unreferenced file is a temp upload, and the temp model is
-            // owner-scoped: `delete_file`'s doc and its `info.count == 0`
-            // gate both say so. Ownership is therefore the WHOLE answer here,
-            // which is what this branch has always meant.
+            // A file with no reference is a temp upload.
+            // The temp model gives the file to its owner.
+            // The doc of `delete_file` and its `info.count == 0` check both
+            // say so.
+            // Ownership is therefore the WHOLE answer in this branch, as it
+            // has always been.
             return Ok(rec.owner_sub == caller_sub);
         }
-        // A file attached to rows is governed by the ROW policy, including for
-        // the user who uploaded it. Short-circuiting on ownership before this
-        // loop would let an uploader Read or Delete a file attached to a row
-        // they hold no grant on -- so an owner attaching a file to a shared
-        // row would lose the ability to remove it, while a user they never
-        // granted anything to would lose the ability to read it.
+        // The ROW policy governs a file that is attached to rows.
+        // The policy governs the user who uploaded the file as well.
+        // If the code returned early on ownership before this loop, an
+        // uploader could Read or Delete a file on a row with no grant.
+        // An owner who attached a file to a shared row would then lose the
+        // ability to remove the file.
+        // A user who received no grant would lose the ability to read the
+        // file.
         for (ty, rid) in rows {
             if self
                 .policy
@@ -511,10 +562,11 @@ impl FsEngine {
                 .await?;
             Some(id)
         };
-        // Allocate before touching S3 is not possible (the multipart upload
-        // is created first), so the slot vectors are built fallibly: a
-        // failure here has to surface as a 4xx rather than take the process
-        // down with it.
+        // The engine cannot allocate before it touches S3, because it
+        // creates the multipart upload first.
+        // The code therefore builds the slot vectors in a way that can fail.
+        // A failure here must become a 4xx, and must not take the process
+        // down.
         let etags = part_slots(req.file_total_parts)?;
         let checksums = part_slots(req.file_total_parts)?;
         let session = UploadSession {
@@ -530,9 +582,9 @@ impl FsEngine {
             checksums,
         };
         self.store.save_session(&session).await?;
-        // Persist S3-side state with the session: after a restart the
-        // client RAM map is empty and only this record can rehydrate
-        // (or abort) the backend upload.
+        // The engine stores the S3 state with the session.
+        // After a restart, the client RAM map is empty.
+        // Only this record can load the backend upload, or abort it.
         if let Some(upload_id) = session.s3_upload_id.as_deref() {
             let s3_upload_id = self.s3.backend_upload_id(upload_id).await.ok_or_else(|| {
                 FsError::Internal("multipart created but backend id missing".into())
@@ -551,24 +603,31 @@ impl FsEngine {
         Ok(file_id)
     }
 
-    /// Stores a single chunk; only the session owner may write.
+    /// Stores one chunk. Only the owner of the session may write.
     ///
-    /// The body arrives as a chunk stream capped at the session's
-    /// expected part size: oversize bodies are cut mid-stream (413)
-    /// instead of buffered to completion, and a declared
-    /// `Content-Length` that already mismatches is rejected before a
-    /// single chunk is read. The part itself is still buffered once —
-    /// S3 SigV4 must hash the full part before sending, so zero-buffer
-    /// uploads are protocol-blocked; the bound is now the part size
-    /// (≤10 MiB by init validation), not the 16 MiB blanket cap.
+    /// The body arrives as a chunk stream.
+    /// The stream stops at the expected part size of the session.
+    /// A body that is too large ends with 413 in the middle of the stream,
+    /// and the code does not buffer it to the end.
+    /// A declared `Content-Length` that does not match is rejected before
+    /// the code reads the first chunk.
+    /// The code buffers the part once, because S3 SigV4 must hash the whole
+    /// part before it sends it.
+    /// The S3 protocol therefore blocks uploads with no buffer.
+    /// The bound is now the part size, which is at most 10 MiB by init
+    /// validation, and not the 16 MiB cap for all bodies.
     ///
-    /// The session's two rows are merged under its lock *after* the bytes
-    /// are staged, never before: the body stream and the S3 round trip are
-    /// the slow part and are per-part, so holding the lock across them
-    /// would serialize a client's own parallel part uploads — the pattern
-    /// this exists to support. Everything that can lose an entry is in the
-    /// merge ([`merge_part`](Self::merge_part)), which re-reads under the
-    /// lock instead of trusting the copy read here.
+    /// The engine merges the two rows of the session under the lock *after*
+    /// it stages the bytes, and never before.
+    /// The body stream and the S3 round trip are the slow parts, and both
+    /// are per part.
+    /// Holding the lock across them would make the parallel part uploads of
+    /// one client wait for each other.
+    /// That pattern is the reason for this lock.
+    /// Everything that can lose an entry is in the merge
+    /// (`merge_part`).
+    /// The merge reads the rows again under the lock, and does not trust
+    /// the copy that the caller read.
     #[tracing::instrument(skip(self, body, checksum_sha256), fields(file_id = %file_id, part_index, declared_len = declared_len, caller_sub = %caller_sub), err)]
     pub async fn upload_part<S>(
         &self,
@@ -580,9 +639,11 @@ impl FsEngine {
         caller_sub: &str,
     ) -> Result<(), FsError>
     where
-        // No `Send` bound: actix `Payload` is `!Send` (thread-local h1
-        // body) and handlers run on the worker arbiter, so the intake
-        // future stays thread-local like the `Bytes` extractor was.
+        // The code sets no `Send` bound.
+        // The actix `Payload` is `!Send`, because the h1 body is
+        // thread-local, and the handlers run on the worker arbiter.
+        // The intake future therefore stays thread-local, as the `Bytes`
+        // extractor did.
         S: futures_util::Stream<Item = Result<bytes::Bytes, FsError>>,
     {
         use futures_util::StreamExt as _;
@@ -612,9 +673,9 @@ impl FsEngine {
             }
             _ => {}
         }
-        // Absolute ceiling mirrors the HTTP payload cap: the old `Bytes`
-        // extractor rejected anything past it, and part sizes above it
-        // were never uploadable.
+        // The ceiling matches the HTTP payload cap.
+        // The old `Bytes` extractor rejected anything above the cap, and a
+        // part size above it was never uploadable.
         let ceiling = expected.min(crate::http::MAX_PAYLOAD_BYTES as u64) + 1;
         let mut buf =
             Vec::with_capacity(expected.min(crate::http::MAX_PAYLOAD_BYTES as u64) as usize);
@@ -683,31 +744,38 @@ impl FsEngine {
         .await
     }
 
-    /// Folds one uploaded part into the session row and its durable
-    /// multipart record, under the session's lock.
+    /// Adds one uploaded part to the session row and to the durable multipart
+    /// record. The engine holds the lock of the session.
     ///
-    /// Everything that can lose a concurrent part's entry is here: the
-    /// session and the record are separate KV keys, so a merge that
-    /// wrote only one of them — or read them at different instants than
-    /// the sibling that was interleaved with — dropped a part that the
-    /// client had already been told was uploaded.
+    /// Everything that can lose the entry of a concurrent part is here.
+    /// The session and the record are separate KV keys.
+    /// A merge that wrote only one of them dropped a part that the client
+    /// already knew was uploaded.
+    /// A merge that read them at a different moment from the sibling that
+    /// ran at the same time dropped a part too.
     ///
-    /// The session is re-read under the lock rather than reused from the
-    /// caller's copy, which was taken before the body was streamed and
-    /// before the S3 round trip. That copy is still what the size and
-    /// bounds checks ran against, which is sound because `file_size`,
-    /// `part_size` and `file_total_parts` are fixed at init and the id is
-    /// a fresh uuid, so no other request can resize the session; the
-    /// re-read still re-checks the index and the owner.
+    /// The engine reads the session again under the lock.
+    /// The engine does not use the copy from the caller.
+    /// The caller took that copy before it read the body and before the S3
+    /// round trip.
+    /// The size and bounds checks still ran against that copy.
+    /// Those checks are sound because `file_size`, `part_size`, and
+    /// `file_total_parts` are fixed at init, and the id is a new uuid.
+    /// No other request can then resize the session.
+    /// The read under the lock checks the index and the owner again.
     ///
-    /// The record is written FIRST. A crash between the two keys must
-    /// leave the session short an etag, never the record short a part:
-    /// the first is a 400 "not all parts uploaded" that the client repairs
-    /// by re-uploading the part `GET /fs/uploads/{id}` shows missing, while
-    /// the second is the unwedgeable "etag count N != part count N-1" that
-    /// looks complete in every response the client can see. It is the same
-    /// ordering `FsStore::delete_session` uses, cascade rows before the
-    /// row that makes them reachable.
+    /// The engine writes the record FIRST.
+    /// A crash between the two keys must then leave the session short of
+    /// one etag, and never the record short of one part.
+    /// A session that is short of an etag returns a 400 "not all parts
+    /// uploaded".
+    /// The client repairs that by uploading again the part that
+    /// `GET /fs/uploads/{id}` shows as missing.
+    /// A record that is short of one part gives "etag count N != part count
+    /// N-1", which no client can clear.
+    /// Every response that the client can see shows the upload as complete.
+    /// The engine uses the same order as `FsStore::delete_session`, which
+    /// deletes the cascade rows before the row that reaches them.
     async fn merge_part(
         &self,
         file_id: &str,
@@ -731,8 +799,8 @@ impl FsEngine {
         if slot >= session.etags.len() {
             return Err(FsError::BadRequest("part index out of bounds".into()));
         }
-        // Mirror staged content ids into the durable record so a
-        // restarted client can still complete this upload.
+        // The engine copies the staged content ids into the durable
+        // record, so that a restarted client can complete the upload.
         if let Some(upload_id) = upload_id
             && let Some(mut record) = self.store.load_multipart(upload_id).await?
         {
@@ -748,12 +816,14 @@ impl FsEngine {
         Ok(())
     }
 
-    /// Rehydrates client-side multipart state from the durable record.
+    /// Loads the multipart state of the client from the durable record.
     ///
-    /// Sessions predating persistence (or a crashed init between the
-    /// session write and the record write) have no record: their
-    /// backend upload is unaddressable, so callers get a clear restart
-    /// signal instead of an opaque `unknown upload_id`.
+    /// A session from before the store added persistence has no record.
+    /// A session whose init crashed between the session write and the
+    /// record write also has no record.
+    /// The backend upload of such a session cannot be addressed.
+    /// The caller then gets a clear restart signal, and not an unclear
+    /// `unknown upload_id`.
     async fn ensure_multipart(&self, upload_id: &str) -> Result<(), FsError> {
         let Some(record) = self.store.load_multipart(upload_id).await? else {
             return Err(FsError::BadRequest(
@@ -764,12 +834,14 @@ impl FsEngine {
         self.s3.restore_multipart(&record).await
     }
 
-    /// Aborts the S3 side of an expired/abandoned session.
+    /// Aborts the S3 side of an expired session or of an abandoned session.
     ///
-    /// `NotFound` from S3 means already gone (aborted, completed, or a
-    /// fresh InMemory backend after restart): success for GC purposes.
-    /// Any other failure propagates so the session is retained for
-    /// retry instead of leaking staged bytes no record points at.
+    /// `NotFound` from S3 means that the upload is already gone.
+    /// It was aborted, completed, or a restart gave a new InMemory backend.
+    /// For GC that is a success.
+    /// Any other failure passes to the caller, so that the session stays
+    /// for a retry.
+    /// This also stops the leak of staged bytes that no record points at.
     pub(crate) async fn abort_session_upload(
         &self,
         session: &UploadSession,
@@ -785,9 +857,12 @@ impl FsEngine {
                 });
         };
         if self.store.load_multipart(upload_id).await?.is_none() {
-            // Predates persistence: backend unaddressable, staged parts
-            // unreachable. Warn loudly, let the session go (a future
-            // sweeper with S3 multipart listing could reclaim these).
+            // The session is from before the store added persistence.
+            // The backend upload cannot be addressed, and the staged parts
+            // cannot be reached.
+            // The engine warns, and then lets the session go.
+            // A later sweeper that lists the S3 multipart uploads can
+            // reclaim these parts.
             tracing::warn!(
                 "gc expiring {} has no multipart record; staged S3 parts may leak",
                 session.id
@@ -815,13 +890,14 @@ impl FsEngine {
         }
     }
 
-    /// Finalizes an upload session; only the owner may complete.
+    /// Finalizes an upload session. Only the owner may complete it.
     ///
-    /// Idempotent from the client's side: a retry after a failed announce
-    /// finds the committed record *and* the session the failure left
-    /// behind, re-announces, and converges. See
-    /// [`with_change_sink`](Self::with_change_sink) for what that does and
-    /// does not guarantee.
+    /// The method is idempotent for the client.
+    /// A retry after a failed announce finds the committed record and the
+    /// session that the failure left behind.
+    /// The method announces again, and the retry converges.
+    /// See [`with_change_sink`](Self::with_change_sink) for what this
+    /// guarantees.
     #[tracing::instrument(skip(self, req), fields(file_id = %file_id, caller_sub = %caller_sub), err)]
     pub async fn complete_upload(
         &self,
@@ -829,16 +905,21 @@ impl FsEngine {
         req: CompleteRequest,
         caller_sub: &str,
     ) -> Result<(), FsError> {
-        // Held across the whole completion, S3 round trip included: a
-        // complete that interleaved with a part upload is the same lost
-        // write as two parts interleaving with each other, and unlike two
-        // parts it is not the client's normal pattern. This is per session,
-        // so it costs nothing to a client uploading several files at once.
+        // The engine holds the lock across the whole completion, and
+        // the S3 round trip too.
+        // A complete that runs at the same time as a part upload loses a
+        // write in the same way as two parts that run at the same time.
+        // Unlike two parts, a complete and a part upload are not the normal
+        // pattern of a client.
+        // The lock is per session, so it costs nothing to a client that
+        // uploads several files at once.
         let session_lock = self.session_locks.acquire(file_id).await;
         let _held = session_lock.acquire().await;
-        // The record is read first because it is the committed half: a
-        // session that outlived its own commit is the retry handle, and a
-        // record with no session is an upload that already converged.
+        // The engine reads the record first, because the record is the
+        // committed half.
+        // A session that outlived its own commit is the handle for the
+        // retry.
+        // A record with no session is an upload that already converged.
         let committed = self.store.get_file(file_id).await?;
         let session = self.store.get_session(file_id).await?;
         if let Some(rec) = &committed {
@@ -846,17 +927,21 @@ impl FsEngine {
                 return Err(FsError::Forbidden);
             }
             let Some(_session) = session else {
-                // Announced and cleaned up by an earlier attempt: only this
-                // module drops the session, and only after the append
-                // returned, so there is nothing left to announce. Success
-                // WITHOUT an append, which is what stops a client looping
-                // `complete` on a file id from growing the feed.
+                // An earlier attempt announced the op and cleaned up.
+                // Only this module drops the session.
+                // It drops the session only after the append returns.
+                // There is then nothing left to announce.
+                // The method returns success WITHOUT an append.
+                // That is what stops a client that repeats `complete` on one
+                // file id from growing the feed.
                 return Ok(());
             };
-            // Committed, session still here: the announce (or the cleanup
-            // after it) failed. Re-announce from the committed record --
-            // the exact op that was lost -- then drop the handle so the
-            // bound holds for the next retry too.
+            // The record is committed and the session is still there, so the
+            // announce, or the cleanup after it, failed.
+            // The method announces again from the committed record, which is
+            // the exact op that was lost.
+            // The method then drops the handle, so that the bound also holds
+            // for the next retry.
             self.announce(WalOp::FileCreate { rec: rec.clone() })
                 .await?;
             self.store.delete_session(file_id).await?;
@@ -892,8 +977,9 @@ impl FsEngine {
             self.s3
                 .complete_multipart_upload(&self.bucket, &session.s3_key, upload_id, etags)
                 .await?;
-            // Drop the durable record with the completed upload (the
-            // session delete below cascades as a backstop).
+            // The engine deletes the durable record with the
+            // completed upload.
+            // The session delete below is then a backup for that delete.
             self.store.delete_multipart(upload_id).await?;
         }
         let record = FileRecord {
@@ -905,28 +991,33 @@ impl FsEngine {
             owner_sub: session.owner_sub.clone(),
             created_at: chrono::Utc::now().timestamp(),
         };
-        // Commit, announce, and only then release the retry handle. The
-        // old order deleted the session before the append, so an append
-        // that failed left a committed file with no session and no op --
-        // the client's retry 404'd on `get_session` and every replica
-        // applying the feed incrementally never learned the file existed.
+        // The engine commits, then announces, and only then releases
+        // the retry handle.
+        // The old order deleted the session before the append.
+        // An append that then failed left a committed file with no session
+        // and no op.
+        // The retry of the client returned 404 on `get_session`.
+        // Each replica that applies the feed incrementally never learned
+        // that the file exists.
         self.store.save_file(&record).await?;
         self.announce(WalOp::FileCreate { rec: record }).await?;
         self.store.delete_session(file_id).await?;
         Ok(())
     }
 
-    /// Aborts a multipart upload; only the owner may cancel.
+    /// Aborts a multipart upload. Only the owner may cancel it.
     ///
-    /// S3 abort runs before the session is deleted, and a failed abort
-    /// (other than already-gone) fails the cancel: the session stays
-    /// so GC retries instead of leaking staged parts no record
-    /// points at.
+    /// The engine aborts in S3 before it deletes the session.
+    /// A failed abort, other than an upload that is already gone, fails the
+    /// cancel.
+    /// The session then stays, and GC retries it.
+    /// This stops the leak of staged parts that no record points at.
     #[tracing::instrument(skip(self), fields(file_id = %file_id, caller_sub = %caller_sub), err)]
     pub async fn cancel_upload(&self, file_id: &str, caller_sub: &str) -> Result<(), FsError> {
-        // Same lock as completion: a cancel that interleaved with a part
-        // upload's merge would let that merge write the session back
-        // underneath it, resurrecting an upload whose S3 side is gone.
+        // The engine takes the same lock as for the completion.
+        // A cancel that runs at the same time as the merge of a part upload
+        // would let the merge write the session back.
+        // That would bring back an upload whose S3 side is gone.
         let session_lock = self.session_locks.acquire(file_id).await;
         let _held = session_lock.acquire().await;
         let session = self
@@ -944,7 +1035,8 @@ impl FsEngine {
         Ok(())
     }
 
-    /// Returns file metadata if caller owns temp file or has row access.
+    /// Returns the file metadata. The caller must own the temp file, or the
+    /// caller must have access to the row.
     #[tracing::instrument(skip(self), fields(file_id = %file_id, caller_sub = %caller_sub), err)]
     pub async fn get_metadata(
         &self,
@@ -967,20 +1059,28 @@ impl FsEngine {
         })
     }
 
-    /// Deletes a finalized file; allowed when caller has row `Delete` or owns temp unreferenced file.
+    /// Deletes a finalized file.
+    /// The caller must have `Delete` on the row, or the caller must own the
+    /// unreferenced temp file.
     ///
-    /// The announce comes FIRST, for the same reason [`gc`](crate::fs::gc)
-    /// puts it before the row delete: the row is the only thing left that
-    /// knows this deletion still has to be announced, so an append that
-    /// fails has to retain it. The old order deleted the row and the bytes
-    /// and announced last, which turned a WAL blip into a 500 whose retry
-    /// 404'd (`get_file` -> `None`) -- every replica kept serving a record
-    /// for bytes that were already gone, and nothing re-announced it.
+    /// The engine announces FIRST, for the same reason as [`gc`].
+    /// `gc` announces before it deletes the row.
+    /// The row is the only thing left that knows that this deletion still
+    /// needs an announce.
+    /// A failed append must therefore keep it.
+    /// The old order deleted the row and the bytes, and announced last.
+    /// A WAL failure then turned into a 500.
+    /// The retry of that 500 returned 404, because `get_file` gave `None`.
+    /// Each replica kept serving a record for bytes that were already gone,
+    /// and nothing announced the delete again.
     ///
-    /// Metadata still goes before S3 bytes: a failure between them leaks an
-    /// unreachable object, which gc's orphan pass provably reaps after the
-    /// TTL, rather than leaving a record that 404s every download. A retry
-    /// of THAT case finds no row and 404s, which is why the bytes are last.
+    /// The engine deletes the metadata before the S3 bytes.
+    /// A failure between the two deletes leaks an object that no row
+    /// reaches, and the orphan pass of gc deletes it after the TTL.
+    /// The other order would leave a record that returns 404 for every
+    /// download.
+    /// A retry of that case finds no row and returns 404.
+    /// That is why the bytes are last.
     #[tracing::instrument(skip(self), fields(file_id = %file_id, caller_sub = %caller_sub), err)]
     pub async fn delete_file(&self, file_id: &str, caller_sub: &str) -> Result<(), FsError> {
         let rec = self
@@ -988,7 +1088,8 @@ impl FsEngine {
             .get_file(file_id)
             .await?
             .ok_or_else(|| FsError::NotFound("file not found".into()))?;
-        // temp unreferenced file owned by caller can be deleted directly
+        // The caller can delete an unreferenced temp file that the
+        // caller owns.
         let info = self.store.get_ref_info(file_id).await?;
         if info.count == 0 {
             if rec.owner_sub != caller_sub {
@@ -997,15 +1098,18 @@ impl FsEngine {
         } else if !self.can_access(caller_sub, file_id, Action::Delete).await? {
             return Err(FsError::Forbidden);
         }
-        // Announced before the row goes, not after: an append that fails
-        // here leaves the row, and the client's retry re-runs this whole
-        // authorized path and converges. Re-announcing is free -- replaying
-        // `FileDelete` is a `delete_file` on the replica, idempotent on a
-        // file that is already gone.
+        // The engine announces before the row goes, and not after.
+        // A failed append then leaves the row.
+        // The retry of the client runs this whole authorized path again and
+        // converges.
+        // An announce again costs nothing.
+        // On the replica, replaying `FileDelete` is a `delete_file`, and it
+        // is idempotent for a file that is already gone.
         //
-        // Deliberately NOT extended to "no record means already deleted,
-        // announce anyway": that would turn every 404 into a permanent feed
-        // entry, and the feed is append-only with nothing to authorize
+        // The code deliberately does NOT extend this to "no record means
+        // already deleted, announce anyway".
+        // That change would turn every 404 into a permanent feed entry.
+        // The feed is append-only, and it has nothing to check the request
         // against once the record is gone.
         self.announce(WalOp::FileDelete {
             file_id: file_id.to_string(),
@@ -1016,11 +1120,12 @@ impl FsEngine {
         Ok(())
     }
 
-    /// Streams a file body if caller has row `Read` or owns temp.
+    /// Streams a file body. The caller must have `Read` on the row, or own
+    /// the temp file.
     ///
-    /// Chunks flow straight from the object store to the response: the
-    /// full body is never buffered, so arbitrarily large files download
-    /// in constant memory.
+    /// The chunks go straight from the object store to the response.
+    /// The engine never buffers the whole body, so a file of any size
+    /// downloads with the same memory use.
     #[tracing::instrument(skip(self), fields(file_id = %file_id, caller_sub = %caller_sub), err)]
     pub async fn get_object(
         &self,
@@ -1039,13 +1144,14 @@ impl FsEngine {
         Ok((rec, body))
     }
 
-    /// Streams one absolute byte range (`end` exclusive) of a file the
-    /// caller may read.
+    /// Streams one absolute byte range of a file that the caller may read.
+    /// The `end` value is not part of the range.
     ///
-    /// Auth and metadata size come from the same checks as
-    /// [`FsEngine::get_object`]; sizes are immutable after completion,
-    /// so the range is clamped defensively and routes decide 416
-    /// against metadata they already hold.
+    /// The auth check and the metadata size come from the same checks as
+    /// [`FsEngine::get_object`].
+    /// A size never changes after the completion, so the engine clamps the
+    /// range as a safety measure.
+    /// The routes then return 416 from metadata that they already hold.
     #[tracing::instrument(skip(self), fields(file_id = %file_id, caller_sub = %caller_sub, start = range.start, end = range.end), err)]
     pub async fn get_object_range(
         &self,
@@ -1070,7 +1176,7 @@ impl FsEngine {
         Ok((rec, body))
     }
 
-    /// Returns upload progress; only owner may poll.
+    /// Returns upload progress. Only the owner may poll.
     #[tracing::instrument(skip(self), fields(file_id = %file_id, caller_sub = %caller_sub), err)]
     pub async fn get_progress(
         &self,
@@ -1120,11 +1226,12 @@ mod tests {
         make_engine_and_policy(sub).await.0
     }
 
-    /// The engine plus the write-capable policy handle.
+    /// The engine and the policy handle that can write rules.
     ///
-    /// `FsEngine` only holds an `Authorizer`, so a test that needs to grant a
-    /// rule has to keep the engine that seeded it -- which is the point of
-    /// the narrower field, not a workaround for it.
+    /// `FsEngine` only holds an `Authorizer`.
+    /// A test that must grant a rule therefore has to keep the engine that
+    /// created the rule.
+    /// That is the point of the narrower field, and not a workaround.
     async fn make_engine_and_policy(sub: &str) -> (FsEngine, PolicyEngine) {
         use crate::db::build_test_store;
         let prefix = format!("{}-{sub}", crate::db::test_prefix("fs-engine"));
@@ -1147,13 +1254,14 @@ mod tests {
         }
     }
 
-    /// Wraps one buffered part as the chunk stream the engine now takes.
+    /// Wraps one buffered part as the chunk stream that the engine now takes.
     fn once_body(body: Vec<u8>) -> impl futures_util::Stream<Item = Result<Bytes, FsError>> {
         futures_util::stream::once(async move { Ok(Bytes::from(body)) })
     }
 
-    /// Engine over an explicit byte backend, for the tests that need to
-    /// control when the backend answers.
+    /// Creates an engine over an explicit byte backend.
+    /// A test that must control when the backend answers uses this
+    /// helper.
     async fn engine_with_s3(sub: &str, s3: Arc<dyn S3Client>) -> FsEngine {
         let prefix = format!("{}-{sub}", crate::db::test_prefix("fs-engine"));
         let store = FsStore::primary(crate::db::build_test_store(&prefix).await);
@@ -1164,26 +1272,30 @@ mod tests {
         FsEngine::from_parts(store, s3, "test-bucket".to_string(), policy.authorizer())
     }
 
-    /// [`S3Client`] that parks ONE chosen `upload_part` until released.
+    /// An [`S3Client`] that parks ONE chosen `upload_part` until the test
+    /// releases it.
     ///
-    /// Everything else delegates to a real in-memory backend, so
-    /// `complete_upload` genuinely assembles the object; only WHEN one part
-    /// upload reaches the backend is controlled. That is what makes the
-    /// interleaving a regression test rather than a race the scheduler has
-    /// to lose: the parked part is inside the backend call while the other
-    /// parts run their whole read-merge-write.
+    /// Every other call goes to a real in-memory backend, so
+    /// `complete_upload` really assembles the object.
+    /// The code controls only WHEN one part upload reaches the backend.
+    /// That control makes the interleaving a regression test, and not a
+    /// race that the scheduler must lose.
+    /// The parked part is inside the backend call, while the other parts run
+    /// their whole read, merge, and write.
     struct GateS3 {
         inner: Arc<dyn S3Client>,
-        /// The 1-indexed part number to park. It has to be the LAST one:
-        /// the in-memory backend only accepts parts in ascending order.
+        /// The part number to park, counted from 1.
+        /// It must be the LAST part, because the in-memory backend accepts
+        /// only parts in ascending order.
         gate_part: i32,
         parked: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
         release: Arc<tokio::sync::Notify>,
     }
 
     impl GateS3 {
-        /// The client, a "parked" signal fired from inside the `gate_part`
-        /// upload, and the handle that lets it go.
+        /// Returns the client, the signal that fires inside the `gate_part`
+        /// upload to show that it is parked, and the handle that releases
+        /// it.
         fn new(
             inner: Arc<dyn S3Client>,
             gate_part: i32,
@@ -1316,29 +1428,34 @@ mod tests {
     ///         self.store.save_multipart(&record).await?;
     ///     }
     ///
-    /// Nothing held the read-modify-write: `FsStore` takes `inner.write()`
-    /// per call, and `FsEngine` is shared across workers as `web::Data`.
-    /// Parallel part upload is the normal multipart client pattern, so part
-    /// 1 writing back the session it read before part 0's save dropped part
-    /// 0's etag, and `GET /fs/uploads/{id}` reported it as never uploaded
-    /// even though the bytes were staged.
+    /// Nothing held the read-modify-write.
+    /// `FsStore` takes `inner.write()` for each call, and `FsEngine` is
+    /// shared across the workers as `web::Data`.
+    /// Parallel part upload is the normal pattern of a multipart client.
+    /// Part 1 then wrote back the session that it read before the save of
+    /// part 0, and that dropped the etag of part 0.
+    /// `GET /fs/uploads/{id}` reported the part as never uploaded, although
+    /// the bytes were staged.
     ///
-    /// The worse interleaving dropped only the RECORD: both session etags
-    /// present, record short a part, `complete_upload` passing its
-    /// `any(is_none)` gate and failing in the backend with "etag count 2
-    /// != part count 1" -- a failure no client response hints at and no
-    /// retry can clear.
+    /// A worse interleaving dropped only the RECORD.
+    /// Both session etags were then present, and the record was short of one
+    /// part.
+    /// `complete_upload` passed its `any(is_none)` check, and then failed in
+    /// the backend with "etag count 2 != part count 1".
+    /// No client response reports that failure, and no retry can clear it.
     ///
-    /// Deterministic by construction: part 0 is parked inside the backend
-    /// call while part 1 runs start to finish, so the sibling that must
-    /// interleave is guaranteed to interleave. Before the fix part 1's
-    /// stale copy is written back over part 0's etag and the session is
-    /// left `[Some, None]`.
+    /// The test is deterministic by construction.
+    /// Part 0 is parked inside the backend call, and part 1 runs from start
+    /// to finish.
+    /// The sibling that must interleave therefore always interleaves.
+    /// Before the fix, the stale copy of part 1 was written back over the
+    /// etag of part 0, and the session was left `[Some, None]`.
     #[tokio::test]
     async fn concurrent_part_uploads_keep_every_etag_and_record_part() -> anyhow::Result<()> {
         const PARTS: u64 = 3;
-        // The LAST part parks: parts must reach the backend in ascending
-        // order, so the parked one has to be the one whose siblings ran
+        // The LAST part is parked.
+        // The parts must reach the backend in ascending order.
+        // The parked part must therefore be the one whose siblings ran
         // first.
         let (gate, parked, release) = GateS3::new(ObjectStoreClient::in_memory(), PARTS as i32);
         let engine = engine_with_s3("alice-parallel", Arc::new(gate)).await;
@@ -1353,8 +1470,8 @@ mod tests {
             )
             .await?;
 
-        // The last part parks inside the backend; the earlier two then run
-        // their whole read-merge-write while it waits.
+        // The last part is parked inside the backend, and the earlier
+        // two parts run their whole read, merge, and write while it waits.
         let last = tokio::spawn({
             let engine = engine.clone();
             let id = id.clone();
@@ -1409,8 +1526,8 @@ mod tests {
             record.parts
         );
 
-        // The whole point: an upload whose client has been told every part
-        // is present must actually complete.
+        // The whole point of the test: an upload whose client was told
+        // that every part is present must really complete.
         engine
             .complete_upload(
                 &id,
@@ -1447,10 +1564,11 @@ mod tests {
         Ok(())
     }
 
-    /// End-to-end version of the allocation-abort regression: the abusive
-    /// body must come back as a 4xx, not take the process with it. Running
-    /// this against the unfixed engine would abort the test binary, which
-    /// is exactly the failure being guarded.
+    /// The end-to-end version of the test for the allocation abort.
+    /// The abusive body must return a 4xx, and must not take the process
+    /// with it.
+    /// Running this test against the engine before the fix stopped the test
+    /// binary, and that failure is the one that the test guards.
     #[tokio::test]
     async fn init_upload_rejects_an_allocation_bomb_without_dying() -> anyhow::Result<()> {
         let engine = make_engine("alice").await;
@@ -1472,20 +1590,25 @@ mod tests {
         Ok(())
     }
 
-    /// The slot vectors are built fallibly, so an absurd count is a 4xx even
-    /// if validation is bypassed or the cap is later raised by mistake.
+    /// The engine builds the slot vectors in a way that can fail, so an
+    /// absurd count returns a 4xx.
+    /// That is true even if a caller skips the validation or raises the
+    /// cap by mistake.
     #[test]
     fn part_slots_never_aborts() {
-        // Legal: exactly the S3 limit.
+        // This value is valid. It is exactly the S3 limit.
         assert_eq!(
             part_slots(model::MAX_MULTIPART_PARTS).unwrap().len(),
             10_000
         );
-        // Illegal by the cap, but reachable only if validation is skipped;
-        // must return an error rather than attempt the allocation.
+        // This value breaks the cap, and it is reachable only if a caller
+        // skips the validation.
+        // The function must return an error, and must not try the
+        // allocation.
         let err = part_slots(u64::MAX).expect_err("u64::MAX must not allocate");
         assert!(matches!(err, FsError::BadRequest(_)), "got {err:?}");
-        // The failure message must not leak memory state to the client.
+        // The failure message must not tell the client about the memory
+        // state.
         assert!(!err.to_string().contains("memory"), "leaks: {err}");
     }
 
@@ -1493,7 +1616,7 @@ mod tests {
     async fn temp_upload_owned_by_caller() -> anyhow::Result<()> {
         let engine = make_engine("alice").await;
         let id = engine.init_upload(valid_single(), "alice").await?;
-        // bob cannot write alice's session
+        // The subject bob cannot write the session of alice.
         let err = engine
             .upload_part(&id, 0, once_body(vec![1u8; 1024]), None, None, "bob")
             .await
@@ -1519,15 +1642,15 @@ mod tests {
                 "alice",
             )
             .await?;
-        // no row permission -> forbidden
+        // No row permission gives a forbidden error.
         assert!(engine.attach("invoice", "123", &id, "alice").await.is_err());
-        // grant alice write on invoice:123
+        // The test grants write on invoice:123 to alice.
         policy
             .add_rule("alice".into(), "invoice:123".into(), Action::Write)
             .await
             .unwrap();
         assert_eq!(engine.attach("invoice", "123", &id, "alice").await?, 1);
-        // idempotent
+        // The second attach is idempotent.
         assert_eq!(engine.attach("invoice", "123", &id, "alice").await?, 1);
         Ok(())
     }
@@ -1549,9 +1672,9 @@ mod tests {
                 "alice",
             )
             .await?;
-        // bob cannot read temp file owned by alice
+        // The subject bob cannot read the temp file of alice.
         assert!(engine.get_metadata(&id, "bob").await.is_err());
-        // grant bob read via row
+        // The test grants read on the row to bob.
         policy
             .add_rule("alice".into(), "invoice:123".into(), Action::Write)
             .await
@@ -1566,15 +1689,17 @@ mod tests {
         Ok(())
     }
 
-    /// `can_access` is the one FS call site that goes through
-    /// `authorize_row` rather than `require_row`, so it is the one path the
-    /// narrowed field could have broken silently: the trait impl it resolves
-    /// against moved when `policy` became an `Authorizer`.
+    /// `can_access` is the only FS call site that uses `authorize_row` and
+    /// not `require_row`.
+    /// It is therefore the one path that the narrower field could break
+    /// without an error.
+    /// The trait impl that it resolves against moved when `policy` became
+    /// an `Authorizer`.
     ///
-    /// Denial is asserted as carefully as the grant. A delegation mistake
-    /// that resolved to a permissive default would still return `true` for
-    /// the granted subject, so only the granted assertion would notice
-    /// nothing.
+    /// The test checks a denial as carefully as it checks a grant.
+    /// A delegation error that resolved to a default that allows access
+    /// would still return `true` for the granted subject.
+    /// Only the granted check would then find nothing wrong.
     #[tokio::test]
     async fn authorize_row_decides_access_through_the_narrowed_policy_field() -> anyhow::Result<()>
     {
@@ -1599,7 +1724,8 @@ mod tests {
             .unwrap();
         engine.attach("invoice", "123", &id, "alice").await?;
 
-        // A linked row with no rule for bob is a deny, not an error.
+        // A linked row with no rule for bob denies the access. It does not
+        // return an error.
         assert!(!engine.can_access("bob", &id, Action::Read).await?);
 
         policy
@@ -1607,19 +1733,24 @@ mod tests {
             .await
             .unwrap();
         assert!(engine.can_access("bob", &id, Action::Read).await?);
-        // Read on the row is not write on it: the action is part of the key.
+        // Read on the row is not write on the row. The action is part of the
+        // key.
         assert!(!engine.can_access("bob", &id, Action::Delete).await?);
 
-        // The OWNER is now subject to the row policy like anyone else.
-        // Alice holds Write on invoice:123, not Delete, so a file attached to
-        // that row is not hers to remove. This assertion used to read "the
-        // owner always reaches their own file, whatever policy says", which
-        // is the bug: it let an uploader delete a file another user was
-        // relying on through a row they control.
+        // The OWNER is subject to the row policy now, like every other
+        // subject.
+        // Alice holds Write on invoice:123, and not Delete.
+        // Alice therefore cannot remove a file attached to that row.
+        // This assertion used to read "the owner always reaches their own
+        // file, whatever policy says".
+        // That reading was the bug, because it let an uploader delete a
+        // file that another user used through a row that the uploader
+        // controls.
         assert!(!engine.can_access("alice", &id, Action::Delete).await?);
         assert!(engine.can_access("alice", &id, Action::Write).await?);
-        // And a policy change made after the fact is seen, which is only
-        // true because the handle shares the engine rather than copying it.
+        // The test also sees a policy change that comes later.
+        // This is true only because the handle shares the engine, and does
+        // not copy it.
         policy
             .remove_rule("bob".into(), "invoice:123".into(), Action::Read)
             .await
@@ -1628,12 +1759,14 @@ mod tests {
         Ok(())
     }
 
-    /// Ownership still answers for an UNREFERENCED file — that is the temp
-    /// upload model, and it is the only place ownership grants anything.
+    /// Ownership still answers for an UNREFERENCED file.
+    /// That is the temp upload model, and it is the only place where
+    /// ownership grants access.
     ///
-    /// The narrowing in `can_access` must not take that with it: `init_upload`
-    /// + `upload_part` + `complete_upload` produces a file attached to no row,
-    /// and its owner must be able to read and delete it without a policy grant.
+    /// The narrower check in `can_access` must not remove that.
+    /// `init_upload`, `upload_part`, and `complete_upload` together produce
+    /// a file that is attached to no row.
+    /// Its owner must then read and delete the file with no policy grant.
     #[tokio::test]
     async fn the_owner_reaches_their_own_unreferenced_temp_file() -> anyhow::Result<()> {
         let (engine, _policy) = make_engine_and_policy("alice").await;
@@ -1652,23 +1785,30 @@ mod tests {
             )
             .await?;
 
-        // No rows: ownership is the whole answer.
+        // The file has no rows, so ownership is the whole answer.
         assert!(engine.can_access("alice", &id, Action::Read).await?);
         assert!(engine.can_access("alice", &id, Action::Delete).await?);
-        // And it is still owner-scoped, not world-readable.
+        // The file is still available to its owner only, and not to every
+        // subject.
         assert!(!engine.can_access("bob", &id, Action::Read).await?);
         assert!(!engine.can_access("bob", &id, Action::Delete).await?);
         Ok(())
     }
 
-    /// `FsEngine` holds the read-only handle, not the write-capable engine.
+    /// `FsEngine` holds the read-only handle, and not the engine that can
+    /// write rules.
     ///
-    /// Every production use of the field is `require_row`/`authorize_row`, so
-    /// the engine was a grant `fs` did not need and should not have had: it
-    /// has no change feed for policy mutations, so a rule added through it
-    /// would reach replicas with no WAL op to replay. Asserting the field's
-    /// type is the only way to keep that true -- every behavioural test here
-    /// passes either way, because the handle and the engine agree.
+    /// Every production use of the field is `require_row` or
+    /// `authorize_row`.
+    /// A whole engine gives `fs` a grant that `fs` does not need and
+    /// should not have.
+    /// `fs` has no change feed for policy mutations.
+    /// A rule added through it would reach the replicas with no WAL op to
+    /// replay.
+    /// The test checks the type of the field, because that is the only way
+    /// to keep this true.
+    /// Every test of behaviour in this file passes either way, because the
+    /// handle and the engine agree.
     #[test]
     fn the_policy_field_is_the_read_only_handle() {
         let src = std::fs::read_to_string("src/fs/mod.rs").expect("read src/fs/mod.rs");
@@ -1682,8 +1822,8 @@ mod tests {
             "FsEngine's policy field must be the read-only Authorizer"
         );
 
-        // And there is exactly one `RowAuthorizer` impl in the crate, for
-        // that handle.
+        // The crate also has exactly one `RowAuthorizer` impl, and that
+        // impl is for this handle.
         let row = std::fs::read_to_string("src/policy/row.rs").expect("read src/policy/row.rs");
         let impls: Vec<&str> = row
             .lines()
@@ -1704,8 +1844,10 @@ mod tests {
 
         let engine = make_engine("alice").await;
         let id = engine.init_upload(valid_single(), "alice").await?;
-        // Unbounded 1 KiB chunks against a 1 KiB part: the intake must
-        // 413 after the second chunk, not buffer forever.
+        // The test sends 1 KiB chunks with no end, against a part of
+        // 1 KiB.
+        // The intake must then return 413 after the second chunk.
+        // The intake must not buffer for ever.
         let flood =
             futures_util::stream::repeat_with(|| Ok::<_, FsError>(Bytes::from(vec![0u8; 1024])));
         let err = engine
@@ -1729,8 +1871,9 @@ mod tests {
 
         let engine = make_engine("alice").await;
         let id = engine.init_upload(valid_single(), "alice").await?;
-        // Records whether the stream is polled at all: a declared length
-        // that already mismatches must fail before the first poll.
+        // The flag records whether the stream was polled at all.
+        // A declared length that does not match must fail before the first
+        // poll.
         let polled = Arc::new(AtomicBool::new(false));
         let flag = polled.clone();
         let untouched = futures_util::stream::poll_fn(move |_| {
@@ -1743,7 +1886,8 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, FsError::BadRequest(_)));
         assert!(!polled.load(Ordering::SeqCst));
-        // Declared larger than expected is 413, not 400.
+        // A declared length that is larger than expected returns 413, and not
+        // 400.
         let err = engine
             .upload_part(
                 &id,
@@ -1788,7 +1932,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn token_mint_verify() -> anyhow::Result<()> {
+    async fn mint_token_then_verify_token() -> anyhow::Result<()> {
         let engine = make_engine("alice").await;
         let tok = engine.mint_token("alice", "file1", Action::Read)?;
         engine.verify_token(&tok, "file1", Action::Read)?;
@@ -1837,10 +1981,10 @@ mod tests {
         Ok(())
     }
 
-    /// [`ChangeSink`] double that refuses every append.
+    /// A [`ChangeSink`] test double that refuses every append.
     ///
-    /// Stands in for the one failure both fixes here exist for: the
-    /// mutation commits and the feed does not take it.
+    /// It stands for the one failure that both fixes here guard against.
+    /// The mutation commits, and the feed does not take it.
     struct DeadFeed;
 
     #[async_trait::async_trait]
@@ -1851,19 +1995,23 @@ mod tests {
     }
 
     /// A complete that committed but could not announce must be repairable
-    /// by the client's retry, and only by one.
+    /// by the retry of the client.
+    /// Only the retry can repair it.
     ///
-    /// The old order was `save_file`, `delete_session`, `announce`. A WAL
-    /// failure at the announce returned 500 with the record COMMITTED on
-    /// master, and the client's retry then read `get_session` as `None`
-    /// and 404'd "upload session not found" -- for good. The file was
-    /// downloadable on master while every replica applying the feed
-    /// incrementally never learned it existed, and no other code path
-    /// re-announces a `FileCreate`.
+    /// The old order was `save_file`, `delete_session`, `announce`.
+    /// A WAL failure at the announce returned 500, and the record was
+    /// COMMITTED on the master.
+    /// The retry of the client then read `get_session` as `None`.
+    /// It returned 404 "upload session not found" for good.
+    /// The file was then available on the master.
+    /// Each replica that applies the feed incrementally never learned that
+    /// the file exists.
+    /// No other code path announces a `FileCreate` again.
     ///
-    /// Asserting the first call returning 500 proves none of that, so the
-    /// test drives the retry, which is where the loss happened: it must
-    /// converge and the lost op must reach the feed.
+    /// An assertion that the first call returns 500 proves none of this.
+    /// The test therefore drives the retry, which is where the loss
+    /// happened.
+    /// The retry must converge, and the lost op must reach the feed.
     #[tokio::test]
     async fn a_complete_whose_announce_failed_is_repaired_by_the_retry() -> anyhow::Result<()> {
         use crate::records::WalOp;
@@ -1886,8 +2034,9 @@ mod tests {
         .await
         .expect_err("a feed that refuses every append must fail the complete");
 
-        // Committed, and the session is deliberately still there: that is
-        // the handle the retry replays the announce from.
+        // The record is committed, and the session is still there on
+        // purpose.
+        // That session is the handle from which the retry announces again.
         assert!(
             engine.store.get_file(&id).await?.is_some(),
             "the record did not commit, so this test is not exercising the window"
@@ -1897,7 +2046,8 @@ mod tests {
             "the session must survive a failed announce, or the retry has nothing to converge on"
         );
 
-        // Feed repaired: the client retries, and this time it converges.
+        // The feed is then repaired. The client retries, and this time the
+        // retry converges.
         let wal = Wal::new(
             crate::db::build_test_store(&crate::db::test_prefix("fs-complete-retry")).await,
         );
@@ -1925,8 +2075,9 @@ mod tests {
         );
         assert!(engine.store.get_session(&id).await?.is_none());
 
-        // Bounded: the retry consumed the handle, so a client looping
-        // `complete` cannot append forever against a converged upload.
+        // The number of announces is bounded. The retry used the handle.
+        // A client that repeats `complete` cannot append for ever against an
+        // upload that converged.
         engine
             .complete_upload(
                 &id,
@@ -1943,22 +2094,24 @@ mod tests {
             "a repeat complete appended to the feed again"
         );
 
-        // And the file is the committed one, not a re-upload.
+        // The file is the one that was committed, and not a new upload.
         assert_eq!(engine.get_metadata(&id, "alice").await?.name, "retry.txt");
         Ok(())
     }
 
     /// A delete that could not announce must leave the row for the retry.
     ///
-    /// The old order was `delete_file`, `s3.delete_object`, `announce`. A
-    /// WAL failure at the announce returned 500 with the row GONE, so the
-    /// retry took `get_file` -> `None` and 404'd, while replicas kept
-    /// serving a record for bytes that were already deleted -- the same
-    /// stranding gc fixed in a4e40f9, one layer up.
+    /// The old order was `delete_file`, `s3.delete_object`, `announce`.
+    /// A WAL failure at the announce returned 500, and the row was GONE.
+    /// The retry then read `get_file` as `None` and returned 404.
+    /// Each replica kept serving a record for bytes that were already
+    /// deleted.
+    /// That is the same stranding that gc fixed in a4e40f9, one layer up.
     ///
-    /// The row surviving the failed announce is the assertion that
-    /// distinguishes the two orders; the retry converging is the one that
-    /// matters to the client.
+    /// The assertion that the row survives the failed announce is what
+    /// tells the two orders apart.
+    /// The assertion that the retry converges is the part that matters to
+    /// the client.
     #[tokio::test]
     async fn a_delete_whose_announce_failed_is_retried_rather_than_stranded() -> anyhow::Result<()>
     {
@@ -1994,7 +2147,8 @@ mod tests {
             "the row was deleted while its delete could not be announced"
         );
 
-        // Feed repaired: the client's retry re-runs the authorized path.
+        // The feed is then repaired. The retry of the client runs the
+        // authorized path again.
         engine.delete_file(&id, "alice").await?;
         assert!(engine.store.get_file(&id).await?.is_none());
         let entries = wal.range(1, wal.head().await?).await?;
@@ -2005,9 +2159,10 @@ mod tests {
             entries[1].op
         );
 
-        // An id that never existed stays a 404 and appends nothing: the
-        // feed is append-only, so turning every 404 into a `FileDelete`
-        // would be permanent growth any authenticated caller could force.
+        // An id that never existed still returns 404 and appends nothing.
+        // The feed is append-only.
+        // Every 404 that became a `FileDelete` would grow the feed for
+        // ever, and any caller with a token could force that growth.
         let err = engine
             .delete_file("never-existed", "alice")
             .await

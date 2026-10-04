@@ -1,19 +1,21 @@
 //! Per-user filtered replicas on stable `OxKvStore` prefixes.
 //!
-//! The master [`FsStore`] remains the sole write path. Each user owns one
-//! replica prefix (`{db_prefix}/u/{sha256-hex(sub)}/`) holding their
-//! filtered file set. Builds filter into a RAM scratch store, diff against
-//! the live replica, and commit the diff plus the coverage marker in ONE
-//! transaction: crash before commit leaves the old state untouched (oxkv
-//! replays only listed WALs on open), and an empty diff commits nothing at
-//! all.
+//! The master [`FsStore`] stays the only write path. Each user owns one
+//! replica prefix (`{db_prefix}/u/{sha256-hex(sub)}/`). That prefix holds
+//! the file set the user can read. A build filters into a RAM scratch store.
+//! Then the build compares the scratch store with the live replica. Then the
+//! build commits the diff and the coverage marker in ONE transaction. A
+//! crash before the commit leaves the old state untouched, because `oxkv`
+//! replays only the WALs that it lists on open. An empty diff commits
+//! nothing.
 //!
-//! The `sync:applied` sentinel inside the prefix tracks WAL coverage, so no
-//! sidecar pointer object exists. Small deltas replay with idempotent
-//! re-apply (sentinel written last); legacy policy marks and large ranges
-//! fall back to full recalc, while rich rule/group ops resync only the
-//! affected user/row. Served read-only via `/sync/db/`; wasm clients open
-//! an `OxKvReader` over the prefix and follow the live manifest.
+//! The `sync:applied` sentinel inside the prefix tracks WAL coverage. No
+//! sidecar pointer object exists. A small delta replays with an idempotent
+//! re-apply, and the code writes the sentinel last. A legacy policy mark or a
+//! large range falls back to a full recalculation. A rich rule op or group
+//! op resyncs only the affected user or row. The route `/sync/db/` serves
+//! the prefix read-only. A wasm client opens an `OxKvReader` over the
+//! prefix and follows the live manifest.
 
 use crate::fs::error::FsError;
 use crate::fs::store::{FileScan, FsStore, KvPages};
@@ -30,8 +32,9 @@ const APPLIED_KEY: &str = "sync:applied";
 /// Upper bound for file/relation ops replayed incrementally.
 const MAX_REPLAY_OPS: usize = 1000;
 
-/// Upper bound for files touched by one policy op before falling back to
-/// a full recalc (keeps one group/row change from scanning the store).
+/// Upper bound for the files that one policy op may touch before the code
+/// falls back to a full recalculation. The bound stops one group or row
+/// change from scanning the whole store.
 const MAX_POLICY_REPLAY_FILES: usize = 1000;
 
 /// Manager for per-user replicas.
@@ -43,12 +46,12 @@ pub struct SnapshotManager {
     pub(crate) store: FsStore,
     /// Policy for filtering.
     ///
-    /// The read-only [`Authorizer`](crate::policy::Authorizer), not a
-    /// [`PolicyEngine`](crate::policy::PolicyEngine): a snapshot build
-    /// only ever *asks* whether the caller may read a row. Holding the full
-    /// engine here — and exposing it as a public field — would hand every
-    /// consumer of `SnapshotManager` a write-capable engine, which is the
-    /// bypass `PolicyEngine::enforcer` being private exists to prevent.
+    /// This field holds the read-only [`Authorizer`](crate::policy::Authorizer).
+    /// It does not hold a [`PolicyEngine`](crate::policy::PolicyEngine). A
+    /// snapshot build only asks whether the caller may read a row. Holding
+    /// the full engine here, and exposing it as a public field, would give
+    /// every consumer of `SnapshotManager` a write-capable engine. That is
+    /// the bypass that `PolicyEngine::enforcer` prevents by being private.
     pub(crate) policy: Authorizer,
     /// Shared object store backing every replica prefix.
     pub(crate) object_store: std::sync::Arc<dyn object_store::ObjectStore>,
@@ -58,9 +61,9 @@ pub struct SnapshotManager {
     skip_probe: bool,
     /// SST block cache shared by every replica open from this manager.
     ///
-    /// Writer/reader opens used to build a private cold cache per call
-    /// (dropped with the handle); sharing keeps hot SSTs resident across
-    /// rebuilds. Clones share the state, matching the build queue.
+    /// Each open used to build a private cold cache that the handle dropped.
+    /// Sharing the cache keeps the hot SSTs in memory across rebuilds.
+    /// Clones share this state, in the same way as the build queue.
     sst_cache: oxkv::LruCache<String, std::sync::Arc<oxkv::SstFile>>,
     /// Subjects with a rebuild queued or running, plus the work channel.
     builds: std::sync::Arc<BuildQueue>,
@@ -68,80 +71,86 @@ pub struct SnapshotManager {
 
 /// One subject's queued rebuild.
 pub struct BuildJob {
-    /// Stable hash of the OIDC subject; see [`SnapshotManager::user_prefix`].
+    /// Stable hash of the OIDC subject. See [`SnapshotManager::user_prefix`].
     sub: String,
     /// WAL head observed when the job was queued.
     ///
-    /// Advisory only, kept for log lines: a worker re-reads the head before
-    /// building, so a job that waited behind a long build covers *more* than
-    /// this rather than less.
+    /// The worker uses this value only for log lines. A worker re-reads the
+    /// head before it builds. A job that waited behind a long build then
+    /// covers more entries than this value, not fewer.
     head: u64,
     /// The in-flight slot, carried with the job.
     ///
-    /// The slot is released when the job is dropped, so it is held across the
-    /// queue wait, across the build, and through a worker that dies mid-build
-    /// -- none of which can leave the subject permanently marked in flight.
-    /// Underscored because the field is load-bearing only through
-    /// [`BuildClaim`]'s `Drop`, never through access.
+    /// The slot is released when the code drops the job. The slot stays held
+    /// across the queue wait, across the build, and through a worker that
+    /// dies during the build. None of these events can leave the subject
+    /// marked in flight forever. The leading underscore shows that the field
+    /// matters only through the `Drop` of [`BuildClaim`]. No code reads the
+    /// field.
     _claim: BuildClaim,
 }
 
 impl BuildJob {
-    /// Stable hash of the OIDC subject; see [`SnapshotManager::user_prefix`].
+    /// Stable hash of the OIDC subject. See [`SnapshotManager::user_prefix`].
     pub fn sub(&self) -> &str {
         &self.sub
     }
 
     /// WAL head observed when the job was queued.
     ///
-    /// Advisory: a worker re-reads the head before building, so the returned
-    /// value is what was observed when the job was queued, not what it is now.
+    /// The worker uses this value only for log lines. A worker re-reads the
+    /// head before it builds. The returned value is what the code observed
+    /// when the job was queued. It is not the current head.
     pub fn head(&self) -> u64 {
         self.head
     }
 }
 
-/// Tracks which subjects have a rebuild in flight, and hands work to the
-/// pool that runs them.
+/// Tracks the subjects that have a rebuild in flight and gives the work to
+/// the pool that runs it.
 ///
-/// This replaces a process-wide `Mutex<()>` that both `replay` and
-/// `build_full` held for their whole duration. That lock was a convoy: a
-/// full rebuild for one user blocked an incremental replay for a *different*
-/// user -- typically milliseconds of work -- behind a job that can take
-/// minutes. Users are independent here, each replica being its own S3 prefix,
-/// so the guard only ever needed to be per subject.
+/// This type replaces a process-wide `Mutex<()>` that both `replay` and
+/// `build_full` held for their whole duration. That lock made all work wait
+/// behind one job. A full rebuild for one user blocked an incremental
+/// replay for a different user. The blocked replay typically takes
+/// milliseconds. The blocking rebuild can take minutes. Users are
+/// independent here, because each replica has its own S3 prefix. The guard
+/// only ever needed to be per subject.
 ///
-/// The in-flight set doubles as the coalescing point. `POST /sync/sync` is
-/// driven by client polling, so a deploy or a busy period produces many
-/// requests per user for the same pending rebuild; without this each one
-/// would run a full scan to discover there was nothing to do.
+/// The in-flight set also merges requests for the same rebuild. A client
+/// polls `POST /sync/sync`, so a deploy or a busy period sends many requests
+/// per user for the same pending rebuild. Without the set, each request runs
+/// a full scan and then finds that there is nothing to do.
 ///
-/// Created by the host, which keeps the receiving end and drains it with
-/// [`BuildPool::spawn`]. It is not created inside [`SnapshotManager::new`]
-/// because a `Clone`d manager in a test would otherwise silently start
-/// background work.
+/// The host creates this type. The host keeps the receiving end and drains it
+/// with [`BuildPool::spawn`]. [`SnapshotManager::new`] does not create it,
+/// because a test that clones the manager would then start background work
+/// without asking for it.
 pub struct BuildQueue {
     inflight: std::sync::Mutex<std::collections::HashSet<String>>,
     jobs: tokio::sync::mpsc::UnboundedSender<BuildJob>,
 }
 
-/// A held in-flight slot, released when dropped.
+/// A held in-flight slot. The `Drop` of this type releases the slot.
 ///
-/// A `Drop` guard rather than a call every holder must remember, and the
-/// reason is that the holders are droppable futures. `advance` is driven by
-/// `POST /sync/sync`, whose handler future the client may drop at any
-/// `.await` inside `replay` -- `wal.range`, `open_writer`, the per-op
-/// `apply_op` loop. Under a manual `release` on a separate code path, a
-/// disconnect mid-replay left the subject inserted with no release ever
-/// executed, and every subsequent `advance` for it took the `!claim(sub)`
-/// branch: `{applied_seq: <stale>, pending: true}`, the one path that never
-/// re-checks or re-queues. The replica froze at its old coverage for the life
-/// of the process, with no error logged and no recovery short of a restart.
+/// The type acts as a `Drop` guard instead of a call that every holder must
+/// remember. The reason is that the holders are droppable futures. A client
+/// sends `POST /sync/sync`, and the client may drop the handler future at
+/// any `.await` inside `replay`. Those points are `wal.range`,
+/// `open_writer`, and the `apply_op` loop for each op. The old code released
+/// the slot through a manual `release` call on a separate path. A disconnect
+/// during a replay then left the subject in the set, and no code ran the
+/// release. Every later `advance` for that subject then took the
+/// `!claim(sub)` branch. That branch returns `{applied_seq: <stale>, pending:
+/// true}`. No other path skips both the re-check and the re-queue. The
+/// replica then stays frozen at its old coverage for the life of the
+/// process. No code logs an error. Only a restart recovers.
 ///
-/// The worker has the same shape for a different reason: `release` ran only
-/// if `build_full` RETURNED, so a panic inside it both leaked the claim and
-/// killed the task holding it. Carrying the guard in the [`BuildJob`]
-/// releases it when the job is dropped, however that happens.
+/// The worker has the same shape for another reason. The old `release` call
+/// ran only if `build_full` returned. A panic inside `build_full` then both
+/// leaked the claim and killed the task that held it. The [`BuildJob`] now
+/// carries this guard, so the code releases the slot when the job is dropped,
+/// however that drop happens.
 pub struct BuildClaim {
     queue: std::sync::Arc<BuildQueue>,
     sub: String,
@@ -173,15 +182,16 @@ impl BuildQueue {
         )
     }
 
-    /// Takes the single in-flight slot for `sub`, or reports it is taken.
+    /// Takes the single in-flight slot for `sub`, or reports that the slot is
+    /// taken.
     ///
-    /// `None` means another request or worker is already advancing this
-    /// user's replica, which is the coalescing case rather than an error:
-    /// the caller reports current coverage and lets the client poll.
+    /// `None` means that another request or worker already advances this
+    /// user's replica. That is the merge case, not an error. The caller then
+    /// reports the current coverage and lets the client poll.
     ///
-    /// Takes `self` by `Arc` so the returned [`BuildClaim`] can keep the
-    /// queue alive in order to release through it; a guard holding a borrow
-    /// would not outlive the call that produced it.
+    /// The method takes `self` by `Arc`, so the returned [`BuildClaim`] can
+    /// keep the queue alive and release through it. A guard that holds a
+    /// borrow cannot outlive the call that made it.
     fn claim(self: &std::sync::Arc<Self>, sub: &str) -> Option<BuildClaim> {
         self.inflight().insert(sub.to_string()).then(|| BuildClaim {
             queue: std::sync::Arc::clone(self),
@@ -189,23 +199,24 @@ impl BuildQueue {
         })
     }
 
-    /// Releases the slot for `sub` without holding a guard.
+    /// Releases the slot for `sub` without a guard.
     ///
-    /// Test-only: every production holder now owns a [`BuildClaim`], which
-    /// releases through `Drop`. This stands in for a worker finishing its job,
-    /// without inventing a guard that is not actually held across anything.
+    /// Only tests call this method. Every production holder owns a
+    /// [`BuildClaim`], and the `Drop` of that type releases the slot. This
+    /// method stands in for a worker that finished its job. The method does
+    /// not create a guard that the caller then fails to hold.
     #[cfg(test)]
     fn release(&self, sub: &str) {
         self.inflight().remove(sub);
     }
 
-    /// The in-flight set, recovering from a poisoned lock.
+    /// The in-flight set. The method recovers from a poisoned lock.
     ///
-    /// The set holds subject strings and nothing else, so a panic in some
-    /// unrelated holder cannot leave it inconsistent -- the worst case is a
-    /// stale entry, which costs one redundant rebuild. Propagating the poison
-    /// would turn that into a permanently broken queue, so the inner value is
-    /// taken regardless.
+    /// The set holds subject strings and nothing else. A panic in an
+    /// unrelated holder then cannot leave the set inconsistent. The worst
+    /// case is one stale entry, and that costs one redundant rebuild.
+    /// Propagating the poison would make the queue permanently unusable, so
+    /// the method takes the inner value in every case.
     fn inflight(&self) -> std::sync::MutexGuard<'_, std::collections::HashSet<String>> {
         self.inflight
             .lock()
@@ -214,16 +225,17 @@ impl BuildQueue {
 
     /// Hands a claimed subject to the worker pool.
     ///
-    /// Takes the [`BuildClaim`] by value and moves it into the job, so the
-    /// slot is held across the queue wait rather than being released the
-    /// moment the request returns -- otherwise a burst of polls between
-    /// `send` and the worker picking the job up would queue duplicates, which
-    /// is the coalescing the in-flight set exists for.
+    /// The method takes the [`BuildClaim`] by value and moves it into the
+    /// job. The slot then stays held across the queue wait. Without that, the
+    /// slot would be released the moment the request returns. A burst of
+    /// polls between `send` and the pickup by a worker would then queue
+    /// duplicates. The in-flight set exists to prevent those duplicates.
     ///
-    /// Returns `false` if no pool is draining the queue. The `BuildJob` comes
-    /// back inside the `SendError` and is dropped with it, releasing the
-    /// claim, so the next request retries rather than leaving the subject
-    /// permanently marked in-flight and never rebuilt.
+    /// The method returns `false` if no pool drains the queue. The
+    /// `BuildJob` then comes back inside the `SendError`. The error drops the
+    /// job, and the job drops the claim. The next request then retries.
+    /// Without that, the subject stays marked in flight forever and never
+    /// rebuilds.
     fn dispatch(&self, claim: BuildClaim, head: u64) -> bool {
         self.jobs
             .send(BuildJob {
@@ -235,10 +247,11 @@ impl BuildQueue {
     }
 }
 
-/// Drains a [`BuildQueue`], running the full rebuilds it carries.
+/// Drains a [`BuildQueue`] and runs the full rebuilds that it carries.
 ///
-/// Separate from [`SnapshotManager`] because spawning tasks is a side effect
-/// a `Clone` should not carry, mirroring [`crate::fs::gc::spawn`].
+/// The type is separate from [`SnapshotManager`] because a task spawn is a
+/// side effect. A `Clone` must not carry that side effect. This type mirrors
+/// [`crate::fs::gc::spawn`].
 pub struct BuildPool {
     rx: tokio::sync::mpsc::UnboundedReceiver<BuildJob>,
 }
@@ -249,18 +262,20 @@ impl BuildPool {
         Self { rx }
     }
 
-    /// Starts `workers` tasks, each running queued rebuilds to completion.
+    /// Starts `workers` tasks. Each task runs the queued rebuilds to the end.
     ///
-    /// `workers` is deliberately small. A build streams its diff (see
-    /// [`SnapshotManager::build_full`]) so its memory tracks the size of a
-    /// *change* rather than of a replica, but it still scans the master and
-    /// writes to S3 -- so this bounds object-store pressure as much as CPU.
-    /// One worker is a valid configuration and a reasonable default.
+    /// The `workers` count is deliberately small. A build streams its diff
+    /// (see [`SnapshotManager::build_full`]), so its memory tracks the size
+    /// of a change instead of the size of a replica. The build still scans
+    /// the master and writes to S3. This count therefore limits
+    /// object-store pressure as much as it limits CPU use. One worker is a
+    /// valid setting and a reasonable default.
     pub fn spawn(self, manager: std::sync::Arc<SnapshotManager>, workers: usize) {
-        // A single receiver cannot be moved into N tasks, so the pool shares
-        // one behind a short-held lock. `recv` is awaited outside the guard --
-        // the guard only exists to pick which worker takes the next job, and
-        // holding it across the await would serialize the workers into one.
+        // A single receiver cannot move into N tasks, so the pool shares one
+        // receiver behind a lock. The code holds the lock for a short time.
+        // The code awaits `recv` outside the guard. The guard only decides
+        // which worker takes the next job. Holding the guard across the await
+        // would make the workers run one at a time.
         let rx = std::sync::Arc::new(tokio::sync::Mutex::new(self.rx));
         let workers = workers.max(1);
         for worker in 0..workers {
@@ -273,11 +288,12 @@ impl BuildPool {
                         guard.recv().await
                     };
                     let Some(job) = job else { break };
-                    // The request that queued this has already returned, so the
-                    // log is the only remaining channel for a failure. The
-                    // slot travels with `job` and is released when it drops,
-                    // so the next `advance` retries rather than finding the
-                    // subject wedged -- including if this task unwinds.
+                    // The request that queued this job already returned, so
+                    // the log is the only remaining channel for a failure.
+                    // The slot travels with `job`. The code releases the slot
+                    // when the job drops. The next `advance` then retries
+                    // instead of finding the subject stuck. The same holds if
+                    // this task unwinds.
                     let result = manager.build_full(job.sub()).await;
                     if let Err(e) = &result {
                         tracing::warn!(
@@ -297,16 +313,17 @@ impl BuildPool {
     }
 }
 
-/// The collaborators a [`SnapshotManager`] reads master state through.
+/// The collaborators that a [`SnapshotManager`] uses to read master state.
 ///
-/// Grouped so [`SnapshotManager::new`] is three arguments instead of six,
-/// and so adding a fourth source of master state is a field addition rather
-/// than a signature change for every caller.
+/// The type groups the collaborators so that [`SnapshotManager::new`] takes
+/// three arguments instead of six. It also lets a fourth source of master
+/// state become a field addition instead of a signature change for every
+/// caller.
 pub struct SnapshotDeps {
     /// Change feed to replay from.
     pub wal: Wal,
-    /// Master file store (reads only; the master is written through
-    /// [`FsEngine`](crate::fs::FsEngine)).
+    /// Master file store for reads only. The code writes the master through
+    /// [`FsEngine`](crate::fs::FsEngine).
     pub store: FsStore,
     /// Read-only policy view for row visibility checks.
     pub policy: Authorizer,
@@ -314,19 +331,21 @@ pub struct SnapshotDeps {
     pub object_store: std::sync::Arc<dyn object_store::ObjectStore>,
     /// Rebuild queue, shared with the [`BuildPool`] that drains it.
     ///
-    /// Taken rather than created here so the host can hold the receiving end
-    /// and decide when background work starts. See [`BuildQueue::new`].
+    /// The caller passes the queue instead of the code creating it here, so
+    /// the host can hold the receiving end and choose when to start the
+    /// background work. See [`BuildQueue::new`].
     pub builds: BuildQueue,
 }
 
 /// What a replica prefix is opened against.
 ///
-/// An enum rather than a `skip_probe: bool`, because the flag was the sixth
-/// positional argument of a six-argument constructor and nothing at the call
-/// site said what `true` meant. Passing the wrong one is not a compile error
-/// and not a wrong answer either -- it is a probe run against a backend that
-/// has no conditional writes, or a skipped probe against real S3, and the
-/// second of those loses the check that guards the `manifest.json` CAS.
+/// The type is an enum instead of a `skip_probe: bool`, because the flag was
+/// the sixth positional argument of a six-argument constructor. Nothing at
+/// the call site said what `true` meant. The wrong value does not cause a
+/// compile error. It also does not cause an obviously wrong answer. It
+/// causes a probe against a backend that has no conditional writes, or a
+/// skipped probe against real S3. The second case removes the check that
+/// guards the `manifest.json` CAS.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplicaBackend {
     /// A real object store. Opens probe for conditional writes.
@@ -336,10 +355,10 @@ pub enum ReplicaBackend {
 }
 
 impl SnapshotManager {
-    /// Create a manager.
+    /// Creates a manager.
     ///
-    /// Takes an [`Authorizer`] rather than a
-    /// [`PolicyEngine`](crate::policy::PolicyEngine): replicas are a read
+    /// The method takes an [`Authorizer`] instead of a
+    /// [`PolicyEngine`](crate::policy::PolicyEngine). A replica is a read
     /// projection, so this type never needs write access to policy.
     pub fn new(deps: SnapshotDeps, db_prefix: impl Into<String>, backend: ReplicaBackend) -> Self {
         Self {
@@ -357,37 +376,43 @@ impl SnapshotManager {
 
 /// What an incremental [`SnapshotManager::replay`] was able to do.
 ///
-/// A decline is not an error, and that distinction is the whole point of the
-/// type. "This delta cannot be replayed incrementally, recalculate instead"
-/// and "the store rejected the write" are different facts, and the previous
-/// encoding signalled the first with `FsError::Internal("replay needs full
-/// recalc ...")`. Matching on that string is the same fragility as the
-/// `detail.contains("fenced")` search this crate already removed: reword the
-/// message and a real store failure silently becomes a queued rebuild, or a
-/// legitimate decline starts returning 500s.
+/// A decline is not an error, and that distinction is the point of the type.
+/// "This delta cannot be replayed incrementally, so recalculate instead" and
+/// "the store rejected the write" are different facts. The previous encoding
+/// signalled the first fact with this value:
+/// `FsError::Internal("replay needs full recalc ...")`. Matching on that
+/// string is as fragile as the `detail.contains("fenced")` search that this
+/// crate already removed. A reworded message turns a real store failure into
+/// a queued rebuild without a trace. A reworded message also turns a
+/// legitimate decline into 500 responses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplayOutcome {
     /// The replica now covers this WAL sequence.
     Advanced(u64),
-    /// This change cannot be replayed incrementally. A full rebuild is
-    /// required: a legacy policy mark, a delta over `MAX_REPLAY_OPS`, or a
-    /// replica that was never built.
+    /// The change cannot replay incrementally. A full rebuild is required.
+    ///
+    /// One of these conditions requires the rebuild:
+    ///
+    /// - A legacy policy mark.
+    /// - A delta over `MAX_REPLAY_OPS`.
+    /// - A replica that was never built.
     NeedsFullRebuild,
 }
 
 /// What one replayed op did to the replica.
 ///
-/// The split exists because "this op cannot be applied incrementally" and
-/// "the store rejected the write" are different facts, and only the first
-/// is a reason to queue a rebuild. Every decline site returns
-/// [`Self::NeedsFullRebuild`]; a genuine failure is still `Err` and stays a
-/// 500, which is the reason [`ReplayOutcome`] exists at all.
+/// The enum separates two different facts. The first fact states that this
+/// op cannot apply incrementally. The second fact states that the store
+/// rejected the write. Only the first fact is a reason to queue a rebuild.
+/// Every decline site returns [`Self::NeedsFullRebuild`]. A genuine failure
+/// is still `Err` and stays a 500. [`ReplayOutcome`] exists for that
+/// difference.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ApplyOutcome {
     /// The op was applied incrementally.
     Applied,
-    /// The op cannot be applied incrementally; the whole delta needs a
-    /// full rebuild.
+    /// The op cannot apply incrementally. The whole delta then needs a full
+    /// rebuild.
     NeedsFullRebuild,
 }
 
@@ -396,45 +421,46 @@ enum ApplyOutcome {
 pub struct AdvanceOutcome {
     /// WAL sequence the replica now covers.
     pub applied_seq: u64,
-    /// True when a full rebuild was queued (or is already queued) and the
-    /// caller is looking at coverage from before it.
+    /// True when the code queued a full rebuild or found one already queued.
+    /// The caller then sees the coverage from before that rebuild.
     ///
-    /// Distinct from `applied_seq < head`: a rebuild that was already in
-    /// flight also leaves the caller short of the head, and a client that
-    /// cannot tell "queued for you" from "someone else got there first" cannot
-    /// decide how long to keep polling.
+    /// This field differs from `applied_seq < head`. A rebuild that was
+    /// already in flight also leaves the caller short of the head. A client
+    /// that cannot tell "queued for you" from "someone else got there first"
+    /// cannot decide how long to keep polling.
     pub pending: bool,
 }
 
 impl SnapshotManager {
-    /// Advances `sub`'s replica toward the WAL head.
+    /// Advances the replica of `sub` toward the WAL head.
     ///
-    /// Three outcomes, in the order they are tried:
+    /// The method tries three outcomes in this order:
     ///
-    /// 1. Already covered -- and covered means `applied == head`, not
-    ///    `applied >= head`. A replica claiming coverage AHEAD of the head is
-    ///    not caught up; it is corruption or a rewound feed, and it falls
-    ///    through to [`replay`](Self::replay), which declines it into a
-    ///    rebuild. See the note there.
-    /// 2. A bounded incremental [`replay`](Self::replay) succeeds. Run inline,
-    ///    because it is milliseconds of work and the caller wants the result
-    ///    now.
-    /// 3. Otherwise a full rebuild is needed, and it is *queued* rather than
-    ///    run. A rebuild scans the whole master and can take minutes; doing
-    ///    that inside a request held a connection for its duration and blocked
-    ///    every other user's sync behind it. The caller gets
-    ///    `pending: true` and polls [`GET /sync/status`](crate::sync::route) to
-    ///    watch coverage move.
+    /// 1. The replica is already covered. Covered means `applied == head`.
+    ///    It does not mean `applied >= head`. A replica that claims coverage
+    ///    ahead of the head is not caught up. The feed is corrupt or has
+    ///    rewound. The method then falls through to
+    ///    [`replay`](Self::replay), which declines the case into a rebuild.
+    ///    See the note there.
+    /// 2. A bounded incremental [`replay`](Self::replay) succeeds. The
+    ///    method runs the replay inline. The replay takes milliseconds, and
+    ///    the caller wants the result now.
+    /// 3. Otherwise the code needs a full rebuild. The method queues the
+    ///    rebuild instead of running it. A rebuild scans the whole master and
+    ///    can take minutes. Running the rebuild inside a request held a
+    ///    connection for the whole duration. It also blocked the sync of
+    ///    every other user. The caller receives `pending: true` and polls
+    ///    [`GET /sync/status`](crate::sync::route) to watch the coverage move.
     ///
-    /// Concurrent calls for the same subject collapse to one: the second
-    /// returns the current coverage as `pending` rather than queueing a
+    /// Concurrent calls for the same subject merge into one. The second call
+    /// returns the current coverage as `pending` instead of queuing a
     /// duplicate scan. Different subjects are independent.
     ///
-    /// The claim is a [`BuildClaim`] held for the whole body, so a client
-    /// that disconnects mid-replay releases the slot on the way out. A manual
-    /// `release` on a separate code path leaked it permanently, wedging this
-    /// subject on the `pending: true` short-circuit below for the life of the
-    /// process.
+    /// A [`BuildClaim`] holds the claim for the whole body. A client that
+    /// disconnects during a replay then releases the slot on the way out. An
+    /// older manual `release` call on a separate code path leaked the slot
+    /// forever. That leak kept this subject on the `pending: true`
+    /// short-circuit below for the life of the process.
     pub async fn advance(&self, sub: &str) -> Result<AdvanceOutcome, FsError> {
         let head = self.wal.head().await?;
         let applied = self.load_applied(sub).await?;
@@ -463,16 +489,18 @@ impl SnapshotManager {
             }
             Ok(ReplayOutcome::NeedsFullRebuild) => {
                 // The claim moves into the queue with the job, so the slot
-                // stays held until the pool is finished with it. `dispatch`
-                // takes it by value and drops it with the `SendError` when no
-                // pool is draining, so the release happens on both paths.
+                // stays held until the pool finishes with it. `dispatch`
+                // takes the claim by value. When no pool drains the queue,
+                // `dispatch` drops the claim with the `SendError`. The
+                // release therefore runs on both paths.
                 if !self.builds.dispatch(claim, head) {
-                    // No pool is draining the queue, so nothing will ever run
-                    // this build and every future poll for this subject queues
-                    // another. That is a deployment mistake -- `BuildPool::spawn`
-                    // was never called -- and it fails silently otherwise, so
-                    // it is logged at `error` rather than left for a client to
-                    // discover by polling.
+                    // No pool drains the queue, so nothing will ever run
+                    // this build. Every future poll for this subject then
+                    // queues another. A deployment mistake caused this
+                    // state, because no code called `BuildPool::spawn`. The
+                    // mistake fails silently otherwise, so the code logs it
+                    // at `error` instead of leaving a client to find it by
+                    // polling.
                     tracing::error!(
                         "no replica rebuild worker is running; {} will not converge. \
                          Call BuildPool::spawn when wiring SnapshotManager.",
@@ -484,10 +512,10 @@ impl SnapshotManager {
                     pending: true,
                 })
             }
-            // A fencing loss here means a concurrent builder published this
-            // replica first. Adopt their coverage rather than failing, the
-            // same recovery the full-rebuild path used before it moved into
-            // the pool.
+            // A fencing loss here means that a concurrent builder published
+            // this replica first. The method adopts the coverage of that
+            // builder instead of returning an error. The full-rebuild path
+            // used the same recovery before it moved into the pool.
             Err(e) if e.is_fencing_loss() => {
                 drop(claim);
                 Ok(AdvanceOutcome {
@@ -502,24 +530,26 @@ impl SnapshotManager {
         }
     }
 
-    /// Replica prefix for `sub` (`{db}/u/{sha256-hex(sub)}`).    ///
-    /// The digest keeps replica prefixes fixed-length and safe by
-    /// construction (hex only): subjects are attacker-influenced OIDC
-    /// values, so embedding them raw would allow traversal or collisions.
+    /// Replica prefix for `sub` (`{db}/u/{sha256-hex(sub)}`).
+    ///
+    /// The digest keeps each replica prefix fixed-length and safe by
+    /// construction. The digest contains hex digits only. Subjects are
+    /// attacker-influenced OIDC values, so a raw subject would allow path
+    /// traversal or prefix collisions.
     pub fn user_prefix(&self, sub: &str) -> String {
         format!("{}/u/{}", self.db_prefix.trim_matches('/'), safe_sub(sub))
     }
 
     /// Full object key for `tail` inside the replica.
     ///
-    /// Rejects path traversal (`..`) and EMPTY path segments. The empty
-    /// interior segment matters because `object_store`'s `Path::from` filters
-    /// empty parts out when it splits on `/` (object_store-0.12.5
-    /// `path/mod.rs`, `from_iter`), so `db/u/{sha}//manifest.json` and
-    /// `db/u/{sha}/manifest.json` are the SAME key to the backend while
-    /// being different strings to this function's caller. Serving the alias
-    /// meant two URLs for one mutable, per-commit object, and the cache
-    /// headers were chosen from the raw tail -- see
+    /// The method rejects path traversal (`..`) and empty path segments. The
+    /// empty interior segment matters. `object_store`'s `Path::from` removes
+    /// empty parts when it splits on `/` (object_store-0.12.5
+    /// `path/mod.rs`, `from_iter`). The backend then reads
+    /// `db/u/{sha}//manifest.json` and `db/u/{sha}/manifest.json` as the same
+    /// key. The caller of this function reads them as different strings.
+    /// Serving the alias gave two URLs for one object that changes on each
+    /// commit. The code also chose the cache headers from the raw tail. See
     /// [`crate::sync::route::object_handler`].
     pub fn resolve_object(&self, sub: &str, tail: &str) -> Result<String, FsError> {
         if tail.split('/').any(|seg| seg.is_empty() || seg == "..") {
@@ -549,25 +579,27 @@ impl SnapshotManager {
         Ok(out)
     }
 
-    /// Builds the replica for `sub` at current `wal` head.
+    /// Builds the replica for `sub` at the current `wal` head. Returns the
+    /// covered WAL head.
     ///
-    /// See the module docs for the atomicity contract. Returns the covered
-    /// WAL head.
+    /// The module docs state the atomicity contract.
     ///
-    /// A master file row that does not decode REFUSES the build. The
-    /// filtered walk cannot see it, the merge-join below therefore sees the
-    /// key on the live side only, and takes it as "the master no longer has
-    /// this file" -- so committing would delete that file's metadata row and
-    /// its relation rows from this replica while the master still holds it.
-    /// The gc orphan-byte pass declines to act on the same evidence for the
-    /// same reason ([`crate::fs::gc`]); this is the same input in the
-    /// destructive direction. The replica is left exactly as it was, which
-    /// costs a stale file the user can already see rather than an
-    /// unrecoverable one.
+    /// A master file row that does not decode makes the method REFUSE the
+    /// build. The filtered walk cannot see that row. The merge-join below then
+    /// sees the key on the live side only. The join then reads that key as
+    /// "the master no longer has this file". A commit would then delete the
+    /// metadata row of that file, and its relation rows, from this replica.
+    /// The master would still hold them. The gc orphan-byte pass declines to
+    /// act on the same evidence for the same reason
+    /// ([`crate::fs::gc`]). This path takes the same input in the
+    /// destructive direction. The replica stays exactly as it was. That
+    /// choice keeps one stale file that the user can already see instead of
+    /// an unrecoverable file.
     pub async fn build_full(&self, sub: &str) -> Result<u64, FsError> {
         let head = self.wal.head().await?;
-        // Converge the RAM mirror before the bulk scan (no-op unless
-        // [database].mirror_master opted into the prototype).
+        // Bring the RAM mirror up to date before the bulk scan. This call
+        // does nothing unless [database].mirror_master opted into the
+        // prototype.
         self.store.refresh_mirror().await?;
 
         let snap_prefix = format!(
@@ -578,8 +610,8 @@ impl SnapshotManager {
         let scratch = FsStore::new(crate::db::build_scratch_store(&snap_prefix).await);
         let undecodable = self.copy_filtered(sub, &scratch).await?;
         if !undecodable.is_empty() {
-            // Before anything on the live side is opened, so "refuse" really
-            // does leave the replica alone.
+            // This check runs before the code opens anything on the live
+            // side, so a refusal really does leave the replica alone.
             tracing::error!(
                 replica = %self.user_prefix(sub),
                 rows = undecodable.len(),
@@ -594,12 +626,12 @@ impl SnapshotManager {
             )));
         }
 
-        // One writer, used for three jobs: the live side of the diff, the
-        // transaction the diff is staged in, and the handle the commit runs on.
-        // Reading the live side through the writer rather than a separate
-        // reader is safe because nothing has been written through it yet, so
-        // its session overlay is empty and it observes exactly the committed
-        // state the replica currently holds.
+        // One writer handles three jobs. The writer is the live side of the
+        // diff, the transaction that stages the diff, and the handle that
+        // runs the commit. Reading the live side through the writer is safe
+        // instead of using a separate reader, because no code has written
+        // through the writer yet. Its session overlay is therefore empty. It
+        // sees exactly the committed state that the replica holds now.
         let writer = self.open_writer(sub).await?;
 
         let mut desired = scratch.pages();
@@ -608,10 +640,11 @@ impl SnapshotManager {
         let tx = writer.begin_tx().map_err(store_err)?;
         let mut wrote = false;
 
-        // The coverage marker is control metadata, not replica data. It lives
-        // on the live side only -- it is written after the diff, below -- so
-        // the merge has to step over it rather than read it as a key the
-        // filter dropped and delete it.
+        // The coverage marker is control metadata, not replica data. The
+        // marker lives on the live side only. The code writes the marker
+        // after the diff, below. The merge must step over the marker. It must
+        // not read the marker as a key that the filter dropped and then
+        // delete it.
         async fn next_data_key(live: &mut KvPages) -> Result<Option<oxkv::KeyValue>, FsError> {
             while let Some(kv) = live.next().await? {
                 if kv.key != APPLIED_KEY {
@@ -621,8 +654,9 @@ impl SnapshotManager {
             Ok(None)
         }
 
-        // Merge-join. Both sides are key-ordered by construction, so this
-        // holds one key per side rather than a map of the whole replica.
+        // The loop performs a merge join. Both sides are key-ordered by
+        // construction, so the loop holds one key per side instead of a map
+        // of the whole replica.
         loop {
             let a = desired.next().await?;
             let b = next_data_key(&mut live).await?;
@@ -637,13 +671,14 @@ impl SnapshotManager {
                     wrote = true;
                 }
                 (Some(a), Some(b)) => match a.key.cmp(&b.key) {
-                    // Only on the desired side: a new or changed key.
+                    // The key is only on the desired side. The key is new,
+                    // or the value changed.
                     std::cmp::Ordering::Less => {
                         tx.put_bytes(&a.key, &a.value).await.map_err(store_err)?;
                         wrote = true;
                     }
-                    // Only on the live side: the filter dropped it, or the
-                    // master no longer has it.
+                    // The key is only on the live side. Either the filter
+                    // dropped it, or the master no longer has it.
                     std::cmp::Ordering::Greater => {
                         tx.delete(&b.key).await.map_err(store_err)?;
                         wrote = true;
@@ -658,9 +693,9 @@ impl SnapshotManager {
             }
         }
 
-        // Coverage marker last, in the same transaction as the data. A crash
-        // before commit leaves the previous state and its marker untouched, so
-        // the next build simply redoes the work.
+        // The coverage marker goes last, in the same transaction as the data.
+        // A crash before the commit leaves the previous state and its marker
+        // untouched, so the next build repeats the work.
         let marker = serde_json::to_vec(&head).map_err(|e| FsError::Internal(e.to_string()))?;
         let covered = self.load_applied(sub).await? == Some(head);
         if !wrote && covered {
@@ -676,31 +711,38 @@ impl SnapshotManager {
 
     /// Replays WAL entries `applied+1..=head` for `sub` onto the live replica.
     ///
-    /// Ops apply in order with visibility re-checked against current master
-    /// state, then the coverage marker advances: re-applying converges, so a
-    /// crash between ops heals on the next poll. Legacy policy marks (object
-    /// only), ranges over `MAX_REPLAY_OPS` entries, a delta that cannot be
-    /// replayed within the fan-out budget, and a replica claiming coverage
-    /// AHEAD of the head all return [`ReplayOutcome::NeedsFullRebuild`]; a
-    /// store failure is still `Err`. Rich rule/group ops resync only the
-    /// affected user/row (irrelevant users/objects skip).
+    /// The method applies the ops in order. The method re-checks visibility
+    /// against the current master state. Then the method advances the coverage
+    /// marker. Re-applying the same ops converges, so a crash between ops
+    /// heals on the next poll.
+    ///
+    /// Each condition below returns [`ReplayOutcome::NeedsFullRebuild`]:
+    ///
+    /// - A legacy policy mark (object only).
+    /// - A range over `MAX_REPLAY_OPS` entries.
+    /// - A delta that the fan-out budget cannot replay.
+    /// - A replica that claims coverage ahead of the head.
+    ///
+    /// A store failure still returns `Err`. A rich rule op or group op
+    /// resyncs only the affected user or row. The method skips irrelevant
+    /// users and objects.
     pub async fn replay(&self, head: u64, sub: &str) -> Result<ReplayOutcome, FsError> {
         let Some(applied) = self.load_applied(sub).await? else {
             return Ok(ReplayOutcome::NeedsFullRebuild);
         };
-        // `>` and not `>=`, and the distinction is the point. A head only
-        // moves forward, so a replica whose applied sequence is ahead of it
-        // is not "caught up": it is a rewound feed, a restored-from-backup
-        // object store, or a coverage marker that outlived the entries it
-        // claims to cover. Reporting `Advanced` there leaves the replica
-        // serving data derived from entries the feed no longer has, with a
-        // marker claiming those entries were applied.
+        // The comparison uses `>` and not `>=`, and that difference is the
+        // point. A head only moves forward. A replica whose applied sequence
+        // is ahead of the head is therefore not caught up. The feed has
+        // rewound, or the code restored the object store from a backup, or a
+        // coverage marker outlived the entries it claims to cover. Returning
+        // `Advanced` there leaves the replica serving data that comes from
+        // entries the feed no longer has. The marker still claims that the
+        // code applied those entries.
         //
-        // The only correct answer is to rebuild from the master, which is
-        // what a `NeedsFullRebuild` queues. This is also the case that makes
-        // `Wal::range`'s `from > to` error reachable from here: Wave 3 made
-        // that a loud `Err`, and the caller that was supposed to reach it is
-        // this one.
+        // The only correct answer is a rebuild from the master, and
+        // `NeedsFullRebuild` queues that rebuild. This case also makes the
+        // `from > to` error of `Wal::range` reachable from here. Wave 3 made
+        // that error a loud `Err`, and this caller was supposed to reach it.
         if applied > head {
             return Ok(ReplayOutcome::NeedsFullRebuild);
         }
@@ -729,15 +771,17 @@ impl SnapshotManager {
         Ok(ReplayOutcome::Advanced(head))
     }
 
-    /// Opens the replica writer (acquires/takes over the prefix epoch).
+    /// Opens the replica writer. The call acquires or takes over the prefix
+    /// epoch.
     ///
-    /// A fresh handle is taken per build/replay rather than cached for the
-    /// manager's lifetime: replicas are read-mostly and idle long enough
-    /// for a cached writer to sit on a stale epoch, and `build_lock`
-    /// serializes open→write→commit so two handles on one prefix are never
-    /// live at the same time (the `db::build_s3_store` contract holds for
-    /// every *concurrent* writer; it is a new session per *sequential*
-    /// build, exactly like the `policy export` CLI).
+    /// The method takes a fresh handle for each build or replay instead of
+    /// caching it for the life of the manager. Replicas are read-mostly and
+    /// stay idle long enough for a cached writer to sit on a stale epoch.
+    /// `build_lock` serializes the sequence open, write, commit. Two handles
+    /// on one prefix are therefore never live at the same time. The
+    /// `db::build_s3_store` contract holds for every concurrent writer. Each
+    /// sequential build instead uses a new session, exactly as the
+    /// `policy export` CLI does.
     async fn open_writer(&self, sub: &str) -> Result<oxkv::OxKvStore, FsError> {
         oxkv::OxKvStore::builder()
             .with_object_store(self.object_store.clone())
@@ -748,11 +792,12 @@ impl SnapshotManager {
             .map_err(FsError::from)
     }
 
-    /// Opens a read-only follower over the replica (no ownership taken).
+    /// Opens a read-only follower over the replica. The call takes no
+    /// ownership.
     ///
-    /// Followers never take an epoch, so they cannot fence the writer; the
-    /// shared SST cache keeps repeated opens from re-downloading hot
-    /// segments.
+    /// A follower never takes an epoch, so a follower cannot fence the
+    /// writer. The shared SST cache keeps repeated opens from downloading the
+    /// hot segments again.
     async fn open_reader(&self, sub: &str) -> Result<OxKvReader, FsError> {
         let base: std::sync::Arc<dyn object_store::ObjectStore> = self.object_store.clone();
         let storage: std::sync::Arc<dyn oxkv::Storage> = std::sync::Arc::new(base);
@@ -766,21 +811,22 @@ impl SnapshotManager {
 
     /// Applies one WAL op onto a replica under construction.
     ///
-    /// Visibility is re-checked against current master state, so applying
-    /// is idempotent: files that vanished or turned unreadable are skipped.
+    /// The method re-checks visibility against the current master state, so
+    /// applying is idempotent. Files that vanished or turned unreadable are
+    /// skipped.
     ///
-    /// A delta that cannot be replayed incrementally returns
+    /// A delta that cannot replay incrementally returns
     /// [`ApplyOutcome::NeedsFullRebuild`], not `Err`. The three fan-out
-    /// helpers used to answer with `FsError::Internal("replay needs full
-    /// recalc (policy fan-out too large)")`, and to every caller above that
-    /// text is indistinguishable from a store failure: `replay` propagated
-    /// it with a bare `?`, `advance`'s final arm released the claim and
-    /// returned it, and the route's `?` rendered `500 {"error":"internal
-    /// server error"}`. `APPLIED_KEY` only advances on success, so the next
-    /// poll replayed the identical entry and 500ed identically, for the life
-    /// of the process -- a subject that never converges, and a rebuild that
-    /// is never queued, which is the one outcome `ReplayOutcome` was
-    /// introduced to make expressible.
+    /// helpers used to answer with this value:
+    /// `FsError::Internal("replay needs full recalc (policy fan-out too large)")`.
+    /// Every caller above sees that text as the same thing as a store
+    /// failure. `replay` propagated it with a bare `?`. The last arm of
+    /// `advance` released the claim and returned it. The `?` of the route
+    /// then rendered `500 {"error":"internal server error"}`. `APPLIED_KEY`
+    /// only advances on success. The next poll then replayed the same entry
+    /// and returned the same 500, for the life of the process. That leaves a
+    /// subject that never converges and a rebuild that is never queued. That
+    /// last outcome is the one that `ReplayOutcome` now makes expressible.
     async fn apply_op(
         &self,
         sub: &str,
@@ -823,11 +869,12 @@ impl SnapshotManager {
                 dst.detach(row_type, row_id, file_id).await?;
             }
             WalOp::PolicyAdd { .. } | WalOp::PolicyRemove { .. } => {
-                // `replay` rejects a range containing one of these before it
-                // opens a writer, so the arm is unreachable today. It
-                // declines for the same reason the fan-out arms do: a legacy
-                // mark names an object and no rule, so the only correct
-                // handling is a full recalc -- a decision, not a failure.
+                // `replay` rejects a range that contains one of these ops
+                // before it opens a writer, so this arm is unreachable today.
+                // The arm declines for the same reason as the fan-out arms. A
+                // legacy mark names an object and no rule. The only correct
+                // handling is therefore a full recalculation. That is a
+                // decision, not a failure.
                 return Ok(ApplyOutcome::NeedsFullRebuild);
             }
             WalOp::PolicyRuleAdd {
@@ -852,27 +899,29 @@ impl SnapshotManager {
         Ok(ApplyOutcome::Applied)
     }
 
-    /// Every group `sub` is a member of, transitively.
+    /// Every group that `sub` is a member of, including indirect groups.
     ///
-    /// This is the closure the RBAC matcher actually resolves. `g = _, _`
-    /// with `m = g(r.sub, p.sub) && …` walks the whole role hierarchy, and
-    /// `WalOp::GroupAdd { user, group }` puts no constraint on `group`, so
-    /// `alice ∈ editors ∈ staff` is a shape the feed can carry.
+    /// The RBAC matcher resolves this closure. `g = _, _` with
+    /// `m = g(r.sub, p.sub) && …` walks the whole role hierarchy.
+    /// `WalOp::GroupAdd { user, group }` sets no constraint on `group`, so
+    /// the feed can carry the shape `alice ∈ editors ∈ staff`.
     /// [`Authorizer::get_groups_of_user`] is casbin's
-    /// `RoleManager::get_roles`, which answers with DIRECT roles only, so
-    /// one hop is not the answer to "can this rule subject be `sub`".
+    /// `RoleManager::get_roles`. That function answers with DIRECT roles
+    /// only. One hop therefore does not answer "can this rule subject be
+    /// `sub`".
     ///
-    /// Walks the same breadth-first expansion as casbin's
-    /// `get_implicit_roles_for_user` (casbin-2.20.0 `rbac_api.rs:313`)
-    /// rather than delegating to it: that lives on `Enforcer`, which is
-    /// private to [`crate::policy`], and reaching it would mean handing the
-    /// replay path a write-capable engine — the bypass
-    /// `PolicyEngine::enforcer` being private exists to prevent. The hop
-    /// primitive is already on the read-only handle.
+    /// The method walks the same breadth-first expansion as casbin's
+    /// `get_implicit_roles_for_user` (casbin-2.20.0 `rbac_api.rs:313`).
+    /// The method does not call that function. That function lives on
+    /// `Enforcer`, which is private to [`crate::policy`]. Reaching it would
+    /// hand the replay path a write-capable engine, which is the bypass that
+    /// `PolicyEngine::enforcer` prevents by being private. The read-only
+    /// handle already has the hop primitive.
     ///
-    /// Visited-set rather than depth limit: a cycle in the hierarchy (`a ∈ b`
-    /// and `b ∈ a`) must terminate, and a cycle makes the closure the whole
-    /// reachable component rather than something a fixed depth truncates.
+    /// The method uses a visited set instead of a depth limit. A cycle in the
+    /// hierarchy (`a ∈ b` and `b ∈ a`) must end. A cycle also makes the
+    /// closure the whole reachable component. A fixed depth would cut that
+    /// component short.
     async fn implicit_groups(&self, sub: &str) -> std::collections::HashSet<String> {
         let mut found: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut frontier = vec![sub.to_string()];
@@ -886,14 +935,15 @@ impl SnapshotManager {
         found
     }
 
-    /// Resyncs the single row a permission rule changed.
+    /// Resyncs the single row that a permission rule changed.
     ///
-    /// Skips fast: non-`read` actions never affect read replicas,
-    /// non-row objects (`rules`, `user_groups`, …) hold no files, and a rule
-    /// subject `sub` cannot reach — neither directly nor through nested
-    /// groups — cannot match. Otherwise every file on the row is re-checked
-    /// via [`Self::resync_file`] (idempotent: converge, never over-delete).
-    /// Fan-out over [`MAX_POLICY_REPLAY_FILES`] returns
+    /// The method skips most cases early. A non-`read` action never affects a
+    /// read replica. A non-row object (`rules`, `user_groups`, …) holds no
+    /// files. A rule subject `sub` cannot reach cannot match, neither
+    /// directly nor through nested groups. Otherwise the method re-checks
+    /// every file on the row through [`Self::resync_file`]. That resync is
+    /// idempotent. It converges, and it never deletes too much. A fan-out
+    /// over [`MAX_POLICY_REPLAY_FILES`] returns
     /// [`ApplyOutcome::NeedsFullRebuild`].
     async fn apply_rule_op(
         &self,
@@ -923,12 +973,14 @@ impl SnapshotManager {
         Ok(ApplyOutcome::Applied)
     }
 
-    /// Resyncs rows a membership change can affect (only when `user == sub`).
+    /// Resyncs the rows that a membership change can affect. The method acts
+    /// only when `user == sub`.
     ///
-    /// Drops through when the change is for another user. For `sub` itself,
-    /// every `read` row the group grants is resynced; groups with no row
-    /// reads (e.g. `superadmin` on `rules`/`user_groups`) are a no-op.
-    /// Oversized fan-out returns [`ApplyOutcome::NeedsFullRebuild`].
+    /// The method does nothing when the change is for another user. For `sub`
+    /// itself, the method resyncs every `read` row that the group grants.
+    /// Groups with no row reads, such as `superadmin` on
+    /// `rules`/`user_groups`, cause no work. An oversized fan-out returns
+    /// [`ApplyOutcome::NeedsFullRebuild`].
     async fn apply_membership_op(
         &self,
         sub: &str,
@@ -955,13 +1007,14 @@ impl SnapshotManager {
         Ok(ApplyOutcome::Applied)
     }
 
-    /// Resyncs rows a deleted group could have exposed.
+    /// Resyncs the rows that a deleted group could have exposed.
     ///
-    /// Past membership is unknowable (links are already gone), so any group
-    /// holding row `read` rules resyncs its rows: [`Self::resync_file`]
-    /// re-checks current visibility, making over-application safe (files
-    /// still visible via other rows stay, others converge to deleted).
-    /// Groups with no row reads skip; oversized fan-out returns
+    /// The old membership is unknowable, because the links are already gone.
+    /// Every group that holds row `read` rules therefore resyncs its rows.
+    /// [`Self::resync_file`] re-checks the current visibility, so extra
+    /// applications are safe. Files that stay visible through other rows
+    /// remain. The other files converge to deleted. Groups with no row reads
+    /// skip the work. An oversized fan-out returns
     /// [`ApplyOutcome::NeedsFullRebuild`].
     async fn apply_group_delete(
         &self,
@@ -990,10 +1043,10 @@ impl SnapshotManager {
 
     /// Converges one file on the replica after a policy change.
     ///
-    /// Readable files are ensured present with the changed row attached
-    /// (or detached when that row alone turned unreadable); files readable
-    /// via no row are deleted. Missing master records delete the stale
-    /// replica copy.
+    /// The method ensures that a readable file is present, with the changed
+    /// row attached. The method detaches the row when that row alone turned
+    /// unreadable. The method deletes files that no row makes readable. A
+    /// missing master record makes the method delete the stale replica copy.
     async fn resync_file(
         &self,
         sub: &str,
@@ -1024,48 +1077,49 @@ impl SnapshotManager {
         Ok(())
     }
 
-    /// Row `(type, id)` pairs readable through `group`, at any depth.
+    /// Row `(type, id)` pairs that `group` can read, at any depth.
     ///
-    /// This is the decision [`Self::apply_membership_op`] stands in for, so
-    /// it has to be the same question `enforce` asks and not a narrower
-    /// one. It used to ask the narrower one:
+    /// The method answers the question that [`Self::apply_membership_op`]
+    /// stands in for. It must ask the same question as `enforce`, not a
+    /// narrower one. The old code asked the narrower question:
     ///
     /// ```text
     /// for (obj, act) in self.policy.rules_for_subject(group).await { … }
     /// ```
     ///
-    /// [`Authorizer::rules_for_subject`] is a direct `p`-rule read -- rules
-    /// whose `p.sub` is literally `group` -- so `alice ∈ editors ∈ staff`
-    /// with `p, staff, invoice:1, read` returned nothing for `editors`.
-    /// Replaying `WalOp::GroupAdd { user: alice, group: editors }` then
-    /// resynced no rows at all, and the file `enforce` would have
-    /// authorized never reached alice's replica. That is the same
-    /// direct-vs-transitive asymmetry 77036cb fixed on the rule path
-    /// (`apply_rule_op`'s skip set built from `get_groups_of_user`), and it
-    /// is the same shape of harm: the full rebuild routes every file
-    /// through `visible_rows` -> `authorize_row` and gets this right, so
-    /// the incremental path was weaker than the rebuild.
+    /// [`Authorizer::rules_for_subject`] reads direct `p` rules, which are
+    /// the rules whose `p.sub` is literally `group`. For `alice ∈ editors ∈
+    /// staff` with `p, staff, invoice:1, read`, that read returned nothing
+    /// for `editors`. A replay of `WalOp::GroupAdd { user: alice, group:
+    /// editors }` then resynced no rows. The file that `enforce` would have
+    /// authorized never reached alice's replica. Commit 77036cb fixed the
+    /// same direct and transitive asymmetry on the rule path, because
+    /// `apply_rule_op` built its skip set from `get_groups_of_user`. The
+    /// harm has the same shape here. A full rebuild routes every file
+    /// through `visible_rows` -> `authorize_row` and handles this case
+    /// correctly, so the incremental path was weaker than the rebuild.
     ///
-    /// Inverted relative to a revocation, so less bad than the rule-path bug
-    /// and still worth fixing: the resync here only ever ADDS what
-    /// [`Self::resync_file`] then re-checks through `can_read` /
-    /// `authorize_row`, so widening this set cannot over-include. It only
-    /// decides how much gets re-checked, and a stale-absent file converges
-    /// on the next replay of a membership op or the next full rebuild --
-    /// except that neither is guaranteed to come, which is what makes the
-    /// silent staleness worth closing rather than noting.
+    /// This case is the inverse of a revocation, so it does less harm than
+    /// the rule-path bug. It is still worth fixing. The resync here only
+    /// ADDS what [`Self::resync_file`] then re-checks through `can_read` and
+    /// `authorize_row`. Widening this set therefore cannot include too much.
+    /// The set only decides how much the code re-checks. A stale missing file
+    /// converges on the next replay of a membership op, or on the next full
+    /// rebuild. Neither of those two events is guaranteed, which is why the
+    /// code closes the silent staleness instead of noting it.
     ///
-    /// Walks the hierarchy with [`Self::implicit_groups`] rather than a
-    /// second traversal, so "the closure of a group under `g`" has exactly
-    /// one definition in this module. Unbounded like that closure, and
-    /// deliberately: it errs toward re-checking MORE rows, which is the
-    /// safe direction for a set that only feeds idempotent resyncs, while
-    /// a depth limit would re-introduce a skip — and a skip is the whole
-    /// bug. The cost is already bounded where it can actually hurt, by
-    /// [`MAX_POLICY_REPLAY_FILES`] over the fan-out itself.
+    /// The method walks the hierarchy with [`Self::implicit_groups`] instead
+    /// of a second traversal. That way "the closure of a group under `g`" has
+    /// exactly one definition in this module. The walk is unbounded, in the
+    /// same way as that closure, and deliberately so. The method errs toward
+    /// re-checking MORE rows, which is the safe direction for a set that only
+    /// feeds idempotent resyncs. A depth limit would bring back a skip, and a
+    /// skip is the whole bug. [`MAX_POLICY_REPLAY_FILES`] already bounds the
+    /// cost where the cost causes harm, by limiting the fan-out itself.
     ///
-    /// Deduped, because a group and its ancestors commonly share a row and
-    /// every repeated entry is a repeated resync of the same files.
+    /// The method removes duplicates, because a group and its ancestors often
+    /// share a row. Every repeated entry would repeat the resync of the same
+    /// files.
     async fn read_rows_for_group(&self, group: &str) -> Result<Vec<(String, String)>, FsError> {
         let mut out: std::collections::BTreeSet<(String, String)> =
             std::collections::BTreeSet::new();
@@ -1084,23 +1138,25 @@ impl SnapshotManager {
         Ok(out.into_iter().collect())
     }
 
-    /// Writes the caller's visible file set into `dst`.
+    /// Writes the visible file set of the caller into `dst`.
     ///
-    /// One pass over the master listing: the record in hand answers the
-    /// owner check (no re-read), and one rows scan serves both the
-    /// visibility check and the attach loop. Previously each file cost
-    /// a re-read plus two full-store scans (one inside `can_read`, one
-    /// for attach) on top of the listing itself.
+    /// The method makes one pass over the master listing. The record in hand
+    /// answers the owner check, with no second read. One rows scan then
+    /// serves the visibility check and the attach loop. The old code instead
+    /// paid one re-read and two full-store scans for each file, one inside
+    /// `can_read` and one for the attach, on top of the listing itself.
     ///
-    /// Returns the keys the walk could not decode, which is the caller's
-    /// cue to refuse the diff: `dst` is deliberately INCOMPLETE when this
-    /// is non-empty, and `build_full` diffs it against a live replica.
+    /// The method returns the keys that the walk could not decode. The caller
+    /// uses that list as the cue to refuse the diff. `dst` is deliberately
+    /// INCOMPLETE when the list is not empty. `build_full` then compares
+    /// `dst` with a live replica.
     async fn copy_filtered(&self, sub: &str, dst: &FsStore) -> Result<Vec<String>, FsError> {
-        // Paged, not collected. `list_files` returns every record in the
-        // master as a `Vec<FileRecord>`, which for a large master is the
-        // single largest allocation in the rebuild and is entirely
-        // unnecessary: the filter below decides per record and keeps none of
-        // them. The key layout stays in `fs::store`; this only drives it.
+        // The method pages the listing instead of collecting it. `list_files`
+        // returns every master record as a `Vec<FileRecord>`. For a large
+        // master, that vector is the single largest allocation in the
+        // rebuild, and the code does not need it. The filter below decides
+        // per record and keeps no record. The key layout stays in
+        // `fs::store`, and this method only drives that layout.
         let mut scan = self.store.pages();
         let mut undecodable = Vec::new();
         loop {
@@ -1163,9 +1219,9 @@ fn store_err(e: oxkv::StoreError) -> FsError {
 
 /// Splits a rule object into `(row_type, row_id)` when it names a row.
 ///
-/// Row objects are `{type}:{id}`; control-plane objects (`rules`,
-/// `user_groups`, …) contain no colon and return `None` so policy replay
-/// can skip them without touching storage.
+/// Row objects have the form `{type}:{id}`. Control-plane objects (`rules`,
+/// `user_groups`, …) contain no colon. The function returns `None` for them,
+/// so that policy replay can skip them without touching storage.
 fn split_row_obj(obj: &str) -> Option<(&str, &str)> {
     let (ty, rid) = obj.split_once(':')?;
     if ty.is_empty() || rid.is_empty() {
@@ -1174,13 +1230,14 @@ fn split_row_obj(obj: &str) -> Option<(&str, &str)> {
     Some((ty, rid))
 }
 
-/// Maps a subject to a prefix-safe identifier.
+/// Maps a subject to an identifier that is safe in a prefix.
 ///
-/// Subjects are attacker-influenced (OIDC `sub`), so a lossy replace is
-/// not enough: `a/b`, `a:b`, and `a_b` would all collide on one replica
-/// prefix and leak data across users. The SHA-256 hex digest is
-/// collision-resistant, fixed-length, and prefix-safe by construction
-/// (lowercase hex only, no separators or traversal sequences).
+/// An attacker can influence subjects (OIDC `sub`), so a lossy replace is
+/// not enough. The values `a/b`, `a:b`, and `a_b` would all collide on one
+/// replica prefix, and that collision leaks data across users. The SHA-256
+/// hex digest resists collisions, has a fixed length, and is prefix-safe by
+/// construction. It contains lowercase hex digits only, with no separators
+/// and no traversal sequences.
 fn safe_sub(sub: &str) -> String {
     use sha2::{Digest, Sha256};
     Sha256::digest(sub.as_bytes())
@@ -1196,12 +1253,12 @@ mod tests {
     use crate::records::ChangeSink;
     use object_store::memory::InMemory;
 
-    /// Builds a manager plus the [`PolicyEngine`] it reads through.
+    /// Builds a manager plus the [`PolicyEngine`] that it reads through.
     ///
-    /// The engine comes back alongside so tests can mutate policy and then
-    /// let the replica *observe* the change, rather than mutating through
-    /// the manager — the manager deliberately only holds a read-only
-    /// `Authorizer`, which is the property under test.
+    /// The function also returns the engine, so that a test can change the
+    /// policy and then let the replica observe the change. The test does not
+    /// change the policy through the manager. The manager holds only a
+    /// read-only `Authorizer`, and that is the property under test.
     async fn test_manager() -> (
         SnapshotManager,
         crate::policy::PolicyEngine,
@@ -1230,15 +1287,15 @@ mod tests {
         (mgr, policy, mem)
     }
 
-    /// The backend choice maps to the probe flag, and the polarity is the
-    /// whole risk.
+    /// The backend choice maps to the probe flag, and the flag polarity is
+    /// the whole risk.
     ///
-    /// `skip_probe` was a bare `bool` in a six-argument constructor, so
-    /// nothing at the call site distinguished "probe real S3" from "no
-    /// probe". Getting it backwards is not a compile error and not a wrong
-    /// answer: skipping the probe against real S3 drops the conditional-write
-    /// check that guards the `manifest.json` CAS, which only shows up later
-    /// as two builders believing they both won.
+    /// `skip_probe` was a bare `bool` in a six-argument constructor. Nothing
+    /// at the call site told "probe real S3" apart from "no probe". The wrong
+    /// value does not cause a compile error. It also does not cause an
+    /// obviously wrong answer. Skipping the probe against real S3 removes
+    /// the conditional-write check that guards the `manifest.json` CAS. That
+    /// fault shows up later, as two builders that each believe it won.
     #[tokio::test]
     async fn replica_backend_selects_the_storage_probe() {
         let deps = async {
@@ -1286,14 +1343,14 @@ mod tests {
         );
     }
 
-    /// A manager whose [`BuildQueue`] receiver is RETAINED.
+    /// Builds a manager and KEEPS the receiver of its [`BuildQueue`].
     ///
-    /// `test_manager` discards the receiver (`BuildQueue::new().0`), so
-    /// every dispatch fails and the claim is released immediately by the
-    /// failure path. That is the right default for a fixture that only
-    /// cares about replay, and the wrong one for anything about
-    /// coalescing: a test written against it cannot tell "the in-flight set
-    /// held the slot" from "nothing was ever claimed".
+    /// `test_manager` drops the receiver (`BuildQueue::new().0`). Then every
+    /// dispatch fails, and the failure path releases the claim at once. That
+    /// default suits a fixture that only tests replay. It does not suit a
+    /// test about merging requests. A test written against that fixture
+    /// cannot tell "the in-flight set held the slot" from "nothing was ever
+    /// claimed".
     async fn test_manager_with_queue() -> (
         SnapshotManager,
         crate::policy::PolicyEngine,
@@ -1376,9 +1433,9 @@ mod tests {
         Ok(())
     }
 
-    /// Writes a raw value under `key` in the MASTER store, bypassing every
-    /// typed setter, so a test can plant a row no writer in this crate would
-    /// produce.
+    /// Writes a raw value under `key` in the MASTER store. The call skips
+    /// every typed setter, so that a test can plant a row that no writer in
+    /// this crate would produce.
     async fn put_raw(store: &FsStore, key: &str, value: &[u8]) {
         store
             .kv_handle()
@@ -1390,45 +1447,47 @@ mod tests {
     }
 
     /// An undecodable master row must not delete a file from a replica that
-    /// already has it.
+    /// already has the file.
     ///
-    /// The rebuild is a merge-join: the filtered master walk is the desired
-    /// side, the replica is the live side, and a key present only on the
-    /// live side is deleted. A `fs:files:{id}:meta` row that fails to decode
-    /// is skipped by `next_file`, so the walk cannot see it, so the join
-    /// reads "master no longer has this file" -- and commits the deletion of
-    /// the file's metadata row and its relation rows from the user's replica,
-    /// while the master still holds them. `GET /sync/db/...{id}:meta` then
-    /// 404s for a file the master serves fine.
+    /// The rebuild performs a merge join. The filtered master walk is the
+    /// desired side. The replica is the live side. The join deletes a key
+    /// that is present only on the live side. A `fs:files:{id}:meta` row
+    /// that fails to decode is skipped by `next_file`. The walk then cannot
+    /// see that row. The join then reads "master no longer has this file".
+    /// The join then deletes the metadata row of that file, and its relation
+    /// rows, from the replica of the user. The master still holds them.
+    /// `GET /sync/db/...{id}:meta` then returns 404 for a file that the
+    /// master serves correctly.
     ///
-    /// This is worse than "one file is omitted from one replica": the
-    /// omission is not the outcome, the DELETE is. An earlier lane assessed
-    /// the consequence as an omission, which is right about the master and
-    /// wrong about the replica.
+    /// This fault does more than "omit one file from one replica". The
+    /// omission is not the outcome. The DELETE is the outcome. An earlier
+    /// change assessed the consequence as an omission. That assessment is
+    /// right about the master and wrong about the replica.
     ///
-    /// The gc orphan-byte pass reaches the opposite conclusion for the
-    /// identical input and refuses to act on it ("an unreferenced key cannot
-    /// be proven unreferenced", src/fs/gc.rs). `build_full` had no equivalent
-    /// gate and is the destructive direction, so it now refuses the build
-    /// outright: the replica is left exactly as it was.
+    /// For the same input, the gc orphan-byte pass reaches the opposite
+    /// conclusion and refuses to act. Its rule is "an unreferenced key cannot
+    /// be proven unreferenced", src/fs/gc.rs. `build_full` had no equivalent
+    /// gate, and `build_full` acts in the destructive direction. The method
+    /// therefore refuses the build now. The replica stays exactly as it was.
     ///
-    /// Reachable without corruption: any field added to `FileRecord` without
-    /// a `#[serde(default)]` undecodes every row the previous version wrote,
-    /// so one ordinary schema change away.
+    /// The code can reach this state without corruption. Adding any field to
+    /// `FileRecord` without a `#[serde(default)]` makes every row that the
+    /// previous version wrote undecodable. One ordinary schema change is
+    /// enough.
     ///
-    /// The assertion is both halves. `f1` decodes and is still there, so the
-    /// rebuild is not merely refusing everything; `f2` is the file whose
-    /// master row stopped decoding, and it must survive on the replica. On
-    /// the old behaviour the second build deletes `fs:files:f2:meta` AND
-    /// `fs:rel:invoice:1:f2` from the replica.
+    /// The test checks both halves. `f1` decodes, and `f1` is still there, so
+    /// the rebuild is not refusing everything. `f2` is the file whose master
+    /// row stopped decoding, and `f2` must survive on the replica. The old
+    /// code deleted `fs:files:f2:meta` AND `fs:rel:invoice:1:f2` from the
+    /// replica on the second build.
     #[tokio::test]
     async fn an_undecodable_master_row_cannot_delete_a_file_from_a_replica() -> anyhow::Result<()> {
         let (mgr, policy, mem) = test_manager().await;
         policy
             .add_rule("alice".into(), "invoice:1".into(), Action::Read)
             .await?;
-        // Both files are alice's and both hang off a row she may read, so
-        // both are in her filtered set on the first build.
+        // Both files belong to alice. Both hang off a row that she may read.
+        // Both are in her filtered set on the first build.
         for id in ["f1", "f2"] {
             mgr.store.save_file(&file_record(id, "alice")).await?;
             mgr.store.attach("invoice", "1", id).await?;
@@ -1438,7 +1497,8 @@ mod tests {
         assert!(replica_has(&mem, &mgr, "alice", "fs:rel:invoice:1:f2").await);
 
         // The master row for f2 stops decoding, as it would after a schema
-        // change. The master still HAS the file; only the walk cannot read it.
+        // change. The master still HAS the file. Only the walk cannot read
+        // it.
         put_raw(&mgr.store, "fs:files:f2:meta", br#"{"id":"f2","size":1"#).await;
 
         let refused = mgr.build_full("alice").await;
@@ -1453,7 +1513,7 @@ mod tests {
             replica_has(&mem, &mgr, "alice", "fs:files:f1:meta").await,
             "the refusal must not cost the replica the files it CAN read"
         );
-        // ...and the unreadable one was not deleted from the replica.
+        // The unreadable file was also not deleted from the replica.
         assert!(
             replica_has(&mem, &mgr, "alice", "fs:files:f2:meta").await,
             "the rebuild deleted a file from the replica on the strength of a row it could not read"
@@ -1463,8 +1523,8 @@ mod tests {
             "the rebuild deleted a file's relation rows from the replica as well"
         );
 
-        // Repaired, the rebuild resumes -- the gate defers, it does not
-        // disable the replica.
+        // After the repair, the rebuild resumes. The gate defers the build.
+        // It does not disable the replica.
         mgr.store.save_file(&file_record("f2", "alice")).await?;
         assert_eq!(mgr.build_full("alice").await?, 0);
         assert!(replica_has(&mem, &mgr, "alice", "fs:files:f2:meta").await);
@@ -1522,7 +1582,8 @@ mod tests {
         mgr.store.save_file(&file_record("f1", "alice")).await?;
         mgr.build_full("alice").await?;
 
-        // Simulate the logged write path: master mutation + WAL entry.
+        // Simulate the logged write path. The code changes the master and
+        // appends a WAL entry.
         let f2 = file_record("f2", "alice");
         mgr.store.save_file(&f2).await?;
         mgr.wal.append(WalOp::FileCreate { rec: f2 }).await?;
@@ -1545,7 +1606,8 @@ mod tests {
         mgr.build_full("alice").await?;
         assert!(replica_has(&mem, &mgr, "alice", "fs:rel:invoice:1:f1").await);
 
-        // Detach then delete on master, each logged like the engines do.
+        // Detach and then delete on the master. The code logs both, as the
+        // engines do.
         mgr.store.detach("invoice", "1", "f1").await?;
         mgr.wal
             .append(WalOp::Detach {
@@ -1567,32 +1629,34 @@ mod tests {
         Ok(())
     }
 
-    /// Concurrent `advance` calls for one subject collapse into one build.
+    /// Concurrent `advance` calls for one subject merge into one build.
     ///
-    /// This is the coalescing property, and it is worth more than the queue
-    /// itself. `POST /sync/sync` is driven by client polling, so a deploy or a
-    /// busy period produces many requests per user for the same pending
-    /// rebuild. Without the in-flight set each one runs a full master scan to
-    /// discover there was nothing to do -- and because the old guard was a
-    /// process-wide mutex, those scans also ran one at a time, so they queued
-    /// up behind each other rather than at least being cheap.
+    /// This is the merge property, and it matters more than the queue itself.
+    /// A client polls `POST /sync/sync`, so a deploy or a busy period sends
+    /// many requests per user for the same pending rebuild. Without the
+    /// in-flight set, each request runs a full master scan and then finds
+    /// that there is nothing to do. The old guard was also a process-wide
+    /// mutex, so those scans ran one at a time. They then queued up behind
+    /// each other instead of at least being cheap.
     ///
-    /// The fixture RETAINS the queue receiver. Under the old
-    /// `BuildQueue::new().0` the receiver was dropped, so every `dispatch`
-    /// failed on a closed channel and released the claim on the failure path:
-    /// the in-flight set was empty again before each assertion, and "the claim
-    /// short-circuited the queue" and "nothing was ever claimed" were the same
-    /// observable state. Deleting the whole set left this test green.
-    /// The receiver is deliberately not drained -- a live pool would finish
-    /// the build and release the slot between calls, which is correct but
-    /// exercises nothing. Holding the queued job IS the coalescing window.
+    /// The fixture KEEPS the queue receiver. The old `BuildQueue::new().0`
+    /// dropped the receiver. Every `dispatch` then failed on a closed
+    /// channel, and the failure path released the claim. The in-flight set
+    /// was empty again before each assertion. "The claim short-circuited the
+    /// queue" and "nothing was ever claimed" then looked the same from
+    /// outside. Deleting the whole set left this test green.
+    ///
+    /// The test does not drain the receiver on purpose. A live pool would
+    /// finish the build and release the slot between calls. That result is
+    /// correct, but it tests nothing. Holding the queued job IS the merge
+    /// window.
     #[tokio::test]
     async fn concurrent_advances_for_one_subject_collapse() -> anyhow::Result<()> {
         let (mgr, _, mut jobs) = test_manager_with_queue().await;
         mgr.store.save_file(&file_record("f1", "alice")).await?;
 
-        // A never-built replica needs a full rebuild, so every call here wants
-        // to queue one.
+        // A replica that was never built needs a full rebuild, so every call
+        // here tries to queue one.
         let first = mgr.advance("alice").await?;
         assert!(first.pending, "a never-built replica must be queued");
         assert_eq!(first.applied_seq, 0, "nothing has been built yet");
@@ -1615,33 +1679,34 @@ mod tests {
         Ok(())
     }
 
-    /// Drives one `advance` until it parks on an object-store read, then
+    /// Drives one `advance` until it stops at an object-store read, then
     /// drops it there.
     ///
-    /// `advance` is polled with a no-op waker, so every operation the
-    /// `InMemory` backend can answer synchronously runs to completion
-    /// inside a single poll. The one that cannot is the stalling read this
-    /// arms below, and that suspension point is exactly the state a client
-    /// disconnect abandons: the handler future is dropped with the claim
-    /// inserted and no release executed.
+    /// The test polls `advance` with a no-op waker. Every operation that the
+    /// `InMemory` backend can answer at once then runs to the end inside a
+    /// single poll. The one exception is the stalling read that the test arms
+    /// below. That suspension point is exactly the state that a client
+    /// disconnect abandons. The handler future is dropped with the claim
+    /// inserted and with no release executed.
     ///
-    /// Returns `true` once the future has parked, so the caller knows the
-    /// claim was live at the drop rather than the test asserting against a
-    /// future that ran to the end and released on its own.
-    /// Arms on the first WRITE, not the first read.
+    /// The helper returns `true` once the future has stopped. The caller then
+    /// knows that the claim was live at the drop. Without that value, the test
+    /// could assert against a future that ran to the end and released on its
+    /// own.
     ///
-    /// `advance` reads the coverage marker (`load_applied`) before it takes
-    /// the claim, so a stall on a read would park with the slot still free
-    /// and prove nothing. Every replica write -- opening the writer, the
-    /// per-op apply, the marker -- happens inside `replay`, after the claim
-    /// is held.
+    /// The helper arms on the first WRITE, not on the first read. `advance`
+    /// reads the coverage marker (`load_applied`) before it takes the claim. A
+    /// stop on a read would then park with the slot still free, and it would
+    /// prove nothing. Every replica write happens inside `replay`, after the
+    /// claim is held. Those writes are the opening of the writer, the apply
+    /// for each op, and the marker write.
     #[derive(Debug)]
     struct StallingStore {
         inner: std::sync::Arc<dyn object_store::ObjectStore>,
-        /// Armed before the advance so only that read stalls.
+        /// Armed before the advance, so that only that read stalls.
         armed: std::sync::Arc<std::sync::atomic::AtomicBool>,
-        /// Set by the stalling read, so the test can prove the future
-        /// suspended at THAT read rather than somewhere else.
+        /// Set by the stalling read. The field lets the test prove that the
+        /// future stopped at THAT read and not somewhere else.
         hit: std::sync::Arc<std::sync::atomic::AtomicBool>,
     }
 
@@ -1655,8 +1720,8 @@ mod tests {
         ) -> object_store::Result<object_store::PutResult> {
             if self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
                 self.hit.store(true, std::sync::atomic::Ordering::SeqCst);
-                // Never resolves: the caller is expected to drop the future
-                // it is parked in rather than wait this out.
+                // This call never resolves. The caller must drop the future
+                // that it is stopped in instead of waiting for a result.
                 std::future::pending::<()>().await;
             }
             self.inner.put_opts(location, payload, opts).await
@@ -1729,20 +1794,21 @@ mod tests {
         }
     }
 
-    /// A future dropped mid-flight must release the subject's slot.
+    /// A future that the code drops mid-flight must release the slot of the
+    /// subject.
     ///
-    /// This is the leak the [`BuildClaim`] exists to close. `advance` runs
-    /// inside a request handler future, and the client may disconnect at any
-    /// `.await` in `replay`. The handler is then dropped with the claim
-    /// inserted and no release executed -- and every later `advance` for that
-    /// subject takes the `pending: true` short-circuit forever: the replica is
-    /// frozen at its old coverage for the life of the process, silently, with
-    /// no error logged and no recovery short of a restart.
+    /// This is the leak that the [`BuildClaim`] exists to close. `advance`
+    /// runs inside a request handler future, and the client may disconnect at
+    /// any `.await` in `replay`. The code then drops the handler with the
+    /// claim inserted and with no release executed. Every later `advance` for
+    /// that subject then takes the `pending: true` short-circuit forever. The
+    /// replica stays frozen at its old coverage for the life of the process.
+    /// No code logs an error, and only a restart recovers.
     ///
-    /// Driven through a real `advance` future, parked on a real store read, so
-    /// it fails if the guard is ever moved off the path that holds it. The
-    /// stalling store arms AFTER `build_full`, so the setup builds normally
-    /// and only the advance being dropped parks.
+    /// The test drives a real `advance` future and stops it at a real store
+    /// read. The test then fails if the guard ever moves off the path that
+    /// holds it. The stalling store arms AFTER `build_full`. The setup then
+    /// builds normally, and only the advance that the test drops stops.
     #[tokio::test]
     async fn a_future_dropped_mid_replay_releases_the_slot() -> anyhow::Result<()> {
         use std::future::Future;
@@ -1760,8 +1826,8 @@ mod tests {
             })
             .await?;
 
-        // Arm the stall only now: `build_full` and the WAL append above must
-        // run for real, and only the advance being dropped may park.
+        // Arm the stall only now. `build_full` and the WAL append above must
+        // run for real. Only the advance that the test drops may stop.
         let armed = Arc::new(AtomicBool::new(true));
         let hit = Arc::new(AtomicBool::new(false));
         let inner = mgr.object_store.clone();
@@ -1774,10 +1840,10 @@ mod tests {
         let mut advance = Box::pin(mgr.advance("alice"));
         let waker = futures_util::task::noop_waker_ref();
         let mut cx = Context::from_waker(waker);
-        // One poll: with the stall armed, everything `InMemory` can answer
-        // synchronously runs to the first replica WRITE and parks there. A
-        // single poll is therefore the whole wait -- and `Ready` here would
-        // mean the write never happened, which the assertion catches.
+        // One poll. With the stall armed, everything that `InMemory` can
+        // answer at once runs to the first replica WRITE and stops there. One
+        // poll is therefore the whole wait. A `Ready` result here would mean
+        // that the write never happened, and the assertion below catches it.
         match Pin::new(&mut advance).as_mut().poll(&mut cx) {
             Poll::Pending => {}
             Poll::Ready(r) => panic!("the advance finished instead of parking: {r:?}"),
@@ -1787,7 +1853,8 @@ mod tests {
             "the advance future must park inside replay, with the claim live"
         );
 
-        // Dropped mid-replay, claim inserted: the slot must not survive.
+        // The test drops the future during the replay, with the claim
+        // inserted. The slot must not survive.
         drop(advance);
         assert!(
             mgr.builds.claim("alice").is_some(),
@@ -1800,12 +1867,12 @@ mod tests {
         Ok(())
     }
 
-    /// A rebuild that is already running leaves the caller short of the head,
-    /// and `pending` has to say so.
+    /// A rebuild that already runs leaves the caller short of the head, and
+    /// `pending` must say so.
     ///
-    /// The distinction from `applied_seq < head` is the point: a client that
+    /// The difference from `applied_seq < head` is the point. A client that
     /// cannot tell "queued for you" from "someone else got there first"
-    /// cannot decide whether to keep polling or give up.
+    /// cannot decide whether to keep polling or to stop.
     #[tokio::test]
     async fn pending_is_reported_rather_than_silently_short() -> anyhow::Result<()> {
         let (mgr, _, _) = test_manager().await;
@@ -1820,9 +1887,9 @@ mod tests {
 
     /// Different subjects do not block each other.
     ///
-    /// The regression this pins: `replay` and `build_full` used to share one
-    /// process-wide `Mutex<()>`, so a full rebuild for alice blocked a replay
-    /// for bob behind work that can take minutes.
+    /// The test guards against a past fault. `replay` and `build_full` shared
+    /// one process-wide `Mutex<()>`. A full rebuild for alice then blocked a
+    /// replay for bob behind work that can take minutes.
     #[tokio::test]
     async fn one_subject_does_not_block_another() -> anyhow::Result<()> {
         let (mgr, _, _) = test_manager().await;
@@ -1831,7 +1898,7 @@ mod tests {
         // Alice takes the slot.
         let alice = mgr.builds.claim("alice").expect("alice's slot is free");
 
-        // Bob is unaffected: he is not behind alice in any queue.
+        // Bob is not affected. He is not behind alice in any queue.
         let bob = mgr
             .builds
             .claim("bob")
@@ -1851,30 +1918,31 @@ mod tests {
         Ok(())
     }
 
-    /// A replica claiming coverage AHEAD of the WAL head must rebuild, and the
-    /// genuinely-caught-up case must stay a no-op.
+    /// A replica that claims coverage ahead of the WAL head must rebuild. The
+    /// genuinely caught-up case must stay a no-op.
     ///
-    /// Wave 3 made `Wal::range(from > to)` a loud `Err` on the grounds that
-    /// a rewound head must reach the full-rebuild fallback, and its author
-    /// flagged the gap this closes: `range` cannot tell "caught up" from
-    /// "head rewound" from inside itself -- it does not know the caller's
-    /// applied sequence -- so the loud error only helps a caller that
-    /// actually reaches it. `replay` short-circuited on `applied >= head`
-    /// and never passed `from > to`, and `advance` short-circuited on the
-    /// same condition before `replay` was called at all. Both reported
-    /// success for a replica whose coverage the feed can no longer justify.
+    /// Wave 3 made `Wal::range(from > to)` a loud `Err`. The ground for that
+    /// change was that a rewound head must reach the full-rebuild fallback.
+    /// The author of that change flagged the gap that this test closes.
+    /// `range` cannot tell "caught up" from "head rewound" from inside
+    /// itself, because it does not know the applied sequence of the caller.
+    /// The loud error therefore helps only a caller that reaches it. `replay`
+    /// stopped at `applied >= head` and never passed `from > to`. `advance`
+    /// stopped at the same condition before `replay` ran at all. Both
+    /// reported success for a replica whose coverage the feed can no longer
+    /// justify.
     ///
-    /// A head only moves forward, so `applied > head` means a rewound feed,
-    /// a restored-from-backup object store, or a marker that outlived the
-    /// entries it claims. The only correct answer is to rebuild from the
-    /// master.
+    /// A head only moves forward. Therefore `applied > head` means a rewound
+    /// feed, an object store restored from a backup, or a marker that
+    /// outlived the entries it claims. The only correct answer is a rebuild
+    /// from the master.
     ///
-    /// The applied marker is driven directly here rather than by rewinding a
-    /// real head: `Wal` has no rewind, and 130841e made a corrupt head fail
-    /// the append rather than rewind it, so a backwards head cannot be
-    /// produced through the public API at all. Writing the marker over a
-    /// built replica reproduces the state a rewind leaves behind, which is
-    /// the state this has to recognise.
+    /// The test writes the applied marker directly instead of rewinding a
+    /// real head. `Wal` has no rewind. Commit 130841e made a corrupt head
+    /// fail the append instead of rewinding it. The public API therefore
+    /// cannot produce a backwards head at all. Writing the marker over a
+    /// built replica reproduces the state that a rewind leaves behind, and
+    /// that is the state that the code must recognise.
     #[tokio::test]
     async fn an_applied_sequence_ahead_of_the_head_triggers_a_rebuild() -> anyhow::Result<()> {
         let (mgr, _, _) = test_manager_with_queue().await;
@@ -1882,8 +1950,8 @@ mod tests {
         mgr.build_full("alice").await?;
         assert_eq!(mgr.load_applied("alice").await?, Some(0));
 
-        // The replica now claims three entries the feed at head 0 cannot have
-        // handed it.
+        // The replica now claims three entries. The feed at head 0 cannot
+        // have given it those entries.
         let ahead = 3u64;
         mgr.open_writer("alice")
             .await?
@@ -1898,8 +1966,8 @@ mod tests {
             "coverage ahead of the head is corruption, not convergence"
         );
 
-        // And the same through `advance`, whose own short-circuit used to
-        // return `pending: false` before `replay` was ever reached.
+        // The same holds through `advance`. Its own short-circuit used to
+        // return `pending: false` before `replay` ever ran.
         let out = mgr.advance("alice").await?;
         assert!(
             out.pending,
@@ -1940,8 +2008,8 @@ mod tests {
         let (mgr, _, mem) = test_manager().await;
         mgr.store.save_file(&file_record("f1", "alice")).await?;
         mgr.build_full("alice").await?;
-        // Other user's membership, non-row object, and non-read action:
-        // none can affect alice's read replica.
+        // The ops cover another user's membership, a non-row object, and a
+        // non-read action. None of them can affect the read replica of alice.
         mgr.wal
             .append(WalOp::GroupAdd {
                 user: "bob".into(),
@@ -1971,14 +2039,15 @@ mod tests {
     #[tokio::test]
     async fn replay_applies_rule_grant_then_revoke() -> anyhow::Result<()> {
         let (mgr, policy, mem) = test_manager().await;
-        // Bob's file on invoice:1; alice sees nothing yet.
+        // The file on invoice:1 belongs to bob. Alice sees nothing yet.
         mgr.store.save_file(&file_record("f1", "bob")).await?;
         mgr.store.attach("invoice", "1", "f1").await?;
         mgr.build_full("alice").await?;
         assert!(!replica_has(&mem, &mgr, "alice", "fs:files:f1:meta").await);
 
-        // Grant editors read on the row, add alice to editors (master
-        // mutation first, WAL entries like the engines append).
+        // Grant editors read on the row, then add alice to editors. The
+        // master mutation comes first, then the WAL entries, as the engines
+        // append them.
         policy
             .add_rule("editors".into(), "invoice:1".into(), Action::Read)
             .await?;
@@ -2021,27 +2090,28 @@ mod tests {
 
     /// A revocation through a NESTED group must still reach the replica.
     ///
-    /// The regression this pins: `apply_rule_op` decided "this replayed op
-    /// cannot affect this subject" from `get_groups_of_user`, which is
-    /// casbin's `RoleManager::get_roles` — DIRECT roles only. Here `alice ∈
-    /// editors ∈ staff`, so a removal of `p, staff, invoice:1, read`
-    /// returned `Ok(())` without calling `resync_file`: the filter and the
-    /// `authorize_row` it stands in for disagreed about whether the rule
-    /// applied. The file stayed in alice's replica and stayed served by
-    /// `GET /sync/db/{object}` under a coverage marker that had already
-    /// advanced past the revocation — over-inclusion of data the subject was
-    /// just denied, not staleness.
+    /// The test guards against a past fault. `apply_rule_op` decided "this
+    /// replayed op cannot affect this subject" from `get_groups_of_user`.
+    /// That function is casbin's `RoleManager::get_roles`, and it returns
+    /// DIRECT roles only. Here `alice ∈ editors ∈ staff`. A removal of
+    /// `p, staff, invoice:1, read` then returned `Ok(())` without a call to
+    /// `resync_file`. The filter and the `authorize_row` that it stands in
+    /// for then disagreed about whether the rule applied. The file stayed in
+    /// the replica of alice. The route `GET /sync/db/{object}` kept serving
+    /// it under a coverage marker that had already moved past the
+    /// revocation. The result is too much data for a subject that the
+    /// revocation just denied, and not stale data.
     ///
-    /// The replica is seeded by the full rebuild, which routes every file
-    /// through `visible_rows` -> `authorize_row` and is reviewed as
-    /// correct. That matters for what the assertion means: the file is
+    /// The full rebuild seeds the replica. That rebuild routes every file
+    /// through `visible_rows` -> `authorize_row`, and it handles the case
+    /// correctly. That matters for the meaning of the assertion. The file is
     /// PROVABLY present before the replayed revocation, so "it is gone
-    /// afterwards" can only be the replay's doing. A grant that was itself
-    /// skipped would make it pass for the wrong reason.
+    /// afterwards" can only come from the replay. A skipped grant would let
+    /// the test pass for the wrong reason.
     #[tokio::test]
     async fn a_revoke_through_a_nested_group_reaches_the_replica() -> anyhow::Result<()> {
         let (mgr, policy, mem) = test_manager().await;
-        // Two hops: alice is in editors, editors is in staff, and the rule
+        // Two hops. Alice is in editors, and editors is in staff. The rule
         // names staff. `get_groups_of_user("alice")` answers ["editors"].
         policy
             .assign_group("alice".into(), "editors".into())
@@ -2080,11 +2150,11 @@ mod tests {
 
     /// The mirror case: a grant through a nested group must not be skipped.
     ///
-    /// The filter was wrong in both directions, and testing only the revoke
-    /// half would let the grant half regress silently. Here the replica is
-    /// built while the rule does NOT exist, so the only way `f1` appears is
-    /// if the replayed `PolicyRuleAdd` reached it — skipping it leaves a
-    /// file an `enforce` authorizes silently absent.
+    /// The old filter was wrong in both directions. Testing only the revoke
+    /// half would let the grant half regress without a trace. The test builds
+    /// the replica while the rule does NOT exist. The only way for `f1` to
+    /// appear is for the replayed `PolicyRuleAdd` to reach it. Skipping that
+    /// op leaves a file that `enforce` authorizes silently absent.
     #[tokio::test]
     async fn a_grant_through_a_nested_group_reaches_the_replica() -> anyhow::Result<()> {
         let (mgr, policy, mem) = test_manager().await;
@@ -2117,35 +2187,36 @@ mod tests {
         Ok(())
     }
 
-    /// The membership path's mirror of the two tests above.
+    /// The membership path mirrors the two tests above.
     ///
-    /// `apply_rule_op` got the nested-group fix in 77036cb; the path that
-    /// handles a GROUP MEMBERSHIP change never got it, because
-    /// `read_rows_for_group` resolved the group's rules through
-    /// `rules_for_subject`, which reads rules whose `p.sub` is literally the
-    /// group name and nothing above it. So here `alice ∈ editors ∈ staff`
-    /// with the rule naming `staff`, and the replayed op is the one that
+    /// Commit 77036cb added the nested-group fix to `apply_rule_op`. The
+    /// path that handles a GROUP MEMBERSHIP change never received that fix.
+    /// `read_rows_for_group` resolved the rules of the group through
+    /// `rules_for_subject`. That call reads the rules whose `p.sub` is
+    /// literally the group name, and no rule above it. Here `alice ∈ editors
+    /// ∈ staff`, and the rule names `staff`. The replayed op is the op that
     /// makes alice a member at all:
     ///
     /// ```text
     /// WalOp::GroupAdd { user: alice, group: editors }
     /// ```
     ///
-    /// The old code asked `rules_for_subject("editors")`, found no `p` row
-    /// (the grant names `staff`), resynced nothing, and left the file out of
-    /// alice's replica — while `enforce` authorized it, and while the full
-    /// rebuild, which routes every file through `visible_rows` ->
-    /// `authorize_row`, would have included it. The incremental path being
-    /// weaker than the rebuild is the asymmetry; the shape of the harm is
-    /// under-inclusion rather than the over-inclusion 77036cb fixed, which
-    /// is why it was not a blocker, but it is the same class and it is
-    /// silent.
+    /// The old code called `rules_for_subject("editors")` and found no `p`
+    /// row, because the grant names `staff`. The old code then resynced
+    /// nothing and left the file out of the replica of alice. `enforce`
+    /// authorized the file at the same time. The full rebuild would have
+    /// included it, because that rebuild routes every file through
+    /// `visible_rows` -> `authorize_row`. The incremental path was weaker
+    /// than the rebuild, and that is the asymmetry. The harm is the
+    /// under-inclusion, not the over-inclusion that 77036cb fixed. That is
+    /// why the fault was not a blocker. It belongs to the same class, and it
+    /// is silent.
     ///
-    /// Seeded by a full rebuild taken while the rule and the OUTER
-    /// membership already exist and only alice's own membership is missing,
-    /// so `!replica_has` is established first: the file is provably absent
-    /// before the replay, and the only thing that can put it there is the
-    /// membership op resolving transitively.
+    /// The test takes a full rebuild while the rule and the OUTER membership
+    /// already exist, and while alice's own membership is still missing. The
+    /// test therefore sets `!replica_has` first. The file is provably absent
+    /// before the replay. Only a transitive resolution of the membership op
+    /// can put it there.
     #[tokio::test]
     async fn a_membership_op_resolves_the_groups_ancestor_rules() -> anyhow::Result<()> {
         let (mgr, policy, mem) = test_manager().await;
@@ -2185,13 +2256,13 @@ mod tests {
         Ok(())
     }
 
-    /// The direct rule still resolves, and a rule the ancestor does NOT hold
-    /// does not get conjured in.
+    /// The direct rule still resolves, and the code does not invent a rule
+    /// that an ancestor does NOT hold.
     ///
-    /// The transitive widening is only sound if the group's own rows still
-    /// come through and the answer stays bounded by what the hierarchy
-    /// actually grants; pinning both halves keeps a future "just return
-    /// everything" shortcut from passing.
+    /// The transitive widening is sound only if the rows of the group still
+    /// come through, and only if the answer stays inside what the hierarchy
+    /// actually grants. The test pins both halves. That keeps a future
+    /// shortcut that returns everything from passing.
     #[tokio::test]
     async fn a_membership_op_still_resolves_the_groups_own_rules() -> anyhow::Result<()> {
         let (mgr, policy, mem) = test_manager().await;
@@ -2266,26 +2337,26 @@ mod tests {
         Ok(())
     }
 
-    /// An oversized policy fan-out DECLINES; it does not 500, and it does
-    /// not fail the same way forever.
+    /// An oversized policy fan-out DECLINES. It does not return a 500, and it
+    /// does not fail the same way forever.
     ///
-    /// `ReplayOutcome` was introduced to replace error-TEXT matching
-    /// ("replay needs full recalc ...") with a typed value. The refactor
-    /// converted the two PRE-FLIGHT decline sites to `Ok(NeedsFullRebuild)`
-    /// and left all three FAN-OUT sites returning the very `Err` it was
-    /// meant to eliminate. An admin granting `read` on a row holding 1001
-    /// files therefore reached `apply_rule_op`, tripped
-    /// `MAX_POLICY_REPLAY_FILES`, and produced `FsError::Internal` -- which
-    /// `advance`'s final arm treats as a store failure: release the claim,
-    /// return the error, render `500`. Because `APPLIED_KEY` never
-    /// advances, the next poll replayed the identical entry and 500ed
-    /// identically. The subject never converged and no rebuild was ever
-    /// queued.
+    /// `ReplayOutcome` replaced error-TEXT matching ("replay needs full
+    /// recalc ...") with a typed value. That change converted the two
+    /// PRE-FLIGHT decline sites to `Ok(NeedsFullRebuild)`. It left all three
+    /// FAN-OUT sites returning the `Err` that the change was meant to
+    /// eliminate. An admin who grants `read` on a row that holds 1001 files
+    /// then reached `apply_rule_op`. The call tripped
+    /// `MAX_POLICY_REPLAY_FILES` and produced `FsError::Internal`. The last
+    /// arm of `advance` treated that error as a store failure. The arm
+    /// released the claim, returned the error, and rendered `500`. Because
+    /// `APPLIED_KEY` never advanced, the next poll replayed the same entry
+    /// and returned the same 500. The subject never converged, and no
+    /// rebuild was ever queued.
     ///
-    /// Asserted through `advance` rather than `replay` because that is the
-    /// level at which the old `Err` became visible, and the second call is
-    /// the "forever" half: it must reach the same declining branch and
-    /// answer `pending: true`, not reproduce the failure.
+    /// The test calls `advance` instead of `replay`, because that is the
+    /// level at which the old `Err` became visible. The second call covers
+    /// the "forever" half. It must reach the same declining branch and answer
+    /// `pending: true`, and it must not repeat the failure.
     #[tokio::test]
     async fn an_oversized_policy_fan_out_declines_instead_of_failing() -> anyhow::Result<()> {
         let (mgr, policy, mut jobs) = test_manager_with_queue().await;
@@ -2322,8 +2393,9 @@ mod tests {
             first.applied_seq, 0,
             "coverage is from before the queued rebuild"
         );
-        // A rebuild really was queued, which is the whole point: the old
-        // `Err` path released the claim and queued nothing.
+        // The test then checks that a rebuild really reached the queue. That
+        // is the point of the test. The old `Err` path released the claim and
+        // queued nothing.
         let queued = jobs.try_recv().expect("a rebuild must be queued");
         assert_eq!(queued.sub, "alice");
         assert!(
@@ -2331,10 +2403,11 @@ mod tests {
             "the in-flight set must collapse the retries into one job"
         );
 
-        // The "forever" half: the marker did not advance, so the next poll
-        // replays the same entry. It must decline again the same way rather
-        // than reproduce the 500. The claim is released first so this
-        // reaches `replay` instead of short-circuiting on the slot.
+        // The "forever" half. The marker did not advance, so the next poll
+        // replays the same entry. The call must decline again in the same way
+        // instead of returning the same 500. The test releases the claim
+        // first, so the call reaches `replay` instead of stopping on the
+        // slot.
         mgr.builds.release("alice");
         let second = mgr
             .advance("alice")
@@ -2357,18 +2430,20 @@ mod tests {
     #[tokio::test]
     async fn prefixes_are_stable_and_safe() {
         let (mgr, _, _) = test_manager().await;
-        // Stable and hex-only (prefix-safe by construction).
+        // The prefix is stable and contains hex digits only, so it is
+        // prefix-safe by construction.
         let prefix = mgr.user_prefix("alice");
         assert_eq!(prefix, mgr.user_prefix("alice"));
         let digest = prefix.strip_prefix("test-db/u/").expect("prefix shape");
         assert_eq!(digest.len(), 64);
         assert!(digest.bytes().all(|b| b.is_ascii_hexdigit()));
-        // Former collisions now isolate: each maps to its own prefix.
+        // The former collisions now separate. Each subject maps to its own
+        // prefix.
         assert_ne!(mgr.user_prefix("a/b"), mgr.user_prefix("a:b"));
         assert_ne!(mgr.user_prefix("a/b"), mgr.user_prefix("a_b"));
         assert_ne!(mgr.user_prefix("alice"), mgr.user_prefix("bob"));
-        // Gateway still confines reads to the replica prefix, and the alias the
-        // empty interior segment created does not exist.
+        // The gateway still confines reads to the replica prefix. The alias
+        // that the empty interior segment created does not exist.
         assert!(mgr.resolve_object("alice", "../escape").is_err());
         assert!(mgr.resolve_object("alice", "a/../../escape").is_err());
         assert!(mgr.resolve_object("alice", "").is_err());

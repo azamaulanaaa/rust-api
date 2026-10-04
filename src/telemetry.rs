@@ -1,17 +1,20 @@
-//! Telemetry bootstrap: installs the global [`tracing`] subscriber and,
-//! when configured, exports spans to an OpenTelemetry collector via OTLP.
+//! Telemetry bootstrap. The module installs the global [`tracing`]
+//! subscriber. When the config sets an endpoint, it also exports spans to an
+//! OpenTelemetry collector through OTLP.
 //!
-//! Console output is always enabled; `RUST_LOG` overrides the filter when
-//! set, otherwise the level derives from the CLI's verbose flag. When an
-//! OTLP endpoint is configured, spans are batch-exported over OTLP and the
-//! W3C Trace Context propagator is registered globally so distributed
-//! traces can be continued across service boundaries.
+//! Console output is always on. The variable `RUST_LOG` sets the filter when
+//! it is present. Otherwise the level comes from the verbose flag of the
+//! command line. When the config sets an OTLP endpoint, the server exports
+//! spans in batches over OTLP. It also registers the W3C Trace Context
+//! propagator for the whole process, so that a trace continues across the
+//! boundary between services.
 //!
-//! Transport follows the compiled cargo feature, not the endpoint string:
-//! the default `otlp-http` feature exports over HTTP/protobuf and
-//! `otlp-grpc` exports over gRPC. The two expect different endpoint shapes
-//! (`http://collector:4318/v1/traces` versus `http://collector:4317`), so
-//! switching features means updating `observability.otlp_endpoint` too.
+//! The transport follows the compiled cargo feature, not the endpoint string.
+//! The default `otlp-http` feature exports over HTTP and protobuf. The
+//! `otlp-grpc` feature exports over gRPC. The two features need different
+//! shapes for the endpoint. The shapes are `http://collector:4318/v1/traces`
+//! and `http://collector:4317`. So a change of feature also needs a change
+//! to `observability.otlp_endpoint`.
 
 use anyhow::Context;
 use opentelemetry::global;
@@ -27,11 +30,12 @@ use opentelemetry_sdk::{
 };
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
-/// Handle for telemetry resources that must live for the process duration.
+/// Handle for the telemetry resources. The resources must stay alive for the
+/// whole run of the process.
 ///
-/// Dropping it shuts down the installed tracer and meter providers,
-/// flushing pending spans and metric points (best effort). Keep it alive
-/// until shutdown.
+/// Dropping the handle stops the tracer and meter providers. The providers
+/// send the spans and the metric points that are still pending, on a best
+/// effort basis. Keep the handle until the server shuts down.
 #[derive(Debug)]
 pub struct Telemetry {
     tracer_provider: Option<SdkTracerProvider>,
@@ -40,16 +44,18 @@ pub struct Telemetry {
 
 impl Drop for Telemetry {
     fn drop(&mut self) {
-        // Safety net for early-error paths; the normal shutdown path is the
-        // explicit [`Telemetry::shutdown`], which reports failures.
+        // A safety net for the paths that end in an error. The normal
+        // shutdown path is the explicit [`Telemetry::shutdown`], which
+        // reports a failure.
         self.shutdown_inner();
     }
 }
 
 impl Telemetry {
-    /// Flushes and releases telemetry resources, returning an error if any
-    /// pending spans or metric points could not be delivered. Call once at
-    /// process exit; dropping without this still flushes best-effort.
+    /// Sends the telemetry resources and releases them. The function returns an
+    /// error if any span or metric point could not be delivered. Call the
+    /// function once at the end of the process. Dropping the handle without
+    /// this call still sends the data on a best effort basis.
     pub fn shutdown(mut self) -> anyhow::Result<()> {
         let mut errors = Vec::new();
         if let Some(provider) = self.tracer_provider.take()
@@ -58,8 +64,8 @@ impl Telemetry {
             errors.push(format!("tracer provider: {e:?}"));
         }
         if let Some(provider) = self.meter_provider.take() {
-            // Final periodic-reader collection: flushes pending metric
-            // points to the collector.
+            // The last collection of the periodic reader. It sends
+            // the metric points that are still pending to the collector.
             if let Err(e) = provider.shutdown() {
                 errors.push(format!("meter provider: {e:?}"));
             }
@@ -81,8 +87,8 @@ impl Telemetry {
             eprintln!("failed to shut down tracer provider: {e:?}");
         }
         if let Some(provider) = self.meter_provider.take() {
-            // Final periodic-reader collection: flushes pending metric
-            // points to the collector.
+            // The last collection of the periodic reader. It sends
+            // the metric points that are still pending to the collector.
             if let Err(e) = provider.shutdown() {
                 eprintln!("failed to shut down meter provider: {e:?}");
             }
@@ -90,14 +96,16 @@ impl Telemetry {
     }
 }
 
-/// Installs the global tracing subscriber and optional span export.
+/// Installs the global tracing subscriber and, when the config sets an
+/// endpoint, the export of spans.
 ///
-/// Log filtering uses `RUST_LOG` syntax; when the environment variable is
-/// unset, `verbose` selects between `debug` and `info` levels. When
-/// `otlp_endpoint` is `Some`, spans are exported over OTLP and the W3C
-/// Trace Context propagator is registered globally; request metrics are
-/// exported through a second OTLP pipeline on the same endpoint, over the
-/// same transport (HTTP/protobuf by default, gRPC with `otlp-grpc`).
+/// The filter of the logs uses the syntax of `RUST_LOG`. When the variable
+/// is not set, `verbose` selects `debug` or `info`. When `otlp_endpoint` is
+/// `Some`, the server exports spans over OTLP. It also registers the W3C
+/// Trace Context propagator for the whole process. The request metrics go
+/// through a second OTLP pipeline. That pipeline uses the same endpoint and
+/// the same transport, which is HTTP and protobuf by default, or gRPC with
+/// `otlp-grpc`.
 pub fn init(
     verbose: bool,
     service_name: &str,
@@ -108,8 +116,9 @@ pub fn init(
     let env_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter));
 
-    // Register before any request can be served so inbound traceparent
-    // headers link remote parents to our server spans (see request tracing).
+    // Register before the server can serve any request. Then the
+    // inbound `traceparent` headers link a remote parent to the spans of
+    // this server. See the docs for the tracing of a request.
     global::set_text_map_propagator(TraceContextPropagator::new());
 
     let fmt_layer = tracing_subscriber::fmt::layer();

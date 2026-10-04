@@ -1,15 +1,16 @@
 //! Actix routes for the OIDC login, callback, session, and logout flows.
 //!
 //! [`OidcApiModule`](crate::oidc::route::OidcApiModule) owns the provider
-//! client and the whole `/auth` scope -- `/auth/login`, `/auth/callback`,
-//! `/auth/logout`, and the `/auth/me` session probe -- and seeds the JWT
-//! validation middleware every other module reuses.
+//! client and the whole `/auth` scope. The scope holds `/auth/login`,
+//! `/auth/callback`, `/auth/logout`, and the `/auth/me` session probe. The
+//! module also seeds the JWT validation middleware that every other module
+//! reuses.
 //!
-//! It is one module rather than a public-flow module plus a session module
-//! because actix matches scopes by prefix: two modules registering
-//! `web::scope("/auth")` means whichever is registered first swallows every
-//! `/auth/*` path and the other's routes are unreachable. One module owns
-//! one prefix.
+//! This file has one module, not a public-flow module plus a session module,
+//! because actix matches scopes by prefix. If two modules register
+//! `web::scope("/auth")`, the module registered first swallows every
+//! `/auth/*` path and the routes of the other module are unreachable. One
+//! module owns one prefix.
 
 use std::sync::Arc;
 
@@ -35,11 +36,12 @@ where
     jwt_middleware: middleware::jwt::JwtClaimsMiddleware<C>,
     /// Middleware for `/auth/me` only.
     ///
-    /// `C` is the host app's claims type; `me` has to answer with the
-    /// concrete [`Claims`](middleware::jwt::Claims) shape the SPA codegen
-    /// depends on, so it needs its own middleware. Keeping it on the single
-    /// `/auth/me` resource is what lets the rest of the scope stay generic:
-    /// the scope itself never has to name `Claims`.
+    /// `C` is the claims type of the host app. The route `me` has to answer
+    /// with the concrete [`Claims`](middleware::jwt::Claims) shape that the
+    /// SPA codegen depends on, so it needs its own middleware. The single
+    /// `/auth/me` resource keeps this middleware. That is what lets the rest
+    /// of the scope stay generic. The scope itself never has to name
+    /// `Claims`.
     session_middleware: middleware::jwt::JwtClaimsMiddleware<middleware::jwt::Claims>,
 }
 
@@ -47,8 +49,9 @@ impl<C> OidcApiModule<C>
 where
     C: DeserializeOwned,
 {
-    /// Builds the module: loads the provider's JWKS once to seed the JWT
-    /// validation middleware (audience = client ID, issuer = provider).
+    /// Builds the module. It loads the provider's JWKS once to seed the JWT
+    /// validation middleware. The audience is the client ID. The issuer is
+    /// the provider.
     pub async fn init(oidc_client: OidcClient) -> anyhow::Result<Self> {
         let jwt_middleware = middleware::jwt::JwtClaimsMiddleware::new_with_jks(
             oidc_client.jwks_uri().as_str(),
@@ -58,10 +61,10 @@ where
         .await?
         .with_allowed_tenants(oidc_client.allowed_tenants().to_vec());
 
-        // Same provider, same keys, different claims type. Loading the JWKS
-        // twice costs one extra request at startup and keeps `/auth/me`
-        // answerable for a host app that types its own claims as anything
-        // other than `Claims`.
+        // This uses the same provider and the same keys, but a different
+        // claims type. Loading the JWKS twice costs one extra request at
+        // startup. It keeps `/auth/me` able to answer for a host app that
+        // gives its own claims type any value other than `Claims`.
         let session_middleware = middleware::jwt::JwtClaimsMiddleware::new_with_jks(
             oidc_client.jwks_uri().as_str(),
             oidc_client.client_id().as_str(),
@@ -98,15 +101,15 @@ where
     fn configure(&self, cfg: &mut web::ServiceConfig) {
         let oidc_client = web::Data::from(self.oidc_client.clone());
 
-        // JWT wrap is safe for the public routes: requests without any token
-        // pass through unmodified. `/auth/me` gets its own `Claims`-typed
-        // middleware on the resource instead, so this scope does not have to
-        // name a concrete claims type.
+        // The JWT wrap is safe for the public routes. A request without any
+        // token passes through unmodified. The route `/auth/me` gets its own
+        // `Claims`-typed middleware on the resource instead. The scope
+        // therefore does not have to name a concrete claims type.
         //
-        // The whole scope lives here on purpose. A second module registering
-        // `web::scope("/auth")` would match every `/auth/*` path, and since
-        // actix tries services in registration order the later module's
-        // routes would be unreachable rather than merged.
+        // The whole scope lives here on purpose. A second module that
+        // registers `web::scope("/auth")` matches every `/auth/*` path. Actix
+        // tries services in registration order, so the routes of the later
+        // module stay unreachable instead of merging.
         cfg.service(
             web::scope("/auth")
                 .app_data(oidc_client)
@@ -138,12 +141,14 @@ pub struct MeResponse {
 
 /// Returns the caller's session (`401` without valid credentials).
 ///
-/// SPA entry point: TanStack guards and the worker poll this instead of
-/// decoding the JWT themselves, so claim-shape drift breaks codegen rather
-/// than silently mis-authorizing.
-/// Registered through an explicit `web::resource` rather than a `#[get]`
-/// attribute, because the route needs its own `Claims`-typed middleware and
-/// only a resource can carry one.
+/// This route is the entry point for the SPA. The TanStack guards and the
+/// worker poll it instead of decoding the JWT themselves. A change in the
+/// claim shape then breaks the codegen instead of silently authorizing the
+/// wrong data.
+///
+/// The route uses an explicit `web::resource` and not a `#[get]` attribute.
+/// The route needs its own `Claims`-typed middleware, and only a resource
+/// can carry one.
 #[utoipa::path(get, path = "/auth/me", tag = "auth", responses((status = 200, body = MeResponse), (status = 401, body = crate::http::error::ErrorBody)))]
 pub async fn me(claims: Validated<middleware::jwt::Claims>) -> impl Responder {
     let aud = match &claims.aud {
@@ -160,9 +165,9 @@ pub async fn me(claims: Validated<middleware::jwt::Claims>) -> impl Responder {
 
 /// Clears the `auth_token` session cookie (always `204`, even anonymous).
 ///
-/// `POST` (not `GET`) so prefetchers and CSRF-prone links cannot log the
-/// user out; the cleared cookie mirrors the login `Secure`/`SameSite` flags
-/// so browsers actually drop it.
+/// The route uses `POST` and not `GET`. Prefetchers and links that can cause
+/// a CSRF therefore cannot log the user out. The cleared cookie copies the
+/// `Secure` and `SameSite` flags of the login cookie, so browsers drop it.
 #[utoipa::path(post, path = "/auth/logout", tag = "auth", responses((status = 204, description = "logged out")))]
 #[post("/logout")]
 pub async fn logout(oidc_client: web::Data<OidcClient>) -> impl Responder {
@@ -215,7 +220,7 @@ pub async fn login(oidc_client: web::Data<OidcClient>) -> impl Responder {
 pub struct AuthCallbackQuery {
     /// Authorization code issued by the provider.
     pub code: String,
-    /// OAuth2 `state` value; must match the CSRF cookie.
+    /// OAuth2 `state` value. It must match the CSRF cookie.
     pub state: String,
 }
 
@@ -289,8 +294,8 @@ pub async fn callback(
                 })
         }
         Err(e) => {
-            // Full detail goes to server logs; clients only ever see a
-            // stable, non-sensitive message.
+            // The server logs receive the full detail. Clients only ever see a stable,
+            // non-sensitive message.
             let (status, message) = match &e {
                 OidcError::ExchangeFailure(_)
                 | OidcError::MissingIdToken
@@ -344,8 +349,8 @@ mod tests {
 
     const CLIENT_ID: &str = "test-client";
 
-    /// A mock OIDC provider plus the fully-initialized API module wired to
-    /// it, and the RSA signing key matching the served JWKS.
+    /// A mock OIDC provider, the API module wired to it, and the RSA
+    /// signing key that matches the served JWKS.
     struct Fixture {
         server: MockServer,
         module: OidcApiModule<serde_json::Value>,
@@ -406,8 +411,9 @@ mod tests {
         }
     }
 
-    /// Builds a test app exposing the module's routes. Kept inline per test
-    /// so actix's service type is always concretely inferred.
+    /// Builds a test app that exposes the routes of the module. This code
+    /// stays inline per test, so that actix always infers the service type
+    /// as a concrete type.
     macro_rules! test_app {
         ($fixture:expr) => {
             test::init_service(actix_web::App::new().configure(|cfg| {
@@ -417,8 +423,9 @@ mod tests {
         };
     }
 
-    /// Extracts the CSRF/nonce/PKCE cookie values plus the authorization
-    /// code and state parameters from a completed GET /auth/login response.
+    /// Extracts the CSRF, nonce, and PKCE cookie values, plus the
+    /// authorization code and state parameters, from a completed
+    /// `GET /auth/login` response.
     fn login_parts(res: &ServiceResponse) -> anyhow::Result<(String, String, String, String)> {
         assert_eq!(res.status(), 302);
 
@@ -475,7 +482,7 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        assert_eq!(location.host_str().unwrap(), "127.0.0.1"); // mock provider
+        assert_eq!(location.host_str().unwrap(), "127.0.0.1"); // The mock provider.
         let query: std::collections::HashMap<String, String> =
             location.query_pairs().into_owned().collect();
         assert_eq!(query["client_id"], CLIENT_ID);
@@ -492,10 +499,11 @@ mod tests {
                 .find(|c| c.name() == name)
                 .unwrap_or_else(|| panic!("missing {name} cookie"));
             assert_eq!(cookie.http_only(), Some(true), "{name} must be HttpOnly");
-            // Fixture callback is plain http, so the Secure flag is
-            // omitted entirely (the cookie crate reports that as None;
-            // https behavior is pinned by `secure_scheme_https_only` in
-            // `oidc::tests`); HttpOnly + SameSite still hold.
+            // The callback in the fixture is plain http, so the cookie
+            // omits the Secure flag. The cookie crate reports the missing
+            // flag as None. The test `secure_scheme_https_only` in
+            // `oidc::tests` pins the https behavior instead. The HttpOnly and
+            // SameSite flags still hold.
             assert_eq!(cookie.secure(), None, "{name} omits Secure on http");
             assert_eq!(cookie.same_site(), Some(SameSite::Lax));
         }
@@ -544,7 +552,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn callback_happy_path_returns_token_and_clears_cookies() -> anyhow::Result<()> {
+    async fn callback_with_valid_code_returns_token_and_clears_cookies() -> anyhow::Result<()> {
         let fx = Fixture::new().await?;
         let svc = test_app!(fx);
         let login_res = test::call_service(
@@ -555,8 +563,9 @@ mod tests {
         let (csrf, nonce, pkce, state) = login_parts(&login_res)?;
         let code = "test-code";
 
-        // Mint an ID token whose nonce matches the login-issued cookie so
-        // the mocked token response passes full provider-side validation.
+        // This mints an ID token whose nonce matches the cookie from the
+        // login, so the mocked token response passes the full validation of
+        // the provider.
         let header = {
             let mut h = Header::new(jsonwebtoken::Algorithm::RS256);
             h.kid = Some("test-key-id".to_string());
@@ -589,7 +598,7 @@ mod tests {
         let res = test::call_service(&svc, req).await;
 
         assert_eq!(res.status(), 200);
-        // Cookies must be extracted before read_body consumes the response.
+        // The code reads the cookies before read_body consumes the response.
         let auth_cookie = res
             .response()
             .cookies()
@@ -636,15 +645,16 @@ mod tests {
         .map_err(anyhow::Error::from)
     }
 
-    /// The session probe has to survive being served from the same scope as
-    /// the public flow.
+    /// The session probe has to survive being served from the same scope
+    /// as the public flow.
     ///
-    /// This used to register `OidcSessionModule` alongside `OidcApiModule`,
-    /// both claiming `web::scope("/auth")`. Actix tries services in
-    /// registration order and a scope matches its whole prefix, so the first
-    /// scope swallowed every `/auth/*` path and `/auth/me` was a `404` in the
-    /// shipped server -- while this test, which mounted the session module
-    /// alone, passed. The composition is what matters, so the test composes.
+    /// This test used to register `OidcSessionModule` next to
+    /// `OidcApiModule`. Both claimed `web::scope("/auth")`. Actix tries
+    /// services in registration order, and a scope matches its whole prefix.
+    /// The first scope therefore swallowed every `/auth/*` path, and
+    /// `/auth/me` was a `404` in the shipped server. The old test passed
+    /// because it mounted the session module alone. The composition is what
+    /// matters, so this test composes the modules.
     #[tokio::test]
     async fn me_returns_session_for_valid_cookie() -> anyhow::Result<()> {
         let fx = Fixture::new().await?;
@@ -665,7 +675,7 @@ mod tests {
         assert_eq!(body.iss, fx.server.uri());
         assert_eq!(body.aud, vec![CLIENT_ID.to_string()]);
 
-        // Anonymous probe is 401, never 500.
+        // An anonymous probe is a 401, never a 500.
         let res =
             test::call_service(&svc, test::TestRequest::get().uri("/auth/me").to_request()).await;
         assert_eq!(res.status(), 401);
@@ -718,7 +728,7 @@ mod tests {
         assert_eq!(res.status(), 401);
         let body: AuthResponse = serde_json::from_slice(&test::read_body(res).await).unwrap();
         assert!(!body.success);
-        // Provider failure details must never reach the client.
+        // The details of a provider failure never reach the client.
         assert_eq!(body.error.as_deref(), Some("authentication failed"));
     }
 }

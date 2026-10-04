@@ -1,16 +1,18 @@
-//! Storage plumbing: OxKV store factory and the single-writer lease.
+//! Storage plumbing: the OxKV store factory and the single-writer lease.
 //!
-//! Centralizes conversion from S3 configuration + prefix into an
-//! `object_store` + `oxkv::OxKvStore`. Reuses the same bucket/region/endpoint
-//! settings that the file-byte store uses, but with a distinct prefix for
-//! transactional keys (`p:`, `g:`, `fs:`, `wal:`) so one bucket hosts both.
+//! The module turns an S3 configuration and a prefix into an `object_store`
+//! and an `oxkv::OxKvStore`. It uses the same bucket, region, and endpoint
+//! settings as the store for the file bytes. It uses a separate prefix for
+//! the transactional keys, which are `p:`, `g:`, `fs:`, and `wal:`. So one
+//! bucket holds both sets of data.
 //!
-//! [`WriterLease`](crate::lease::WriterLease) lives there instead: `oxkv`
-//! deliberately acquires ownership by CAS-bumping `ownership.json`, i.e.
-//! last-writer-wins, so a second process on the same prefix cannot be
-//! *detected* through `oxkv` -- it can only fence the first one at write
-//! time. The lease is the missing half, a heartbeat record in the same
-//! bucket that makes a live predecessor observable at startup.
+//! [`WriterLease`](crate::lease::WriterLease) lives in another module.
+//! `oxkv` takes ownership with a CAS bump on `ownership.json`. So the last
+//! writer wins. A second process on the same prefix cannot be *detected*
+//! through `oxkv`. It can only fence the first one at write time. The lease
+//! is the half that `oxkv` does not provide. The lease is a record of the
+//! heartbeat in the same bucket. It makes a predecessor that is still alive
+//! visible at startup.
 
 use std::sync::Arc;
 
@@ -21,9 +23,10 @@ use crate::fs::s3::S3ClientConfig;
 
 /// Builds an `Arc<dyn ObjectStore>` from [`S3ClientConfig`].
 ///
-/// Delegates to [`s3_builder`](crate::fs::object_store::s3_builder) so the
-/// file-byte client and the OxKV stores share one `AmazonS3Builder` setup;
-/// returns the raw store so `OxKvStoreBuilder` can wrap it.
+/// The function calls [`s3_builder`](crate::fs::object_store::s3_builder), so
+/// the client for the file bytes and the OxKV stores share one
+/// `AmazonS3Builder` setup. It returns the raw store, so that
+/// `OxKvStoreBuilder` can wrap it.
 pub fn build_object_store(
     cfg: &S3ClientConfig,
 ) -> Result<Arc<dyn ObjectStore>, object_store::Error> {
@@ -31,15 +34,16 @@ pub fn build_object_store(
     Ok(Arc::new(store))
 }
 
-/// Builds a fenced [`OxKvStore`] at `prefix` inside `cfg`'s bucket.
+/// Builds a fenced [`OxKvStore`] at `prefix` inside the bucket of `cfg`.
 ///
-/// `prefix` is the object prefix (e.g. `"oxkv"` -> keys live under
-/// `oxkv/ownership.json`, `oxkv/e000000/wal/...`).
+/// `prefix` is the object prefix. An example is `"oxkv"`, where the keys live
+/// under `oxkv/ownership.json` and `oxkv/e000000/wal/...`.
 ///
-/// Contract: keep exactly one live handle per prefix. Each built store owns
-/// a fresh session (memtable/WAL buffer); two live handles on the same
-/// prefix can fence each other or diverge on real S3. Share the handle with
-/// `Arc` (clones share writer state) instead of building a second one.
+/// Contract: keep exactly one live handle per prefix. Each store that the
+/// function builds owns a new session. A session has a memtable and a WAL
+/// buffer. Two live handles on one prefix can fence each other. They can also
+/// diverge on a real S3. Share the handle with `Arc` instead of building a
+/// second one. A clone of the handle shares the state of the writer.
 pub async fn build_s3_store(cfg: &S3ClientConfig, prefix: &str) -> Result<OxKvStore, StoreError> {
     let inner = build_object_store(cfg).map_err(|e| StoreError::Other(e.to_string()))?;
     let object_prefix = ObjectPath::from(prefix.trim_matches('/'));
@@ -50,27 +54,29 @@ pub async fn build_s3_store(cfg: &S3ClientConfig, prefix: &str) -> Result<OxKvSt
         .await
 }
 
-/// Default SST block cache for replica opens.
+/// Default cache of SST blocks for the calls that open a replica.
 ///
-/// Same 256 MB S3-FIFO sizing oxkv wires per handle in `build()`.
-/// Sharing one instance across opens (instead of dropping a cold cache
-/// with every handle) keeps repeated rebuilds from re-downloading hot
-/// SSTs; clones coordinate through the shared state.
+/// This is the same 256 MB S3-FIFO size that oxkv sets for each handle in
+/// `build()`. One instance that every call shares is better than a cold cache
+/// that every handle drops. Sharing means that a rebuild does not receive hot
+/// SSTs again. The clones coordinate through the shared state.
 pub fn default_sst_cache() -> LruCache<String, Arc<SstFile>> {
     LruCache::new(256 * 1024 * 1024, |_: &String, v: &Arc<SstFile>| {
         u32::try_from(v.size()).unwrap_or(u32::MAX)
     })
 }
 
-/// Builds a collision-resistant OxKV prefix for one test.
+/// Builds an OxKV prefix for one test that cannot collide with another.
 ///
-/// `name` identifies the test or fixture (e.g. `"fs-store"`). The pid and
-/// a random suffix are appended so tests never share a prefix -- not
-/// within one binary (they run in parallel), not across concurrent `cargo
-/// test` invocations, and not with a stray object left in a real bucket.
-/// Use it with the `build_test_store*` family rather than a fixed string:
-/// a shared prefix silently fences another test's session via oxkv epoch
-/// takeover, which fails intermittently and only under load.
+/// `name` identifies the test or the test data, for example `"fs-store"`. The
+/// function appends the process ID and a random suffix. So two tests never
+/// share a prefix. That is true within one binary, because the tests run at
+/// the same time. It is also true across two calls of `cargo test` that run
+/// at the same time. It is also true when a stray object is left in a real
+/// bucket. Use this function with the `build_test_store*` family, not with a
+/// fixed string. A shared prefix silently fences the session of another test
+/// through the oxkv epoch. That failure appears only at random, and only
+/// under load.
 #[cfg(test)]
 pub fn test_prefix(name: &str) -> String {
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -81,10 +87,11 @@ pub fn test_prefix(name: &str) -> String {
     )
 }
 
-/// Builds an in-memory [`OxKvStore`] for tests (uses `skip_probe(true)` so
-/// `InMemory`'s missing conditional-write probe does not fail). Each prefix gets a
-/// fresh `InMemory` so tests are isolated; for reopening the same prefix
-/// within one test use [`build_test_store_new_session`].
+/// Builds an [`OxKvStore`] in memory for a test. The function uses
+/// `skip_probe(true)`, because `InMemory` has no probe for a
+/// conditional write. Each prefix gets a new `InMemory`, so the tests
+/// stay separate. To open the same prefix again inside one test, use
+/// [`build_test_store_new_session`].
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 pub async fn build_test_store(prefix: &str) -> OxKvStore {
@@ -98,12 +105,13 @@ pub async fn build_test_store(prefix: &str) -> OxKvStore {
         .expect("test OxKvStore must build")
 }
 
-/// Builds an in-memory [`OxKvStore`] over the shared `inner` backend at `prefix`.
+/// Builds an [`OxKvStore`] in memory over the backend `inner` at `prefix`.
 ///
-/// This creates a NEW fencing session over the same prefix (separate
-/// memtable/WAL buffer superseding the previous session), not a shared
-/// handle — adequate for single-threaded test reopen flows where the old
-/// handle is dropped first, not a model for production sharing.
+/// The function creates a NEW fencing session over the same prefix. The new
+/// session has a separate memtable and WAL buffer. The new session replaces
+/// the earlier session. So the handle is not shared. That is enough for a
+/// single-threaded test that opens the prefix again after it drops the old
+/// handle. It is not a model for sharing in production.
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 pub async fn build_test_store_new_session(inner: Arc<dyn ObjectStore>, prefix: &str) -> OxKvStore {
@@ -116,13 +124,15 @@ pub async fn build_test_store_new_session(inner: Arc<dyn ObjectStore>, prefix: &
         .expect("test OxKvStore must build")
 }
 
-/// Builds an ephemeral [`OxKvStore`] over a fresh in-memory object store.
+/// Builds an [`OxKvStore`] that is not durable, over a new in-memory object
+/// store.
 ///
-/// Production serialization buffer (e.g. assembling a snapshot before
-/// uploading it as one S3 object): nothing is durable here, the caller owns
-/// persistence. Uses `skip_probe(true)` since `InMemory` has no
-/// conditional-write probe. Callers must pass a unique `prefix` per buffer;
-/// sharing one prefix across buffers is a bug.
+/// Production uses this buffer for work such as the assembly of a snapshot
+/// before the server uploads it as one S3 object. Nothing here survives
+/// the process. The caller owns the persistence. The function uses
+/// `skip_probe(true)`, because `InMemory` has no probe for a
+/// conditional write. The caller must use a different `prefix` for each
+/// buffer. Using one prefix for two buffers is a bug.
 #[allow(clippy::expect_used)]
 pub async fn build_scratch_store(prefix: &str) -> OxKvStore {
     let inner = Arc::new(object_store::memory::InMemory::new()) as Arc<dyn ObjectStore>;
@@ -135,30 +145,33 @@ pub async fn build_scratch_store(prefix: &str) -> OxKvStore {
         .expect("scratch OxKvStore must build")
 }
 
-// `build_scratch_store` keeps its own `#[allow(clippy::expect_used)]`: unlike
-// the test-only builders it is unconditional public API -- `sync` uses it to
-// assemble a snapshot in RAM -- so it compiles in non-test builds and is not
-// covered by the crate-root `cfg_attr(test, allow(..))`.
+// `build_scratch_store` needs an `#[allow(clippy::expect_used)]` of its
+// own. The builders for tests only do not need one. `build_scratch_store` is
+// unconditional public API. `sync` uses it to build a snapshot in RAM. So it
+// compiles in builds that are not tests. The crate-root
+// `cfg_attr(test, allow(..))` does not cover it.
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
-    /// The test-only store builders are not part of the public API.
+    /// The builders for tests only are not part of the public API.
     ///
-    /// They hand back `InMemory` stores opened with `skip_probe(true)`, which
-    /// is the safe choice for a test backend with no conditional-write probe
-    /// and the *wrong* choice for anything else -- no probe means no
-    /// `manifest.json` CAS guard and no fencing detection. Shipping them as
-    /// default public API advertised exactly that as a supported way to build
-    /// a store, on a crate whose single-writer story is the headline. They
-    /// stay reachable from every test in this crate, and a host app that
-    /// wants one can build it from `object_store::memory::InMemory` in three
-    /// lines, which the `skip_probe` note in
-    /// [`build_scratch_store`](Self::build_scratch_store) already shows.
+    /// They return `InMemory` stores that use `skip_probe(true)`. That is
+    /// the safe choice for a test backend with no probe for a conditional
+    /// write. It is the *wrong* choice for anything else. Without the probe,
+    /// there is no `manifest.json` CAS check and no detection of fencing.
+    /// Publishing them as default public API offered exactly that as a
+    /// supported way to build a store, in a crate whose single-writer
+    /// design is the main feature. Every test in this crate can still reach
+    /// them. A host application that wants one can build it from
+    /// `object_store::memory::InMemory` in three lines. The note about
+    /// `skip_probe` in [`build_scratch_store`](Self::build_scratch_store)
+    /// already shows that.
     ///
-    /// `build_scratch_store` is deliberately *not* in this set: `sync` uses it
-    /// to assemble a snapshot in RAM before uploading it, so it is real API.
+    /// The test leaves out `build_scratch_store` on purpose. `sync` uses it
+    /// to build a snapshot in RAM before it uploads the snapshot. So that
+    /// function is real API.
     #[test]
     fn test_only_store_builders_are_not_public() {
         for name in [
@@ -177,8 +190,8 @@ mod tests {
             let at = src
                 .find(&needle)
                 .unwrap_or_else(|| panic!("{name} should still exist"));
-            // A `#[cfg(test)]` between the item's doc comment and its
-            // signature, which is where rustfmt keeps the attributes.
+            // A `#[cfg(test)]` between the doc comment of the item and its
+            // signature. rustdoc keeps the attributes in that place.
             let above = &src[..at];
             let gated = above
                 .rfind("#[cfg(test)]")

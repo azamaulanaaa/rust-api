@@ -1,9 +1,10 @@
 //! Casbin storage adapter backed by an [`oxkv`] key-value store.
 //!
-//! Every policy rule is stored as one key-value pair: a deterministic key
-//! encoding section, policy type, and a content hash of the rule, with the
-//! rule vector JSON-serialized as value. Deterministic keys make duplicate
-//! detection a single `has` lookup and keep repeated adds idempotent.
+//! Every policy rule is stored as one key-value pair. The key is
+//! deterministic. It encodes the section, the policy type, and a content
+//! hash of the rule. The value is the rule vector in JSON. Deterministic keys
+//! make duplicate detection a single `has` lookup and keep repeated adds
+//! idempotent.
 //!
 //! All mutating adapter operations run inside an [`oxkv`] transaction, so
 //! batch operations commit atomically.
@@ -15,7 +16,7 @@ use casbin::{
 };
 use oxkv::{Direction, GetSet, Store, StoreView, Transaction as _, Validator};
 
-/// Key prefix separator; keys are `{sec}:{ptype}:{rule-hash}`.
+/// Key prefix separator. The keys have the form `{sec}:{ptype}:{rule-hash}`.
 const SEP: char = ':';
 
 /// Hex-encodes a string so it is safe to embed in a store key.
@@ -36,10 +37,10 @@ fn store_err(e: oxkv::StoreError) -> CasbinError {
 
 /// Encodes one rule as a validated `(key, value)` pair.
 ///
-/// The adapter enforces [`PolicyRuleValidator`] directly on every write path
-/// instead of requiring callers to wrap their store in an [`oxkv::HookStore`].
-/// Validation runs before any transaction opens, so rejected writes fail
-/// without touching the store.
+/// The adapter enforces [`PolicyRuleValidator`] directly on every write path.
+/// Callers therefore do not have to wrap their store in an
+/// [`oxkv::HookStore`]. The validation runs before any transaction
+/// opens, so rejected writes fail without touching the store.
 async fn encode_rule<S>(
     store: &S,
     sec: &str,
@@ -50,8 +51,8 @@ where
     S: Store + Send + Sync,
 {
     let key = rule_key(sec, ptype, rule);
-    // StoreError: From<serde_json::Error> — convert before crossing
-    // into casbin's error domain.
+    // StoreError implements From<serde_json::Error>. The code converts
+    // the error before it crosses into the error domain of casbin.
     let value = serde_json::to_vec(rule)
         .map_err(oxkv::StoreError::from)
         .map_err(store_err)?;
@@ -62,22 +63,27 @@ where
     Ok((key, value))
 }
 
-/// Validates every write into the policy store before it becomes durable.
+/// Validates every write into the policy store before the write becomes
+/// durable.
 ///
-/// Enforces the adapter's storage contract at the storage layer so a bug in
-/// the adapter itself (or any future tooling touching the same file) is
-/// rejected at write time instead of poisoning [`OxkvAdapter`]'s startup
-/// load:
+/// The validator enforces the storage contract of the adapter at the storage
+/// layer. A bug in the adapter itself, or in any future tooling that touches
+/// the same file, is then rejected at write time. It does not poison the
+/// startup load of [`OxkvAdapter`]:
 ///
-/// - keys must be `{sec}:{ptype}:{hex-hash}` with a known section (`p`/`g`)
-/// - values must decode as a JSON string array
-/// - rules must match the RBAC model's field count (3 for `p`, 2 for `g`)
+/// - Keys must have the form `{sec}:{ptype}:{hex-hash}`, with a known
+///   section (`p` or `g`).
+/// - Values must decode as a JSON array of strings.
+/// - Rules must match the field count of the RBAC model. That count is 3 for
+///   `p` and 2 for `g`.
 pub struct PolicyRuleValidator;
 
 impl PolicyRuleValidator {
-    /// Expected rule field count for a section of the RBAC model defined
-    /// in [`PolicyEngine`](super::PolicyEngine). Coupled to that model on
-    /// purpose: changing the model requires revisiting this validator.
+    /// It returns the expected field count of a rule in a section of the RBAC
+    /// model. The model is defined in
+    /// [`PolicyEngine`](super::PolicyEngine). The count is coupled to that
+    /// model on purpose. A change to the model requires a check of this
+    /// validator again.
     fn expected_arity(sec: &str) -> usize {
         match sec {
             "p" => 3, // sub, obj, act
@@ -124,10 +130,12 @@ impl Validator for PolicyRuleValidator {
 
 /// A Casbin [`Adapter`] persisting policies to any [`oxkv::Store`].
 ///
-/// Generic over the backend so production can use a prefix-scoped `OxKvStore`
-/// while tests use the in-memory B-tree store or an `InMemory`-backed `OxKvStore`.
-/// Every write path validates rules through [`PolicyRuleValidator`] via the
-/// private `encode_rule` helper, before staging them.
+/// Generic over the backend. Production uses a prefix-scoped
+/// `OxKvStore`. The tests use the in-memory B-tree store or an
+/// `InMemory`-backed `OxKvStore`.
+/// Every write path validates the rules through [`PolicyRuleValidator`]
+/// before it stages them. The private helper `encode_rule` runs that
+/// validation.
 pub struct OxkvAdapter<S: Store> {
     store: S,
 }
@@ -149,7 +157,8 @@ impl<S: Store> OxkvAdapter<S> {
             let mut parts = kv.key.splitn(3, SEP);
             let (Some(sec), Some(ptype), Some(_)) = (parts.next(), parts.next(), parts.next())
             else {
-                // Foreign or corrupt entry: skip rather than poison startup.
+                // A foreign or corrupt entry is skipped. It does not
+                // poison the startup.
                 continue;
             };
             let rule: Vec<String> = serde_json::from_slice(&kv.value)?;
@@ -175,8 +184,9 @@ impl<S: Store> OxkvAdapter<S> {
         Ok(())
     }
 
-    /// True when `rule[field_index + i] == field_values[i]` for all i;
-    /// implements casbin's filtered-policy matching semantics.
+    /// It returns `true` when `rule[field_index + i] == field_values[i]` for
+    /// all `i`. It implements the matching semantics of a filtered policy
+    /// in casbin.
     fn rule_matches(rule: &[String], field_index: usize, field_values: &[String]) -> bool {
         field_values
             .iter()
@@ -242,8 +252,9 @@ where
             })
             .collect();
 
-        // Validate (and encode) every entry before opening the transaction
-        // so a malformed rule fails without touching the store.
+        // The code validates and encodes every entry before it opens
+        // the transaction. A malformed rule then fails without touching the
+        // store.
         let mut encoded = Vec::with_capacity(entries.len());
         for (sec, ptype, rule) in &entries {
             encoded.push(encode_rule(&self.store, sec, ptype, rule).await?);
@@ -280,9 +291,9 @@ where
         ptype: &str,
         rules: Vec<Vec<String>>,
     ) -> casbin::Result<bool> {
-        // Validate (and encode) every rule before opening the transaction so
-        // a malformed rule fails without staging partial state; duplicate
-        // handling below is unchanged.
+        // The code validates and encodes every rule before it opens
+        // the transaction. A malformed rule then fails without staging
+        // partial state. The duplicate handling below stays the same.
         let mut encoded = Vec::with_capacity(rules.len());
         for rule in &rules {
             encoded.push(encode_rule(&self.store, sec, ptype, rule).await?);
@@ -375,14 +386,14 @@ mod tests {
 
     /// A store whose commits report a lost epoch.
     ///
-    /// Reads come from a real `BTreeStore` so the engine loads normally; only
-    /// the durability step fails, which is exactly when `oxkv` fences a
-    /// writer. Using a real backend here rather than a hand-built error is
-    /// the point: the test has to prove that casbin carries the
-    /// `oxkv::StoreError` through `AdapterError` intact, because
-    /// `From<casbin::Error> for PolicyError` depends on downcasting that box
-    /// and would degrade to an opaque 500 the moment casbin flattened it to
-    /// a string.
+    /// The reads come from a real `BTreeStore`, so the engine loads
+    /// normally. Only the durability step fails. That is exactly when `oxkv`
+    /// fences a writer. The test uses a real backend here instead of a
+    /// hand-built error, because the test has to prove that casbin carries
+    /// the `oxkv::StoreError` through `AdapterError` without change. The
+    /// impl `From<casbin::Error> for PolicyError` depends on downcasting
+    /// that box. It would degrade to an opaque 500 as soon as casbin
+    /// flattened the error to a string.
     struct FencedStore(BTreeStore);
 
     #[async_trait::async_trait]
@@ -461,28 +472,30 @@ mod tests {
         }
     }
 
-    /// A policy write that loses the epoch has to be recognisable as such,
-    /// AND it has to latch this instance out of rotation.
+    /// A policy write that loses the epoch must be recognisable as such. It
+    /// must also latch this instance out of the rotation.
     ///
-    /// Before this, every policy failure reached the client as a 500 with
-    /// the fencing reason buried inside casbin's adapter wrapper, so a
-    /// process that had stopped being the writer looked identical to one
-    /// with a flaky store. Same condition, same prefix, same log query as
-    /// `FsError::Fenced` -- and the classification is a downcast of the box
-    /// casbin hands back, so if casbin ever stops preserving it this test is
-    /// what notices.
+    /// Before this change, every policy failure reached the client as a 500
+    /// with the fencing reason inside the adapter wrapper of casbin. A
+    /// process that had stopped being the writer then looked the same as a
+    /// process with a flaky store. The condition, the prefix, and the log
+    /// query are the same as for `FsError::Fenced`. The classification
+    /// downcasts the box that casbin returns, so this test notices as soon as
+    /// casbin stops preserving that box.
     ///
-    /// The latch half is asserted against a PRIVATE latch, not
-    /// `fencing::primary_loss()`. The global is a one-way `AtomicBool` with
-    /// no reset, and `fencing::tests::the_process_wide_signal_is_readable`
-    /// trips it unconditionally; cargo runs tests in parallel threads in one
-    /// binary, so the `note_primary_loss` call could be deleted from the casbin
-    /// `From` impl entirely and this assertion would still pass whenever the
-    /// fencing test won the race. A test that cannot fail is worse than a
-    /// missing one, because it reads as coverage.
+    /// The second half of the test asserts against a PRIVATE latch, and not
+    /// against `fencing::primary_loss()`. The global is a one-way
+    /// `AtomicBool` with no reset. The test
+    /// `fencing::tests::the_process_wide_signal_is_readable` trips it
+    /// unconditionally. Cargo runs the tests in parallel threads in one
+    /// binary. The call to `note_primary_loss` could therefore be deleted
+    /// from the casbin `From` impl entirely, and this assertion would still
+    /// pass whenever the fencing test won the race. A test that cannot fail
+    /// is worse than a missing test, because it reads as coverage.
     ///
-    /// `Box::leak` because the field is a `&'static`, matching how a
-    /// production engine holds the process-wide one.
+    /// The code calls `Box::leak` because the field has the type
+    /// `&'static`. That matches the way a production engine holds the
+    /// process-wide latch.
     #[tokio::test]
     async fn a_fenced_policy_write_is_typed_as_a_fencing_loss() {
         let latch: &'static Latch = Box::leak(Box::new(Latch::new()));
@@ -517,10 +530,11 @@ mod tests {
         );
         assert!(rendered.contains("epoch 7 superseded"), "{rendered}");
 
-        // And it took this instance out of rotation, which is the part that
-        // makes the classification worth having: `/ready` reports on the
-        // latch, and before it existed a fenced policy write was a 500 on a
-        // server that still claimed to be healthy.
+        // The code also takes this instance out of the rotation.
+        // That is the part that makes the classification worth having.
+        // The route `/ready` reports on the latch. Before the latch
+        // existed, a fenced policy write was a 500 on a server that still
+        // claimed to be healthy.
         assert!(
             latch.is_tripped(),
             "a fenced policy write must latch the fencing signal, or /ready \
@@ -532,8 +546,9 @@ mod tests {
     async fn persists_rules_across_reopen() {
         use std::sync::Arc;
 
-        // Shared in-memory LSM backend; reopening rebuilds from it (WAL
-        // replay) the way a second `OxKvStore` session would on real S3.
+        // The backend is an in-memory LSM store that is shared. Reopening
+        // rebuilds from it through WAL replay, in the same way as a second
+        // `OxKvStore` session on real S3.
         let backend = Arc::new(oxkv::MemStorage::new());
         let open = |backend: Arc<oxkv::MemStorage>| async move {
             oxkv::OxKvStore::builder()
@@ -629,30 +644,30 @@ mod tests {
 
         let store = oxkv::HookStore::new(BTreeStore::default()).with_validator(PolicyRuleValidator);
 
-        // Valid p-rule passes.
+        // The store accepts a valid p-rule.
         store
             .set_bytes("p:p:ab01", br#"["alice","doc_a","read"]"#)
             .await
             .unwrap();
 
-        // Non-JSON value rejected.
+        // The store rejects a value that is not JSON.
         let tx = store.begin_tx().unwrap();
         assert!(tx.set_bytes("p:p:cd02", b"not json").await.is_err());
 
-        // Wrong arity for section rejected at staging (g needs 2 fields).
+        // The store rejects the wrong field count at the staging (g needs 2 fields).
         let tx = store.begin_tx().unwrap();
         assert!(tx.set_bytes("g:g:ef03", br#"["user"]"#).await.is_err());
 
-        // Unknown section rejected at staging.
+        // The store rejects an unknown section at the staging.
         let tx = store.begin_tx().unwrap();
         assert!(tx.set_bytes("x:m:ff04", br#"["a","b"]"#).await.is_err());
     }
 
-    /// The key-shape rejection has to name the segment it is actually
-    /// missing. The message used to render `{sec}:{SEP}{hash}`, which
-    /// both interpolated the separator constant and dropped `ptype` — so
-    /// a two-segment key was reported as malformed in a format that
-    /// looked like the valid one.
+    /// The rejection of a bad key shape must name the segment that is
+    /// actually missing. The message used to render `{sec}:{SEP}{hash}`.
+    /// That format both interpolated the separator constant and dropped
+    /// `ptype`. The message then reported a key with two segments as
+    /// malformed, and the format in the message looked like the valid one.
     #[tokio::test]
     async fn validator_error_names_the_ptype_segment() {
         use oxkv::Store as _;
@@ -676,7 +691,7 @@ mod tests {
         let s3 = crate::db::build_test_store(&crate::db::test_prefix("adapter-validate")).await;
         let mut adapter = OxkvAdapter::new(s3);
 
-        // Wrong arity rejected without touching the store.
+        // The store rejects the wrong field count without a change.
         assert!(
             adapter
                 .add_policy("p", "p", vec!["only-one-field".into()])
@@ -685,7 +700,7 @@ mod tests {
         );
         assert!(adapter.load_all().await.unwrap().is_empty());
 
-        // A valid rule still writes.
+        // The store still accepts a valid rule.
         assert!(
             adapter
                 .add_policy("p", "p", vec!["u".into(), "o".into(), "read".into()])

@@ -1,9 +1,10 @@
-//! Refreshable JWKS-backed signing-key store.
+//! A signing key store that uses JWKS and can refresh its keys.
 //!
-//! Keys are loaded once on construction and served from cache afterwards.
-//! When a token references an unknown `kid` (typically right after the
-//! provider rotated its signing keys), the JWKS document is refetched —
-//! debounced so repeated misses cannot be used to flood the provider.
+//! The store loads the keys once when it is created. It serves the keys
+//! from the cache afterwards. When a token refers to an unknown `kid`, which
+//! usually happens right after the provider rotated its signing keys, the
+//! store fetches the JWKS document again. A debounce limit stops repeated
+//! misses from flooding the provider.
 
 use std::{
     collections::HashMap,
@@ -17,15 +18,16 @@ use jsonwebtoken::{
     jwk::{AlgorithmParameters, Jwk, JwkSet, KeyAlgorithm},
 };
 
-/// Shared `reqwest` client for JWKS fetches — reuses the same connection
-/// pool and avoids constructing a new client per refresh (previously
-/// `reqwest::get` did that). The client is `rustls`-only to match the
-/// workspace-wide `reqwest` feature set and save `native-tls` compile time.
+/// The shared `reqwest` client for the JWKS fetches. The client reuses one
+/// connection pool, so it avoids creating a new client for each refresh.
+/// `reqwest::get` created a new client each time. The client uses only
+/// `rustls`, to match the `reqwest` feature set of the whole workspace and
+/// to save the `native-tls` compile time.
 ///
-/// The `expect` is the crate's convention for a build-time-only failure
-/// that cannot be surfaced to a caller (same as `db::build_test_store`):
-/// it fires at first use and only on a malformed TLS backend, so there is
-/// no request to fail.
+/// The `expect` follows the convention of this crate for a build-time
+/// failure that the code cannot pass to a caller, as in
+/// `db::build_test_store`. It runs at first use, and only when the TLS
+/// backend is malformed, so there is no request that can fail.
 #[allow(clippy::expect_used)]
 static JWKS_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
@@ -34,33 +36,37 @@ static JWKS_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
         .expect("JWKS reqwest client must build")
 });
 
-/// Minimum interval between two JWKS fetches triggered by unknown-key misses.
-/// Prevents a flood of junk tokens from hammering the identity provider.
+/// The minimum time between two JWKS fetches that an unknown-key miss
+/// triggers. The limit stops a flood of junk tokens from overloading the
+/// identity provider.
 ///
-/// The window is consumed when a refresh is ATTEMPTED, not when it succeeds,
-/// so the bound holds against a provider that is down as firmly as against one
-/// that is healthy.
+/// The code consumes the window when it ATTEMPTS a refresh, and not when the
+/// refresh succeeds. Therefore the limit holds against a provider that is
+/// down as firmly as it holds against one that is healthy.
 const JWKS_REFRESH_DEBOUNCE: Duration = Duration::from_secs(5);
 
-/// A single verification key resolved from the provider's JWKS, paired
-/// with the algorithm tokens signed by it must use.
+/// One verification key that the code resolved from the JWKS of the
+/// provider. The key also holds the algorithm that every token signed with it
+/// must use.
 #[derive(Debug, Clone)]
 pub struct SigningKey {
-    /// The raw key material used to verify token signatures.
+    /// The raw key material that verifies the token signatures.
     pub(crate) decoding_key: DecodingKey,
-    /// Verification algorithm derived from this key's own `alg` (or the OIDC
-    /// default RS256 when the JWK omits it). Tokens are validated against
-    /// exactly this algorithm, preventing algorithm-confusion attacks.
+    /// The verification algorithm that comes from the `alg` of this key. The
+    /// code uses the OIDC default RS256 when the JWK has no `alg`. The code
+    /// validates the tokens against exactly this algorithm, which prevents
+    /// algorithm-confusion attacks.
     pub(crate) algorithm: Algorithm,
 }
 
-/// Refreshable JWKS-backed signing key store.
+/// A signing key store that uses JWKS and can refresh its keys.
 ///
-/// One cache per process, shared by every `JwtClaimsMiddleware` clone
-/// (clones share the `Arc` state, so one provider fetch serves all
-/// workers). On an unknown-`kid` miss the document is refetched at most
-/// once per `JWKS_REFRESH_DEBOUNCE`, and a fetch that fails or returns
-/// no usable keys keeps the previous set rather than dropping it.
+/// The process has one cache. Every clone of `JwtClaimsMiddleware` shares
+/// that cache, because the clones share the `Arc` state. Therefore one fetch
+/// from the provider serves every worker. On an unknown-`kid` miss, the
+/// store fetches the document again at most once per
+/// `JWKS_REFRESH_DEBOUNCE`. A fetch that fails, or that returns no usable
+/// keys, keeps the previous set instead of dropping it.
 #[derive(Clone)]
 pub struct JwksKeys {
     inner: Arc<JwksKeysInner>,
@@ -79,8 +85,8 @@ impl JwksKeys {
         Self::build(url.into(), JWKS_REFRESH_DEBOUNCE).await
     }
 
-    /// Test-only variant with an injectable debounce window; `Duration::ZERO`
-    /// makes every on-miss refresh fire immediately.
+    /// The test-only variant with a debounce window that a test can set.
+    /// `Duration::ZERO` makes every refresh on a miss fire at once.
     #[cfg(test)]
     async fn with_refresh_debounce(
         url: impl Into<String>,
@@ -110,23 +116,24 @@ impl JwksKeys {
 
     /// Resolves the verification key for a token.
     ///
-    /// A missing `kid` is only resolvable when the provider publishes exactly
-    /// one key; otherwise the request cannot select safely and `None` is
-    /// returned.
+    /// The store can resolve a missing `kid` only when the provider
+    /// publishes exactly one key. Otherwise the request cannot select a key
+    /// safely, and the function returns `None`.
     pub async fn get(&self, kid: Option<&str>) -> Option<SigningKey> {
-        // Fast path: cached hit.
+        // The fast path: the cache holds the key.
         if let Some(key) = self.lookup(kid).await {
             return Some(key);
         }
 
-        // Miss: the provider may have rotated signing keys. Refresh once
-        // (debounced), then retry the lookup against fresh material.
+        // The code misses. The provider may have rotated its signing keys.
+        // The store refreshes once, within the debounce limit, and then looks
+        // up the key again.
         self.maybe_refresh().await;
         self.lookup(kid).await
     }
 
     async fn lookup(&self, kid: Option<&str>) -> Option<SigningKey> {
-        let keys = self.inner.keys.read().await.clone(); // cheap Arc clone
+        let keys = self.inner.keys.read().await.clone(); // The Arc clone is cheap
         match kid {
             Some(id) => keys.get(id).cloned(),
             None => {
@@ -139,41 +146,42 @@ impl JwksKeys {
         }
     }
 
-    /// Refetches at most once per debounce window, and drops the previous
-    /// keys rather than emptying the cache on a failure.
+    /// Fetches the keys again at most once per debounce window, and keeps the
+    /// previous keys instead of emptying the cache on a failure.
     ///
-    /// The timestamp is advanced BEFORE the fetch, in the same critical
-    /// section that decides whether to fetch, so a failure consumes the
-    /// window exactly like a success. It previously advanced only in the
-    /// success arm, which meant the bound this module documents -- "at most
-    /// once per `JWKS_REFRESH_DEBOUNCE`" -- held only while the provider was
-    /// reachable. Against a slow or down IdP, `elapsed()` kept growing past
-    /// the window on every request, and each miss issued a fresh outbound
-    /// GET: the exact flood the module doc claims is prevented, amplified at
-    /// the provider rather than at this process.
+    /// The code advances the timestamp BEFORE the fetch, in the same critical
+    /// section that decides whether to fetch. Therefore a failure consumes the
+    /// window exactly like a success. The code used to advance the timestamp
+    /// only in the success arm, so the bound that this module documents,
+    /// "at most once per `JWKS_REFRESH_DEBOUNCE`", held only while the
+    /// provider was reachable. Against a slow or down IdP, `elapsed()` grew
+    /// past the window on every request, and each miss sent a new outbound
+    /// GET. That is the exact flood that the module doc claims to prevent,
+    /// amplified at the provider instead of at this process.
     ///
-    /// The guard is also released before the fetch rather than held across
-    /// it. It used to be held across a round trip with a ten-second client
-    /// timeout, so one slow GET parked every other worker's unknown-`kid`
-    /// miss behind it. Scoping the claim to its own critical section keeps
-    /// the mutual exclusion that matters -- see below -- without holding a
-    /// lock over I/O.
+    /// The code also releases the guard before the fetch, and it does not
+    /// hold the guard across the fetch. It used to hold the guard across a
+    /// round trip with a ten-second client timeout, so one slow GET parked
+    /// every other worker's unknown-`kid` miss behind it. Scoping the guard
+    /// to its own critical section keeps the mutual exclusion that matters,
+    /// as described below, without holding a lock over I/O.
     ///
-    /// Two concurrent misses still produce ONE fetch: the winner is the one
-    /// that finds the timestamp stale and rewrites it, and every other caller
-    /// then reads a fresh one and returns without fetching. The loser does
-    /// not wait for the winner's result -- it does not need to, because the
-    /// lookup it performs afterwards is against the shared cache, which the
-    /// winner updates when it lands. So the concurrency is bounded to one
-    /// in-flight refresh process-wide, not one per worker.
+    /// Two concurrent misses still produce ONE fetch. The winner finds the
+    /// timestamp stale and rewrites it. Every other caller then reads a
+    /// fresh timestamp and returns without fetching. The loser does not wait
+    /// for the winner's result, and it does not need to. The lookup that it
+    /// runs afterwards reads the shared cache, and the winner updates that
+    /// cache when the result lands. The concurrency is therefore bounded to
+    /// one refresh for the whole process, and not one for each worker.
     ///
-    /// The trade is that the window is measured from the START of an attempt,
-    /// so a fetch that outlives the debounce leaves it already elapsed and
-    /// the next miss may refresh again immediately. That is still the
-    /// documented bound -- one refresh per `JWKS_REFRESH_DEBOUNCE` -- and it
-    /// is the right direction: a provider slow enough for the fetch to
-    /// exceed the window is exactly the one where re-checking for a rotation
-    /// is worth more than waiting.
+    /// The trade is that the window is measured from the START of an attempt.
+    /// A fetch that takes longer than the debounce therefore leaves the
+    /// window already elapsed, and the next miss may refresh again at once.
+    /// That is still the documented bound of one refresh per
+    /// `JWKS_REFRESH_DEBOUNCE`, and it is the right direction. A provider
+    /// that is slow enough for the fetch to exceed the window is exactly the
+    /// provider for which another check for a rotation is worth more than a
+    /// wait.
     async fn maybe_refresh(&self) {
         {
             let mut last_refresh = self.inner.last_refresh.lock().await;
@@ -208,14 +216,15 @@ async fn fetch_keys(url: &str) -> anyhow::Result<HashMap<String, SigningKey>> {
 
 /// Converts a JWK into a verification entry.
 ///
-/// - HMAC (`oct`) keys are rejected outright: an OIDC provider must never
-///   publish shared secrets in its JWKS, and trusting them would enable
+/// - The function rejects every HMAC (`oct`) key. An OIDC provider must never
+///   publish shared secrets in its JWKS, and trusting such a key would allow
 ///   algorithm-confusion attacks.
-/// - The algorithm is taken from the key's own `alg` parameter, falling back
-///   to RS256 (the de-facto OIDC default) when omitted — common among older
-///   providers.
-/// - Encryption-only or unrecognized `alg` values fail the parse and are
-///   skipped, as are keys without a `kid` that tokens could never address.
+/// - The function reads the algorithm from the `alg` parameter of the key. It
+///   falls back to RS256, which is the usual OIDC default, when the parameter
+///   is absent. Many older providers omit the parameter.
+/// - The function skips a key when its `alg` value is for encryption only, or
+///   when the value is not recognized. It also skips a key without a `kid`,
+///   because a token could never refer to that key.
 fn to_signing_key(jwk: &Jwk) -> Option<(String, SigningKey)> {
     if matches!(jwk.algorithm, AlgorithmParameters::OctetKey(_)) {
         return None;
@@ -238,7 +247,7 @@ fn to_signing_key(jwk: &Jwk) -> Option<(String, SigningKey)> {
     ))
 }
 
-/// Shared fixtures for JWT/JWKS test modules across this crate.
+/// The fixtures that the JWT and JWKS test modules of this crate share.
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::*;
@@ -249,13 +258,13 @@ pub(crate) mod test_support {
     use serde_json::json;
     use wiremock::MockServer;
 
-    /// Minimal claims shape used by decode assertions.
+    /// The smallest claims shape that the decode assertions use.
     #[derive(Debug, Clone, Deserialize)]
     pub(crate) struct TestClaims {
         pub sub: String,
     }
 
-    /// Serves a static JWKS document on a fresh mock provider.
+    /// Serves a static JWKS document on a new mock provider.
     pub(crate) async fn spawn_jwks(body: serde_json::Value) -> MockServer {
         let server = MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
@@ -266,7 +275,8 @@ pub(crate) mod test_support {
         server
     }
 
-    /// Generates an RSA keypair and returns (jwks JSON entry, encoding key).
+    /// Creates an RSA key pair. The function returns the JWKS JSON entry and the
+    /// encoding key.
     pub(crate) fn rsa_key(kid: &str) -> anyhow::Result<(serde_json::Value, EncodingKey)> {
         let mut rng = rand::thread_rng();
         let private = RsaPrivateKey::new(&mut rng, 2048)?;
@@ -287,7 +297,7 @@ pub(crate) mod test_support {
         Ok((entry, EncodingKey::from_rsa_der(der.as_bytes())))
     }
 
-    /// Signs `claims` as an RS256 JWT under the given `kid`.
+    /// Signs `claims` as an RS256 JWT with the given `kid`.
     pub(crate) fn sign_rs256(
         claims: &serde_json::Value,
         kid: &str,
@@ -309,17 +319,18 @@ mod tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    /// Requests the mock provider has served so far.
+    /// The number of requests that the mock provider has served so far.
     ///
-    /// `received_requests` is `None` when recording is disabled, which the
-    /// pooled servers this crate starts do not do -- but a zero default keeps
-    /// the assertions below reading as counts rather than as `Option` arms.
+    /// The value `received_requests` is `None` when the recording is
+    /// disabled. The pooled servers that this crate starts do not disable
+    /// the recording, but a default of zero keeps the assertions below
+    /// reading as counts instead of as `Option` arms.
     async fn served_requests(server: &MockServer) -> usize {
         server.received_requests().await.map_or(0, |r| r.len())
     }
 
     #[tokio::test]
-    async fn loads_keys_and_resolves_kid() -> anyhow::Result<()> {
+    async fn loads_keys_and_resolves_a_kid() -> anyhow::Result<()> {
         let (key_a, _) = rsa_key("kid-a")?;
         let server = spawn_jwks(json!({ "keys": [key_a] })).await;
 
@@ -331,7 +342,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_kid_triggers_refresh() -> anyhow::Result<()> {
+    async fn an_unknown_kid_triggers_a_refresh() -> anyhow::Result<()> {
         let (key_a, _) = rsa_key("kid-a")?;
         let (key_b, enc_b) = rsa_key("kid-b")?;
         let server = MockServer::start().await;
@@ -339,8 +350,9 @@ mod tests {
         let serve_jwks = |body: serde_json::Value| {
             let server = &server;
             async move {
-                // Reset first so wiremock doesn't keep serving older mounts
-                // (it matches the FIRST mounted mock, not the latest).
+                // Reset first, so that wiremock does not keep serving older
+                // mounts. Wiremock matches the FIRST mounted mock, and not
+                // the latest one.
                 server.reset().await;
                 Mock::given(method("GET"))
                     .and(path("/jwks"))
@@ -352,14 +364,15 @@ mod tests {
 
         serve_jwks(json!({ "keys": [key_a] })).await;
 
-        // Zero debounce so the on-miss refresh fires immediately.
+        // The debounce is zero, so the refresh on a miss fires at once.
         let keys =
             JwksKeys::with_refresh_debounce(format!("{}/jwks", server.uri()), Duration::ZERO)
                 .await?;
         assert!(keys.get(Some("kid-a")).await.is_some());
-        assert!(keys.get(Some("kid-b")).await.is_none()); // miss → debounced refresh
+        assert!(keys.get(Some("kid-b")).await.is_none()); // A miss causes a refresh
 
-        // Provider rotates: JWKS now serves only kid-b.
+        // The provider rotates its keys, so the JWKS document now serves
+        // only kid-b.
         serve_jwks(json!({ "keys": [key_b] })).await;
 
         let refreshed = keys.get(Some("kid-b")).await;
@@ -372,7 +385,7 @@ mod tests {
             "retired kid must be dropped"
         );
 
-        // The refreshed key must actually verify a token signed with kid-b.
+        // The refreshed key must verify a token that kid-b signed.
         let token = sign_rs256(
             &json!({ "sub": "u2", "exp": 2000000000u64 }),
             "kid-b",
@@ -388,28 +401,28 @@ mod tests {
 
     /// A FAILED refresh must consume the debounce window.
     ///
-    /// The regression: `last_refresh` advanced only in the
-    /// success-with-keys arm, so against an unreachable or broken provider
-    /// `elapsed()` kept growing past the window and every subsequent miss
-    /// issued a fresh outbound GET -- the flood the module doc claims is
-    /// prevented, aimed at the identity provider. Nothing here is an authz
-    /// question: the lookup still fails closed and the previous keys are
-    /// kept. It is availability, at a third party, amplified by unauthenticated
-    /// junk tokens.
+    /// The regression: `last_refresh` advanced only in the success-with-keys
+    /// arm, so against an unreachable or broken provider `elapsed()` grew
+    /// past the window on every request. Every later miss sent a new
+    /// outbound GET. That is the flood that the module doc claims to
+    /// prevent, aimed at the identity provider. Nothing here is a question
+    /// about authorization. The lookup still fails closed, and the store
+    /// keeps the previous keys. It is a question of availability, at a third
+    /// party, and unauthenticated junk tokens amplify the effect.
     ///
-    /// The assertion is on the provider's request count rather than on a
-    /// returned value, because the returned value is `None` either way and
-    /// cannot distinguish "debounced" from "refetched and failed again".
+    /// The assertion checks the number of requests at the provider, not a
+    /// returned value. The returned value is `None` in both cases, so it
+    /// cannot tell "debounced" from "fetched again and failed again".
     ///
-    /// Both failure arms are covered -- a transport/parse error and an empty
-    /// key set -- because they are separate branches and either one alone
-    /// would reintroduce the flood for a provider that hits it.
+    /// The test covers both failure arms, a transport or parse error and an
+    /// empty key set. They are separate branches, and either one alone would
+    /// reintroduce the flood for a provider that hits it.
     ///
-    /// The debounce is a real 500ms with a sleep past it, rather than the
-    /// `Duration::ZERO` the other tests use: the window has to be over for
-    /// the FIRST miss to fetch, and then closed again for the second. 500ms
-    /// is orders of magnitude longer than the two lookups either side of it,
-    /// so this is not a timing race.
+    /// The debounce is a real 500ms with a sleep past it, and not the
+    /// `Duration::ZERO` that the other tests use. The window has to be over
+    /// for the FIRST miss to fetch, and then closed again for the second.
+    /// 500ms is much longer than the two lookups on either side of it, so
+    /// this is not a timing race.
     #[tokio::test]
     async fn a_failed_refresh_still_consumes_the_debounce_window() -> anyhow::Result<()> {
         let (key_a, _) = rsa_key("kid-a")?;
@@ -427,7 +440,8 @@ mod tests {
             }
         };
 
-        // Healthy to start, so the cache is populated and `kid-a` resolves.
+        // The provider is healthy at first, so the cache holds the keys
+        // and `kid-a` resolves.
         serve(200, json!({ "keys": [key_a] }).to_string()).await;
         let debounce = Duration::from_millis(500);
         let keys =
@@ -435,7 +449,7 @@ mod tests {
         assert!(keys.get(Some("kid-a")).await.is_some());
         let after_construction = served_requests(&server).await;
 
-        // The provider starts failing in both ways in turn.
+        // The provider then fails in both ways in turn.
         for (status, body) in [(503u16, "upstream unavailable".to_string())] {
             tokio::time::sleep(debounce).await;
             serve(status, body).await;
@@ -452,7 +466,7 @@ mod tests {
                 "the first miss inside an elapsed window must fetch once"
             );
 
-            // The next miss, well inside the window the failure just
+            // The next miss, well inside the window that the failure just
             // consumed, must not reach the provider at all.
             assert!(keys.get(Some("kid-unknown")).await.is_none());
             assert_eq!(
@@ -464,9 +478,9 @@ mod tests {
             );
         }
 
-        // Same window, different failure arm: a 200 whose body carries no
-        // usable key. It took the `Ok(_)` branch before, and the old code
-        // advanced `last_refresh` in neither failure path.
+        // The same window with a different failure arm: a 200 whose body
+        // has no usable key. That case took the `Ok(_)` branch before, and
+        // the old code advanced `last_refresh` in neither failure path.
         tokio::time::sleep(debounce).await;
         serve(200, json!({ "keys": [] }).to_string()).await;
         let before = served_requests(&server).await;
@@ -490,31 +504,32 @@ mod tests {
     /// The refresh mutex is not held across the network call, and concurrent
     /// misses still collapse into ONE fetch.
     ///
-    /// These are one change, so they are one test. The guard used to be held
-    /// for the whole `fetch_keys` await, whose client timeout is ten
-    /// seconds: one slow GET parked every other worker's unknown-`kid` miss
-    /// behind it. Narrowing the lock is only safe if the mutual exclusion it
-    /// provided survives, so both halves are asserted: the parked fetch does
-    /// not block the second miss, and the second miss does not start a
-    /// second fetch.
+    /// One change produced both properties, so one test covers them. The guard
+    /// used to be held for the whole `fetch_keys` await, whose client timeout
+    /// is ten seconds. One slow GET parked every other worker's unknown-`kid`
+    /// miss behind it. Narrowing the lock is only safe if the mutual
+    /// exclusion that it provided survives, so the test asserts both halves.
+    /// The parked fetch does not block the second miss, and the second miss
+    /// does not start a second fetch.
     ///
-    /// The miss that loses the race answers `None` rather than waiting for
-    /// the winner's result -- it re-reads the shared cache, which the winner
-    /// updates when it lands, and fails closed until then. That is the
-    /// intended behaviour and it is asserted, not left implied: this is an
-    /// authentication path, so "concurrent misses may miss" must be a
-    /// deliberate, pinned property.
+    /// The miss that loses the race answers `None` instead of waiting for the
+    /// winner's result. It reads the shared cache again, which the winner
+    /// updates when the result lands, and it fails closed until then. That is
+    /// the intended behavior, and the test asserts it instead of leaving it
+    /// implied. This is an authentication path, so "concurrent misses may
+    /// miss" must be a deliberate property that a test pins.
     ///
-    /// Deterministic rather than a race: the mock delays its response for
-    /// longer than the whole test's patience for the second miss, so the
-    /// first fetch is provably still in flight when the second runs.
+    /// The test is deterministic rather than a race. The mock delays its
+    /// response for longer than the whole test waits for the second miss, so
+    /// the first fetch is still in flight when the second miss runs.
     #[tokio::test]
     async fn concurrent_misses_collapse_into_one_unblocked_fetch() -> anyhow::Result<()> {
         let (key_a, _) = rsa_key("kid-a")?;
         let (key_b, _) = rsa_key("kid-new")?;
         let server = MockServer::start().await;
 
-        // Healthy and fast to begin with, so the fixture caches kid-a.
+        // The provider is healthy and fast at first, so the fixture caches
+        // kid-a.
         server.reset().await;
         Mock::given(method("GET"))
             .and(path("/jwks"))
@@ -522,17 +537,18 @@ mod tests {
             .mount(&server)
             .await;
 
-        // Short but real: long enough that the second miss below is inside
-        // the window the first one consumes, short enough that the window has
-        // elapsed by the time the first miss runs. `Duration::ZERO` would let
-        // both fetch and prove nothing.
+        // The debounce is short but real. It is long enough that the
+        // second miss below is inside the window that the first one
+        // consumes, and short enough that the window has elapsed by the time
+        // the first miss runs. `Duration::ZERO` would let both misses fetch
+        // and would prove nothing.
         let debounce = Duration::from_millis(500);
         let keys =
             JwksKeys::with_refresh_debounce(format!("{}/jwks", server.uri()), debounce).await?;
         assert!(keys.get(Some("kid-a")).await.is_some(), "fixture cache");
 
-        // The provider rotates AND gets slow: the refresh the miss below
-        // triggers takes five seconds to come back.
+        // The provider rotates its keys AND becomes slow, so the refresh
+        // that the miss below triggers takes five seconds to come back.
         server.reset().await;
         Mock::given(method("GET"))
             .and(path("/jwks"))
@@ -571,7 +587,7 @@ mod tests {
             "two concurrent misses must produce ONE refresh, not one each"
         );
 
-        // The winner eventually lands the rotated key.
+        // The winner eventually installs the rotated key.
         let resolved = tokio::time::timeout(Duration::from_secs(20), first)
             .await
             .expect("the parked fetch must finish")
@@ -584,9 +600,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_algorithm_confusion() -> anyhow::Result<()> {
-        // Provider publishes an RSA key; attacker signs an HS256 token trying
-        // to use the RSA public material as an HMAC secret.
+    async fn rejects_algorithm_confusion_attacks() -> anyhow::Result<()> {
+        // The provider publishes an RSA key. The attacker signs an HS256
+        // token and tries to use the RSA public material as an HMAC secret.
         let (key_a, _) = rsa_key("kid-a")?;
         let server = spawn_jwks(json!({ "keys": [key_a] })).await;
         let keys = JwksKeys::new(format!("{}/jwks", server.uri())).await?;
@@ -613,7 +629,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hmac_octet_keys_are_rejected() -> anyhow::Result<()> {
+    async fn rejects_hmac_octet_keys() -> anyhow::Result<()> {
         let oct_key = json!({
             "kty": "oct",
             "kid": "shared",
@@ -632,10 +648,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn derives_es256_from_ec_key() -> anyhow::Result<()> {
-        // Arbitrary P-256 point coordinates — parsing a JWK never validates
-        // curve membership, so this exercises the EC code path without a
-        // signer dependency.
+    async fn derives_es256_from_an_ec_key() -> anyhow::Result<()> {
+        // Arbitrary P-256 point coordinates. Parsing a JWK never checks
+        // that a point is on the curve, so this reaches the EC code path
+        // without a signer dependency.
         let coord = URL_SAFE_NO_PAD.encode([7u8; 32]);
         let ec_entry = json!({
             "kty": "EC",
@@ -655,7 +671,7 @@ mod tests {
     }
 
     #[test]
-    fn omits_alg_falls_back_to_rs256() {
+    fn a_missing_alg_falls_back_to_rs256() {
         let (key_a, _) = rsa_key("kid-legacy").unwrap();
         let mut legacy = key_a.clone();
         legacy["alg"] = serde_json::Value::Null;
@@ -669,7 +685,7 @@ mod tests {
     }
 
     #[test]
-    fn encryption_only_alg_is_skipped() {
+    fn an_encryption_only_alg_is_skipped() {
         let jwk: Jwk = serde_json::from_value(json!({
             "kty": "RSA",
             "kid": "enc-key",

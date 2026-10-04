@@ -1,9 +1,9 @@
-//! GC for abandoned uploads and orphaned files.
+//! Garbage collection for abandoned uploads and orphaned files.
 //!
-//! Sessions and temp/orphaned files older than 24h are removed.
-//! Expired files are announced to the change feed (when the engine has a
-//! sink wired) so replicas replay the deletion instead of keeping stale
-//! copies.
+//! The sweeper removes sessions and temp or orphaned files that are older
+//! than 24 hours. The engine announces expired files to the change feed
+//! when a sink is set. Each replica then replays the deletion instead of
+//! keeping a stale copy.
 
 use std::{collections::HashSet, sync::Arc, time::Duration};
 
@@ -12,15 +12,17 @@ use tokio::time::interval;
 use crate::fs::FsEngine;
 use crate::fs::store::RecordScan;
 
-/// Object prefix holding file bytes (`UploadSession`/`FileRecord` keys
-/// are `files/{id}`); the orphan-byte pass lists exactly this scope so
-/// oxkv prefixes sharing the bucket are never touched.
+/// The object prefix that holds the file bytes.
+///
+/// The `UploadSession` and `FileRecord` keys are `files/{id}`. The orphan
+/// byte pass lists only this scope. Therefore the oxkv prefixes in the
+/// same bucket are never touched.
 const FILE_BYTES_PREFIX: &str = "files/";
 
 /// TTL for abandoned sessions and orphaned files.
 pub const TTL_SECS: i64 = 24 * 3600;
 
-/// Spawn sweeper that runs every hour.
+/// Starts the sweeper task. The task runs once every hour.
 pub fn spawn(engine: Arc<FsEngine>) {
     tokio::spawn(async move {
         let mut ticker = interval(Duration::from_secs(3600));
@@ -33,13 +35,13 @@ pub fn spawn(engine: Arc<FsEngine>) {
     });
 }
 
-/// Single sweep: sessions, orphaned files, and orphan S3 bytes.
+/// Runs one sweep for sessions, orphaned files, and orphan S3 bytes.
 ///
-/// The session pass runs under the SAME per-session lock that
-/// `merge_part` and `complete_upload` take, and re-reads each row under it.
-/// The listing is a snapshot taken before the loop starts, so on its own it
-/// says nothing about what the row holds by the time the sweeper reaches it
-/// -- see the note inside the loop.
+/// The session pass runs under the same per-session lock that `merge_part`
+/// and `complete_upload` take. The pass reads each row again under the lock.
+/// The listing is a snapshot. The code takes it before the loop starts.
+/// Therefore the listing alone says nothing about what a row holds when the
+/// sweeper reaches it. See the note inside the loop.
 #[tracing::instrument(skip(engine), err)]
 pub async fn sweep_once(engine: &FsEngine) -> Result<usize, crate::fs::error::FsError> {
     let now = chrono::Utc::now().timestamp();
@@ -56,45 +58,52 @@ pub async fn sweep_once(engine: &FsEngine) -> Result<usize, crate::fs::error::Fs
 
     // sessions
     for listed in &sessions {
-        // The lock the upload path already uses for this session's rows.
-        // Taking it here is what makes the sweeper a fourth serialized
-        // writer rather than a fifth racy one: `merge_part` re-reads the
-        // session under this lock and writes the copy back, so a sweep that
-        // does not take it can land between that read and that write.
+        // This is the lock that the upload path already uses for the rows of
+        // this session. Taking the lock here makes the sweeper the fourth
+        // serialized writer. Without the lock the sweeper would be a fifth
+        // writer that races with the others. `merge_part` reads the session
+        // again under this lock and writes the copy back. A sweep that does
+        // not take the lock can land between that read and that write.
         //
-        // The failure that produced is not a lost update, it is a destroyed
-        // file. A client opens a session and stalls; nothing refreshes
-        // `created_at`, so after the TTL the sweep considers it expired.
-        // The client resumes and `upload_part` PUTs the bytes, then folds
-        // them into the row. If the sweep's `delete_object` and
-        // `delete_session` land inside that fold, the write resurrects the
-        // row with the etag set -- and `complete_upload` then takes the
-        // single-part branch, skips the multipart block (there is no S3
-        // upload to complete, the object was already deleted), and commits
-        // `save_file` -> `announce` -> `delete_session` and returns `Ok`.
-        // The file is in the feed and answers `GET /fs/{id}`; every
-        // download 404s forever, because the bytes went in the sweep and
-        // nothing anywhere looks for a record whose object is missing.
+        // The failure that this lock prevents is not a lost update. The
+        // failure is a destroyed file. A client opens a session and then
+        // stalls. Nothing refreshes `created_at`. Therefore the sweep
+        // considers the session expired after the TTL. The client resumes
+        // and `upload_part` PUTs the bytes. Then `merge_part` folds the
+        // bytes into the row. If the sweep runs `delete_object` and
+        // `delete_session` during that fold, the write restores the row with
+        // the etag set. Then `complete_upload` takes the single part branch.
+        // It skips the multipart block because there is no S3 upload to
+        // complete. The object was already deleted. Then `complete_upload`
+        // commits `save_file` -> `announce` -> `delete_session` and returns
+        // `Ok`. The file is in the feed and answers `GET /fs/{id}`. Every
+        // download then returns 404 forever. The bytes went in the sweep and
+        // nothing looks for a record whose object is missing.
         //
-        // Under this lock the two orderings are the only ones left. Sweep
-        // first: the row goes, so the fold re-reads `None` and the client
-        // gets a 404 -- the bytes it wrote are unreferenced and the
-        // orphan-byte pass reaps them. Fold first: the row is written, and
-        // this pass deletes it moments later, so there is still no record
-        // for `complete_upload` to commit. Neither ends with a file whose
-        // bytes are gone.
+        // Under this lock only two orderings remain:
         //
-        // Declaration order matters and matches the call sites: the guard
-        // is dropped before the claim is released, so a new claim can never
-        // mint a second mutex while this guard is still live.
+        // 1. Sweep first. The row goes. The fold reads `None`, so the client
+        //    gets a 404. The bytes that it wrote are unreferenced, and the
+        //    orphan byte pass removes them.
+        // 2. Fold first. The row is written. This pass deletes the row
+        //    moments later, so there is still no record for
+        //    `complete_upload` to commit.
+        //
+        // Neither ordering ends with a file whose bytes are gone.
+        //
+        // The declaration order matters and matches the order at the call
+        // sites. The code drops the guard before it releases the claim.
+        // Therefore a new claim can never create a second mutex while this
+        // guard is still live.
         let session_lock = engine.session_locks.acquire(&listed.id).await;
         let _held = session_lock.acquire().await;
-        // Re-read under the lock rather than trusting the listing. A
-        // session listed here may since have been completed -- which saves
-        // the file record pointing at exactly these bytes -- or cancelled,
-        // in which case deleting on the stale copy would reap a live
-        // file's bytes and leave the same permanently-404 record this lock
-        // exists to prevent.
+        // The code reads the row again under the lock. The code does not
+        // trust the listing. A session in the listing may have completed
+        // since the listing was taken. A completed session saves the file
+        // record that points at exactly these bytes. A session may also have
+        // been cancelled. Deleting on the stale copy of a cancelled session
+        // removes the bytes of a live file. That would leave the same
+        // permanently 404 record that this lock prevents.
         let Some(s) = engine.store.get_session(&listed.id).await? else {
             tracing::debug!("fs gc skipping upload {}: no longer a session", listed.id);
             continue;
@@ -107,9 +116,10 @@ pub async fn sweep_once(engine: &FsEngine) -> Result<usize, crate::fs::error::Fs
             s.id,
             now - s.created_at
         );
-        // S3 first via the engine (restores post-restart state, tolerates
-        // already-gone): on failure the session is kept so the next
-        // sweep retries instead of leaking bytes no record points at.
+        // The engine deletes the S3 object first. The engine restores the
+        // state after a restart and tolerates an object that is already
+        // gone. On failure the code keeps the session, so the next sweep
+        // retries. The code does not leak bytes that no record points at.
         if engine.abort_session_upload(&s).await.is_err() {
             tracing::warn!("fs gc keeping upload {} for retry", s.id);
             continue;
@@ -118,21 +128,23 @@ pub async fn sweep_once(engine: &FsEngine) -> Result<usize, crate::fs::error::Fs
         cleaned += 1;
     }
 
-    // orphaned / temp files
+    // Orphaned and temp files.
     for f in &files {
-        // One unreadable row costs one file, not the sweep. The order is
-        // sessions, then files, then orphan bytes, so propagating here
-        // would strand every file listed after this one and skip the
-        // orphan pass entirely -- on every subsequent sweep, because
-        // nothing in the sweeper repairs the key. The result is an
-        // unbounded leak of expired sessions, orphaned rows and orphan
-        // bytes, with one `warn!` an hour as the only sign.
+        // One unreadable row costs one file. It does not cost the sweep. The
+        // sweep runs sessions first, then files, then orphan bytes.
+        // Therefore an error here would strand every file that the listing
+        // returns after this one. The error would also skip the orphan byte
+        // pass on every later sweep, because nothing in the sweeper repairs
+        // the key. The result is an unbounded leak of expired sessions,
+        // orphaned rows, and orphan bytes. One `warn!` per hour is the only
+        // sign.
         //
-        // This is the same call the sibling branch below already declines
-        // to propagate, for the same reason: one bad item is retained and
-        // the sweep continues. Retaining is also the safe direction here.
-        // The orphan-byte pass keys off `f.s3_key`, which this row does
-        // not affect, so skipping the file leaks it rather than losing it.
+        // This is the same call that the sibling branch below already
+        // refuses to propagate, and for the same reason. The sweep retains
+        // one bad item and then continues. Retaining the item is also the
+        // safe direction here. The orphan byte pass uses `f.s3_key`. This
+        // row does not affect that key, so skipping the file leaks the file
+        // instead of losing it.
         let info = match engine.store.get_ref_info(&f.id).await {
             Ok(info) => info,
             Err(e) => {
@@ -148,11 +160,12 @@ pub async fn sweep_once(engine: &FsEngine) -> Result<usize, crate::fs::error::Fs
             continue;
         }
         tracing::info!("fs gc expiring file {} (age {}s)", f.id, now - age);
-        // Same retain-on-failure contract as sessions above. Age is measured
-        // from `orphan_since` when the file was attached and later detached,
-        // falling back to `created_at` for a file that was never referenced;
-        // unlike a session there is no record method to delegate to, since
-        // the timestamp lives on `RefInfo`, not on `FileRecord`.
+        // The code retains the item on failure, as it does for sessions
+        // above. The code measures the age from `orphan_since` when the file
+        // was attached and later detached. The code uses `created_at` for a
+        // file that was never referenced. Unlike a session, there is no
+        // record method that the code can call, because the timestamp is on
+        // `RefInfo`, not on `FileRecord`.
         if engine
             .s3
             .delete_object(&engine.bucket, &f.s3_key)
@@ -166,21 +179,23 @@ pub async fn sweep_once(engine: &FsEngine) -> Result<usize, crate::fs::error::Fs
             tracing::warn!("fs gc keeping file {} for retry", f.id);
             continue;
         }
-        // Announce *before* the row goes, not after. The row is the only
-        // record that this deletion still has to happen: once it is gone
-        // no future sweep can find the file to re-announce, so a failed
-        // append here strands every replica's copy for good -- the master
-        // has no row, the replica has the record and the bytes, and no
-        // later replay repairs either. Announced first, the same transient
-        // failure leaves the row in place and the next sweep announces
-        // again. Re-announcing is free of consequence: replaying
-        // `FileDelete` is a `delete_file` on the replica, which is
-        // idempotent on a file that is already gone.
+        // The code announces before the row goes, and not after. The row is
+        // the only record that says that this deletion still has to happen.
+        // After the row is gone, no future sweep can find the file to
+        // announce again. A failed append here therefore strands the copy on
+        // every replica for good. The master has no row. The replica has the
+        // record and the bytes. No later replay repairs either side.
+        // When the code announces first, the same transient failure leaves
+        // the row in place. The next sweep announces the deletion again.
+        // Announcing again has no bad effect. Replaying `FileDelete` runs a
+        // `delete_file` on the replica. That call is idempotent on a file
+        // that is already gone.
         //
-        // A failed announce retains the file rather than propagating. The
-        // bytes are already gone at this point, so propagating would leave
-        // exactly the unretryable state described above, and would abort
-        // the rest of the sweep over one file.
+        // A failed announce retains the file. The code does not propagate the
+        // error. The bytes are already gone at this point. Therefore
+        // propagating would leave the exact state that cannot be retried, as
+        // described above. It would also abort the rest of the sweep for one
+        // file.
         if let Err(e) = engine
             .announce(crate::records::WalOp::FileDelete {
                 file_id: f.id.clone(),
@@ -197,17 +212,18 @@ pub async fn sweep_once(engine: &FsEngine) -> Result<usize, crate::fs::error::Fs
         cleaned += 1;
     }
 
-    // orphan S3 bytes: listed keys no session or file record references.
-    // Crash windows between byte and metadata writes strand such keys;
-    // only reap them past the TTL so in-flight uploads always survive.
+    // Orphan S3 bytes: listed keys that no session record or file record
+    // references. A crash between the byte write and the metadata write can
+    // strand such a key. The pass removes them only after the TTL, so
+    // uploads that are in flight always survive.
     //
-    // The liveness set below is built from the two scans above, so a row
-    // either of them could not decode is a key whose bytes *look*
-    // unreferenced when they are not -- the delete is irreversible and the
-    // metadata row stays put, so every later download of that file 404s
-    // forever. Proving a key unreferenced needs a complete scan, so an
-    // incomplete one skips the whole pass: leaking the bytes costs
-    // storage, taking them costs the file.
+    // The code builds the liveness set below from the two scans above. A row
+    // that either scan cannot decode makes its key look unreferenced when the
+    // key is in fact referenced. The delete is irreversible and the metadata
+    // row stays. Therefore every later download of that file returns 404
+    // forever. The code needs a complete scan to prove that a key is
+    // unreferenced. An incomplete scan therefore skips the whole pass.
+    // Leaking the bytes costs storage. Removing the bytes costs the file.
     let unread = unread_sessions.len() + unread_files.len();
     if unread > 0 {
         tracing::warn!(
@@ -222,7 +238,8 @@ pub async fn sweep_once(engine: &FsEngine) -> Result<usize, crate::fs::error::Fs
         for f in &files {
             live.insert(f.s3_key.as_str());
         }
-        // A listing failure skips just this pass (metadata work above stands).
+        // A listing failure skips only this pass. The metadata work above
+        // still stands.
         let listed = match engine.s3.list_keys(&engine.bucket, FILE_BYTES_PREFIX).await {
             Ok(keys) => keys,
             Err(e) => {
@@ -353,7 +370,7 @@ mod tests {
     #[tokio::test]
     async fn sweep_cleans_orphaned_files() -> anyhow::Result<()> {
         let engine = make_engine().await;
-        // fresh temp file stays
+        // The fresh temp file stays.
         let fresh = FileRecord {
             id: "fresh-file".into(),
             name: "a.txt".into(),
@@ -364,7 +381,8 @@ mod tests {
             created_at: chrono::Utc::now().timestamp() - 3600,
         };
         engine.store.save_file(&fresh).await?;
-        // old temp (never attached, refs 0, age > TTL)
+        // The old temp file was never attached. It has 0 references and an
+        // age above the TTL.
         let old = FileRecord {
             id: "old-file".into(),
             name: "b.txt".into(),
@@ -424,7 +442,8 @@ mod tests {
     #[tokio::test]
     async fn sweep_keeps_live_and_fresh_s3_keys() -> anyhow::Result<()> {
         let engine = make_engine().await;
-        // Live single-part session: bytes exist, session still open.
+        // A live single part session. The bytes exist and the session is
+        // still open.
         let file_id = engine
             .init_upload(
                 crate::fs::model::InitRequest {
@@ -438,7 +457,8 @@ mod tests {
         engine
             .upload_part(&file_id, 0, once_body(vec![9u8; 1024]), None, None, "alice")
             .await?;
-        // Fresh stray bytes (e.g. crash between put and metadata write).
+        // Fresh stray bytes, for example after a crash between the put and
+        // the metadata write.
         engine
             .s3
             .put_object(
@@ -462,14 +482,14 @@ mod tests {
         Ok(())
     }
 
-    /// Scriptable [`S3Client`] double: records deletions and returns a
-    /// canned listing, so the sweeper's orphan-byte and
-    /// retain-on-failure paths can be driven without a real backend.
+    /// A scriptable [`S3Client`] double. It records deletions and returns a
+    /// prepared listing. The tests therefore drive the orphan byte path and
+    /// the retain on failure path without a real backend.
     ///
-    /// One double covers both, because the two tests that need it differ
-    /// only in what `list_keys` reports and whether the byte operations
-    /// succeed -- and a per-test struct meant re-listing all nine trait
-    /// methods every time a method was added to `S3Client`.
+    /// One double covers both paths. The two tests that use it differ only
+    /// in what `list_keys` reports and in whether the byte operations
+    /// succeed. A separate struct for each test would require listing all
+    /// nine trait methods every time the code adds a method to `S3Client`.
     struct FakeS3 {
         listed: Vec<ListedKey>,
         deleted: std::sync::Mutex<Vec<String>>,
@@ -490,7 +510,8 @@ mod tests {
             self.deleted.lock().expect("delete log").clone()
         }
 
-        /// Error every byte-mutating call when the double is in failure mode.
+        /// Returns an error from every call that writes bytes when the
+        /// double is in failure mode.
         fn write_guard(&self, op: &str) -> Result<(), FsError> {
             if self.writes_succeed {
                 Ok(())
@@ -584,7 +605,8 @@ mod tests {
         let policy =
             PolicyEngine::init_s3(build_test_store(&format!("{orphan_prefix}-p")).await).await?;
         let engine = FsEngine::from_parts(store, s3.clone(), "b".into(), policy.authorizer());
-        // Fresh session referencing live-key: aged but live, must survive.
+        // A fresh session references live-key. The key is old but live, so
+        // it must survive.
         let mut sess = session_with_age("sess-live", 60, false);
         sess.s3_key = "files/live-key".into();
         engine.store.save_session(&sess).await?;
@@ -598,9 +620,9 @@ mod tests {
     async fn sweep_reaps_restarted_multipart_session() -> anyhow::Result<()> {
         use object_store::memory::InMemory;
 
-        // One backend surviving the "restart"; client RAM does not (S3
-        // buckets outlive process restarts, so the backend upload id
-        // stays addressable while the pre-restart RAM map is gone).
+        // One backend survives the restart. The RAM of the client does
+        // not. S3 buckets outlive process restarts, so the backend upload id
+        // stays addressable. The RAM map from before the restart is gone.
         let inner = std::sync::Arc::new(InMemory::new());
         let prefix = crate::db::test_prefix("gc-restart");
         let store = FsStore::new(build_test_store(&prefix).await);
@@ -614,7 +636,8 @@ mod tests {
             "test-bucket".into(),
             policy.authorizer(),
         );
-        // Real multipart upload: backend id + durable record exist.
+        // A real multipart upload. The backend id and the durable record
+        // both exist.
         let file_id = engine_pre
             .init_upload(
                 crate::fs::model::InitRequest {
@@ -634,13 +657,14 @@ mod tests {
         let upload_id = sess.s3_upload_id.clone().expect("multipart session");
         sess.created_at -= TTL_SECS + 100;
         engine_pre.store.save_session(&sess).await?;
-        drop(engine_pre); // restart: RAM multipart states gone.
+        drop(engine_pre); // The restart removes the multipart states from RAM.
         let post: std::sync::Arc<dyn S3Client> =
             std::sync::Arc::new(ObjectStoreClient::new_combined(inner));
         let engine_post =
             FsEngine::from_parts(store, post, "test-bucket".into(), policy.authorizer());
-        // GC restores the backend upload from the record, aborts it for
-        // real, and converges the session plus its record.
+        // Garbage collection restores the backend upload from the record.
+        // It aborts the upload for real and removes the session and its
+        // record.
         assert_eq!(sweep_once(&engine_post).await?, 1);
         assert!(engine_post.store.get_session(&file_id).await?.is_none());
         assert!(
@@ -653,8 +677,8 @@ mod tests {
         Ok(())
     }
 
-    /// Writes a raw value under `key`, bypassing every typed setter, so a
-    /// test can plant a row no writer in this crate would produce.
+    /// Writes a raw value under `key`. The call bypasses every typed setter,
+    /// so a test can plant a row that no writer in this crate would produce.
     async fn put_raw(store: &FsStore, key: &str, value: &[u8]) {
         use oxkv::GetSet as _;
         store
@@ -666,7 +690,7 @@ mod tests {
             .expect("raw write");
     }
 
-    /// [`std::io::Write`] sink sharing one buffer with the subscriber.
+    /// A [`std::io::Write`] sink. It shares one buffer with the subscriber.
     #[derive(Clone)]
     struct SharedBuf(Arc<std::sync::Mutex<Vec<u8>>>);
 
@@ -680,12 +704,13 @@ mod tests {
         }
     }
 
-    /// Captures `tracing` output for the body, at `WARN` and above.
+    /// Captures `tracing` output for the body at level `WARN` and above.
     ///
-    /// Returns the buffer the subscriber writes into and the guard that
-    /// keeps it installed. `set_default` is thread-local, and a
-    /// `#[tokio::test]` runs the sweep on the calling thread, so this sees
-    /// the sweeper's own events.
+    /// The function returns the buffer that the subscriber writes into. It
+    /// also returns the guard that keeps the subscriber installed.
+    /// `set_default` is thread local. A `#[tokio::test]` runs the sweep on
+    /// the calling thread. Therefore this function sees the events of the
+    /// sweeper.
     fn capture_warnings() -> (
         Arc<std::sync::Mutex<Vec<u8>>>,
         tracing::subscriber::DefaultGuard,
@@ -702,21 +727,22 @@ mod tests {
     /// A row that will not decode must not cost the file whose bytes it
     /// describes.
     ///
-    /// The sweep builds its liveness set from `list_files`/`list_sessions`,
-    /// and an undecodable row is absent from both. Before the fix that made
-    /// its object indistinguishable from a crash-stranded one: aged past the
-    /// TTL, unreferenced by the *scan*, so the orphan-byte pass deleted the
-    /// real S3 object while the metadata row it belongs to stayed put. The
-    /// file was then permanently 404, out of a metadata problem that had a
-    /// one-line fix.
+    /// The sweep builds its liveness set from `list_files` and
+    /// `list_sessions`. An undecodable row is absent from both. Before the
+    /// fix, such a row made its object the same as an object stranded by a
+    /// crash. The row was older than the TTL. The scan did not reference
+    /// the key. The orphan byte pass therefore deleted the real S3 object.
+    /// The metadata row of that object stayed. The file then returned 404
+    /// forever, because of a metadata problem that had a one line fix.
     ///
-    /// Reachable without corruption too -- any field added to `FileRecord`
-    /// without a `#[serde(default)]` undecodes every row the previous
-    /// version wrote, so this is one ordinary schema change away.
+    /// Corruption is not necessary to reach this state. Any field that the
+    /// code adds to `FileRecord` without a `#[serde(default)]` makes every
+    /// row from the previous version fail to decode. One ordinary schema
+    /// change is therefore enough.
     ///
-    /// The assertion is that *no* object is deleted. The `files/good` row
-    /// decodes and is fresh, so it is legitimately not collectable either;
-    /// only `files/bad` distinguishes the two behaviours.
+    /// The assertion is that the sweep deletes no object. The `files/good`
+    /// row decodes and is fresh, so it also must not be removed. Only
+    /// `files/bad` distinguishes the two behaviours.
     #[tokio::test]
     async fn sweep_never_deletes_bytes_of_an_undecodable_metadata_row() -> anyhow::Result<()> {
         let now = chrono::Utc::now().timestamp();
@@ -738,8 +764,9 @@ mod tests {
         let policy = PolicyEngine::init_s3(build_test_store(&format!("{prefix}-p")).await).await?;
         let engine = FsEngine::from_parts(store, s3.clone(), "b".into(), policy.authorizer());
 
-        // Fresh, unreferenced, unexpired: the sweep has no cause to delete
-        // the bytes this record points at.
+        // The row is fresh, unreferenced, and unexpired. The sweep
+        // therefore has no cause to delete the bytes that this record
+        // points at.
         engine
             .store
             .save_file(&FileRecord {
@@ -752,7 +779,7 @@ mod tests {
                 created_at: now,
             })
             .await?;
-        // The row whose bytes must survive, with a value nothing decodes.
+        // This row must keep its bytes. No value decodes it.
         put_raw(
             &engine.store,
             "fs:files:bad:meta",
@@ -768,8 +795,8 @@ mod tests {
             "the sweep deleted an object whose metadata row it could not read"
         );
 
-        // ...and the skip is visible, so this is diagnosable rather than a
-        // silent leak: both the key and the refused pass are named.
+        // The log also shows the skip, so the state is not a silent
+        // leak. The log names the key and the refused pass.
         let logs = String::from_utf8(log.lock().expect("log buffer").clone()).expect("utf8");
         assert!(
             logs.contains("fs:files:bad:meta"),
@@ -782,8 +809,8 @@ mod tests {
         Ok(())
     }
 
-    /// Once every row decodes, the pass resumes -- the fix defers, it does
-    /// not disable the orphan-byte sweep.
+    /// Once every row decodes, the pass resumes. The fix defers the pass.
+    /// It does not disable the orphan byte sweep.
     #[tokio::test]
     async fn orphan_byte_resumes_after_the_undecodable_row_decodes() -> anyhow::Result<()> {
         let now = chrono::Utc::now().timestamp();
@@ -804,8 +831,8 @@ mod tests {
         assert!(s3.deleted().is_empty());
 
         put_raw(&engine.store, "fs:files:bad:meta", b"not json").await;
-        // Repaired: the row decodes again, so the sweep can prove
-        // `files/stray` is unreferenced and reap it on this same pass.
+        // The row decodes again. Therefore the sweep can prove that
+        // `files/stray` is unreferenced and removes it in this same pass.
         let repaired = FileRecord {
             id: "bad".into(),
             name: "b.txt".into(),
@@ -826,10 +853,11 @@ mod tests {
         Ok(())
     }
 
-    /// [`ChangeSink`] double that refuses every append.
+    /// A [`ChangeSink`] double that refuses every append.
     ///
-    /// Stands in for the one failure mode this ordering exists for: the
-    /// mutation commits locally and the feed does not take it.
+    /// The double stands in for the one failure mode that this order
+    /// supports. In that mode the mutation commits locally and the feed does
+    /// not take it.
     struct DeadFeed;
 
     #[async_trait::async_trait]
@@ -840,28 +868,29 @@ mod tests {
     }
 
     /// A file whose bytes are gone and whose deletion could not be
-    /// announced must still be findable, or the deletion is lost for good.
+    /// announced must still be findable. Otherwise the deletion is lost for
+    /// good.
     ///
-    /// The old order was delete the object, delete the row, then announce:
+    /// The old order deletes the object, deletes the row, and then announces:
     ///
     ///     engine.store.delete_file(&f.id).await?;
     ///     engine.announce(WalOp::FileDelete { .. }).await?;
     ///     cleaned += 1;
     ///
-    /// A transient WAL failure at the announce returns `Err` with the row
-    /// already deleted, so the retry cannot happen -- nothing scans for a
-    /// file that has no record -- and every replica keeps the record *and*
-    /// its bytes permanently. Nothing repairs it either, because the
-    /// master's row is the only thing a later replay could have compared
-    /// against.
+    /// A transient WAL failure at the announce returns `Err` after the code
+    /// deleted the row. The retry therefore cannot happen, because nothing
+    /// scans for a file that has no record. Every replica then keeps the
+    /// record and its bytes permanently. Nothing repairs the state, because
+    /// the row on the master is the only value that a later replay could
+    /// compare against.
     ///
-    /// This drives the real order against a feed that refuses everything,
-    /// then repairs the feed and sweeps again: the second sweep must find
-    /// the file, announce it, and remove the row. Under the old order the
-    /// first sweep already deleted the row and the second finds nothing,
-    /// so the file is simply never announced.
+    /// The test drives the current order against a feed that refuses
+    /// everything. The test then repairs the feed and sweeps again. The second
+    /// sweep must find the file, announce it, and remove the row. Under the
+    /// old order the first sweep already deleted the row. The second sweep
+    /// then finds nothing, so the code never announces the file.
     #[tokio::test]
-    async fn a_failed_delete_announce_is_retried_rather_than_stranded() -> anyhow::Result<()> {
+    async fn failed_announce_is_retried_and_the_row_is_not_stranded() -> anyhow::Result<()> {
         let now = chrono::Utc::now().timestamp();
         let prefix = crate::db::test_prefix("gc-announce");
         let store = FsStore::new(build_test_store(&prefix).await);
@@ -887,16 +916,16 @@ mod tests {
             .put_object("b", "files/strand-me", Bytes::from_static(b"x"), None, None)
             .await?;
 
-        // Feed down: the sweep may delete the bytes, but the row has to
-        // survive or the deletion has nowhere to be retried from.
+        // The feed is down. The sweep may delete the bytes, but the row must
+        // survive. Otherwise no later sweep can retry the deletion.
         assert_eq!(sweep_once(&engine).await?, 0);
         assert!(
             engine.store.get_file("strand-me").await?.is_some(),
             "the row was deleted while its delete could not be announced"
         );
 
-        // Feed repaired. The row is still there, so the sweep finds the
-        // file and this time the op lands.
+        // The feed is repaired. The row is still there, so the sweep finds
+        // the file and the operation now lands.
         let wal = crate::sync::wal::Wal::new(
             build_test_store(&crate::db::test_prefix("gc-announce-wal")).await,
         );
@@ -913,28 +942,28 @@ mod tests {
         Ok(())
     }
 
-    /// One undecodable ref-count row must not stall every sweep.
+    /// One undecodable ref count row must not stall every sweep.
     ///
-    /// `get_ref_info` maps a decode failure to `Err`, and the `?` that
-    /// consumed it aborted `sweep_once` inside the file loop. Because the
-    /// sweep runs sessions, then files, then orphan bytes, every file
-    /// listed *after* the bad row stopped being cleaned and the orphan
-    /// pass stopped running -- on every subsequent hourly sweep, because
-    /// nothing in the sweeper repairs that key. One undecodable
-    /// `fs:refs:{id}` value was therefore an unbounded leak of expired
-    /// sessions, orphaned rows and orphan bytes, reported as a single
-    /// `warn!` an hour.
+    /// `get_ref_info` maps a decode failure to `Err`. The `?` operator then
+    /// aborted `sweep_once` inside the file loop. The sweep runs sessions,
+    /// then files, then orphan bytes. Therefore every file after the bad row
+    /// stopped being cleaned. The orphan byte pass also stopped running on
+    /// every later hourly sweep, because nothing in the sweeper repairs the
+    /// key. One undecodable `fs:refs:{id}` value therefore caused an
+    /// unbounded leak of expired sessions, orphaned rows, and orphan bytes.
+    /// A single `warn!` per hour reported the leak.
     ///
-    /// The ids are chosen so the bad row sorts first, because the scan is
-    /// key-ordered: under the old behaviour nothing after it was reached
-    /// at all.
+    /// The test chooses the ids so that the bad row comes first. The scan is
+    /// ordered by key. Under the old behaviour, the code did not reach any
+    /// row after the bad row.
     ///
-    /// `RefInfo` has no `#[serde(default)]` either, so any field added to
-    /// it turns this into a whole-store stall rather than a one-row one.
-    /// That is deliberately left alone -- a default for `count` is `0`, and
-    /// `0` is what makes a file eligible for collection, so the default
-    /// would fail toward deleting live bytes instead of toward a leak.
-    /// Confining the damage to one row is the fix for it.
+    /// `RefInfo` has no `#[serde(default)]` either. Any field that the code
+    /// adds to it therefore turns this problem into a stall of the whole
+    /// store, and not into a stall of one row. The code deliberately leaves
+    /// this alone. The default for `count` is `0`. The value `0` is what
+    /// makes a file eligible for collection. The default would therefore
+    /// fail toward the deletion of live bytes, and not toward a leak.
+    /// Confining the damage to one row is the fix for this problem.
     #[tokio::test]
     async fn one_unreadable_ref_count_row_costs_one_file_not_the_sweep() -> anyhow::Result<()> {
         let now = chrono::Utc::now().timestamp();
@@ -944,7 +973,8 @@ mod tests {
         let policy = PolicyEngine::init_s3(build_test_store(&format!("{prefix}-p")).await).await?;
         let engine = FsEngine::from_parts(store, s3.clone(), "b".into(), policy.authorizer());
 
-        // `aaa-` sorts before `zzz-`, so the bad row is reached first.
+        // The key `aaa-` sorts before `zzz-`. The code therefore reaches the
+        // bad row first.
         for id in ["aaa-bad-refs", "zzz-good"] {
             engine
                 .store
@@ -961,46 +991,47 @@ mod tests {
         }
         put_raw(&engine.store, "fs:files:aaa-bad-refs:refs", b"{\"count\":").await;
 
-        // The file behind the bad row is still cleaned...
+        // The sweep still cleans the file after the bad row.
         assert_eq!(sweep_once(&engine).await?, 1);
         assert_eq!(s3.deleted(), vec!["files/zzz-good".to_string()]);
         assert!(engine.store.get_file("zzz-good").await?.is_none());
-        // ...and the one whose ref-count could not be read is retained,
-        // rather than deleted on a guess or allowed to stall the rest.
+        // The sweep retains the file whose ref count it cannot read. The
+        // code does not delete the file on a guess. The code does not let
+        // the file stall the rest of the sweep.
         assert!(engine.store.get_file("aaa-bad-refs").await?.is_some());
         Ok(())
     }
 
-    /// An in-flight part fold must not be deleted out from under by the
-    /// sweeper, and the file that follows it must not commit with no bytes.
+    /// The sweeper must not delete an in-flight part fold, and the file
+    /// that follows the fold must not commit without bytes.
     ///
-    /// This is the interleaving the session lock exists for. A client opens
-    /// an upload and stalls; `created_at` never refreshes, so after the TTL
-    /// the hourly sweep calls the session expired. The client resumes and
-    /// PUTs the bytes, and `merge_part` -- which re-reads the session under
-    /// the lock and writes that copy back -- is mid read-modify-write when
-    /// the sweep runs. A sweep that does not take the same lock can land
-    /// between the read and the write: it deletes the object, deletes the
-    /// row, and the fold's write puts the row back with `etags[0]` set.
-    /// `complete_upload` then sees a complete single-part session, skips the
-    /// multipart block entirely -- there is no S3 upload left to complete,
-    /// the object was already deleted -- and commits, returning `Ok`. The
-    /// file is announced and answers `GET /fs/{id}`, and every download 404s
-    /// forever.
+    /// The session lock exists for this interleaving. A client opens an
+    /// upload and then stalls. The value `created_at` never refreshes.
+    /// Therefore the hourly sweep calls the session expired after the TTL.
+    /// The client resumes and PUTs the bytes. Then `merge_part` runs a read
+    /// modify write operation. The operation reads the session under the
+    /// lock and writes that copy back. The sweep runs during the operation.
+    /// A sweep that does not take the same lock can land between the read
+    /// and the write. The sweep deletes the object and deletes the row. Then
+    /// the write of the fold puts the row back with `etags[0]` set.
+    /// `complete_upload` then sees a complete single part session and skips
+    /// the multipart block. There is no S3 upload left to complete, because
+    /// the object was already deleted. `complete_upload` then commits and
+    /// returns `Ok`. The code announces the file, and the file answers
+    /// `GET /fs/{id}`. Every download then returns 404 forever.
     ///
-    /// No adversary is needed: stalling past a 24-hour TTL and resuming
-    /// during a sweep tick is an ordinary thing for a resumable upload
-    /// client to do.
+    /// The test needs no adversary. A client that can resume an upload can
+    /// easily stall for more than 24 hours and resume during a sweep tick.
     ///
-    /// The window is between two store calls inside `merge_part` with
-    /// nothing to hang a double on, so the fold is stood in for: the test
-    /// holds the engine's own session lock and performs the same
-    /// read-then-write `merge_part` performs. What is asserted is the
-    /// property that matters, from the outside: while the fold holds the
-    /// lock the sweep cannot complete, and afterwards there is no record
-    /// whose object is missing.
+    /// The window is between two store calls inside `merge_part`. The code
+    /// has nothing to attach a double to in the window, so the test stands
+    /// in for the fold. The test holds the session lock of the engine and
+    /// performs the same read then write that `merge_part` performs. The
+    /// test asserts the property that matters, from the outside. While the
+    /// fold holds the lock, the sweep cannot complete. After the fold
+    /// releases the lock, no record points at a missing object.
     #[tokio::test]
-    async fn a_sweep_cannot_expire_a_session_under_an_in_flight_part_fold() -> anyhow::Result<()> {
+    async fn sweep_cannot_expire_a_session_during_a_part_fold() -> anyhow::Result<()> {
         let engine = make_engine().await;
         let file_id = engine
             .init_upload(
@@ -1012,14 +1043,15 @@ mod tests {
                 "alice",
             )
             .await?;
-        // The client's part has landed: bytes on the object store, etag in
-        // the row. What is left is the fold, held open below.
+        // The part of the client has landed. The bytes are on the object
+        // store and the etag is in the row. The fold is the only step that
+        // is left. The test holds the fold open below.
         engine
             .upload_part(&file_id, 0, once_body(vec![9u8; 1024]), None, None, "alice")
             .await?;
-        // Age it past the TTL, which is the whole of "stalled": nothing
-        // refreshes `created_at`, so an in-progress upload is indistinguishable
-        // from an abandoned one to the sweeper.
+        // The test ages the session past the TTL. This age is the whole of a
+        // stalled upload. Nothing refreshes `created_at`, so the sweeper
+        // cannot tell an upload in progress from an abandoned upload.
         let mut session = engine
             .store
             .get_session(&file_id)
@@ -1028,8 +1060,9 @@ mod tests {
         session.created_at -= TTL_SECS + 100;
         engine.store.save_session(&session).await?;
 
-        // `merge_part`'s critical section: the session lock is held, and the
-        // row has been read. The write is the next statement.
+        // This is the critical section of `merge_part`. The code holds the
+        // session lock and has read the row. The next statement is the
+        // write.
         let claim = engine.session_locks.acquire(&file_id).await;
         let _guard = claim.acquire().await;
         let mut folded = engine
@@ -1044,12 +1077,13 @@ mod tests {
             let _ = tx.send(sweep_once(&swept).await);
         });
 
-        // The sweep cannot be allowed to finish here. Its abort deletes the
-        // object and its row delete removes the row `merge_part` is about to
-        // write back; under the old lock-free sweep this window is where the
-        // file is lost. The bound is only here so the test cannot hang if the
-        // property regresses -- on the old code the sweep finishes in
-        // microseconds, well inside it.
+        // The sweep must not finish here. The abort of the sweep deletes
+        // the object. The row delete of the sweep removes the row that
+        // `merge_part` will write back. Under the old sweep without a lock,
+        // the sweep loses the file in this window. The bound is only here
+        // so that the test cannot hang if the property fails again. Under
+        // the old code the sweep finishes in microseconds, well inside the
+        // bound.
         assert!(
             tokio::time::timeout(Duration::from_millis(250), &mut rx)
                 .await
@@ -1061,8 +1095,9 @@ mod tests {
             "the sweep deleted a session whose rows were being merged"
         );
 
-        // Finish the fold, then let go in the order the production sites do:
-        // the guard drops before the claim is released.
+        // The test finishes the fold and then releases the values in the
+        // order that the production sites use. The code drops the guard
+        // before it releases the claim.
         folded.checksums[0] = Some("sha256:x".into());
         engine.store.save_session(&folded).await?;
         drop(_guard);
@@ -1079,10 +1114,11 @@ mod tests {
             "the sweep did not reap the bytes of the session it expired"
         );
 
-        // The client's completion. Whether the sweep went first (404) or the
-        // fold did (the sweep then expired the session), there must be no
-        // `Ok` here: the old behaviour was a committed record for an object
-        // that no longer existed.
+        // This is the completion of the client. The code must not return
+        // `Ok` here. That holds whether the sweep went first with a 404 or
+        // the fold went first and the sweep then expired the session. The
+        // old behaviour committed a record for an object that no longer
+        // existed.
         let committed = engine
             .complete_upload(
                 &file_id,
@@ -1117,8 +1153,9 @@ mod tests {
         let store = FsStore::new(build_test_store(&fail_prefix).await);
         let policy =
             PolicyEngine::init_s3(build_test_store(&format!("{fail_prefix}-p")).await).await?;
-        // Every byte-mutating call fails, so both the session abort and the
-        // orphaned-file delete are retained for the next sweep.
+        // Every call that writes bytes fails. Therefore the sweep retains
+        // both the session abort and the orphaned file delete for the next
+        // sweep.
         let engine = FsEngine::from_parts(
             store,
             Arc::new(FakeS3::new(Vec::new(), false)),
@@ -1129,8 +1166,9 @@ mod tests {
             .store
             .save_session(&session_with_age("old-fail", TTL_SECS + 10, true))
             .await?;
-        // Durable record present so expiry reaches the S3 abort (which
-        // fails) instead of taking the no-record early return.
+        // The durable record is present. Therefore the expiry reaches the
+        // S3 abort, which fails, instead of taking the early return for a
+        // missing record.
         engine
             .store
             .save_multipart(&PersistedMultipart {
@@ -1154,8 +1192,8 @@ mod tests {
                 created_at: chrono::Utc::now().timestamp() - TTL_SECS - 10,
             })
             .await?;
-        // S3 failure keeps sessions and files for the next sweep instead
-        // of leaking bytes no record points at.
+        // An S3 failure keeps the sessions and the files for the next sweep.
+        // The code does not leak bytes that no record points at.
         let cleaned = sweep_once(&engine).await?;
         assert_eq!(cleaned, 0);
         assert!(engine.store.get_session("old-fail").await?.is_some());

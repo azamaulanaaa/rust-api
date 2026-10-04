@@ -1,7 +1,7 @@
-//! Liveness and readiness probes.
+//! The liveness probe and the readiness probe.
 //!
-//! [`health`](crate::http::health::health) is a static 200 so a wedged
-//! dependency cannot fail the liveness check;
+//! [`health`](crate::http::health::health) always returns 200, so a stuck
+//! dependency cannot fail the liveness check.
 //! [`ready`](crate::http::health::ready) reflects the injected
 //! [`ReadyCheck`](crate::http::health::ReadyCheck).
 
@@ -9,15 +9,17 @@ use std::sync::Arc;
 
 use actix_web::{HttpResponse, Responder, get, web};
 
-/// Synchronous dependency check backing `/ready`.
+/// The synchronous dependency check that backs `/ready`.
 ///
-/// Runs on every probe poll, so implementations must be cheap and
-/// non-blocking (e.g. a lock `try_read`, never I/O). `true` means ready.
+/// The server runs the check on every probe poll, so an implementation must
+/// be cheap and must not block. A lock `try_read` is acceptable. I/O is not
+/// acceptable. `true` means ready.
 pub type ReadyCheck = Arc<dyn Fn() -> bool + Send + Sync>;
 
-/// Readiness probe: `200` when the injected [`ReadyCheck`] passes,
-/// `503` when dependencies are wedged, `200` when no check is wired
-/// (startup already gates on S3/OIDC/JWKS before binding).
+/// The readiness probe returns `200` when the injected [`ReadyCheck`]
+/// passes. It returns `503` when the dependencies are stuck. It returns `200`
+/// when no check is wired, because startup already waits for S3/OIDC/JWKS
+/// before it binds the listener.
 #[utoipa::path(get, path = "/ready", tag = "health", responses((status = 200, description = "ready"), (status = 503, description = "not ready")))]
 #[get("/ready")]
 pub async fn ready(check: Option<web::Data<ReadyCheck>>) -> impl Responder {
@@ -27,7 +29,7 @@ pub async fn ready(check: Option<web::Data<ReadyCheck>>) -> impl Responder {
     }
 }
 
-/// Liveness probe endpoint returning `200 OK` with an empty body.
+/// The liveness probe endpoint returns `200 OK` with an empty body.
 #[utoipa::path(get, path = "/health", tag = "health", responses((status = 200, description = "OK")))]
 #[get("/health")]
 pub async fn health() -> impl Responder {
@@ -48,7 +50,7 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn ready_without_check_is_200() {
+    async fn ready_returns_200_when_no_check_is_wired() {
         let app = test::init_service(App::new().service(ready)).await;
         let resp =
             test::call_service(&app, test::TestRequest::get().uri("/ready").to_request()).await;
@@ -56,7 +58,7 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn ready_reflects_check() {
+    async fn ready_reflects_the_result_of_the_check() {
         let passing: ReadyCheck = Arc::new(|| true);
         let app =
             test::init_service(App::new().app_data(web::Data::new(passing)).service(ready)).await;

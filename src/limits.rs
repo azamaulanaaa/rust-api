@@ -2,29 +2,36 @@
 //!
 //! # Why rate limiting is not the whole answer
 //!
-//! `GET /sync/db/{object}` serves a replica object, and a replica prefix
-//! holds oxkv's own files -- an SST segment runs to hundreds of megabytes.
-//! A token bucket does not help much there: a client allowed 60 requests a
-//! minute can still have 60 multi-hundred-megabyte reads in flight at once,
-//! and that is the shape that actually hurts. What bounds it is a cap on
-//! *concurrency*, so that is the primary control here and
-//! [`ConcurrencyGate`](crate::limits::ConcurrencyGate) is the important part of this module.
+//! `GET /sync/db/{object}` serves one object of a replica. A replica prefix
+//! holds the files of oxkv, and one SST segment reaches hundreds of
+//! megabytes. A token bucket does not help much there. A client that is
+//! allowed 60 requests a minute can still have 60 reads of hundreds of
+//! megabytes at the same time. That is the shape that causes harm. So a cap
+//! on *concurrency* is the primary control here.
+//! [`ConcurrencyGate`](crate::limits::ConcurrencyGate) is the important part
+//! of this module.
 //!
-//! [`TokenBucket`](crate::limits::TokenBucket) still earns its place, for the endpoints where request
-//! *rate* is the cost: `POST /sync/sync` fans out into store scans, and
-//! `/auth/login` is an outbound round trip to the identity provider.
+//! [`TokenBucket`](crate::limits::TokenBucket) still has a use. It applies to
+//! the endpoints where the request *rate* is the cost. An example is
+//! `POST /sync/sync`, which starts store scans. Another is `/auth/login`,
+//! which makes an outgoing round trip to the identity provider.
 //!
 //! # Keying, and what it does not do
 //!
-//! Buckets are keyed by peer address, not by authenticated subject. The JWT
-//! middleware inserts generically-typed claims, so a limiter that keyed on
-//! `sub` would need either a bound on the claims type or a second parse of
-//! the token to pull one field out. Neither is worth it for a coarse control:
-//! the concurrency gate, which is the control that matters for the expensive
-//! route, is keyed on nothing at all and so is unaffected.
+//! Buckets are keyed by peer address, not by the subject that authenticated.
+//! The JWT middleware inserts claims of a type that the caller does not
+//! choose. So a limiter that used `sub` as its key would need one of two
+//! things:
 //!
-//! The consequence is honest rather than hidden -- clients behind one NAT
-//! share a bucket. That is a fairness property, not a safety one.
+//! - A bound on the type of the claims.
+//! - A second parse of the token to get one field.
+//!
+//! Neither is worth it for a coarse control. The concurrency gate is the
+//! control that matters for the expensive route. Its key is nothing at all,
+//! so the choice does not affect it.
+//!
+//! The result is a fairness property, not a hidden one. Clients behind one
+//! NAT share a bucket.
 
 use std::{
     collections::HashMap,
@@ -41,62 +48,64 @@ use actix_web::{
 
 use crate::http::error::ApiError;
 
-/// How long a bucket may go untouched before it is dropped.
+/// How long a bucket may go untouched before the function drops it.
 ///
-/// A background floor, not the bound. Ten minutes is far longer than any
-/// bucket takes to refill, so a dropped bucket is indistinguishable from a
-/// full one -- but an insert path can outrun it: a refused request still
-/// inserts (see [`TokenBucket::take`]), so a client with a routed IPv6
-/// prefix fills the map faster than the window drains it. The hard bound is
-/// [`MAX_TRACKED_PEERS`].
+/// This duration is a floor, not the bound. Ten minutes is far longer than
+/// any bucket takes to fill again. A dropped bucket therefore looks the same
+/// as a full one. But an insert path can be faster than the floor. A
+/// refused request still inserts, as [`TokenBucket::take`] shows. So a client
+/// with a routed IPv6 prefix fills the map faster than the window drains it.
+/// The hard bound is [`MAX_TRACKED_PEERS`].
 const IDLE_EVICT: Duration = Duration::from_secs(600);
 
-/// How many requests pass between idle sweeps.
+/// How many requests pass between two idle sweeps.
 ///
-/// `make_room` already bounds the map on insert, so this sweep is no longer
-/// what keeps the map bounded -- it only reclaims memory early. Running it
-/// unconditionally meant an O(n) walk of up to [`MAX_TRACKED_PEERS`] entries
-/// under the one mutex `take` also needs, on EVERY request, including requests
-/// that are over budget and here only to be refused. Sweeping on a cadence
-/// keeps the reclamation and stops the limiter from being the amplifier it
+/// `make_room` now sets the bound on the map at insert. So this sweep is no
+/// longer what keeps the map bounded. The sweep only reclaims memory early.
+/// The sweep used to run on every request. Each run then walked up to
+/// [`MAX_TRACKED_PEERS`] entries under the one mutex that `take` also needs.
+/// That ran for every request, including requests that were over budget and
+/// were there only to be refused. A sweep on a fixed cadence keeps the
+/// reclamation, and stops the limiter from being the amplifier that it
 /// exists to bound.
 const IDLE_SWEEP_EVERY: u64 = 64;
 
-/// Hard ceiling on how many peers are tracked at once.
+/// Highest number of peers that the map tracks at the same time.
 ///
-/// The map is keyed by bare peer IP, so its size is chosen by whoever is
-/// sending, and it grows BEFORE any budget check: `take` inserts on the way
-/// to refusing. [`IDLE_EVICT`] cannot be the only bound because the insert
-/// path outruns a ten-minute window with a single burst of distinct source
-/// addresses.
+/// The map is keyed by the bare peer IP. So whoever sends, decides the size
+/// of the map. The map grows *before* any check of the budget, because `take`
+/// inserts on the way to refusing. [`IDLE_EVICT`] cannot be the only bound,
+/// because the insert path is faster than a ten-minute window when a single
+/// burst has many different source addresses.
 ///
-/// Beyond the cap the LEAST RECENTLY SEEN entry is dropped, rather than the
-/// new one being refused: refusing an unseen peer would let an attacker lock
-/// every legitimate new client out of the limiter for the life of the
-/// process with no way to evict their own entries, and this map exists to
-/// bound cost, not to allocate it. Dropping the coldest entry also preserves
-/// the property [`peer_key`] exists for -- a peer that is still sending keeps
-/// its bucket, and its own budget, instead of being handed a fresh full one
-/// by everyone else's rotation.
+/// Past the cap, the function drops the LEAST RECENTLY SEEN entry. The
+/// function does not refuse the new one. Refusing an unseen peer would let
+/// an attacker lock every valid new client out of the limiter for the life
+/// of the process. No client could then remove its own entry. The purpose of
+/// this map is to bound cost, not to allocate cost. Dropping the coldest
+/// entry also keeps the property that [`peer_key`] exists for. A peer that
+/// is still sending keeps its bucket, and keeps its own budget, instead of
+/// receiving a new full one from the rotation of other peers.
 ///
-/// A fixed ceiling, not a multiple of the fleet: nothing here can tell a load
-/// balancer's pool of legitimate peers from a rotation, and evicting the
-/// coldest is a better answer to being wrong in either direction than
-/// refusing to track anyone.
+/// This is a fixed ceiling, not a multiple of the size of the fleet. Nothing
+/// here can tell the pool of valid peers of a load balancer from an
+/// attacker. Removing the coldest entry is the better answer to being wrong
+/// in either direction than refusing to track anyone.
 const MAX_TRACKED_PEERS: usize = 4096;
 
-/// A token bucket per key.
+/// A token bucket for each key.
 ///
-/// Refills continuously rather than in steps, so a client that waits does not
-/// have to wait for a whole window to reopen, and a client that bursts is
-/// capped at `capacity` rather than at `capacity * window`.
+/// The bucket refills at a steady rate, not in steps. A client that waits
+/// does not have to wait for a whole window to open again. A client that
+/// bursts is capped at `capacity`, not at `capacity * window`.
 #[derive(Clone)]
 pub struct TokenBucket {
     capacity: f64,
     refill_per_sec: f64,
     buckets: Arc<Mutex<HashMap<String, BucketState>>>,
-    /// Requests seen since the last idle sweep. A plain atomic rather than a
-    /// field under `buckets`, so the common path never touches the mutex.
+    /// Requests that were seen since the last idle sweep. The field is a plain
+    /// atomic value, not a field under `buckets`, so that the common path
+    /// never touches the mutex.
     since_sweep: Arc<AtomicU64>,
 }
 
@@ -107,9 +116,10 @@ struct BucketState {
 
 /// Drops the coldest entries until there is room for one more.
 ///
-/// Evicts by `last`, so the peer that is still sending keeps its bucket.
-/// Doing this only when a NEW key arrives is what keeps the cost off the
-/// common path: a repeat request from a tracked peer does not scan at all.
+/// The function removes entries by `last`. So the peer that is still sending
+/// keeps its bucket. The function runs only when a NEW key arrives. That is
+/// what keeps the cost off the common path. A request that repeats from a
+/// tracked peer does not scan the map at all.
 fn make_room(buckets: &mut HashMap<String, BucketState>) {
     while buckets.len() >= MAX_TRACKED_PEERS {
         let Some(coldest) = buckets
@@ -117,9 +127,10 @@ fn make_room(buckets: &mut HashMap<String, BucketState>) {
             .min_by_key(|(_, b)| b.last)
             .map(|(k, _)| k.clone())
         else {
-            // Unreachable: an empty map is under the cap, and the cap is a
-            // non-zero constant. Written rather than unwrapped because the
-            // crate denies `unwrap`.
+            // The map cannot be empty here, because an empty map is
+            // under the cap and the cap is not zero. The code returns
+            // instead of calling `unwrap`, because the crate denies
+            // `unwrap`.
             return;
         };
         buckets.remove(&coldest);
@@ -127,11 +138,11 @@ fn make_room(buckets: &mut HashMap<String, BucketState>) {
 }
 
 impl TokenBucket {
-    /// `capacity` requests may burst, refilling at `per_minute` / 60 per
-    /// second.
+    /// `capacity` requests may burst. The bucket refills at `per_minute` / 60
+    /// per second.
     ///
-    /// `per_minute == 0` disables the limiter, which is the documented way to
-    /// turn it off for a trusted deployment.
+    /// A value of `per_minute` equal to `0` disables the limiter. That is the
+    /// documented way to turn it off in a trusted deployment.
     pub fn new(capacity: u32, per_minute: u32) -> Self {
         let capacity = f64::from(capacity);
         Self {
@@ -142,36 +153,39 @@ impl TokenBucket {
         }
     }
 
-    /// Whether the periodic idle sweep is due, without taking the lock.
+    /// Whether the periodic idle sweep is due. The function does not take the
+    /// lock.
     ///
-    /// True once every [`IDLE_SWEEP_EVERY`] requests. `fetch_update` resets
-    /// the counter to zero in the same step that claims the sweep, so two workers
-    /// cannot both believe they are the one due; at worst a racing pair loses
-    /// one sweep, which is harmless for a housekeeping pass. The counter starts
-    /// one short of the threshold so the first call sweeps, which keeps a
-    /// low-traffic process reclaiming rather than never.
+    /// The answer is true once every [`IDLE_SWEEP_EVERY`] requests.
+    /// `fetch_update` sets the counter back to zero in the same step that
+    /// claims the sweep. So two workers cannot both believe that they are
+    /// the one that is due. At worst, a pair that races loses one sweep.
+    /// That is harmless for housekeeping. The counter starts one short of the
+    /// threshold, so the first call sweeps. That keeps a process with little
+    /// traffic reclaiming memory, instead of never doing so.
     fn sweep_due(&self) -> bool {
         let seen = self.since_sweep.fetch_add(1, Ordering::Relaxed);
         if seen + 1 < IDLE_SWEEP_EVERY {
             return false;
         }
-        // Claim the window: drop everything counted since the last sweep.
+        // The function claims the window. It drops everything that was
+        // counted since the last sweep.
         self.since_sweep.fetch_sub(seen + 1, Ordering::Relaxed);
         true
     }
 
-    /// True when the limiter is not doing anything.
+    /// True when the limiter does nothing.
     pub fn is_disabled(&self) -> bool {
         self.refill_per_sec == 0.0
     }
 
-    /// Takes one token for `key`, or reports the caller is over budget.
+    /// Takes one token for `key`, or reports that the caller is over budget.
     ///
-    /// Inserts BEFORE deciding, so a refused request from a never-seen
-    /// address still grows the map. That is deliberate in one direction --
-    /// the alternative lets a client retry into a fresh full bucket -- and
-    /// is exactly why [`MAX_TRACKED_PEERS`] exists rather than a cap on
-    /// spendable tokens.
+    /// The function inserts BEFORE it decides. So a refused request from an
+    /// address that was never seen grows the map. That is deliberate in one
+    /// direction, because the other choice lets a client retry into a new
+    /// full bucket. It is also why `MAX_TRACKED_PEERS` exists, instead of
+    /// a cap on the tokens that a client can spend.
     pub fn take(&self, key: &str) -> bool {
         if self.is_disabled() {
             return true;
@@ -179,9 +193,10 @@ impl TokenBucket {
         let now = Instant::now();
         let mut buckets = self.buckets.lock().unwrap_or_else(PoisonError::into_inner);
 
-        // Room is made only for a NEW key: an already-tracked entry must keep
-        // its tokens and its `last`, so this must not run for it or every
-        // repeat request would evict a bystander.
+        // The function makes room only for a NEW key. An entry that is
+        // already tracked must keep its tokens and its `last`. So the code
+        // must not run for it, or every request that repeats would remove
+        // another peer.
         if !buckets.contains_key(key) {
             make_room(&mut buckets);
         }
@@ -201,7 +216,8 @@ impl TokenBucket {
         }
     }
 
-    /// Tokens `key` could still spend, for tests and diagnostics.
+    /// Tokens that `key` can still spend. The function is for tests and
+    /// diagnostics.
     #[cfg(test)]
     pub fn available(&self, key: &str) -> f64 {
         self.buckets
@@ -211,15 +227,18 @@ impl TokenBucket {
             .map_or(self.capacity, |b| b.tokens)
     }
 
-    /// Drops buckets untouched for the idle window (ten minutes).
+    /// Drops the buckets that no request touched for the idle window, which is
+    /// ten minutes.
     ///
-    /// Called on the request path rather than from a timer: a timer would be
-    /// another background task to own and shut down. The scan is bounded by
-    /// [`MAX_TRACKED_PEERS`], because the map cannot be larger than the cap.
+    /// The function runs on the request path instead of in a timer. A timer
+    /// would be a second background task to own and to stop. The scan is
+    /// bounded by `MAX_TRACKED_PEERS`, because the map cannot be larger
+    /// than the cap.
     ///
-    /// Returns immediately when disabled, which is what makes it acceptable to
-    /// leave the middleware installed with a zero limit -- the default -- since
-    /// a disabled bucket then costs one atomic load per request and no lock.
+    /// The function returns at once when the limiter is disabled. That is
+    /// what makes it acceptable to leave the middleware installed with a
+    /// limit of zero, which is the default. A disabled bucket then costs one
+    /// atomic load per request, and no lock.
     pub fn evict_idle(&self) {
         if self.is_disabled() {
             return;
@@ -229,7 +248,7 @@ impl TokenBucket {
         buckets.retain(|_, b| now.duration_since(b.last) < IDLE_EVICT);
     }
 
-    /// Number of tracked keys, for tests.
+    /// Number of tracked keys. The function is for tests.
     #[cfg(test)]
     pub fn tracked(&self) -> usize {
         self.buckets
@@ -238,7 +257,8 @@ impl TokenBucket {
             .len()
     }
 
-    /// Moves every tracked entry's clock back by `by`, for tests.
+    /// Moves the clock of every tracked entry back by `by`. The function is for
+    /// tests.
     #[cfg(test)]
     pub fn age_all_for_test(&self, by: Duration) {
         let mut buckets = self.buckets.lock().unwrap_or_else(PoisonError::into_inner);
@@ -248,26 +268,27 @@ impl TokenBucket {
     }
 }
 
-/// Caps how many expensive operations may be in flight at once.
+/// Caps the number of expensive operations that may run at the same time.
 ///
-/// This is the control that bounds the real cost of the replica gateway. A
-/// permit is held by the response *body*, not by the handler, so it is
-/// released when the download actually finishes rather than when the handler
-/// returns: with the permit scoped to the handler, a client that opened a
-/// stream and then stopped reading would have given its slot back while still
-/// holding the memory.
+/// This is the control that bounds the real cost of the replica gateway. The
+/// response *body* holds a permit, not the handler. So the permit goes back
+/// when the download actually ends, not when the handler returns. If the
+/// permit belonged to the handler, a client that opened a stream and then
+/// stopped reading would give back its slot while it still held the memory.
 #[derive(Clone)]
 pub struct ConcurrencyGate {
-    /// `None` disables the gate. It cannot be expressed as a zero-permit
-    /// semaphore, because that refuses everything -- the opposite of off.
+    /// `None` disables the gate. A semaphore with zero permits cannot
+    /// represent this. A semaphore with zero permits refuses everything,
+    /// which is the opposite of off.
     max: Option<usize>,
     permits: Arc<tokio::sync::Semaphore>,
 }
 
 impl ConcurrencyGate {
-    /// A gate allowing `max` concurrent operations.
+    /// A gate that allows `max` operations at the same time.
     ///
-    /// `max == 0` disables the gate, documented for trusted deployments.
+    /// A value of `max` equal to `0` disables the gate. That is documented
+    /// for trusted deployments.
     pub fn new(max: usize) -> Self {
         match max {
             0 => Self {
@@ -281,16 +302,17 @@ impl ConcurrencyGate {
         }
     }
 
-    /// True when the gate is not doing anything.
+    /// True when the gate does nothing.
     pub fn is_disabled(&self) -> bool {
         self.max.is_none()
     }
 
-    /// Takes a permit, or `None` when the caller must wait.
+    /// Takes a permit, or returns `None` when the caller must wait.
     ///
-    /// `None` is overloaded: it means "no slot" when the gate is enabled and
-    /// "no gate" when it is disabled, so callers distinguish with
-    /// [`is_disabled`](Self::is_disabled) rather than by inspecting this.
+    /// `None` carries two meanings. It means "no slot" when the gate is
+    /// enabled. It also means "no gate" when the gate is disabled. So a
+    /// caller must use [`is_disabled`](Self::is_disabled) to tell them
+    /// apart, instead of reading this value.
     pub fn acquire(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
         if self.is_disabled() {
             return None;
@@ -299,47 +321,53 @@ impl ConcurrencyGate {
     }
 }
 
-/// Key for a peer: address only, no port, so a client reconnecting does not
-/// get a fresh budget.
+/// Key for a peer. The key is the address only, with no port. So a client
+/// that connects again does not receive a new budget.
 pub fn peer_key(addr: Option<std::net::SocketAddr>) -> String {
     match addr.map(|a| a.ip()) {
         Some(IpAddr::V4(v4)) => v4.to_string(),
         Some(IpAddr::V6(v6)) => v6.to_string(),
-        // No peer address (in-process tests, or a trusted proxy that did not
-        // forward one). One shared bucket is the conservative choice: it caps
-        // the fleet rather than exempting it.
+        // The peer sent no address. A test in this process sends none. A
+        // trusted proxy that did not forward one also sends none. One shared
+        // bucket is then the safe choice. It caps the whole fleet instead
+        // of exempting the fleet.
         None => "unknown".to_string(),
     }
 }
 
-/// Rejects a request with the uniform envelope when a limit is hit.
+/// Rejects a request with the uniform error body when a limit is reached.
 pub fn too_many(what: &str) -> HttpResponse {
     tracing::warn!("rate limited: {what}");
-    // `ResponseError` is what renders the uniform envelope, so the limited
-    // response is byte-identical in shape to every other error.
+    // `ResponseError` renders the uniform error body. So a limited response
+    // has the same form as every other error.
     ResponseError::error_response(&ApiError::TooManyRequests)
 }
 
-/// Wraps a stream so a concurrency permit is held for as long as it is.
+/// Wraps a stream, so that a concurrency permit is held for as long as the
+/// stream exists.
 ///
-/// The permit is released on drop, which covers all three endings: the
-/// download completing, the client disconnecting mid-stream, and the task
-/// being cancelled at shutdown. A separate release path would miss at least
-/// one of them.
+/// The permit goes back when the wrapper drops. That covers all three
+/// endings:
 ///
-/// A `Stream` rather than a `MessageBody` because actix blanket-implements
-/// `MessageBody` for streams, which keeps this free of `unsafe` pinning in a
-/// crate that denies `unwrap` and `expect`.
+/// - The download ends.
+/// - The client stops reading in the middle of the stream.
+/// - The task is cancelled at shutdown.
+///
+/// A separate path for the release would miss at least one of them.
+///
+/// The type is a `Stream`, not a `MessageBody`. Actix has a blanket
+/// implementation of `MessageBody` for streams, which keeps this free of
+/// `unsafe` pinning in a crate that denies `unwrap` and `expect`.
 pub struct GatedStream<S> {
-    /// Boxed so the wrapper is `Unpin` whatever the stream is, which keeps the
-    /// `poll_next` below free of `unsafe` projection.
+    /// The field is boxed so that the wrapper is `Unpin` whatever the
+    /// stream is. That keeps the `poll_next` below free of `unsafe`.
     inner: std::pin::Pin<Box<S>>,
-    /// Dropped with the stream, releasing the slot.
+    /// The field is dropped with the stream, which releases the slot.
     _permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 impl<S> GatedStream<S> {
-    /// Wraps `inner`, holding `permit` until the wrapper is dropped.
+    /// Wraps `inner` and holds `permit` until the wrapper drops.
     pub fn new(inner: S, permit: Option<tokio::sync::OwnedSemaphorePermit>) -> Self {
         Self {
             inner: Box::pin(inner),
@@ -358,18 +386,19 @@ where
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
-        // `Self` is `Unpin` -- a pinned box and an `Option` of one -- so this
-        // is a plain mutable borrow.
+        // `Self` is `Unpin`, because it is a pinned box and an `Option` of
+        // one. So a plain mutable borrow is enough here.
         let this = self.get_mut();
         this.inner.as_mut().poll_next(cx)
     }
 }
 
-/// Actix middleware enforcing a [`TokenBucket`] before the handler runs.
+/// Actix middleware that applies a [`TokenBucket`] before the handler runs.
 ///
-/// Applied outermost, so it also covers the routes no subject-keyed limiter
-/// could reach: `/auth/login`, which is an outbound round trip to the
-/// identity provider, and `/health`, which a load balancer polls hard.
+/// The middleware is the outermost one. So it also covers the routes that no
+/// limiter keyed on the subject could reach. Examples are `/auth/login`,
+/// which makes an outgoing round trip to the identity provider, and
+/// `/health`, which a load balancer polls often.
 pub struct RateLimit {
     bucket: TokenBucket,
 }
@@ -381,7 +410,7 @@ impl RateLimit {
     }
 }
 
-/// The installed limiter. See [`RateLimit`].
+/// The limiter that is installed. See [`RateLimit`].
 pub struct RateLimitMiddleware<S> {
     service: std::rc::Rc<S>,
     bucket: TokenBucket,
@@ -425,12 +454,13 @@ where
 
     fn call(&self, req: ServiceRequest) -> Self::Future {
         let service = std::rc::Rc::clone(&self.service);
-        // The map is capped at `MAX_TRACKED_PEERS` on insert, and that cap is
-        // what bounds it. The idle sweep is only early reclamation, so it
-        // rides along every `IDLE_SWEEP_EVERY` requests rather than on every
-        // one: otherwise each request walked up to the cap under the mutex
-        // `take` also needs, paid by every worker including peers that are
-        // over budget and here only to be refused.
+        // The cap of `MAX_TRACKED_PEERS` at insert is what bounds the map.
+        // The idle sweep only reclaims memory early. So the sweep runs once
+        // every `IDLE_SWEEP_EVERY` requests, instead of on every request. If
+        // it ran on every request, each request would walk up to the cap
+        // under the mutex that `take` also needs. Every worker would pay
+        // that cost, including peers that are over budget and are there only
+        // to be refused.
         if self.bucket.sweep_due() {
             self.bucket.evict_idle();
         }
@@ -465,16 +495,16 @@ mod tests {
         assert!(bucket.take("b"), "b is unaffected by a");
     }
 
-    /// A full bucket must not accumulate tokens while idle, or a client that
-    /// waits an hour gets a burst proportional to the wait.
+    /// A full bucket must not add tokens while it is idle. Otherwise a client
+    /// that waits an hour receives a burst that matches the wait.
     #[test]
     fn refill_is_capped_at_capacity() {
         let bucket = TokenBucket::new(2, 600_000);
         assert!(bucket.take("a"));
         assert!(bucket.take("a"));
         assert!(!bucket.take("a"));
-        // Move the clock forward rather than sleeping: `last` is what the
-        // refill is computed from.
+        // Move the clock forward instead of sleeping. The refill is
+        // computed from `last`.
         let mut buckets = bucket.buckets.lock().unwrap();
         let state = buckets.get_mut("a").expect("bucket exists");
         state.last -= Duration::from_secs(3600);
@@ -495,16 +525,17 @@ mod tests {
         }
     }
 
-    /// The idle window drops entries, and ONLY the idle ones.
+    /// The idle window drops entries, and it drops ONLY the idle ones.
     ///
-    /// Two separate properties, and the halves have to pin both. Deleting
-    /// the `retain` in `evict_idle` entirely leaves a map that grows
-    /// without bound, which is the property in this test's name -- so the
-    /// aged half below is what makes it mean anything. And an implementation
-    /// that dropped EVERY entry whenever any one was idle would satisfy both
-    /// halves while throwing away live peers' budgets on every request,
-    /// handing unlimited fresh tokens to anyone who lets a bucket go quiet
-    /// for ten minutes. That is the case only the mixed half catches.
+    /// The test pins two separate properties, and each half pins one of them.
+    /// If the test removed the `retain` in `evict_idle` entirely, the map
+    /// would grow without a bound. That is the property in the name of this
+    /// test. The half below that moves the clock is what makes the name mean
+    /// something. An implementation that dropped EVERY entry as soon as any
+    /// one entry was idle would satisfy both halves. That implementation
+    /// would also throw away the budgets of live peers on every request, and
+    /// it would hand unlimited new tokens to anyone who left a bucket idle
+    /// for ten minutes. Only the mixed half catches that case.
     #[test]
     fn idle_buckets_are_evicted_so_the_map_cannot_grow_without_bound() {
         let bucket = TokenBucket::new(10, 60);
@@ -512,13 +543,15 @@ mod tests {
             bucket.take(&format!("peer-{i}"));
         }
         assert_eq!(bucket.tracked(), 100);
-        // Nothing has been idle for ten minutes, so eviction must be a no-op
-        // here rather than dropping live buckets on every request.
+        // No entry was idle for ten minutes, so the eviction must
+        // change nothing here. It must not drop live buckets on every
+        // request.
         bucket.evict_idle();
         assert_eq!(bucket.tracked(), 100);
 
-        // Age every entry past the window instead of sleeping ten minutes:
-        // `last` is the only thing `evict_idle` reads.
+        // Move the clock of every entry past the window instead of
+        // sleeping for ten minutes. `last` is the only value that
+        // `evict_idle` reads.
         let mut buckets = bucket.buckets.lock().unwrap();
         for state in buckets.values_mut() {
             state.last -= IDLE_EVICT + Duration::from_secs(1);
@@ -532,25 +565,27 @@ mod tests {
         );
     }
 
-    /// Eviction is per-entry: an idle peer goes, an active one keeps its
-    /// budget.
+    /// The eviction works on each entry. An idle peer goes. An active peer
+    /// keeps its budget.
     ///
-    /// The sibling test proves entries past the window are dropped and that
-    /// a wholly-fresh map is left alone, which together are also satisfied
-    /// by `buckets.clear()`. That implementation is not merely wasteful --
-    /// `evict_idle` runs on EVERY request (`RateLimitMiddleware::call`), so
-    /// clearing would reset every tracked peer's tokens to a full bucket
-    /// roughly once per request, and the limiter would rate-limit nothing
-    /// at all for a client spread thin enough to never touch two keys
-    /// inside ten minutes.
+    /// The test above shows that entries past the window are dropped. It also
+    /// shows that a map with new entries is left alone. An implementation
+    /// with `buckets.clear()` satisfies both tests. That implementation is
+    /// more than wasteful. `evict_idle` runs on EVERY request, in
+    /// `RateLimitMiddleware::call`. So clearing would set the tokens of every
+    /// tracked peer back to a full bucket about once per request. The limiter
+    /// would then limit nothing at all for a client whose requests are so far
+    /// apart that it never touches two keys inside ten minutes.
     ///
-    /// `last` is moved directly rather than sleeping, as in the siblings.
+    /// The test moves `last` directly instead of sleeping, as the other tests
+    /// in this module do.
     #[test]
     fn eviction_drops_the_idle_peers_and_leaves_the_active_ones_alone() {
         let bucket = TokenBucket::new(2, 60);
-        // Drain both to refusal, so a full bucket cannot be mistaken for a
-        // kept one. The refill is real (1/sec) but the loop finishes in
-        // microseconds, well inside the window it would need to refill from.
+        // Take both buckets down to refusal. Then a full bucket cannot be
+        // mistaken for a bucket that was kept. The refill is real at
+        // 1 token per second. The loop ends in microseconds, which is well
+        // inside the time that a refill would need.
         for key in ["active", "quiet"] {
             while bucket.take(key) {}
             assert!(
@@ -583,25 +618,26 @@ mod tests {
 
     /// The map is bounded by COUNT, not only by idle time.
     ///
-    /// This is the regression: `evict_idle` was the only bound, and its
-    /// amortisation argument was inverted. `take` inserts on the way to
-    /// REFUSING, so a client rotating through a routed IPv6 prefix grows
-    /// the map with every request it is turned away for -- and nothing is
-    /// dropped for ten minutes. Reaching the cap here needs
-    /// `MAX_TRACKED_PEERS + 500` distinct keys rather than a ten-minute
-    /// wait, which is the shape the old code could not survive: it asserted
-    /// only that eviction left a freshly-filled map alone, which is true
-    /// whether or not the map is bounded at all.
+    /// This is the regression. `evict_idle` was the only bound, and its
+    /// argument about cost was wrong. `take` inserts on the way to REFUSING.
+    /// So a client that rotates through a routed IPv6 prefix grows the map
+    /// with every request that the server turns away. Nothing is dropped for
+    /// ten minutes. Reaching the cap in this test needs
+    /// `MAX_TRACKED_PEERS + 500` different keys, not a wait of ten minutes.
+    /// That is the shape that the old code could not survive. The old test
+    /// only checked that the eviction left a new map alone. That check holds
+    /// whether or not the map has any bound at all.
     ///
-    /// Fails on the pre-fix code with `tracked() == MAX_TRACKED_PEERS + 500`.
+    /// The test fails on the code before the fix, with
+    /// `tracked() == MAX_TRACKED_PEERS + 500`.
     #[test]
     fn the_map_stays_bounded_when_peers_outrun_the_idle_window() {
         let bucket = TokenBucket::new(1, 60);
         for i in 0..MAX_TRACKED_PEERS + 500 {
-            // Most of these are REFUSED: capacity 1, one call per key, so the
-            // first key drains its bucket and the rest are all over budget --
-            // which is the path that inserts and is therefore the one the
-            // bound has to cover.
+            // Most of these requests are REFUSED. The capacity is 1, and
+            // each key is used once. So the first key uses up its bucket,
+            // and every other key is over budget. That is the path that
+            // inserts, so the bound has to cover it.
             bucket.take(&format!("peer-{i}"));
             bucket.evict_idle();
         }
@@ -612,12 +648,12 @@ mod tests {
         );
     }
 
-    /// The cap evicts the COLDEST entry, so an active peer is not punished
-    /// for someone else's rotation.
+    /// The cap removes the COLDEST entry. So an active peer does not pay for
+    /// the rotation of another peer.
     ///
-    /// Refusing the new key instead would hand any attacker who fills the map
-    /// a way to lock every legitimate first-time client out of the limiter for
-    /// the life of the process.
+    /// Refusing the new key instead would give any attacker who fills the map
+    /// a way to lock every valid first-time client out of the limiter for the
+    /// life of the process.
     #[test]
     fn the_cap_evicts_the_coldest_peer_not_the_new_one() {
         let bucket = TokenBucket::new(10, 60);
@@ -626,7 +662,8 @@ mod tests {
             let mut buckets = bucket.buckets.lock().unwrap();
             buckets.get_mut("cold").expect("bucket exists").last -= Duration::from_secs(3600);
         }
-        // Fill to the cap so "cold" is the only candidate, then overflow once.
+        // Fill the map to the cap, so that "cold" is the only candidate.
+        // Then go past the cap once.
         for i in 0..MAX_TRACKED_PEERS - 1 {
             bucket.take(&format!("peer-{i}"));
         }
@@ -643,13 +680,14 @@ mod tests {
         );
     }
 
-    /// A peer that is ALREADY tracked is not evicted by its own repeat
-    /// request, and keeps its budget across the overflow.
+    /// A peer that is ALREADY tracked is not removed by its own repeated
+    /// request. The peer keeps its budget through the overflow.
     ///
-    /// Room is made before the insert, so an implementation that does not
-    /// check for an existing key evicts a bystander on every single request
-    /// once the map is at the cap -- turning the limiter into a source of
-    /// free budget for anyone sending fast enough.
+    /// The function makes room before the insert. So an implementation that
+    /// does not check for an existing key removes another peer on every
+    /// single request, once the map is at the cap. That would turn the
+    /// limiter into a source of free budget for anyone who sends fast
+    /// enough.
     #[test]
     fn a_tracked_peer_keeps_its_budget_across_the_overflow() {
         let bucket = TokenBucket::new(10, 60);
@@ -684,7 +722,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_gated_stream_holds_its_slot_for_the_bodys_lifetime() {
+    async fn a_gated_stream_holds_its_slot_for_the_body() {
         let gate = ConcurrencyGate::new(1);
         let permit = gate.acquire().expect("slot");
         let gated = GatedStream::new(
@@ -692,19 +730,20 @@ mod tests {
             Some(permit),
         );
 
-        // While the body is alive the slot is gone. This is the half that
-        // matters: a gate that released on handler return would let a client
-        // open a stream, stop reading, and walk away with the memory still
-        // resident -- the permit would look returned while the slot was not
-        // actually bounding anything.
+        // While the body exists, the slot is gone. This is the half that
+        // matters. A gate that returned the permit when the handler returned
+        // would let a client open a stream, stop reading, and leave with
+        // the memory still in use. The permit would look returned while the
+        // slot bounded nothing.
         assert!(
             gate.acquire().is_none(),
             "the slot must be held while the body exists"
         );
 
-        // Dropping mid-stream is the other half: a client that opened a read
-        // and disconnected must still give the slot back, or the gate slowly
-        // wedges as dead reads accumulate.
+        // Dropping in the middle of the stream is the other half. A client
+        // that opened a read and then disconnected must still give the slot
+        // back. Otherwise the gate slowly stops working as dead reads build
+        // up.
         drop(gated);
         assert!(
             gate.acquire().is_some(),
@@ -733,31 +772,36 @@ mod tests {
         );
     }
 
-    /// The envelope is the same one every other error uses, so a client that
-    /// parses errors does not need a special case for being limited.
+    /// The response for a limit uses the same error body that every other error
+    /// uses. So a client that parses errors does not need a separate case for
+    /// the case where the server limits it.
     ///
-    /// The status code alone does not establish that, and this test used to
-    /// assert nothing else. `too_many` was free to return
-    /// `HttpResponse::TooManyRequests().finish()` -- a bare 429 with no body
-    /// at all -- and this stayed green, which is exactly the duplication
-    /// `http::error::tests::the_envelope_has_one_construction_site` exists
-    /// to rule out. That guard is structural: it counts files that build the
-    /// envelope, so a 429 built outside it is invisible to it, and this is
-    /// the behavioural half.
+    /// The status code alone does not show that. This test used to check
+    /// nothing else. The function `too_many` was free to return
+    /// `HttpResponse::TooManyRequests().finish()`, which is a bare 429 with
+    /// no body at all. The test stayed green in that case. That is exactly
+    /// the duplication that
+    /// `http::error::tests::the_envelope_has_one_construction_site` exists to
+    /// prevent. That guard checks the form of the source files, so it counts
+    /// the files that build the error body. A 429 built outside it is
+    /// invisible to that guard. This test is the other half, which checks
+    /// the behaviour.
     ///
-    /// `RateLimitMiddleware` is the path that matters, so the response is
-    /// read through the middleware rather than off `too_many` directly: a
-    /// hand-built 429 inside the transform that is not the one `too_many`
-    /// returns is the regression worth catching, and only a request can
-    /// catch it. `sync::route`'s `FsError::TooManyRequests` path is the
-    /// other one, and is asserted there.
+    /// The path that matters is `RateLimitMiddleware`. So the test reads the
+    /// response through the middleware, not directly from `too_many`. A 429
+    /// that is built inside the transform, and that is not the one
+    /// `too_many` returns, is the failure that this test must catch. Only a
+    /// request can catch it. The other path is
+    /// `FsError::TooManyRequests` in `sync::route`. That path is asserted in
+    /// its own module.
     #[actix_web::test]
     async fn the_limit_response_uses_the_uniform_envelope() {
         use actix_web::{App, http::StatusCode, test};
 
-        // Capacity 1: the first request spends the token and the second is
-        // over budget. No peer address on an in-process request, so both
-        // land in the same bucket via `peer_key(None)`.
+        // The capacity is 1. The first request uses the token, and the
+        // second is over budget. A request in this process has no peer
+        // address, so both requests land in the same bucket through
+        // `peer_key(None)`.
         let app = test::init_service(
             App::new()
                 .wrap(RateLimit::new(TokenBucket::new(1, 60)))
@@ -766,8 +810,9 @@ mod tests {
         .await;
         let request = || test::TestRequest::get().uri("/").to_request();
 
-        // The control first: it proves this app serves, so the 429 below is
-        // the limiter and not a route that never matched.
+        // The control request comes first. It shows that the app serves, so
+        // the 429 below comes from the limiter and not from a route
+        // that never matched.
         let served = test::call_service(&app, request()).await;
         assert_eq!(served.status(), StatusCode::OK);
 
@@ -781,13 +826,14 @@ mod tests {
         assert_eq!(parsed.error, "too many requests");
     }
 
-    /// The idle sweep is early reclamation, not the bound -- `make_room` is
-    /// the bound -- so it must not walk the map on every request.
+    /// The idle sweep reclaims memory early. The bound is `make_room`. So the
+    /// sweep must not walk the map on every request.
     ///
-    /// At the cap the sweep is an O(n) walk under the mutex `take` also needs,
-    /// and it used to be paid by every worker on every request, including
-    /// requests over budget that are here only to be refused. That made the
-    /// limiter the amplification point it exists to bound.
+    /// At the cap, the sweep walks the map under the mutex that `take` also
+    /// needs. It used to pay that cost on every request, for every worker.
+    /// That includes requests that are over budget and are there only to be
+    /// refused. That made the limiter the point of amplification that it
+    /// exists to bound.
     #[test]
     fn the_idle_sweep_is_not_walked_on_every_request() {
         let bucket = TokenBucket::new(1, 60);
@@ -808,9 +854,9 @@ mod tests {
         );
     }
 
-    /// Reclamation still happens: once the cadence comes round, an aged entry
-    /// is dropped. Without this the cadence could degenerate to "never" and
-    /// the test above would still pass.
+    /// The cadence still reclaims memory. An entry whose clock moved past the
+    /// window is dropped once the cadence comes round. Without this test,
+    /// the cadence could become "never", and the test above would still pass.
     #[test]
     fn the_cadence_still_reclaims_idle_entries() {
         let bucket = TokenBucket::new(10, 60);
