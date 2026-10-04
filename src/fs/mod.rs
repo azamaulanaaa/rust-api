@@ -256,6 +256,41 @@ impl TokenKeys {
             .transpose()?;
         Ok(Self { current, previous })
     }
+
+    /// Mint a capability token for `file_id` and `act`, signed by the
+    /// current key.
+    ///
+    /// Lives here rather than only on [`FsEngine`] so a caller holding the
+    /// keys can produce a token without an engine -- which is also the only
+    /// way to observe WHICH secret a resolved [`TokenKeys`] carries.
+    /// `TokenKeys` deliberately exposes nothing about its material (no
+    /// accessor for `secret` or `kid`), and that is the right default: the
+    /// keys are a signing capability, and "read the secret back out" is not
+    /// an operation anything legitimate needs. Verification by round trip
+    /// answers the same question without one.
+    pub fn mint(&self, sub: &str, file_id: &str, act: Action) -> Result<String, FsError> {
+        token::mint(
+            sub,
+            file_id,
+            act,
+            &self.current.kid,
+            &self.current.secret,
+            None,
+        )
+    }
+
+    /// Verify a capability token against the current key, then the previous
+    /// one if a rotation is in progress.
+    ///
+    /// The same shape [`FsEngine::verify_token`] uses, exposed here so both
+    /// sides of a mint/verify round trip are reachable from the keys alone.
+    pub fn verify(&self, token: &str, file_id: &str, act: Action) -> Result<(), FsError> {
+        let mut secrets = vec![self.current.secret.as_slice()];
+        if let Some(prev) = &self.previous {
+            secrets.push(prev.secret.as_slice());
+        }
+        token::verify(token, file_id, act, &secrets).map(|_| ())
+    }
 }
 
 impl FsEngine {
@@ -363,26 +398,12 @@ impl FsEngine {
 
     /// Mint a capability token for `file_id` and `act`.
     pub fn mint_token(&self, sub: &str, file_id: &str, act: Action) -> Result<String, FsError> {
-        let keys = &self.token_keys;
-        token::mint(
-            sub,
-            file_id,
-            act,
-            &keys.current.kid,
-            &keys.current.secret,
-            None,
-        )
+        self.token_keys.mint(sub, file_id, act)
     }
 
     /// Verify a capability token.
     pub fn verify_token(&self, token: &str, file_id: &str, act: Action) -> Result<(), FsError> {
-        let keys = &self.token_keys;
-        let mut secrets = vec![keys.current.secret.as_slice()];
-        if let Some(prev) = &keys.previous {
-            secrets.push(prev.secret.as_slice());
-        }
-        token::verify(token, file_id, act, &secrets)?;
-        Ok(())
+        self.token_keys.verify(token, file_id, act)
     }
 
     /// Attach a file to a row; caller must have `Write` on the row.

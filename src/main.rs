@@ -589,14 +589,36 @@ force_path_style = true
         assert_eq!(projected.secret_access_key.as_deref(), Some("secret"));
     }
 
-    /// A configured secret is used, and an absent one falls back to an
-    /// ephemeral key rather than refusing to start.
+    /// A configured secret is the one the resolved keys actually sign with,
+    /// and an absent one falls back to an ephemeral key rather than refusing
+    /// to start.
     ///
     /// The fallback is a real behaviour, not an oversight: a laptop with no
-    /// `[capability].secret` should run, at the cost of invalidating tokens on
-    /// restart.
+    /// `[capability].secret` should run, at the cost of invalidating tokens
+    /// on restart.
     ///
-    /// Note what is *not* tested here: a malformed secret. `Config::try_from`
+    /// What this used to assert was `resolve_token_keys(...).is_ok()` in both
+    /// cases, which cannot fail in the way its name claims. `TokenKeys` has
+    /// no accessor for its `kid` or `secret`, so there was nothing to
+    /// compare -- and the failure is not exotic. Replacing the whole body of
+    /// `resolve_token_keys` with
+    ///
+    ///     Ok(TokenKeys::ephemeral())
+    ///
+    /// drops the configured secret AND the rotation `previous_secret` on the
+    /// floor, and both `is_ok()` assertions still pass. Every deployment's
+    /// capability tokens would then be signed with a fresh random key per
+    /// boot, so every delegated file URL handed out before a restart stops
+    /// validating after it -- silently, because the tokens carry no error
+    /// until a client tries to use one.
+    ///
+    /// So the property is asserted BEHAVIOURALLY: mint a token through the
+    /// keys `resolve_token_keys` returned and verify it against
+    /// independently-constructed keys built from the configured secret. A
+    /// token that only the configured secret validates is the observable
+    /// form of "the configured secret was preferred".
+    ///
+    /// Note what is *not* tested here: a malformed secret. `Config::parse`
     /// validates it, so this function never sees a bad one -- enforced at the
     /// loader and covered by `config::tests::validate_rejects_bad_values`.
     /// Asserting it here would pin a path that cannot execute, and the failure
@@ -605,16 +627,89 @@ force_path_style = true
     /// validating) is actually prevented upstream.
     #[test]
     fn capability_keys_prefer_the_configured_secret() {
+        use rust_api::fs::TokenKeys as Keys;
+        use rust_api::policy::Action;
+
+        let configured = "ab".repeat(32);
+        let rotated_away = "cd".repeat(32);
+        let with_secrets = |secret: &str, previous: Option<&str>| {
+            let mut toml = format!("{BASE}\n[capability]\nsecret = \"{secret}\"\n");
+            if let Some(previous) = previous {
+                toml.push_str(&format!("previous_secret = \"{previous}\"\n"));
+            }
+            config_from(&toml)
+        };
+
+        // A token minted by the resolved keys is one the configured secret
+        // validates. An ephemeral key would produce a token no configured
+        // secret accepts.
+        let keys = resolve_token_keys(&with_secrets(&configured, None))
+            .expect("a configured secret resolves");
+        let expected = Keys::from_hex(&configured, None).expect("the same secret, built directly");
+        let minted = keys
+            .mint("alice", "file-1", Action::Read)
+            .expect("minting through the resolved keys");
         assert!(
-            resolve_token_keys(&config_from(BASE)).is_ok(),
-            "an absent secret still boots, on an ephemeral key"
+            expected.verify(&minted, "file-1", Action::Read).is_ok(),
+            "the resolved keys must sign with the CONFIGURED secret; an \
+             ephemeral key here invalidates every capability token on restart"
         );
 
-        let good = config_from(&format!(
-            "{BASE}\n[capability]\nsecret = \"{}\"\n",
-            "ab".repeat(32)
-        ));
-        assert!(resolve_token_keys(&good).is_ok());
+        // And it is specifically that secret, not any well-formed one.
+        let other = Keys::from_hex(&rotated_away, None).expect("a different valid secret");
+        assert!(
+            other.verify(&minted, "file-1", Action::Read).is_err(),
+            "a token must not validate under an unrelated secret, or the \
+             assertion above proves nothing"
+        );
+
+        // Rotation: the PREVIOUS secret is wired for verification, so a token
+        // minted before the rotation still works. `previous_secret` being
+        // dropped is the other half of the same silent breakage.
+        let rotating = resolve_token_keys(&with_secrets(&configured, Some(&rotated_away)))
+            .expect("rotation resolves");
+        let old_token = Keys::from_hex(&rotated_away, None)
+            .expect("the retired secret")
+            .mint("alice", "file-2", Action::Write)
+            .expect("mint under the retired secret");
+        assert!(
+            rotating.verify(&old_token, "file-2", Action::Write).is_ok(),
+            "previous_secret must verify during rotation, or every delegated \
+             URL minted before the deploy stops working"
+        );
+        // ...and the new secret still mints.
+        let new_token = rotating
+            .mint("alice", "file-3", Action::Read)
+            .expect("mint under the current secret");
+        assert!(
+            Keys::from_hex(&configured, None)
+                .expect("the current secret")
+                .verify(&new_token, "file-3", Action::Read)
+                .is_ok(),
+            "the current secret mints through a rotating key set too"
+        );
+
+        // The absent-secret fallback still boots -- and really is ephemeral,
+        // so a token from one resolution does not survive another. That is
+        // the documented cost, asserted rather than assumed.
+        let ephemeral = resolve_token_keys(&config_from(BASE))
+            .expect("an absent secret still boots, on an ephemeral key");
+        let boot_one = ephemeral
+            .mint("alice", "file-4", Action::Read)
+            .expect("mint under an ephemeral key");
+        let boot_two = resolve_token_keys(&config_from(BASE))
+            .expect("second boot")
+            .mint("alice", "file-4", Action::Read)
+            .expect("mint under a second ephemeral key");
+        assert!(
+            ephemeral.verify(&boot_two, "file-4", Action::Read).is_err(),
+            "an unconfigured deployment must get a FRESH key per boot, not a \
+             stable one -- otherwise the fallback is silently a hardcoded secret"
+        );
+        assert!(
+            ephemeral.verify(&boot_one, "file-4", Action::Read).is_ok(),
+            "control: the token it did mint is still its own"
+        );
     }
 
     /// Both policy subcommands must claim the writer lease before opening a
