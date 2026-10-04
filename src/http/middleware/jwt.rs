@@ -35,32 +35,79 @@ const TENANT_PLACEHOLDER: &str = "{tenantid}";
 /// publishes an issuer containing a literal `{tenantid}` placeholder that
 /// each token resolves to its issuing tenant.
 ///
-/// Tokens are validated by deriving the expected issuer from the token's own
-/// `tid` claim; signature, audience, and nonce validation are unchanged. The
-/// audience remains the real multi-tenancy gate — it is scoped to our client
-/// registration regardless of issuing tenant.
+/// # Why the allowlist is not optional
+///
+/// The expected issuer is necessarily derived from the token's *own*
+/// unverified `tid` claim, because no static issuer can match a placeholder.
+/// That derivation is a tautology over attacker-supplied data: any token
+/// whose `iss` and `tid` agree with each other satisfies it. Signature
+/// validation does not help either — a multi-tenant app registration publishes
+/// one JWKS containing every tenant's keys, so a token minted by a tenant the
+/// operator never intended to trust verifies against keys already cached here.
+///
+/// Audience is **not** a substitute: `aud` is the client ID, which is
+/// identical for every tenant that has consented to the app registration. The
+/// tenant gate is therefore the allowlist and nothing else, and it fails
+/// closed — an empty allowlist accepts no tenant at all, and
+/// [`crate::config::Config::validate`] refuses to start a templated issuer
+/// without one.
 #[derive(Debug, Clone)]
 pub struct IssuerTemplate {
     /// Issuer portion before the `{tenantid}` placeholder.
     prefix: String,
     /// Issuer portion after the `{tenantid}` placeholder.
     suffix: String,
+    /// The only tenant identifiers this deployment accepts.
+    allowed_tenants: Vec<String>,
 }
 
 impl IssuerTemplate {
     /// Parses a template from a discovered issuer; `None` when the issuer is
     /// not templated (the common single-tenant case).
-    pub fn parse(issuer: &str) -> Option<Self> {
+    ///
+    /// `allowed_tenants` is the tenant allowlist and applies only to the
+    /// templated case; it is required to be non-empty by config validation,
+    /// but an empty list is still honoured here as "reject everything" rather
+    /// than "allow everything".
+    pub fn parse(issuer: &str, allowed_tenants: Vec<String>) -> Option<Self> {
         let (prefix, suffix) = issuer.split_once(TENANT_PLACEHOLDER)?;
         Some(Self {
             prefix: prefix.to_string(),
             suffix: suffix.to_string(),
+            allowed_tenants,
         })
     }
 
-    /// Resolves the template for a tenant identifier.
+    /// Resolves the template for a tenant identifier that is *known* to be
+    /// allowed, without re-checking it.
+    ///
+    /// Prefer [`IssuerTemplate::resolve_checked`]. This exists for tests and
+    /// for building the set of issuers to accept, not for validating a token.
     pub fn resolve(&self, tenant_id: &str) -> String {
         format!("{}{}{}", self.prefix, tenant_id, self.suffix)
+    }
+
+    /// Resolves the template for a tenant identifier, rejecting any tenant
+    /// outside the configured allowlist.
+    ///
+    /// The error string names the rejected tenant and is safe to log; it is
+    /// never serialized into a client response.
+    pub fn resolve_checked(&self, tenant_id: &str) -> Result<String, String> {
+        if !self
+            .allowed_tenants
+            .iter()
+            .any(|allowed| allowed == tenant_id)
+        {
+            return Err(format!(
+                "tenant `{tenant_id}` is not in the configured allowlist"
+            ));
+        }
+        Ok(self.resolve(tenant_id))
+    }
+
+    /// The tenant identifiers this deployment accepts.
+    pub fn allowed_tenants(&self) -> &[String] {
+        &self.allowed_tenants
     }
 }
 
@@ -156,8 +203,9 @@ where
         // Base validation carries the audience/issuer checks; the expected
         // algorithm is re-pinned per request from the selected signing key.
         // A templated issuer ({tenantid}) cannot be pinned statically — the
-        // middleware resolves it per request from the token's tid claim.
-        let issuer_template = IssuerTemplate::parse(issuer);
+        // middleware resolves it per request from the token's tid claim, and
+        // checks that claim against the allowlist.
+        let issuer_template = IssuerTemplate::parse(issuer, Vec::new());
         let mut validation = Validation::new(Algorithm::RS256);
         validation.set_audience(&[audience]);
         if issuer_template.is_none() {
@@ -170,6 +218,23 @@ where
             issuer_template,
             _claims: PhantomData,
         })
+    }
+
+    /// Sets the tenant allowlist for a templated (`{tenantid}`) issuer.
+    ///
+    /// Required for such an issuer and ignored for a single-tenant one,
+    /// where the issuer is pinned statically. Left unset, the allowlist is
+    /// empty, which **rejects every tenant** — fail closed by construction,
+    /// so forgetting this cannot silently open the deployment to every tenant
+    /// that has consented to a multi-tenant app registration.
+    ///
+    /// [`crate::oidc::OidcClient::new`] rejects a templated issuer with an
+    /// empty allowlist, so a served app cannot reach the unset state.
+    pub fn with_allowed_tenants(mut self, allowed_tenants: Vec<String>) -> Self {
+        if let Some(template) = &mut self.issuer_template {
+            template.allowed_tenants = allowed_tenants;
+        }
+        self
     }
 }
 
@@ -299,7 +364,14 @@ where
                         )
                         .into());
                     };
-                    validation.set_issuer(&[template.resolve(&tenant_id)]);
+                    // The issuer is derived from the token's own `tid`, so
+                    // resolving it proves nothing on its own. This check is
+                    // the tenant gate and it fails closed.
+                    let expected = template.resolve_checked(&tenant_id).map_err(|cause| {
+                        tracing::warn!("rejecting token from unknown tenant: {cause}");
+                        ApiError::InvalidCredentials(cause.into())
+                    })?;
+                    validation.set_issuer(&[expected]);
                 }
 
                 match decode::<C>(&token, &signing_key.decoding_key, &validation) {
@@ -381,10 +453,49 @@ mod tests {
 
     #[test]
     fn issuer_template_parses_and_resolves() {
-        let tpl = IssuerTemplate::parse("https://login.test/{tenantid}/v2.0")
-            .expect("templated issuer should parse");
+        let tpl = IssuerTemplate::parse(
+            "https://login.test/{tenantid}/v2.0",
+            vec!["abc-123".to_string()],
+        )
+        .expect("templated issuer should parse");
         assert_eq!(tpl.resolve("abc-123"), "https://login.test/abc-123/v2.0");
-        assert!(IssuerTemplate::parse("https://plain.test/v2.0").is_none());
+        assert!(IssuerTemplate::parse("https://plain.test/v2.0", Vec::new()).is_none());
+    }
+
+    /// The allowlist is the only real gate on a templated issuer: the
+    /// expected issuer is derived from the token's own `tid`, and `aud` is
+    /// the shared client ID, so neither can distinguish tenants.
+    #[test]
+    fn templated_issuer_rejects_a_tenant_outside_the_allowlist() {
+        let tpl = IssuerTemplate::parse(
+            "https://login.test/{tenantid}/v2.0",
+            vec!["trusted-tenant".to_string()],
+        )
+        .expect("templated issuer should parse");
+
+        assert_eq!(
+            tpl.resolve_checked("trusted-tenant").ok().as_deref(),
+            Some("https://login.test/trusted-tenant/v2.0"),
+        );
+        let err = tpl
+            .resolve_checked("attacker-guid")
+            .expect_err("an unlisted tenant must be rejected");
+        assert!(
+            err.contains("attacker-guid"),
+            "error names the tenant: {err}"
+        );
+    }
+
+    /// Fail closed: an unset allowlist accepts nobody, so forgetting to
+    /// configure one cannot open the deployment to every consenting tenant.
+    #[test]
+    fn templated_issuer_with_no_allowlist_rejects_every_tenant() {
+        let tpl = IssuerTemplate::parse("https://login.test/{tenantid}/v2.0", Vec::new())
+            .expect("templated issuer should parse");
+        assert!(
+            tpl.resolve_checked("any-tenant").is_err(),
+            "an empty allowlist must reject every tenant"
+        );
     }
 
     #[tokio::test]
@@ -398,7 +509,8 @@ mod tests {
             "test-aud",
             &format!("{}/{{tenantid}}/v2.0", server.uri()),
         )
-        .await?;
+        .await?
+        .with_allowed_tenants(vec![tenant_guid.to_string()]);
 
         let svc = actix_web::test::init_service(
             actix_web::App::new()

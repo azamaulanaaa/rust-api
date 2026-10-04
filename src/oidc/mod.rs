@@ -33,6 +33,13 @@ pub struct OidcConfig {
     pub issuer_url: String,
     /// Absolute URL the provider redirects back to after login.
     pub redirect_url: String,
+    /// Tenant identifiers this deployment accepts, for a provider that
+    /// publishes a `{tenantid}` issuer template.
+    ///
+    /// Empty for a single-tenant issuer, where the issuer is pinned
+    /// statically. Must be non-empty when the discovered issuer is templated;
+    /// [`OidcClient::new`] rejects that combination.
+    pub allowed_tenants: Vec<String>,
 }
 
 /// Errors raised by [`OidcClient`] during discovery and token exchange.
@@ -91,6 +98,7 @@ pub struct OidcClient {
     issuer: String,
     /// Parsed template when [`OidcClient::issuer`] is templated.
     issuer_template: Option<IssuerTemplate>,
+    allowed_tenants: Vec<String>,
     /// Absolute login-callback URL; its scheme decides the `Secure` flag
     /// on auth cookies (plain-http deployments must still receive them).
     redirect_url: String,
@@ -145,7 +153,15 @@ impl OidcClient {
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| OidcError::Discovery("metadata missing issuer".to_string()))?
             .to_string();
-        let issuer_template = IssuerTemplate::parse(&raw_issuer);
+        let issuer_template = IssuerTemplate::parse(&raw_issuer, config.allowed_tenants.clone());
+        if let Some(template) = &issuer_template
+            && template.allowed_tenants().is_empty()
+        {
+            return Err(OidcError::Configuration(format!(
+                "issuer {raw_issuer:?} is a multi-tenant template but no allowed tenants are \
+                 configured; set [authorization].allowed_tenants"
+            )));
+        }
 
         let body = if issuer_template.is_some() {
             body.replace("{tenantid}", &format!("{:032x}", 0))
@@ -178,6 +194,7 @@ impl OidcClient {
             issuer: raw_issuer,
             issuer_template,
             redirect_url: config.redirect_url,
+            allowed_tenants: config.allowed_tenants,
         })
     }
 
@@ -239,7 +256,11 @@ impl OidcClient {
                 .claims(&verifier, &nonce)
                 .map_err(|e| OidcError::InvalidToken(e.to_string()))?;
 
-            // Signature verification above authenticates this payload.
+            // Signature verification above authenticates this payload, but
+            // an authenticated caller is not an *authorized* tenant: any
+            // tenant that has consented to a multi-tenant app registration
+            // can mint a token that verifies against the shared JWKS. The
+            // allowlist is the tenant gate, and it fails closed.
             let raw = id_token.to_string();
             let Some(tenant_id) = extract_unverified_claim(&raw, "tid").filter(|t| !t.is_empty())
             else {
@@ -247,7 +268,9 @@ impl OidcClient {
                     "token missing tenant identifier".to_string(),
                 ));
             };
-            let expected = template.resolve(&tenant_id);
+            let expected = template
+                .resolve_checked(&tenant_id)
+                .map_err(OidcError::InvalidToken)?;
             let actual_iss = extract_unverified_claim(&raw, "iss");
             if actual_iss.as_deref() != Some(expected.as_str()) {
                 return Err(OidcError::InvalidToken(format!(
@@ -291,6 +314,12 @@ impl OidcClient {
     /// The provider's JWKS endpoint hosting its public signing keys.
     pub fn jwks_uri(&self) -> &url::Url {
         self.provider_metadata.jwks_uri().url()
+    }
+
+    /// The tenant identifiers this deployment accepts for a templated
+    /// issuer. Empty for a single-tenant issuer.
+    pub fn allowed_tenants(&self) -> &[String] {
+        &self.allowed_tenants
     }
 }
 
@@ -403,6 +432,7 @@ mod tests {
                 client_secret: "test-secret".to_string(),
                 issuer_url: server.uri(),
                 redirect_url: "http://localhost/callback".to_string(),
+                allowed_tenants: Vec::new(),
             };
 
             OidcClient::new(config).await?
