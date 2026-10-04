@@ -304,6 +304,22 @@ pub enum ReplayOutcome {
     NeedsFullRebuild,
 }
 
+/// What one replayed op did to the replica.
+///
+/// The split exists because "this op cannot be applied incrementally" and
+/// "the store rejected the write" are different facts, and only the first
+/// is a reason to queue a rebuild. Every decline site returns
+/// [`Self::NeedsFullRebuild`]; a genuine failure is still `Err` and stays a
+/// 500, which is the reason [`ReplayOutcome`] exists at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApplyOutcome {
+    /// The op was applied incrementally.
+    Applied,
+    /// The op cannot be applied incrementally; the whole delta needs a
+    /// full rebuild.
+    NeedsFullRebuild,
+}
+
 /// How far a replica got, and whether more is still to come.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AdvanceOutcome {
@@ -548,10 +564,11 @@ impl SnapshotManager {
     /// Ops apply in order with visibility re-checked against current master
     /// state, then the coverage marker advances: re-applying converges, so a
     /// crash between ops heals on the next poll. Legacy policy marks (object
-    /// only) and ranges over `MAX_REPLAY_OPS` entries fall back to a full
-    /// recalc via `Err`; rich rule/group ops resync only the affected
-    /// user/row (irrelevant users/objects skip, oversized fan-out falls
-    /// back via `Err`).
+    /// only), ranges over `MAX_REPLAY_OPS` entries, and a delta that cannot
+    /// be replayed within the fan-out budget all return
+    /// [`ReplayOutcome::NeedsFullRebuild`]; a store failure is still `Err`.
+    /// Rich rule/group ops resync only the affected user/row (irrelevant
+    /// users/objects skip).
     pub async fn replay(&self, head: u64, sub: &str) -> Result<ReplayOutcome, FsError> {
         let Some(applied) = self.load_applied(sub).await? else {
             return Ok(ReplayOutcome::NeedsFullRebuild);
@@ -566,7 +583,9 @@ impl SnapshotManager {
         let writer = self.open_writer(sub).await?;
         let dst = FsStore::new(writer.clone());
         for entry in &entries {
-            self.apply_op(sub, &dst, &entry.op).await?;
+            if self.apply_op(sub, &dst, &entry.op).await? == ApplyOutcome::NeedsFullRebuild {
+                return Ok(ReplayOutcome::NeedsFullRebuild);
+            }
         }
         writer
             .set_bytes(
@@ -617,7 +636,25 @@ impl SnapshotManager {
     ///
     /// Visibility is re-checked against current master state, so applying
     /// is idempotent: files that vanished or turned unreadable are skipped.
-    async fn apply_op(&self, sub: &str, dst: &FsStore, op: &WalOp) -> Result<(), FsError> {
+    ///
+    /// A delta that cannot be replayed incrementally returns
+    /// [`ApplyOutcome::NeedsFullRebuild`], not `Err`. The three fan-out
+    /// helpers used to answer with `FsError::Internal("replay needs full
+    /// recalc (policy fan-out too large)")`, and to every caller above that
+    /// text is indistinguishable from a store failure: `replay` propagated
+    /// it with a bare `?`, `advance`'s final arm released the claim and
+    /// returned it, and the route's `?` rendered `500 {"error":"internal
+    /// server error"}`. `APPLIED_KEY` only advances on success, so the next
+    /// poll replayed the identical entry and 500ed identically, for the life
+    /// of the process -- a subject that never converges, and a rebuild that
+    /// is never queued, which is the one outcome `ReplayOutcome` was
+    /// introduced to make expressible.
+    async fn apply_op(
+        &self,
+        sub: &str,
+        dst: &FsStore,
+        op: &WalOp,
+    ) -> Result<ApplyOutcome, FsError> {
         match op {
             WalOp::FileCreate { rec } => {
                 if self.can_read(sub, &rec.id).await? {
@@ -654,9 +691,12 @@ impl SnapshotManager {
                 dst.detach(row_type, row_id, file_id).await?;
             }
             WalOp::PolicyAdd { .. } | WalOp::PolicyRemove { .. } => {
-                return Err(FsError::Internal(
-                    "legacy policy op reached apply (needs full recalc)".into(),
-                ));
+                // `replay` rejects a range containing one of these before it
+                // opens a writer, so the arm is unreachable today. It
+                // declines for the same reason the fan-out arms do: a legacy
+                // mark names an object and no rule, so the only correct
+                // handling is a full recalc -- a decision, not a failure.
+                return Ok(ApplyOutcome::NeedsFullRebuild);
             }
             WalOp::PolicyRuleAdd {
                 sub: rule_sub,
@@ -668,16 +708,16 @@ impl SnapshotManager {
                 obj,
                 act,
             } => {
-                self.apply_rule_op(sub, dst, rule_sub, obj, act).await?;
+                return self.apply_rule_op(sub, dst, rule_sub, obj, act).await;
             }
             WalOp::GroupAdd { user, group } | WalOp::GroupRemove { user, group } => {
-                self.apply_membership_op(sub, dst, user, group).await?;
+                return self.apply_membership_op(sub, dst, user, group).await;
             }
             WalOp::GroupDelete { group } => {
-                self.apply_group_delete(sub, dst, group).await?;
+                return self.apply_group_delete(sub, dst, group).await;
             }
         }
-        Ok(())
+        Ok(ApplyOutcome::Applied)
     }
 
     /// Every group `sub` is a member of, transitively.
@@ -721,7 +761,8 @@ impl SnapshotManager {
     /// subject `sub` cannot reach — neither directly nor through nested
     /// groups — cannot match. Otherwise every file on the row is re-checked
     /// via [`Self::resync_file`] (idempotent: converge, never over-delete).
-    /// Fan-out over [`MAX_POLICY_REPLAY_FILES`] falls back via `Err`.
+    /// Fan-out over [`MAX_POLICY_REPLAY_FILES`] returns
+    /// [`ApplyOutcome::NeedsFullRebuild`].
     async fn apply_rule_op(
         &self,
         sub: &str,
@@ -729,27 +770,25 @@ impl SnapshotManager {
         rule_sub: &str,
         obj: &str,
         act: &str,
-    ) -> Result<(), FsError> {
+    ) -> Result<ApplyOutcome, FsError> {
         if !act.eq_ignore_ascii_case("read") {
-            return Ok(());
+            return Ok(ApplyOutcome::Applied);
         }
         let Some((row_type, row_id)) = split_row_obj(obj) else {
-            return Ok(());
+            return Ok(ApplyOutcome::Applied);
         };
         if rule_sub != sub && !self.implicit_groups(sub).await.contains(rule_sub) {
-            return Ok(());
+            return Ok(ApplyOutcome::Applied);
         }
         let files = self.store.files_for_row(row_type, row_id).await?;
         if files.len() > MAX_POLICY_REPLAY_FILES {
-            return Err(FsError::Internal(
-                "replay needs full recalc (policy fan-out too large)".into(),
-            ));
+            return Ok(ApplyOutcome::NeedsFullRebuild);
         }
         for file_id in files {
             self.resync_file(sub, dst, row_type, row_id, &file_id)
                 .await?;
         }
-        Ok(())
+        Ok(ApplyOutcome::Applied)
     }
 
     /// Resyncs rows a membership change can affect (only when `user == sub`).
@@ -757,16 +796,16 @@ impl SnapshotManager {
     /// Drops through when the change is for another user. For `sub` itself,
     /// every `read` row the group grants is resynced; groups with no row
     /// reads (e.g. `superadmin` on `rules`/`user_groups`) are a no-op.
-    /// Oversized fan-out falls back via `Err`.
+    /// Oversized fan-out returns [`ApplyOutcome::NeedsFullRebuild`].
     async fn apply_membership_op(
         &self,
         sub: &str,
         dst: &FsStore,
         user: &str,
         group: &str,
-    ) -> Result<(), FsError> {
+    ) -> Result<ApplyOutcome, FsError> {
         if user != sub {
-            return Ok(());
+            return Ok(ApplyOutcome::Applied);
         }
         let rows = self.read_rows_for_group(group).await?;
         let mut total = 0usize;
@@ -774,16 +813,14 @@ impl SnapshotManager {
             let files = self.store.files_for_row(&row_type, &row_id).await?;
             total += files.len();
             if total > MAX_POLICY_REPLAY_FILES {
-                return Err(FsError::Internal(
-                    "replay needs full recalc (policy fan-out too large)".into(),
-                ));
+                return Ok(ApplyOutcome::NeedsFullRebuild);
             }
             for file_id in files {
                 self.resync_file(sub, dst, &row_type, &row_id, &file_id)
                     .await?;
             }
         }
-        Ok(())
+        Ok(ApplyOutcome::Applied)
     }
 
     /// Resyncs rows a deleted group could have exposed.
@@ -792,32 +829,31 @@ impl SnapshotManager {
     /// holding row `read` rules resyncs its rows: [`Self::resync_file`]
     /// re-checks current visibility, making over-application safe (files
     /// still visible via other rows stay, others converge to deleted).
-    /// Groups with no row reads skip; oversized fan-out falls back via `Err`.
+    /// Groups with no row reads skip; oversized fan-out returns
+    /// [`ApplyOutcome::NeedsFullRebuild`].
     async fn apply_group_delete(
         &self,
         sub: &str,
         dst: &FsStore,
         group: &str,
-    ) -> Result<(), FsError> {
+    ) -> Result<ApplyOutcome, FsError> {
         let rows = self.read_rows_for_group(group).await?;
         if rows.is_empty() {
-            return Ok(());
+            return Ok(ApplyOutcome::Applied);
         }
         let mut total = 0usize;
         for (row_type, row_id) in rows {
             let files = self.store.files_for_row(&row_type, &row_id).await?;
             total += files.len();
             if total > MAX_POLICY_REPLAY_FILES {
-                return Err(FsError::Internal(
-                    "replay needs full recalc (policy fan-out too large)".into(),
-                ));
+                return Ok(ApplyOutcome::NeedsFullRebuild);
             }
             for file_id in files {
                 self.resync_file(sub, dst, &row_type, &row_id, &file_id)
                     .await?;
             }
         }
-        Ok(())
+        Ok(ApplyOutcome::Applied)
     }
 
     /// Converges one file on the replica after a policy change.
@@ -1057,6 +1093,43 @@ mod tests {
             make(ReplicaBackend::InMemory).skip_probe,
             "InMemory has no conditional writes to probe"
         );
+    }
+
+    /// A manager whose [`BuildQueue`] receiver is RETAINED.
+    ///
+    /// `test_manager` discards the receiver (`BuildQueue::new().0`), so
+    /// every dispatch fails and the claim is released immediately by the
+    /// failure path. That is the right default for a fixture that only
+    /// cares about replay, and the wrong one for anything about
+    /// coalescing: a test written against it cannot tell "the in-flight set
+    /// held the slot" from "nothing was ever claimed".
+    async fn test_manager_with_queue() -> (
+        SnapshotManager,
+        crate::policy::PolicyEngine,
+        tokio::sync::mpsc::UnboundedReceiver<BuildJob>,
+    ) {
+        let mem = std::sync::Arc::new(InMemory::new());
+        let wal = Wal::new(crate::db::build_test_store(&crate::db::test_prefix("snap-wal")).await);
+        let store =
+            FsStore::new(crate::db::build_test_store(&crate::db::test_prefix("snap-store")).await);
+        let policy = crate::policy::PolicyEngine::init_s3(
+            crate::db::build_test_store(&crate::db::test_prefix("snap-policy")).await,
+        )
+        .await
+        .unwrap();
+        let (builds, jobs) = BuildQueue::new();
+        let mgr = SnapshotManager::new(
+            SnapshotDeps {
+                wal,
+                store,
+                policy: policy.authorizer(),
+                object_store: mem as std::sync::Arc<dyn object_store::ObjectStore>,
+                builds,
+            },
+            "test-db",
+            ReplicaBackend::InMemory,
+        );
+        (mgr, policy, jobs)
     }
 
     fn file_record(id: &str, owner: &str) -> FileRecord {
@@ -1517,8 +1590,87 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn split_row_obj_rejects_control_plane_objects() {
+    /// An oversized policy fan-out DECLINES; it does not 500, and it does
+    /// not fail the same way forever.
+    ///
+    /// `ReplayOutcome` was introduced to replace error-TEXT matching
+    /// ("replay needs full recalc ...") with a typed value. The refactor
+    /// converted the two PRE-FLIGHT decline sites to `Ok(NeedsFullRebuild)`
+    /// and left all three FAN-OUT sites returning the very `Err` it was
+    /// meant to eliminate. An admin granting `read` on a row holding 1001
+    /// files therefore reached `apply_rule_op`, tripped
+    /// `MAX_POLICY_REPLAY_FILES`, and produced `FsError::Internal` -- which
+    /// `advance`'s final arm treats as a store failure: release the claim,
+    /// return the error, render `500`. Because `APPLIED_KEY` never
+    /// advances, the next poll replayed the identical entry and 500ed
+    /// identically. The subject never converged and no rebuild was ever
+    /// queued.
+    ///
+    /// Asserted through `advance` rather than `replay` because that is the
+    /// level at which the old `Err` became visible, and the second call is
+    /// the "forever" half: it must reach the same declining branch and
+    /// answer `pending: true`, not reproduce the failure.
+    #[tokio::test]
+    async fn an_oversized_policy_fan_out_declines_instead_of_failing() -> anyhow::Result<()> {
+        let (mgr, policy, mut jobs) = test_manager_with_queue().await;
+        // One row, one more file than the fan-out budget allows.
+        for i in 0..=MAX_POLICY_REPLAY_FILES {
+            let id = format!("f{i}");
+            mgr.store.save_file(&file_record(&id, "bob")).await?;
+            mgr.store.attach("invoice", "1", &id).await?;
+        }
+        // Alice is covered through seq 0 with nothing on invoice:1.
+        mgr.build_full("alice").await?;
+
+        // The grant is the op whose fan-out trips the cap.
+        policy
+            .add_rule("alice".into(), "invoice:1".into(), Action::Read)
+            .await?;
+        mgr.wal
+            .append(WalOp::PolicyRuleAdd {
+                sub: "alice".into(),
+                obj: "invoice:1".into(),
+                act: "read".into(),
+            })
+            .await?;
+
+        let first = mgr
+            .advance("alice")
+            .await
+            .map_err(|e| anyhow::anyhow!("a fan-out cap must not be an error: {e}"))?;
+        assert!(
+            first.pending,
+            "an oversized fan-out must queue a rebuild, not fail: {first:?}"
+        );
+        assert_eq!(
+            first.applied_seq, 0,
+            "coverage is from before the queued rebuild"
+        );
+        // A rebuild really was queued, which is the whole point: the old
+        // `Err` path released the claim and queued nothing.
+        let queued = jobs.try_recv().expect("a rebuild must be queued");
+        assert_eq!(queued.sub, "alice");
+        assert!(
+            jobs.try_recv().is_err(),
+            "the in-flight set must collapse the retries into one job"
+        );
+
+        // The "forever" half: the marker did not advance, so the next poll
+        // replays the same entry. It must decline again the same way rather
+        // than reproduce the 500. The claim is released first so this
+        // reaches `replay` instead of short-circuiting on the slot.
+        mgr.builds.release("alice");
+        let second = mgr
+            .advance("alice")
+            .await
+            .map_err(|e| anyhow::anyhow!("the repeat call must not fail either: {e}"))?;
+        assert!(second.pending, "still pending, and still not an error");
+        assert_eq!(second.applied_seq, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn split_row_obj_rejects_control_plane_objects() {
         assert_eq!(split_row_obj("invoice:123"), Some(("invoice", "123")));
         assert_eq!(split_row_obj("rules"), None);
         assert_eq!(split_row_obj("user_groups"), None);
