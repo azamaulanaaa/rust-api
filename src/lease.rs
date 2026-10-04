@@ -71,6 +71,28 @@ struct LeaseRecord {
     pid: u32,
 }
 
+impl LeaseRecord {
+    /// True while this record is still a live lease at `now`.
+    ///
+    /// Unsigned on purpose. The comparison used to be `age < ttl_secs as
+    /// i64`, and a TTL at or above 2^63 casts to a *negative* `i64` -- so
+    /// `age < negative` is false for every live holder, every second
+    /// writer was told the lease was stale and took over, and the only
+    /// symptom was a `warn!` nobody reads.
+    /// `[database].writer_lease_ttl_secs` is an unvalidated `u64`, so that
+    /// value was one keystroke away.
+    ///
+    /// `checked_sub` yields `None` when the holder's clock is behind ours,
+    /// which reads as live. A negative age from clock skew is the safe
+    /// direction to get wrong here.
+    fn is_live_at(&self, now: i64) -> bool {
+        match now.checked_sub(self.renewed_at) {
+            Some(age) => u64::try_from(age).is_ok_and(|age| age < self.ttl_secs),
+            None => true,
+        }
+    }
+}
+
 /// Why a lease could not be claimed.
 #[derive(Debug, thiserror::Error)]
 pub enum LeaseError {
@@ -178,7 +200,7 @@ impl WriterLease {
                 },
             })?;
         let age = now - held.record.renewed_at;
-        if age < held.record.ttl_secs as i64 {
+        if held.record.is_live_at(now) {
             return Err(LeaseError::held(&prefix, &held.record, age));
         }
 
@@ -504,14 +526,20 @@ fn lease_path(prefix: &str) -> ObjectPath {
 impl LeaseError {
     /// Builds the "someone else holds it" error for a lease we read.
     fn held(prefix: &str, record: &LeaseRecord, age: i64) -> Self {
-        let ttl = record.ttl_secs as i64;
+        // Unsigned subtraction, not `ttl as i64 - age`: a TTL at or above
+        // 2^63 casts negative, so the old form produced a negative `wait`
+        // (clamped to 0) for a lease that was nowhere near stale.
+        let wait = u64::try_from(age)
+            .ok()
+            .and_then(|age| record.ttl_secs.checked_sub(age))
+            .unwrap_or(0);
         Self::Held {
             prefix: prefix.to_string(),
             instance: record.instance.clone(),
             pid: record.pid,
             age,
             ttl: record.ttl_secs,
-            wait: (ttl - age).max(0),
+            wait: i64::try_from(wait).unwrap_or(i64::MAX),
         }
     }
 }
@@ -643,6 +671,45 @@ mod tests {
         let text = err.to_string();
         assert!(text.contains(prefix), "unhelpful message: {text}");
         assert!(text.contains(first.instance()), "unhelpful message: {text}");
+    }
+
+    /// A TTL too large for the comparison must not make a live lease look
+    /// stale.
+    ///
+    /// The check was `age < ttl_secs as i64`, and a TTL at or above 2^63
+    /// casts to a negative `i64`, so the comparison is false for every
+    /// live holder: the second writer is told the lease expired, takes the
+    /// prefix from a running server, and the only trace is a `warn!`.
+    /// `[database].writer_lease_ttl_secs` is a `u64`, so that value was
+    /// reachable.
+    ///
+    /// This claims with a huge TTL rather than backdating: the record is
+    /// milliseconds old, so under the old comparison it read as stale and
+    /// the take-over would have succeeded. The lease must refuse.
+    #[tokio::test]
+    async fn a_lease_too_long_to_compare_is_still_live() {
+        let store = mem();
+        let prefix = "lease-test-huge-ttl";
+        const HUGE: u64 = i64::MAX as u64 + 1;
+        let first = WriterLease::acquire(Arc::clone(&store), prefix, HUGE)
+            .await
+            .expect("first writer claims");
+
+        let err = WriterLease::acquire(Arc::clone(&store), prefix, HUGE)
+            .await
+            .expect_err("an unexpired lease must not be takeable at any TTL");
+        let LeaseError::Held { instance, wait, .. } = &err else {
+            panic!("expected Held, got {err:?}");
+        };
+        assert_eq!(instance, first.instance());
+        // The operator-facing `wait` was a by-product of the same cast and
+        // came out 0 for a lease with centuries left, so it is asserted
+        // too: a number that says "no wait needed" on a live lease is as
+        // misleading as the comparison itself.
+        assert!(
+            *wait > 0,
+            "the error must still say how long to wait: {err}",
+        );
     }
 
     /// A holder that stops renewing (crash) must not block recovery: past
