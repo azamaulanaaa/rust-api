@@ -7,9 +7,9 @@
 //! pointer. Every object inside the replica prefix has its own address at
 //! `GET /sync/db/{object}`. That route passes the backend `ETag` through
 //! and supports `If-None-Match`. A client then checks for changes through
-//! headers and downloads only the objects that moved. Three names inside the
-//! prefix change under one name (`manifest.json`, `ownership.json`,
-//! `probe/canary`) and are revalidated (`Cache-Control: no-cache`). The
+//! headers and downloads only the objects that moved. The route revalidates
+//! three names inside the prefix (`manifest.json`, `ownership.json`,
+//! `probe/canary`) with `Cache-Control: no-cache`. The
 //! append-only and content-addressed classes (`e{epoch}/sst/*`,
 //! `e{epoch}/wal/*`, `e{epoch}/blob/*`) are immutable by construction
 //! (`Cache-Control: public, max-age=31536000, immutable`).
@@ -405,8 +405,8 @@ fn is_mutable_object_key(
 /// Whether this object holds a JSON document.
 ///
 /// The function uses the same derivation as [`is_mutable_object_key`]. The
-/// storage probe canary holds the bytes of the probe, so it is served as an
-/// octet stream even though the code revalidates it.
+/// storage probe canary holds the bytes of the probe, so the route serves it
+/// as an octet stream even though the code revalidates it.
 fn is_json_object_key(
     path: &object_store::path::Path,
     replica_prefix: &object_store::path::Path,
@@ -414,7 +414,7 @@ fn is_json_object_key(
     is_one_object_of(path, replica_prefix, JSON_OBJECTS)
 }
 
-/// Whether `path` is `replica_prefix` followed by one name from `names`.
+/// Whether `path` names one item of `names` under `replica_prefix`.
 ///
 /// The function builds the candidate key as one string. `Path::child` treats
 /// a `/` inside its argument as a legal character of a single segment, so it
@@ -1360,7 +1360,7 @@ mod tests {
     /// on every writer build with a higher epoch. A client or an intermediary
     /// that honours the header keeps a stale ownership record for a year.
     #[actix_web::test]
-    async fn every_mutable_object_is_revalidated_and_engine_files_are_not() -> anyhow::Result<()> {
+    async fn the_route_revalidates_only_the_mutable_objects() -> anyhow::Result<()> {
         use object_store::PutPayload;
 
         let fx = fixture().await?;

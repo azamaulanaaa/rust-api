@@ -852,7 +852,7 @@ impl SnapshotManager {
     /// It does not see the state of the moment it opened.
     ///
     /// Every caller in this module opens the follower for one short read. So
-    /// one repair per read is enough for the call. A caller that must read a
+    /// one fix per read is enough for the call. A caller that must read a
     /// stable snapshot needs another mechanism, because `oxkv` 0.9 does not
     /// provide one.
     async fn open_reader(&self, sub: &str) -> Result<OxKvReader, FsError> {
