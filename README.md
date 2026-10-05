@@ -155,7 +155,7 @@ The lease only sees writers that take it. `src/fencing.rs` covers the uncooperat
 
 A **replica** fencing loss deliberately does not latch. Losing a build race is routine, and `sync` resolves it by adopting the winner's coverage. `FsStore` therefore carries an explicit primary mark (`FsStore::primary` vs `FsStore::new`) that decides whether a failure is terminal. `sync`'s replica stores are never marked. A latch in the shared `oxkv::StoreError → FsError` conversion would have pulled a healthy server out of rotation every time two workers raced to build one user's replica.
 
-The process does **not** stop on a fencing loss. It is already read-only, so it can no longer diverge. Exiting immediately would mean zero healthy writers whenever the successor is not serving yet. Marking the instance unready instead drains it through the load balancer. That leaves the restart to an operator who has the log line saying the handle is terminal.
+The process does **not** exit on a fencing loss. It is already read-only, so it can no longer diverge. Exiting immediately would mean zero healthy writers whenever the successor is not serving yet. Marking the instance unready instead drains it through the load balancer. That leaves the restart to an operator who has the log line saying the handle is terminal.
 
 The lease cannot stop a network partition from splitting the prefix. Nothing lease-based can. What the lease buys is that the losing side *finds out* and stops taking traffic, instead of discovering the split through corrupted data.
 
@@ -209,7 +209,7 @@ The sweeper runs hourly (`fs::gc::spawn`, `sweep_once`) and reclaims objects in 
 | How it decides | a `files/` listing names the object, no session row and no file row references it, and it is older than the 24h TTL | the key has the exact WAL shape **and** the manifest does not list it. A failed manifest compare-and-swap strands one |
 | Extra requirement | needs a **complete** decode of both metadata scans. If any row fails to decode, the code skips the whole pass. Leaking bytes beats deleting a live file | needs no metadata row of this crate, and reads none |
 | Call | `engine.s3.list_keys(…,"files/")` + `delete_object`, inside `fs::gc` | `FsStore::gc_wal_orphans` → `oxkv::OxKvStore::gc_orphans`, inside `fs::gc` |
-| Failure handling | a failed delete retains the item for the next sweep and does not abort the sweep | a failed `LIST`/`DELETE` only shortens the pass, and a later hourly sweep continues. A **fenced store returns `Ok(0)` and deletes nothing**, because `gc_orphans` re-validates ownership before it deletes. For a window, no listing names a current owner's in-flight WAL, and a stale handle would delete a live write |
+| Failure handling | a failed delete retains the item for the next sweep and does not abort the sweep | a failed `LIST`/`DELETE` only shortens the pass, and a later hourly sweep continues. A **fenced store returns `Ok(0)` and deletes nothing**, because `gc_orphans` re-validates ownership before it deletes. For a window, the manifest names no current owner's in-flight WAL, and a stale handle would delete a live write |
 
 The two are complementary, not replacements. The store pass reclaims what oxkv itself orphaned inside the store's prefix. The byte pass answers a question the store pass cannot: whether an application key is still referenced. That question is why the byte pass needs a complete metadata scan first.
 
@@ -240,7 +240,7 @@ So a client may assume:
 - a reader replays the `wal` list into an overlay and reads that overlay first, so the `sst` array alone never yields the current value.
 - `seq` (`#[serde(default)]`, so a manifest written before 0.9 decodes with `seq = 0` on every entry) is the recoverable form of the same ordering.
 
-And a client must **never sort, reorder, filter, deduplicate, or rewrite `sst` entries**. The client must not sort by key range, not by `seq`, and not by any other key. Reordering destroys the recency that the engine relies on. A client that reorders and then reads by position resolves overlapping keys to the wrong segment. Copying `sst` verbatim into a local engine is fine. Rearranging it is not. A copy that keeps only `sst` is not enough, because it drops every record that has not reached a segment yet. This is a **client obligation, not a server guarantee**. This server streams the bytes through unchanged and never validates the entries it serves.
+And a client must **never sort, reorder, filter, deduplicate, or rewrite `sst` entries**. The client must do none of this by key range, by `seq`, or by any other key. Reordering destroys the recency that the engine relies on. A client that reorders and then reads by position resolves overlapping keys to the wrong segment. Copying `sst` verbatim into a local engine is fine. Rearranging it is not. A copy that keeps only `sst` is not enough, because it drops every record that has not reached a segment yet. This is a **client obligation, not a server guarantee**. This server streams the bytes through unchanged and never validates the entries it serves.
 
 **2. Three names in a replica prefix change under one name.**
 The engine writes six classes into a replica prefix: `manifest.json`, `ownership.json`, `probe/canary`, and the append-only or content-addressed classes `e{epoch}/sst/*`, `e{epoch}/wal/*`, and `e{epoch}/blob/*`. The first three names each carry different bytes at different times. The route compares the resolved object key against a list of exactly those three names. It serves a matching object with `Cache-Control: no-cache`. It serves every other object of the prefix with `Cache-Control: public, max-age=31536000, immutable`. The rule matches those three keys only. A key that merely ends in one of those names is not mutable.
@@ -258,7 +258,7 @@ A client must revalidate each of the three mutable names, and it must not keep a
 **3. A long-lived reader is no longer pinned, and that obligation moved to the client.**
 oxkv 0.9 removed `OxKvStore::{register_reader, unregister_reader, min_reader_version}`, the trio that kept SSTs alive for in-flight readers. `OxKvReader` is now a live view of the prefix, not a snapshot pinned at open time. Instead, 0.9 protects reader-visible data by ordering. `maintain_wal` refuses to GC a WAL unless the force-flush that SST-covers it succeeded, and a vanished listed WAL counts as SST-covered. It also protects that data with one retry against a fresh manifest on `not found` (`retry_once_not_found`). That retry is the same correction 0.7 spelled out at each call site, not a new guarantee.
 
-A client that relied on the reader pin to hold a stable view must change. That is an **obligation, not a guarantee the server can restore**. The client must either re-open the `OxKvReader` (or re-read the manifest) whenever it needs a view consistent with a moment in time. Otherwise, the client must snapshot the keys it needs itself. Holding one reader open across a build is no longer a way to keep an old view alive. A compaction or WAL GC can retire segments underneath it. This crate's own server-side readers (`snapshot::open_reader`) already open per call and read a single key, so they never depended on the pin. A long-lived client reader will.
+A client that relied on the reader pin to hold a stable view must change. That is an **obligation, not a guarantee the server can restore**. The client must either re-open the `OxKvReader` (or re-read the manifest) whenever it needs a view consistent with a moment in time. Otherwise, the client must snapshot the keys it needs itself. Holding one reader open across a build no longer keeps an old view alive. The reason is that a compaction or WAL GC can retire segments underneath it. This crate's own server-side readers (`snapshot::open_reader`) already open per call and read a single key, so they never depended on the pin. A long-lived client reader will.
 
 ### Rebuild scheduling
 
@@ -420,7 +420,7 @@ cargo run -- serve --config config.toml
 
 ### Cost limits
 
-`[limits]` bounds the two places where one request's cost is not bounded by the request. **Both default to off (`0`).** A default limit is a default outage. The right number depends on your egress budget and your clients' poll interval. Neither of those belongs to this crate, so the crate cannot know them.
+`[limits]` bounds the two places where one request's cost is not bounded by the request. **Both default to off (`0`).** A default limit is a default outage. That holds because the right number depends on your egress budget and your clients' poll interval. Neither of those belongs to this crate, so the crate cannot know them.
 
 ```toml
 [limits]
@@ -535,7 +535,7 @@ let app = http::apply_limits(App::new())
 HttpServer::new(move || app.clone()).run().await?;
 ```
 
-`svc.configure` returns `Result<_, DuplicateRoutePrefix>`. Each `ApiModule` declares the single prefix it owns, and the code refuses a set that mounts the same prefix twice, before it registers anything. Actix itself cannot report this. A scope matches its whole prefix, and the code tries services in registration order. A second module on the same prefix has its routes silently ignored, while its `/prefix/*` requests reach the first module.
+`svc.configure` returns `Result<_, DuplicateRoutePrefix>`. Each `ApiModule` declares the single prefix it owns, and the code refuses a set that mounts the same prefix twice, before it registers anything. Actix itself cannot report this. A scope matches its whole prefix, and the code tries services in registration order. Therefore, a second module on the same prefix has its routes silently ignored, while its `/prefix/*` requests reach the first module.
 
 The code mounts `http::docs::config` **last** on purpose. A catch-all mount registered ahead of your modules can shadow them.
 
@@ -590,7 +590,7 @@ mise run dist-build    # build the archives locally into dist/
 
 The `cargo-dist` tool pin in `mise.toml` must track `cargo-dist-version` in `dist-workspace.toml`. cargo-dist generates the GitHub release workflow rather than checking it in. Run `cargo dist init --ci=github` to (re)create it at the pinned version.
 
-Commit messages follow the [Conventional Commits](https://www.conventionalcommits.org/) style. The scope is optional, and it names the part of the crate that changed. `feat:`, `fix:`, and `docs:` appear beside scoped subjects such as `chore(deps)!:`, `feat(fs):`, `fix(sync)!:`, and `docs(readme)!:`.
+Commit messages follow the [Conventional Commits](https://www.conventionalcommits.org/) style. The scope is optional, and it names the part of the crate that changed. Therefore `feat:`, `fix:`, and `docs:` appear beside scoped subjects such as `chore(deps)!:`, `feat(fs):`, `fix(sync)!:`, and `docs(readme)!:`.
 
 ## License
 
