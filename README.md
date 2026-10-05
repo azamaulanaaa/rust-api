@@ -131,11 +131,11 @@ g = _, _                 # group membership: user belongs to group
 m = g(r.sub, p.sub) && r.obj == p.obj && r.act == p.act
 ```
 
-A request is authorized when its subject either holds a matching `p`-rule directly or belongs to a group (`g`-link) that does. A typical setup grants permissions to *groups* via `POST /policy/rules`, then manages membership via the `/policy/groups` endpoints.
+The Casbin RBAC model authorizes a request when its subject either holds a matching `p`-rule directly or belongs to a group (`g`-link) that does. A typical setup grants permissions to *groups* via `POST /policy/rules`, then manages membership via the `/policy/groups` endpoints.
 
 Rules persist to a prefix-scoped [`oxkv::OxKvStore`](https://docs.rs/oxkv) under `{database.prefix}/policy` inside the configured S3 bucket (one `ObjectStore` + one `AmazonS3Builder` shared with the file-byte store via `db::build_s3_store` / `fs::object_store::s3_builder`). Each rule is one key-value pair (`{sec}:{ptype}:{hash}` → JSON array) written transactionally. `adapter::encode_rule` and `PolicyRuleValidator` enforce validation on every write path. Wrong-arity rules, non-JSON payloads, and unknown sections fail before any transaction opens. The adapter validates directly instead of requiring callers to wrap their store in a `HookStore`.
 
-> **Single-live-handle-per-prefix:** each `OxKvStore` owns a fresh fencing session (memtable/WAL buffer). Two live handles on the same prefix can fence each other or diverge on real S3. Share the handle via `Arc`. Do not build a second one. This crate's own tests use a fresh `InMemory` per prefix, and a new session over the same `InMemory` for single-threaded reopen (the new session supersedes the previous one). Exception: the `policy export` / `policy import` CLI subcommands open a short-lived second handle on `{prefix}/policy` (and `{prefix}/wal` for import). Never run them concurrently with a live server on the same prefix.
+> **Single-live-handle-per-prefix:** each `OxKvStore` owns a fresh fencing session (memtable/WAL buffer). Two live handles on the same prefix can fence each other or diverge on real S3. Share the handle via `Arc`. Do not build a second one. This crate's own tests use a fresh `InMemory` per prefix. For single-threaded reopen they use a new session over the same `InMemory`, and the new session supersedes the previous one. Exception: the `policy export` / `policy import` CLI subcommands open a short-lived second handle on `{prefix}/policy` (and `{prefix}/wal` for import). Never run them concurrently with a live server on the same prefix.
 
 ### Single-writer enforcement
 
@@ -155,7 +155,7 @@ The lease only sees writers that take it. `src/fencing.rs` covers the uncooperat
 
 A **replica** fencing loss deliberately does not latch. Losing a build race is routine, and `sync` resolves it by adopting the winner's coverage. `FsStore` therefore carries an explicit primary mark (`FsStore::primary` vs `FsStore::new`) that decides whether a failure is terminal. `sync`'s replica stores are never marked. A latch in the shared `oxkv::StoreError → FsError` conversion would have pulled a healthy server out of rotation every time two workers raced to build one user's replica.
 
-The process does **not** terminate on a fencing loss. It is already read-only, so it can no longer diverge. Exiting immediately would mean zero healthy writers whenever the successor is not serving yet. Marking the instance unready instead drains it through the load balancer. That leaves the restart to an operator who has the log line saying the handle is terminal.
+The process does **not** stop on a fencing loss. It is already read-only, so it can no longer diverge. Exiting immediately would mean zero healthy writers whenever the successor is not serving yet. Marking the instance unready instead drains it through the load balancer. That leaves the restart to an operator who has the log line saying the handle is terminal.
 
 The lease cannot stop a network partition from splitting the prefix. Nothing lease-based can. What the lease buys is that the losing side *finds out* and stops taking traffic, instead of discovering the split through corrupted data.
 
@@ -169,21 +169,21 @@ A store whose epoch was lost surfaces as `FsError::Fenced`. The code classifies 
 
 Keeping that correct means every `oxkv::StoreError` → `FsError` conversion has to route through `From`. That includes the private `store_err` helpers in `fs::store` and `sync::snapshot`, which are one-liners for exactly that reason. The reason string is operator-facing. The code logs it at `error` level, because a lost epoch is terminal for that handle and not a blip. The code never serializes it.
 
-Policy writes reach the store through casbin, whose `Adapter` trait is written in `casbin::Error`. There the `oxkv::StoreError` arrives boxed inside `AdapterError`, so the code has to redo the classification at the boundary. `From<casbin::Error> for PolicyError` downcasts that box and lifts the epoch loss into `PolicyError::Fenced`, which `PolicyError::is_fencing_loss()` detects. Without it, a stale writer's policy write produced
+Policy writes reach the store through casbin, whose `Adapter` trait uses `casbin::Error`. There the `oxkv::StoreError` arrives boxed inside `AdapterError`, so the code has to redo the classification at the boundary. `From<casbin::Error> for PolicyError` downcasts that box and lifts the epoch loss into `PolicyError::Fenced`, which `PolicyError::is_fencing_loss()` detects. Without it, a stale writer's policy write produced
 
 ```text
 Casbin(AdapterError(AdapterError(Fenced("epoch 7 superseded"))))
 ```
 
-— a 500 indistinguishable from any other store failure, on the same prefix and the same condition `FsError::Fenced` already reports. `PolicyError::Fenced` deliberately renders the same text as `FsError::Fenced` ("store epoch lost to another writer …"), so one log query finds a fencing loss on either store, and the client still only ever sees `{"error":"internal server error"}`. `policy::adapter::tests::a_fenced_policy_write_is_typed_as_a_fencing_loss` drives this through a real casbin enforcer over a store whose `commit` reports a lost epoch, so it also pins the assumption that casbin preserves the box rather than flattening it to a string.
+— a 500 indistinguishable from any other store failure, on the same prefix and the same condition `FsError::Fenced` already reports. `PolicyError::Fenced` deliberately renders the same text as `FsError::Fenced` ("store epoch lost to another writer …"). One log query then finds a fencing loss on either store, and the client still only ever sees `{"error":"internal server error"}`. The test `policy::adapter::tests::a_fenced_policy_write_is_typed_as_a_fencing_loss` drives this through a real casbin enforcer over a store whose `commit` reports a lost epoch. It also pins the assumption that casbin preserves the box rather than flattening it to a string.
 
 ### Row-level and file delegation
 
-Business rows authorize as `{row_type}:{row_id}` via `RowAuthorizer` (`policy/row.rs`). Files are not gated by a coarse `fs` object; instead:
+Business rows authorize as `{row_type}:{row_id}` via `RowAuthorizer` (`policy/row.rs`). Files are not gated by a coarse `fs` object. Instead:
 
 - `POST /fs/uploads` creates a temp file owned by `owner_sub` (`refs==0`) in the `{prefix}/fs` `OxKvStore` (`fs:uploads:{id}:meta`, staged parts `fs:uploads:{id}:part:{idx}`, durable `fs:mp:{upload_id}` multipart record for multipart uploads). Part intake is stream-capped at the expected part size (oversize → `413`, declared-length mismatch → `400` before reading).
 
-**Upload size limits.** `InitRequest` is validated against the same constraints as the worker-side `Schema.filter`, plus S3's per-upload part cap:
+**Upload size limits.** The server validates `InitRequest` against the same constraints as the worker-side `Schema.filter`, plus S3's per-upload part cap:
 
 | Field | Constraint |
 |---|---|
@@ -196,7 +196,7 @@ Business rows authorize as `{row_type}:{row_id}` via `RowAuthorizer` (`policy/ro
 The part cap applies at `init`, not at `complete`. A client therefore learns its split is illegal before it uploads anything, not after. The cap also bounds the per-session `etags`/`checksums` vectors that the engine allocates from the declared count. Files larger than ~4.9 GiB need a larger `part_size` cap or a different upload strategy.
 - `FsEngine::attach(row_type,row_id,file_id,caller)` requires `Write` on `{row_type}:{row_id}` and increments `fs:files:{id}:refs` + writes `fs:rel:{type}:{id}:{file}`.
 - `FsEngine::detach` decrements and sets `orphan_since` when `refs==0`.
-- Reads and deletes check `owner_sub == caller` for a temp file, or require any owning row to grant `Read`/`Delete`. Editing a row runs `detach(old)+create new+attach(new)`. The old S3 object then becomes an orphan, and GC removes it after 24h.
+- Reads and deletes validate `owner_sub == caller` for a temp file, or require any owning row to grant `Read`/`Delete`. Editing a row runs `detach(old)+create new+attach(new)`. The old S3 object then becomes an orphan, and GC removes it after 24h.
 - `FsEngine::mint_token` and `verify_token` (`fs/token.rs`) implement short-lived HMAC delegation without extra policy hits. No `/fs/*` route consumes them today, so keep using the OIDC JWT for file operations. File bytes live in S3 via `object_store` (`AmazonS3` in production, `InMemory` in tests). Multipart state survives restarts through the `fs:mp:{upload_id}` record (`restore_multipart` before `upload_part`/`complete`/`cancel`/GC. Sessions that predate the record fail with a restart-this-upload `400`). Cancel and GC abort S3 first and retain the session on failure, so the next sweep retries instead of leaking staged bytes.
 
 ### Garbage collection
