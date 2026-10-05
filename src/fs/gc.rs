@@ -4,6 +4,29 @@
 //! than 24 hours. The engine announces expired files to the change feed
 //! when a sink is set. Each replica then replays the deletion instead of
 //! keeping a stale copy.
+//!
+//! # The two scopes
+//!
+//! The sweeper reclaims objects in two scopes. The scopes are separate.
+//! Each pass names one scope and ignores the other.
+//!
+//! 1. The application byte scope. The keys have the shape `files/{id}`.
+//!    The orphan byte pass lists this scope and deletes an object that no
+//!    session row and no file row references. A crash between the byte
+//!    write and the metadata write strands such an object.
+//! 2. The store internal scope. The keys have the shape
+//!    `e{6 digits}/wal/{8 digits}.log` under the oxkv prefix of this
+//!    store. The store level pass deletes a WAL object that the manifest
+//!    does not list. A failed manifest compare-and-swap strands such an
+//!    object.
+//!
+//! The two scopes hold different objects. Therefore the store level pass
+//! complements the orphan byte pass. The store level pass does not replace
+//! it. The orphan byte pass also decides a question that the store level
+//! pass cannot answer. That pass needs a complete scan of the metadata
+//! rows before it can call an application key unreferenced. The store
+//! level pass has no such requirement. It reads no metadata row of this
+//! crate.
 
 use std::{collections::HashSet, sync::Arc, time::Duration};
 
@@ -15,8 +38,10 @@ use crate::fs::store::RecordScan;
 /// The object prefix that holds the file bytes.
 ///
 /// The `UploadSession` and `FileRecord` keys are `files/{id}`. The orphan
-/// byte pass lists only this scope. Therefore the oxkv prefixes in the
-/// same bucket are never touched.
+/// byte pass lists only this scope. Therefore no other application key
+/// family is in reach of that pass. The oxkv prefix of this store is
+/// outside this scope. The store level pass reaches that prefix. The pass
+/// above and the store level pass therefore never look at the same object.
 const FILE_BYTES_PREFIX: &str = "files/";
 
 /// TTL for abandoned sessions and orphaned files.
@@ -35,7 +60,12 @@ pub fn spawn(engine: Arc<FsEngine>) {
     });
 }
 
-/// Runs one sweep for sessions, orphaned files, and orphan S3 bytes.
+/// Runs one sweep for sessions, orphaned files, orphan S3 bytes, and
+/// orphaned store WAL objects.
+///
+/// The function returns the number of application items that the sweep
+/// removed. The store level pass does not add to that number. The two
+/// scopes are separate, and the log of each pass reports its own count.
 ///
 /// The session pass runs under the same per-session lock that `merge_part`
 /// and `complete_upload` take. The pass reads each row again under the lock.
@@ -210,6 +240,34 @@ pub async fn sweep_once(engine: &FsEngine) -> Result<usize, crate::fs::error::Fs
         }
         engine.store.delete_file(&f.id).await?;
         cleaned += 1;
+    }
+
+    // Store-internal WAL orphans. A failed manifest compare-and-swap
+    // leaves a WAL object in storage that the manifest does not list. No
+    // read path can reach that object. The object then costs storage for
+    // the life of the prefix.
+    //
+    // The code runs this pass before the orphan-byte pass. The two passes
+    // cover different scopes. The order between them decides no shared
+    // outcome. The store pass goes first because the byte pass below is
+    // the pass that the module already treats as the last one. A failure
+    // here then leaves the byte pass, and the returns above, untouched.
+    //
+    // The code calls the store on the handle that the engine already
+    // holds. The code must not open a second handle on the same prefix. A
+    // second handle can fence this one on real S3.
+    //
+    // An error here is logged and not propagated. The pass deletes only
+    // unreachable objects. A failure therefore costs storage and not data.
+    // The next hourly sweep tries again.
+    match engine.store.gc_wal_orphans().await {
+        Ok(0) => {}
+        Ok(reclaimed) => {
+            tracing::info!("fs gc reclaimed {reclaimed} orphaned store WAL objects");
+        }
+        Err(e) => {
+            tracing::warn!("fs gc skipping store WAL orphan pass: {e}");
+        }
     }
 
     // Orphan S3 bytes: listed keys that no session record or file record
@@ -1198,6 +1256,195 @@ mod tests {
         assert_eq!(cleaned, 0);
         assert!(engine.store.get_session("old-fail").await?.is_some());
         assert!(engine.store.get_file("old-fail-file").await?.is_some());
+        Ok(())
+    }
+
+    /// Writes one raw object into the backend of a test store.
+    ///
+    /// The call bypasses `oxkv`. A test can therefore plant an object that
+    /// no writer in this crate would produce. That is the only way to
+    /// reproduce the object that a failed manifest compare-and-swap leaves
+    /// behind.
+    async fn put_object(inner: &Arc<dyn object_store::ObjectStore>, path: &str) {
+        use object_store::{ObjectStore as _, PutPayload, path::Path as ObjectPath};
+        inner
+            .put(&ObjectPath::from(path), PutPayload::from("raw".as_bytes()))
+            .await
+            .expect("raw put");
+    }
+
+    /// The store level pass and the orphan byte pass are two scopes. Each
+    /// one runs in the same sweep.
+    ///
+    /// The orphan byte pass lists the `files/` scope of the application. The
+    /// store level pass lists the oxkv prefix of this store. A key in one
+    /// scope is never a candidate for the pass of the other scope. The store
+    /// level pass therefore complements the orphan byte pass. The test fails
+    /// if either pass replaces the other, or if either pass reaches into the
+    /// scope of the other.
+    ///
+    /// The test plants one unlisted WAL object. That object is the whole
+    /// target of the store level pass. A failed manifest compare-and-swap
+    /// creates exactly that object. Nothing can read it afterwards.
+    ///
+    /// The test also plants an `sst/` object and a `manifest.json` value.
+    /// Both have a path that the shape check must reject. The pass would
+    /// destroy live data if it accepted either of them.
+    ///
+    /// `cleaned` stays at 1. The application pass counts its own deletion.
+    /// The store level pass reports its own count in the log. The return
+    /// value of `sweep_once` therefore keeps its old meaning.
+    #[tokio::test]
+    async fn sweep_reclaims_store_wal_orphans_in_their_own_scope() -> anyhow::Result<()> {
+        use object_store::ObjectStore as _;
+        use object_store::memory::InMemory;
+
+        let now = chrono::Utc::now().timestamp();
+        // The application scope. One aged byte that no row references.
+        let s3 = Arc::new(FakeS3::new(
+            vec![ListedKey {
+                key: "files/stray".into(),
+                last_modified: now - TTL_SECS - 3600,
+            }],
+            true,
+        ));
+        let prefix = crate::db::test_prefix("gc-wal-orphan");
+        let inner = Arc::new(InMemory::new()) as Arc<dyn object_store::ObjectStore>;
+        let handle = crate::db::build_test_store_new_session(Arc::clone(&inner), &prefix).await;
+        let store = FsStore::new(handle);
+        let policy = PolicyEngine::init_s3(build_test_store(&format!("{prefix}-p")).await).await?;
+        let engine = FsEngine::from_parts(store, s3.clone(), "b".into(), policy.authorizer());
+        // A live row. The pass must not touch it.
+        engine
+            .store
+            .save_file(&FileRecord {
+                id: "live".into(),
+                name: "l.txt".into(),
+                mimetype: "text/plain".into(),
+                size: 1,
+                s3_key: "files/live".into(),
+                owner_sub: "alice".into(),
+                created_at: now,
+            })
+            .await?;
+
+        // The store scope. One unlisted WAL object, plus two objects that
+        // the shape check must reject.
+        let orphan = format!("{prefix}/e000001/wal/00009999.log");
+        let sst = format!("{prefix}/e000001/sst/L0/000000009.sst");
+        for path in [&orphan, &sst] {
+            put_object(&inner, path).await;
+        }
+
+        let cleaned = sweep_once(&engine).await?;
+        assert_eq!(cleaned, 1, "the store pass must not count into cleaned");
+        assert!(
+            inner
+                .get(&object_store::path::Path::from(orphan.as_str()))
+                .await
+                .is_err(),
+            "the sweep kept an unlisted store WAL object"
+        );
+        assert!(
+            inner
+                .get(&object_store::path::Path::from(sst.as_str()))
+                .await
+                .is_ok(),
+            "the sweep deleted an SST object"
+        );
+        assert!(
+            inner
+                .get(&object_store::path::Path::from(
+                    format!("{prefix}/manifest.json").as_str()
+                ))
+                .await
+                .is_ok(),
+            "the sweep deleted the manifest"
+        );
+        // The application pass ran in the same sweep.
+        assert_eq!(s3.deleted(), vec!["files/stray".to_string()]);
+        assert!(engine.store.get_file("live").await?.is_some());
+        Ok(())
+    }
+
+    /// A failed store level pass must not abort the passes that follow it.
+    ///
+    /// The store level pass runs before the orphan byte pass. An error in
+    /// that pass must therefore stay inside it. The module already requires
+    /// this for the other passes. One failure may not strand the work of a
+    /// whole sweep, because nothing in the sweeper repairs a skipped pass.
+    ///
+    /// The test makes the pass fail for real. `gc_orphans` reads
+    /// `ownership.json` before it deletes anything. A corrupt ownership
+    /// record makes that read fail. A corrupt file is a state that a real
+    /// bucket can hold after an interrupted write. No double is needed.
+    ///
+    /// The test then asserts two facts. The orphan byte pass still deleted
+    /// its aged object. The sweep returned the count of that pass, and not an
+    /// error.
+    #[tokio::test]
+    async fn a_failed_store_wal_pass_does_not_abort_the_later_passes() -> anyhow::Result<()> {
+        use object_store::memory::InMemory;
+
+        let now = chrono::Utc::now().timestamp();
+        let s3 = Arc::new(FakeS3::new(
+            vec![ListedKey {
+                key: "files/stray".into(),
+                last_modified: now - TTL_SECS - 3600,
+            }],
+            true,
+        ));
+        let prefix = crate::db::test_prefix("gc-wal-fail");
+        let inner = Arc::new(InMemory::new()) as Arc<dyn object_store::ObjectStore>;
+        let handle = crate::db::build_test_store_new_session(Arc::clone(&inner), &prefix).await;
+        let store = FsStore::new(handle);
+        let policy = PolicyEngine::init_s3(build_test_store(&format!("{prefix}-p")).await).await?;
+        let engine = FsEngine::from_parts(store, s3.clone(), "b".into(), policy.authorizer());
+        // A fresh row. The file pass skips it, so the file pass writes
+        // nothing. The test then isolates the store pass.
+        engine
+            .store
+            .save_file(&FileRecord {
+                id: "live".into(),
+                name: "l.txt".into(),
+                mimetype: "text/plain".into(),
+                size: 1,
+                s3_key: "files/live".into(),
+                owner_sub: "alice".into(),
+                created_at: now,
+            })
+            .await?;
+        // The ownership record now fails to parse. The pass above must fail
+        // on it.
+        put_object(&inner, &format!("{prefix}/ownership.json")).await;
+        let orphan = format!("{prefix}/e000001/wal/00009999.log");
+        put_object(&inner, &orphan).await;
+
+        let (log, _guard) = capture_warnings();
+        let cleaned = sweep_once(&engine).await?;
+        assert_eq!(
+            cleaned, 1,
+            "a failed store pass took the orphan byte pass with it"
+        );
+        assert_eq!(s3.deleted(), vec!["files/stray".to_string()]);
+        assert!(
+            engine.store.get_file("live").await?.is_some(),
+            "the sweep deleted the row of a file that is not expired"
+        );
+        // The failed pass deleted nothing. The object stays for the next
+        // sweep.
+        assert!(
+            inner
+                .get(&object_store::path::Path::from(orphan.as_str()))
+                .await
+                .is_ok(),
+            "a failed pass still deleted an object"
+        );
+        let logs = String::from_utf8(log.lock().expect("log buffer").clone()).expect("utf8");
+        assert!(
+            logs.contains("skipping store WAL orphan pass"),
+            "the failed pass was not logged:\n{logs}"
+        );
         Ok(())
     }
 }
