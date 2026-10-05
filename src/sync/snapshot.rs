@@ -16,6 +16,38 @@
 //! op resyncs only the affected user or row. The route `/sync/db/` serves
 //! the prefix read-only. A wasm client opens an `OxKvReader` over the
 //! prefix and follows the live manifest.
+//!
+//! # This module never writes a manifest
+//!
+//! `oxkv` writes `{prefix}/manifest.json`. This module never writes it, and
+//! it never parses it. The only use of the object is an existence check in
+//! [`SnapshotManager::load_applied`]. The route in
+//! [`crate::sync::route`] streams the bytes to the client.
+//!
+//! That restraint is a contract, because `oxkv` gives the `sst` list in the
+//! manifest two meanings at once. The list position is the recency. Every
+//! read walks the list in reverse and stops at the first hit. The `seq`
+//! field of `oxkv::SstMeta` records that position, so the order is
+//! recoverable. A sort by key range therefore destroys the recency. It lets
+//! an older segment win a lookup, so a client reads a stale value.
+//!
+//! So no code in this crate may sort, filter, or rewrite those entries. The
+//! engine object names stay immutable, so the route can serve every
+//! non-manifest object with a one-year max-age. `oxkv` never reuses a name
+//! for different bytes. It refuses to overwrite a sequence object that holds
+//! other bytes, and a blob name is the SHA-256 of the value.
+//!
+//! # A reader in `oxkv` 0.9 holds no pin
+//!
+//! `oxkv` 0.9 removed `register_reader`, `unregister_reader`, and
+//! `min_reader_version`. No caller can now ask a writer to keep a segment
+//! alive. The writer instead collects a `WAL` file only after a flush put
+//! every record of that file into an `SST`. A read that loses a segment to a
+//! compaction then runs again against a fresh manifest.
+//!
+//! `open_reader` opens one follower per call. The call then reads one key
+//! and drops the follower. So the call does not need a pin, and the loss of
+//! the pin costs nothing here.
 
 use crate::fs::error::FsError;
 use crate::fs::store::{FileScan, FsStore, KvPages};
@@ -559,6 +591,18 @@ impl SnapshotManager {
     }
 
     /// Reads the WAL coverage marker, or `None` when never built.
+    ///
+    /// The method reads `manifest.json` only to test that the prefix exists.
+    /// The method never parses the bytes. `oxkv` alone writes that object, and
+    /// `oxkv` alone decides the order of its `sst` list. See the module
+    /// documentation.
+    ///
+    /// An error from the follower open is now an error here. `oxkv` 0.7
+    /// opened a follower with an empty manifest when the read of
+    /// `manifest.json` failed. The method then answered `None`. `oxkv` 0.9
+    /// reports that failure instead. A temporary `S3` error then reaches the
+    /// caller as an error. It no longer looks like a prefix that was never
+    /// built.
     pub async fn load_applied(&self, sub: &str) -> Result<Option<u64>, FsError> {
         use object_store::ObjectStore as _;
 
@@ -798,6 +842,17 @@ impl SnapshotManager {
     /// A follower never takes an epoch, so a follower cannot fence the
     /// writer. The shared SST cache keeps repeated opens from downloading the
     /// hot segments again.
+    ///
+    /// `oxkv` 0.9 offers no reader pin. The writer collects a `WAL` file only
+    /// after a flush put every record of that file into an `SST`. A read that
+    /// loses a segment to a compaction then runs again against a fresh
+    /// manifest. The follower therefore sees the live state of the prefix.
+    /// It does not see the state of the moment it opened.
+    ///
+    /// Every caller in this module opens the follower for one short read. So
+    /// one repair per read is enough for the call. A caller that must read a
+    /// stable snapshot needs another mechanism, because `oxkv` 0.9 does not
+    /// provide one.
     async fn open_reader(&self, sub: &str) -> Result<OxKvReader, FsError> {
         let base: std::sync::Arc<dyn object_store::ObjectStore> = self.object_store.clone();
         let storage: std::sync::Arc<dyn oxkv::Storage> = std::sync::Arc::new(base);
