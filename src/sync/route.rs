@@ -7,10 +7,12 @@
 //! pointer. Every object inside the replica prefix has its own address at
 //! `GET /sync/db/{object}`. That route passes the backend `ETag` through
 //! and supports `If-None-Match`. A client then checks for changes through
-//! headers and downloads only the objects that moved. Engine files are
-//! immutable by construction (`Cache-Control: immutable`). The code
-//! revalidates every other object of the prefix
-//! (`Cache-Control: no-cache`).
+//! headers and downloads only the objects that moved. Three names inside the
+//! prefix change under one name (`manifest.json`, `ownership.json`,
+//! `probe/canary`) and are revalidated (`Cache-Control: no-cache`). The
+//! append-only and content-addressed classes (`e{epoch}/sst/*`,
+//! `e{epoch}/wal/*`, `e{epoch}/blob/*`) are immutable by construction
+//! (`Cache-Control: public, max-age=31536000, immutable`).
 
 use actix_web::{
     HttpRequest, HttpResponse, get,
@@ -1308,6 +1310,14 @@ mod tests {
             (format!("test-db/u/{digest}/not-manifest.json"), false),
             // A mutable name below a class directory is a forged name.
             (format!("test-db/u/{digest}/blob/manifest.json"), false),
+            // A mutable name under another subject's prefix is not mutable
+            // for me. This row pins the prefix half of the rule: the
+            // candidate key comes from the caller's own replica prefix, so a
+            // revert that drops that argument fails here.
+            (
+                format!("test-db/u/{}/ownership.json", "c".repeat(64)),
+                false,
+            ),
         ] {
             // Through the SAME function that `object_handler` calls, so a
             // revert of the derivation in production fails this test instead
