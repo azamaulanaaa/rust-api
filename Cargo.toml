@@ -41,7 +41,13 @@ jsonwebtoken = { version = "10.2", features = ["rust_crypto"] }
 openidconnect = { version = "4.0", default-features = false, features = ["reqwest", "rustls-tls"] }
 
 object_store = { version = "0.12", default-features = false, features = ["aws"] }
-oxkv = { version = "0.7", features = ["oxkv", "oxkv-s3", "otel"] }
+# `btree` is named explicitly because oxkv 0.9 re-exports `CachedOxKvStore`,
+# `CachedTx` and `WarmMode` only under
+# `all(feature = "oxkv", feature = "btree")`, and `src/fs/store.rs` builds a
+# `CachedOxKvStore` with `WarmMode::Lazy`. The item resolves today only
+# because the oxkv default feature happens to include `btree`. Naming it here
+# keeps the build correct if that default ever changes.
+oxkv = { version = "0.9", features = ["btree", "oxkv", "oxkv-s3", "otel"] }
 
 opentelemetry = "0.32"
 opentelemetry-otlp = { version = "0.32", optional = true, default-features = false }
