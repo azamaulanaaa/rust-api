@@ -535,7 +535,7 @@ let app = http::apply_limits(App::new())
 HttpServer::new(move || app.clone()).run().await?;
 ```
 
-`svc.configure` returns `Result<_, DuplicateRoutePrefix>`. Each `ApiModule` declares the single prefix it owns, and the code refuses a set that mounts the same prefix twice, before it registers anything. Actix itself cannot report this. A scope matches its whole prefix and the code tries services in registration order, so a second module on the same prefix has its routes silently ignored while its `/prefix/*` requests reach the first module.
+`svc.configure` returns `Result<_, DuplicateRoutePrefix>`. Each `ApiModule` declares the single prefix it owns, and the code refuses a set that mounts the same prefix twice, before it registers anything. Actix itself cannot report this. A scope matches its whole prefix, and the code tries services in registration order. A second module on the same prefix has its routes silently ignored, while its `/prefix/*` requests reach the first module.
 
 The code mounts `http::docs::config` **last** on purpose. A catch-all mount registered ahead of your modules can shadow them.
 
@@ -554,43 +554,43 @@ mise run bans
 mise run cov                              # coverage via cargo llvm-cov
 ```
 
-`mise run build` / `run` / `test` link with zig for local cross builds; CI uses plain `cargo`. The `licenses`/`advisories`/`bans`/`cov` tasks call the underlying cargo plugins directly.
+`mise run build` / `run` / `test` link with zig for local cross builds. CI uses plain `cargo`. The `licenses`/`advisories`/`bans`/`cov` tasks call the underlying cargo plugins directly.
 
-Every public item must carry rustdoc — enforced at compile time via `[lints.rust] missing_docs = "deny"` in `Cargo.toml`, and by a `cargo doc --no-deps` step in CI so unresolved intra-doc links also fail.
+Every public item must carry rustdoc. `Cargo.toml` sets `[lints.rust] missing_docs = "deny"`, so the compiler enforces this at compile time. A `cargo doc --no-deps` step in CI also fails on unresolved intra-doc links.
 
-The composition root is covered too: `http::tests` builds the real served application in-process (via `wired_app!`) and asserts that built-in routes, CORS, the readiness probe, the OpenAPI document, and a registered module's routes are all reachable — no socket required. `docs::tests` additionally checks that every declared path is *mounted*, not merely present in the spec.
-Dependency licensing is enforced via [`cargo-deny`](https://embarkstudios.github.io/cargo-deny/) (`deny.toml`: `licenses` + `advisories` + `bans`); all three run in CI. Note that `bans` is configured with `multiple-versions = "warn"`, so duplicate transitive versions (currently `rand` ×3, `base64` ×3) are reported but do not fail the job.
-`oxkv` 0.9 (`btree` + `oxkv` + `oxkv-s3` + `otel` features) + `object_store` 0.12 (shared `AmazonS3Builder` for file bytes and `OxKvStore`). `btree` is requested explicitly even though the oxkv default feature set includes it: 0.9 re-exports `CachedOxKvStore`, `CachedTx` and `WarmMode` only under `all(feature = "oxkv", feature = "btree")`, and `src/fs/store.rs` builds the `[database].mirror_master` mirror with `CachedOxKvStore::open_with_mode(…, WarmMode::Lazy)`. The item resolves today only because of that default; naming the feature keeps the build correct if the default ever changes.
+Tests also cover the composition root. `http::tests` builds the real served application in-process (via `wired_app!`). It asserts that built-in routes, CORS, the readiness probe, the OpenAPI document, and a registered module's routes are all reachable. No socket required. `docs::tests` additionally checks that every declared path is *mounted*, not merely present in the spec.
+[`cargo-deny`](https://embarkstudios.github.io/cargo-deny/) enforces dependency licensing (`deny.toml`: `licenses` + `advisories` + `bans`). All three run in CI. Note that `deny.toml` configures `bans` with `multiple-versions = "warn"`. Duplicate transitive versions (currently `rand` ×3, `base64` ×3) do not fail the job, and cargo-deny reports them.
+`oxkv` 0.9 (`btree` + `oxkv` + `oxkv-s3` + `otel` features) + `object_store` 0.12 (shared `AmazonS3Builder` for file bytes and `OxKvStore`). The crate requests `btree` explicitly, even though the oxkv default feature set includes it. Version 0.9 re-exports `CachedOxKvStore`, `CachedTx` and `WarmMode` only under `all(feature = "oxkv", feature = "btree")`. `src/fs/store.rs` builds the `[database].mirror_master` mirror with `CachedOxKvStore::open_with_mode(…, WarmMode::Lazy)`. The item resolves today only because of that default. Naming the feature keeps the build correct if the default ever changes.
 
 ### Known unfixable advisories
 
-`mise run advisories` is green, and it is green because of six **documented suppressions** in `deny.toml` — not because the findings are gone. Every one is blocked on a dependency we do not control, so each is recorded with the blocker and the compensating control rather than left to fail the build forever. An advisory that is *not* in that list still fails the check, and `lib::tests::every_ignore_is_justified` fails if an entry is added without a substantive reason (a bare link does not pass).
+`mise run advisories` is green, and it is green because of six **documented suppressions** in `deny.toml` — not because the findings are gone. A dependency we do not control blocks every one of the six. So each suppression records the blocker and the compensating control, rather than leaving the advisory to fail the build forever. An advisory that is *not* in that list still fails the check. `lib::tests::every_ignore_is_justified` also fails if you add an entry without a substantive reason (a bare link does not pass).
 
 | Advisory | Crate | Why the fix is not taken | Exposure today |
 |---|---|---|---|
-| RUSTSEC-2026-0258 | `h2` 0.3.27 | Fixed in `h2 >= 0.4.16`, but every `actix-http` through 3.18.12 requires `h2 ^0.3.27` — no actix-web release can take it | **Real.** `h2` is compiled in (actix-web enables `http2` by default) and reachable by any client speaking `h2c`. Terminate HTTP/2 in front of this process, or bound memory |
-| RUSTSEC-2026-0194 | `quick-xml` 0.38.4 | Fixed in `>= 0.41.0`. Reached only via `object_store`, and `oxkv` 0.9.0 (latest) pins `object_store ^0.12` in its public API | Low — response-parsing DoS; needs a crafted XML body from the S3 origin, which is a configured trusted endpoint |
+| RUSTSEC-2026-0258 | `h2` 0.3.27 | Fixed in `h2 >= 0.4.16`, but every `actix-http` through 3.18.12 requires `h2 ^0.3.27` — no actix-web release can take it | **Real.** actix-web enables `http2` by default, so the build compiles `h2` in. Any client speaking `h2c` can reach it. Terminate HTTP/2 in front of this process, or bound memory |
+| RUSTSEC-2026-0194 | `quick-xml` 0.38.4 | Fixed in `>= 0.41.0`. Reached only via `object_store`, and `oxkv` 0.9.0 (latest) pins `object_store ^0.12` in its public API | Low — response-parsing DoS. It needs a crafted XML body from the S3 origin, which is a configured trusted endpoint |
 | RUSTSEC-2026-0195 | `quick-xml` 0.38.4 | Same upstream block as RUSTSEC-2026-0194: `oxkv` 0.9.0 pins `object_store ^0.12` in its public API | Low — unbounded allocation on the same response path |
-| RUSTSEC-2023-0071 | `rsa` 0.9.10 | **No patched version exists.** | None — the Marvin attack needs RSA *private-key decryption*. We only verify RS256 against JWKS public keys; no RSA signing outside tests, no encrypted ID tokens, no `private_key_jwt` |
-| RUSTSEC-2025-0134 | `rustls-pemfile` 2.2.0 | Unmaintained, not a vulnerability; reached only through `object_store`, so it carries the same `object_store ^0.12` pin through `oxkv` | None — a forwarding shim over `rustls-pki-types` per the advisory |
-| RUSTSEC-2026-0249 | `smartstring` 1.0.1 | Unmaintained; via `casbin` → `rhai`, and `casbin` 2.20.0 is latest | None — `rhai` only ever evaluates `RBAC_MODEL`, a compile-time constant, so no request-derived expression reaches the parser |
+| RUSTSEC-2023-0071 | `rsa` 0.9.10 | **No patched version exists.** | None — the Marvin attack needs RSA *private-key decryption*. We only verify RS256 against JWKS public keys. There is no RSA signing outside tests, no encrypted ID tokens, and no `private_key_jwt` |
+| RUSTSEC-2025-0134 | `rustls-pemfile` 2.2.0 | Unmaintained, not a vulnerability. Only `object_store` reaches it. So it carries the same `object_store ^0.12` pin through `oxkv` | None — a forwarding shim over `rustls-pki-types` per the advisory |
+| RUSTSEC-2026-0249 | `smartstring` 1.0.1 | Unmaintained. It comes via `casbin` → `rhai`, and `casbin` 2.20.0 is latest | None — `rhai` only ever evaluates `RBAC_MODEL`, a compile-time constant, so no request-derived expression reaches the parser |
 
 Two of these are worth an operational note rather than a code change. The `h2` finding is the one to act on: it is genuinely reachable, and the mitigation is deployment-side. And the `rsa` entry is load-bearing on a property of this crate — authorization-code flow with PKCE, no client-assertion signing. Adding `private_key_jwt` would make it live, and this table is where that should be noticed.
 
-Re-examine this list whenever `oxkv`, `actix-web`, or `casbin` moves; the `oxkv` pin is the single blocker holding three of the six.
+Re-examine this list whenever `oxkv`, `actix-web`, or `casbin` moves. The `oxkv` pin is the single blocker holding three of the six.
 
 ## Releases
 
-Release archives are built with [cargo-dist](https://opensource.axo.dev/cargo-dist/), configured in `dist-workspace.toml` (version 0.30.2, `ci = "github"`, no installers) against the `[profile.dist]` in `Cargo.toml`. Targets: `aarch64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu`, `x86_64-pc-windows-msvc`.
+[cargo-dist](https://opensource.axo.dev/cargo-dist/) builds the release archives. Its configuration is in `dist-workspace.toml` (version 0.30.2, `ci = "github"`, no installers), against the `[profile.dist]` in `Cargo.toml`. Targets: `aarch64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu`, `x86_64-pc-windows-msvc`.
 
 ```bash
 mise run dist-plan     # print the artifact plan without building
 mise run dist-build    # build the archives locally into dist/
 ```
 
-The `cargo-dist` tool pin in `mise.toml` must track `cargo-dist-version` in `dist-workspace.toml`. The GitHub release workflow is generated by cargo-dist rather than checked in; run `cargo dist init --ci=github` to (re)create it at the pinned version.
+The `cargo-dist` tool pin in `mise.toml` must track `cargo-dist-version` in `dist-workspace.toml`. cargo-dist generates the GitHub release workflow rather than checking it in. Run `cargo dist init --ci=github` to (re)create it at the pinned version.
 
-Commit messages follow the [Conventional Commits](https://www.conventionalcommits.org/) style. The scope is optional and names the part of the crate that changed, so `feat:`, `fix:`, and `docs:` appear beside scoped subjects such as `chore(deps)!:`, `feat(fs):`, `fix(sync)!:`, and `docs(readme)!:`.
+Commit messages follow the [Conventional Commits](https://www.conventionalcommits.org/) style. The scope is optional, and it names the part of the crate that changed. `feat:`, `fix:`, and `docs:` appear beside scoped subjects such as `chore(deps)!:`, `feat(fs):`, `fix(sync)!:`, and `docs(readme)!:`.
 
 ## License
 
