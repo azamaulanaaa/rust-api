@@ -311,7 +311,7 @@ The code enforces this, not just the documentation. `records::tests::producers_d
 
 ## Configuration
 
-The server is configured with a TOML file passed via `--config`:
+You configure the server with a TOML file. Pass that file with `--config`:
 
 ```toml
 public_address = "http://localhost:8080"   # public base URL used to build OIDC redirects
@@ -375,13 +375,13 @@ Secrets via environment (win over the file when present and non-empty, for secre
 
 ## Production hardening
 
-The binary enforces no rate limits: per-IP throttling on the
-credential and control-plane routes is delegated to the load balancer
-in front of it. The routes that need it are `/auth/*` (login/callback
-are unauthenticated and each callback fans out to JWKS + token
-exchange), `/setup/*` (one-time bootstrap), and `/policy/*` (every
-write is Casbin evaluation work). Data-plane `/fs` and `/sync` reads
-can stay generous. Example for nginx:
+The binary enforces no rate limits. The load balancer in front of it
+handles per-IP throttling on the credential and control-plane routes.
+The routes that need it are `/auth/*` (login and callback need no
+authentication, and each callback fans out to JWKS + token exchange),
+`/setup/*` (one-time bootstrap), and `/policy/*` (every write is Casbin
+evaluation work). Data-plane `/fs` and `/sync` reads can stay
+generous. Example for nginx:
 
 ```nginx
 # 10 req/s burst 20 for auth + setup, 30 req/s burst 50 for policy writes.
@@ -404,7 +404,7 @@ server {
 }
 ```
 
-Tune the rates to your IdP latency and admin headcount; the numbers
+Tune the rates to your IdP latency and admin headcount. The numbers
 above assume an interactive login flow, not machine-to-machine token
 churn. Never expose the binary directly to the internet without this
 (or an equivalent WAF/ingress) layer.
@@ -420,7 +420,7 @@ cargo run -- serve --config config.toml
 
 ### Cost limits
 
-`[limits]` bounds the two places where one request's cost is not bounded by the request. **Both default to off (`0`).** A default limit is a default outage, because the right number depends on your egress budget and your clients' poll interval. Neither of those belongs to this crate, so the crate cannot know them.
+`[limits]` bounds the two places where one request's cost is not bounded by the request. **Both default to off (`0`).** A default limit is a default outage. The right number depends on your egress budget and your clients' poll interval. Neither of those belongs to this crate, so the crate cannot know them.
 
 ```toml
 [limits]
@@ -429,7 +429,7 @@ rate_burst = 120               # defaults to rate_per_minute
 max_concurrent_downloads = 16  # concurrent GET /sync/db/{object}; 0 disables
 ```
 
-`max_concurrent_downloads` is the one that matters. A replica prefix holds oxkv's own files, so `GET /sync/db/{object}` can be a multi-hundred-megabyte SST read. **A rate limit does not bound that**, because an allowed rate can still be in flight all at once. The gate caps concurrency instead. The response *body* holds the permit, not the handler, so a client that opens a read and then stops consuming still occupies its slot until it disconnects. Refusals are `429` inside the uniform error envelope.
+`max_concurrent_downloads` is the one that matters. A replica prefix holds oxkv's own files, so `GET /sync/db/{object}` can be a multi-hundred-megabyte SST read. **A rate limit does not bound that**, because an allowed rate can still be in flight all at once. The gate caps concurrency instead. The response *body* holds the permit, not the handler. Therefore, a client that opens a read and then stops consuming still occupies its slot until it disconnects. Refusals are `429` inside the uniform error envelope.
 
 `rate_per_minute` is a token bucket per peer address. The code installs it as the outermost middleware, so it also covers the routes that a subject-keyed limiter cannot reach. Those routes include `/auth/login`, which makes an outbound round trip to the identity provider, and `/health`, which a load balancer polls hard. Two limitations deserve naming. Buckets key on **address, not subject**, so clients behind one NAT share a budget. That is a fairness property, not a safety one. The concurrency gate, which is the control that matters, keys on nothing at all. The code also evicts idle buckets after ten minutes, so the map cannot grow with IPv6 rotation.
 
@@ -454,13 +454,13 @@ There is no automated backup job and no restore drill in this repository. Both a
 
 #### Readiness
 
-`GET /ready` returns 503 for any of three independent conditions. The policy lock is held, the server lost the single-writer lease, or a primary prefix got fenced. `/health` is liveness and stays 200.
+`GET /ready` returns 503 for any of three independent conditions. A writer holds the policy lock, the server lost the single-writer lease, or a primary prefix got fenced. `/health` is liveness and stays 200.
 
 Wire `/ready` to something that actually acts on it, such as a Kubernetes readiness probe or a load balancer health check. If nothing reads the route and the server only *serves* it, none of the three conditions removes the instance from rotation. The single-writer guarantees above then degrade to "documented" rather than enforced. This matters most for the fencing case, because it fires from a background task, so no client ever sees the error.
 
 #### Telemetry
 
-Traces and metrics go to an OTLP endpoint that `[observability]` configures. The `otlp-http` (default) or `otlp-grpc` cargo feature selects the exporter. `telemetry.rs` has no unit tests and cannot usefully have any. The global subscriber installs once per process, and confirming that spans and metrics actually arrive needs a collector. **Verify it once against a real collector.** A misconfigured exporter fails silently, and you will not find out until you need the traces.
+Traces and metrics go to an OTLP endpoint that `[observability]` configures. The `otlp-http` (default) or `otlp-grpc` cargo feature selects the exporter. `telemetry.rs` has no unit tests and cannot usefully have any. The global subscriber installs once per process. Verifying that spans and metrics actually arrive needs a collector. **Verify it once against a real collector.** A misconfigured exporter fails silently, and you will not find out until you need the traces.
 
 ### Logging & tracing
 
