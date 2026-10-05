@@ -23,10 +23,10 @@
 //! The two scopes hold different objects. Therefore the store level pass
 //! complements the orphan byte pass. The store level pass does not replace
 //! it. The orphan byte pass also decides a question that the store level
-//! pass cannot answer. That pass needs a complete scan of the metadata
-//! rows before it can call an application key unreferenced. The store
-//! level pass has no such requirement. It reads no metadata row of this
-//! crate.
+//! pass cannot answer. The orphan byte pass needs a complete scan of the
+//! metadata rows before it can call an application key unreferenced. The
+//! store level pass has no such requirement. It reads no metadata row of
+//! this crate.
 
 use std::{collections::HashSet, sync::Arc, time::Duration};
 
@@ -1445,6 +1445,232 @@ mod tests {
             logs.contains("skipping store WAL orphan pass"),
             "the failed pass was not logged:\n{logs}"
         );
+        Ok(())
+    }
+
+    /// Reads the `wal` list of the manifest that the store wrote.
+    ///
+    /// The function reads `manifest.json` from the backend. It does not
+    /// read through the store, because the store read path does not
+    /// expose the `wal` list. Every entry is a full prefixed id, so a
+    /// caller can read the object of each entry in the backend.
+    async fn listed_wal_ids(
+        inner: &Arc<dyn object_store::ObjectStore>,
+        prefix: &str,
+    ) -> Vec<String> {
+        use object_store::ObjectStore as _;
+        let raw = inner
+            .get(&object_store::path::Path::from(
+                format!("{prefix}/manifest.json").as_str(),
+            ))
+            .await
+            .expect("the manifest must exist in the backend of a written store");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&raw.bytes().await.expect("manifest bytes"))
+                .expect("the manifest must be JSON");
+        manifest["wal"]
+            .as_array()
+            .map(|ids| {
+                ids.iter()
+                    .filter_map(|id| id.as_str().map(ToString::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// A listed `WAL` object is live data. The pass must keep it.
+    ///
+    /// The sibling test above proves that the pass reclaims an unlisted
+    /// object. That sibling test cannot prove that the pass spares a
+    /// listed object. It reads the row of a live file through the store.
+    /// The read is served from the memtable. The read therefore succeeds
+    /// even if the pass deleted the `WAL` object that holds the
+    /// acknowledged write. The bytes stay in RAM after such a deletion, so
+    /// the read cannot see the loss.
+    ///
+    /// This test makes a real write through the store. Then it reads the
+    /// backend. The backend is the only place where a deleted object is
+    /// visible. The test fails when the write listed no `WAL` id, because a
+    /// test with no listed object proves nothing.
+    ///
+    /// The test plants one unlisted object as well. The sweep must delete
+    /// that object and must keep every listed object.
+    #[tokio::test]
+    async fn sweep_spares_the_listed_store_wal_object() -> anyhow::Result<()> {
+        use object_store::ObjectStore as _;
+        use object_store::memory::InMemory;
+
+        // The application scope is empty. So the count of `sweep_once`
+        // covers the store pass alone.
+        let s3 = Arc::new(FakeS3::new(Vec::new(), true));
+        let prefix = crate::db::test_prefix("gc-wal-listed");
+        let inner = Arc::new(InMemory::new()) as Arc<dyn object_store::ObjectStore>;
+        let handle = crate::db::build_test_store_new_session(Arc::clone(&inner), &prefix).await;
+        let store = FsStore::new(handle);
+        let policy = PolicyEngine::init_s3(build_test_store(&format!("{prefix}-p")).await).await?;
+        let engine = FsEngine::from_parts(store, s3, "b".into(), policy.authorizer());
+
+        // A real write through the store. The write announces a `WAL`
+        // object, and the manifest lists the full prefixed id of that
+        // object.
+        engine
+            .store
+            .save_file(&FileRecord {
+                id: "live".into(),
+                name: "l.txt".into(),
+                mimetype: "text/plain".into(),
+                size: 1,
+                s3_key: "files/live".into(),
+                owner_sub: "alice".into(),
+                created_at: chrono::Utc::now().timestamp(),
+            })
+            .await?;
+
+        // The ids come from the manifest in the backend. Each id must name
+        // an object that the backend holds now.
+        let listed = listed_wal_ids(&inner, &prefix).await;
+        assert!(
+            !listed.is_empty(),
+            "the write through the store listed no WAL object, so the test proves nothing"
+        );
+        for id in &listed {
+            assert!(
+                inner
+                    .get(&object_store::path::Path::from(id.as_str()))
+                    .await
+                    .is_ok(),
+                "the listed WAL object {id} is not in the backend, so the test proves nothing"
+            );
+        }
+
+        // The unlisted object of this scope. Only this object is a target
+        // of the pass.
+        let orphan = format!("{prefix}/e000001/wal/00009999.log");
+        put_object(&inner, &orphan).await;
+
+        assert_eq!(sweep_once(&engine).await?, 0, "the sweep deleted an item");
+        assert!(
+            inner
+                .get(&object_store::path::Path::from(orphan.as_str()))
+                .await
+                .is_err(),
+            "the sweep kept an unlisted store WAL object"
+        );
+        // Every listed object holds an acknowledged write. The backend is
+        // the check, and not the memtable of the store.
+        for id in &listed {
+            assert!(
+                inner
+                    .get(&object_store::path::Path::from(id.as_str()))
+                    .await
+                    .is_ok(),
+                "the sweep deleted the listed WAL object {id} and lost an acknowledged write"
+            );
+        }
+        Ok(())
+    }
+
+    /// A fenced store must reclaim nothing. The pass must keep every
+    /// object.
+    ///
+    /// `gc_orphans` returns 0 when the ownership record of the prefix
+    /// names another session. The current owner can hold a `WAL` object in
+    /// flight. The owner puts the object, then the owner lists the object.
+    /// The object is unlisted during that window. A stale session and a
+    /// stale manifest would then delete a live write. The fenced branch of
+    /// the pass is a safety condition, and not an optimization.
+    ///
+    /// The test fences the store for real. A second session over the same
+    /// prefix and the same backend runs the epoch CAS. That is what a
+    /// second writer does. The test then proves that the store is fenced.
+    /// The assertions below would otherwise pass on a store that no
+    /// takeover ever reached.
+    #[tokio::test]
+    async fn a_fenced_store_reclaims_no_store_wal_object() -> anyhow::Result<()> {
+        use object_store::ObjectStore as _;
+        use object_store::memory::InMemory;
+
+        let prefix = crate::db::test_prefix("gc-wal-fenced");
+        let inner = Arc::new(InMemory::new()) as Arc<dyn object_store::ObjectStore>;
+        let handle = crate::db::build_test_store_new_session(Arc::clone(&inner), &prefix).await;
+        // A latch of this test. The write below records a fencing loss,
+        // so the process wide latch must stay out of this test.
+        let latch: &'static crate::fencing::Latch =
+            Box::leak(Box::new(crate::fencing::Latch::new()));
+        let store = FsStore::primary_with_latch(handle, latch);
+        let policy = PolicyEngine::init_s3(build_test_store(&format!("{prefix}-p")).await).await?;
+        let s3 = Arc::new(FakeS3::new(Vec::new(), true));
+        let engine = FsEngine::from_parts(store, s3, "b".into(), policy.authorizer());
+
+        // A real write before the takeover. The manifest lists the `WAL`
+        // object of that write.
+        engine
+            .store
+            .save_file(&FileRecord {
+                id: "live".into(),
+                name: "l.txt".into(),
+                mimetype: "text/plain".into(),
+                size: 1,
+                s3_key: "files/live".into(),
+                owner_sub: "alice".into(),
+                created_at: chrono::Utc::now().timestamp(),
+            })
+            .await?;
+        let listed = listed_wal_ids(&inner, &prefix).await;
+        assert!(
+            !listed.is_empty(),
+            "the write through the store listed no WAL object, so the test proves nothing"
+        );
+        let orphan = format!("{prefix}/e000001/wal/00009999.log");
+        put_object(&inner, &orphan).await;
+
+        // A second session takes the epoch of the prefix. The holder must
+        // outlive the call below.
+        let _holder = crate::db::build_test_store_new_session(Arc::clone(&inner), &prefix).await;
+
+        // The store lost the epoch. A write on it fails now, so the test
+        // knows that the pass below runs on a fenced store.
+        let err = engine
+            .store
+            .save_file(&FileRecord {
+                id: "after-takeover".into(),
+                name: "a.txt".into(),
+                mimetype: "text/plain".into(),
+                size: 1,
+                s3_key: "files/after-takeover".into(),
+                owner_sub: "alice".into(),
+                created_at: chrono::Utc::now().timestamp(),
+            })
+            .await
+            .expect_err("a write on a fenced store must fail");
+        assert!(
+            err.is_fencing_loss(),
+            "the store was not fenced, so the test proves nothing: {err:?}"
+        );
+
+        assert_eq!(
+            engine.store.gc_wal_orphans().await?,
+            0,
+            "a fenced store must report no reclaimed object"
+        );
+        // The unlisted object stays as well. A fenced pass reaches no
+        // object, listed or unlisted.
+        assert!(
+            inner
+                .get(&object_store::path::Path::from(orphan.as_str()))
+                .await
+                .is_ok(),
+            "a fenced pass deleted an unlisted object"
+        );
+        for id in &listed {
+            assert!(
+                inner
+                    .get(&object_store::path::Path::from(id.as_str()))
+                    .await
+                    .is_ok(),
+                "a fenced pass deleted the listed WAL object {id}"
+            );
+        }
         Ok(())
     }
 }
