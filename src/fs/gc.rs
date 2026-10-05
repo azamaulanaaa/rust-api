@@ -64,7 +64,7 @@ pub fn spawn(engine: Arc<FsEngine>) {
 /// orphaned store WAL objects.
 ///
 /// The function returns the number of application items that the sweep
-/// removed. The store level pass does not add to that number. The two
+/// deleted. The store level pass does not add to that number. The two
 /// scopes are separate, and the log of each pass reports its own count.
 ///
 /// The session pass runs under the same per-session lock that `merge_part`
@@ -257,8 +257,9 @@ pub async fn sweep_once(engine: &FsEngine) -> Result<usize, crate::fs::error::Fs
     // holds. The code must not open a second handle on the same prefix. A
     // second handle can fence this one on real S3.
     //
-    // An error here is logged and not propagated. The pass deletes only
-    // unreachable objects. A failure therefore costs storage and not data.
+    // An error here does not stop the sweep. The code logs the error and
+    // does not propagate it. The pass deletes only unreachable objects. A
+    // failure therefore costs storage and not data.
     // The next hourly sweep tries again.
     match engine.store.gc_wal_orphans().await {
         Ok(0) => {}
@@ -1295,7 +1296,7 @@ mod tests {
     /// The store level pass reports its own count in the log. The return
     /// value of `sweep_once` therefore keeps its old meaning.
     #[tokio::test]
-    async fn sweep_reclaims_store_wal_orphans_in_their_own_scope() -> anyhow::Result<()> {
+    async fn the_sweep_reclaims_wal_orphans_in_their_own_scope() -> anyhow::Result<()> {
         use object_store::ObjectStore as _;
         use object_store::memory::InMemory;
 
@@ -1377,13 +1378,13 @@ mod tests {
     /// The test makes the pass fail for real. `gc_orphans` reads
     /// `ownership.json` before it deletes anything. A corrupt ownership
     /// record makes that read fail. A corrupt file is a state that a real
-    /// bucket can hold after an interrupted write. No double is needed.
+    /// bucket can hold after an interrupted write. The test needs no double.
     ///
     /// The test then asserts two facts. The orphan byte pass still deleted
     /// its aged object. The sweep returned the count of that pass, and not an
     /// error.
     #[tokio::test]
-    async fn a_failed_store_wal_pass_does_not_abort_the_later_passes() -> anyhow::Result<()> {
+    async fn the_sweep_continues_after_the_store_wal_pass_fails() -> anyhow::Result<()> {
         use object_store::memory::InMemory;
 
         let now = chrono::Utc::now().timestamp();
@@ -1483,7 +1484,7 @@ mod tests {
     /// The sibling test above proves that the pass reclaims an unlisted
     /// object. That sibling test cannot prove that the pass spares a
     /// listed object. It reads the row of a live file through the store.
-    /// The read is served from the memtable. The read therefore succeeds
+    /// The read goes to the memtable. The read therefore succeeds
     /// even if the pass deleted the `WAL` object that holds the
     /// acknowledged write. The bytes stay in RAM after such a deletion, so
     /// the read cannot see the loss.
@@ -1496,7 +1497,7 @@ mod tests {
     /// The test plants one unlisted object as well. The sweep must delete
     /// that object and must keep every listed object.
     #[tokio::test]
-    async fn sweep_spares_the_listed_store_wal_object() -> anyhow::Result<()> {
+    async fn the_sweep_spares_the_listed_wal_object() -> anyhow::Result<()> {
         use object_store::ObjectStore as _;
         use object_store::memory::InMemory;
 
@@ -1576,17 +1577,17 @@ mod tests {
     /// `gc_orphans` returns 0 when the ownership record of the prefix
     /// names another session. The current owner can hold a `WAL` object in
     /// flight. The owner puts the object, then the owner lists the object.
-    /// The object is unlisted during that window. A stale session and a
-    /// stale manifest would then delete a live write. The fenced branch of
-    /// the pass is a safety condition, and not an optimization.
+    /// No manifest lists the object during that window. A stale session and a
+    /// stale manifest would then delete a live write. The pass treats its
+    /// fenced branch as a safety condition, not an optimization.
     ///
     /// The test fences the store for real. A second session over the same
     /// prefix and the same backend runs the epoch CAS. That is what a
-    /// second writer does. The test then proves that the store is fenced.
-    /// The assertions below would otherwise pass on a store that no
+    /// second writer does. The test then proves that a takeover fences the
+    /// store. The assertions below would otherwise pass on a store that no
     /// takeover ever reached.
     #[tokio::test]
-    async fn a_fenced_store_reclaims_no_store_wal_object() -> anyhow::Result<()> {
+    async fn the_pass_reclaims_no_object_from_a_fenced_store() -> anyhow::Result<()> {
         use object_store::ObjectStore as _;
         use object_store::memory::InMemory;
 
