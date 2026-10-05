@@ -8,8 +8,9 @@
 //! `GET /sync/db/{object}`. That route passes the backend `ETag` through
 //! and supports `If-None-Match`. A client then checks for changes through
 //! headers and downloads only the objects that moved. Engine files are
-//! immutable by construction (`Cache-Control: immutable`). Only
-//! `manifest.json` is revalidated per commit.
+//! immutable by construction (`Cache-Control: immutable`). The code
+//! revalidates every other object of the prefix
+//! (`Cache-Control: no-cache`).
 
 use actix_web::{
     HttpRequest, HttpResponse, get,
@@ -123,12 +124,38 @@ pub struct SyncAdvanceResponse {
     pub pending: bool,
 }
 
-/// The one replica object that the code revalidates per commit.
+/// The replica object that the engine rewrites on every commit.
 ///
-/// Engine files are immutable by construction. Every build rewrites the
-/// manifest. Caching the manifest is how a client ends up pinned to a
-/// replica state that no longer exists.
+/// The engine bumps this object with a compare-and-set on every commit.
+/// Caching it is how a client ends up pinned to a replica state that no
+/// longer exists.
 const MANIFEST_OBJECT: &str = "manifest.json";
+
+/// The replica object that the engine rewrites on every writer build.
+///
+/// The engine acquires ownership of a prefix by writing this object with a
+/// compare-and-set that raises the epoch. The code opens a writer for every
+/// build. The object therefore changes under one name on every rebuild.
+const OWNERSHIP_OBJECT: &str = "ownership.json";
+
+/// The replica object that the storage probe rewrites under one name.
+///
+/// The storage probe writes this object with `Create` and then with `Update`,
+/// and the two puts carry different bytes. The probe removes the object when
+/// it ends. A reader that asks for the object during a build sees it, so the
+/// code revalidates it.
+const PROBE_CANARY_OBJECT: &str = "probe/canary";
+
+/// The objects of a replica prefix that change under one name.
+///
+/// The engine writes these three names at the top level of the prefix. The
+/// engine never writes any other name twice with different bytes. It refuses
+/// to overwrite a segment object or a log object that holds other bytes. The
+/// name of a blob object is the SHA-256 of its value.
+const MUTABLE_OBJECTS: &[&str] = &[MANIFEST_OBJECT, OWNERSHIP_OBJECT, PROBE_CANARY_OBJECT];
+
+/// The objects of a replica prefix that hold a JSON document.
+const JSON_OBJECTS: &[&str] = &[MANIFEST_OBJECT, OWNERSHIP_OBJECT];
 
 /// Quoted `ETag` for a `GET /sync/status` body.
 ///
@@ -285,8 +312,8 @@ async fn object_handler(
     // `tail == "/manifest.json"` while resolving to the same object as the
     // canonical URL. `object_store`'s `Path::from` drops empty segments, and
     // `/db/{object:.*}` matches on the raw path. Keying the cache policy on
-    // `tail == "manifest.json"` therefore served the one object that this
-    // module documents as revalidated per commit with this header:
+    // `tail == "manifest.json"` therefore served an object that the engine
+    // rewrites on every commit with this header:
     // `Cache-Control: public, max-age=31536000, immutable`: a browser or CDN
     // would then keep that header for a year and never revalidate. The
     // client would stay pinned to the replica state at its first fetch, while
@@ -295,13 +322,16 @@ async fn object_handler(
     // `resolve_object` now rejects empty segments as well, so the alias does
     // not exist. Deriving the cache policy from the resolved key is the second
     // of two independent defences. It is the defence that no other spelling
-    // of the path can go around. `filename()` returns the last segment of
-    // the resolved key. It can name `manifest.json` only for an object that
-    // genuinely IS the manifest. No non-manifest can receive `no-cache` by
-    // forging a name. The manifest cannot receive the immutable header by
-    // hiding a slash.
+    // of the path can go around. The code compares the resolved key with the
+    // replica prefix of the caller, followed by one name from
+    // `MUTABLE_OBJECTS`. Only an object that is genuinely one of those names
+    // receives `no-cache`. No other object receives `no-cache` by forging a
+    // name. No mutable object receives the immutable header through any
+    // spelling of the path.
     let object_path = object_store::path::Path::from(key.as_str());
-    let is_manifest = is_manifest_key(&object_path);
+    let replica_prefix = object_store::path::Path::from(manager.user_prefix(&claims.sub).as_str());
+    let is_mutable = is_mutable_object_key(&object_path, &replica_prefix);
+    let is_json = is_json_object_key(&object_path, &replica_prefix);
 
     // The code takes the permit before it touches the object store. A refused
     // request then costs at most one `get`.
@@ -339,27 +369,62 @@ async fn object_handler(
         // Dropping `out` abandons the unread payload, and that is the point.
         // A not-modified answer has no body to send.
         drop(out);
-        return Ok(object_not_modified(etag.as_deref(), is_manifest));
+        return Ok(object_not_modified(etag.as_deref(), is_mutable, is_json));
     }
-    object_response(out, is_manifest, etag, size, permit)
+    object_response(out, is_mutable, is_json, etag, size, permit)
 }
 
-/// Whether this object is the per-subject replica MANIFEST.
+/// Whether this object changes under one name inside the replica prefix.
 ///
-/// The function derives the answer from the RESOLVED key, not from the raw
-/// request tail. The two can disagree. `resolve_object` used to accept an
-/// empty interior segment, so `GET /sync/db//manifest.json` reached the real
-/// manifest through a different spelling. Keying the mutable and immutable
-/// decision on the raw tail then served that manifest with `immutable,
-/// max-age=31536000`. `resolve_object` now rejects empty segments as well.
-/// Deriving from the resolved key is the property that actually holds, and
-/// this function is the only place where that property lives.
+/// The function derives the answer from the RESOLVED key and from the replica
+/// prefix of the caller. It never reads the raw request tail. The resolved key
+/// and the raw tail can disagree. `resolve_object` used to accept an empty
+/// interior segment, so `GET /sync/db//manifest.json` reached the real manifest
+/// through a different spelling. Keying the mutable and immutable decision on
+/// the raw tail then served that manifest with `immutable, max-age=31536000`.
+/// `resolve_object` now rejects empty segments as well. Deriving from the
+/// resolved key is the property that actually holds, and this function is the
+/// only place where that property lives.
 ///
 /// `Path::from` drops empty segments and normalises separators. Therefore
-/// `filename()` returns the last segment of what the backend will actually
-/// serve.
-fn is_manifest_key(path: &object_store::path::Path) -> bool {
-    path.filename() == Some(MANIFEST_OBJECT)
+/// the comparison sees the key that the backend will actually serve.
+///
+/// The engine writes the objects of a replica prefix under these names:
+/// `manifest.json`, `ownership.json`, `probe/canary`, `e*/sst/*`, `e*/wal/*`,
+/// and `e*/blob/*`. The first three change under one name. The engine never
+/// writes any other name twice with different bytes.
+fn is_mutable_object_key(
+    path: &object_store::path::Path,
+    replica_prefix: &object_store::path::Path,
+) -> bool {
+    is_one_object_of(path, replica_prefix, MUTABLE_OBJECTS)
+}
+
+/// Whether this object holds a JSON document.
+///
+/// The function uses the same derivation as [`is_mutable_object_key`]. The
+/// storage probe canary holds the bytes of the probe, so it is served as an
+/// octet stream even though the code revalidates it.
+fn is_json_object_key(
+    path: &object_store::path::Path,
+    replica_prefix: &object_store::path::Path,
+) -> bool {
+    is_one_object_of(path, replica_prefix, JSON_OBJECTS)
+}
+
+/// Whether `path` is `replica_prefix` followed by one name from `names`.
+///
+/// The function builds the candidate key as one string. `Path::child` treats
+/// a `/` inside its argument as a legal character of a single segment, so it
+/// cannot build the two segment name of the storage probe canary.
+fn is_one_object_of(
+    path: &object_store::path::Path,
+    replica_prefix: &object_store::path::Path,
+    names: &[&str],
+) -> bool {
+    names.iter().any(|name| {
+        path == &object_store::path::Path::from(format!("{}/{name}", replica_prefix.as_ref()))
+    })
 }
 
 /// The `200` response for one replica object, streaming `out`.
@@ -378,7 +443,8 @@ fn is_manifest_key(path: &object_store::path::Path) -> bool {
 /// the size up front, and the immutability caching still works.
 fn object_response(
     out: object_store::GetResult,
-    is_manifest: bool,
+    is_mutable: bool,
+    is_json: bool,
     etag: Option<String>,
     size: u64,
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
@@ -387,7 +453,7 @@ fn object_response(
     if let Some(ref etag) = etag {
         resp.insert_header((ETAG, etag.as_str()));
     }
-    let mut resp = object_cache_headers(resp, is_manifest);
+    let mut resp = object_cache_headers(resp, is_mutable, is_json);
     Ok(resp
         .insert_header((CONTENT_LENGTH, size))
         // The permit travels with the body, so the code holds the slot until
@@ -411,25 +477,29 @@ fn object_response(
 /// object that it fetches without an `If-None-Match`.
 fn object_cache_headers(
     mut resp: actix_web::HttpResponseBuilder,
-    is_manifest: bool,
+    is_mutable: bool,
+    is_json: bool,
 ) -> actix_web::HttpResponseBuilder {
-    if is_manifest {
+    if is_mutable {
         resp.insert_header((CACHE_CONTROL, "no-cache"));
-        resp.insert_header((CONTENT_TYPE, "application/json"));
     } else {
         resp.insert_header((CACHE_CONTROL, "public, max-age=31536000, immutable"));
+    }
+    if is_json {
+        resp.insert_header((CONTENT_TYPE, "application/json"));
+    } else {
         resp.insert_header((CONTENT_TYPE, "application/octet-stream"));
     }
     resp
 }
 
 /// The `304` for a replica object, carrying the headers a `200` would have.
-fn object_not_modified(etag: Option<&str>, is_manifest: bool) -> HttpResponse {
+fn object_not_modified(etag: Option<&str>, is_mutable: bool, is_json: bool) -> HttpResponse {
     let mut resp = HttpResponse::NotModified();
     if let Some(etag) = etag {
         resp.insert_header((ETAG, etag));
     }
-    object_cache_headers(resp, is_manifest).finish()
+    object_cache_headers(resp, is_mutable, is_json).finish()
 }
 
 #[cfg(test)]
@@ -577,7 +647,7 @@ mod tests {
             attributes: object_store::Attributes::new(),
         };
 
-        let resp = object_response(out, false, Some("\"v1\"".into()), SEGMENT, None)
+        let resp = object_response(out, false, false, Some("\"v1\"".into()), SEGMENT, None)
             .expect("building the response must not read the body");
 
         assert_eq!(
@@ -1197,30 +1267,153 @@ mod tests {
     ///
     /// The test is structural, because the property applies to a branch that
     /// the alias can no longer reach. `object_handler` must derive
-    /// `is_manifest` from the `Path::filename()` of the RESOLVED key. Keying
-    /// it on the raw tail is what made `/manifest.json` immutable. Deleting
-    /// the alias alone would leave the same inversion reachable through any
-    /// future path spelling that `Path::from` normalises.
+    /// `is_mutable` from the RESOLVED key and from the replica prefix.
+    /// Keying it on the raw tail is what made `/manifest.json` immutable.
+    /// Deleting the alias alone would leave the same inversion reachable
+    /// through any future path spelling that `Path::from` normalises.
     ///
-    /// The test also pins the direction that matters for safety. A key whose
-    /// filename is not `manifest.json` must NOT receive `no-cache`. The
-    /// derivation from the resolved key must not hand a non-manifest the
-    /// weaker policy.
+    /// The test covers every object class that the engine writes into a
+    /// prefix. The three mutable names must not receive the immutable header,
+    /// because the engine rewrites each of them under one name. The segment,
+    /// log, and blob names must keep the one-year max-age, because the engine
+    /// never writes other bytes under one of those names.
+    ///
+    /// The test also pins the direction that matters for safety. An object
+    /// that is not a mutable name must NOT receive `no-cache`, even when it
+    /// carries a mutable name below its own prefix. The derivation from the
+    /// resolved key must not hand a forged name the weaker policy.
     #[test]
     fn cache_control_follows_the_resolved_key() {
-        for (key, expect_manifest) in [
-            ("test-db/u/abc/manifest.json", true),
+        let digest = "a".repeat(64);
+        let prefix = object_store::path::Path::from(format!("test-db/u/{digest}"));
+        for (key, expect_mutable) in [
+            (format!("test-db/u/{digest}/manifest.json"), true),
+            (format!("test-db/u/{digest}/ownership.json"), true),
+            (format!("test-db/u/{digest}/probe/canary"), true),
+            (
+                format!("test-db/u/{digest}/e000007/sst/L0/000000042.sst"),
+                false,
+            ),
+            (
+                format!("test-db/u/{digest}/e000007/wal/00000042.log"),
+                false,
+            ),
+            (
+                format!("test-db/u/{digest}/e000007/blob/{}", "b".repeat(64)),
+                false,
+            ),
             // An alias that the backend normalises to the same object.
-            ("test-db/u/abc//manifest.json", true),
-            ("test-db/u/abc/sst/seg-0001.sst", false),
-            ("test-db/u/abc/not-manifest.json", false),
-            ("test-db/u/abc/manifest.json.bak", false),
+            (format!("test-db/u/{digest}//manifest.json"), true),
+            (format!("test-db/u/{digest}/manifest.json.bak"), false),
+            (format!("test-db/u/{digest}/not-manifest.json"), false),
+            // A mutable name below a class directory is a forged name.
+            (format!("test-db/u/{digest}/blob/manifest.json"), false),
         ] {
             // Through the SAME function that `object_handler` calls, so a
             // revert of the derivation in production fails this test instead
             // of leaving it green while the inversion returns.
-            let path = object_store::path::Path::from(key);
-            assert_eq!(is_manifest_key(&path), expect_manifest, "{key}");
+            let path = object_store::path::Path::from(key.as_str());
+            assert_eq!(
+                is_mutable_object_key(&path, &prefix),
+                expect_mutable,
+                "{key}"
+            );
         }
+
+        // The two JSON objects hold a JSON document. The probe canary holds
+        // the bytes of the probe, so it stays an octet stream.
+        for (key, expect_json) in [
+            (format!("test-db/u/{digest}/manifest.json"), true),
+            (format!("test-db/u/{digest}/ownership.json"), true),
+            (format!("test-db/u/{digest}/probe/canary"), false),
+            (
+                format!("test-db/u/{digest}/e000007/sst/L0/000000042.sst"),
+                false,
+            ),
+        ] {
+            let path = object_store::path::Path::from(key.as_str());
+            assert_eq!(is_json_object_key(&path, &prefix), expect_json, "{key}");
+        }
+    }
+
+    /// Every mutable object of a prefix asks the client to revalidate.
+    ///
+    /// The test drives the real handler through the real gateway. It writes
+    /// one object of each class into the object store, because the engine
+    /// writes `ownership.json` and the probe canary only for a backend that
+    /// supports conditional writes.
+    ///
+    /// The test pins the fault that it fixes. The branch asked only one
+    /// question, and the answer was "is this the manifest". Every other
+    /// object then received `public, max-age=31536000, immutable`. The
+    /// ownership record is one of those objects, and the engine rewrites it
+    /// on every writer build with a higher epoch. A client or an intermediary
+    /// that honours the header keeps a stale ownership record for a year.
+    #[actix_web::test]
+    async fn every_mutable_object_is_revalidated_and_engine_files_are_not() -> anyhow::Result<()> {
+        use object_store::PutPayload;
+
+        let fx = fixture().await?;
+        let prefix = fx.manager.user_prefix("alice");
+        let store = fx.manager.object_store.clone();
+        for (name, bytes) in [
+            ("manifest.json", &b"{}"[..]),
+            ("ownership.json", &b"{\"epoch\":1}"[..]),
+            ("probe/canary", &b"probe-ok"[..]),
+            ("e000007/sst/L0/000000042.sst", &b"segment"[..]),
+            ("e000007/wal/00000042.log", &b"log"[..]),
+        ] {
+            store
+                .put(
+                    &object_store::path::Path::from(format!("{prefix}/{name}")),
+                    PutPayload::from(bytes.to_vec()),
+                )
+                .await?;
+        }
+
+        let module = SyncApiModule::new(fx.manager.clone(), setup(&fx).await?);
+        let app =
+            actix_web::test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+        for (name, expect_cache, expect_type) in [
+            ("manifest.json", "no-cache", "application/json"),
+            ("ownership.json", "no-cache", "application/json"),
+            ("probe/canary", "no-cache", "application/octet-stream"),
+            (
+                "e000007/sst/L0/000000042.sst",
+                "public, max-age=31536000, immutable",
+                "application/octet-stream",
+            ),
+            (
+                "e000007/wal/00000042.log",
+                "public, max-age=31536000, immutable",
+                "application/octet-stream",
+            ),
+        ] {
+            let res = actix_web::test::call_service(
+                &app,
+                actix_web::test::TestRequest::get()
+                    .uri(&format!("/sync/db/{name}"))
+                    .insert_header(("Cookie", format!("auth_token={token}")))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(res.status(), http::StatusCode::OK, "{name}");
+            assert_eq!(
+                res.headers()
+                    .get(CACHE_CONTROL)
+                    .and_then(|v| v.to_str().ok()),
+                Some(expect_cache),
+                "{name}"
+            );
+            assert_eq!(
+                res.headers()
+                    .get(actix_web::http::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok()),
+                Some(expect_type),
+                "{name}"
+            );
+        }
+        Ok(())
     }
 }

@@ -26,16 +26,18 @@
 //!
 //! That restraint is a contract, because `oxkv` gives the `sst` list in the
 //! manifest two meanings at once. The list position is the recency. Every
-//! read walks the list in reverse and stops at the first hit. The `seq`
-//! field of `oxkv::SstMeta` records that position, so the order is
+//! read walks the list in reverse and stops at the first hit. Each entry of
+//! the list records that position in a `seq` field, so the order is
 //! recoverable. A sort by key range therefore destroys the recency. It lets
 //! an older segment win a lookup, so a client reads a stale value.
 //!
-//! So no code in this crate may sort, filter, or rewrite those entries. The
-//! engine object names stay immutable, so the route can serve every
-//! non-manifest object with a one-year max-age. `oxkv` never reuses a name
+//! So no code in this crate may sort, filter, or rewrite those entries.
+//! The segment names stay immutable, so the route can serve every segment,
+//! log, and blob object with a one-year max-age. `oxkv` never reuses a name
 //! for different bytes. It refuses to overwrite a sequence object that holds
-//! other bytes, and a blob name is the SHA-256 of the value.
+//! other bytes, and a blob name is the SHA-256 of the value. The manifest,
+//! the ownership record, and the storage probe are the exceptions, because
+//! `oxkv` rewrites each of them under one name.
 //!
 //! # A reader in `oxkv` 0.9 holds no pin
 //!
