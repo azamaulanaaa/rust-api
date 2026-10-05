@@ -770,6 +770,30 @@ impl FsStore {
         })
     }
 
+    /// Reclaims the store-internal WAL objects that no manifest lists.
+    ///
+    /// The function deletes a different class of object than the sweeper
+    /// does. A failed manifest compare-and-swap leaves a WAL object in
+    /// storage that no manifest lists. No read path can reach that object.
+    /// The object then costs storage for the life of the prefix.
+    ///
+    /// The function uses the handle that this store already holds. It must
+    /// not open a second handle on the same prefix. A second handle can
+    /// fence this one on real S3.
+    ///
+    /// The function returns the number of reclaimed objects. A fenced store
+    /// returns 0 and deletes nothing. A failed `LIST` or `DELETE` only
+    /// shortens the pass. A later call continues the work.
+    pub async fn gc_wal_orphans(&self) -> Result<usize, FsError> {
+        // The pass deletes objects, but it holds no logical key of this
+        // store. `oxkv` takes its own writer gate inside the call. That
+        // gate serializes the pass against every `oxkv` write on this
+        // handle. The lock here therefore only keeps the handle alive.
+        // The read lock does not block the read path of the engine.
+        let g = self.inner.read().await;
+        g.gc_orphans().await.map_err(|e| self.store_err(e))
+    }
+
     /// Returns the underlying handle, for a paged scan of the whole keyspace.
     ///
     /// [`FsStore::pages`] needs the store itself, and not the `FsStore`
