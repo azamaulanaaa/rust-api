@@ -71,7 +71,7 @@ id = "RUSTSEC-2026-0194"
 reason = """
 quick-xml: quadratic runtime scanning a start tag for duplicate attribute \
 names, a denial-of-service. Fixed in quick-xml >= 0.41.0. quick-xml is reached \
-only through object_store, and oxkv 0.7.0 (the latest release) pins \
+only through object_store, and oxkv 0.9.0 (the latest release) pins \
 object_store ^0.12 in its public API -- \
 OxKvStore::builder().with_object_store() takes Arc<dyn object_store::ObjectStore> \
 -- so object_store cannot be moved off 0.12 without an upstream oxkv release. \
@@ -86,7 +86,7 @@ reason = """
 quick-xml: unbounded namespace-declaration allocation in NsReader, a \
 memory-exhaustion denial of service. Fixed in quick-xml >= 0.41.0. Same \
 upstream block as RUSTSEC-2026-0194: object_store 0.12.5 is the only 0.12.x \
-published, and oxkv 0.7.0 pins object_store ^0.12 in its public API, so the \
+published, and oxkv 0.9.0 pins object_store ^0.12 in its public API, so the \
 fix cannot be taken without an upstream oxkv release. Response-parsing only, \
 from a trusted S3 origin.
 """
@@ -110,7 +110,8 @@ id = "RUSTSEC-2025-0134"
 reason = """
 rustls-pemfile is unmaintained (repository archived August 2025). This is a \
 maintenance signal, not a vulnerability. Reached only through object_store, so \
-it carries the same oxkv ^0.12 pin as the quick-xml entries above. Per the \
+it carries the same object_store ^0.12 pin through oxkv as the quick-xml \
+entries above. Per the \
 advisory the crate is now a thin wrapper over parsing code that lives in \
 rustls-pki-types, so the abandoned surface is a forwarding shim rather than \
 its own crypto.
