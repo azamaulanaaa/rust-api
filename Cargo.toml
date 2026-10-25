@@ -2,7 +2,9 @@
 name = "rust-api"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/azamaulanaaa/rust-api"
 
 # The lib and bin targets are picked up from `src/lib.rs` and `src/main.rs`
 # by cargo's defaults, so no [lib]/[[bin]] table is needed.
@@ -83,3 +85,10 @@ expect_used = "deny"
 [profile.dist]
 inherits = "release"
 lto = "thin"
+
+[[bin]]
+name = "rust-api"
+path = "src/main.rs"
+
+[package.metadata.dist]
+dist = true

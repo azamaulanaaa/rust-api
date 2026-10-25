@@ -1,26 +1,78 @@
 [tools]
 rust = { version = "stable", components = "rust-analyzer" }
-zig = "latest"
-"cargo:cargo-zigbuild" = "latest"
 "cargo:cargo-llvm-cov" = "latest"
 "cargo:cargo-deny" = "latest"
-# Keep in sync with `cargo-dist-version` in dist-workspace.toml.
-"cargo:cargo-dist" = "0.30.2"
+"cargo:cargo-dist" = "0.32.0"
+"cargo:cargo-zigbuild" = "latest"
 
-[tasks]
-# Local builds link with zig; CI and the dist release profile use plain
-# cargo. Only `build`/`run`/`test` go through cargo-zigbuild -- the plugin
-# forwards anything it does not recognize straight to cargo, so wrapping
-# `deny` or `llvm-cov` in it worked by accident and is not written that
-# way anymore.
-build = { run = "cargo-zigbuild build" }
-run = { run = "cargo-zigbuild run" }
-test = { run = "cargo-zigbuild test" }
-cov = { run = "cargo llvm-cov" }
-licenses = { run = "cargo deny check licenses" }
-advisories = { run = "cargo deny check advisories" }
-bans = { run = "cargo deny check bans" }
-# Release artifacts (see dist-workspace.toml). `mise run dist init`
-# regenerates the GitHub release workflow pinned to the same version.
-dist-plan = { run = "cargo dist plan" }
-dist-build = { run = "cargo dist build" }
+[tasks.build]
+run = "cargo-zigbuild build --all-targets --all-features"
+
+[tasks.run]
+run = "cargo-zigbuild run"
+
+[tasks.test]
+run = [
+  "cargo-zigbuild test --all-targets --all-features",
+  "cargo test --doc",
+]
+
+[tasks.cov]
+run = "cargo llvm-cov --all-features --summary-only"
+description = "Print a coverage summary for the test suite"
+
+[tasks.cov-html]
+run = "cargo llvm-cov --all-features --html --open"
+description = "Write an HTML coverage report and open it"
+
+[tasks.fmt]
+run = "cargo fmt --all --check"
+
+[tasks.clippy]
+run = "cargo clippy --all-targets --all-features"
+
+[tasks.lint]
+depends = ["fmt", "clippy"]
+
+[tasks.licenses]
+run = "cargo deny check licenses"
+description = "Every locked dependency's licence must be compatible with MIT OR Apache-2.0"
+
+[tasks.advisories]
+run = "cargo deny check advisories"
+description = "Known vulnerabilities and yanked releases in the resolved graph"
+
+[tasks.bans]
+run = "cargo deny check bans"
+description = "Wildcard dependencies and duplicate versions"
+
+[tasks.deps]
+depends = ["licenses", "advisories", "bans"]
+
+[tasks.msrv]
+run = '''
+floor=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+echo "building against the declared floor: $floor"
+cargo "+$floor" check --all-targets --all-features --locked
+'''
+description = "Build against the declared minimum supported Rust version"
+
+[tasks.doc]
+run = "cargo doc --no-deps --all-features"
+env = { RUSTDOCFLAGS = "-D warnings" }
+
+[tasks.check]
+depends = ["lint", "test", "deps", "msrv", "doc", "dist-check"]
+description = "Run every check CI runs"
+
+[tasks.dist-plan]
+run = "dist plan"
+description = "List the artifacts a release would produce, without building"
+
+[tasks.dist-check]
+run = "dist plan --output-format=human > /dev/null"
+description = "Check that the release plan resolves"
+
+[tasks.dist-build]
+run = "dist build --artifacts=local --target=\"$(rustc -vV | sed -n 's/^host: //p')\""
+description = "Build the release archive for this machine into target/distrib"

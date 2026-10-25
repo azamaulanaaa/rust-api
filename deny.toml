@@ -1,19 +1,12 @@
-# cargo-deny configuration: https://embarkstudios.github.io/cargo-deny/
-#
-# `cargo deny check licenses` verifies every locked dependency's license is
-# compatible with this project's MIT OR Apache-2.0 licensing.
-
 [graph]
 all-features = true
 
 [licenses]
 version = 2
-# Permissive licenses observed across the dependency graph. Anything not on
-# this list (copyleft, proprietary, unknown) fails the check and must be
-# reviewed before being added.
 allow = [
     "MIT",
     "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
     "BSD-1-Clause",
     "BSD-2-Clause",
     "BSD-3-Clause",
@@ -24,35 +17,18 @@ allow = [
     "Unicode-3.0",
     "BSL-1.0",
     "CDLA-Permissive-2.0",
-    # Weak/file-level copyleft compatible with redistribution under
-    # MIT OR Apache-2.0 (source stays available; see README License section).
     "MPL-2.0",
 ]
-# Some crates ship license text without an SPDX expression.
-confidence-threshold = 0.8
+confidence-threshold = 0.9
 
 [bans]
-# Warn when multiple versions of the same crate end up in the tree.
 multiple-versions = "warn"
 wildcards = "deny"
+allow-wildcard-paths = false
 
 [advisories]
 version = 2
-yanked = "warn"
-
-# Known-unfixable advisories, each with the upstream blocker named and a
-# compensating control. Every one of these is blocked on a dependency we do
-# not control, so the honest options were "fail the build forever" or
-# "document why and re-check". These were chosen deliberately and are
-# re-examined whenever a pinned dependency moves; see the "Known unfixable
-# advisories" section of the README for the full table.
-#
-# There is a test (`advisories::every_ignore_is_justified`) that fails if an
-# entry here has no substantive `reason`, because an ignore list that grows
-# silently is how a real vulnerability gets waved through.
-#
-# The one thing this list must never do is hide a *new* finding: an advisory
-# that is not listed below still fails the check.
+yanked = "deny"
 
 [[advisories.ignore]]
 id = "RUSTSEC-2026-0258"
@@ -130,5 +106,38 @@ parser DoS in that path would be exploitable.
 """
 
 [sources]
-unknown-registry = "warn"
-unknown-git = "warn"
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+
+[[advisories.ignore]]
+id = "RUSTSEC-2026-0367"
+reason = """
+zip: insecure preservation of SUID/SGID bits during extraction. Reached only \
+through utoipa-swagger-ui, which extracts bundled static assets at build/runtime \
+for the Swagger UI. No untrusted archive is processed by this application.
+"""
+
+[[advisories.ignore]]
+id = "RUSTSEC-2026-0368"
+reason = """
+zip: symbolic-link path traversal in ZipArchive::extract. Reached only through \
+utoipa-swagger-ui's bundled assets. No attacker-controlled archive is extracted.
+"""
+
+[[advisories.ignore]]
+id = "RUSTSEC-2026-0369"
+reason = """
+zip: Unix permissions applied through symlinks during extraction. Reached only \
+through utoipa-swagger-ui's bundled assets. No attacker-controlled archive is \
+extracted.
+"""
+
+[[advisories.ignore]]
+id = "RUSTSEC-2026-0387"
+reason = """
+crypto-bigint: timing variability in constant-time operations. Reached through \
+jsonwebtoken and openidconnect via elliptic-curve. No patched version is \
+available within the current dependency constraints; RSA/ECDSA verification uses \
+public keys and does not perform secret-dependent operations on attacker input.
+"""
