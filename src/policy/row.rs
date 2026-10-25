@@ -9,8 +9,8 @@ use super::{Action, Authorizer, PolicyError};
 
 /// Row-level authorizer for business entities.
 ///
-/// The object is `{row_type}:{row_id}`, so the policies stay in the form
-/// `sub, obj, act` and need no schema change.
+/// The object is `{row_type}:{row_id}`. The policies stay in the form
+/// `sub, obj, act`. They need no schema change.
 #[async_trait]
 pub trait RowAuthorizer: Send + Sync {
     /// Returns `true` when `sub` may perform `act` on the row.
@@ -22,8 +22,8 @@ pub trait RowAuthorizer: Send + Sync {
         act: Action,
     ) -> Result<bool, PolicyError>;
 
-    /// Like [`RowAuthorizer::authorize_row`], but the function returns an
-    /// error [`PolicyError::AccessDenied`] on denial.
+    /// Like [`RowAuthorizer::authorize_row`], but returns
+    /// [`PolicyError::AccessDenied`] on denial.
     async fn require_row(
         &self,
         sub: &str,
@@ -41,13 +41,13 @@ pub fn row_object(row_type: &str, row_id: &str) -> String {
 /// Row-level checks for business entities.
 ///
 /// The code implements this trait only for [`Authorizer`], the read-only
-/// handle. It also implemented the trait for
+/// handle. The code also implemented the trait for
 /// [`PolicyEngine`](super::PolicyEngine), with an identical body. That impl
 /// existed only because `fs` received the whole engine, and `fs` only
-/// ever reads. The duplication was a second place where a change to the row
-/// object or to the mapping of a denial had to be applied. The impl that
-/// could also write gave a consumer that held the engine no reason to use
-/// the handle that matched its use.
+/// reads. The duplication created a second place to edit. Any edit to the
+/// row object or to the denial mapping had to touch both places. The impl
+/// that could also write gave a consumer that held the engine no reason to
+/// use the handle that matched its use.
 #[async_trait]
 impl RowAuthorizer for Authorizer {
     async fn authorize_row(

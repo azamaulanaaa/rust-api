@@ -1,12 +1,13 @@
 //! One-time bootstrap endpoint. It assigns an authenticated account the
 //! built-in [`SUPERADMIN_ROLE`] while no other superadmin exists.
 //!
-//! A fresh deployment starts with an empty policy store, so nobody can pass
-//! the self-authorization checks on the `/policy` routes. This module closes
-//! that gap. The first authenticated user that calls `POST /setup/admin`
-//! claims the superadmin role. Every later call is a hard conflict (409),
-//! also after a restart, because the claim check and the write share one
-//! lock over the persisted state of the enforcer.
+//! A fresh deployment starts with an empty policy store. Nobody can pass
+//! the self-authorization checks on the `/policy` routes. This module
+//! closes that gap. The first authenticated user that calls
+//! `POST /setup/admin` claims the superadmin role. Every later call is a
+//! hard conflict (409). This holds even after a restart. The claim check
+//! and the write share one lock. That lock covers the persisted state of
+//! the enforcer.
 
 use std::sync::Arc;
 

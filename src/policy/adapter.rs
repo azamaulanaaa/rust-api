@@ -19,7 +19,7 @@ use oxkv::{Direction, GetSet, Store, StoreView, Transaction as _, Validator};
 /// Key prefix separator. The keys have the form `{sec}:{ptype}:{rule-hash}`.
 const SEP: char = ':';
 
-/// Hex-encodes a string so it is safe to embed in a store key.
+/// Encodes a string as hex so it is safe to embed in a store key.
 fn hex_encode(s: &str) -> String {
     s.bytes().map(|b| format!("{b:02x}")).collect()
 }
@@ -79,7 +79,7 @@ where
 pub struct PolicyRuleValidator;
 
 impl PolicyRuleValidator {
-    /// It returns the expected field count of a rule in a section of the RBAC
+    /// Returns the expected field count of a rule in a section of the RBAC
     /// model. The model is defined in
     /// [`PolicyEngine`](super::PolicyEngine). The count is coupled to that
     /// model on purpose. A change to the model requires a check of this
@@ -184,7 +184,7 @@ impl<S: Store> OxkvAdapter<S> {
         Ok(())
     }
 
-    /// It returns `true` when `rule[field_index + i] == field_values[i]` for
+    /// Returns `true` when `rule[field_index + i] == field_values[i]` for
     /// all `i`. It implements the matching semantics of a filtered policy
     /// in casbin.
     fn rule_matches(rule: &[String], field_index: usize, field_values: &[String]) -> bool {
@@ -389,11 +389,11 @@ mod tests {
     /// The reads come from a real `BTreeStore`, so the engine loads
     /// normally. Only the durability step fails. That is exactly when `oxkv`
     /// fences a writer. The test uses a real backend here instead of a
-    /// hand-built error, because the test has to prove that casbin carries
-    /// the `oxkv::StoreError` through `AdapterError` without change. The
-    /// impl `From<casbin::Error> for PolicyError` depends on downcasting
-    /// that box. It would degrade to an opaque 500 as soon as casbin
-    /// flattened the error to a string.
+    /// hand-built error. The test must prove that casbin carries the
+    /// `oxkv::StoreError` through `AdapterError` without change. The impl
+    /// `From<casbin::Error> for PolicyError` depends on downcasting that
+    /// box. It would degrade to an opaque 500 as soon as casbin flattened
+    /// the error to a string.
     struct FencedStore(BTreeStore);
 
     #[async_trait::async_trait]
@@ -480,7 +480,7 @@ mod tests {
     /// process that had stopped being the writer then looked the same as a
     /// process with a flaky store. The condition, the prefix, and the log
     /// query are the same as for `FsError::Fenced`. The classification
-    /// downcasts the box that casbin returns, so this test notices as soon as
+    /// downcasts the box that casbin returns. The test notices as soon as
     /// casbin stops preserving that box.
     ///
     /// The second half of the test asserts against a PRIVATE latch, and not
@@ -489,9 +489,9 @@ mod tests {
     /// `fencing::tests::the_process_wide_signal_is_readable` trips it
     /// unconditionally. Cargo runs the tests in parallel threads in one
     /// binary. The call to `note_primary_loss` could therefore be deleted
-    /// from the casbin `From` impl entirely, and this assertion would still
-    /// pass whenever the fencing test won the race. A test that cannot fail
-    /// is worse than a missing test, because it reads as coverage.
+    /// from the casbin `From` impl entirely. This assertion would still pass
+    /// whenever the fencing test won the race. A test that cannot fail is
+    /// worse than a missing test, because it reads as coverage.
     ///
     /// The code calls `Box::leak` because the field has the type
     /// `&'static`. That matches the way a production engine holds the

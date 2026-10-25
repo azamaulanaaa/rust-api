@@ -1,13 +1,14 @@
-//! HTTP server scaffolding. The crate provides a modular service registry,
-//! the request middleware that every module uses (bearer token extraction,
-//! JWKS-based JWT validation, tracing for each request), and shared body
-//! size limits.
+//! HTTP server scaffolding. The crate provides a modular service registry.
+//! The crate provides the request middleware that every module uses. That
+//! middleware covers bearer token extraction. It covers JWKS-based JWT
+//! validation. It covers tracing for each request. The crate provides
+//! shared body size limits.
 //!
 //! [`ApiService`](crate::http::ApiService) combines
 //! [`ApiModule`](crate::http::ApiModule) implementations into one Actix
-//! application. [`cors`](crate::http::cors) and
-//! [`health`](crate::http::health) hold the edge settings and the probes
-//! that are not specific to one module.
+//! application. [`cors`](crate::http::cors) holds the edge settings.
+//! [`health`](crate::http::health) holds the probes that are not specific
+//! to one module.
 
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
@@ -26,9 +27,9 @@ pub mod middleware;
 
 /// The maximum size of a raw request body. The limit covers 10 MiB
 /// single-part uploads plus headroom. Without this limit, the `Bytes`
-/// extractor uses the actix default of 256 KiB and rejects every documented
+/// extractor uses the actix default of 256 KiB. It rejects every documented
 /// part size with 413. The FS part intake shares this limit. That code
-/// streams `Payload` directly, so it enforces the same absolute ceiling
+/// streams `Payload` directly. It enforces the same absolute ceiling
 /// chunk by chunk.
 pub(crate) const MAX_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 
@@ -45,9 +46,9 @@ const CLIENT_TIMEOUT: Duration = Duration::from_secs(60);
 /// Applies the shared body-size limits to an Actix application.
 ///
 /// The function is separate so that unit tests can check the limits. The
-/// function is public so that a host app that mounts the API in its own
-/// `App` can apply the same limits. See [`ApiService::configure`] for the
-/// full recipe.
+/// function is public. A host app that mounts the API in its own `App`
+/// can apply the same limits. See [`ApiService::configure`] for the full
+/// recipe.
 pub fn apply_limits<T>(app: App<T>) -> App<T>
 where
     T: actix_web::dev::ServiceFactory<
@@ -79,13 +80,13 @@ where
 
 /// Logs a failure that occurs during a streamed response body.
 ///
-/// The response head is already on the wire when a body chunk fails, so the
+/// The response head is already on the wire when a body chunk fails. The
 /// server cannot change the status code. The client then sees a truncated
 /// body and nothing else. This is the only place where the operator can
-/// learn the cause. Every streaming body must pass through this function.
+/// learn the cause. Every streaming body must use this function.
 ///
-/// The function is generic over the error type because the two streaming
-/// sources report different error types.
+/// The function is generic over the error type. The two streaming sources
+/// report different error types.
 /// [`FsError`](crate::fs::error::FsError) reports the errors of file
 /// downloads. `object_store::Error` reports the errors of raw replica
 /// objects. The function logs both error types without translation.
@@ -111,9 +112,9 @@ pub fn health_routes(cfg: &mut web::ServiceConfig) {
 ///
 /// An empty `allowed_origins` disables CORS responses. Only same-origin
 /// requests then succeed. Each origin must be an exact `http(s)` origin
-/// without a trailing slash. The function always allows credentials, so the
+/// without a trailing slash. The function always allows credentials. The
 /// `auth_token` cookie and the `Authorization` bearer header work across
-/// origins. The function exposes the `ETag` and range headers, so the
+/// origins. The function exposes the `ETag` and range headers. The
 /// `/sync/db/*` conditional polls and the `/fs` ranged downloads work from
 /// the browser.
 pub fn cors(allowed_origins: &[String]) -> actix_cors::Cors {
@@ -142,19 +143,19 @@ pub fn cors(allowed_origins: &[String]) -> actix_cors::Cors {
     cors
 }
 
-/// A self-contained unit of the API surface. The unit holds a set of routes,
-/// app data, and middleware. Implement this trait to add business functions
-/// to an [`ApiService`].
+/// A self-contained unit of the API surface. The unit holds a set of routes.
+/// The unit holds app data. The unit holds middleware. Implement this trait
+/// to add business functions to an [`ApiService`].
 pub trait ApiModule: Send + Sync {
     /// The one route prefix that this module owns, for example `/fs`.
     ///
     /// [`ApiService::configure`] uses this value to refuse two modules on
     /// the same prefix. Actix matches services in registration order. A
-    /// scope matches its whole prefix, and not the paths that it declares.
-    /// The first module therefore does not merge the routes of the second
+    /// scope matches its whole prefix. It does not match the paths that it
+    /// declares. The first module does not merge the routes of the second
     /// module. The routes of the second module are unreachable. The result
-    /// is a `404` on a route that the OpenAPI document describes, and that
-    /// a unit test covers when the test mounts only this module.
+    /// is a `404` on a route that the OpenAPI document describes. A unit
+    /// test covers that route when the test mounts only this module.
     ///
     /// Return the empty string for a module that mounts only top-level
     /// routes (`/health`, `/openapi.json`). Such a module still conflicts
@@ -181,7 +182,7 @@ pub struct DuplicateRoutePrefix {
 /// Rejects a module set in which two modules claim the same
 /// [`ApiModule::prefix`].
 ///
-/// The function runs before anything is mounted, so a rejected composition
+/// The function runs before anything is mounted. A rejected composition
 /// leaves no half-registered routes behind.
 fn check_prefixes(modules: &[Box<dyn ApiModule>]) -> Result<(), DuplicateRoutePrefix> {
     let mut seen: Vec<&str> = Vec::with_capacity(modules.len());
@@ -200,9 +201,9 @@ fn check_prefixes(modules: &[Box<dyn ApiModule>]) -> Result<(), DuplicateRoutePr
 /// Mounts the modules and the readiness probe onto a `ServiceConfig`.
 ///
 /// The function cannot fail. [`check_prefixes`] has already rejected all
-/// collisions, and both call sites run it first.
+/// collisions. Both call sites run it first.
 ///
-/// [`ApiService::configure`] and [`wired_app!`] share this function, so the
+/// [`ApiService::configure`] and [`wired_app!`] share this function. The
 /// public path and the served path cannot differ.
 fn register_modules(
     modules: &[Box<dyn ApiModule>],
@@ -222,18 +223,18 @@ fn register_modules(
 ///
 /// The code is a macro, not a function, for one specific reason. The
 /// actix-web `App` type has no nameable public type. A function can
-/// therefore return only an opaque `impl` bound. `HttpServer::new` rejects
-/// that bound, because the bound is weaker than the `IntoServiceFactory`
-/// impl that it needs. Expansion at the call site gives each site the
-/// concrete type inference that it requires. It also keeps one description
-/// of the middleware order and the app data.
+/// return only an opaque `impl` bound. `HttpServer::new` rejects that
+/// bound. The bound is weaker than the `IntoServiceFactory` impl that it
+/// needs. Expansion at the call site gives each site the concrete type
+/// inference that it requires. It also keeps one description of the
+/// middleware order and the app data.
 ///
 /// The macro is internal to this crate. Only this macro mounts the modules
 /// without passing a `Result` through the actix `configure` closures.
 /// Those closures return `()`. Both call sites run [`check_prefixes`]
-/// first, and both report the error correctly. The assertion in this macro
-/// is therefore unreachable. A startup panic is better than a module that
-/// is hidden without a message.
+/// first. Both report the error correctly. The assertion in this macro is
+/// therefore unreachable. A startup panic is better than a module that is
+/// hidden without a message.
 macro_rules! wired_app {
     ($modules:expr, $readiness:expr, $cors_origins:expr, $bucket:expr) => {{
         apply_limits(App::new())
@@ -262,9 +263,9 @@ macro_rules! wired_app {
     }};
 }
 
-/// Completes when the process must shut down. The signal is Ctrl-C on all
-/// platforms. On unix the signal is also SIGTERM, which container
-/// orchestrators send. The function is separate so that the wiring in
+/// Completes when the process must stop. The signal is Ctrl-C on all
+/// platforms. On unix the signal is also SIGTERM. Container orchestrators
+/// send SIGTERM. The function is separate so that the wiring in
 /// [`ApiService::start`] is testable.
 async fn shutdown_signal() {
     #[cfg(unix)]
@@ -290,7 +291,7 @@ async fn shutdown_signal() {
 }
 
 /// The HTTP server. The server combines [`ApiModule`] instances into one
-/// Actix Web application and binds the application to a socket address.
+/// Actix Web application. It binds the application to a socket address.
 pub struct ApiService {
     modules: Vec<Box<dyn ApiModule>>,
     readiness: Option<health::ReadyCheck>,
@@ -336,19 +337,19 @@ impl ApiService {
 
     /// Sets the request-rate limit for each peer address.
     ///
-    /// A value of `per_minute == 0` disables the limit, which is the
+    /// A value of `per_minute == 0` disables the limit. That value is the
     /// default. The middleware is installed as the outermost middleware. It
-    /// therefore also limits the routes that a limiter keyed on the subject
-    /// cannot reach.
+    /// also limits the routes that a limiter keyed on the subject cannot
+    /// reach.
     pub fn with_rate_limit(mut self, bucket: crate::limits::TokenBucket) -> Self {
         self.bucket = bucket;
         self
     }
 
     /// Injects the dependency check that backs `GET /ready`. The server runs
-    /// the check on every probe poll, so the check must be cheap and must not
-    /// block. If no check is present, `/ready` still returns 200 after
-    /// startup has bound the listener. Startup waits for S3/OIDC/JWKS.
+    /// the check on every probe poll. The check must be cheap. The check
+    /// must not block. If no check is present, `/ready` still returns 200
+    /// after startup has bound the listener. Startup waits for S3/OIDC/JWKS.
     pub fn with_readiness_check(mut self, check: health::ReadyCheck) -> Self {
         self.readiness = Some(check);
         self
@@ -358,9 +359,10 @@ impl ApiService {
     /// an existing `web::ServiceConfig`.
     ///
     /// This method is the composable half of [`start`](Self::start). A host
-    /// app needs this method to mount this API inside its own `App` instead
-    /// of giving up the listener. Use this method with the global middleware
-    /// that this module already exposes, which is [`cors`],
+    /// app needs this method to mount this API inside its own `App`. The
+    /// host app keeps the listener. Use this method with the global
+    /// middleware that this module already exposes. That middleware is
+    /// [`cors`],
     /// [`RequestTracingMiddleware`](middleware::request_tracing::RequestTracingMiddleware),
     /// and [`BearerTokenMiddleware`](middleware::bearer_token::BearerTokenMiddleware).
     /// Add [`apply_limits`], [`health_routes`], and [`docs::config`] as
@@ -373,10 +375,10 @@ impl ApiService {
     /// The service deliberately does not offer a method that returns the
     /// assembled `App`. actix-web exposes no nameable public type for it.
     /// `BoxedHttpServiceFactory` is crate-private. Such a signature would
-    /// therefore expose an unnameable `impl` bound that `HttpServer::new`
-    /// rejects. The other option is one dynamic factory for each worker.
-    /// Configuring an `App` that the caller already owns is possible, and it
-    /// is cheaper.
+    /// expose an unnameable `impl` bound. `HttpServer::new` rejects that
+    /// bound. The other option is one dynamic factory for each worker.
+    /// Configuring an `App` that the caller already owns is possible. It is
+    /// cheaper.
     pub fn configure(&self, cfg: &mut web::ServiceConfig) -> Result<(), DuplicateRoutePrefix> {
         check_prefixes(&self.modules)?;
         register_modules(&self.modules, &self.readiness, cfg);
@@ -385,8 +387,8 @@ impl ApiService {
 
     /// Binds the composed application to `addr`. The method serves the
     /// application until a shutdown signal arrives (Ctrl-C or SIGTERM). The
-    /// method then drains the connections within the shutdown timeout before
-    /// it returns.
+    /// method then drains the connections within the shutdown timeout. It
+    /// returns after that.
     pub async fn start(self, addr: SocketAddr) -> anyhow::Result<()> {
         // The check runs before the listener exists, so a bad composition is
         // a startup error that names the prefix. Otherwise the server runs
@@ -446,19 +448,19 @@ mod tests {
         }
     }
 
-    /// Builds the real served application in-process. There is no socket and
-    /// there is no shutdown signal.
+    /// Builds the real served application in-process. There is no socket.
+    /// There is no shutdown signal.
     ///
     /// `wired_app!` exists for this purpose. Before it, only `start()` could
-    /// reach the composition root. The composition root sets CORS, the
-    /// middleware order, readiness, and the mounted modules. No test could
-    /// check any of it.
+    /// reach the composition root. The composition root sets CORS. It sets
+    /// the middleware order. It sets readiness. It sets the mounted
+    /// modules. No test could check any of it.
     ///
     /// The code is a macro, not a helper function. `test::init_service`
-    /// returns a service that uses the `Request` type of actix-http. This
-    /// crate does not depend on actix-http directly, so it cannot name that
-    /// type in a signature. Expansion here keeps the concrete type inferred
-    /// at each use.
+    /// returns a service. That service uses the `Request` type of
+    /// actix-http. This crate does not depend on actix-http directly. It
+    /// cannot name that type in a signature. Expansion here keeps the
+    /// concrete type inferred at each use.
     macro_rules! served {
         ($service:expr) => {{
             test::init_service(wired_app!(

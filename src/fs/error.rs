@@ -83,7 +83,7 @@ pub enum FsError {
 impl From<oxkv::StoreError> for FsError {
     /// The only place that classifies an `oxkv` error.
     ///
-    /// Every conversion into `FsError` must go through here.
+    /// Every conversion into `FsError` must use this implementation.
     /// The `store_err` helpers in `fs::store` and `sync::snapshot` are
     /// part of this rule.
     /// Without this rule, a fencing loss becomes [`Store`](Self::Store)

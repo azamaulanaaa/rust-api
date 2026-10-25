@@ -1,11 +1,11 @@
 //! Actix middleware that extracts the `Authorization: Bearer <token>`
 //! header.
 //!
-//! The middleware runs globally, and it is deliberately permissive. It
-//! parses the header and puts the raw string into the request extensions.
-//! It leaves every accept or reject decision to the downstream
+//! The middleware runs globally. It is deliberately permissive. It parses
+//! the header. It puts the raw string into the request extensions. It
+//! leaves every accept or reject decision to the downstream
 //! [`JwtClaimsMiddleware`](crate::http::middleware::jwt::JwtClaimsMiddleware).
-//! A request that sends no header passes through unchanged.
+//! A request that sends no header proceeds unchanged.
 
 use std::{
     future::{Ready, ready},
@@ -21,7 +21,7 @@ use futures_util::future::LocalBoxFuture;
 
 /// The Actix transform that extracts a bearer token from the
 /// `Authorization: Bearer <token>` header. The transform puts the token
-/// into the request extensions, so a downstream service can use it.
+/// into the request extensions. A downstream service can use it.
 pub struct BearerTokenMiddleware;
 
 impl<S, B> Transform<S, ServiceRequest> for BearerTokenMiddleware
@@ -36,8 +36,8 @@ where
     type InitError = ();
     type Future = Ready<Result<Self::Transform, Self::InitError>>;
 
-    /// Wraps `service` so that every request that passes through it has its
-    /// bearer token extracted into the extensions.
+    /// Wraps `service`. Every request that it handles has its bearer
+    /// token extracted into the extensions.
     fn new_transform(&self, service: S) -> Self::Future {
         ready(Ok(BearerTokenMiddlewareService {
             service: Rc::new(service),
@@ -97,10 +97,10 @@ fn extract_bearer_token(req: &ServiceRequest) -> Option<BearerToken> {
 /// Splits `auth_str` into its scheme and its token. The function accepts
 /// any casing of `Bearer`, as RFC 7235 requires.
 ///
-/// The function returns the token exactly as it received it, and does not
-/// trim it. Therefore a value such as `"Bearer  abc"` keeps its leading
-/// space. Only the validator can decide whether such a value is acceptable,
-/// not the extractor.
+/// The function returns the token exactly as it received it. The function
+/// does not trim it. Therefore a value such as `"Bearer  abc"` keeps its
+/// leading space. Only the validator can decide whether such a value is
+/// acceptable. The extractor cannot.
 fn parse_bearer_token(auth_str: &str) -> Option<BearerToken> {
     let mut parts = auth_str.splitn(2, ' ');
     match (parts.next(), parts.next()) {

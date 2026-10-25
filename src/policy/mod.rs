@@ -115,7 +115,7 @@ pub enum PolicyError {
 const POLICY_PREFIX: &str = "{db}/policy";
 
 impl PolicyError {
-    /// It returns `true` when this error is a lost epoch. That condition means
+    /// Returns `true` when this error is a lost epoch. That condition means
     /// that another writer took the prefix.
     ///
     /// A policy write calls this function to detect that the write failed
@@ -303,10 +303,10 @@ impl PolicyEngine {
 
     /// Classifies a casbin failure against THIS engine's latch.
     ///
-    /// Every casbin call in this module goes through this function. It does
-    /// not use `?` to go straight into [`PolicyError::from`], because the
-    /// `From` impl has no engine in scope and can therefore only reach the
-    /// process-wide latch.
+    /// Every casbin call in this module goes through this function.
+    /// It does not use `?` to go straight into [`PolicyError::from`].
+    /// The `From` impl has no engine in scope.
+    /// It can therefore only reach the process-wide latch.
     /// Production behaviour is identical, because the latch of the engine
     /// *is* [`process_latch`](crate::fencing::process_latch).
     fn classify(&self, e: casbin::Error) -> PolicyError {
@@ -461,7 +461,7 @@ impl PolicyEngine {
 
     /// Grants [`SUPERADMIN_ROLE`] full management rights over policy rules
     /// and group membership. It runs more than once without changing the
-    /// result. It returns the newly added `(obj, act)` pairs. The caller
+    /// result. Returns the newly added `(obj, act)` pairs. The caller
     /// must hold the write lock of the enforcer, so that the bootstrap check
     /// and the seed share one critical section.
     ///
@@ -556,7 +556,7 @@ impl PolicyEngine {
     }
 
     /// Removes every membership link that points at `group`. The function
-    /// deletes the group in effect. It returns `false` when the group holds
+    /// deletes the group in effect. Returns `false` when the group holds
     /// no members.
     pub async fn delete_group(&self, group: &str) -> Result<bool, PolicyError> {
         let mut ef = self.enforcer.write().await;
@@ -632,7 +632,7 @@ impl PolicyEngine {
         }
     }
 
-    /// Non-blocking liveness probe. It returns `true` when the write lock of
+    /// Non-blocking liveness probe. Returns `true` when the write lock of
     /// the enforcer is free.
     ///
     /// The only sanctioned way to inspect the enforcer from outside. It backs
@@ -695,13 +695,13 @@ impl Authorizer {
         }
     }
 
-    /// Read-only method. It returns the users in a group.
+    /// Read-only method. Returns the users in a group.
     pub async fn get_users_in_group(&self, group: &str) -> Vec<String> {
         let ef = self.enforcer.read().await;
         ef.get_users_for_role(group, None)
     }
 
-    /// Read-only method. It returns the groups of a user.
+    /// Read-only method. Returns the groups of a user.
     pub async fn get_groups_of_user(&self, user_id: &str) -> Vec<String> {
         let ef = self.enforcer.read().await;
         ef.get_roles_for_user(user_id, None)

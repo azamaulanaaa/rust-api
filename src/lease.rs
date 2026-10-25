@@ -994,7 +994,7 @@ mod tests {
         }
     }
 
-    /// The displaced writer must find out on its next renewal, and it must set
+    /// The displaced writer must discover the loss on its next renewal, and it must set
     /// itself unready. That is the half that makes this a lease instead of
     /// an assertion at startup.
     #[tokio::test]
@@ -1028,7 +1028,7 @@ mod tests {
         assert!(!first.renew().await);
     }
 
-    /// Renewal keeps a live lease alive, so a process that runs for a long
+    /// Renewal keeps a live lease alive. So a process that runs for a long
     /// time is never displaced by a peer that saw a stale record.
     #[tokio::test]
     async fn renewal_keeps_a_healthy_lease() {
@@ -1228,7 +1228,7 @@ mod tests {
     /// bound. `StuckStore` never answers `get`. That is what an
     /// unreachable S3 looks like from here.
     #[tokio::test]
-    async fn a_stalled_release_gives_up_rather_than_blocking_shutdown() {
+    async fn a_stalled_release_abandons_rather_than_blocking_shutdown() {
         let prefix = "lease-test-stalled-release";
         let now = chrono::Utc::now().timestamp();
         let record = LeaseRecord {

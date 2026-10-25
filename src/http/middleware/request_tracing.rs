@@ -62,8 +62,8 @@ impl opentelemetry::propagation::Extractor for HeaderExtractor<'_> {
 
 /// The middleware factory that installs a tracing span for each request.
 ///
-/// Register it as the outermost middleware, so that the activity of the
-/// downstream handler and middleware nests inside the request span.
+/// Register it as the outermost middleware. The activity of the
+/// downstream handler and middleware then nests inside the request span.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct RequestTracingMiddleware;
 

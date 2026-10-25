@@ -178,7 +178,7 @@ fn policy_action_name(action: &PolicyAction) -> &'static str {
 /// writer.
 async fn run_policy_command(action: PolicyAction) -> anyhow::Result<()> {
     let purpose = policy_action_name(&action);
-    // Both values come out before the match that takes the action. So
+    // Both values appear before the match that takes the action. So
     // each branch below uses the path that it was given, instead of an
     // `Option` that the code builds again from the enum.
     let file = match &action {
@@ -436,7 +436,7 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
 
     // This is the orderly release, and the code awaits it. `start` returns
     // on SIGTERM, which is the path that drains the server. So this is the
-    // place where the lease must go back. Dropping the guard only *makes*
+    // place where the lease must return. Dropping the guard only *makes*
     // the release runnable. The runtime that would poll the release is about
     // to be dropped too. Code that skipped this left the record in place. So
     // a replacement pod read it as a live lease. The pod then entered
@@ -467,8 +467,8 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
 /// The failure that the message prevents is invisible from the command
 /// line. The command opens a second writer handle. The server is fenced.
 ///    The server drains on its next write to the policy, through a latch that
-/// nothing clears. A command that exits with a status that is not zero and
-/// prints this text has changed nothing.
+/// nothing clears. A command that exits with a non-zero status and prints
+/// this text changes nothing.
 fn lease_refused_message(purpose: &str, db_prefix: &str) -> String {
     format!(
         "cannot run `{purpose}`: it opens a second writer handle on \
@@ -535,9 +535,9 @@ async fn claim_writer_lease(
     Ok((lost, Some(guard)))
 }
 
-/// The main code of the crate had no test, so the code most likely to fail
-/// without a report was in the three pure functions here. Those three
-/// functions had no test at all.
+/// The main code of the crate had no test. So the code most likely to fail
+/// without a report sat in the three pure functions here. Those functions
+/// had no test at all.
 #[cfg(test)]
 mod tests {
     use super::*;
