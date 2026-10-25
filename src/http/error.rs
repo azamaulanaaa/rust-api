@@ -1,9 +1,9 @@
 //! The shared API error type that renders one uniform JSON error envelope.
 //!
-//! Every API failure serializes as `{"error": "<message>"}`, where the
-//! message is a stable description that contains no sensitive data. The
+//! Every API failure serializes as `{"error": "<message>"}`. The message is
+//! a stable description. The description contains no sensitive data. The
 //! response renderer attaches the underlying causes through
-//! [`std::error::Error::source`] and logs them on the server. The renderer
+//! [`std::error::Error::source`]. It logs them on the server. The renderer
 //! never sends the causes to a client.
 
 use actix_web::{HttpResponse, ResponseError, http::StatusCode};
@@ -12,9 +12,9 @@ use thiserror::Error;
 
 /// The wire format for every API error: `{"error": "<message>"}`.
 ///
-/// The type also derives `Deserialize`, so a test can check the served body
-/// through this type instead of an anonymous `serde_json::Value`. That way a
-/// test confirms that the wire format really has this shape.
+/// The type also derives `Deserialize`. A test can check the served body
+/// through this type instead of an anonymous `serde_json::Value`. That way
+/// a test confirms that the wire format really has this shape.
 #[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ErrorBody {
     /// A stable description of the failure. The description contains no
@@ -41,8 +41,8 @@ pub enum ApiError {
     ///
     /// This variant exists because the actix JSON extractor fails with a
     /// bare `400 Bad Request` in `text/plain`. That is the one way a
-    /// documented route answers outside the uniform envelope, and any
-    /// client that sends a truncated or mistyped payload reaches it.
+    /// documented route answers outside the uniform envelope. Any client
+    /// that sends a truncated or mistyped payload reaches it.
     /// [`apply_limits`](crate::http::apply_limits) installs this variant as
     /// the error handler of the extractor. The extractor message names the
     /// offending field. The server logs the message and never sends it.
@@ -90,11 +90,11 @@ impl ApiError {
 
     /// Renders the uniform envelope for any status and message.
     ///
-    /// The function is the only place that builds the body, so a status
+    /// The function is the only place that builds the body. A status
     /// cannot receive a body of a different shape. [`FsError`] renders
     /// through this function too. `FsError` is a second `ResponseError`
-    /// implementation in this crate with its own status table. It used to
-    /// build its body with a bare `json!` macro, so the served shape for
+    /// implementation in this crate. It has its own status table. It used
+    /// to build its body with a bare `json!` macro. The served shape for
     /// `/fs` and `/sync` was an anonymous value. The OpenAPI document
     /// described that value as [`ErrorBody`] by convention only. The
     /// function now builds an [`ErrorBody`] directly.
@@ -129,11 +129,11 @@ mod tests {
 
     /// Reads the production code of a source file and drops the comment
     /// lines, with [`crate::test_support::production_source`]. Every such
-    /// guard shares this one helper, and no file needs a copy of it.
+    /// guard shares this one helper. No file needs a copy of it.
     ///
-    /// The walk stops at a `#[cfg(test)]` that opens a `mod`, and not at the
-    /// attribute alone. The attribute also marks test-only items, and this
-    /// walk reads every file under `src`. Therefore, matching the attribute
+    /// The walk stops at a `#[cfg(test)]` that opens a `mod`. It does not
+    /// stop at the attribute alone. The attribute also marks test-only
+    /// items. This walk reads every file under `src`. Matching the attribute
     /// after `trim_start` would stop at the first indented one. `limits.rs`
     /// carries two. Matching the attribute at column 0 alone would stop at
     /// a column-0 item attribute. `src/db.rs` carries three before its real
@@ -145,16 +145,16 @@ mod tests {
     /// This crate has two `ResponseError` implementations. `ApiError` serves
     /// control-plane failures. `FsError` serves the larger set of errors of
     /// the file engine. `FsError` used to build its own body with a bare
-    /// `json!` macro. Both types then produced identical bytes, and that is
+    /// `json!` macro. Both types then produced identical bytes. That is
     /// exactly the problem. The OpenAPI document described every error as
-    /// `ErrorBody`, but `/fs` and `/sync` served an anonymous value that
+    /// `ErrorBody`. `/fs` and `/sync` served an anonymous value. That value
     /// matched the schema only by convention. No test could tell the two
     /// apart.
     ///
     /// The test therefore checks the duplication in the source structure
     /// instead. A test of the behavior cannot work here. Writing such a
-    /// test would be worse than no test, because it would read as coverage
-    /// of a property that it does not have.
+    /// test would be worse than no test. It would read as coverage of a
+    /// property that it does not have.
     #[test]
     fn the_envelope_has_one_construction_site() {
         fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
@@ -226,7 +226,7 @@ mod tests {
         );
     }
 
-    /// Every variant renders a fixed string, so no request-derived payload
+    /// Every variant renders a fixed string. No request-derived payload
     /// can reach the wire through the envelope. The file engine holds the
     /// same rule. See `FsError::client_message`. This test fixes the API
     /// side.

@@ -971,7 +971,7 @@ mod tests {
     /// The master and replica split is the whole point of the latch.
     /// This test checks the half that a test can assert without the
     /// process-wide signal.
-    /// `sync` recovers a replica write that loses a build race, so a latch
+    /// `sync` recovers a replica write that loses a build race. A latch
     /// would pull a healthy server out of rotation for an event that does
     /// not matter.
     /// A failure on the master that is not a fencing loss is a plain 500.

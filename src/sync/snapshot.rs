@@ -365,8 +365,8 @@ pub struct SnapshotDeps {
     pub object_store: std::sync::Arc<dyn object_store::ObjectStore>,
     /// Rebuild queue, shared with the [`BuildPool`] that drains it.
     ///
-    /// The caller passes the queue instead of the code creating it here, so
-    /// the host can hold the receiving end and choose when to start the
+    /// The caller passes the queue instead of the code creating it here. The
+    /// host then holds the receiving end and chooses when to start the
     /// background work. See [`BuildQueue::new`].
     pub builds: BuildQueue,
 }
@@ -1144,8 +1144,8 @@ impl SnapshotManager {
     /// for (obj, act) in self.policy.rules_for_subject(group).await { … }
     /// ```
     ///
-    /// [`Authorizer::rules_for_subject`] reads direct `p` rules, which are
-    /// the rules whose `p.sub` is literally `group`. For `alice ∈ editors ∈
+    /// [`Authorizer::rules_for_subject`] reads direct `p` rules. Those rules
+    /// have `p.sub` literally `group`. For `alice ∈ editors ∈
     /// staff` with `p, staff, invoice:1, read`, that read returned nothing
     /// for `editors`. A replay of `WalOp::GroupAdd { user: alice, group:
     /// editors }` then resynced no rows. The file that `enforce` would have
@@ -1200,8 +1200,9 @@ impl SnapshotManager {
     /// The method makes one pass over the master listing. The record in hand
     /// answers the owner check, with no second read. One rows scan then
     /// serves the visibility check and the attach loop. The old code instead
-    /// paid one re-read and two full-store scans for each file, one inside
-    /// `can_read` and one for the attach, on top of the listing itself.
+    /// paid one re-read and two full-store scans for each file. One scan ran
+    /// inside `can_read`. One scan ran for the attach. Both ran on top of the
+    /// listing itself.
     ///
     /// The method returns the keys that the walk could not decode. The caller
     /// uses that list as the cue to refuse the diff. `dst` is deliberately
@@ -1509,7 +1510,7 @@ mod tests {
     /// The rebuild performs a merge join. The filtered master walk is the
     /// desired side. The replica is the live side. The join deletes a key
     /// that is present only on the live side. A `fs:files:{id}:meta` row
-    /// that fails to decode is skipped by `next_file`. The walk then cannot
+    /// that fails to decode. `next_file` skips that row. The walk then cannot
     /// see that row. The join then reads "master no longer has this file".
     /// The join then deletes the metadata row of that file, and its relation
     /// rows, from the replica of the user. The master still holds them.
@@ -1746,7 +1747,7 @@ mod tests {
     /// disconnect abandons. The handler future is dropped with the claim
     /// inserted and with no release executed.
     ///
-    /// The helper returns `true` once the future has stopped. The caller then
+    /// The helper returns `true` once the future stops. The caller then
     /// knows that the claim was live at the drop. Without that value, the test
     /// could assert against a future that ran to the end and released on its
     /// own.
@@ -2259,7 +2260,7 @@ mod tests {
     /// ```
     ///
     /// The old code called `rules_for_subject("editors")` and found no `p`
-    /// row, because the grant names `staff`. The old code then resynced
+    /// row. The grant names `staff`. The old code then resynced
     /// nothing and left the file out of the replica of alice. `enforce`
     /// authorized the file at the same time. The full rebuild would have
     /// included it, because that rebuild routes every file through
@@ -2317,9 +2318,9 @@ mod tests {
     /// that an ancestor does NOT hold.
     ///
     /// The transitive widening is sound only if the rows of the group still
-    /// come through, and only if the answer stays inside what the hierarchy
-    /// actually grants. The test pins both halves. That keeps a future
-    /// shortcut that returns everything from passing.
+    /// come through. It is also sound only if the answer stays inside what
+    /// the hierarchy actually grants. The test pins both halves. That keeps
+    /// a future shortcut that returns everything from passing.
     #[tokio::test]
     async fn a_membership_op_still_resolves_the_groups_own_rules() -> anyhow::Result<()> {
         let (mgr, policy, mem) = test_manager().await;

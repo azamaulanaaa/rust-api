@@ -48,8 +48,8 @@ use serde::{Deserialize, Serialize};
 /// `list_files`. The pass for orphan bytes then deletes the object that the
 /// row still describes. So a field whose absence has an honest value carries
 /// `#[serde(default)]`. A field whose absence means that the record points at
-/// the wrong place, or has passed the age for collection on purpose, does
-/// not carry a default:
+/// the wrong place does not carry a default. The same holds when the field
+/// has passed the age for collection on purpose.
 ///
 /// - `id` and `s3_key` identify the row and the bytes that it owns. `id` is
 ///   already in the key, but a default of `""` would describe no object.
@@ -325,12 +325,12 @@ mod tests {
     /// field" and "no stored record can be read" is a default on that field.
     /// An unreadable file row does nothing quietly. The row drops out of
     /// `list_files`. The sweeper then reads the object of that row as one
-    /// that nothing uses, and it deletes the bytes of a file that the
-    /// metadata still describes. So the set of fields with a default is
-    /// deliberate, not a blanket. `id`, `s3_key`, `size`, and `created_at`
-    /// stay required, because a default on one of them points at the wrong
-    /// object, or reports the wrong length, or makes the record old enough
-    /// for collection at once.
+    /// that nothing uses. It deletes the bytes of a file that the metadata
+    /// still describes. So the set of fields with a default is deliberate,
+    /// not a blanket. `id`, `s3_key`, `size`, and `created_at` stay
+    /// required. A default on one of them points at the wrong object. It
+    /// can report the wrong length. It can make the record old enough for
+    /// collection at once.
     #[test]
     fn an_added_field_does_not_orphan_an_existing_row() {
         // A row as an older version wrote it. The row has no `name`, no

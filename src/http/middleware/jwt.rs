@@ -4,7 +4,7 @@
 //! The code puts the validated claims (generic over `C`) into the request
 //! extensions. Read the claims with
 //! [`Validated`](crate::http::middleware::jwt::Validated). A request that
-//! sends no token passes through unchanged, so each route decides its own
+//! sends no token proceeds unchanged. Each route decides its own
 //! authentication requirements.
 
 use std::{
@@ -39,28 +39,26 @@ const TENANT_PLACEHOLDER: &str = "{tenantid}";
 const AUTH_COOKIE: &str = "auth_token";
 
 /// A template for a multi-tenant issuer. The discovery document of the
-/// provider publishes an issuer that contains the literal placeholder
-/// `{tenantid}`. Each token resolves the placeholder to the tenant that
-/// issued it.
+/// provider publishes an issuer. That issuer contains the literal
+/// placeholder `{tenantid}`. Each token resolves the placeholder to the
+/// tenant that issued it.
 ///
 /// # Why the allowlist is not optional
 ///
-/// The expected issuer must come from the `tid` claim of the token itself,
-/// because the claim is not verified. No static issuer can match an issuer
-/// that contains a placeholder. The derivation therefore proves nothing,
-/// because it uses data that an attacker supplied. Any token whose `iss` and
-/// `tid` claims agree satisfies it. Signature validation does not help
-/// either. A multi-tenant app registration publishes one JWKS with the keys
-/// of every tenant. Therefore a token that a tenant the operator never
-/// intended to trust signed verifies against keys that this store already
-/// caches.
+/// The expected issuer must come from the `tid` claim of the token itself.
+/// The claim is not verified. No static issuer can match an issuer that
+/// contains a placeholder. The derivation proves nothing. It uses data that
+/// an attacker supplied. Any token whose `iss` and `tid` claims agree
+/// satisfies it. Signature validation does not help. A multi-tenant app
+/// registration publishes one JWKS. That JWKS holds the keys of every
+/// tenant. Therefore a token that a tenant the operator never intended to
+/// trust signed verifies against keys that this store already caches.
 ///
-/// Audience is **not** a substitute. The `aud` claim is the client ID, and
-/// that ID is the same for every tenant that consented to the app
-/// registration. The allowlist is therefore the only tenant gate, and it
-/// fails closed. An empty allowlist accepts no tenant at all, and
-/// `Config::validate` refuses to start a templated issuer without an
-/// allowlist.
+/// Audience is **not** a substitute. The `aud` claim is the client ID.
+/// That ID is the same for every tenant that consented to the app
+/// registration. The allowlist is the only tenant gate. It fails closed. An
+/// empty allowlist accepts no tenant at all. `Config::validate` refuses to
+/// start a templated issuer without an allowlist.
 #[derive(Debug, Clone)]
 pub struct IssuerTemplate {
     /// The issuer part before the `{tenantid}` placeholder.
@@ -73,13 +71,13 @@ pub struct IssuerTemplate {
 
 impl IssuerTemplate {
     /// Parses a template from a discovered issuer. The function returns `None`
-    /// when the issuer is not templated, which is the usual single-tenant
+    /// when the issuer is not templated. That is the usual single-tenant
     /// case.
     ///
     /// `allowed_tenants` is the tenant allowlist. It applies only to the
     /// templated case. The configuration validation requires the list to be
-    /// non-empty. The function still accepts an empty list here, and an
-    /// empty list means "reject everything" instead of "allow everything".
+    /// non-empty. The function still accepts an empty list here. An empty
+    /// list means "reject everything". It does not mean "allow everything".
     pub fn parse(issuer: &str, allowed_tenants: Vec<String>) -> Option<Self> {
         let (prefix, suffix) = issuer.split_once(TENANT_PLACEHOLDER)?;
         Some(Self {
@@ -93,8 +91,8 @@ impl IssuerTemplate {
     /// allowed. The function does not check the identifier again.
     ///
     /// Prefer [`IssuerTemplate::resolve_checked`]. Use this function for
-    /// tests, and to build the set of issuers to accept. Do not use it to
-    /// validate a token.
+    /// tests. Use it to build the set of issuers to accept. Do not use it
+    /// to validate a token.
     pub fn resolve(&self, tenant_id: &str) -> String {
         format!("{}{}{}", self.prefix, tenant_id, self.suffix)
     }
@@ -125,10 +123,10 @@ impl IssuerTemplate {
 
 /// Extracts a top-level string field from an unverified JWT payload.
 ///
-/// The function only serves to *derive validation inputs*, for example the
-/// expected issuer from `tid`, before the verified decode. Every security
-/// decision still goes through the decode that checks the signature
-/// afterwards.
+/// The function serves to *derive validation inputs*. For example, it
+/// derives the expected issuer from `tid`. It does so before the verified
+/// decode. Every security decision still goes through the decode. That
+/// decode checks the signature.
 pub(crate) fn extract_unverified_claim(token: &str, field: &str) -> Option<String> {
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 
@@ -178,8 +176,8 @@ pub struct Claims {
 /// The Actix middleware that validates JWTs against a [`JwksKeys`] store
 /// before the request reaches the wrapped service. The code puts the
 /// validated claims (generic over `C`) into the request extensions. Read the
-/// claims with [`Validated`]. A request that sends no token passes through
-/// unchanged, so each route decides its own authentication requirements.
+/// claims with [`Validated`]. A request that sends no token proceeds
+/// unchanged. Each route decides its own authentication requirements.
 #[derive(Clone)]
 pub struct JwtClaimsMiddleware<C>
 where
@@ -240,15 +238,14 @@ where
     /// Sets the tenant allowlist for a templated (`{tenantid}`) issuer.
     ///
     /// A templated issuer requires this allowlist. A single-tenant issuer
-    /// does not need it, because the code pins that issuer statically. If
-    /// the caller leaves the allowlist unset, the list is empty. An empty
-    /// list **rejects every tenant**, so the function fails closed. A
-    /// caller who forgets this call therefore cannot silently open the
-    /// deployment to every tenant that consented to a multi-tenant app
-    /// registration.
+    /// does not need it. The code pins that issuer statically. If the
+    /// caller leaves the allowlist unset, the list is empty. An empty list
+    /// **rejects every tenant**. The function fails closed. A caller who
+    /// forgets this call cannot silently open the deployment to every
+    /// tenant that consented to a multi-tenant app registration.
     ///
     /// [`crate::oidc::OidcClient::new`] rejects a templated issuer with an
-    /// empty allowlist, so a served app cannot reach the unset state.
+    /// empty allowlist. A served app cannot reach the unset state.
     pub fn with_allowed_tenants(mut self, allowed_tenants: Vec<String>) -> Self {
         if let Some(template) = &mut self.issuer_template {
             template.allowed_tenants = allowed_tenants;
@@ -284,9 +281,9 @@ where
 /// The extractor for the claims that [`JwtClaimsMiddleware`] validated.
 ///
 /// `web::ReqData` fails the extraction with a 500 when the middleware did
-/// not run, or when the client sent no token. This extractor returns a
-/// **401 Unauthorized** instead. An anonymous request to a protected route
-/// must not look like a server fault.
+/// not run. It also fails with a 500 when the client sent no token. This
+/// extractor returns a **401 Unauthorized** instead. An anonymous request
+/// to a protected route must not look like a server fault.
 #[derive(Debug)]
 pub struct Validated<C>(pub C);
 
@@ -576,8 +573,8 @@ mod tests {
     }
 
     /// The allowlist is the only real gate on a templated issuer. The expected
-    /// issuer comes from the `tid` claim of the token, and `aud` is the
-    /// shared client ID. Neither value can tell one tenant from another.
+    /// issuer comes from the `tid` claim of the token. `aud` is the shared
+    /// client ID. Neither value can tell one tenant from another.
     #[test]
     fn templated_issuer_rejects_a_tenant_outside_the_allowlist() {
         let tpl = IssuerTemplate::parse(
@@ -599,7 +596,7 @@ mod tests {
         );
     }
 
-    /// Fail closed. An unset allowlist accepts nobody, so a caller who forgets
+    /// Fail closed. An unset allowlist accepts nobody. A caller who forgets
     /// to configure one cannot open the deployment to every consenting
     /// tenant.
     #[test]
@@ -718,37 +715,37 @@ mod tests {
     /// `insert_header(("Cookie", format!("auth_token={token}")))`. A
     /// crate-wide search for `Authorization` finds it only in the
     /// `allowed_headers` of `cors()` and in `extract_bearer_token`.
-    /// Therefore `BearerToken` was never in the extensions, `bearer` was
-    /// always `None`, and the `.or()` was dead code as far as the suite was
+    /// Therefore `BearerToken` was never in the extensions. `bearer` was
+    /// always `None`. The `.or()` was dead code as far as the suite was
     /// concerned.
     ///
     /// Therefore going back to the pre-fix `cookie_token.or(bearer)` fails
-    /// ZERO tests, and the author confirmed this by making the change. A
+    /// ZERO tests. The author confirmed this by making the change. A
     /// client that presents a valid fresh header next to a stale cookie
-    /// then authenticates as the subject of the COOKIE, which is the wrong
+    /// then authenticates as the subject of the COOKIE. That is the wrong
     /// user entirely. That is not a nuisance. The header is what an API
-    /// client sends, and the cookie is what a browser session leaves behind,
-    /// so the stale one wins in exactly the case that the fix addresses.
+    /// client sends. The cookie is what a browser session leaves behind.
+    /// So the stale one wins in exactly the case that the fix addresses.
     ///
-    /// The test gives both mechanisms a DIFFERENT subject, so the test pins
+    /// The test gives both mechanisms a DIFFERENT subject. So the test pins
     /// which mechanism was used. The test does more than check that the
     /// request authenticated. The cookie-only request at the end makes it an
-    /// ordering assertion instead of a "bearer works" assertion. Without
+    /// ordering assertion. It is not a "bearer works" assertion. Without
     /// that request, `bearer.or(cookie)` and a hypothetical "bearer only"
     /// would both pass.
     ///
     /// The test wraps `BearerTokenMiddleware` for the same reason. That
-    /// middleware puts `BearerToken` into the extensions, and it had no test
+    /// middleware puts `BearerToken` into the extensions. It had no test
     /// at all. Only the pure `parse_bearer_token` string parser had a test.
-    /// The step from middleware to extensions to JWT therefore had no test.
+    /// The step from middleware to extensions to JWT had no test.
     ///
-    /// The wrap order matters, and it is the reverse of the order that it
-    /// reads. actix applies the LAST `.wrap` as the outermost one, so the
-    /// code lists `BearerTokenMiddleware` after the validator to make it run
+    /// The wrap order matters. It is the reverse of the order that it
+    /// reads. actix applies the LAST `.wrap` as the outermost one. So the
+    /// code lists `BearerTokenMiddleware` after the validator. It runs
     /// BEFORE the validator. In the other order the extractor never sees the
     /// request. That is exactly the mistake that this test found while
-    /// someone was writing it, and it is why the code names the order here
-    /// instead of leaving the next reader to discover it again.
+    /// someone was writing it. It is why the code names the order here. It
+    /// does not leave the next reader to discover it again.
     #[actix_web::test]
     async fn a_bearer_header_wins_over_a_stale_cookie() -> anyhow::Result<()> {
         use super::super::bearer_token::BearerTokenMiddleware;
@@ -853,20 +850,20 @@ mod tests {
         Ok(())
     }
     /// Regression test for the lockout. An unusable credential must change to
-    /// anonymous instead of returning 401, or the cookie becomes the cause
-    /// of the lockout.
+    /// anonymous instead of returning 401. Otherwise the cookie becomes the
+    /// cause of the lockout.
     ///
-    /// `callback` sets `auth_token` with a 7-day `max_age` while the `exp`
-    /// of the token is set by the provider and is typically ~1h. An hour
-    /// after the login, a browser sends an expired JWT on *every* request.
-    /// The code wraps this middleware over the whole `/auth` scope. That
-    /// scope includes `/auth/login`, `/auth/callback` and `/auth/logout`,
-    /// and none of them takes a `Validated<C>`. A hard 401 there meant that
-    /// the user could neither log in again nor clear the cookie. The user
-    /// had to delete the cookies by hand.
+    /// `callback` sets `auth_token` with a 7-day `max_age`. The `exp` of
+    /// the token is set by the provider. It is typically ~1h. An hour after
+    /// the login, a browser sends an expired JWT on *every* request. The
+    /// code wraps this middleware over the whole `/auth` scope. That scope
+    /// includes `/auth/login`, `/auth/callback` and `/auth/logout`. None of
+    /// them takes a `Validated<C>`. A hard 401 there meant that the user
+    /// could neither authenticate again nor clear the cookie. The user had to
+    /// delete the cookies by hand.
     ///
-    /// The degraded request reaches a handler that needs no subject, and it
-    /// carries a `Set-Cookie` that clears the dead cookie, so the browser
+    /// The degraded request reaches a handler that needs no subject. It
+    /// carries a `Set-Cookie` that clears the dead cookie. So the browser
     /// stops replaying it.
     #[tokio::test]
     async fn an_expired_cookie_does_not_block_the_public_auth_routes() -> anyhow::Result<()> {

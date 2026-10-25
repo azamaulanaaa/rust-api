@@ -1,6 +1,6 @@
-//! The liveness probe and the readiness probe.
+//! The liveness probe. The readiness probe.
 //!
-//! [`health`](crate::http::health::health) always returns 200, so a stuck
+//! [`health`](crate::http::health::health) always returns 200. A stuck
 //! dependency cannot fail the liveness check.
 //! [`ready`](crate::http::health::ready) reflects the injected
 //! [`ReadyCheck`](crate::http::health::ReadyCheck).
@@ -11,15 +11,15 @@ use actix_web::{HttpResponse, Responder, get, web};
 
 /// The synchronous dependency check that backs `/ready`.
 ///
-/// The server runs the check on every probe poll, so an implementation must
-/// be cheap and must not block. A lock `try_read` is acceptable. I/O is not
-/// acceptable. `true` means ready.
+/// The server runs the check on every probe poll. An implementation must
+/// be cheap. An implementation must not block. A lock `try_read` is
+/// acceptable. I/O is not acceptable. `true` means ready.
 pub type ReadyCheck = Arc<dyn Fn() -> bool + Send + Sync>;
 
 /// The readiness probe returns `200` when the injected [`ReadyCheck`]
 /// passes. It returns `503` when the dependencies are stuck. It returns `200`
-/// when no check is wired, because startup already waits for S3/OIDC/JWKS
-/// before it binds the listener.
+/// when no check is wired. Startup already waits for S3/OIDC/JWKS before it
+/// binds the listener.
 #[utoipa::path(get, path = "/ready", tag = "health", responses((status = 200, description = "ready"), (status = 503, description = "not ready")))]
 #[get("/ready")]
 pub async fn ready(check: Option<web::Data<ReadyCheck>>) -> impl Responder {

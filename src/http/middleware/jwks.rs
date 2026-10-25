@@ -1,10 +1,10 @@
 //! A signing key store that uses JWKS and can refresh its keys.
 //!
 //! The store loads the keys once when it is created. It serves the keys
-//! from the cache afterwards. When a token refers to an unknown `kid`, which
-//! usually happens right after the provider rotated its signing keys, the
-//! store fetches the JWKS document again. A debounce limit stops repeated
-//! misses from flooding the provider.
+//! from the cache afterwards. When a token refers to an unknown `kid`, the
+//! store fetches the JWKS document again. An unknown `kid` usually happens
+//! right after the provider rotated its signing keys. A debounce limit
+//! stops repeated misses from flooding the provider.
 
 use std::{
     collections::HashMap,
@@ -19,15 +19,15 @@ use jsonwebtoken::{
 };
 
 /// The shared `reqwest` client for the JWKS fetches. The client reuses one
-/// connection pool, so it avoids creating a new client for each refresh.
+/// connection pool. It avoids creating a new client for each refresh.
 /// `reqwest::get` created a new client each time. The client uses only
-/// `rustls`, to match the `reqwest` feature set of the whole workspace and
-/// to save the `native-tls` compile time.
+/// `rustls`. This choice matches the `reqwest` feature set of the whole
+/// workspace. It saves the `native-tls` compile time.
 ///
 /// The `expect` follows the convention of this crate for a build-time
-/// failure that the code cannot pass to a caller, as in
-/// `db::build_test_store`. It runs at first use, and only when the TLS
-/// backend is malformed, so there is no request that can fail.
+/// failure. The code cannot pass that failure to a caller. See
+/// `db::build_test_store`. It runs at first use. It runs only when the TLS
+/// backend is malformed. No request can fail from it.
 #[allow(clippy::expect_used)]
 static JWKS_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
@@ -40,33 +40,35 @@ static JWKS_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
 /// triggers. The limit stops a flood of junk tokens from overloading the
 /// identity provider.
 ///
-/// The code consumes the window when it ATTEMPTS a refresh, and not when the
-/// refresh succeeds. Therefore the limit holds against a provider that is
-/// down as firmly as it holds against one that is healthy.
+/// The code consumes the window when it ATTEMPTS a refresh. It does not
+/// consume the window when the refresh succeeds. Therefore the limit holds
+/// against a provider that is down. It holds against a provider that is
+/// healthy.
 const JWKS_REFRESH_DEBOUNCE: Duration = Duration::from_secs(5);
 
 /// One verification key that the code resolved from the JWKS of the
-/// provider. The key also holds the algorithm that every token signed with it
-/// must use.
+/// provider. The key also holds the algorithm. Every token signed with it
+/// must use that algorithm.
 #[derive(Debug, Clone)]
 pub struct SigningKey {
     /// The raw key material that verifies the token signatures.
     pub(crate) decoding_key: DecodingKey,
     /// The verification algorithm that comes from the `alg` of this key. The
     /// code uses the OIDC default RS256 when the JWK has no `alg`. The code
-    /// validates the tokens against exactly this algorithm, which prevents
-    /// algorithm-confusion attacks.
+    /// validates the tokens against exactly this algorithm. This check
+    /// prevents algorithm-confusion attacks.
     pub(crate) algorithm: Algorithm,
 }
 
 /// A signing key store that uses JWKS and can refresh its keys.
 ///
 /// The process has one cache. Every clone of `JwtClaimsMiddleware` shares
-/// that cache, because the clones share the `Arc` state. Therefore one fetch
-/// from the provider serves every worker. On an unknown-`kid` miss, the
-/// store fetches the document again at most once per
-/// `JWKS_REFRESH_DEBOUNCE`. A fetch that fails, or that returns no usable
-/// keys, keeps the previous set instead of dropping it.
+/// that cache. The clones share the `Arc` state. Therefore one fetch from
+/// the provider serves every worker. On an unknown-`kid` miss, the store
+/// fetches the document again at most once per
+/// `JWKS_REFRESH_DEBOUNCE`. A fetch that fails keeps the previous set.
+/// A fetch that returns no usable keys keeps the previous set. The store
+/// does not drop the previous set.
 #[derive(Clone)]
 pub struct JwksKeys {
     inner: Arc<JwksKeysInner>,
@@ -118,7 +120,7 @@ impl JwksKeys {
     ///
     /// The store can resolve a missing `kid` only when the provider
     /// publishes exactly one key. Otherwise the request cannot select a key
-    /// safely, and the function returns `None`.
+    /// safely. The function returns `None`.
     pub async fn get(&self, kid: Option<&str>) -> Option<SigningKey> {
         // The fast path: the cache holds the key.
         if let Some(key) = self.lookup(kid).await {
@@ -146,40 +148,40 @@ impl JwksKeys {
         }
     }
 
-    /// Fetches the keys again at most once per debounce window, and keeps the
-    /// previous keys instead of emptying the cache on a failure.
+    /// Fetches the keys again at most once per debounce window. It keeps
+    /// the previous keys instead of emptying the cache on a failure.
     ///
-    /// The code advances the timestamp BEFORE the fetch, in the same critical
-    /// section that decides whether to fetch. Therefore a failure consumes the
-    /// window exactly like a success. The code used to advance the timestamp
-    /// only in the success arm, so the bound that this module documents,
-    /// "at most once per `JWKS_REFRESH_DEBOUNCE`", held only while the
-    /// provider was reachable. Against a slow or down IdP, `elapsed()` grew
-    /// past the window on every request, and each miss sent a new outbound
-    /// GET. That is the exact flood that the module doc claims to prevent,
-    /// amplified at the provider instead of at this process.
+    /// The code advances the timestamp BEFORE the fetch. It does so in the
+    /// same critical section that decides whether to fetch. Therefore a
+    /// failure consumes the window exactly like a success. The code used to
+    /// advance the timestamp only in the success arm. The bound that this
+    /// module documents, "at most once per `JWKS_REFRESH_DEBOUNCE`", held
+    /// only while the provider was reachable. Against a slow or down IdP,
+    /// `elapsed()` grew past the window on every request. Each miss sent a
+    /// new outbound GET. That is the exact flood that the module doc claims
+    /// to prevent. The flood hit the provider instead of this process.
     ///
-    /// The code also releases the guard before the fetch, and it does not
-    /// hold the guard across the fetch. It used to hold the guard across a
-    /// round trip with a ten-second client timeout, so one slow GET parked
-    /// every other worker's unknown-`kid` miss behind it. Scoping the guard
-    /// to its own critical section keeps the mutual exclusion that matters,
-    /// as described below, without holding a lock over I/O.
+    /// The code also releases the guard before the fetch. It does not hold
+    /// the guard across the fetch. It used to hold the guard across a round
+    /// trip with a ten-second client timeout. One slow GET parked every
+    /// other worker's unknown-`kid` miss behind it. Scoping the guard to
+    /// its own critical section keeps the mutual exclusion that matters.
+    /// It does so without holding a lock over I/O.
     ///
     /// Two concurrent misses still produce ONE fetch. The winner finds the
     /// timestamp stale and rewrites it. Every other caller then reads a
     /// fresh timestamp and returns without fetching. The loser does not wait
-    /// for the winner's result, and it does not need to. The lookup that it
-    /// runs afterwards reads the shared cache, and the winner updates that
-    /// cache when the result lands. The concurrency is therefore bounded to
-    /// one refresh for the whole process, and not one for each worker.
+    /// for the winner's result. It does not need to. The lookup that it
+    /// runs afterwards reads the shared cache. The winner updates that
+    /// cache when the result lands. The concurrency is bounded to one
+    /// refresh for the whole process. It is not one for each worker.
     ///
-    /// The trade is that the window is measured from the START of an attempt.
-    /// A fetch that takes longer than the debounce therefore leaves the
-    /// window already elapsed, and the next miss may refresh again at once.
+    /// The trade is that the window is measured from the START of an
+    /// attempt. A fetch that takes longer than the debounce leaves the
+    /// window already elapsed. The next miss may refresh again at once.
     /// That is still the documented bound of one refresh per
-    /// `JWKS_REFRESH_DEBOUNCE`, and it is the right direction. A provider
-    /// that is slow enough for the fetch to exceed the window is exactly the
+    /// `JWKS_REFRESH_DEBOUNCE`. It is the right direction. A provider that
+    /// is slow enough for the fetch to exceed the window is exactly the
     /// provider for which another check for a rotation is worth more than a
     /// wait.
     async fn maybe_refresh(&self) {
@@ -217,14 +219,14 @@ async fn fetch_keys(url: &str) -> anyhow::Result<HashMap<String, SigningKey>> {
 /// Converts a JWK into a verification entry.
 ///
 /// - The function rejects every HMAC (`oct`) key. An OIDC provider must never
-///   publish shared secrets in its JWKS, and trusting such a key would allow
+///   publish shared secrets in its JWKS. Trusting such a key would allow
 ///   algorithm-confusion attacks.
 /// - The function reads the algorithm from the `alg` parameter of the key. It
-///   falls back to RS256, which is the usual OIDC default, when the parameter
-///   is absent. Many older providers omit the parameter.
-/// - The function skips a key when its `alg` value is for encryption only, or
-///   when the value is not recognized. It also skips a key without a `kid`,
-///   because a token could never refer to that key.
+///   falls back to RS256 when the parameter is absent. RS256 is the usual
+///   OIDC default. Many older providers omit the parameter.
+/// - The function skips a key when its `alg` value is for encryption only.
+///   It skips a key when the value is not recognized. It also skips a key
+///   without a `kid`. A token could never refer to that key.
 fn to_signing_key(jwk: &Jwk) -> Option<(String, SigningKey)> {
     if matches!(jwk.algorithm, AlgorithmParameters::OctetKey(_)) {
         return None;
@@ -323,8 +325,8 @@ mod tests {
     ///
     /// The value `received_requests` is `None` when the recording is
     /// disabled. The pooled servers that this crate starts do not disable
-    /// the recording, but a default of zero keeps the assertions below
-    /// reading as counts instead of as `Option` arms.
+    /// the recording. A default of zero keeps the assertions below reading
+    /// as counts instead of as `Option` arms.
     async fn served_requests(server: &MockServer) -> usize {
         server.received_requests().await.map_or(0, |r| r.len())
     }
@@ -402,26 +404,28 @@ mod tests {
     /// A FAILED refresh must consume the debounce window.
     ///
     /// The regression: `last_refresh` advanced only in the success-with-keys
-    /// arm, so against an unreachable or broken provider `elapsed()` grew
-    /// past the window on every request. Every later miss sent a new
-    /// outbound GET. That is the flood that the module doc claims to
-    /// prevent, aimed at the identity provider. Nothing here is a question
-    /// about authorization. The lookup still fails closed, and the store
-    /// keeps the previous keys. It is a question of availability, at a third
-    /// party, and unauthenticated junk tokens amplify the effect.
+    /// arm. Against an unreachable or broken provider, `elapsed()` grew past
+    /// the window on every request. Every later miss sent a new outbound
+    /// GET. That is the flood that the module doc claims to prevent. The
+    /// flood hit the identity provider. Nothing here is a question about
+    /// authorization. The lookup still fails closed. The store keeps the
+    /// previous keys. It is a question of availability at a third party.
+    /// Unauthenticated junk tokens amplify the effect.
     ///
-    /// The assertion checks the number of requests at the provider, not a
-    /// returned value. The returned value is `None` in both cases, so it
-    /// cannot tell "debounced" from "fetched again and failed again".
+    /// The assertion checks the number of requests at the provider. It does
+    /// not check a returned value. The returned value is `None` in both
+    /// cases. It cannot tell "debounced" from "fetched again and failed
+    /// again".
     ///
-    /// The test covers both failure arms, a transport or parse error and an
-    /// empty key set. They are separate branches, and either one alone would
-    /// reintroduce the flood for a provider that hits it.
+    /// The test covers both failure arms. One arm is a transport or parse
+    /// error. The other is an empty key set. They are separate branches.
+    /// Either one alone would reintroduce the flood for a provider that hits
+    /// it.
     ///
-    /// The debounce is a real 500ms with a sleep past it, and not the
+    /// The debounce is a real 500ms with a sleep past it. It is not the
     /// `Duration::ZERO` that the other tests use. The window has to be over
-    /// for the FIRST miss to fetch, and then closed again for the second.
-    /// 500ms is much longer than the two lookups on either side of it, so
+    /// for the FIRST miss to fetch. It is then closed again for the second.
+    /// 500ms is much longer than the two lookups on either side of it. So
     /// this is not a timing race.
     #[tokio::test]
     async fn a_failed_refresh_still_consumes_the_debounce_window() -> anyhow::Result<()> {
@@ -501,27 +505,27 @@ mod tests {
         Ok(())
     }
 
-    /// The refresh mutex is not held across the network call, and concurrent
+    /// The refresh mutex is not held across the network call. Concurrent
     /// misses still collapse into ONE fetch.
     ///
-    /// One change produced both properties, so one test covers them. The guard
-    /// used to be held for the whole `fetch_keys` await, whose client timeout
-    /// is ten seconds. One slow GET parked every other worker's unknown-`kid`
-    /// miss behind it. Narrowing the lock is only safe if the mutual
-    /// exclusion that it provided survives, so the test asserts both halves.
-    /// The parked fetch does not block the second miss, and the second miss
-    /// does not start a second fetch.
+    /// One change produced both properties. So one test covers them. The
+    /// guard used to be held for the whole `fetch_keys` await. That await
+    /// has a client timeout of ten seconds. One slow GET parked every other
+    /// worker's unknown-`kid` miss behind it. Narrowing the lock is safe
+    /// only if the mutual exclusion that it provided survives. So the test
+    /// asserts both halves. The parked fetch does not block the second miss.
+    /// The second miss does not start a second fetch.
     ///
-    /// The miss that loses the race answers `None` instead of waiting for the
-    /// winner's result. It reads the shared cache again, which the winner
-    /// updates when the result lands, and it fails closed until then. That is
-    /// the intended behavior, and the test asserts it instead of leaving it
-    /// implied. This is an authentication path, so "concurrent misses may
+    /// The miss that loses the race answers `None`. It does not wait for
+    /// the winner's result. It reads the shared cache again. The winner
+    /// updates that cache when the result lands. It fails closed until then.
+    /// That is the intended behavior. The test asserts it. It does not leave
+    /// it implied. This is an authentication path. "Concurrent misses may
     /// miss" must be a deliberate property that a test pins.
     ///
     /// The test is deterministic rather than a race. The mock delays its
-    /// response for longer than the whole test waits for the second miss, so
-    /// the first fetch is still in flight when the second miss runs.
+    /// response for longer than the whole test waits for the second miss.
+    /// So the first fetch is still in flight when the second miss runs.
     #[tokio::test]
     async fn concurrent_misses_collapse_into_one_unblocked_fetch() -> anyhow::Result<()> {
         let (key_a, _) = rsa_key("kid-a")?;
@@ -548,7 +552,7 @@ mod tests {
         assert!(keys.get(Some("kid-a")).await.is_some(), "fixture cache");
 
         // The provider rotates its keys AND becomes slow, so the refresh
-        // that the miss below triggers takes five seconds to come back.
+        // that the miss below triggers takes five seconds to return.
         server.reset().await;
         Mock::given(method("GET"))
             .and(path("/jwks"))

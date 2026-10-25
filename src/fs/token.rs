@@ -63,7 +63,7 @@ pub fn kid_for(secret: &[u8]) -> String {
     )
 }
 
-/// Mint a token for `sub` to perform `act` on `file_id`.
+/// Mint a token for `sub` to do `act` on `file_id`.
 pub fn mint(
     sub: &str,
     file_id: &str,

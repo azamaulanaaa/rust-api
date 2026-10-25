@@ -84,8 +84,8 @@ const IDLE_SWEEP_EVERY: u64 = 64;
 /// of the process. No client could then remove its own entry. The purpose of
 /// this map is to bound cost, not to allocate cost. Dropping the coldest
 /// entry also keeps the property that [`peer_key`] exists for. A peer that
-/// is still sending keeps its bucket, and keeps its own budget, instead of
-/// receiving a new full one from the rotation of other peers.
+/// is still sending keeps its bucket and its own budget. It does not
+/// receive a new full one from the rotation of other peers.
 ///
 /// This is a fixed ceiling, not a multiple of the size of the fleet. Nothing
 /// here can tell the pool of valid peers of a load balancer from an
@@ -274,7 +274,8 @@ impl TokenBucket {
 /// response *body* holds a permit, not the handler. So the permit goes back
 /// when the download actually ends, not when the handler returns. If the
 /// permit belonged to the handler, a client that opened a stream and then
-/// stopped reading would give back its slot while it still held the memory.
+/// stopped reading would give back its slot. That client would still hold
+/// the memory.
 #[derive(Clone)]
 pub struct ConcurrencyGate {
     /// `None` disables the gate. A semaphore with zero permits cannot
@@ -533,8 +534,8 @@ mod tests {
     /// test. The half below that moves the clock is what makes the name mean
     /// something. An implementation that dropped EVERY entry as soon as any
     /// one entry was idle would satisfy both halves. That implementation
-    /// would also throw away the budgets of live peers on every request, and
-    /// it would hand unlimited new tokens to anyone who left a bucket idle
+    /// would also throw away the budgets of live peers on every request.
+    /// It would hand unlimited new tokens to anyone who left a bucket idle
     /// for ten minutes. Only the mixed half catches that case.
     #[test]
     fn idle_buckets_are_evicted_so_the_map_cannot_grow_without_bound() {
@@ -574,8 +575,9 @@ mod tests {
     /// more than wasteful. `evict_idle` runs on EVERY request, in
     /// `RateLimitMiddleware::call`. So clearing would set the tokens of every
     /// tracked peer back to a full bucket about once per request. The limiter
-    /// would then limit nothing at all for a client whose requests are so far
-    /// apart that it never touches two keys inside ten minutes.
+    /// would then limit nothing at all. That holds for a client whose
+    /// requests are so far apart that it never touches two keys inside ten
+    /// minutes.
     ///
     /// The test moves `last` directly instead of sleeping, as the other tests
     /// in this module do.
@@ -652,8 +654,8 @@ mod tests {
     /// the rotation of another peer.
     ///
     /// Refusing the new key instead would give any attacker who fills the map
-    /// a way to lock every valid first-time client out of the limiter for the
-    /// life of the process.
+    /// a way to lock every valid first-time client out of the limiter. That
+    /// lock lasts for the life of the process.
     #[test]
     fn the_cap_evicts_the_coldest_peer_not_the_new_one() {
         let bucket = TokenBucket::new(10, 60);

@@ -86,7 +86,8 @@ pub struct FsEngine {
     /// should have.
     /// `fs` has no change feed for policy mutations.
     /// A rule added through this field would then reach the policy state
-    /// of the replicas with no WAL op, and with no way to replay it.
+    /// of the replicas with no WAL op. The replicas would have no way to
+    /// replay it.
     /// `sync::SnapshotManager` holds the same handle for the same reason.
     policy: Authorizer,
     token_keys: Arc<TokenKeys>,
@@ -148,8 +149,8 @@ struct SessionEntry {
 /// A claim on the lock of one session. The claim is held or pending.
 ///
 /// Owning the claim keeps the map entry alive.
-/// Dropping the claim returns it, so that two parts of one upload that run
-/// one after the other do not leave a mutex behind for ever.
+/// Dropping the claim returns it. Two parts of one upload that run
+/// one after the other then do not leave a mutex behind for ever.
 struct SessionLock<'a> {
     map: &'a std::sync::Mutex<HashMap<String, Arc<SessionEntry>>>,
     key: String,
@@ -367,8 +368,7 @@ impl FsEngine {
     /// A WAL failure therefore lost the mutation and the session or row
     /// that the retry needed.
     ///
-    /// These points hold now, and each mutation is written to keep them:
-    ///
+    /// These points hold now. Each mutation is written to keep them.    ///
     /// * The engine announces before the step that makes a mutation
     ///   impossible to retry. [`delete_file`](Self::delete_file) announces
     ///   before the row goes, as [`gc`] does. The engine also announces

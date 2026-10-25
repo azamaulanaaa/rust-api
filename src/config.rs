@@ -711,9 +711,10 @@ mod tests {
     /// A templated issuer cannot be pinned statically, so the expected issuer
     /// must come from the `tid` claim of each token. Without an allowlist,
     /// that check does nothing. Any tenant that agreed to an app registration
-    /// for more than one tenant makes a token that verifies with the shared
-    /// JWKS and that carries our client ID as `aud`. The server must refuse
-    /// to start instead.
+    /// for more than one tenant makes a token. That token verifies with the
+    /// shared JWKS. That token carries our client ID as `aud`. The server
+    /// must refuse to start instead.
+
     #[test]
     fn a_templated_issuer_requires_an_allowed_tenant() {
         let templated = minimal_toml().replace(
@@ -912,7 +913,7 @@ mod tests {
     /// This is the property that stopped being true when file parsing gained
     /// an environment overlay. `Config::try_from` reads six `RUST_API_*`
     /// variables. Under `RUST_API_CLIENT_SECRET=...`, two parses of the same
-    /// document can therefore disagree, and they did disagree for every test
+    /// document can therefore disagree. They did disagree for every test
     /// that asserted on a value in the file. No claim of the form "the config
     /// file says X" survives an overlay whose input the test does not
     /// control.

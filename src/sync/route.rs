@@ -219,8 +219,8 @@ fn normalize_etag(tag: &str) -> &str {
 /// Returns the replica pointer for `sub` without building.
 ///
 /// The function only reads. It reports the current coverage (`applied_seq`,
-/// `None` when the replica was never built) next to the WAL `head`, so that
-/// a client can decide whether a `POST /sync/sync` is worthwhile. The
+/// `None` when the replica was never built) next to the WAL `head`. A
+/// client then decides whether a `POST /sync/sync` is worthwhile. The
 /// function never touches the replica beyond the coverage-marker read.
 #[utoipa::path(get, path = "/sync/status", tag = "sync", responses((status = 200, body = SyncStatusResponse), (status = 304, description = "not modified"), (status = 401, body = crate::http::error::ErrorBody)))]
 #[get("/status")]
@@ -417,7 +417,7 @@ fn is_json_object_key(
 /// Whether `path` names one item of `names` under `replica_prefix`.
 ///
 /// The function builds the candidate key as one string. `Path::child` treats
-/// a `/` inside its argument as a legal character of a single segment, so it
+/// a `/` inside its argument as a legal character of a single segment. It
 /// cannot build the two segment name of the storage probe canary.
 fn is_one_object_of(
     path: &object_store::path::Path,
@@ -432,7 +432,7 @@ fn is_one_object_of(
 /// The `200` response for one replica object, streaming `out`.
 ///
 /// The function is separate from [`object_handler`] so that a test can check
-/// the streaming property. The caller must hand over a [`GetResult`] that it
+/// the streaming property. The caller must provide a [`GetResult`] that it
 /// has not read yet. The only way to build the response is to consume the
 /// result as a stream.
 ///
@@ -924,8 +924,8 @@ mod tests {
     /// Only `pending` moved. The server answered 304 and suppressed the body.
     /// The client then kept believing `pending: false`, so it never polled
     /// again. The documented recovery loop ("keep polling `GET /sync/status`
-    /// and advancing until this is false") was unreachable for any client that
-    /// used the ETag that the endpoint hands it.
+    /// and advancing until this is false") was unreachable. Any client that
+    /// used the ETag that the endpoint hands it could not reach that loop.
     ///
     /// The test checks both directions. A repeat poll that changes nothing is
     /// still a 304, so the fix is not "stop sending validators".
@@ -1349,8 +1349,8 @@ mod tests {
     /// Every mutable object of a prefix asks the client to revalidate.
     ///
     /// The test drives the real handler through the real gateway. It writes
-    /// one object of each class into the object store, because the engine
-    /// writes `ownership.json` and the probe canary only for a backend that
+    /// one object of each class into the object store. The engine writes
+    /// `ownership.json` and the probe canary only for a backend that
     /// supports conditional writes.
     ///
     /// The test pins the fault that it fixes. The branch asked only one

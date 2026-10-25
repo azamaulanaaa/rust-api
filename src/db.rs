@@ -162,8 +162,8 @@ mod tests {
     /// write. It is the *wrong* choice for anything else. Without the probe,
     /// there is no `manifest.json` CAS check and no detection of fencing.
     /// Publishing them as default public API offered exactly that as a
-    /// supported way to build a store, in a crate whose single-writer
-    /// design is the main feature. Every test in this crate can still reach
+    /// supported way to build a store. The crate has a single-writer design
+    /// as its main feature. Every test in this crate can still reach
     /// them. A host application that wants one can build it from
     /// `object_store::memory::InMemory` in three lines. The note about
     /// `skip_probe` in [`build_scratch_store`](Self::build_scratch_store)

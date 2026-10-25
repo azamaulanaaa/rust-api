@@ -41,7 +41,7 @@ use crate::fs::store::RecordScan;
 /// byte pass lists only this scope. Therefore no other application key
 /// family is in reach of that pass. The oxkv prefix of this store is
 /// outside this scope. The store level pass reaches that prefix. The pass
-/// above and the store level pass therefore never look at the same object.
+/// above and the store level pass therefore never inspect the same object.
 const FILE_BYTES_PREFIX: &str = "files/";
 
 /// TTL for abandoned sessions and orphaned files.
@@ -1017,8 +1017,8 @@ mod tests {
     /// row after the bad row.
     ///
     /// `RefInfo` has no `#[serde(default)]` either. Any field that the code
-    /// adds to it therefore turns this problem into a stall of the whole
-    /// store, and not into a stall of one row. The code deliberately leaves
+    /// adds to it turns this problem into a stall of the whole store. The
+    /// field does not turn it into a stall of one row. The code deliberately leaves
     /// this alone. The default for `count` is `0`. The value `0` is what
     /// makes a file eligible for collection. The default would therefore
     /// fail toward the deletion of live bytes, and not toward a leak.
@@ -1080,7 +1080,7 @@ mod tests {
     /// `GET /fs/{id}`. Every download then returns 404 forever.
     ///
     /// The test needs no adversary. A client that can resume an upload can
-    /// easily stall for more than 24 hours and resume during a sweep tick.
+    /// stall for more than 24 hours and resume during a sweep tick.
     ///
     /// The window is between two store calls inside `merge_part`. The code
     /// has nothing to attach a double to in the window, so the test stands
@@ -1583,9 +1583,9 @@ mod tests {
     ///
     /// The test fences the store for real. A second session over the same
     /// prefix and the same backend runs the epoch CAS. That is what a
-    /// second writer does. The test then proves that a takeover fences the
-    /// store. The assertions below would otherwise pass on a store that no
-    /// takeover ever reached.
+    /// second writer does. The test then proves that a second writer fences
+    /// the store. The assertions below would otherwise succeed for a store that
+    /// no second writer ever reached.
     #[tokio::test]
     async fn the_pass_reclaims_no_object_from_a_fenced_store() -> anyhow::Result<()> {
         use object_store::ObjectStore as _;
