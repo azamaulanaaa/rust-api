@@ -1,0 +1,6 @@
+# Clippy configuration.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-dbg-in-tests = true
+too-many-arguments-threshold = 7
+allowed-duplicate-crates = ["syn"]

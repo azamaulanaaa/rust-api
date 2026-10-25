@@ -1,98 +1,146 @@
 name: CI
 
+permissions:
+  contents: read
+
 on:
   push:
     branches: [main]
   pull_request:
+  workflow_call:
 
 env:
   CARGO_TERM_COLOR: always
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
 jobs:
-  test:
-    name: Test & lint (stable)
+  lint:
+    name: Lint (fmt & clippy)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-
-      - name: Cache build artifacts
-        uses: Swatinem/rust-cache@v2
-
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: ./.github/actions/setup-rust
       - name: Check formatting
         run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
 
-      - name: Clippy (warnings are errors)
-        run: cargo clippy --locked --all-targets -- -D warnings
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: ./.github/actions/setup-rust
+        with:
+          components: ''
+      - run: cargo test --all-targets --all-features --locked
+      - run: cargo test --doc --locked
 
-      - name: Build docs (rustdoc is denied; broken links fail too)
-        run: cargo doc --locked --no-deps
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: ./.github/actions/setup-rust
+        with:
+          components: llvm-tools-preview
+          install: cargo-llvm-cov@0.9.1
+      - name: Measure coverage
+        run: cargo llvm-cov --all-features --html --locked --output-dir target/llvm-cov
+      - name: Upload report
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: coverage-html
+          path: target/llvm-cov/html
+          retention-days: 7
+
+  msrv:
+    name: MSRV
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Read the declared floor
+        id: floor
+        run: echo "version=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml | head -1)" >> "$GITHUB_OUTPUT"
+      - uses: ./.github/actions/setup-rust
+        with:
+          toolchain: ${{ steps.floor.outputs.version }}
+          components: ''
+      - run: cargo check --all-targets --all-features --locked
+
+  doc:
+    name: Docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: ./.github/actions/setup-rust
+        with:
+          components: ''
+      - name: Check rustdoc
+        run: cargo doc --no-deps --all-features
         env:
           RUSTDOCFLAGS: -D warnings
 
-      - name: Run tests
-        run: cargo test --locked --all-targets
-
-      - name: Run doc tests
-        run: cargo test --locked --doc
-
-  licenses:
-    name: Licenses (cargo deny)
+  release-config:
+    name: Release config
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache build artifacts
-        uses: Swatinem/rust-cache@v2
-
-      - name: Check dependency licenses
-        uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: ./.github/actions/setup-rust
         with:
-          command: check
-          command-arguments: licenses
+          components: ''
+          install: cargo-dist@0.32.0
+      - name: The release workflow still gates publishing on CI
+        run: |
+          set -eu
+          workflow=.github/workflows/release.yml
+          if ! grep -q 'uses: ./.github/workflows/ci.yml' "$workflow"; then
+            echo "::error::$workflow no longer calls ci.yml; re-apply the 'checks' job"
+            exit 1
+          fi
+          if ! grep -A4 'build-local-artifacts:' "$workflow" | grep -q '^ *- checks$'; then
+            echo "::error::$workflow no longer waits for checks before building; re-apply it to build-local-artifacts needs"
+            exit 1
+          fi
+          echo "release workflow is gated on CI"
+      - name: The release plan resolves
+        run: dist plan --output-format=human > /dev/null
+
+  licenses:
+    name: Licences (cargo deny)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: ./.github/actions/setup-rust
+        with:
+          components: ''
+          install: cargo-deny@0.20.2
+      - name: Check dependency licences
+        run: cargo deny check licenses
 
   advisories:
     name: Advisories (cargo deny)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache build artifacts
-        uses: Swatinem/rust-cache@v2
-
-      - name: Check advisories (vulns / yanks)
-        uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: ./.github/actions/setup-rust
         with:
-          command: check
-          command-arguments: advisories
+          components: ''
+          install: cargo-deny@0.20.2
+      - name: Check advisories (vulns / yanks)
+        run: cargo deny check advisories
 
   bans:
-    name: Duplicate dependencies (cargo deny)
+    name: Bans (cargo deny)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache build artifacts
-        uses: Swatinem/rust-cache@v2
-
-      # `bans` is configured with multiple-versions = "warn", so duplicate
-      # transitive versions are surfaced in the log without failing the job.
-      # The strict parts (wildcard requirements, license conflicts) do fail.
-      - name: Check for duplicate/banned dependencies
-        uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: ./.github/actions/setup-rust
         with:
-          command: check
-          command-arguments: bans
+          components: ''
+          install: cargo-deny@0.20.2
+      - name: Check wildcards and duplicate versions
+        run: cargo deny check bans
