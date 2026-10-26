@@ -379,9 +379,36 @@ Secrets via environment (win over the file when present and non-empty, for secre
 
 ## Production hardening
 
-The binary enforces no rate limits. The load balancer in front of it
-handles per-IP throttling on the credential and control-plane routes.
-The routes that need it are `/auth/*` (login and callback need no
+The binary ships with **no rate limits enabled by default**. Both `[limits]`
+knobs default to `0` (off), because the right number depends on your egress
+budget and your clients' poll interval, and this crate cannot know either of
+them. A default limit would be a default outage.
+Use this checklist before a production deploy:
+
+- [ ] Set `[limits].rate_per_minute` (and `rate_burst`) to a value that
+      matches your expected client traffic. `0` leaves every route
+      unlimited, including `/auth/login`, which makes an outbound round trip
+      to the identity provider, and `/health`, which a load balancer polls.
+- [ ] Set `[limits].max_concurrent_downloads`. This is the control that
+      matters: `GET /sync/db/{object}` can be a multi-hundred-megabyte SST
+      read, and a token bucket does not bound that. A rate limit can still be
+      in flight all at once. The gate caps concurrency instead. `0` leaves it
+      unlimited.
+- [ ] Put a reverse proxy or WAF in front of the binary, with per-IP
+      throttling on `/auth/*`, `/setup/*`, and `/policy/*`. Data-plane
+      `/fs` and `/sync` reads can stay generous. See the example below.
+- [ ] Never expose the binary directly to the internet without that layer
+      (or an equivalent ingress).
+- [ ] Set `[database].writer_lease_ttl_secs` to a value above your worst-case
+      pause between renewals (GC pause, slow S3 round trip). Use `0` only
+      where exactly one process can ever reach the bucket.
+- [ ] Configure `[capability].secret` (or `RUST_API_CAPABILITY_SECRET`) so
+      capability tokens survive a restart; the ephemeral fallback logs a
+      warning and invalidates tokens on restart.
+- [ ] Wire `GET /ready` to a probe that drains traffic (Kubernetes
+      readiness or load-balancer health check).
+
+The routes that need throttling are `/auth/*` (login and callback need no
 authentication, and each callback fans out to JWKS + token exchange),
 `/setup/*` (one-time bootstrap), and `/policy/*` (every write is Casbin
 evaluation work). Data-plane `/fs` and `/sync` reads can stay
