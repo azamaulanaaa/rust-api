@@ -1,8 +1,9 @@
 //! Audit logging for mutations.
 //!
-//! [`AuditEvent`] describes one mutation. An [`AuditSink`] receives events.
-//! [`TracingAuditSink`] is the default sink: it writes each event with
-//! `tracing::info!`.
+//! [`AuditEvent`](crate::audit::AuditEvent) describes one mutation.
+//! [`AuditSink`](crate::audit::AuditSink) receives events.
+//! [`TracingAuditSink`](crate::audit::TracingAuditSink) is the default sink:
+//! it writes each event with `tracing::info!`.
 
 use tracing::info;
 

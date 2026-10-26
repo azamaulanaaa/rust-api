@@ -158,9 +158,9 @@ pub struct RuleListResponse {
 
 /// Query parameters shared by every `/policy` listing endpoint.
 ///
-/// `limit` and `offset` are optional. [`Page`] resolves them, and it is the
-/// single place where the bounds `DEFAULT_PAGE_SIZE` and `MAX_PAGE_SIZE`
-/// live.
+/// `limit` and `offset` are optional. A private `Page` helper resolves them,
+/// and it is the single place where the bounds `DEFAULT_PAGE_SIZE` and
+/// `MAX_PAGE_SIZE` live.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, utoipa::IntoParams)]
 pub struct ListQuery {
     /// Page size. The default is 100, and the cap is 1000.
