@@ -75,6 +75,9 @@ pub mod fencing;
 /// bound.
 pub mod limits;
 
+/// Retry helper with exponential backoff for transient failures.
+pub mod retry;
+
 /// Telemetry bootstrap: global [`tracing`] subscriber installation and
 /// OpenTelemetry wiring.
 pub mod telemetry;
