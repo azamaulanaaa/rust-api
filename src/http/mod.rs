@@ -239,6 +239,7 @@ macro_rules! wired_app {
     ($modules:expr, $readiness:expr, $cors_origins:expr, $bucket:expr) => {{
         apply_limits(App::new())
             .wrap(cors($cors_origins))
+            .wrap(middleware::request_id::RequestIdMiddleware)
             .wrap(middleware::request_tracing::RequestTracingMiddleware)
             .wrap(middleware::bearer_token::BearerTokenMiddleware)
             // Outermost, so it also limits the routes that a limiter keyed on
