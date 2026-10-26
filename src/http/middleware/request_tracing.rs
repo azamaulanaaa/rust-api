@@ -121,6 +121,9 @@ where
             "url.path" = %req.path(),
             "http.response.status_code" = Empty,
             "latency.ms" = Empty,
+            "request.id" = Empty,
+            "request_id" = Empty,
+            "http.request.id" = Empty,
         );
 
         // Continue an upstream distributed trace when a traceparent exists.
@@ -159,3 +162,8 @@ where
         })
     }
 }
+
+/// Re-exported request id types for callers that expect them here.
+pub use crate::http::middleware::request_id::{
+    RequestID, RequestIDMiddleware, RequestId, RequestIdMiddleware,
+};
