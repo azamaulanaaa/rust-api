@@ -781,6 +781,91 @@ promise different things:
   not put a durable queue in front of work that a simple periodic sweep
   already covers. Pick the lightest mechanism that still meets the
   durability requirement.
+## Idempotency keys
+
+A client that retries a mutating request after a timeout or a dropped
+connection can otherwise run the same operation twice. Mutating requests
+may therefore carry an `Idempotency-Key` header. The server records the
+first response under that key and replays it for every later request that
+carries the same key, instead of running the mutation again.
+
+### Header
+
+- Name: `Idempotency-Key`.
+- Value: an opaque client-generated string. A UUID is the usual choice.
+  Length is 1 to 255 characters.
+- Scope: the key is scoped to the caller and to the endpoint. The same
+  value sent by two different users, or to two different paths, is two
+  different operations.
+- Send the same key on the first attempt and on every retry. A new key
+  means a new operation.
+- A request without the header runs normally and is not deduplicated.
+
+### Dedup store
+
+- Location: a prefix-scoped `OxKvStore` at `{database.prefix}/idempotency`,
+  built with the same store factory as the other stores. It is covered by
+  the single-writer lease and by the same fencing rules.
+- Key shape: `{subject}:{method}:{route}:{idempotency-key}` (or a hash of
+  it), so users and endpoints cannot collide.
+- Value: a request fingerprint (hash of method, path, and body) plus the
+  stored response (status code and body) and an expiry timestamp.
+- TTL: 24 hours. After expiry the key may be reused. Expired entries are
+  reaped on read or by the hourly sweep.
+- Replay: a known key with a matching fingerprint returns the stored
+  response and sets `Idempotent-Replayed: true`. The mutation does not run
+  again, and nothing is appended to the WAL.
+- Conflict: a known key with a different fingerprint is rejected with
+  `409 Conflict`. The original mutation is not rerun.
+- The store is operational state, not business data. It is not part of the
+  replica feed, and replicas do not read it.
+
+### Which endpoints honor it
+
+The header is honored on non-idempotent mutations and ignored elsewhere.
+Endpoints that are already idempotent by address (PUT/DELETE by id) do
+not need it, and reads never use it.
+
+| Method | Path | Honors key? | Notes |
+|---|---|---|---|
+| POST | `/setup/admin` | Yes | bootstrap; replay returns the original 201 or 409 |
+| POST | `/policy/rules` | Yes | adds a rule |
+| DELETE | `/policy/rules` | Yes | removes a rule |
+| POST | `/policy/groups` | Yes | assigns a user to a group |
+| DELETE | `/policy/groups/{group_name}` | Yes | deletes a group |
+| DELETE | `/policy/groups/{group_name}/users/{user_id}` | Yes | removes a membership |
+| POST | `/fs/uploads` | Yes | creates an upload session |
+| PUT | `/fs/uploads/{id}/parts/{idx}` | No | addressed by upload and part index; retry the same part |
+| POST | `/fs/uploads/{id}/complete` | Yes | assembles the upload |
+| DELETE | `/fs/uploads/{id}` | No | cancel is idempotent by id |
+| DELETE | `/fs/files/{id}` | No | delete is idempotent by id |
+| POST | `/sync/sync` | No | already convergent; duplicate requests collapse to one build |
+| GET | all | No | reads are safe to retry |
+
+An endpoint that does not honor the key ignores it. A client can send the
+header everywhere; unknown or inapplicable keys cost nothing.
+
+### Client guidance
+
+- Mint one key per logical operation, reuse it across retries, and never
+  reuse it for a different payload.
+- Treat a replayed response (including its status code) as the result of
+  the original request.
+- Idempotency keys do not bypass authorization. The caller's identity is
+  part of the dedup key, so the same key from a different user is a
+  different operation.
+
+### Operational notes
+
+- The store is opened through `db::build_s3_store` (or the equivalent
+  factory) and shared via `Arc`. Do not open a second handle on the same
+  prefix; it can fence the first one on real S3.
+- A crash between the mutation and the dedup write leaves the retry to
+  re-execute. Mutations that honor the key must therefore be safe to
+  repeat, or must be deduplicated by their own natural key, until the
+  dedup record commits.
+- Counts and logs should distinguish a fresh execution from a replay, so
+  retries do not inflate metrics.
 
 ## Extending the API
 
