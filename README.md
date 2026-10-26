@@ -550,6 +550,104 @@ is required to follow it.
 Hard delete remains the right tool when a record must vanish immediately
 (for example, to satisfy a deletion request). Soft delete trades that for a
 recovery window and a simpler audit trail.
+## Webhooks and event delivery
+
+An application can notify external systems when the master mutates. The crate
+provides an `EventSink` trait for that, alongside the existing `ChangeSink`
+that feeds replica sync. `ChangeSink` keeps replicas convergent; `EventSink`
+delivers events to receivers outside the crate. The two sinks are independent
+and can both be wired at once.
+
+### EventSink trait
+
+An `EventSink` is an async trait that receives one event at a time. A host
+application implements it for its transport (HTTP webhook, message queue,
+etc.):
+
+```rust
+use async_trait::async_trait;
+
+#[async_trait]
+pub trait EventSink: Send + Sync {
+    /// Delivers one event. Returns `Ok(())` once the receiver has accepted
+    /// it. A returned error makes the implementation retry.
+    async fn deliver(&self, event: Event) -> anyhow::Result<()>;
+}
+```
+
+An `Event` carries a stable identifier, a kind, the affected subject, a
+timestamp, and a payload:
+
+```rust
+pub struct Event {
+    /// Stable id. The receiver uses it as an idempotency key.
+    pub id: String,
+    /// Kind of change (for example `file.created`, `policy.rule.added`).
+    pub kind: String,
+    /// Subject of the change (user, row, or file).
+    pub subject: String,
+    /// Unix timestamp of the mutation.
+    pub occurred_at: i64,
+    /// JSON payload with the details of the change.
+    pub payload: serde_json::Value,
+}
+```
+
+### Wiring alongside ChangeSink
+
+Wire an `EventSink` the same way as a `ChangeSink`, on both engines:
+
+```rust
+let fs = FsEngine::new(store, policy)
+    .with_change_sink(wal.clone())
+    .with_event_sink(events.clone());
+
+let policy = PolicyEngine::new(store)
+    .with_change_sink(wal.clone())
+    .with_event_sink(events.clone());
+```
+
+`with_change_sink` keeps feeding the replica WAL. `with_event_sink` adds
+external delivery on top of it. Neither sink replaces the other; omitting
+one leaves that path disabled.
+
+### At-least-once delivery
+
+Delivery is **at-least-once**. An event may reach a receiver more than
+once, because a network blip, a slow receiver, or a process restart can
+make the sender unsure whether the first attempt landed. The crate (and
+any implementation) treats a successful `deliver` as the only proof of
+receipt. Anything short of that is a retry.
+
+A mutation commits first; event delivery follows. A delivery failure does
+not roll the mutation back, and it does not fail the request that caused
+it. The event stays queued for retry instead.
+
+### Retry/backoff
+
+A failed `deliver` is retried with exponential backoff and jitter. A
+typical schedule starts at a few seconds, doubles each attempt, and caps
+at a few minutes, with a bounded number of attempts before the event moves
+to a dead-letter queue (or is dropped and logged, depending on the
+implementation). Concurrent deliveries to one receiver serialize or bound
+their concurrency so a slow receiver cannot exhaust the worker pool.
+
+The exact numbers are a deployment choice; the contract is that a
+transient failure never silently drops an event, and a permanent failure
+surfaces in the logs instead of blocking mutations.
+
+### Idempotency on the receiver
+
+Because delivery is at-least-once, the receiver must be **idempotent**.
+It should key its handling on `Event.id` (the idempotency key) and store
+the set of processed ids with a TTL that exceeds the retry window. A
+redelivered event with a known id is a no-op. A receiver that is not
+idempotent will apply the same mutation twice.
+
+Events may arrive out of order and may be duplicated after a partial
+failure. The receiver should therefore apply each event as an absolute
+state change keyed on its id, not as a delta that assumes a previous
+event.
 
 ## Extending the API
 
