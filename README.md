@@ -161,6 +161,70 @@ cargo progenitor -i openapi.json -o rust-api-client -n rust-api-client -v 0.1.0
 Or use progenitor's `generate_api!` macro or `build.rs` flow for in-crate generation.
 
 Set the client's base URL to the server's public address and add an `Authorization: Bearer <token>` header (or the session cookie from `/auth/callback`) to protected calls. See `examples/` for checked-in generation scripts and generated-client usage.
+## Frontend / SPA example
+
+Minimal integration flow for a browser SPA. The server must list the SPA origin in `[http].allowed_origins` (or `RUST_API_ALLOWED_ORIGINS`) for cross-origin calls; credentials are always allowed.
+
+1. **Login redirect.** Send the user to `GET /auth/login`. The identity provider redirects back to `/auth/callback`, which sets the `auth_token` cookie and returns the token in the response body. Keep the token in memory and attach it as `Authorization: Bearer <token>` on later calls, or rely on the cookie for same-origin requests.
+
+2. **Guard routes with `/auth/me`.** On app load and before every protected route, call `GET /auth/me`. A `200` response means the session is valid and returns `sub`, `iss`, `aud`, and `exp`. A `401` means redirect to login. Use `exp` to refresh proactively.
+
+3. **Poll sync status.** Call `GET /sync/status` with `If-None-Match` set to the last `ETag`. A `304` means nothing changed. A `200` returns `prefix`, `applied_seq`, `head`, and a new `ETag`. This route never builds a replica.
+
+4. **Advance the replica.** When `applied_seq < head`, call `POST /sync/sync`. A short replay returns `200` with the advanced `applied_seq`. A full rebuild returns `200` with `pending: true` and the coverage from before the rebuild. Keep polling `GET /sync/status` until `pending` is false.
+
+5. **Read replica objects.** For each object the manifest lists, call `GET /sync/db/{object}` with `If-None-Match`. The three names oxkv rewrites under one name (`manifest.json`, `ownership.json`, `probe/canary`) carry `no-cache`. Every other object is immutable for a year. Do not sort the manifest's `sst` entries.
+
+6. **Download a file.** Call `GET /fs/files/{id}` with the bearer token. The route supports `Range` and returns `206` or `416`. Call `GET /fs/files/{id}/meta` first when metadata is needed.
+
+Example (TypeScript, using `fetch`):
+
+```ts
+const base = "https://api.example.com";
+
+// 1. Login redirect (browser navigation, not fetch)
+window.location.href = `${base}/auth/login`;
+
+// 2. Guard
+const me = await fetch(`${base}/auth/me`, {
+  headers: { Authorization: `Bearer ${token}` },
+  credentials: "include",
+});
+if (!me.ok) window.location.href = `${base}/auth/login`;
+const session = await me.json(); // { sub, iss, aud, exp }
+
+// 3. Poll sync status
+let etag = "";
+const statusRes = await fetch(`${base}/sync/status`, {
+  headers: { "If-None-Match": etag, Authorization: `Bearer ${token}` },
+});
+if (statusRes.status !== 304) {
+  const status = await statusRes.json(); // { prefix, applied_seq, head }
+  etag = statusRes.headers.get("ETag") ?? "";
+
+  // 4. Advance the replica
+  if (status.applied_seq < status.head) {
+    const syncRes = await fetch(`${base}/sync/sync`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    const sync = await syncRes.json(); // { applied_seq, pending? }
+    // poll GET /sync/status until pending is false
+  }
+}
+
+// 5. Read a replica object
+const manifestRes = await fetch(`${base}/sync/db/manifest.json`, {
+  headers: { "If-None-Match": etag, Authorization: `Bearer ${token}` },
+});
+
+// 6. Download a file
+const fileRes = await fetch(`${base}/fs/files/${fileId}`, {
+  headers: { Authorization: `Bearer ${token}`, Range: "bytes=0-1023" },
+});
+```
+
+Generate the typed client from `/openapi.json` instead of hand-writing these shapes. That document covers every route.
 
 ## Architecture
 
