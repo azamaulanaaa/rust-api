@@ -487,6 +487,70 @@ rust-api policy import --config config.toml --input backup.json
 
 Under the hood these commands call `admin::export_s3` and `admin::import_s3` on the `{prefix}/policy` `OxKvStore`. Imports are idempotent, so the code skips already-present rules. Every entry passes the same `PolicyRuleValidator` as live API writes. The code also appends added rules to the WAL, and production wires that call through. Replicas then replay the import instead of discovering it only through a full recalc.
 
+## Soft delete and restore
+
+A soft delete keeps a record in storage but marks it deleted, instead of
+removing it at once. The mark is a **tombstone** (`deleted_at`), and a
+**TTL** bounds how long the tombstone survives before garbage collection
+removes it for good. This convention is for application data built on top
+of this crate; the crate itself does not implement it, and no code change
+is required to follow it.
+
+### Convention
+
+- **Tombstone.** A record carries `deleted_at: Option<i64>` (a Unix
+  timestamp, or `None` while live). Deleting sets it to the current time;
+  restoring clears it. The row stays in the store, so a restore within the
+  window is a single write.
+- **TTL.** A tombstone lives for a fixed window (for example 24 hours or
+  7 days, chosen by the application). Until the window expires the record
+  is hidden from normal reads but recoverable. After the window it is
+  eligible for physical removal.
+- **Reads.** Every read path, list, and search filters out records where
+  `deleted_at` is set. That filter belongs in the server, not in the
+  client: a client that filters on its own sees deleted rows whenever it
+  forgets.
+- **Restore.** Clearing `deleted_at` within the window restores the record.
+  Restore must also re-attach any files the delete detached (see below),
+  before garbage collection reclaims their bytes.
+- **GC interaction.** The hourly sweeper (`fs::gc::sweep_once`) reclaims
+  file bytes that are unreferenced and older than its 24-hour orphan TTL.
+  A soft delete should detach the record's files at delete time, the same
+  way an edit does: decrement `refs`, and set `orphan_since` when `refs`
+  reaches 0. The bytes then disappear on the next sweep after the orphan
+  TTL. A tombstone whose TTL is shorter than that orphan TTL can be purged
+  before its bytes are gone; a tombstone whose TTL is longer must keep
+  `refs` alive until purge, or accept that restore may find the bytes
+  already collected. Pick the window with that in mind, and make purge
+  wait for the byte sweep when the two differ.
+- **Purge.** A scheduled job removes records whose `deleted_at` is older
+  than the TTL. It runs as a separate pass from the byte sweep, and it
+  must not remove a record whose `deleted_at` is still `None`.
+
+### Suggested implementation pattern
+
+1. Add `deleted_at: Option<i64>` to the row or file metadata, defaulting
+   to `None`.
+2. **Soft delete**, in one transaction: set `deleted_at = now`, detach the
+   record's files (decrement `refs`, set `orphan_since` on the last
+   detach), and append the change to the WAL so replicas replay it.
+3. **Reads and lists**: filter `deleted_at.is_none()`. Apply the same
+   filter to every query, including counts and exports.
+4. **Restore**, only while `now - deleted_at < TTL`: clear `deleted_at`
+   and re-attach the files (increment `refs`, clear `orphan_since`). Reject
+   the request once the window has passed or the bytes are gone.
+5. **Purge**: a periodic job deletes records with
+   `deleted_at < now - TTL`, then lets the normal byte sweep reclaim their
+   (already detached) objects. Keep purge and the byte sweep ordered so a
+   restore can still find its bytes.
+6. **Replicas**: the tombstone is just another field. Sync replays the
+   delete and the restore like any other mutation; clients observe the
+   change through the normal coverage marker.
+
+Hard delete remains the right tool when a record must vanish immediately
+(for example, to satisfy a deletion request). Soft delete trades that for a
+recovery window and a simpler audit trail.
+
 ## Extending the API
 
 Implement `ApiModule` and register it on the service:
