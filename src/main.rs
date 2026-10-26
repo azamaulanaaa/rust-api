@@ -376,7 +376,6 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
     // background task refreshes them, so `/ready` can report a dependency
     // that went away without blocking the probe.
     let dependency_health = rust_api::http::health::DependencyHealth::new();
-    dependency_health.spawn_probes(replica_objects.clone(), oidc_discovery_url);
     dependency_health.spawn_probes(replica_objects.clone(), oidc_discovery_url, cancel.clone());
     let master_store = if mirror_master {
         FsStore::new_mirrored(fs_s3_store.clone())
