@@ -1123,6 +1123,8 @@ A module owns exactly one prefix. Actix matches a scope by its whole prefix and 
 
 Handlers can extract validated JWT claims via the `Validated<C>` extractor (returns 401 automatically when claims are absent). See the crate documentation (`cargo doc --no-deps --open`) for details.
 
+A complete, compilable example lives at `examples/sample_module.rs` (`cargo build --example sample_module`).
+
 ### Mounting inside your own server
 
 `ApiService::start` owns the listener. To keep it, register your modules and apply the same global stack yourself — every piece is public:
