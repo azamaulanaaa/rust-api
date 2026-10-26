@@ -9,7 +9,7 @@ use crate::fs::FsEngine;
 use crate::fs::error::FsError;
 use crate::fs::model::{CompleteRequest, InitRequest, InitResponse};
 use crate::http::middleware::jwt::{Claims, JwtClaimsMiddleware, Validated};
-use crate::http::{ApiModule, logged_body};
+use crate::http::{ApiModule, ValidatedJson, logged_body};
 
 /// The API module that exposes the `/fs` routes. The module requires JWT validation.
 pub struct FsApiModule {
@@ -55,7 +55,7 @@ impl ApiModule for FsApiModule {
 async fn init_upload(
     engine: web::Data<FsEngine>,
     claims: Validated<Claims>,
-    body: web::Json<InitRequest>,
+    body: ValidatedJson<InitRequest>,
 ) -> Result<HttpResponse, FsError> {
     let file_id = engine.init_upload(body.into_inner(), &claims.sub).await?;
     Ok(HttpResponse::Created().json(serde_json::json!({ "file_id": file_id })))
