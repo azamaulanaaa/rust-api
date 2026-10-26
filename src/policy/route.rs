@@ -12,9 +12,10 @@ use serde::{Deserialize, Serialize};
 
 use super::{Action, GroupSummary, PolicyEngine, PolicyError, UserAssignment};
 use crate::http::{
-    ApiModule,
+    ApiModule, ValidatedJson,
     error::ApiError,
     middleware::jwt::{Claims, JwtClaimsMiddleware, Validated},
+    validation::{Validate, ValidationError},
 };
 
 /// API module exposing the `/policy` management routes for rules and group
@@ -102,6 +103,30 @@ pub struct GroupRequest {
     pub user_id: String,
     /// Target group name.
     pub group: String,
+}
+
+impl Validate for PolicyRequest {
+    fn validate(&self) -> Result<(), ValidationError> {
+        if self.sub.trim().is_empty() {
+            return Err(ValidationError::from("sub cannot be empty"));
+        }
+        if self.obj.trim().is_empty() {
+            return Err(ValidationError::from("obj cannot be empty"));
+        }
+        Ok(())
+    }
+}
+
+impl Validate for GroupRequest {
+    fn validate(&self) -> Result<(), ValidationError> {
+        if self.user_id.trim().is_empty() {
+            return Err(ValidationError::from("user_id cannot be empty"));
+        }
+        if self.group.trim().is_empty() {
+            return Err(ValidationError::from("group cannot be empty"));
+        }
+        Ok(())
+    }
 }
 
 /// Generic success indicator returned by mutating endpoints.
@@ -236,7 +261,7 @@ async fn get_rules(
 async fn add_rule(
     policy_engine: web::Data<PolicyEngine>,
     auth_claims: Validated<Claims>,
-    req: web::Json<PolicyRequest>,
+    req: ValidatedJson<PolicyRequest>,
 ) -> Result<impl Responder, ApiError> {
     policy_engine
         .require(&auth_claims.sub, Resource::Rules.as_str(), Action::Write)
@@ -259,7 +284,7 @@ async fn add_rule(
 async fn remove_rule(
     policy_engine: web::Data<PolicyEngine>,
     auth_claims: Validated<Claims>,
-    req: web::Json<PolicyRequest>,
+    req: ValidatedJson<PolicyRequest>,
 ) -> Result<impl Responder, ApiError> {
     policy_engine
         .require(&auth_claims.sub, Resource::Rules.as_str(), Action::Write)
@@ -324,7 +349,7 @@ async fn get_group_users(
 async fn assign_group(
     policy_engine: web::Data<PolicyEngine>,
     auth_claims: Validated<Claims>,
-    req: web::Json<GroupRequest>,
+    req: ValidatedJson<GroupRequest>,
 ) -> Result<impl Responder, ApiError> {
     policy_engine
         .require(

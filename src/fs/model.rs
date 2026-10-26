@@ -3,6 +3,8 @@
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+use crate::http::validation::{Validate, ValidationError};
+
 /// Mirrors `MetadataUploadSchema` from `src/worker/fs/index.ts`.
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
 pub struct InitRequest {
@@ -114,6 +116,12 @@ pub struct CompleteRequest {
     pub mimetype: String,
 }
 
+impl Validate for InitRequest {
+    fn validate(&self) -> Result<(), ValidationError> {
+        InitRequest::validate(self).map_err(|err| ValidationError::from(err.to_string()))
+    }
+}
+
 impl CompleteRequest {
     /// Validates `name` and `mimetype` are non-empty.
     pub fn validate(&self) -> Result<(), crate::fs::error::FsError> {
@@ -125,6 +133,12 @@ impl CompleteRequest {
             return Err(FsError::BadRequest("mimetype cannot be empty".into()));
         }
         Ok(())
+    }
+}
+
+impl Validate for CompleteRequest {
+    fn validate(&self) -> Result<(), ValidationError> {
+        CompleteRequest::validate(self).map_err(|err| ValidationError::from(err.to_string()))
     }
 }
 

@@ -18,8 +18,12 @@ use actix_web::{App, HttpServer, web};
 pub mod docs;
 /// Shared error type rendering a uniform JSON error envelope.
 pub mod error;
+/// Reusable request-body validation extractor.
+pub mod validation;
 
 use error::ApiError;
+/// Re-export the validation helpers at the http module root.
+pub use validation::*;
 /// Built-in liveness probe shared by every deployment.
 pub mod health;
 /// Request middleware for token extraction and validation.
