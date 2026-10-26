@@ -563,6 +563,18 @@ and can both be wired at once.
 An `EventSink` is an async trait that receives one event at a time. A host
 application implements it for its transport (HTTP webhook, message queue,
 etc.):
+## Background job queue
+
+Some work does not belong in a request: sending email, rebuilding a search
+index, purging soft-deleted rows. This crate ships no job queue of its own
+(it has no business logic), but applications built on it share the same
+storage and single-writer guarantees, so one small convention keeps queues
+consistent across modules.
+
+### Reusable abstraction
+
+Define one trait for the queue and one shape for a job, so producers and
+workers depend on the abstraction rather than on storage:
 
 ```rust
 use async_trait::async_trait;
@@ -648,6 +660,96 @@ Events may arrive out of order and may be duplicated after a partial
 failure. The receiver should therefore apply each event as an absolute
 state change keyed on its id, not as a delta that assumes a previous
 event.
+pub trait JobQueue: Send + Sync {
+    /// Enqueue a job. Returns once the job is durably recorded (or, for an
+    /// in-process queue, once it is accepted).
+    async fn enqueue(&self, job: Job) -> anyhow::Result<JobId>;
+
+    /// Claim the next runnable job for `worker`. Returns `None` when empty.
+    async fn claim(&self, worker: &str) -> anyhow::Result<Option<ClaimedJob>>;
+
+    /// Mark a claimed job done. Repeating the call is a no-op.
+    async fn complete(&self, id: JobId) -> anyhow::Result<()>;
+
+    /// Return a claimed job to the queue, or move it to dead-letter once
+    /// the retry budget is exhausted.
+    async fn fail(&self, id: JobId, error: &str) -> anyhow::Result<()>;
+}
+
+pub struct Job {
+    pub kind: String,
+    pub subject: String,
+    pub payload: serde_json::Value,
+    pub run_at: i64, // Unix timestamp; 0 means now
+}
+
+pub struct ClaimedJob {
+    pub id: JobId,
+    pub job: Job,
+    pub attempt: u32,
+}
+```
+
+Producers call `enqueue`; workers call `claim`/`complete`/`fail`. Keeping
+the trait small means an in-memory implementation and a durable one are
+interchangeable in tests.
+
+### Persistence option
+
+Two implementations are worth having:
+
+- **In-process.** A `tokio::sync::mpsc` channel (or a `VecDeque` behind a
+  mutex) plus a worker task. No storage, no recovery. This is what
+  `sync::snapshot::BuildQueue` uses: the queue lives only in the process,
+  and a restart simply drops pending work.
+- **Durable.** An `OxKvStore` prefix such as `{prefix}/jobs`, with one row
+  per job (`job:{id}` → the serialized `Job` plus status, `attempt`,
+  `claimed_by`, and `run_at`). Claiming is a compare-and-set on the status
+  field, so two workers never run the same job. Reusing the store factory
+  (`db` module) and prefix scoping gives S3-backed durability and the
+  single-writer lease for free.
+
+A durable queue should write through the same `ChangeSink`/WAL only if
+replicas need to observe job state. Otherwise keep it out of the replica
+feed and treat it as operational state.
+
+### Durability guarantees
+
+Be explicit about what "durable" means, because the two implementations
+promise different things:
+
+- **In-process queue.** No durability. A crash or deploy loses every
+  queued and in-flight job. Acceptable only when the producer can cheaply
+  re-derive the work (the replica case: `sync:applied` is the durable
+  record, and the client's next poll re-queues).
+- **Durable queue.** A job survives a process restart once `enqueue`
+  returns. Claiming is atomic, so a crash mid-job leaves the job claimed;
+  a reaper (or the next worker) reclaims it after a lease timeout.
+  Completion is idempotent, so a job that completed but whose ack was lost
+  is not run twice. Order is not guaranteed across workers; if order
+  matters, encode it in `run_at` or a priority field and have workers
+  claim the earliest runnable job.
+- **No exactly-once.** Neither implementation promises exactly-once
+  execution. A durable queue gives at-least-once delivery with idempotent
+  handlers, the same contract as `EventSink`. Design handlers to be
+  idempotent on `Job.id`.
+
+### When to use vs in-process
+
+- **Use in-process** when the work is cheap to recompute, the producer
+  re-queues on its next interaction (poll, sync, request), or losing a job
+  has no user-visible consequence. Examples in this crate: replica rebuilds
+  (`BuildQueue`), GC sweeps driven by a timer.
+- **Use a durable queue** when a job must run even if no client ever asks
+  again, when it carries user-visible side effects (billing, email,
+  webhook delivery), or when its input cannot be reconstructed after the
+  fact. If the job mutates business data, prefer appending to the
+  WAL/`ChangeSink` and deriving the job from the feed instead of a
+  separate queue.
+- **Do not** run long or unbounded work inside a request handler, and do
+  not put a durable queue in front of work that a simple periodic sweep
+  already covers. Pick the lightest mechanism that still meets the
+  durability requirement.
 
 ## Extending the API
 
