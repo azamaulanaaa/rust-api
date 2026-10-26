@@ -121,8 +121,8 @@ pub struct ListResponse {
 /// Permission rules with pagination metadata.
 #[derive(Serialize, utoipa::ToSchema)]
 pub struct RuleListResponse {
-    /// One page of rules, each as `[sub, obj, act]`.
-    pub rules: Vec<Vec<String>>,
+    /// One page of items, each as `[sub, obj, act]`.
+    pub items: Vec<Vec<String>>,
     /// Total number of stored rules (independent of paging).
     pub total: usize,
     /// The page size applied to this response.
@@ -136,15 +136,18 @@ pub struct RuleListResponse {
 /// `limit` and `offset` are optional. [`Page`] resolves them, and it is the
 /// single place where the bounds `DEFAULT_PAGE_SIZE` and `MAX_PAGE_SIZE`
 /// live.
-/// The type is private to this module, because the OpenAPI surface declares
-/// the two parameters inline on each route.
-#[derive(Debug, Deserialize)]
-struct RulesQuery {
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, utoipa::IntoParams)]
+pub struct ListQuery {
     /// Page size. The default is 100, and the cap is 1000.
+    #[serde(rename = "limit")]
     pub limit: Option<usize>,
     /// Number of items to skip. The default is 0.
+    #[serde(rename = "offset")]
     pub offset: Option<usize>,
 }
+
+/// Backwards-compatible alias for the previous name of [`ListQuery`].
+pub type RulesQuery = ListQuery;
 
 /// Page size used when the client does not specify one.
 pub(crate) const DEFAULT_PAGE_SIZE: usize = 100;
@@ -168,7 +171,7 @@ struct Page {
 
 impl Page {
     /// Resolves the client's requested window against the shared bounds.
-    fn from_query(query: &RulesQuery) -> Self {
+    fn from_query(query: &ListQuery) -> Self {
         Self {
             limit: query.limit.unwrap_or(DEFAULT_PAGE_SIZE).min(MAX_PAGE_SIZE),
             offset: query.offset.unwrap_or(0),
@@ -206,12 +209,12 @@ impl From<PolicyError> for ApiError {
     }
 }
 
-#[utoipa::path(get, path = "/policy/rules", tag = "policy", params(("limit" = Option<usize>, Query), ("offset" = Option<usize>, Query)), responses((status=200, body=RuleListResponse), (status=401, body=crate::http::error::ErrorBody)))]
+#[utoipa::path(get, path = "/policy/rules", tag = "policy", params(ListQuery), responses((status=200, body=RuleListResponse), (status=401, body=crate::http::error::ErrorBody)))]
 #[get("/rules")]
 async fn get_rules(
     policy_engine: web::Data<PolicyEngine>,
     auth_claims: Validated<Claims>,
-    query: web::Query<RulesQuery>,
+    query: web::Query<ListQuery>,
 ) -> Result<impl Responder, ApiError> {
     policy_engine
         .require(&auth_claims.sub, Resource::Rules.as_str(), Action::Read)
@@ -221,7 +224,7 @@ async fn get_rules(
     let total = all_rules.len();
     let page = Page::from_query(&query);
     Ok(HttpResponse::Ok().json(RuleListResponse {
-        rules: page.apply(all_rules),
+        items: page.apply(all_rules),
         total,
         limit: page.limit,
         offset: page.offset,
@@ -374,7 +377,7 @@ async fn remove_user_from_group(
 #[derive(Serialize, utoipa::ToSchema)]
 pub struct GroupsResponse {
     /// Page of groups with member counts.
-    pub groups: Vec<GroupSummary>,
+    pub items: Vec<GroupSummary>,
     /// Total number of known groups.
     pub total: usize,
     /// Effective page size after capping.
@@ -387,7 +390,7 @@ pub struct GroupsResponse {
 #[derive(Serialize, utoipa::ToSchema)]
 pub struct UsersResponse {
     /// Page of subjects with their groups.
-    pub users: Vec<UserAssignment>,
+    pub items: Vec<UserAssignment>,
     /// Total number of subjects holding memberships.
     pub total: usize,
     /// Effective page size after capping.
@@ -397,12 +400,12 @@ pub struct UsersResponse {
 }
 
 /// Lists every known group with member counts.
-#[utoipa::path(get, path = "/policy/groups", tag = "policy", params(("limit" = Option<usize>, Query), ("offset" = Option<usize>, Query)), responses((status = 200, body = GroupsResponse), (status = 401, body = crate::http::error::ErrorBody), (status = 403, body = crate::http::error::ErrorBody)))]
+#[utoipa::path(get, path = "/policy/groups", tag = "policy", params(ListQuery), responses((status = 200, body = GroupsResponse), (status = 401, body = crate::http::error::ErrorBody), (status = 403, body = crate::http::error::ErrorBody)))]
 #[get("/groups")]
 async fn list_groups(
     policy_engine: web::Data<PolicyEngine>,
     auth_claims: Validated<Claims>,
-    query: web::Query<RulesQuery>,
+    query: web::Query<ListQuery>,
 ) -> Result<impl Responder, ApiError> {
     policy_engine
         .require(
@@ -416,7 +419,7 @@ async fn list_groups(
     let total = all.len();
     let page = Page::from_query(&query);
     Ok(HttpResponse::Ok().json(GroupsResponse {
-        groups: page.apply(all),
+        items: page.apply(all),
         total,
         limit: page.limit,
         offset: page.offset,
@@ -424,12 +427,12 @@ async fn list_groups(
 }
 
 /// Lists every subject holding group memberships.
-#[utoipa::path(get, path = "/policy/users", tag = "policy", params(("limit" = Option<usize>, Query), ("offset" = Option<usize>, Query)), responses((status = 200, body = UsersResponse), (status = 401, body = crate::http::error::ErrorBody), (status = 403, body = crate::http::error::ErrorBody)))]
+#[utoipa::path(get, path = "/policy/users", tag = "policy", params(ListQuery), responses((status = 200, body = UsersResponse), (status = 401, body = crate::http::error::ErrorBody), (status = 403, body = crate::http::error::ErrorBody)))]
 #[get("/users")]
 async fn list_users(
     policy_engine: web::Data<PolicyEngine>,
     auth_claims: Validated<Claims>,
-    query: web::Query<RulesQuery>,
+    query: web::Query<ListQuery>,
 ) -> Result<impl Responder, ApiError> {
     policy_engine
         .require(
@@ -443,7 +446,7 @@ async fn list_users(
     let total = all.len();
     let page = Page::from_query(&query);
     Ok(HttpResponse::Ok().json(UsersResponse {
-        users: page.apply(all),
+        items: page.apply(all),
         total,
         limit: page.limit,
         offset: page.offset,
@@ -586,7 +589,7 @@ mod tests {
         // The default limit of 100 is larger than this list, so the function
         // returns the whole set.
         assert_eq!(
-            Page::from_query(&RulesQuery {
+            Page::from_query(&ListQuery {
                 limit: None,
                 offset: None
             })
@@ -595,7 +598,7 @@ mod tests {
         );
 
         // The offset slices the list at the right position.
-        let page = Page::from_query(&RulesQuery {
+        let page = Page::from_query(&ListQuery {
             limit: Some(3),
             offset: Some(4),
         });
@@ -604,7 +607,7 @@ mod tests {
         // A limit above MAX_PAGE_SIZE is capped. The response
         // echoes back the capped value.
         let big: Vec<Vec<String>> = (0..(MAX_PAGE_SIZE + 50)).map(|_| rule("x")).collect();
-        let capped = Page::from_query(&RulesQuery {
+        let capped = Page::from_query(&ListQuery {
             limit: Some(MAX_PAGE_SIZE * 2),
             offset: Some(0),
         });
@@ -612,7 +615,7 @@ mod tests {
         assert_eq!(capped.apply(big.clone()).len(), MAX_PAGE_SIZE);
 
         // An offset past the end returns an empty page, not a panic.
-        let past_end = Page::from_query(&RulesQuery {
+        let past_end = Page::from_query(&ListQuery {
             limit: Some(3),
             offset: Some(99),
         });
@@ -716,7 +719,7 @@ mod tests {
         assert_eq!(res.status(), http::StatusCode::OK);
         let body: serde_json::Value = actix_web::test::read_body_json(res).await;
         assert!(body["total"].as_u64().unwrap_or(0) >= 1);
-        assert_eq!(body["rules"].as_array().map(|a| a.len()).unwrap_or(0), 1);
+        assert_eq!(body["items"].as_array().map(|a| a.len()).unwrap_or(0), 1);
         // The function removes the rule.
         let res = actix_web::test::call_service(
             &app,
