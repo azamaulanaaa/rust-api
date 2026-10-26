@@ -20,6 +20,10 @@
 /// validates the JWT with JWKS.
 pub mod http;
 
+/// Audit logging for mutations. See [`audit::AuditEvent`] and
+/// [`audit::AuditSink`].
+pub mod audit;
+
 /// OpenID Connect client and login/callback routes implementing the
 /// authorization-code flow with PKCE, CSRF state, and nonce validation.
 pub mod oidc;

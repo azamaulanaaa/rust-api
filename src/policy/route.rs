@@ -242,6 +242,12 @@ async fn add_rule(
     let success = policy_engine
         .add_rule(req.sub.clone(), req.obj.clone(), req.act)
         .await?;
+    tracing::info!(
+        subject = %auth_claims.sub,
+        action = "rule.add",
+        target = %format!("{} {} {}", req.sub, req.obj, req.act),
+        "audit mutation"
+    );
     Ok(HttpResponse::Ok().json(ActionResponse { success }))
 }
 
@@ -259,6 +265,12 @@ async fn remove_rule(
     let success = policy_engine
         .remove_rule(req.sub.clone(), req.obj.clone(), req.act)
         .await?;
+    tracing::info!(
+        subject = %auth_claims.sub,
+        action = "rule.remove",
+        target = %format!("{} {} {}", req.sub, req.obj, req.act),
+        "audit mutation"
+    );
     Ok(HttpResponse::Ok().json(ActionResponse { success }))
 }
 
@@ -322,6 +334,12 @@ async fn assign_group(
     let success = policy_engine
         .assign_group(req.user_id.clone(), req.group.clone())
         .await?;
+    tracing::info!(
+        subject = %auth_claims.sub,
+        action = "group.assign",
+        target = %format!("{} -> {}", req.user_id, req.group),
+        "audit mutation"
+    );
     Ok(HttpResponse::Ok().json(ActionResponse { success }))
 }
 
@@ -341,6 +359,12 @@ async fn remove_user_from_group(
         .await?;
 
     let (group_name, user_id) = path.into_inner();
+    tracing::info!(
+        subject = %auth_claims.sub,
+        action = "group.remove",
+        target = %format!("{} -> {}", user_id, group_name),
+        "audit mutation"
+    );
     let success = policy_engine.remove_from_group(user_id, group_name).await?;
 
     Ok(HttpResponse::Ok().json(ActionResponse { success }))
