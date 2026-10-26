@@ -91,6 +91,7 @@ For deeper detail, see [Configuration](#configuration), [Running](#running), [Fi
 | GET | `/auth/callback` | OIDC authorization-code callback | none |
 | GET | `/auth/me` | Session probe (`sub`, `iss`, `aud`, `exp`) | Bearer token |
 | POST | `/auth/logout` | Clear the session cookie (always `204`) | none |
+| POST | `/auth/refresh` | Session renewal (placeholder: returns `501 Not Implemented`) | none |
 | POST | `/setup/admin` | One-time bootstrap: assign caller the `superadmin` role | Bearer token |
 | GET | `/policy/rules` | List policy rules | Bearer token |
 | POST | `/policy/rules` | Add a policy rule | Bearer token |
@@ -234,6 +235,9 @@ Decision: defer the `/v1` URL prefix. No breaking change exists yet, so a prefix
 Future strategy: introduce `/v1` only when a breaking change is needed. At that point, mount the new contract under `/v1` and keep the unversioned routes serving the previous contract for a deprecation window. During the window, responses on the old routes carry a deprecation notice, and the window's end date is published in the changelog and the OpenAPI document. After the window closes, remove the unversioned routes.
 
 No client migration is required until a breaking change ships.
+### Session renewal (refresh tokens)
+
+The server does not issue refresh tokens today. A session is the OIDC ID token returned by `/auth/callback`; it lives in the `auth_token` cookie for seven days. When it expires, the client re-runs the authorization-code flow through `GET /auth/login`. `POST /auth/refresh` is reserved for a future refresh-token flow and currently answers `501 Not Implemented`. A future implementation will either proxy the provider refresh-token grant or mint short-lived session tokens from a stored refresh token. Until then, treat `501` as "use re-login".
 
 ## Architecture
 
