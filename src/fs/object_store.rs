@@ -15,7 +15,6 @@ use async_trait::async_trait;
 use bytes::Bytes;
 
 use object_store::ObjectStore;
-#[cfg(test)]
 use object_store::memory::InMemory;
 use object_store::multipart::{MultipartStore, PartId};
 use object_store::path::Path as ObjectPath;
@@ -23,7 +22,7 @@ use object_store::{Attribute, Attributes, MultipartId, PutOptions, PutPayload};
 use tokio::sync::Mutex;
 
 use crate::fs::error::FsError;
-use crate::fs::s3::{S3Client, S3ClientConfig};
+use crate::fs::s3::{S3Backend, S3Client, S3ClientConfig};
 
 /// The multipart state that [`MultipartStore`] streams.
 #[derive(Debug)]
@@ -512,9 +511,26 @@ pub fn s3_builder(config: &S3ClientConfig) -> object_store::aws::AmazonS3Builder
 ///
 /// The function uses the setup of [`s3_builder`]. Only the `S3Client`
 /// adapter wrapper lives in this function.
+/// Shared in-memory store.
+pub fn shared_memory_store() -> Arc<InMemory> {
+    use std::sync::OnceLock;
+    static STORE: OnceLock<Arc<InMemory>> = OnceLock::new();
+    STORE.get_or_init(|| Arc::new(InMemory::new())).clone()
+}
+
+/// Builds object store client.
 pub fn build_object_store(
     config: &S3ClientConfig,
 ) -> Result<Arc<dyn S3Client>, object_store::Error> {
+    if config.backend == S3Backend::Memory {
+        let inner = shared_memory_store();
+        return Ok(Arc::new(ObjectStoreClient {
+            store: inner.clone() as Arc<dyn ObjectStore>,
+            multipart: inner as Arc<dyn MultipartStore>,
+            states: Mutex::new(HashMap::new()),
+            is_memory: false,
+        }));
+    }
     let store = s3_builder(config).build()?;
     Ok(Arc::new(ObjectStoreClient::new_combined(Arc::new(store))))
 }

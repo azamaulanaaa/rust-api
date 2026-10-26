@@ -172,6 +172,70 @@ pub struct ListedKey {
 /// Configuration for the object-store client.
 /// It mirrors `config::S3Config`.
 /// It is independent of the binary config crate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum S3Backend {
+    /// Amazon S3 or compatible.
+    #[default]
+    S3,
+    /// In-memory store.
+    Memory,
+}
+
+/// Alias.
+pub type StorageBackend = S3Backend;
+/// Alias.
+pub type Backend = S3Backend;
+/// Alias.
+pub type ObjectStoreBackend = S3Backend;
+/// Alias.
+pub type ObjectBackend = S3Backend;
+
+impl std::fmt::Display for S3Backend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            S3Backend::S3 => write!(f, "s3"),
+            S3Backend::Memory => write!(f, "memory"),
+        }
+    }
+}
+
+impl std::str::FromStr for S3Backend {
+    type Err = String;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "s3" => Ok(S3Backend::S3),
+            "memory" => Ok(S3Backend::Memory),
+            other => Err(format!("unknown storage backend {other:?}")),
+        }
+    }
+}
+
+impl PartialEq<&str> for S3Backend {
+    fn eq(&self, other: &&str) -> bool {
+        self.to_string() == *other
+    }
+}
+
+impl PartialEq<String> for S3Backend {
+    fn eq(&self, other: &String) -> bool {
+        self.to_string() == *other
+    }
+}
+
+impl PartialEq<S3Backend> for &str {
+    fn eq(&self, other: &S3Backend) -> bool {
+        *self == other.to_string()
+    }
+}
+
+impl PartialEq<S3Backend> for String {
+    fn eq(&self, other: &S3Backend) -> bool {
+        *self == other.to_string()
+    }
+}
+
+/// Config.
 #[derive(Debug, Clone)]
 pub struct S3ClientConfig {
     /// The bucket name. `AmazonS3` uses it as the bucket.
@@ -187,6 +251,8 @@ pub struct S3ClientConfig {
     pub access_key_id: Option<String>,
     /// Static secret key (optional).
     pub secret_access_key: Option<String>,
+    /// Which backend to use.
+    pub backend: S3Backend,
 }
 
 /// Builds an `Arc<dyn S3Client>` from [`S3ClientConfig`] through
@@ -210,6 +276,7 @@ mod tests {
             force_path_style: false,
             access_key_id: None,
             secret_access_key: None,
+            backend: S3Backend::S3,
         };
         let _ = build_s3_client(&base).await?;
 
@@ -224,6 +291,7 @@ mod tests {
             access_key_id: Some("minioadmin".into()),
             secret_access_key: Some("minioadmin".into()),
             force_path_style: true,
+            backend: S3Backend::S3,
             ..base.clone()
         };
         let _ = build_s3_client(&with_creds).await?;
@@ -249,6 +317,7 @@ mod tests {
             force_path_style: true,
             access_key_id: None,
             secret_access_key: None,
+            backend: S3Backend::S3,
         };
         let _ = build_s3_client(&cfg).await?;
         Ok(())

@@ -19,7 +19,7 @@ use std::sync::Arc;
 use object_store::ObjectStore;
 use oxkv::{LruCache, ObjectPath, OxKvStore, SstFile, StoreError};
 
-use crate::fs::s3::S3ClientConfig;
+use crate::fs::s3::{S3Backend, S3ClientConfig};
 
 /// Builds an `Arc<dyn ObjectStore>` from [`S3ClientConfig`].
 ///
@@ -30,6 +30,10 @@ use crate::fs::s3::S3ClientConfig;
 pub fn build_object_store(
     cfg: &S3ClientConfig,
 ) -> Result<Arc<dyn ObjectStore>, object_store::Error> {
+    if cfg.backend == S3Backend::Memory {
+        let store = crate::fs::object_store::shared_memory_store();
+        return Ok(store as Arc<dyn ObjectStore>);
+    }
     let store = crate::fs::object_store::s3_builder(cfg).build()?;
     Ok(Arc::new(store))
 }
@@ -47,11 +51,13 @@ pub fn build_object_store(
 pub async fn build_s3_store(cfg: &S3ClientConfig, prefix: &str) -> Result<OxKvStore, StoreError> {
     let inner = build_object_store(cfg).map_err(|e| StoreError::Other(e.to_string()))?;
     let object_prefix = ObjectPath::from(prefix.trim_matches('/'));
-    OxKvStore::builder()
+    let mut builder = OxKvStore::builder()
         .with_object_store(inner)
-        .with_prefix(object_prefix)
-        .build()
-        .await
+        .with_prefix(object_prefix);
+    if cfg.backend == S3Backend::Memory {
+        builder = builder.skip_probe(true);
+    }
+    builder.build().await
 }
 
 /// Default cache of SST blocks for the calls that open a replica.

@@ -116,3 +116,19 @@ sample_ratio = 1.0
 
 # Concurrent downloads of /sync/db/{object}. 0 disables the gate. Default: 0.
 # max_concurrent_downloads = 0
+public_address = "https://example.com"
+listen_port = 8080
+
+[authorization]
+client_id = "rust-api"
+client_secret = "change-me"
+issuer_url = "https://idp.example.com"
+
+[database]
+prefix = "oxkv"
+
+[s3]
+# Storage backend: "s3" (default) or "memory" for local dev.
+# backend = "memory"
+bucket = "my-bucket"
+region = "us-east-1"
