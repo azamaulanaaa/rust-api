@@ -119,6 +119,7 @@ fn s3_client_config(cfg: &config::Config) -> S3ClientConfig {
         force_path_style: cfg.s3.force_path_style,
         access_key_id: cfg.s3.access_key_id.clone(),
         secret_access_key: cfg.s3.secret_access_key.clone(),
+        backend: cfg.s3.backend,
     }
 }
 
@@ -343,11 +344,17 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
     // path. The versioned prefixes `{prefix}/u/{sub}/{seq}` are read replicas
     // that filter the data. The server serves them through `/sync/db/` for
     // the oxkv readers. See `sync::snapshot`.
-    let replica_objects: Arc<dyn object_store::ObjectStore> = Arc::new(
-        rust_api::fs::object_store::s3_builder(&s3_client_config)
-            .build()
-            .context("build snapshot object store")?,
-    );
+    let replica_objects: Arc<dyn object_store::ObjectStore> =
+        if s3_client_config.backend == rust_api::fs::s3::S3Backend::Memory {
+            rust_api::db::build_object_store(&s3_client_config)
+                .context("build snapshot object store")?
+        } else {
+            Arc::new(
+                rust_api::fs::object_store::s3_builder(&s3_client_config)
+                    .build()
+                    .context("build snapshot object store")?,
+            )
+        };
     let master_store = if mirror_master {
         FsStore::new_mirrored(fs_s3_store.clone())
             .await
@@ -507,11 +514,10 @@ async fn claim_writer_lease(
 )> {
     use std::sync::atomic::AtomicBool;
 
-    if ttl_secs == 0 {
+    if ttl_secs == 0 || s3_cfg.backend == rust_api::fs::s3::S3Backend::Memory {
         tracing::warn!(
             prefix = %db_prefix,
-            "[database].writer_lease_ttl_secs is 0: single-writer enforcement is DISABLED. \
-             Two processes on this prefix will silently diverge."
+            "single-writer enforcement is DISABLED (memory backend or ttl 0)."
         );
         return Ok((Arc::new(AtomicBool::new(false)), None));
     }

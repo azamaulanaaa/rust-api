@@ -10,6 +10,10 @@ use std::{fs, path::Path};
 use anyhow::Context;
 use serde::Deserialize;
 
+pub use rust_api::fs::s3::S3Backend;
+pub type StorageBackend = rust_api::fs::s3::S3Backend;
+pub type Backend = rust_api::fs::s3::S3Backend;
+
 /// Top-level server configuration. The server loads it from the path that
 /// `--config` gives.
 #[derive(Deserialize, Debug)]
@@ -275,11 +279,13 @@ impl Config {
                 self.database.writer_lease_ttl_secs
             );
         }
-        if self.s3.bucket.trim().is_empty() {
-            anyhow::bail!("s3.bucket must not be empty");
-        }
-        if self.s3.region.trim().is_empty() {
-            anyhow::bail!("s3.region must not be empty");
+        if self.s3.backend == S3Backend::S3 {
+            if self.s3.bucket.trim().is_empty() {
+                anyhow::bail!("s3.bucket must not be empty");
+            }
+            if self.s3.region.trim().is_empty() {
+                anyhow::bail!("s3.region must not be empty");
+            }
         }
         if let Some(secret) = &self.capability.secret {
             rust_api::fs::token::parse_secret_hex(secret).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -507,6 +513,9 @@ pub struct CapabilityConfig {
 /// `object_store::memory::InMemory`.
 #[derive(Deserialize, Debug, Clone)]
 pub struct S3Config {
+    /// Storage backend to use: `s3` (default) or `memory`.
+    #[serde(default)]
+    pub backend: S3Backend,
     /// S3 bucket name.
     pub bucket: String,
     /// AWS region (e.g. `us-east-1`).
