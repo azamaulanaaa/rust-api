@@ -11,8 +11,8 @@
 use openidconnect::core::{CoreClient, CoreProviderMetadata, CoreResponseType};
 use openidconnect::{
     AuthenticationFlow, AuthorizationCode, ClientId, ClientSecret, CsrfToken, EndpointMaybeSet,
-    EndpointNotSet, EndpointSet, JsonWebKeySet, Nonce, PkceCodeChallenge, PkceCodeVerifier,
-    RedirectUrl, Scope, TokenResponse,
+    EndpointNotSet, EndpointSet, JsonWebKeySet, Nonce, OAuth2TokenResponse, PkceCodeChallenge,
+    PkceCodeVerifier, RedirectUrl, RefreshToken, Scope, TokenResponse,
 };
 
 use thiserror::Error;
@@ -215,6 +215,7 @@ impl OidcClient {
                 Nonce::new_random,
             )
             .add_scope(Scope::new("openid".to_string()))
+            .add_scope(Scope::new("offline_access".to_string()))
             .set_pkce_challenge(pkce_challenge)
             .url();
 
@@ -228,13 +229,14 @@ impl OidcClient {
 
     /// Exchanges an authorization code for an ID token, verifying its
     /// signature against the provider's keys and binding it to `nonce`.
-    /// Returns the raw serialized ID token on success.
+    /// Returns the raw serialized ID token and, when the provider issued
+    /// one, a refresh token on success.
     pub async fn exchange_code(
         &self,
         code: String,
         nonce: Nonce,
         pkce_verifier: PkceCodeVerifier,
-    ) -> Result<String, OidcError> {
+    ) -> Result<(String, Option<String>), OidcError> {
         let request = self
             .client
             .exchange_code(AuthorizationCode::new(code))
@@ -246,6 +248,9 @@ impl OidcClient {
             .await
             .map_err(|e| OidcError::ExchangeFailure(e.to_string()))?;
 
+        let refresh_token = token_response
+            .refresh_token()
+            .map(|token| token.secret().to_string());
         let id_token = token_response.id_token().ok_or(OidcError::MissingIdToken)?;
 
         if let Some(template) = &self.issuer_template {
@@ -287,7 +292,45 @@ impl OidcClient {
                 .map_err(|e| OidcError::InvalidToken(e.to_string()))?;
         }
 
-        Ok(id_token.to_string())
+        Ok((id_token.to_string(), refresh_token))
+    }
+
+    /// Renews an ID token using a provider refresh token. Returns the new
+    /// ID token and, when the provider rotated it, a new refresh token.
+    pub async fn refresh_token(
+        &self,
+        refresh_token: &str,
+    ) -> Result<(String, Option<String>), OidcError> {
+        let refresh_token_value = RefreshToken::new(refresh_token.to_string());
+        let request = self
+            .client
+            .exchange_refresh_token(&refresh_token_value)
+            .map_err(|e| OidcError::Configuration(format!("{:?}", e)))?;
+
+        let token_response = request
+            .request_async(&self.http_client)
+            .await
+            .map_err(|e| OidcError::ExchangeFailure(e.to_string()))?;
+
+        let new_refresh = token_response
+            .refresh_token()
+            .map(|token| token.secret().to_string());
+        let id_token = token_response.id_token().ok_or(OidcError::MissingIdToken)?;
+
+        let nonce_verifier = |_: Option<&Nonce>| Ok(());
+        if let Some(template) = &self.issuer_template {
+            let verifier = self.client.id_token_verifier().require_issuer_match(false);
+            let _verified = id_token
+                .claims(&verifier, nonce_verifier)
+                .map_err(|e| OidcError::InvalidToken(e.to_string()))?;
+            let _ = _verified;
+        } else {
+            id_token
+                .claims(&self.client.id_token_verifier(), nonce_verifier)
+                .map_err(|e| OidcError::InvalidToken(e.to_string()))?;
+        }
+
+        Ok((id_token.to_string(), new_refresh))
     }
 
     /// Whether auth cookies must carry the `Secure` flag.
@@ -476,7 +519,7 @@ mod tests {
             signed_id_token
         };
 
-        let output_token = oidc_client
+        let (output_token, _refresh) = oidc_client
             .exchange_code(
                 "mock-code".to_string(),
                 auth_data.nonce,

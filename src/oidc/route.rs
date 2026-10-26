@@ -273,7 +273,7 @@ pub async fn callback(
         .exchange_code(query.code.clone(), nonce_val, pkce_val)
         .await
     {
-        Ok(token_string) => {
+        Ok((token_string, refresh_token)) => {
             let secure = oidc_client.secure_cookies();
             let auth_cookie = Cookie::build("auth_token", token_string.clone())
                 .path("/")
@@ -283,16 +283,27 @@ pub async fn callback(
                 .max_age(Duration::days(7))
                 .finish();
 
-            HttpResponse::Ok()
+            let mut response = HttpResponse::Ok();
+            response
                 .cookie(clear_cookie("oidc_csrf".to_string(), secure))
                 .cookie(clear_cookie("oidc_nonce".to_string(), secure))
                 .cookie(clear_cookie("oidc_pkce".to_string(), secure))
-                .cookie(auth_cookie)
-                .json(AuthResponse {
-                    success: true,
-                    token: Some(token_string),
-                    error: None,
-                })
+                .cookie(auth_cookie);
+            if let Some(rt) = refresh_token {
+                let refresh_cookie = Cookie::build("refresh_token", rt)
+                    .path("/")
+                    .http_only(true)
+                    .secure(secure)
+                    .same_site(SameSite::Lax)
+                    .max_age(Duration::days(30))
+                    .finish();
+                response.cookie(refresh_cookie);
+            }
+            response.json(AuthResponse {
+                success: true,
+                token: Some(token_string),
+                error: None,
+            })
         }
         Err(e) => {
             // The server logs receive the full detail. Clients only ever see a stable,
@@ -324,19 +335,58 @@ pub async fn callback(
     }
 }
 
-/// Renews a session from a refresh token.
-///
-/// The route is a placeholder. The server does not issue or accept
-/// refresh tokens yet, so every call answers `501 Not Implemented`.
-/// Clients must re-run the authorization-code flow (`/auth/login`) when
-/// their session expires. See the "Session renewal" section of the README.
-#[utoipa::path(post, path = "/auth/refresh", tag = "auth", responses((status = 501, description = "not implemented", body = crate::http::error::ErrorBody)))]
+/// Renews a session from a refresh token stored in the `refresh_token`
+/// cookie. Returns a new ID token and extends the session cookies.
+#[utoipa::path(post, path = "/auth/refresh", tag = "auth", responses((status = 200, body = AuthResponse), (status = 401, body = AuthResponse)))]
 #[post("/refresh")]
-pub async fn refresh() -> impl Responder {
-    crate::http::error::ApiError::envelope(
-        actix_web::http::StatusCode::NOT_IMPLEMENTED,
-        "not implemented",
-    )
+pub async fn refresh(
+    oidc_client: web::Data<OidcClient>,
+    req: HttpRequest,
+) -> impl Responder {
+    let Some(cookie) = req.cookie("refresh_token") else {
+        return HttpResponse::Unauthorized().json(AuthResponse {
+            success: false,
+            token: None,
+            error: Some("missing refresh token".to_string()),
+        });
+    };
+    match oidc_client.refresh_token(cookie.value()).await {
+        Ok((token_string, new_refresh)) => {
+            let secure = oidc_client.secure_cookies();
+            let auth_cookie = Cookie::build("auth_token", token_string.clone())
+                .path("/")
+                .http_only(true)
+                .secure(secure)
+                .same_site(SameSite::Lax)
+                .max_age(Duration::days(7))
+                .finish();
+            let mut response = HttpResponse::Ok();
+            response.cookie(auth_cookie);
+            if let Some(rt) = new_refresh {
+                let refresh_cookie = Cookie::build("refresh_token", rt)
+                    .path("/")
+                    .http_only(true)
+                    .secure(secure)
+                    .same_site(SameSite::Lax)
+                    .max_age(Duration::days(30))
+                    .finish();
+                response.cookie(refresh_cookie);
+            }
+            response.json(AuthResponse {
+                success: true,
+                token: Some(token_string),
+                error: None,
+            })
+        }
+        Err(e) => {
+            tracing::warn!("OIDC refresh failed: {e}");
+            HttpResponse::Unauthorized().json(AuthResponse {
+                success: false,
+                token: None,
+                error: Some("authentication failed".to_string()),
+            })
+        }
+    }
 }
 
 fn clear_cookie(name: String, secure: bool) -> Cookie<'static> {
