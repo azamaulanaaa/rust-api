@@ -86,7 +86,7 @@ For deeper detail, see [Configuration](#configuration), [Running](#running), [Fi
 | Method | Path | Description | Auth |
 |---|---|---|---|
 | GET | `/health` | Liveness probe | none |
-| GET | `/ready` | Readiness probe (policy lock, writer lease, primary fencing) — wire it to a real probe, see [Readiness](#readiness) | none |
+| GET | `/ready` | Readiness probe (policy lock, writer lease, primary fencing, S3/OIDC dependency probes) — wire it to a real probe, see [Readiness](#readiness) | none |
 | GET | `/auth/login` | Start OIDC login (redirects to provider) | none |
 | GET | `/auth/callback` | OIDC authorization-code callback | none |
 | GET | `/auth/me` | Session probe (`sub`, `iss`, `aud`, `exp`) | Bearer token |
@@ -714,7 +714,7 @@ There is no automated backup job and no restore drill in this repository. Both a
 
 #### Readiness
 
-`GET /ready` returns 503 for any of three independent conditions. A writer holds the policy lock, the server lost the single-writer lease, or a primary prefix got fenced. `/health` is liveness and stays 200.
+`GET /ready` returns 503 for any of four independent conditions. A writer holds the policy lock, the server lost the single-writer lease, a primary prefix got fenced, or an external dependency (S3 or OIDC) failed its last background probe. `/health` is liveness and stays 200.
 
 Wire `/ready` to something that actually acts on it, such as a Kubernetes readiness probe or a load balancer health check. If nothing reads the route and the server only *serves* it, none of the three conditions removes the instance from rotation. The single-writer guarantees above then degrade to "documented" rather than enforced. This matters most for the fencing case, because it fires from a background task, so no client ever sees the error.
 
