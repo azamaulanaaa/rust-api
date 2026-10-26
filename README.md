@@ -959,6 +959,45 @@ Two of these are worth an operational note rather than a code change. The `h2` f
 
 Re-examine this list whenever `oxkv`, `actix-web`, or `casbin` moves. The `oxkv` pin is the single blocker holding three of the six.
 
+## Integration tests
+
+The fast tests run in-process. wiremock mocks the identity provider and S3. They need no containers and no network. Run them with `mise run test`.
+
+A separate integration harness exercises the server against real services. Use it for end-to-end smoke tests that wiremock cannot cover: real S3 semantics, real OIDC discovery, and the full HTTP stack over a socket.
+
+### Services
+
+The harness uses docker-compose. It starts two services:
+
+- MinIO as an S3-compatible object store.
+- A mock OIDC provider that issues real tokens.
+
+A `docker-compose.test.yml` file defines these services. MinIO uses the default credentials `minioadmin` / `minioadmin` and a bucket named `rust-api-test`. The mock OIDC provider exposes discovery at `http://localhost:8081/.well-known/openid-configuration`.
+
+### Running
+
+```bash
+docker compose -f docker-compose.test.yml up -d
+cargo test --test integration -- --ignored
+docker compose -f docker-compose.test.yml down
+```
+
+### testcontainers
+
+For CI, the same services start through testcontainers. A test crate requests a MinIO container and a mock OIDC container, waits for readiness, and points the server at them. testcontainers removes the containers when the test process exits.
+
+### Smoke tests
+
+Smoke tests are the minimal end-to-end checks:
+
+1. The server boots and reports healthy on `/health`.
+2. A client completes the OIDC login flow and receives a token.
+3. An admin bootstraps with `/setup/admin`.
+4. A file uploads and downloads through the real S3 backend.
+5. A policy rule is created and evaluated.
+
+Each smoke test stops at the first failure. They run in CI on pull requests that touch storage, auth, or HTTP wiring.
+
 ## Releases
 
 [cargo-dist](https://opensource.axo.dev/cargo-dist/) builds the release archives. Its configuration is in `dist-workspace.toml` (version 0.30.2, `ci = "github"`, no installers), against the `[profile.dist]` in `Cargo.toml`. Targets: `aarch64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu`, `x86_64-pc-windows-msvc`.
