@@ -82,6 +82,34 @@ pub mod retry;
 /// OpenTelemetry wiring.
 pub mod telemetry;
 
+/// Cancellation token for background tasks.
+///
+/// A task polls [`CancelToken::is_cancelled`] and stops when it returns
+/// `true`. The token is cheap to clone, so one token can be handed to many
+/// tasks.
+pub trait CancelToken: Clone + Send + Sync + 'static {
+    /// Returns `true` after cancellation has been requested.
+    fn is_cancelled(&self) -> bool;
+}
+
+impl CancelToken for std::sync::Arc<std::sync::atomic::AtomicBool> {
+    fn is_cancelled(&self) -> bool {
+        self.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl CancelToken for tokio::sync::watch::Receiver<bool> {
+    fn is_cancelled(&self) -> bool {
+        *self.borrow()
+    }
+}
+
+impl CancelToken for tokio_util::sync::CancellationToken {
+    fn is_cancelled(&self) -> bool {
+        tokio_util::sync::CancellationToken::is_cancelled(self)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     /// Every advisory this project suppresses has a reason on purpose.

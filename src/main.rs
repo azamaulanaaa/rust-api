@@ -342,9 +342,13 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
     .await?
     .with_token_keys(token_keys)
     .with_change_sink(Arc::new(wal.clone()));
+    // Cancellation token shared by every background task. The token is
+    // cancelled after the server stops serving, so the tasks exit instead
+    // of being dropped mid-flight.
+    let cancel = tokio_util::sync::CancellationToken::new();
     // Garbage collection. The server removes multipart uploads that
     // were never finished, every hour. The TTL is 24 hours.
-    rust_api::fs::gc::spawn(std::sync::Arc::new(fs_engine.clone()));
+    rust_api::fs::gc::spawn(std::sync::Arc::new(fs_engine.clone()), cancel.clone());
     let fs_api_module = FsApiModule::new(fs_engine, oidc_api_module.middleware());
 
     // Snapshots of the replica of each user. The master stays the write
@@ -373,6 +377,7 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
     // that went away without blocking the probe.
     let dependency_health = rust_api::http::health::DependencyHealth::new();
     dependency_health.spawn_probes(replica_objects.clone(), oidc_discovery_url);
+    dependency_health.spawn_probes(replica_objects.clone(), oidc_discovery_url, cancel.clone());
     let master_store = if mirror_master {
         FsStore::new_mirrored(fs_s3_store.clone())
             .await
@@ -404,8 +409,11 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
     // size of a replica. The build still reads the master and writes to S3.
     // So this size limits the load on the object store as much as it limits
     // the use of the CPU.
-    rust_api::sync::snapshot::BuildPool::new(build_jobs)
-        .spawn(std::sync::Arc::new(snapshot_manager.clone()), 2);
+    rust_api::sync::snapshot::BuildPool::new(build_jobs).spawn(
+        std::sync::Arc::new(snapshot_manager.clone()),
+        2,
+        cancel.clone(),
+    );
     let sync_api_module = SyncApiModule::with_download_gate(
         snapshot_manager.clone(),
         oidc_api_module.middleware(),
@@ -473,6 +481,10 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
     // shutdown. It also defeated the handover on a rolling restart, which is
     // the one thing that this lease exists for.
     //
+    // Stop the background tasks before releasing the lease. The tasks
+    // observe the token and exit their loops instead of being dropped.
+    cancel.cancel();
+
     // This runs before the flush of the telemetry, so that the log lines of
     // the release reach the collector.
     if let Some(guard) = lease_guard {

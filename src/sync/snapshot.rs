@@ -304,7 +304,12 @@ impl BuildPool {
     /// the master and writes to S3. This count therefore limits
     /// object-store pressure as much as it limits CPU use. One worker is a
     /// valid setting and a reasonable default.
-    pub fn spawn(self, manager: std::sync::Arc<SnapshotManager>, workers: usize) {
+    pub fn spawn<C: crate::CancelToken>(
+        self,
+        manager: std::sync::Arc<SnapshotManager>,
+        workers: usize,
+        cancel: C,
+    ) -> tokio::task::JoinHandle<()> {
         // A single receiver cannot move into N tasks, so the pool shares one
         // receiver behind a lock. The code holds the lock for a short time.
         // The code awaits `recv` outside the guard. The guard only decides
@@ -312,16 +317,29 @@ impl BuildPool {
         // would make the workers run one at a time.
         let rx = std::sync::Arc::new(tokio::sync::Mutex::new(self.rx));
         let workers = workers.max(1);
+        let mut handles = Vec::with_capacity(workers);
         for worker in 0..workers {
             let manager = std::sync::Arc::clone(&manager);
             let rx = std::sync::Arc::clone(&rx);
-            tokio::spawn(async move {
+            let cancel = cancel.clone();
+            let handle = tokio::spawn(async move {
                 loop {
-                    let job = {
+                    if cancel.is_cancelled() {
+                        break;
+                    }
+                    let recv_result = {
                         let mut guard = rx.lock().await;
-                        guard.recv().await
+                        tokio::time::timeout(std::time::Duration::from_millis(100), guard.recv())
+                            .await
                     };
-                    let Some(job) = job else { break };
+                    let job = match recv_result {
+                        Ok(Some(job)) => job,
+                        Ok(None) => break,  // queue closed
+                        Err(_) => continue, // timed out; re-check cancellation
+                    };
+                    if cancel.is_cancelled() {
+                        break;
+                    }
                     // The request that queued this job already returned, so
                     // the log is the only remaining channel for a failure.
                     // The slot travels with `job`. The code releases the slot
@@ -343,7 +361,13 @@ impl BuildPool {
                     );
                 }
             });
+            handles.push(handle);
         }
+        tokio::spawn(async move {
+            for handle in handles {
+                let _ = handle.await;
+            }
+        })
     }
 }
 

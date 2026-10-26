@@ -48,16 +48,32 @@ const FILE_BYTES_PREFIX: &str = "files/";
 pub const TTL_SECS: i64 = 24 * 3600;
 
 /// Starts the sweeper task. The task runs once every hour.
-pub fn spawn(engine: Arc<FsEngine>) {
+pub fn spawn<C: crate::CancelToken>(
+    engine: Arc<FsEngine>,
+    cancel: C,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = interval(Duration::from_secs(3600));
         loop {
-            ticker.tick().await;
+            if cancel.is_cancelled() {
+                break;
+            }
+            // Wake periodically so a cancellation request is observed without
+            // waiting for the full hour.
+            if tokio::time::timeout(Duration::from_millis(100), ticker.tick())
+                .await
+                .is_err()
+            {
+                continue;
+            }
+            if cancel.is_cancelled() {
+                break;
+            }
             if let Err(e) = sweep_once(&engine).await {
                 tracing::warn!("fs gc sweep failed: {e}");
             }
         }
-    });
+    })
 }
 
 /// Runs one sweep for sessions, orphaned files, orphan S3 bytes, and
