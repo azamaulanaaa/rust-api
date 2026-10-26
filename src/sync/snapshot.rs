@@ -1814,7 +1814,9 @@ mod tests {
             _location: &object_store::path::Path,
             _opts: object_store::PutMultipartOptions,
         ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
-            unimplemented!("replica writes are not multipart")
+            return Err(object_store::Error::NotSupported {
+                source: "replica writes are not multipart".to_string().into(),
+            });
         }
 
         async fn get_opts(
@@ -2531,5 +2533,28 @@ mod tests {
         assert!(mgr.resolve_object("alice", "").is_err());
         assert!(mgr.resolve_object("alice", "/manifest.json").is_err());
         assert!(mgr.resolve_object("alice", "a//b").is_err());
+    }
+    /// The replica wrapper does not support multipart uploads. It must report
+    /// that as an error instead of panicking.
+    #[tokio::test]
+    async fn stalling_store_put_multipart_opts_returns_not_supported() {
+        use object_store::ObjectStore;
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+        let inner =
+            Arc::new(object_store::memory::InMemory::new()) as Arc<dyn object_store::ObjectStore>;
+        let armed = Arc::new(AtomicBool::new(false));
+        let hit = Arc::new(AtomicBool::new(false));
+        let store = StallingStore {
+            inner,
+            armed: Arc::clone(&armed),
+            hit: Arc::clone(&hit),
+        };
+        let path = object_store::path::Path::from("snapshot-test-multipart");
+        let err = store
+            .put_multipart_opts(&path, object_store::PutMultipartOptions::default())
+            .await
+            .expect_err("multipart uploads are not supported by the replica wrapper");
+        assert!(matches!(err, object_store::Error::NotSupported { .. }));
     }
 }
