@@ -161,12 +161,30 @@ impl DependencyHealth {
         s3_store: Arc<dyn object_store::ObjectStore>,
         oidc_discovery_url: String,
     ) {
+    pub fn spawn_probes<C: crate::CancelToken>(
+        &self,
+        s3_store: Arc<dyn object_store::ObjectStore>,
+        oidc_discovery_url: String,
+        cancel: C,
+    ) -> tokio::task::JoinHandle<()> {
         let dep_health = self.clone();
         tokio::spawn(async move {
             let client = reqwest::Client::new();
             let mut interval = tokio::time::interval(Duration::from_secs(10));
             loop {
                 interval.tick().await;
+                if cancel.is_cancelled() {
+                    break;
+                }
+                if tokio::time::timeout(Duration::from_millis(100), interval.tick())
+                    .await
+                    .is_err()
+                {
+                    continue;
+                }
+                if cancel.is_cancelled() {
+                    break;
+                }
                 let s3_ok = s3_store.list_with_delimiter(None).await.is_ok();
                 dep_health.set_s3(s3_ok);
                 let oidc_ok = client
@@ -178,6 +196,7 @@ impl DependencyHealth {
                 dep_health.set_oidc(oidc_ok);
             }
         });
+        })
     }
 }
 
