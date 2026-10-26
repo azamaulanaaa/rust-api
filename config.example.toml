@@ -1,0 +1,118 @@
+# Example configuration for rust-api.
+#
+# Copy this file to config.toml, fill in the secrets, and start with:
+#   cargo run -- serve --config config.toml
+#
+# Every field below carries its purpose and default. Optional fields are
+# commented out. Uncomment and edit the ones you need.
+#
+# Secrets may also come from the environment. A value that is present and
+# not empty wins over the value in this file:
+#   RUST_API_CLIENT_SECRET
+#   RUST_API_S3_ACCESS_KEY_ID
+#   RUST_API_S3_SECRET_ACCESS_KEY
+#   RUST_API_CAPABILITY_SECRET
+#   RUST_API_CAPABILITY_SECRET_PREV
+#   RUST_API_ALLOWED_ORIGINS  (comma-separated list of origins)
+
+# Public base URL of this deployment. Used to build the OIDC redirect.
+# Must be an http(s) URL.
+public_address = "https://example.com"
+
+# TCP port that the HTTP listener binds to.
+listen_port = 8080
+
+[authorization]
+# OAuth2 client identifier registered at the provider.
+client_id = "rust-api"
+
+# OAuth2 client secret registered at the provider.
+# Override with RUST_API_CLIENT_SECRET.
+client_secret = "change-me"
+
+# Base URL of the OIDC discovery document at the provider.
+issuer_url = "https://idp.example.com"
+
+# Tenant identifiers accepted by this deployment. Required only when
+# issuer_url is a multi-tenant template such as
+# https://login.microsoftonline.com/{tenantid}/v2.0. Ignored for a
+# single-tenant issuer. Default: [].
+# allowed_tenants = ["tenant-a"]
+
+[database]
+# Object prefix inside the S3 bucket for OxKV keys. Default: "oxkv".
+prefix = "oxkv"
+
+# Prototype: keep a lazily-warmed in-RAM mirror of the master fs store.
+# Costs one master key set in RAM; safe only with a single writer.
+# Default: false.
+# mirror_master = false
+
+# Seconds a single-writer lease stays valid without renewal. 0 disables
+# the lease (safe only on a single process). Default: 60.
+# writer_lease_ttl_secs = 60
+
+[s3]
+# S3 bucket name.
+bucket = "my-bucket"
+
+# AWS region, for example us-east-1.
+region = "us-east-1"
+
+# Custom endpoint for S3-compatible providers (MinIO, R2). Omit for AWS.
+# Default: none.
+# endpoint_url = "http://localhost:9000"
+
+# Use path-style addressing. MinIO requires it. Default: false.
+# force_path_style = false
+
+# Access key ID. Falls back to RUST_API_S3_ACCESS_KEY_ID or an instance
+# profile when absent. Default: none.
+# access_key_id = "minioadmin"
+
+# Secret access key. Falls back to RUST_API_S3_SECRET_ACCESS_KEY. Default:
+# none.
+# secret_access_key = "minioadmin"
+
+[observability]
+# Service name attached to every exported telemetry resource.
+# Default: "rust-api".
+service_name = "rust-api"
+
+# OTLP collector endpoint. Span export is off when absent. Transport follows
+# the compiled cargo feature (otlp-http or otlp-grpc). Default: none.
+# otlp_endpoint = "http://localhost:4317"
+
+# Fraction of traces sampled, between 0.0 and 1.0. Default: 1.0.
+sample_ratio = 1.0
+
+[capability]
+# Current signing secret for capability tokens (file-delegation JWTs). It
+# must be 64 hex characters (32 bytes). Generate with:
+#   python3 -c "import secrets; print(secrets.token_hex(32))"
+# Override with RUST_API_CAPABILITY_SECRET. Omit for an ephemeral OS-RNG
+# key per boot (tokens die with the process). Default: none.
+# secret = "<64 hex chars>"
+
+# Previous signing secret, used only to verify tokens during a rotation.
+# Override with RUST_API_CAPABILITY_SECRET_PREV. Default: none.
+# previous_secret = "<64 hex chars>"
+
+[http]
+# Browser origins allowed by CORS. Empty means same-origin only. Each
+# origin must be an http(s) URL without a trailing slash. Credentials are
+# always allowed. Override with RUST_API_ALLOWED_ORIGINS (comma-separated).
+# Default: [].
+# allowed_origins = ["https://app.example.com", "http://localhost:5173"]
+
+[limits]
+# Requests per minute for each peer address, after an initial burst of the
+# same size. 0 disables the bucket. Default: 0.
+# rate_per_minute = 0
+
+# Highest burst allowed before the refill rate applies. 0 means "same as
+# rate_per_minute". Default: 0.
+# rate_burst = 0
+
+# Concurrent downloads of /sync/db/{object}. 0 disables the gate. Default: 0.
+# max_concurrent_downloads = 0
