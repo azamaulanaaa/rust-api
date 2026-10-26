@@ -225,6 +225,15 @@ const fileRes = await fetch(`${base}/fs/files/${fileId}`, {
 ```
 
 Generate the typed client from `/openapi.json` instead of hand-writing these shapes. That document covers every route.
+## API versioning
+
+The API is unversioned today. Every route uses its bare path (`/health`, `/policy/rules`, `/fs/files/{id}`, …), and `/openapi.json` with Swagger UI describe that same surface.
+
+Decision: defer the `/v1` URL prefix. No breaking change exists yet, so a prefix would carry no information and would force every client and the generated OpenAPI document to carry a segment that buys nothing.
+
+Future strategy: introduce `/v1` only when a breaking change is needed. At that point, mount the new contract under `/v1` and keep the unversioned routes serving the previous contract for a deprecation window. During the window, responses on the old routes carry a deprecation notice, and the window's end date is published in the changelog and the OpenAPI document. After the window closes, remove the unversioned routes.
+
+No client migration is required until a breaking change ships.
 
 ## Architecture
 
