@@ -4,6 +4,65 @@ A starter-kit REST API server providing pluggable modules for OIDC authenticatio
 
 The crate is intentionally business-logic free: applications compose `ApiModule` implementations onto an `ApiService` to build their own API surface on top of the shared auth/policy plumbing.
 
+## Quickstart
+
+This quickstart takes about 5 minutes. It assumes you have an S3-compatible bucket and an OIDC provider.
+
+### Prerequisites
+
+- Rust stable. Install it with `mise install`.
+- An S3-compatible bucket. AWS S3 or MinIO both work.
+- An OIDC provider. Keycloak, Entra ID, and Auth0 all work. Register a client. Set the redirect URI to `http://localhost:8080/auth/callback`.
+
+### Steps
+
+1. Create `config.toml` with this content. Replace the marked values.
+
+```toml
+public_address = "http://localhost:8080"
+listen_port = 8080
+
+[authorization]
+client_id = "rust-api"
+client_secret = "secret"          # replace
+issuer_url = "https://idp.example.com"  # replace
+
+[database]
+prefix = "oxkv"
+
+[s3]
+bucket = "my-bucket"              # replace
+region = "us-east-1"              # replace
+# endpoint_url = "http://localhost:9000"   # MinIO/R2
+# force_path_style = true                  # MinIO
+# access_key_id = "minioadmin"
+# secret_access_key = "minioadmin"
+```
+
+2. Run the server.
+
+```bash
+cargo run -- serve --config config.toml
+```
+
+3. Open `http://localhost:8080/auth/login` in a browser. Sign in. Copy the token from the callback response.
+
+4. Bootstrap the first admin. Run this call once.
+
+```bash
+curl -X POST http://localhost:8080/setup/admin -H "Authorization: Bearer <token>"
+```
+
+The call returns `201`. Later calls return `409`.
+
+5. Make one API call.
+
+```bash
+curl http://localhost:8080/policy/rules -H "Authorization: Bearer <token>"
+```
+
+For deeper detail, see [Configuration](#configuration), [Running](#running), [First-run bootstrap](#first-run-bootstrap), and [API endpoints](#api-endpoints).
+
 ## Features
 
 - **OIDC authentication** — authorization-code flow with PKCE, CSRF state, and nonce validation against any spec-compliant identity provider (Keycloak, Entra ID, Auth0, …)
