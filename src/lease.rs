@@ -952,7 +952,9 @@ mod tests {
             _location: &ObjectPath,
             _opts: object_store::PutMultipartOptions,
         ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
-            unimplemented!("the lease never uses multipart")
+            return Err(object_store::Error::NotSupported {
+                source: "the lease never uses multipart".to_string().into(),
+            });
         }
 
         async fn get_opts(
@@ -1402,5 +1404,22 @@ mod tests {
         }
         assert_eq!(lease_path("").as_ref(), LEASE_KEY);
         assert_eq!(lease_path("oxkv").as_ref(), format!("oxkv/{LEASE_KEY}"));
+    }
+    /// The lease wrapper does not support multipart uploads. It must report
+    /// that as an error instead of panicking.
+    #[tokio::test]
+    async fn race_store_put_multipart_opts_returns_not_supported() {
+        let store = mem();
+        let racing = RaceStore {
+            inner: Arc::clone(&store),
+            before_put: RaceHook::new(|| Box::pin(async {})),
+        };
+        let racing: Arc<dyn ObjectStore> = Arc::new(racing);
+        let path = ObjectPath::from("lease-test-multipart");
+        let err = racing
+            .put_multipart_opts(&path, object_store::PutMultipartOptions::default())
+            .await
+            .expect_err("multipart uploads are not supported by the lease wrapper");
+        assert!(matches!(err, object_store::Error::NotSupported { .. }));
     }
 }
