@@ -997,6 +997,67 @@ Smoke tests are the minimal end-to-end checks:
 5. A policy rule is created and evaluated.
 
 Each smoke test stops at the first failure. They run in CI on pull requests that touch storage, auth, or HTTP wiring.
+## Contract tests
+
+Contract tests check this crate against real services. They cover behavior that wiremock cannot reproduce: JWKS key rotation and refresh, the writer-lease compare-and-set, S3 multipart uploads, and garbage collection. They are env-gated and ignored by default, so `cargo test` stays hermetic and needs no network or containers.
+
+### Services
+
+A contract run needs two real services:
+
+- An OIDC identity provider that publishes a JWKS document and can rotate its signing keys.
+- An S3-compatible bucket. MinIO works for local runs.
+
+Point the server config at these services, or export the `RUST_API_*` overrides, before the run.
+
+### Environment
+
+Each test reads its inputs from environment variables. A test skips itself when a required variable is unset, instead of failing.
+
+| Variable | Purpose |
+|---|---|
+| `CONTRACT_TESTS` | Set to `1` to enable the whole suite. |
+| `CONTRACT_IDP_ISSUER_URL` | Issuer URL of the real identity provider. |
+| `CONTRACT_IDP_CLIENT_ID` | Client ID registered with that provider. |
+| `CONTRACT_IDP_CLIENT_SECRET` | Client secret for that client. |
+| `CONTRACT_S3_ENDPOINT` | S3 endpoint URL. |
+| `CONTRACT_S3_BUCKET` | Dedicated bucket for file bytes and lease objects. |
+| `CONTRACT_S3_ACCESS_KEY_ID` | S3 access key ID. |
+| `CONTRACT_S3_SECRET_ACCESS_KEY` | S3 secret access key. |
+| `CONTRACT_S3_REGION` | Region of the bucket. |
+
+### Coverage
+
+- **JWKS refresh.** The provider rotates its signing key. The test waits for the new `kid`, sends a token signed by it, and asserts that the verifier refreshes within the debounce window and accepts the token. It also asserts that a second miss inside the window does not flood the provider.
+- **Lease CAS.** Two holders race for one prefix. The first write wins; the loser's conditional write fails with a precondition error and reports the winner. A stale lease is taken over with a compare-and-set on the exact version read.
+- **Multipart.** A real upload runs part intake, restart, `restore_multipart`, completion, and abort against S3. It checks part counts, ETags, and cleanup of staged bytes.
+- **GC.** The sweeper removes abandoned upload sessions, orphaned file bytes, and multipart leftovers from S3. The store-level pass calls `oxkv::OxKvStore::gc_orphans` to reclaim stranded WAL objects.
+
+### Running
+
+```bash
+CONTRACT_TESTS=1 \
+CONTRACT_IDP_ISSUER_URL=https://idp.example.com \
+CONTRACT_IDP_CLIENT_ID=... \
+CONTRACT_IDP_CLIENT_SECRET=... \
+CONTRACT_S3_ENDPOINT=https://s3.example.com \
+CONTRACT_S3_BUCKET=rust-api-contract \
+CONTRACT_S3_ACCESS_KEY_ID=... \
+CONTRACT_S3_SECRET_ACCESS_KEY=... \
+CONTRACT_S3_REGION=us-east-1 \
+cargo test --test contract -- --ignored
+```
+
+Run one area at a time with a name filter:
+
+```bash
+cargo test --test contract jwks -- --ignored
+cargo test --test contract lease -- --ignored
+cargo test --test contract multipart -- --ignored
+cargo test --test contract gc -- --ignored
+```
+
+Contract tests mutate real buckets. Use a dedicated bucket, and clean it between runs.
 
 ## Releases
 
