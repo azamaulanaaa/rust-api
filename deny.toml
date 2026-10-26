@@ -115,14 +115,19 @@ id = "RUSTSEC-2026-0367"
 reason = """
 zip: insecure preservation of SUID/SGID bits during extraction. Reached only \
 through utoipa-swagger-ui, which extracts bundled static assets at build/runtime \
-for the Swagger UI. No untrusted archive is processed by this application.
+for the Swagger UI. No untrusted archive is processed by this application. \
+Fixed in zip >= 2.2, but utoipa-swagger-ui's latest release still bundles the \
+affected version.
 """
 
 [[advisories.ignore]]
 id = "RUSTSEC-2026-0368"
 reason = """
 zip: symbolic-link path traversal in ZipArchive::extract. Reached only through \
-utoipa-swagger-ui's bundled assets. No attacker-controlled archive is extracted.
+utoipa-swagger-ui's bundled assets. No attacker-controlled archive is extracted. \
+Fixed in zip >= 2.2, but utoipa-swagger-ui's latest release still bundles the \
+affected version. No patched version is available within the current dependency \
+constraints.
 """
 
 [[advisories.ignore]]
@@ -130,7 +135,9 @@ id = "RUSTSEC-2026-0369"
 reason = """
 zip: Unix permissions applied through symlinks during extraction. Reached only \
 through utoipa-swagger-ui's bundled assets. No attacker-controlled archive is \
-extracted.
+extracted. Fixed in zip >= 2.2, but utoipa-swagger-ui's latest release still \
+bundles the affected version. No patched version is available within the current \
+dependency constraints.
 """
 
 [[advisories.ignore]]
