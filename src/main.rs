@@ -278,6 +278,13 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
 
     let base = Url::parse(&config.public_address).context("Invalid public_address in config")?;
 
+    // Keep the discovery URL for the dependency probe. `OidcClient::new`
+    // moves `issuer_url` into the client, so the probe needs its own copy.
+    let oidc_discovery_url = format!(
+        "{}/.well-known/openid-configuration",
+        config.authorization.issuer_url.trim_end_matches('/')
+    );
+
     let oidc_client = OidcClient::new(OidcConfig {
         client_id: config.authorization.client_id.clone(),
         client_secret: config.authorization.client_secret,
@@ -355,6 +362,17 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
                     .context("build snapshot object store")?,
             )
         };
+    let replica_objects: Arc<dyn object_store::ObjectStore> = Arc::new(
+        rust_api::fs::object_store::s3_builder(&s3_client_config)
+            .build()
+            .context("build snapshot object store")?,
+    );
+    // Cheap, non-blocking dependency probes. The flags start healthy;
+    // startup already verified S3 and OIDC before the listener bound. A
+    // background task refreshes them, so `/ready` can report a dependency
+    // that went away without blocking the probe.
+    let dependency_health = rust_api::http::health::DependencyHealth::new();
+    dependency_health.spawn_probes(replica_objects.clone(), oidc_discovery_url);
     let master_store = if mirror_master {
         FsStore::new_mirrored(fs_s3_store.clone())
             .await
@@ -402,8 +420,9 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
     // the server already checks S3, OIDC, JWKS, and the lease.
     let readiness: rust_api::http::health::ReadyCheck = Arc::new({
         let policy_engine = policy_engine.clone();
+        let dependency_health = dependency_health.clone();
         move || {
-            // Three separate reasons mean that this instance cannot serve
+            // Four separate reasons mean that this instance cannot serve
             // writes. Any one of them is enough to take it out of the
             // rotation:
             //
@@ -416,9 +435,12 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
             //   an operator who runs `policy import` against a prefix that
             //   is live. The check of the lease cannot see this, so
             //   `fencing` reports it on its own.
+            // - An external dependency (S3 or OIDC) failed its last
+            //   background probe.
             policy_engine.is_unlocked()
                 && !lease_lost.load(std::sync::atomic::Ordering::Relaxed)
                 && !rust_api::fencing::primary_loss()
+                && dependency_health.is_healthy()
         }
     });
     // The function builds the server first, so that it can start the
