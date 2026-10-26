@@ -156,11 +156,6 @@ impl DependencyHealth {
     ///
     /// The task never blocks the request path. The first probe runs as soon
     /// as the task is scheduled.
-    pub fn spawn_probes(
-        &self,
-        s3_store: Arc<dyn object_store::ObjectStore>,
-        oidc_discovery_url: String,
-    ) {
     pub fn spawn_probes<C: crate::CancelToken>(
         &self,
         s3_store: Arc<dyn object_store::ObjectStore>,
@@ -195,7 +190,6 @@ impl DependencyHealth {
                     .unwrap_or(false);
                 dep_health.set_oidc(oidc_ok);
             }
-        });
         })
     }
 }
