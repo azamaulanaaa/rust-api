@@ -191,12 +191,19 @@ pub type ObjectStoreBackend = S3Backend;
 /// Alias.
 pub type ObjectBackend = S3Backend;
 
+impl S3Backend {
+    /// Returns the lowercase name used by configuration files.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            S3Backend::S3 => "s3",
+            S3Backend::Memory => "memory",
+        }
+    }
+}
+
 impl std::fmt::Display for S3Backend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            S3Backend::S3 => write!(f, "s3"),
-            S3Backend::Memory => write!(f, "memory"),
-        }
+        f.write_str(self.as_str())
     }
 }
 
@@ -213,25 +220,25 @@ impl std::str::FromStr for S3Backend {
 
 impl PartialEq<&str> for S3Backend {
     fn eq(&self, other: &&str) -> bool {
-        self.to_string() == *other
+        *other == self.as_str()
     }
 }
 
 impl PartialEq<String> for S3Backend {
     fn eq(&self, other: &String) -> bool {
-        self.to_string() == *other
+        other == self.as_str()
     }
 }
 
 impl PartialEq<S3Backend> for &str {
     fn eq(&self, other: &S3Backend) -> bool {
-        *self == other.to_string()
+        *self == other.as_str()
     }
 }
 
 impl PartialEq<S3Backend> for String {
     fn eq(&self, other: &S3Backend) -> bool {
-        *self == other.to_string()
+        self.as_str() == other.as_str()
     }
 }
 

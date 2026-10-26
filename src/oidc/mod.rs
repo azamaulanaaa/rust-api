@@ -319,11 +319,32 @@ impl OidcClient {
 
         let nonce_verifier = |_: Option<&Nonce>| Ok(());
         if let Some(template) = &self.issuer_template {
+            // The refresh response carries a new ID token but no fresh
+            // nonce. Keep signature, audience, and expiry validation, then
+            // re-apply the tenant gate that `exchange_code` uses. Trusting
+            // the signed token alone would let any tenant that consented to
+            // the app registration mint a session for this deployment.
             let verifier = self.client.id_token_verifier().require_issuer_match(false);
-            let _verified = id_token
+            let _verified_claims = id_token
                 .claims(&verifier, nonce_verifier)
                 .map_err(|e| OidcError::InvalidToken(e.to_string()))?;
-            let _ = _verified;
+
+            let raw = id_token.to_string();
+            let Some(tenant_id) = extract_unverified_claim(&raw, "tid").filter(|t| !t.is_empty())
+            else {
+                return Err(OidcError::InvalidToken(
+                    "token missing tenant identifier".to_string(),
+                ));
+            };
+            let expected = template
+                .resolve_checked(&tenant_id)
+                .map_err(OidcError::InvalidToken)?;
+            let actual_iss = extract_unverified_claim(&raw, "iss");
+            if actual_iss.as_deref() != Some(expected.as_str()) {
+                return Err(OidcError::InvalidToken(format!(
+                    "token issuer does not match tenant `{tenant_id}`"
+                )));
+            }
         } else {
             id_token
                 .claims(&self.client.id_token_verifier(), nonce_verifier)

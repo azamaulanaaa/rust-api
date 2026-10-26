@@ -339,10 +339,7 @@ pub async fn callback(
 /// cookie. Returns a new ID token and extends the session cookies.
 #[utoipa::path(post, path = "/auth/refresh", tag = "auth", responses((status = 200, body = AuthResponse), (status = 401, body = AuthResponse)))]
 #[post("/refresh")]
-pub async fn refresh(
-    oidc_client: web::Data<OidcClient>,
-    req: HttpRequest,
-) -> impl Responder {
+pub async fn refresh(oidc_client: web::Data<OidcClient>, req: HttpRequest) -> impl Responder {
     let Some(cookie) = req.cookie("refresh_token") else {
         return HttpResponse::Unauthorized().json(AuthResponse {
             success: false,

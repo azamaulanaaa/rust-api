@@ -366,11 +366,6 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
                     .context("build snapshot object store")?,
             )
         };
-    let replica_objects: Arc<dyn object_store::ObjectStore> = Arc::new(
-        rust_api::fs::object_store::s3_builder(&s3_client_config)
-            .build()
-            .context("build snapshot object store")?,
-    );
     // Cheap, non-blocking dependency probes. The flags start healthy;
     // startup already verified S3 and OIDC before the listener bound. A
     // background task refreshes them, so `/ready` can report a dependency

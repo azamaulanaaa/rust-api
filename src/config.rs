@@ -11,8 +11,6 @@ use anyhow::Context;
 use serde::Deserialize;
 
 pub use rust_api::fs::s3::S3Backend;
-pub type StorageBackend = rust_api::fs::s3::S3Backend;
-pub type Backend = rust_api::fs::s3::S3Backend;
 
 /// Top-level server configuration. The server loads it from the path that
 /// `--config` gives.
