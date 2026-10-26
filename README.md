@@ -130,6 +130,38 @@ A fresh deployment boots with an empty policy store, so nobody can pass self-aut
 
 Cross-origin SPAs set `[http].allowed_origins` (or `RUST_API_ALLOWED_ORIGINS`) to their origin(s). Credentials are always allowed. The auth flow runs `GET /auth/login` → provider → `/auth/callback`, which sets the `auth_token` cookie and returns the token. The flow continues with `GET /auth/me` as the guard and session probe, then with `POST /auth/logout` to clear the cookie. Poll `GET /sync/status` (coverage `ETag`, `304` on repeat) and advance with `POST /sync/sync`. Then read replica objects via `GET /sync/db/{object}`. The three names oxkv rewrites under one name (`manifest.json`, `ownership.json`, `probe/canary`) carry `no-cache`. The append-only and content-addressed objects are immutable. The manifest's `sst` entries arrive in recency order, and a client must not sort them. See [The manifest a client reads](#the-manifest-a-client-reads). The server streams replica objects with a declared `Content-Length` instead of buffering them. Therefore, a multi-hundred-megabyte SST segment does not have to fit in the heap once per in-flight request. Generate the client from `/openapi.json`. That document covers every route.
 
+## Generating a client SDK
+
+The server publishes an OpenAPI 3.1 document at `/openapi.json` (Swagger UI at `/swagger-ui/`). Generate a typed client from that document instead of hand-writing request shapes. Re-run generation whenever the spec changes; `spec_covers_all_served_routes` keeps the document in sync with mounted routes.
+
+### openapi-generator
+
+```bash
+# TypeScript (fetch-based)
+npx @openapitools/openapi-generator-cli generate \
+  -i http://localhost:8080/openapi.json \
+  -g typescript-fetch \
+  -o ./generated/typescript-client
+
+# Rust
+npx @openapitools/openapi-generator-cli generate \
+  -i http://localhost:8080/openapi.json \
+  -g rust \
+  -o ./generated/rust-client
+```
+
+### progenitor (Rust)
+
+```bash
+cargo install cargo-progenitor
+curl -s http://localhost:8080/openapi.json -o openapi.json
+cargo progenitor -i openapi.json -o rust-api-client -n rust-api-client -v 0.1.0
+```
+
+Or use progenitor's `generate_api!` macro or `build.rs` flow for in-crate generation.
+
+Set the client's base URL to the server's public address and add an `Authorization: Bearer <token>` header (or the session cookie from `/auth/callback`) to protected calls. See `examples/` for checked-in generation scripts and generated-client usage.
+
 ## Architecture
 
 ```
