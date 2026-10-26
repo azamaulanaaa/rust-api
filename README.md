@@ -528,9 +528,74 @@ sample_ratio = 1.0                          # fraction of traces sampled (0.0–
 # allowed_origins = ["https://app.example.com", "http://localhost:5173"]
 ```
 
-The server uses a single bucket with prefix-scoped stores. `db::build_s3_store` builds one `AmazonS3` `ObjectStore` from `[s3]` and wraps it with `OxKvStore::builder().with_object_store(...).with_prefix("oxkv/policy")` and similar calls, through the shared `fs::object_store::s3_builder`. Breaking change since `988873c`: the crate removed `[database].path` (the Redb file). Use `[database].prefix` instead. The server no longer reads old `*.redb` files, and it provides no automatic migration.
+The server uses a single bucket with prefix-scoped stores. `db::build_s3_store` builds one `AmazonS3` `ObjectStore` from `[s3]` and wraps it with `OxKvStore::builder().with_object_store(...).with_prefix("oxkv/policy")` and similar calls, through the shared `fs::object_store::s3_builder`. Breaking change since `988873c`: the crate removed `[database].path` (the Redb file). Use `[database].prefix` instead. The server no longer reads old `*.redb` files, and it provides no automatic migration. See [Migration from Redb](#migration-from-redb) for the manual steps.
 
 Secrets via environment (win over the file when present and non-empty, for secret managers): `RUST_API_CLIENT_SECRET`, `RUST_API_S3_ACCESS_KEY_ID`, `RUST_API_S3_SECRET_ACCESS_KEY`, `RUST_API_CAPABILITY_SECRET`, `RUST_API_CAPABILITY_SECRET_PREV`, `RUST_API_ALLOWED_ORIGINS` (comma-separated).
+
+## Migration from Redb
+
+Versions before `988873c` kept every domain in one local Redb file named by `[database].path`. The current version removed that key. It stores policy rules, file metadata, the change feed, and per-user replicas as prefix-scoped objects under `[database].prefix` inside the configured S3 bucket. The server does not read old `*.redb` files and provides no automatic migration. Plan the move before you upgrade.
+
+### Old and new configuration
+
+Old shape:
+
+```toml
+[database]
+path = "/var/lib/rust-api/policy.redb"
+
+[s3]
+bucket = "my-bucket"
+region = "us-east-1"
+```
+
+New shape:
+
+```toml
+[database]
+prefix = "oxkv"          # default; policy → {prefix}/policy, fs → {prefix}/fs, wal → {prefix}/wal
+
+[s3]
+bucket = "my-bucket"
+region = "us-east-1"
+```
+
+`[s3]` was already required in the old version for file bytes. Only `[database]` changes.
+
+### Manual migration steps
+
+1. **Export policy rules before you upgrade.** Run the old binary against the old store:
+   ```bash
+   rust-api policy export --store /var/lib/rust-api/policy.redb --out policy-backup.json
+   ```
+   The export contains every `p` and `g` rule. It does **not** contain file metadata, relations, or the change feed.
+2. **Stop the old server.**
+3. **Update the configuration** as shown above. Pick a fresh `[database].prefix` (the default `oxkv` is fine) so the new stores start empty.
+4. **Start the new server.** It creates empty stores under the new prefix.
+5. **Import the policy rules** into the new prefix:
+   ```bash
+   rust-api policy import --config config.toml --input policy-backup.json
+   ```
+   The import is idempotent, so re-running it is safe. It appends the imported rules to the WAL, so replicas replay them instead of waiting for a full recalculation.
+6. **Re-bootstrap if you have no export.** A fresh prefix has no superadmin. Log in, then call `POST /setup/admin` once with your token. Recreate the rules and group memberships you need.
+7. **File metadata does not migrate.** Old file records and relations lived in the Redb file and have no import path. File bytes already in S3 stay in their buckets, but the new server has no metadata for them. Re-upload the files, or accept them as orphans and let the hourly GC remove them after 24 hours.
+8. **The change feed starts at zero.** Replicas rebuild from the current master state. No WAL replay covers the old history.
+9. **Keep the old files.** Retain `*.redb` and `*.redb.fs` until you verify the new deployment. Remove them only after that.
+
+### No automatic migration
+
+The server does not open, read, or convert old Redb files. There is no flag that turns migration on. Running the new binary against an old `[database].path` key fails at config load, because the key no longer exists. Treat the upgrade as a fresh install of the data plane plus an import of policy rules.
+
+### Re-bootstrapping policy
+
+If you cannot export from the old deployment, re-bootstrap from scratch:
+
+1. Start the new server on an empty prefix.
+2. Log in through `/auth/login`.
+3. Call `POST /setup/admin` once. The first authenticated subject becomes `superadmin`.
+4. Recreate rules with `POST /policy/rules` and group memberships with `POST /policy/groups`.
+
+`policy import` is the faster path when an export exists. `POST /setup/admin` is the only path when one does not. Both paths end with a working policy store; only the import path preserves the old rules.
 
 ## Production hardening
 
