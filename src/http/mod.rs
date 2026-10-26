@@ -240,6 +240,7 @@ macro_rules! wired_app {
         apply_limits(App::new())
             .wrap(cors($cors_origins))
             .wrap(middleware::request_id::RequestIdMiddleware)
+            .wrap(actix_web::middleware::Compress::default())
             .wrap(middleware::request_tracing::RequestTracingMiddleware)
             .wrap(middleware::bearer_token::BearerTokenMiddleware)
             // Outermost, so it also limits the routes that a limiter keyed on
@@ -364,6 +365,7 @@ impl ApiService {
     /// host app keeps the listener. Use this method with the global
     /// middleware that this module already exposes. That middleware is
     /// [`cors`],
+    /// [`actix_web::middleware::Compress`],
     /// [`RequestTracingMiddleware`](middleware::request_tracing::RequestTracingMiddleware),
     /// and [`BearerTokenMiddleware`](middleware::bearer_token::BearerTokenMiddleware).
     /// Add [`apply_limits`], [`health_routes`], and [`docs::config`] as
