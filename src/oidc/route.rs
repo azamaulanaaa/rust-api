@@ -117,6 +117,7 @@ where
                 .service(login)
                 .service(callback)
                 .service(logout)
+                .service(refresh)
                 .service(
                     web::resource("/me")
                         .wrap(self.session_middleware.clone())
@@ -321,6 +322,21 @@ pub async fn callback(
             })
         }
     }
+}
+
+/// Renews a session from a refresh token.
+///
+/// The route is a placeholder. The server does not issue or accept
+/// refresh tokens yet, so every call answers `501 Not Implemented`.
+/// Clients must re-run the authorization-code flow (`/auth/login`) when
+/// their session expires. See the "Session renewal" section of the README.
+#[utoipa::path(post, path = "/auth/refresh", tag = "auth", responses((status = 501, description = "not implemented", body = crate::http::error::ErrorBody)))]
+#[post("/refresh")]
+pub async fn refresh() -> impl Responder {
+    crate::http::error::ApiError::envelope(
+        actix_web::http::StatusCode::NOT_IMPLEMENTED,
+        "not implemented",
+    )
 }
 
 fn clear_cookie(name: String, secure: bool) -> Cookie<'static> {
