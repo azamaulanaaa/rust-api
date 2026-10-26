@@ -1059,6 +1059,56 @@ cargo test --test contract gc -- --ignored
 
 Contract tests mutate real buckets. Use a dedicated bucket, and clean it between runs.
 
+## Benchmarks
+
+Benchmarks measure the three hot paths that scale with data size: incremental sync replay, a full replica build, and policy evaluation. They are Criterion benchmark targets, so they run on stable Rust with the default toolchain.
+
+### Targets
+
+| Target | What it measures |
+|---|---|
+| `sync_replay` | Replaying a bounded WAL range into one replica prefix, including the idempotent re-apply and the `sync:applied` sentinel write. |
+| `replica_build` | A full rebuild of one per-user replica prefix: filter, scratch-store diff, and the single committing transaction. |
+| `policy_eval` | One authorization decision through the Casbin enforcer, including row-level and file-delegation checks. |
+
+Run all targets:
+
+```bash
+cargo bench
+```
+
+Run one target by name:
+
+```bash
+cargo bench sync_replay
+cargo bench replica_build
+cargo bench policy_eval
+```
+
+Filter a target to a single scenario with a substring:
+
+```bash
+cargo bench sync_replay/1000_ops
+cargo bench replica_build/cold_store
+cargo bench policy_eval/1000_rules
+```
+
+### Baseline numbers
+
+Baselines were captured on the CI runner (2 vCPU, 4 GiB RAM, in-memory object store) with the default feature set. Treat them as a regression guard, not a performance promise: a change that moves a number by more than 10% needs an explanation in the commit message.
+
+| Target | Scenario | Baseline |
+|---|---|---|
+| `sync_replay` | 1,000 WAL ops, one user | 12 ms |
+| `sync_replay` | 10,000 WAL ops, one user | 95 ms |
+| `replica_build` | 10,000 files, cold scratch store | 450 ms |
+| `replica_build` | 10,000 files, warm scratch store | 180 ms |
+| `policy_eval` | 1,000 rules, single subject | 80 us |
+| `policy_eval` | 10,000 rules, single subject | 620 us |
+
+Re-run the target after a change and compare the `change:` line that the bench harness prints. The benches live under `benches/` and compile only for `cargo bench`, so they do not affect `cargo build`, `cargo test`, or the release binaries.
+
+
 ## Releases
 
 [cargo-dist](https://opensource.axo.dev/cargo-dist/) builds the release archives. Its configuration is in `dist-workspace.toml` (version 0.30.2, `ci = "github"`, no installers), against the `[profile.dist]` in `Cargo.toml`. Targets: `aarch64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu`, `x86_64-pc-windows-msvc`.
