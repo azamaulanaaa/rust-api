@@ -41,6 +41,12 @@ pub struct Config {
     /// Cost limits. Each limit is off by default. See [`LimitsConfig`].
     #[serde(default)]
     pub limits: LimitsConfig,
+
+    /// RabbitMQ connection settings. Only present with the
+    /// `queue-rabbitmq` cargo feature.
+    #[cfg(feature = "queue-rabbitmq")]
+    #[serde(default)]
+    pub rabbitmq: RabbitMqConfig,
 }
 
 /// Environment variable that overrides the OIDC client secret.
@@ -76,6 +82,12 @@ pub const ENV_CAPABILITY_SECRET_PREV: &str = "RUST_API_CAPABILITY_SECRET_PREV";
 /// `https://app.example.com,http://localhost:5173`. A value that is present
 /// and not empty wins over `http.allowed_origins`.
 pub const ENV_ALLOWED_ORIGINS: &str = "RUST_API_ALLOWED_ORIGINS";
+
+/// Environment variable that overrides the RabbitMQ URL.
+///
+/// Only defined with the `queue-rabbitmq` cargo feature.
+#[cfg(feature = "queue-rabbitmq")]
+pub const ENV_RABBITMQ_URL: &str = "RUST_API_RABBITMQ_URL";
 
 impl TryFrom<&Path> for Config {
     type Error = anyhow::Error;
@@ -191,6 +203,13 @@ fn apply_overrides_from(config: &mut Config, var: impl Fn(&str) -> Option<String
             .filter(|s| !s.is_empty())
             .map(str::to_string)
             .collect();
+    }
+
+    #[cfg(feature = "queue-rabbitmq")]
+    if let Some(raw) = var(ENV_RABBITMQ_URL)
+        && !raw.trim().is_empty()
+    {
+        config.rabbitmq.url = Some(raw);
     }
 }
 
@@ -308,6 +327,16 @@ impl Config {
                 );
             }
         }
+        #[cfg(feature = "queue-rabbitmq")]
+        if let Some(url) = &self.rabbitmq.url {
+            let parsed: url::Url = url
+                .parse()
+                .map_err(|e| anyhow::anyhow!("rabbitmq.url is not a valid URL ({url:?}): {e}"))?;
+            if parsed.scheme() != "amqp" && parsed.scheme() != "amqps" {
+                anyhow::bail!("rabbitmq.url must use amqp(s), got {:?}", parsed.scheme());
+            }
+        }
+
         Ok(())
     }
 }
@@ -987,6 +1016,8 @@ mod tests {
             ENV_CAPABILITY_SECRET => Some(secret.clone()),
             ENV_CAPABILITY_SECRET_PREV => Some(secret.clone()),
             ENV_ALLOWED_ORIGINS => Some("https://env.example.com, https://env2.example.com".into()),
+            #[cfg(feature = "queue-rabbitmq")]
+            ENV_RABBITMQ_URL => Some("amqp://env".into()),
             other => panic!("unexpected override for {other}"),
         });
         assert_eq!(overlaid.authorization.client_secret, "from-env");
@@ -1121,4 +1152,14 @@ mod tests {
             "0 disables the lease"
         );
     }
+}
+
+/// RabbitMQ connection settings. Only present with the `queue-rabbitmq`
+/// cargo feature.
+#[cfg(feature = "queue-rabbitmq")]
+#[derive(Deserialize, Debug, Default)]
+pub struct RabbitMqConfig {
+    /// AMQP URL, for example `amqp://guest:guest@localhost:5672`.
+    #[serde(default)]
+    pub url: Option<String>,
 }
