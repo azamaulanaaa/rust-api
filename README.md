@@ -1431,6 +1431,29 @@ The `cargo-dist` tool pin in `mise.toml` must track `cargo-dist-version` in `dis
 
 Commit messages follow the [Conventional Commits](https://www.conventionalcommits.org/) style. The scope is optional, and it names the part of the crate that changed. Therefore `feat:`, `fix:`, and `docs:` appear beside scoped subjects such as `chore(deps)!:`, `feat(fs):`, `fix(sync)!:`, and `docs(readme)!:`.
 
+## Job queue
+
+The crate ships a generic, business-logic-free job queue in `src/queue.rs`.
+The queue defines traits and value types only. Domain job types and
+handlers live in the application crate.
+
+Backends:
+
+- `MemoryQueue` for tests and local development (non-durable).
+- `DurableQueue` over an OxKV store under `{db_prefix}/queue/{name}`.
+  The store must be the single-writer leased handle. The backend does not
+  open a second writer.
+- `RabbitMqQueue` behind the `queue-rabbitmq` feature.
+
+A `QueueWorker` reserves jobs, dispatches by `kind`, acks on success, and
+nacks with retry on failure. Handlers must be idempotent, because delivery
+is at least once. Poison jobs move to the dead-letter state after
+`max_attempts`.
+
+Observability uses `tracing` spans and OpenTelemetry metrics:
+`queue.depth`, `queue.enqueued`, `queue.reserved`, `queue.completed`,
+`queue.failed`, `queue.dead_lettered`, and `queue.processing_duration`.
+
 ## License
 
 Licensed under either of

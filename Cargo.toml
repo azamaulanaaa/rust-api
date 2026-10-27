@@ -13,6 +13,7 @@ repository = "https://github.com/azamaulanaaa/rust-api"
 default = ["otlp-http"]
 otlp-grpc = ["dep:opentelemetry-otlp", "opentelemetry-otlp/grpc-tonic", "opentelemetry-otlp/trace", "opentelemetry-otlp/metrics", "opentelemetry-otlp/internal-logs"]
 otlp-http = ["dep:opentelemetry-otlp", "opentelemetry-otlp/http-proto", "opentelemetry-otlp/trace", "opentelemetry-otlp/metrics", "opentelemetry-otlp/internal-logs"]
+queue-rabbitmq = []
 
 # Version floors are `major.minor`: a new minor is a deliberate bump, patch
 # releases float. Exact versions are pinned by the committed Cargo.lock and
