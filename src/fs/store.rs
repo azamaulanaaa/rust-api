@@ -1479,7 +1479,7 @@ mod tests {
     /// delete that fails partway through.
     /// A test cannot arrange such a failure.
     /// The store is a concrete `OxKvStore` over an in-memory backend.
-    /// The validators of `HookStore` in `oxkv` reject `set_bytes` only,
+    /// The validators of `Hooks` in `oxkv` reject `set_bytes` only,
     /// and never a `delete`.
     /// Fencing fails the first write, whatever the order.
     /// Fencing cannot tell the two orders apart.

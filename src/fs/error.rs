@@ -220,6 +220,11 @@ mod tests {
             oxkv::StoreError::Storage("disk".into()),
             oxkv::StoreError::CasConflict("race".into()),
             oxkv::StoreError::NotModified,
+            oxkv::StoreError::Rejected {
+                key: "k".into(),
+                reason: "bad".into(),
+            },
+            oxkv::StoreError::Other("x".into()),
         ] {
             let mapped = FsError::from(other);
             assert!(

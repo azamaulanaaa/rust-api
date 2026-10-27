@@ -39,7 +39,7 @@ fn store_err(e: oxkv::StoreError) -> CasbinError {
 ///
 /// The adapter enforces [`PolicyRuleValidator`] directly on every write path.
 /// Callers therefore do not have to wrap their store in an
-/// [`oxkv::HookStore`]. The validation runs before any transaction
+/// [`oxkv::Hooks`]. The validation runs before any transaction
 /// opens, so rejected writes fail without touching the store.
 async fn encode_rule<S>(
     store: &S,
@@ -382,7 +382,7 @@ mod tests {
     use crate::fencing::Latch;
     use crate::policy::RBAC_MODEL;
     use casbin::{CoreApi, DefaultModel, Enforcer, MgmtApi};
-    use oxkv::BTreeStore;
+    use oxkv::{BTreeStore, Hooks};
 
     /// A store whose commits report a lost epoch.
     ///
@@ -399,7 +399,7 @@ mod tests {
     #[async_trait::async_trait]
     impl oxkv::GetSet for FencedStore {
         async fn get_bytes(&self, key: &str) -> Result<Option<Vec<u8>>, oxkv::StoreError> {
-            self.0.get_bytes(key).await
+            oxkv::GetSet::get_bytes(&self.0, key).await
         }
         async fn has(&self, key: &str) -> Result<bool, oxkv::StoreError> {
             oxkv::GetSet::has(&self.0, key).await
@@ -420,7 +420,38 @@ mod tests {
             direction: oxkv::Direction,
             cursor: (Option<String>, Option<String>),
         ) -> Result<Vec<oxkv::KeyValue>, oxkv::StoreError> {
-            self.0.gets_bytes(limit, direction, cursor).await
+            oxkv::GetSet::gets_bytes(&self.0, limit, direction, cursor).await
+        }
+    }
+
+    impl oxkv::Hooks for FencedStore {
+        fn add_validator<V>(&self, validator: V)
+        where
+            V: oxkv::Validator + 'static,
+        {
+            self.0.add_validator(validator);
+        }
+
+        fn add_observer<O>(&self, observer: O)
+        where
+            O: oxkv::Observer + 'static,
+        {
+            self.0.add_observer(observer);
+        }
+
+        fn watch_scope(
+            &self,
+            scope: oxkv::Scope,
+        ) -> futures_channel::mpsc::Receiver<oxkv::ChangeEvent> {
+            self.0.watch_scope(scope)
+        }
+
+        fn current_seq(&self) -> u64 {
+            self.0.current_seq()
+        }
+
+        fn events_since(&self, seq: u64) -> Option<Vec<oxkv::ChangeEvent>> {
+            self.0.events_since(seq)
         }
     }
 
@@ -563,7 +594,8 @@ mod tests {
 
         {
             let adapter = OxkvAdapter::new(
-                oxkv::HookStore::new(open(backend.clone()).await)
+                open(backend.clone())
+                    .await
                     .with_validator(PolicyRuleValidator),
             );
             let mut enforcer = Enforcer::new(model, adapter).await.unwrap();
@@ -585,7 +617,8 @@ mod tests {
         {
             let model = DefaultModel::from_str(RBAC_MODEL).await.unwrap();
             let adapter = OxkvAdapter::new(
-                oxkv::HookStore::new(open(backend.clone()).await)
+                open(backend.clone())
+                    .await
                     .with_validator(PolicyRuleValidator),
             );
             let enforcer = Enforcer::new(model, adapter).await.unwrap();
@@ -642,7 +675,7 @@ mod tests {
     async fn validator_rejects_malformed_writes() {
         use oxkv::Store as _;
 
-        let store = oxkv::HookStore::new(BTreeStore::default()).with_validator(PolicyRuleValidator);
+        let store = BTreeStore::default().with_validator(PolicyRuleValidator);
 
         // The store accepts a valid p-rule.
         store
@@ -672,7 +705,7 @@ mod tests {
     async fn validator_error_names_the_ptype_segment() {
         use oxkv::Store as _;
 
-        let store = oxkv::HookStore::new(BTreeStore::default()).with_validator(PolicyRuleValidator);
+        let store = BTreeStore::default().with_validator(PolicyRuleValidator);
         let tx = store.begin_tx().unwrap();
         let err = tx
             .set_bytes("p:only-two", br#"["alice","doc","read"]"#)
