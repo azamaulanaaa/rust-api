@@ -19,7 +19,11 @@ queue-rabbitmq = []
 # releases float. Exact versions are pinned by the committed Cargo.lock and
 # the `--locked` CI jobs, so nothing resolves differently between runs.
 [dependencies]
-actix-web = "4.12"
+# zstd 0.13 has four security advisories. No actix-http release accepts
+# zstd 0.14 yet. This crate mounts `middleware::Compress`. The middleware
+# loses zstd response encoding and keeps brotli, gzip and deflate. Restore
+# `compress-zstd` when actix-http accepts zstd >= 0.14.3.
+actix-web = { version = "4.12", default-features = false, features = ["macros", "compress-brotli", "compress-gzip", "cookies", "http2", "unicode", "compat", "ws"] }
 actix-cors = "0.7"
 # Range, not a floor: actix-web-codegen 4.4.0 generates route structs
 # without docs, tripping `[lints.rust] missing_docs = "deny"`. Revisit on
