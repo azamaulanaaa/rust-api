@@ -1,13 +1,14 @@
 //! Worker runtime for the job queue.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use tracing::{info, warn};
+use tracing::{Instrument, info, warn};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::CancelToken;
 
-use super::{JobHandler, JobQueue, LeasedJob, RetryPolicy};
+use super::{JobHandler, JobQueue, LeasedJob, QueueMetrics, RetryPolicy};
 
 /// A worker that reserves and processes jobs.
 pub struct QueueWorker {
@@ -23,6 +24,8 @@ pub struct QueueWorker {
     lease: Duration,
     /// Poll interval when idle.
     poll_interval: Duration,
+    /// Metrics for the worker.
+    metrics: QueueMetrics,
 }
 
 impl QueueWorker {
@@ -39,6 +42,7 @@ impl QueueWorker {
             batch_size: 4,
             lease: Duration::from_secs(30),
             poll_interval: Duration::from_millis(200),
+            metrics: QueueMetrics::new("worker"),
         }
     }
 
@@ -57,6 +61,12 @@ impl QueueWorker {
     /// Sets the poll interval.
     pub fn with_poll_interval(mut self, interval: Duration) -> Self {
         self.poll_interval = interval;
+        self
+    }
+
+    /// Sets the metrics handle.
+    pub fn with_metrics(mut self, metrics: QueueMetrics) -> Self {
+        self.metrics = metrics;
         self
     }
 
@@ -93,13 +103,31 @@ impl QueueWorker {
     async fn process(&self, leased: LeasedJob) {
         let job = leased.job;
         let job_id = job.id;
-        let start = std::time::Instant::now();
+        let job_kind = job.kind.clone();
+        let start = Instant::now();
+        let parent_cx = super::extract_trace_context(&job.headers);
+        let span = tracing::info_span!(
+            "queue.process",
+            "otel.name" = format!("process {}", job_kind),
+            "queue.backend" = "worker",
+            "job.id" = %job_id,
+            "job.kind" = %job_kind,
+            "job.attempt" = job.attempt,
+        );
+        if let Err(e) = span.set_parent(parent_cx) {
+            tracing::debug!("ignoring invalid inbound trace context: {e}");
+        }
+
         let handler = self.handler_for(&job.kind);
         let Some(handler) = handler else {
             let _ = self
                 .queue
                 .nack(job_id, "no handler for kind", RetryPolicy::NoRetry)
                 .await;
+            self.metrics.record_failed();
+            self.metrics
+                .record_processing_duration(start.elapsed().as_secs_f64());
+            span.in_scope(|| warn!(job_id = %job_id, "no handler for job kind"));
             return;
         };
         // Lease extender.
@@ -119,7 +147,7 @@ impl QueueWorker {
                 }
             })
         };
-        let result = handler.handle(&job).await;
+        let result = handler.handle(&job).instrument(span.clone()).await;
         ext_cancel.cancel();
         let _ = ext_handle.await;
         let elapsed = start.elapsed().as_secs_f64();
@@ -128,6 +156,7 @@ impl QueueWorker {
                 if let Err(e) = self.queue.ack(job_id, res).await {
                     warn!(error = %e, "queue ack failed");
                 }
+                self.metrics.record_completed();
             }
             Err(e) => {
                 warn!(error = %e, "job failed");
@@ -141,8 +170,10 @@ impl QueueWorker {
                         },
                     )
                     .await;
+                self.metrics.record_failed();
             }
         }
-        info!(job_id = %job_id, elapsed = elapsed, "job processed");
+        self.metrics.record_processing_duration(elapsed);
+        span.in_scope(|| info!(job_id = %job_id, elapsed = elapsed, "job processed"));
     }
 }

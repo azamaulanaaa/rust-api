@@ -73,13 +73,15 @@ impl Default for MemoryQueue {
 
 #[async_trait]
 impl super::JobQueue for MemoryQueue {
-    #[instrument(skip(self, job))]
+    #[instrument(name = "queue.enqueue", skip(self, job), fields(queue.backend = "memory", job.id = %job.id, job.kind = %job.kind))]
     async fn enqueue(&self, job: Job) -> Result<JobId, QueueError> {
         if job.max_attempts == 0 {
             return Err(QueueError::Invalid(
                 "max_attempts must be positive".to_string(),
             ));
         }
+        let mut job = job;
+        super::inject_trace_context(&mut job.headers);
         let mut state = self.state.lock().await;
         if let Some(key) = &job.idempotency_key
             && let Some(existing) = state.idempotency.get(key)
@@ -107,7 +109,7 @@ impl super::JobQueue for MemoryQueue {
         Ok(id)
     }
 
-    #[instrument(skip(self))]
+    #[instrument(name = "queue.reserve", skip(self), fields(queue.backend = "memory", worker = %worker, limit = %limit))]
     async fn reserve(
         &self,
         worker: &str,
@@ -154,7 +156,7 @@ impl super::JobQueue for MemoryQueue {
         Ok(out)
     }
 
-    #[instrument(skip(self, result))]
+    #[instrument(name = "queue.ack", skip(self, result), fields(queue.backend = "memory", job.id = %job_id))]
     async fn ack(&self, job_id: JobId, result: Option<Vec<u8>>) -> Result<(), QueueError> {
         let mut state = self.state.lock().await;
         let rec = state
@@ -175,7 +177,7 @@ impl super::JobQueue for MemoryQueue {
         Ok(())
     }
 
-    #[instrument(skip(self))]
+    #[instrument(name = "queue.nack", skip(self), fields(queue.backend = "memory", job.id = %job_id, error = %error))]
     async fn nack(&self, job_id: JobId, error: &str, retry: RetryPolicy) -> Result<(), QueueError> {
         let mut state = self.state.lock().await;
         let rec = state
@@ -225,7 +227,7 @@ impl super::JobQueue for MemoryQueue {
         Ok(())
     }
 
-    #[instrument(skip(self))]
+    #[instrument(name = "queue.extend_lease", skip(self), fields(queue.backend = "memory", job.id = %job_id))]
     async fn extend_lease(&self, job_id: JobId, lease: Duration) -> Result<(), QueueError> {
         let mut state = self.state.lock().await;
         Self::sweep_expired(&mut state);
@@ -251,7 +253,7 @@ impl super::JobQueue for MemoryQueue {
         Ok(())
     }
 
-    #[instrument(skip(self))]
+    #[instrument(name = "queue.status", skip(self), fields(queue.backend = "memory", job.id = %job_id))]
     async fn status(&self, job_id: JobId) -> Result<JobStatus, QueueError> {
         let mut state = self.state.lock().await;
         Self::sweep_expired(&mut state);

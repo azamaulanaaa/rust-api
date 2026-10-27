@@ -125,13 +125,15 @@ impl DurableQueue {
 
 #[async_trait]
 impl super::JobQueue for DurableQueue {
-    #[instrument(skip(self, job))]
+    #[instrument(name = "queue.enqueue", skip(self, job), fields(queue.backend = "durable", job.id = %job.id, job.kind = %job.kind))]
     async fn enqueue(&self, job: Job) -> Result<JobId, QueueError> {
         if job.max_attempts == 0 {
             return Err(QueueError::Invalid(
                 "max_attempts must be positive".to_string(),
             ));
         }
+        let mut job = job;
+        super::inject_trace_context(&mut job.headers);
         if let Some(key) = &job.idempotency_key {
             let ik = Self::idempotency_key(key);
             let g = self.store.read().await;
@@ -171,10 +173,20 @@ impl super::JobQueue for DurableQueue {
             .map_err(|e| QueueError::Store(e.to_string()))?;
         drop(g);
         self.metrics.record_enqueued();
+        // Best-effort depth for telemetry.
+        let depth = {
+            let guard = self.store.read().await;
+            guard
+                .gets_bytes(None, oxkv::Direction::Next, (None, None))
+                .await
+                .map(|kvs| kvs.iter().filter(|kv| kv.key.starts_with("job:")).count() as u64)
+                .unwrap_or(0)
+        };
+        self.metrics.record_depth(depth);
         Ok(id)
     }
 
-    #[instrument(skip(self))]
+    #[instrument(name = "queue.reserve", skip(self), fields(queue.backend = "durable", worker = %worker, limit = %limit))]
     async fn reserve(
         &self,
         worker: &str,
@@ -237,7 +249,7 @@ impl super::JobQueue for DurableQueue {
         Ok(out)
     }
 
-    #[instrument(skip(self, result))]
+    #[instrument(name = "queue.ack", skip(self, result), fields(queue.backend = "durable", job.id = %job_id))]
     async fn ack(&self, job_id: JobId, result: Option<Vec<u8>>) -> Result<(), QueueError> {
         let mut sj = self.load(job_id).await?;
         let finished = Self::now();
@@ -259,7 +271,7 @@ impl super::JobQueue for DurableQueue {
         Ok(())
     }
 
-    #[instrument(skip(self))]
+    #[instrument(name = "queue.nack", skip(self), fields(queue.backend = "durable", job.id = %job_id, error = %error))]
     async fn nack(&self, job_id: JobId, error: &str, retry: RetryPolicy) -> Result<(), QueueError> {
         let mut sj = self.load(job_id).await?;
         let finished = Self::now();
@@ -322,7 +334,7 @@ impl super::JobQueue for DurableQueue {
         Ok(())
     }
 
-    #[instrument(skip(self))]
+    #[instrument(name = "queue.extend_lease", skip(self), fields(queue.backend = "durable", job.id = %job_id))]
     async fn extend_lease(&self, job_id: JobId, lease: Duration) -> Result<(), QueueError> {
         self.sweep_expired().await?;
         let mut sj = self.load(job_id).await?;
@@ -354,7 +366,7 @@ impl super::JobQueue for DurableQueue {
         Ok(())
     }
 
-    #[instrument(skip(self))]
+    #[instrument(name = "queue.status", skip(self), fields(queue.backend = "durable", job.id = %job_id))]
     async fn status(&self, job_id: JobId) -> Result<JobStatus, QueueError> {
         self.sweep_expired().await?;
         let sj = self.load(job_id).await?;

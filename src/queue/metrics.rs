@@ -1,5 +1,6 @@
 //! Metrics helpers for the queue.
 
+use opentelemetry::KeyValue;
 use opentelemetry::global;
 use opentelemetry::metrics::{Counter, Gauge, Histogram, Meter};
 
@@ -33,37 +34,43 @@ impl QueueMetrics {
 
     /// Records an enqueue.
     pub fn record_enqueued(&self) {
-        self.enqueued.add(1, &[]);
-        let _ = self.backend;
+        let attrs = [KeyValue::new("queue.backend", self.backend)];
+        self.enqueued.add(1, &attrs);
     }
 
     /// Records a reserve batch.
     pub fn record_reserved(&self, count: u64) {
-        self.reserved.add(count, &[]);
+        let attrs = [KeyValue::new("queue.backend", self.backend)];
+        self.reserved.add(count, &attrs);
     }
 
     /// Records a completion.
     pub fn record_completed(&self) {
-        self.completed.add(1, &[]);
+        let attrs = [KeyValue::new("queue.backend", self.backend)];
+        self.completed.add(1, &attrs);
     }
 
     /// Records a failure.
     pub fn record_failed(&self) {
-        self.failed.add(1, &[]);
+        let attrs = [KeyValue::new("queue.backend", self.backend)];
+        self.failed.add(1, &attrs);
     }
 
     /// Records a dead-lettered job.
     pub fn record_dead_lettered(&self) {
-        self.dead_lettered.add(1, &[]);
+        let attrs = [KeyValue::new("queue.backend", self.backend)];
+        self.dead_lettered.add(1, &attrs);
     }
 
     /// Records the current depth.
     pub fn record_depth(&self, depth: u64) {
-        self.depth.record(depth, &[]);
+        let attrs = [KeyValue::new("queue.backend", self.backend)];
+        self.depth.record(depth, &attrs);
     }
 
     /// Records processing duration in seconds.
     pub fn record_processing_duration(&self, seconds: f64) {
-        self.processing_duration.record(seconds, &[]);
+        let attrs = [KeyValue::new("queue.backend", self.backend)];
+        self.processing_duration.record(seconds, &attrs);
     }
 }
