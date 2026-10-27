@@ -481,6 +481,80 @@ The worker count stays small on purpose. A build's memory now tracks the size of
 
 The code enforces this, not just the documentation. `records::tests::producers_do_not_depend_on_the_consumer` fails if any production `use` in `fs/` or `policy/` names `crate::sync`. `this_module_depends_on_nothing_in_the_crate` keeps `records` a leaf. Rust permits module cycles, so nothing else would notice the edge creeping back.
 
+
+## Reactive services
+
+Applications attach `oxkv` hooks and run background systems through
+`rust_api::reactive::ReactiveService`. The starter kit ships no domain
+logic; it only provides the extension point.
+
+Implement the trait for your service:
+
+```rust
+use std::sync::Arc;
+use async_trait::async_trait;
+use rust_api::reactive::{ReactiveContext, ReactiveService};
+
+struct MyService;
+
+#[async_trait]
+impl ReactiveService for MyService {
+    fn name(&self) -> &'static str {
+        "my-service"
+    }
+
+    fn register(&self, ctx: &ReactiveContext) {
+        // Attach observers or validators to stores. Keep this cheap and
+        // synchronous: it must not block on S3.
+        let _ = ctx;
+    }
+
+    async fn run(&self, ctx: ReactiveContext) -> anyhow::Result<()> {
+        // Run until ctx.cancel fires. An error stops only this service.
+        ctx.cancel.cancelled().await;
+        Ok(())
+    }
+}
+```
+
+Register the service in `main.rs`, where the stores and engines are already
+built and `cancel` exists:
+
+```rust
+let reactive_services: Vec<Arc<dyn rust_api::reactive::ReactiveService>> = vec![
+    Arc::new(MyService),
+];
+let reactive_context = rust_api::reactive::ReactiveContext {
+    policy: Arc::new(policy_engine.clone()),
+    fs: Arc::new(fs_engine.clone()),
+    wal: Arc::new(wal.clone()),
+    db_prefix: db_prefix.clone(),
+    s3: s3_client_config.clone(),
+    cancel: cancel.clone(),
+};
+let reactive_handles =
+    rust_api::reactive::spawn_services(&reactive_services, reactive_context);
+```
+
+`spawn_services` calls `register` synchronously before spawning `run`. On
+shutdown, cancel the token and await the returned handles before releasing
+the writer lease.
+
+### Where domain logic lives
+
+Domain logic lives in the application crate, not in this one. This crate
+stays business-logic free.
+
+### Limits of `oxkv` hooks
+
+- Hooks are read-only. An observer cannot mutate the store, and cannot
+  trigger further events recursively.
+- Observers run on the writer path. A write awaits their completion before
+  it returns.
+- Watch channels are bounded and lossy. A consumer that falls behind misses
+  events and must recover from a gap in the sequence numbers.
+- `register` is synchronous and runs at startup. Keep it cheap.
+
 ## Configuration
 
 You configure the server with a TOML file. Pass that file with `--config`:

@@ -37,6 +37,10 @@ pub mod policy;
 /// InMemory for tests) with multipart upload over REST.
 pub mod fs;
 
+/// Reactive scaffolding: a business-logic-free extension point for
+/// applications to attach `oxkv` hooks and run background systems.
+pub mod reactive;
+
 #[cfg(test)]
 mod test_support;
 
