@@ -208,7 +208,7 @@ The job queue lives in `src/queue.rs`. It provides `MemoryQueue` for tests, `Dur
 
 `audit::AuditEvent` and `audit::AuditSink` record mutations. `TracingAuditSink` writes each event at info level. The binary does not install a sink. `retry::retry_with_backoff` retries transient failures with exponential backoff.
 
-The crate does not ship external event delivery (webhooks), idempotency-key storage, or soft delete. If an application adds them, deliver events at least once and make receivers idempotent on a stable event id. Replay the stored response for a repeated idempotency key, and reject a different payload with the same key as a conflict. Detach files when a row is soft-deleted, and keep the tombstone TTL and the 24-hour orphan TTL ordered, so a restore does not find the bytes already collected.
+The crate does not ship external event delivery (webhooks), HTTP request idempotency-key storage, or soft delete. If an application adds them, deliver events at least once and make receivers idempotent on a stable event id. Replay the stored response for a repeated idempotency key, and reject a different payload with the same key as a conflict. Detach files when a row is soft-deleted, and keep the tombstone TTL and the 24-hour orphan TTL ordered, so a restore does not find the bytes already collected.
 
 ## API reference
 
