@@ -1040,7 +1040,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2110,7 +2110,7 @@ version = "5.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "51e219e79014df21a225b1860a479e2dcd7cbd9130f4defd4bd0e191ea31d67d"
 dependencies = [
- "base64 0.21.7",
+ "base64 0.22.1",
  "chrono",
  "getrandom 0.2.17",
  "http 1.5.0",
@@ -2304,9 +2304,9 @@ dependencies = [
 
 [[package]]
 name = "oxkv"
-version = "0.9.0"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4500aea960358e9e3147d58d0911c6d8562eb3f0ce5d4d2eea137de8236b0d56"
+checksum = "0d55b2a6f22c68e464a007f688a73984ea87f3d42245a24d2ce5647c7574b80f"
 dependencies = [
  "async-lock",
  "async-trait",
@@ -2667,7 +2667,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2971,6 +2971,7 @@ dependencies = [
  "casbin",
  "chrono",
  "clap",
+ "futures-channel",
  "futures-util",
  "jsonwebtoken",
  "object_store",
@@ -4283,7 +4284,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
