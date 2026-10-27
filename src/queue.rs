@@ -9,6 +9,8 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use opentelemetry::global;
+use opentelemetry::propagation::{Extractor, Injector};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -177,3 +179,42 @@ pub use metrics::QueueMetrics;
 
 #[cfg(feature = "queue-rabbitmq")]
 pub mod rabbitmq;
+
+/// Injects the current OpenTelemetry trace context into job headers.
+///
+/// The function writes the W3C `traceparent` and `tracestate` entries. A
+/// worker that reads the same job can then continue the trace.
+pub fn inject_trace_context(headers: &mut BTreeMap<String, String>) {
+    struct MapInjector<'a>(&'a mut BTreeMap<String, String>);
+    impl Injector for MapInjector<'_> {
+        fn set(&mut self, key: &str, value: String) {
+            self.0.insert(key.to_string(), value);
+        }
+    }
+    global::get_text_map_propagator(|propagator| {
+        propagator.inject_context(
+            &opentelemetry::Context::current(),
+            &mut MapInjector(headers),
+        );
+    });
+}
+
+/// Extracts an OpenTelemetry trace context from job headers.
+///
+/// The function returns the context that [`inject_trace_context`] stored.
+/// An empty context results when the job carries no trace header.
+pub fn extract_trace_context(headers: &BTreeMap<String, String>) -> opentelemetry::Context {
+    struct MapExtractor<'a>(&'a BTreeMap<String, String>);
+    impl Extractor for MapExtractor<'_> {
+        fn get(&self, key: &str) -> Option<&str> {
+            self.0
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(key))
+                .map(|(_, v)| v.as_str())
+        }
+        fn keys(&self) -> Vec<&str> {
+            self.0.keys().map(String::as_str).collect()
+        }
+    }
+    global::get_text_map_propagator(|propagator| propagator.extract(&MapExtractor(headers)))
+}
