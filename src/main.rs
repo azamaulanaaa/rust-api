@@ -346,6 +346,24 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
     // cancelled after the server stops serving, so the tasks exit instead
     // of being dropped mid-flight.
     let cancel = tokio_util::sync::CancellationToken::new();
+    // Applications append their own reactive services here. The starter kit
+    // ships none, so the list stays empty. Each entry implements
+    // `rust_api::reactive::ReactiveService`.
+    let reactive_services: Vec<Arc<dyn rust_api::reactive::ReactiveService>> = vec![];
+
+    // `fs_engine` is moved into `FsApiModule` below. Clone it first, as the
+    // context keeps its own handle.
+    let reactive_context = rust_api::reactive::ReactiveContext {
+        policy: Arc::new(policy_engine.clone()),
+        fs: Arc::new(fs_engine.clone()),
+        wal: Arc::new(wal.clone()),
+        db_prefix: db_prefix.clone(),
+        s3: s3_client_config.clone(),
+        cancel: cancel.clone(),
+    };
+
+    let reactive_handles = rust_api::reactive::spawn_services(&reactive_services, reactive_context);
+
     // Garbage collection. The server removes multipart uploads that
     // were never finished, every hour. The TTL is 24 hours.
     rust_api::fs::gc::spawn(std::sync::Arc::new(fs_engine.clone()), cancel.clone());
@@ -478,6 +496,14 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
     // Stop the background tasks before releasing the lease. The tasks
     // observe the token and exit their loops instead of being dropped.
     cancel.cancel();
+
+    // Stop reactive services before releasing the lease. They observe the
+    // token and exit their loops instead of being dropped.
+    for handle in reactive_handles {
+        if let Ok(Err(error)) = handle.await {
+            tracing::error!(?error, "reactive service failed");
+        }
+    }
 
     // This runs before the flush of the telemetry, so that the log lines of
     // the release reach the collector.
