@@ -61,6 +61,63 @@ mise run bans
 
 These run cargo-deny. See `deny.toml` for the rules.
 
+## Local CI
+
+The repository ships git hooks that mirror the CI workflow.
+
+Install the hooks:
+
+```bash
+mise run hooks
+```
+
+This command sets `core.hooksPath` to `.githooks` and marks the hook files executable.
+
+The `pre-commit` hook runs `mise run lint` when staged changes exist. The `pre-push` hook runs `.githooks/ci-local.sh` with the default jobs. The default jobs are lint, test, MSRV, docs, release config, licences, advisories, and bans.
+
+Run one job on demand:
+
+```bash
+.githooks/ci-local.sh lint
+```
+
+Run several jobs:
+
+```bash
+.githooks/ci-local.sh lint test doc
+```
+
+Run every job, including coverage:
+
+```bash
+.githooks/ci-local.sh --all
+```
+
+Run coverage only:
+
+```bash
+.githooks/ci-local.sh coverage
+```
+
+List the job names or show the help:
+
+```bash
+.githooks/ci-local.sh --list
+.githooks/ci-local.sh --help
+```
+
+The script skips a job when a required tool is missing. The warning names the tool and the install command. Run `mise install` to install the tools. The script also skips the MSRV job when the declared toolchain is not installed. It does not download the toolchain.
+
+Set `CI_LOCAL_STRICT=1` to turn every skip into a failure:
+
+```bash
+CI_LOCAL_STRICT=1 .githooks/ci-local.sh
+```
+
+Set `CI_LOCAL_SKIP=1` to skip the `pre-push` hook for one push. Use `git push --no-verify` to bypass the hook.
+
+The hooks are local. A push with `--no-verify` still runs CI on GitHub.
+
 ## Documentation
 
 Every public item must carry rustdoc. `Cargo.toml` sets `missing_docs = "deny"`. The compiler enforces this at build time. CI also runs `cargo doc --no-deps --all-features` with `RUSTDOCFLAGS="-D warnings"`.
