@@ -5,6 +5,13 @@ rust = { version = "stable", components = "rust-analyzer" }
 "cargo:cargo-dist" = "0.32.0"
 "cargo:cargo-zigbuild" = "latest"
 
+[tasks.hooks]
+run = [
+  "git config core.hooksPath .githooks",
+  "chmod +x .githooks/pre-commit .githooks/pre-push .githooks/ci-local.sh",
+]
+description = "Install the git hooks in this repository"
+
 [tasks.build]
 run = "cargo-zigbuild build --all-targets --all-features"
 
