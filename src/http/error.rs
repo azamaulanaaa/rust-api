@@ -5,12 +5,20 @@
 //! response renderer attaches the underlying causes through
 //! [`std::error::Error::source`]. It logs them on the server. The renderer
 //! never sends the causes to a client.
+//!
+//! The envelope can also carry an optional `code` and optional `details`.
+//! The server omits each field when its value is `None`. Thus the minimal
+//! body keeps its old bytes.
 
 use actix_web::{HttpResponse, ResponseError, http::StatusCode};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-/// The wire format for every API error: `{"error": "<message>"}`.
+/// The wire format for every API error.
+///
+/// The minimal body is `{"error": "<message>"}`. The optional `code` and
+/// `details` fields extend that body. The server omits each optional field
+/// when its value is `None`.
 ///
 /// The type also derives `Deserialize`. A test can check the served body
 /// through this type instead of an anonymous `serde_json::Value`. That way
@@ -20,6 +28,20 @@ pub struct ErrorBody {
     /// A stable description of the failure. The description contains no
     /// sensitive data.
     pub error: String,
+
+    /// A stable machine-readable code for the failure class.
+    ///
+    /// The server omits this field when no code applies.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+
+    /// Optional structured context for the failure.
+    ///
+    /// This field never carries request input, filenames, keys, sizes, store
+    /// errors, or other sensitive data. The server omits this field when no
+    /// safe details exist.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<serde_json::Value>,
 }
 
 /// The API error for the whole application.
@@ -88,6 +110,19 @@ impl ApiError {
         }
     }
 
+    /// The stable machine-readable code for this failure class.
+    pub(crate) fn code(&self) -> &'static str {
+        match self {
+            Self::BadRequest => "invalid_request",
+            Self::MissingCredentials => "authentication_required",
+            Self::InvalidCredentials(_) => "invalid_credentials",
+            Self::Forbidden => "forbidden",
+            Self::Internal(_) => "internal_error",
+            Self::Conflict => "conflict",
+            Self::TooManyRequests => "too_many_requests",
+        }
+    }
+
     /// Renders the uniform envelope for any status and message.
     ///
     /// The function is the only place that builds the body. A status
@@ -98,9 +133,19 @@ impl ApiError {
     /// `/fs` and `/sync` was an anonymous value. The OpenAPI document
     /// described that value as [`ErrorBody`] by convention only. The
     /// function now builds an [`ErrorBody`] directly.
-    pub(crate) fn envelope(status: StatusCode, message: &str) -> HttpResponse {
+    ///
+    /// A `None` code or detail does not appear in the JSON body. Thus the
+    /// minimal body stays exactly `{"error":"<message>"}`.
+    pub(crate) fn envelope(
+        status: StatusCode,
+        message: &str,
+        code: Option<&str>,
+        details: Option<serde_json::Value>,
+    ) -> HttpResponse {
         HttpResponse::build(status).json(ErrorBody {
             error: message.to_string(),
+            code: code.map(str::to_owned),
+            details,
         })
     }
 }
@@ -118,7 +163,9 @@ impl ResponseError for ApiError {
             tracing::warn!("API {} {}: {cause}", self.status(), self);
         }
 
-        Self::envelope(self.status(), &self.to_string())
+        // No current error class has safe structured details. Keep
+        // `details` as `None` so no internal value can reach the wire.
+        Self::envelope(self.status(), &self.to_string(), Some(self.code()), None)
     }
 }
 
@@ -198,6 +245,7 @@ mod tests {
 
     #[test]
     fn status_codes_map_to_the_expected_values() {
+        assert_eq!(ApiError::BadRequest.status(), 400);
         assert_eq!(ApiError::MissingCredentials.status(), 401);
         assert_eq!(
             ApiError::InvalidCredentials("kid mismatch".into()).status(),
@@ -206,6 +254,26 @@ mod tests {
         assert_eq!(ApiError::Forbidden.status(), 403);
         assert_eq!(ApiError::Internal("db down".into()).status(), 500);
         assert_eq!(ApiError::Conflict.status(), 409);
+        assert_eq!(ApiError::TooManyRequests.status(), 429);
+    }
+
+    /// Every variant has one stable code. The codes never carry input.
+    #[test]
+    fn every_variant_has_the_intended_code() {
+        for (err, code) in [
+            (ApiError::BadRequest, "invalid_request"),
+            (ApiError::MissingCredentials, "authentication_required"),
+            (
+                ApiError::InvalidCredentials("raw jwks dump".into()),
+                "invalid_credentials",
+            ),
+            (ApiError::Forbidden, "forbidden"),
+            (ApiError::Internal("secret db DSN".into()), "internal_error"),
+            (ApiError::Conflict, "conflict"),
+            (ApiError::TooManyRequests, "too_many_requests"),
+        ] {
+            assert_eq!(err.code(), code, "wrong code for {err:?}");
+        }
     }
 
     #[test]
@@ -250,6 +318,44 @@ mod tests {
         // The function renders the response again through a full request
         // cycle, so the test covers the serialization as well.
         let body = actix_web::body::to_bytes(res.into_body()).await.unwrap();
+        let parsed: ErrorBody = serde_json::from_slice(&body).expect("body is an ErrorBody");
+        assert_eq!(parsed.error, "authentication required");
+        assert_eq!(parsed.code.as_deref(), Some("authentication_required"));
+        assert!(parsed.details.is_none());
+    }
+
+    /// A body with no code and no details keeps the old bytes. This is the
+    /// backward-compatibility contract for existing clients.
+    #[actix_web::test]
+    async fn minimal_body_keeps_the_old_bytes() {
+        let res = ApiError::envelope(
+            StatusCode::UNAUTHORIZED,
+            "authentication required",
+            None,
+            None,
+        );
+        let body = actix_web::body::to_bytes(res.into_body()).await.unwrap();
         assert_eq!(&body[..], br#"{"error":"authentication required"}"#);
+    }
+
+    /// The optional fields extend the body without a new envelope shape.
+    #[test]
+    fn optional_fields_serialize_additively() {
+        let body = ErrorBody {
+            error: "bad request".to_string(),
+            code: Some("invalid_request".to_string()),
+            details: Some(serde_json::json!({ "field": "name" })),
+        };
+        let json = serde_json::to_value(&body).expect("body serializes");
+        assert_eq!(json["error"], "bad request");
+        assert_eq!(json["code"], "invalid_request");
+        assert_eq!(json["details"]["field"], "name");
+
+        // A client can still parse the minimal body.
+        let old: ErrorBody =
+            serde_json::from_str(r#"{"error":"bad request"}"#).expect("old body parses");
+        assert_eq!(old.error, "bad request");
+        assert!(old.code.is_none());
+        assert!(old.details.is_none());
     }
 }

@@ -69,6 +69,25 @@ mod tests {
     use super::*;
     use serde_json::Value;
 
+    /// The error schema names the new optional fields. `error` stays the
+    /// only required field, so an old client can read every body.
+    #[test]
+    fn error_schema_documents_the_optional_fields() {
+        let spec: Value =
+            serde_json::from_str(&ApiDoc::openapi().to_json().expect("spec serializes"))
+                .expect("spec is JSON");
+        let schema = &spec["components"]["schemas"]["ErrorBody"];
+        let properties = schema["properties"].as_object().expect("error properties");
+        assert!(properties.contains_key("error"));
+        assert!(properties.contains_key("code"));
+        assert!(properties.contains_key("details"));
+
+        let required = schema["required"].as_array().expect("required fields");
+        assert!(required.iter().any(|value| value == "error"));
+        assert!(!required.iter().any(|value| value == "code"));
+        assert!(!required.iter().any(|value| value == "details"));
+    }
+
     /// Guards the PWA contract. Every served route that the SPA code generator
     /// uses must appear in the specification. Drift therefore breaks this
     /// test instead of the front end at run time.

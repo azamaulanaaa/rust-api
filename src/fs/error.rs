@@ -141,6 +141,20 @@ impl FsError {
             Self::TooManyRequests => "too many requests",
         }
     }
+
+    /// The stable machine-readable code for this failure class.
+    ///
+    /// The codes match the ones for [`ApiError`](crate::http::error::ApiError).
+    pub(crate) fn code(&self) -> &'static str {
+        match self {
+            Self::BadRequest(_) => "invalid_request",
+            Self::PayloadTooLarge => "payload_too_large",
+            Self::Forbidden => "forbidden",
+            Self::NotFound(_) => "not_found",
+            Self::Internal(_) | Self::Store(_) | Self::Fenced(_) => "internal_error",
+            Self::TooManyRequests => "too_many_requests",
+        }
+    }
 }
 
 impl ResponseError for FsError {
@@ -193,7 +207,15 @@ impl ResponseError for FsError {
         // detail than the errors of the API.
         // The type does not exist because the envelope needed a second
         // implementation.
-        crate::http::error::ApiError::envelope(self.status_code(), self.client_message())
+        //
+        // No current FS error class has safe structured details. Keep
+        // `details` as `None` so no request detail can reach the wire.
+        crate::http::error::ApiError::envelope(
+            self.status_code(),
+            self.client_message(),
+            Some(self.code()),
+            None,
+        )
     }
 }
 
@@ -270,14 +292,14 @@ mod tests {
             String::from_utf8(raw.to_vec()).expect("utf-8 json")
         }
 
-        for err in [
-            FsError::BadRequest("got 7".into()),
-            FsError::PayloadTooLarge,
-            FsError::Forbidden,
-            FsError::NotFound("no such file".into()),
-            FsError::Internal("dsn".into()),
-            FsError::Store("oxkv".into()),
-            FsError::Fenced("epoch 2".into()),
+        for (err, code) in [
+            (FsError::BadRequest("got 7".into()), "invalid_request"),
+            (FsError::PayloadTooLarge, "payload_too_large"),
+            (FsError::Forbidden, "forbidden"),
+            (FsError::NotFound("no such file".into()), "not_found"),
+            (FsError::Internal("dsn".into()), "internal_error"),
+            (FsError::Store("oxkv".into()), "internal_error"),
+            (FsError::Fenced("epoch 2".into()), "internal_error"),
         ] {
             let expected = err.client_message().to_string();
             let parsed: ErrorBody = serde_json::from_str(&body_of(err.error_response()).await)
@@ -286,6 +308,8 @@ mod tests {
                 parsed.error, expected,
                 "{parsed:?} must carry the sanitized message, never the detail"
             );
+            assert_eq!(parsed.code.as_deref(), Some(code));
+            assert!(parsed.details.is_none(), "FS errors never send details");
         }
 
         // The two types agree on every status that both of them use.

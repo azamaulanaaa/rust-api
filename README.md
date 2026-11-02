@@ -260,7 +260,13 @@ Errors use one body shape:
 {"error": "stable message"}
 ```
 
-The server logs the cause and never serializes it. A malformed JSON body also uses this envelope.
+The optional `code` and `details` fields extend the body:
+
+```json
+{"error": "bad request", "code": "invalid_request", "details": {"field": "name"}}
+```
+
+A client can ignore both optional fields. The `error` field is always present. The server logs the cause and never serializes it. A malformed JSON body also uses this envelope.
 
 Some routes answer outside the envelope. `/auth/login` redirects to the provider. `/auth/callback` and `/auth/refresh` return an `AuthResponse`, because the SPA reads the token from it. `/openapi.json` and `/swagger-ui/*` return documents.
 
