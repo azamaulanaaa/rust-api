@@ -21,7 +21,7 @@ For module documentation, run `cargo doc --no-deps --open`. Start with [`http`](
 | [Quickstart](#quickstart) | Zero to a working API call |
 | [Concepts](#concepts) | Modules, auth, files, sync, queues, and hooks |
 | [API reference](#api-reference) | Endpoints, errors, OpenAPI, versioning, renewal |
-| [Client integration](#client-integration) | SPA flow, TypeScript example, sync contract |
+| [Client integration](#client-integration) | SPA contract, flow, TypeScript example, sync contract |
 | [Configuration](#configuration) | Config file, environment overrides, limits |
 | [Operations](#operations) | Lease, readiness, backups, GC, telemetry, migration |
 | [Extending the server](#extending-the-server) | Custom modules and embedding |
@@ -314,9 +314,54 @@ The login flow requests the `offline_access` scope, so the provider can issue a 
 
 ## Client integration
 
-For a cross-origin SPA, list its origin in `[http].allowed_origins` or `RUST_API_ALLOWED_ORIGINS`. Credentials are always allowed. CORS exposes `ETag`, `Content-Range`, `Accept-Ranges`, and `X-Server-Time-Ms`.
-
 `X-Server-Time-Ms` is on every response. The value is an integer UTC timestamp in milliseconds. Use it for server-authoritative time. Use the standard `Date` header when the new header is absent.
+
+### SPA client contract
+
+The routes in this section are the contract for a generic browser client. The client does not call `/policy/*` or `/setup/*`. These routes are stable for external SPA clients.
+
+All requests send `credentials: "include"`. The `auth_token` cookie is the primary credential. A client can also send `Authorization: Bearer <token>` from memory.
+
+| Area | Routes |
+|---|---|
+| Authentication | `GET /auth/login`, `GET /auth/callback`, `GET /auth/me`, `POST /auth/refresh`, `POST /auth/logout` |
+| Replica sync | `GET /sync/status`, `POST /sync/sync`, `GET /sync/db/manifest.json`, `GET /sync/db/{object}` |
+| File transport | `/fs/uploads*`, `/fs/files*` |
+
+#### Authentication
+
+- `GET /auth/login` is a browser navigation. The callback sets the session cookies.
+- `GET /auth/me` returns `200` with `{ "sub", "iss", "aud", "exp" }`. A `401` means no session.
+- `POST /auth/refresh` returns `200` with a new `auth_token` cookie and an `AuthResponse` body. The client reads `success` and `token`. A rejected refresh returns `401`.
+- `POST /auth/logout` clears the cookie and returns `204`.
+
+#### Replica sync
+
+- `GET /sync/status` sends `If-None-Match` when a cached `ETag` exists. A `200` returns `{ "prefix", "applied_seq", "head" }` and an `ETag`. A `304` means the cache is still valid.
+- `POST /sync/sync` returns `{ "applied_seq", "pending" }`. The client repeats the call while `pending` is `true`, then reads `/sync/status` for the current head.
+- `GET /sync/db/manifest.json` returns the oxkv manifest with `version`, `epoch`, `wal`, and `sst`. The client keeps the `sst` and `wal` order. It does not sort, filter, or deduplicate entries. It sends `If-None-Match` and accepts `304`.
+- `GET /sync/db/{object}` returns bytes with `ETag` and `Content-Length`. The client sends `If-None-Match` and accepts `304`. It URL-encodes each path segment and keeps the `/` separators.
+
+The client caches status and manifest `ETag` values. A `304` without a cached value is an error.
+
+#### File transport
+
+- `POST /fs/uploads` takes `{ "file_size", "part_size", "file_total_parts" }` and returns `{ "file_id" }`.
+- `PUT /fs/uploads/{id}/parts/{index}` sends the part as raw `application/octet-stream` bytes. It does not use `multipart/form-data`.
+- `POST /fs/uploads/{id}/complete` takes `{ "name", "mimetype" }`. The client ignores the response body and then reads `GET /fs/files/{id}/meta`.
+- `DELETE /fs/uploads/{id}` cancels the upload.
+- `GET /fs/uploads/{id}` returns `{ "file_id", "file_size", "part_size", "total_parts", "uploaded_parts", "percent" }`. `uploaded_parts` is a list of part indices.
+- `GET /fs/files/{id}/meta` returns `{ "id", "name", "mimetype", "size" }`. A `404` means the file is absent.
+- `GET /fs/files/{id}` supports `Range` and returns `416` for a range outside the file.
+- `DELETE /fs/files/{id}` removes the file.
+
+The client validates the part size and part count before the upload starts.
+
+#### Errors and CORS
+
+Errors use the envelope in [Auth and errors](#auth-and-errors). The client reads `error`, and the optional `code` and `details` fields. A missing `code` or `details` is safe. The client treats `401` as unauthenticated, `403` as forbidden, `404` as absent, `416` as a bad range, and `5xx` or network failures as retryable. An empty or non-JSON body uses a generic message.
+
+For a cross-origin deployment, add the frontend origin to `[http].allowed_origins` or `RUST_API_ALLOWED_ORIGINS`. Credentials are allowed. CORS exposes `ETag`, `Content-Range`, `Accept-Ranges`, and `X-Server-Time-Ms`. The local frontend origin is `http://localhost:5173`.
 
 ### SPA and PWA flow
 
