@@ -118,9 +118,9 @@ pub fn health_routes(cfg: &mut web::ServiceConfig) {
 /// requests then succeed. Each origin must be an exact `http(s)` origin
 /// without a trailing slash. The function always allows credentials. The
 /// `auth_token` cookie and the `Authorization` bearer header work across
-/// origins. The function exposes the `ETag` and range headers. The
-/// `/sync/db/*` conditional polls and the `/fs` ranged downloads work from
-/// the browser.
+/// origins. The function exposes the `ETag`, range, and server-time headers.
+/// The `/sync/db/*` conditional polls and the `/fs` ranged downloads work
+/// from the browser. A browser client can also read `X-Server-Time-Ms`.
 pub fn cors(allowed_origins: &[String]) -> actix_cors::Cors {
     use actix_web::http::header;
     let mut cors = actix_cors::Cors::default()
@@ -139,6 +139,7 @@ pub fn cors(allowed_origins: &[String]) -> actix_cors::Cors {
             header::CONTENT_RANGE,
             header::ACCEPT_RANGES,
         ])
+        .expose_headers(vec![middleware::server_time::SERVER_TIME_HEADER])
         .supports_credentials()
         .max_age(3600);
     for origin in allowed_origins {
@@ -254,6 +255,10 @@ macro_rules! wired_app {
             // limiter installed but inactive. It costs one atomic load for
             // each request.
             .wrap(crate::limits::RateLimit::new($bucket.clone()))
+            // Outermost, so every response carries the server time. This
+            // includes refusals from the rate limiter and errors from the
+            // handlers below.
+            .wrap(middleware::server_time::ServerTimeMiddleware)
             .configure(health_routes)
             .configure(|cfg| {
                 if let Err(e) = check_prefixes($modules) {
@@ -534,6 +539,62 @@ mod tests {
         let res =
             test::call_service(&app, test::TestRequest::get().uri("/ready").to_request()).await;
         assert_eq!(res.status(), 503);
+    }
+
+    /// Every response from the real composition carries the server time.
+    /// This includes the rate limiter, which replies without a handler.
+    #[actix_web::test]
+    async fn composed_responses_carry_server_time() {
+        let service = ApiService::new().with_rate_limit(crate::limits::TokenBucket::new(1, 1));
+        let app = served!(service);
+
+        let first =
+            test::call_service(&app, test::TestRequest::get().uri("/health").to_request()).await;
+        assert_eq!(first.status(), 200);
+        assert!(first.headers().contains_key("x-server-time-ms"));
+
+        let second =
+            test::call_service(&app, test::TestRequest::get().uri("/health").to_request()).await;
+        assert_eq!(second.status(), 429);
+        assert!(
+            second.headers().contains_key("x-server-time-ms"),
+            "a rate-limit refusal must carry the server time"
+        );
+
+        // A missing route uses a fresh service, because the limiter in the
+        // service above still refuses the request.
+        let service = ApiService::new();
+        let app = served!(service);
+        let missing =
+            test::call_service(&app, test::TestRequest::get().uri("/missing").to_request()).await;
+        assert_eq!(missing.status(), 404);
+        assert!(missing.headers().contains_key("x-server-time-ms"));
+    }
+
+    /// CORS lets a browser read the server-time header.
+    #[actix_web::test]
+    async fn cors_exposes_server_time() {
+        let service = ApiService::new().with_cors_origins(vec!["https://app.example.com".into()]);
+        let app = served!(service);
+        let res = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/health")
+                .insert_header(("Origin", "https://app.example.com"))
+                .to_request(),
+        )
+        .await;
+        let exposed = res
+            .headers()
+            .get("access-control-expose-headers")
+            .and_then(|v| v.to_str().ok())
+            .expect("CORS expose header");
+        assert!(
+            exposed
+                .split(',')
+                .any(|h| h.trim().eq_ignore_ascii_case("x-server-time-ms")),
+            "server time is not exposed: {exposed}"
+        );
     }
 
     /// The documentation names `ApiService::configure` as the way for a host

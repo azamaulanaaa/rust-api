@@ -308,7 +308,9 @@ The login flow requests the `offline_access` scope, so the provider can issue a 
 
 ## Client integration
 
-For a cross-origin SPA, list its origin in `[http].allowed_origins` or `RUST_API_ALLOWED_ORIGINS`. Credentials are always allowed.
+For a cross-origin SPA, list its origin in `[http].allowed_origins` or `RUST_API_ALLOWED_ORIGINS`. Credentials are always allowed. CORS exposes `ETag`, `Content-Range`, `Accept-Ranges`, and `X-Server-Time-Ms`.
+
+`X-Server-Time-Ms` is on every response. The value is an integer UTC timestamp in milliseconds. Use it for server-authoritative time. Use the standard `Date` header when the new header is absent.
 
 ### SPA and PWA flow
 
@@ -680,6 +682,8 @@ HttpServer::new(move || {
         .wrap(http::middleware::request_tracing::RequestTracingMiddleware)
         .wrap(http::middleware::bearer_token::BearerTokenMiddleware)
         .wrap(rust_api::limits::RateLimit::new(bucket.clone()))
+        // Outermost. Every response then carries X-Server-Time-Ms.
+        .wrap(http::middleware::server_time::ServerTimeMiddleware)
         .configure(http::health_routes)
         .configure(move |cfg| svc.configure(cfg).expect("duplicate route prefix"))
         .configure(http::docs::config) // /openapi.json + /swagger-ui

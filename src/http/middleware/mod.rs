@@ -11,6 +11,8 @@
 //! request inside a server span.
 //! [`request_id`](crate::http::middleware::request_id) generates or echoes
 //! an `X-Request-Id` for each request.
+//! [`server_time`](crate::http::middleware::server_time) adds the server
+//! time in UTC milliseconds to each response.
 
 /// The middleware that extracts a bearer token for request authentication.
 pub mod bearer_token;
@@ -24,6 +26,8 @@ pub mod request_id;
 /// The tracing span that the code creates for each request. The spans work
 /// with OpenTelemetry.
 pub mod request_tracing;
+/// The middleware that adds the server time to each response.
+pub mod server_time;
 
 pub use request_id::RequestID;
 pub use request_id::RequestIDMiddleware;
