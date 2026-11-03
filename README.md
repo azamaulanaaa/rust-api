@@ -677,7 +677,7 @@ The new binary ignores a leftover `[database].path` key and uses `[database].pre
 
 ### Security advisories
 
-`mise run advisories` passes because `deny.toml` contains documented suppressions for ten advisories. An advisory outside that list fails the check. `lib::tests::every_ignore_is_justified` fails an entry without a substantive reason. Re-examine the list when `oxkv`, `actix-web`, or `casbin` moves.
+`mise run advisories` passes because `deny.toml` contains documented suppressions for seven advisories. An advisory outside that list fails the check. `lib::tests::every_ignore_is_justified` fails an entry without a substantive reason. Re-examine the list when `oxkv`, `actix-web`, or `casbin` moves.
 
 One suppression is reachable: `h2` 0.3 is compiled in because actix-web enables HTTP/2, and no actix-web release can take the fix yet. Terminate HTTP/2 in front of this process, or bound memory. The others are low exposure, unmaintained, or have no patched version.
 
