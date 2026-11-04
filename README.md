@@ -195,7 +195,9 @@ Upload size limits apply at `init`, before the client sends any data:
 | `part_size` | Multiple of 1 KiB, at most 512 KiB |
 | `file_total_parts` | 1 for a single-part upload, otherwise at most 10,000 |
 | Single-part `file_size` | At most 10 MiB, and equal to `part_size` |
-| Multipart `file_size` | Exactly `file_total_parts × part_size` |
+| Multipart `file_total_parts` | `ceil(file_size / part_size)` |
+| Multipart `file_size` | `(file_total_parts - 1) × part_size < file_size ≤ file_total_parts × part_size` |
+| Multipart part lengths | Every part except the last part has `part_size` bytes. The last part has `file_size - (file_total_parts - 1) × part_size` bytes. |
 | Maximum multipart upload | About 4.9 GiB |
 
 Capability tokens are a short-lived HMAC JWT for direct file delegation. `FsEngine::mint_token` and `verify_token` are available to applications. The `/fs/*` routes authenticate with the OIDC JWT and do not consume capability tokens.
@@ -373,7 +375,9 @@ The client caches status and manifest `ETag` values. A `304` without a cached va
 - `GET /fs/files/{id}` supports `Range` and returns `416` for a range outside the file.
 - `DELETE /fs/files/{id}` removes the file.
 
-The client validates the part size and part count before the upload starts.
+The client validates the part size and part count before the upload starts. It sets `file_total_parts` to `ceil(file_size / part_size)`. Every part except the last part has `part_size` bytes. The last part has `file_size - (file_total_parts - 1) × part_size` bytes. The client does not pad the last part. A padded last part returns `400`.
+
+Example: `file_size = 2500`, `part_size = 1024`, and `file_total_parts = 3`. Part 0 and part 1 have 1024 bytes. Part 2 has 452 bytes.
 
 #### Errors and CORS
 

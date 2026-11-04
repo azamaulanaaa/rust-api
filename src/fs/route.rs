@@ -854,6 +854,112 @@ mod tests {
     }
 
     #[actix_web::test]
+    async fn upload_part_rejects_padded_last_part() -> anyhow::Result<()> {
+        let fx = fixture(true).await?;
+        let mw = JwtClaimsMiddleware::<Claims>::new_with_jks(
+            &format!("{}/jwks", fx.server.uri()),
+            AUD,
+            &fx.issuer(),
+        )
+        .await?;
+        let module = FsApiModule::new(fx.engine.clone(), mw);
+        let app = test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+        let res = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/fs/uploads")
+                .insert_header(("Cookie", format!("auth_token={token}")))
+                .set_json(json!({"file_size": 2500, "part_size": 1024, "file_total_parts": 3}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::CREATED);
+        let body: serde_json::Value = test::read_body_json(res).await;
+        let file_id = body["file_id"].as_str().unwrap();
+        // Part 2 has 452 real bytes. A 1024-byte body is padding.
+        // The route must return 400 and must not trim the body.
+        let res = test::call_service(
+            &app,
+            test::TestRequest::put()
+                .uri(&format!("/fs/uploads/{file_id}/parts/2"))
+                .insert_header(("Cookie", format!("auth_token={token}")))
+                .set_payload(vec![9u8; 1024])
+                .insert_header(("content-length", "1024"))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::BAD_REQUEST);
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn multipart_upload_and_download_preserve_exact_bytes() -> anyhow::Result<()> {
+        let fx = fixture(true).await?;
+        let mw = JwtClaimsMiddleware::<Claims>::new_with_jks(
+            &format!("{}/jwks", fx.server.uri()),
+            AUD,
+            &fx.issuer(),
+        )
+        .await?;
+        let module = FsApiModule::new(fx.engine.clone(), mw);
+        let app = test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+        let res = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/fs/uploads")
+                .insert_header(("Cookie", format!("auth_token={token}")))
+                .set_json(json!({"file_size": 2500, "part_size": 1024, "file_total_parts": 3}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::CREATED);
+        let body: serde_json::Value = test::read_body_json(res).await;
+        let file_id = body["file_id"].as_str().unwrap();
+        let payload: Vec<u8> = (0..2500u32).map(|i| (i % 251) as u8).collect();
+        for (idx, start, len) in [(0usize, 0usize, 1024usize), (1, 1024, 1024), (2, 2048, 452)] {
+            let res = test::call_service(
+                &app,
+                test::TestRequest::put()
+                    .uri(&format!("/fs/uploads/{file_id}/parts/{idx}"))
+                    .insert_header(("Cookie", format!("auth_token={token}")))
+                    .set_payload(payload[start..start + len].to_vec())
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(
+                res.status(),
+                http::StatusCode::NO_CONTENT,
+                "part {idx} must accept its real length"
+            );
+        }
+        let res = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!("/fs/uploads/{file_id}/complete"))
+                .insert_header(("Cookie", format!("auth_token={token}")))
+                .set_json(json!({"name":"exact.bin","mimetype":"application/octet-stream"}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let res = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri(&format!("/fs/files/{file_id}"))
+                .insert_header(("Cookie", format!("auth_token={token}")))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let body = test::read_body(res).await;
+        assert_eq!(body.len(), 2500);
+        assert_eq!(body.as_ref(), payload.as_slice());
+        Ok(())
+    }
+
+    #[actix_web::test]
     async fn ranged_download_serves_206_and_416() -> anyhow::Result<()> {
         let fx = fixture(true).await?;
         let mw = JwtClaimsMiddleware::<Claims>::new_with_jks(
