@@ -9,10 +9,19 @@ use crate::http::validation::{Validate, ValidationError};
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
 pub struct InitRequest {
     /// Total file size in bytes.
+    /// For a multipart upload, every part except the last part has
+    /// `part_size` bytes. The last part has the remaining bytes.
+    /// Example: `file_size` 2500, `part_size` 1024, and
+    /// `file_total_parts` 3. Part 0 and part 1 have 1024 bytes. Part 2 has
+    /// 452 bytes.
     pub file_size: u64,
     /// Chunk size in bytes.
+    /// For a multipart upload, this value is a multiple of 1 KiB and at most
+    /// 512 KiB.
     pub part_size: u64,
     /// Total number of parts.
+    /// For a multipart upload, this value is
+    /// `ceil(file_size / part_size)`. The maximum value is 10,000.
     pub file_total_parts: u64,
 }
 
@@ -81,25 +90,17 @@ impl InitRequest {
                     self.part_size
                 )));
             }
-            // `checked_mul` is a second guard, and not the main one.
-            // The `MAX_MULTIPART_PARTS` cap above already prevents an
-            // overflow of this product. 10,000 parts of 512 KB are about
-            // 5 GB.
-            // The code keeps `checked_mul` because a wrong result here is
-            // a debug panic or a silent wrap in release mode. The guard
-            // costs one line.
-            // The test `init_request_caps_parts_before_arithmetic` proves
-            // that the cap rejects these inputs now.
-            let product = self
-                .file_total_parts
-                .checked_mul(self.part_size)
-                .ok_or_else(|| {
-                    FsError::BadRequest("file_total_parts * part_size overflows u64".into())
-                })?;
-            if product != self.file_size {
+            // The count check above makes these two range checks true.
+            // Keep the checks explicit, because they state the multipart
+            // contract.
+            // The cap above bounds this product to about 5 GB, so the
+            // multiplication cannot overflow.
+            let last_part_start = (self.file_total_parts - 1) * self.part_size;
+            let covered = self.file_total_parts * self.part_size;
+            if self.file_size <= last_part_start || self.file_size > covered {
                 return Err(FsError::BadRequest(format!(
-                    "Inconsistent math: file_total_parts ({}) * part_size ({}) must equal file_size ({})",
-                    self.file_total_parts, self.part_size, self.file_size
+                    "Inconsistent math: file_size ({}) must be greater than {last_part_start} and at most {covered}",
+                    self.file_size
                 )));
             }
         }
@@ -281,15 +282,15 @@ mod tests {
             },
             "must be exactly",
         );
-        // The product must equal file_size. The division must be exact.
-        assert_bad(
-            InitRequest {
-                file_size: 300 * 1024,
-                part_size: 131072,
-                file_total_parts: 3,
-            },
-            "must equal",
-        );
+        // A shorter last part is valid. 300 KiB with 128 KiB parts has
+        // three parts, and the last part has 44 KiB.
+        InitRequest {
+            file_size: 300 * 1024,
+            part_size: 131072,
+            file_total_parts: 3,
+        }
+        .validate()
+        .unwrap();
         // Valid multi-part upload. A 1 MB file with 256 KB parts has 4 parts.
         InitRequest {
             file_size: 1024 * 1024,
@@ -378,10 +379,44 @@ mod tests {
         assert!(err.contains("part_size"), "unhelpful message: {err}");
     }
 
+    #[test]
+    fn init_accepts_short_last_part() {
+        InitRequest {
+            file_size: 2500,
+            part_size: 1024,
+            file_total_parts: 3,
+        }
+        .validate()
+        .expect("the last part has 452 bytes");
+    }
+
+    #[test]
+    fn init_rejects_wrong_part_count() {
+        // A count below ceil(file_size / part_size) cannot hold the file.
+        assert_bad(
+            InitRequest {
+                file_size: 2500,
+                part_size: 1024,
+                file_total_parts: 2,
+            },
+            "must be exactly 3",
+        );
+        // A count above ceil(file_size / part_size) asks for more bytes than
+        // the file has.
+        assert_bad(
+            InitRequest {
+                file_size: 2500,
+                part_size: 1024,
+                file_total_parts: 4,
+            },
+            "must be exactly 3",
+        );
+    }
+
     /// The cap includes its limit. An upload of exactly 10,000 parts is
     /// valid.
     #[test]
-    fn init_request_accepts_exactly_the_part_limit() {
+    fn init_accepts_10000_parts() {
         InitRequest {
             file_size: MAX_MULTIPART_PARTS * 1024,
             part_size: 1024,
@@ -389,6 +424,18 @@ mod tests {
         }
         .validate()
         .expect("10,000 parts is S3's limit, not over it");
+    }
+
+    #[test]
+    fn init_rejects_more_than_10000_parts() {
+        assert_bad(
+            InitRequest {
+                file_size: (MAX_MULTIPART_PARTS + 1) * 1024,
+                part_size: 1024,
+                file_total_parts: MAX_MULTIPART_PARTS + 1,
+            },
+            "at most 10000",
+        );
     }
 
     #[test]

@@ -609,6 +609,8 @@ impl FsEngine {
     /// The stream stops at the expected part size of the session.
     /// A body that is too large ends with 413 in the middle of the stream,
     /// and the code does not buffer it to the end.
+    /// A padded last part ends with 400 when the real remainder is smaller
+    /// than `part_size`. The code does not trim the padding.
     /// A declared `Content-Length` that does not match is rejected before
     /// the code reads the first chunk.
     /// The code buffers the part once, because S3 SigV4 must hash the whole
@@ -664,7 +666,19 @@ impl FsEngine {
         } else {
             session.part_size
         };
+        // Only a multipart last part can have a real remainder that is
+        // smaller than `part_size`.
+        // A body that is longer than that remainder is padded, and a padded
+        // part is a client error, not a payload that is too large.
+        let is_short_last_part = session.file_total_parts > 1
+            && part_index == session.file_total_parts - 1
+            && expected < session.part_size;
         match declared_len {
+            Some(n) if n > expected && is_short_last_part => {
+                return Err(FsError::BadRequest(format!(
+                    "The last part must have {expected} bytes. The declared size is {n}."
+                )));
+            }
             Some(n) if n > expected => return Err(FsError::PayloadTooLarge),
             Some(n) if n != expected => {
                 return Err(FsError::BadRequest(format!(
@@ -673,10 +687,9 @@ impl FsEngine {
             }
             _ => {}
         }
-        // The ceiling matches the HTTP payload cap.
+        // The capacity matches the HTTP payload cap.
         // The old `Bytes` extractor rejected anything above the cap, and a
         // part size above it was never uploadable.
-        let ceiling = expected.min(crate::http::MAX_PAYLOAD_BYTES as u64) + 1;
         let mut buf =
             Vec::with_capacity(expected.min(crate::http::MAX_PAYLOAD_BYTES as u64) as usize);
         let mut total = 0u64;
@@ -684,7 +697,12 @@ impl FsEngine {
         while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
             total += chunk.len() as u64;
-            if total >= ceiling {
+            if total > expected {
+                if is_short_last_part {
+                    return Err(FsError::BadRequest(format!(
+                        "The last part must have {expected} bytes. The body has {total} bytes."
+                    )));
+                }
                 return Err(FsError::PayloadTooLarge);
             }
             buf.extend_from_slice(&chunk);
@@ -1900,6 +1918,43 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, FsError::PayloadTooLarge));
+        Ok(())
+    }
+
+    /// A padded last part is a client error. The engine must not trim it.
+    ///
+    /// This test sends the body without a declared length, so it reaches
+    /// the stream check.
+    #[tokio::test]
+    async fn upload_part_rejects_padded_last_part_without_declared_length() -> anyhow::Result<()> {
+        use actix_web::ResponseError as _;
+
+        let engine = make_engine("alice").await;
+        let id = engine
+            .init_upload(
+                InitRequest {
+                    file_size: 2500,
+                    part_size: 1024,
+                    file_total_parts: 3,
+                },
+                "alice",
+            )
+            .await?;
+        let err = engine
+            .upload_part(&id, 2, once_body(vec![9u8; 1024]), None, None, "alice")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, FsError::BadRequest(_)), "got {err:?}");
+        assert_eq!(err.status_code(), actix_web::http::StatusCode::BAD_REQUEST);
+        let session = engine
+            .store
+            .get_session(&id)
+            .await?
+            .expect("session survives a rejected part");
+        assert!(
+            session.etags[2].is_none(),
+            "a padded part must not be stored"
+        );
         Ok(())
     }
 
