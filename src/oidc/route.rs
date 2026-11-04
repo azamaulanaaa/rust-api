@@ -15,9 +15,11 @@
 use std::sync::Arc;
 
 use actix_web::{
-    HttpRequest, HttpResponse, Responder,
+    HttpRequest, HttpResponse, HttpResponseBuilder, Responder,
     cookie::{Cookie, SameSite, time::Duration},
-    get, post, web,
+    get,
+    http::StatusCode,
+    post, web,
 };
 use openidconnect::{Nonce, PkceCodeVerifier};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -164,26 +166,177 @@ pub async fn me(claims: Validated<middleware::jwt::Claims>) -> impl Responder {
     })
 }
 
-/// Clears the `auth_token` session cookie (always `204`, even anonymous).
+/// Clears the `auth_token` and `refresh_token` session cookies.
 ///
-/// The route uses `POST` and not `GET`. Prefetchers and links that can cause
-/// a CSRF therefore cannot log the user out. The cleared cookie copies the
-/// `Secure` and `SameSite` flags of the login cookie, so browsers drop it.
-#[utoipa::path(post, path = "/auth/logout", tag = "auth", responses((status = 204, description = "logged out")))]
+/// The route always returns `204`, even for an anonymous request or a failed
+/// provider revocation. It uses `POST` and not `GET`. Prefetchers and links
+/// that can cause a CSRF therefore cannot log the user out. The cleared
+/// cookies copy the `Secure` and `SameSite` flags of the login cookie, so
+/// browsers drop them.
+///
+/// When the provider advertises a revocation endpoint, the route starts a
+/// best-effort RFC 7009 revocation of the refresh token. It does not wait for
+/// the result. A failure is logged and does not change the response.
+#[utoipa::path(post, path = "/auth/logout", tag = "auth", responses((status = 204, description = "logged out. Clears auth_token and refresh_token. Starts a best-effort RFC 7009 revocation.")))]
 #[post("/logout")]
-pub async fn logout(oidc_client: web::Data<OidcClient>) -> impl Responder {
+pub async fn logout(oidc_client: web::Data<OidcClient>, req: HttpRequest) -> impl Responder {
+    let refresh_token = req
+        .cookie("refresh_token")
+        .map(|cookie| cookie.value().to_string());
+    let secure = oidc_client.secure_cookies();
+
+    if let Some(token) = refresh_token
+        && oidc_client.has_revocation_endpoint()
+    {
+        let oidc_client = oidc_client.clone();
+        tokio::spawn(async move {
+            if let Err(e) = oidc_client.revoke_token(&token).await {
+                tracing::warn!("OIDC token revocation failed: {e}");
+            }
+        });
+    }
+
     HttpResponse::NoContent()
-        .cookie(clear_cookie(
-            "auth_token".to_string(),
-            oidc_client.secure_cookies(),
-        ))
+        .cookie(clear_cookie("auth_token".to_string(), secure))
+        .cookie(clear_cookie("refresh_token".to_string(), secure))
         .finish()
 }
 
+/// Query parameters for `GET /auth/login`.
+#[derive(Deserialize)]
+pub struct LoginQuery {
+    /// Optional relative path to open after the callback. The value must
+    /// start with one `/`. Absolute URLs are rejected.
+    pub return_to: Option<String>,
+}
+
+/// Checks that a return path is relative and stays on this site.
+///
+/// The path must start with exactly one `/`. The check rejects absolute
+/// URLs, protocol-relative values, values with a scheme or a host, values
+/// with a backslash, and control characters. A query and a fragment are
+/// allowed.
+fn is_valid_return_to(value: &str) -> bool {
+    if !value.starts_with('/')
+        || value.starts_with("//")
+        || value.contains('\\')
+        || value.contains("%5c")
+        || value.contains("%5C")
+        || value.chars().any(char::is_control)
+    {
+        return false;
+    }
+    let Ok(base) = url::Url::parse("http://localhost/") else {
+        return false;
+    };
+    match base.join(value) {
+        Ok(parsed) => parsed.scheme() == "http" && parsed.host_str() == Some("localhost"),
+        Err(_) => false,
+    }
+}
+
+/// Adds the `error` query parameter to a relative return path.
+///
+/// An existing `error` parameter stays unchanged. The function keeps an
+/// existing query and fragment.
+fn redirect_target(return_to: &str, error: Option<&str>) -> String {
+    let Some(code) = error else {
+        return return_to.to_string();
+    };
+    let (before_fragment, fragment) = match return_to.split_once('#') {
+        Some((before_fragment, fragment)) => (before_fragment, Some(fragment)),
+        None => (return_to, None),
+    };
+    let (_, query) = match before_fragment.split_once('?') {
+        Some((path, query)) => (path, Some(query)),
+        None => (before_fragment, None),
+    };
+    let has_error = query
+        .map(|query| {
+            query
+                .split('&')
+                .any(|pair| pair.split('=').next() == Some("error"))
+        })
+        .unwrap_or(false);
+
+    let mut target = before_fragment.to_string();
+    if !has_error {
+        if before_fragment.ends_with('?') || before_fragment.ends_with('&') {
+            target.push_str("error=");
+        } else if query.is_some() {
+            target.push_str("&error=");
+        } else {
+            target.push_str("?error=");
+        }
+        target.push_str(code);
+    }
+    if let Some(fragment) = fragment {
+        target.push('#');
+        target.push_str(fragment);
+    }
+    target
+}
+
+/// Clears the temporary OIDC flow cookies.
+fn clear_auth_flow_cookies(response: &mut HttpResponseBuilder, secure: bool) {
+    response
+        .cookie(clear_cookie("oidc_csrf".to_string(), secure))
+        .cookie(clear_cookie("oidc_nonce".to_string(), secure))
+        .cookie(clear_cookie("oidc_pkce".to_string(), secure))
+        .cookie(clear_cookie("oidc_return_to".to_string(), secure));
+}
+
+/// Builds a callback failure response.
+///
+/// A valid return cookie selects a `302` response with the stable error code.
+/// Without the cookie the response keeps the JSON `AuthResponse` and the
+/// given status.
+fn callback_failure(
+    status: StatusCode,
+    message: &str,
+    code: &str,
+    return_to: Option<&str>,
+    secure: bool,
+) -> HttpResponse {
+    if let Some(return_to) = return_to {
+        let mut response = HttpResponse::Found();
+        clear_auth_flow_cookies(&mut response, secure);
+        response
+            .append_header(("Location", redirect_target(return_to, Some(code))))
+            .finish()
+    } else {
+        let mut response = HttpResponse::build(status);
+        clear_auth_flow_cookies(&mut response, secure);
+        response.json(AuthResponse {
+            success: false,
+            token: None,
+            error: Some(message.to_string()),
+        })
+    }
+}
+
 /// Starts the OIDC authorization-code flow (redirects to the provider).
-#[utoipa::path(get, path = "/auth/login", tag = "auth", responses((status = 302, description = "redirect to provider")))]
+///
+/// The optional `return_to` query parameter stores a relative path in the
+/// short-lived `oidc_return_to` cookie. The callback uses that path to send
+/// the browser back to the SPA. An invalid value returns `400` and does not
+/// start the provider redirect.
+#[utoipa::path(get, path = "/auth/login", tag = "auth", params(("return_to" = Option<String>, Query, description = "Relative path to open after the callback")), responses((status = 302, description = "redirect to provider"), (status = 400, body = AuthResponse)))]
 #[get("/login")]
-pub async fn login(oidc_client: web::Data<OidcClient>) -> impl Responder {
+pub async fn login(
+    oidc_client: web::Data<OidcClient>,
+    query: web::Query<LoginQuery>,
+) -> impl Responder {
+    if let Some(return_to) = &query.return_to
+        && !is_valid_return_to(return_to)
+    {
+        return HttpResponse::BadRequest().json(AuthResponse {
+            success: false,
+            token: None,
+            error: Some("invalid return_to".to_string()),
+        });
+    }
+
     let auth_data = oidc_client.get_auth_url();
     let cookie_duration = Duration::minutes(5);
     let secure = oidc_client.secure_cookies();
@@ -198,8 +351,9 @@ pub async fn login(oidc_client: web::Data<OidcClient>) -> impl Responder {
             .finish()
     };
 
-    HttpResponse::Found()
-        .append_header(("Location", auth_data.url))
+    let mut response = HttpResponse::Found();
+    response.append_header(("Location", auth_data.url));
+    response
         .cookie(base_cookie(
             "oidc_csrf",
             auth_data.csrf_token.secret().to_string(),
@@ -211,18 +365,26 @@ pub async fn login(oidc_client: web::Data<OidcClient>) -> impl Responder {
         .cookie(base_cookie(
             "oidc_pkce",
             auth_data.pkce_verifier.secret().to_string(),
-        ))
-        .finish()
+        ));
+    if let Some(return_to) = &query.return_to {
+        response.cookie(base_cookie("oidc_return_to", return_to.clone()));
+    }
+    response.finish()
 }
 
 /// Query parameters the OIDC provider appends when redirecting back to
 /// `/auth/callback`.
+///
+/// The provider can send `error` without `code` and `state`. The handler
+/// then reports a stable failure instead of a query extraction error.
 #[derive(Deserialize)]
 pub struct AuthCallbackQuery {
     /// Authorization code issued by the provider.
-    pub code: String,
+    pub code: Option<String>,
     /// OAuth2 `state` value. It must match the CSRF cookie.
-    pub state: String,
+    pub state: Option<String>,
+    /// Provider error, for example `access_denied`.
+    pub error: Option<String>,
 }
 
 /// JSON body returned by `/auth/callback` describing the login outcome.
@@ -236,14 +398,49 @@ pub struct AuthResponse {
     pub error: Option<String>,
 }
 
-/// OIDC authorization-code callback (validates state/nonce/PKCE, sets the session cookie).
-#[utoipa::path(get, path = "/auth/callback", tag = "auth", params(("code" = String, Query), ("state" = String, Query)), responses((status = 200, body = AuthResponse), (status = 400, body = AuthResponse), (status = 401, body = AuthResponse)))]
+/// OIDC authorization-code callback.
+///
+/// The handler validates the state, nonce, and PKCE values and sets the
+/// session cookies. It clears the temporary OIDC cookies on every outcome.
+///
+/// A valid `oidc_return_to` cookie selects a `302` redirect to the SPA. A
+/// failure adds a stable `error` query parameter. Without the cookie the
+/// handler keeps the JSON `AuthResponse` and its status codes.
+#[utoipa::path(get, path = "/auth/callback", tag = "auth", params(("code" = Option<String>, Query), ("state" = Option<String>, Query), ("error" = Option<String>, Query, description = "Provider error, for example access_denied")), responses((status = 200, body = AuthResponse), (status = 302, description = "redirect to return_to with an optional stable error code"), (status = 400, body = AuthResponse), (status = 401, body = AuthResponse), (status = 403, body = AuthResponse), (status = 500, body = AuthResponse)))]
 #[get("/callback")]
 pub async fn callback(
     oidc_client: web::Data<OidcClient>,
     query: web::Query<AuthCallbackQuery>,
     req: HttpRequest,
 ) -> impl Responder {
+    let secure = oidc_client.secure_cookies();
+    let return_to = req
+        .cookie("oidc_return_to")
+        .map(|cookie| cookie.value().to_string())
+        .filter(|value| is_valid_return_to(value));
+
+    if let Some(provider_error) = query.error.as_deref() {
+        return if provider_error == "access_denied" {
+            tracing::warn!("OIDC provider denied access");
+            callback_failure(
+                StatusCode::FORBIDDEN,
+                "access denied",
+                "access_denied",
+                return_to.as_deref(),
+                secure,
+            )
+        } else {
+            tracing::warn!("OIDC provider returned error: {provider_error}");
+            callback_failure(
+                StatusCode::UNAUTHORIZED,
+                "authentication failed",
+                "authentication_failed",
+                return_to.as_deref(),
+                secure,
+            )
+        };
+    }
+
     let cookies = (
         req.cookie("oidc_csrf"),
         req.cookie("oidc_nonce"),
@@ -251,30 +448,43 @@ pub async fn callback(
     );
 
     let (Some(csrf), Some(nonce), Some(pkce)) = cookies else {
-        return HttpResponse::BadRequest().json(AuthResponse {
-            success: false,
-            token: None,
-            error: Some("Session expired or security cookies missing".to_string()),
-        });
+        return callback_failure(
+            StatusCode::BAD_REQUEST,
+            "Session expired or security cookies missing",
+            "security_cookies_missing",
+            return_to.as_deref(),
+            secure,
+        );
     };
 
-    if query.state != csrf.value() {
-        return HttpResponse::Unauthorized().json(AuthResponse {
-            success: false,
-            token: None,
-            error: Some("Invalid state parameter".to_string()),
-        });
+    let (Some(code), Some(state)) = (query.code.as_deref(), query.state.as_deref()) else {
+        return callback_failure(
+            StatusCode::UNAUTHORIZED,
+            "authentication failed",
+            "authentication_failed",
+            return_to.as_deref(),
+            secure,
+        );
+    };
+
+    if state != csrf.value() {
+        return callback_failure(
+            StatusCode::UNAUTHORIZED,
+            "Invalid state parameter",
+            "invalid_state",
+            return_to.as_deref(),
+            secure,
+        );
     }
 
     let nonce_val = Nonce::new(nonce.value().to_string());
     let pkce_val = PkceCodeVerifier::new(pkce.value().to_string());
 
     match oidc_client
-        .exchange_code(query.code.clone(), nonce_val, pkce_val)
+        .exchange_code(code.to_string(), nonce_val, pkce_val)
         .await
     {
         Ok((token_string, refresh_token)) => {
-            let secure = oidc_client.secure_cookies();
             let auth_cookie = Cookie::build("auth_token", token_string.clone())
                 .path("/")
                 .http_only(true)
@@ -282,55 +492,62 @@ pub async fn callback(
                 .same_site(SameSite::Lax)
                 .max_age(Duration::days(7))
                 .finish();
-
-            let mut response = HttpResponse::Ok();
-            response
-                .cookie(clear_cookie("oidc_csrf".to_string(), secure))
-                .cookie(clear_cookie("oidc_nonce".to_string(), secure))
-                .cookie(clear_cookie("oidc_pkce".to_string(), secure))
-                .cookie(auth_cookie);
-            if let Some(rt) = refresh_token {
-                let refresh_cookie = Cookie::build("refresh_token", rt)
+            let refresh_cookie = refresh_token.map(|rt| {
+                Cookie::build("refresh_token", rt)
                     .path("/")
                     .http_only(true)
                     .secure(secure)
                     .same_site(SameSite::Lax)
                     .max_age(Duration::days(30))
-                    .finish();
-                response.cookie(refresh_cookie);
+                    .finish()
+            });
+
+            if let Some(return_to) = return_to {
+                let mut response = HttpResponse::Found();
+                clear_auth_flow_cookies(&mut response, secure);
+                response.cookie(auth_cookie);
+                if let Some(refresh_cookie) = refresh_cookie {
+                    response.cookie(refresh_cookie);
+                }
+                response.append_header(("Location", return_to)).finish()
+            } else {
+                let mut response = HttpResponse::Ok();
+                clear_auth_flow_cookies(&mut response, secure);
+                response.cookie(auth_cookie);
+                if let Some(refresh_cookie) = refresh_cookie {
+                    response.cookie(refresh_cookie);
+                }
+                response.json(AuthResponse {
+                    success: true,
+                    token: Some(token_string),
+                    error: None,
+                })
             }
-            response.json(AuthResponse {
-                success: true,
-                token: Some(token_string),
-                error: None,
-            })
         }
         Err(e) => {
             // The server logs receive the full detail. Clients only ever see a stable,
             // non-sensitive message.
-            let (status, message) = match &e {
+            let (status, message, code) = match &e {
                 OidcError::ExchangeFailure(_)
                 | OidcError::MissingIdToken
                 | OidcError::InvalidToken(_) => {
                     tracing::warn!("OIDC code exchange rejected: {e}");
                     (
-                        actix_web::http::StatusCode::UNAUTHORIZED,
+                        StatusCode::UNAUTHORIZED,
                         "authentication failed",
+                        "authentication_failed",
                     )
                 }
                 other => {
                     tracing::error!("OIDC callback failed unexpectedly: {other:?}");
                     (
-                        actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        StatusCode::INTERNAL_SERVER_ERROR,
                         "internal server error",
+                        "internal_error",
                     )
                 }
             };
-            HttpResponse::build(status).json(AuthResponse {
-                success: false,
-                token: None,
-                error: Some(message.to_string()),
-            })
+            callback_failure(status, message, code, return_to.as_deref(), secure)
         }
     }
 }
@@ -407,7 +624,7 @@ mod tests {
     use rsa::{RsaPrivateKey, RsaPublicKey, pkcs1::EncodeRsaPrivateKey, traits::PublicKeyParts};
     use serde_json::json;
     use url::Url;
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{body_string_contains, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     const CLIENT_ID: &str = "test-client";
@@ -449,6 +666,7 @@ mod tests {
                     "issuer": server.uri(),
                     "authorization_endpoint": format!("{}/auth", server.uri()),
                     "token_endpoint": format!("{}/token", server.uri()),
+                    "revocation_endpoint": format!("{}/revoke", server.uri()),
                     "jwks_uri": format!("{}/jwks", server.uri()),
                     "response_types_supported": ["code"],
                     "subject_types_supported": ["public"],
@@ -524,6 +742,94 @@ mod tests {
         format!("oidc_csrf={csrf}; oidc_nonce={nonce}; oidc_pkce={pkce}")
     }
 
+    /// Builds the Cookie header value carrying the security cookies and a
+    /// return path.
+    fn return_cookie_header(csrf: &str, nonce: &str, pkce: &str, return_to: &str) -> String {
+        format!(
+            "{}; oidc_return_to={return_to}",
+            cookie_header(csrf, nonce, pkce)
+        )
+    }
+
+    /// Asserts that a response clears a cookie.
+    fn assert_cookie_cleared(res: &ServiceResponse, name: &str) {
+        let cookie = res
+            .response()
+            .cookies()
+            .find(|cookie| cookie.name() == name)
+            .unwrap_or_else(|| panic!("{name} must be cleared"));
+        assert_eq!(
+            cookie.max_age(),
+            Some(Duration::ZERO),
+            "{name} must be cleared"
+        );
+    }
+
+    /// Returns the Location header of a response.
+    fn location(res: &ServiceResponse) -> String {
+        res.response()
+            .headers()
+            .get(LOCATION)
+            .expect("redirect Location header")
+            .to_str()
+            .unwrap()
+            .to_string()
+    }
+
+    /// Signs an ID token whose nonce matches the login cookie.
+    fn id_token_for(fx: &Fixture, nonce: &str) -> anyhow::Result<String> {
+        let mut header = Header::new(jsonwebtoken::Algorithm::RS256);
+        header.kid = Some("test-key-id".to_string());
+        encode(
+            &header,
+            &json!({
+                "iss": fx.server.uri(),
+                "sub": "user-123",
+                "aud": CLIENT_ID,
+                "exp": 2_000_000_000i64,
+                "iat": 1_000_000_000i64,
+                "nonce": nonce,
+            }),
+            &fx.encoding_key,
+        )
+        .map_err(anyhow::Error::from)
+    }
+
+    /// Mounts a token endpoint that accepts the exchange.
+    async fn mount_successful_exchange(fx: &Fixture, nonce: &str) -> anyhow::Result<()> {
+        let id_token = id_token_for(fx, nonce)?;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "mock-access",
+                "token_type": "Bearer",
+                "id_token": id_token,
+            })))
+            .mount(&fx.server)
+            .await;
+        Ok(())
+    }
+
+    /// Waits for the mock provider to receive a request on `path`.
+    async fn wait_for_provider_request(server: &MockServer, path: &str) {
+        for _ in 0..100 {
+            if let Some(requests) = server.received_requests().await
+                && requests.iter().any(|request| request.url.path() == path)
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let paths = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|request| request.url.path().to_string())
+            .collect::<Vec<_>>();
+        panic!("mock provider did not receive {path}; received {paths:?}");
+    }
+
     #[tokio::test]
     async fn login_redirects_to_provider_with_security_cookies() {
         let fx = Fixture::new().await.unwrap();
@@ -573,6 +879,109 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn login_with_return_to_sets_return_cookie() {
+        let fx = Fixture::new().await.unwrap();
+        let svc = test_app!(fx);
+
+        let res = test::call_service(
+            &svc,
+            test::TestRequest::get()
+                .uri("/auth/login?return_to=%2Fapp%3Ftab%3D1%23section")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), 302);
+
+        let cookie = res
+            .response()
+            .cookies()
+            .find(|cookie| cookie.name() == "oidc_return_to")
+            .expect("login must set oidc_return_to");
+        assert_eq!(cookie.value(), "/app?tab=1#section");
+        assert_eq!(cookie.http_only(), Some(true));
+        assert_eq!(cookie.secure(), None, "the fixture callback uses http");
+        assert_eq!(cookie.same_site(), Some(SameSite::Lax));
+        assert_eq!(cookie.path(), Some("/"));
+        assert_eq!(cookie.max_age(), Some(Duration::minutes(5)));
+    }
+
+    #[tokio::test]
+    async fn login_without_return_to_sets_no_return_cookie() {
+        let fx = Fixture::new().await.unwrap();
+        let svc = test_app!(fx);
+
+        let res = test::call_service(
+            &svc,
+            test::TestRequest::get().uri("/auth/login").to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), 302);
+        assert!(
+            res.response()
+                .cookies()
+                .all(|cookie| cookie.name() != "oidc_return_to")
+        );
+    }
+
+    #[tokio::test]
+    async fn login_rejects_absolute_return_to() {
+        let fx = Fixture::new().await.unwrap();
+        let svc = test_app!(fx);
+
+        let res = test::call_service(
+            &svc,
+            test::TestRequest::get()
+                .uri("/auth/login?return_to=https%3A%2F%2Fevil.example%2Fapp")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), 400);
+        assert!(res.response().headers().get(LOCATION).is_none());
+        let body: AuthResponse = serde_json::from_slice(&test::read_body(res).await).unwrap();
+        assert_eq!(body.error.as_deref(), Some("invalid return_to"));
+    }
+
+    #[tokio::test]
+    async fn login_rejects_protocol_relative_return_to() {
+        let fx = Fixture::new().await.unwrap();
+        let svc = test_app!(fx);
+
+        for value in ["%2F%2Fevil.example%2Fapp", "%2F%2F%2Fevil.example"] {
+            let res = test::call_service(
+                &svc,
+                test::TestRequest::get()
+                    .uri(&format!("/auth/login?return_to={value}"))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(res.status(), 400, "value {value} must fail");
+            assert!(res.response().headers().get(LOCATION).is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn login_rejects_return_to_with_scheme_or_host() {
+        let fx = Fixture::new().await.unwrap();
+        let svc = test_app!(fx);
+
+        for value in [
+            "https%3A%2F%2Fevil.example%2Fapp",
+            "javascript%3Aalert%281%29",
+            "%2F%5Cevil.example%2Fapp",
+        ] {
+            let res = test::call_service(
+                &svc,
+                test::TestRequest::get()
+                    .uri(&format!("/auth/login?return_to={value}"))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(res.status(), 400, "value {value} must fail");
+            assert!(res.response().headers().get(LOCATION).is_none());
+        }
+    }
+
+    #[tokio::test]
     async fn callback_without_cookies_is_400() {
         let fx = Fixture::new().await.unwrap();
         let svc = test_app!(fx);
@@ -615,7 +1024,121 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn callback_with_valid_code_returns_token_and_clears_cookies() -> anyhow::Result<()> {
+    async fn callback_success_with_return_cookie_redirects_to_app() -> anyhow::Result<()> {
+        let fx = Fixture::new().await?;
+        let svc = test_app!(fx);
+        let login_res = test::call_service(
+            &svc,
+            test::TestRequest::get()
+                .uri("/auth/login?return_to=%2Fapp%2Fdashboard")
+                .to_request(),
+        )
+        .await;
+        let (csrf, nonce, pkce, state) = login_parts(&login_res)?;
+        mount_successful_exchange(&fx, &nonce).await?;
+
+        let req = test::TestRequest::get()
+            .uri(&format!("/auth/callback?code=test-code&state={state}"))
+            .insert_header((
+                "Cookie",
+                return_cookie_header(&csrf, &nonce, &pkce, "/app/dashboard"),
+            ))
+            .to_request();
+        let res = test::call_service(&svc, req).await;
+
+        assert_eq!(res.status(), 302);
+        assert_eq!(location(&res), "/app/dashboard");
+        assert!(
+            res.response()
+                .cookies()
+                .any(|cookie| cookie.name() == "auth_token")
+        );
+        for name in ["oidc_csrf", "oidc_nonce", "oidc_pkce", "oidc_return_to"] {
+            assert_cookie_cleared(&res, name);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn callback_failure_with_return_cookie_redirects_with_stable_code() -> anyhow::Result<()>
+    {
+        let fx = Fixture::new().await?;
+        let svc = test_app!(fx);
+        let login_res = test::call_service(
+            &svc,
+            test::TestRequest::get()
+                .uri("/auth/login?return_to=%2Fapp%3Ftab%3D1%23section")
+                .to_request(),
+        )
+        .await;
+        let (csrf, nonce, pkce, _state) = login_parts(&login_res)?;
+
+        let req = test::TestRequest::get()
+            .uri("/auth/callback?code=test-code&state=tampered")
+            .insert_header((
+                "Cookie",
+                return_cookie_header(&csrf, &nonce, &pkce, "/app?tab=1#section"),
+            ))
+            .to_request();
+        let res = test::call_service(&svc, req).await;
+
+        assert_eq!(res.status(), 302);
+        let target = Url::parse("http://localhost/")?.join(&location(&res))?;
+        let query: std::collections::HashMap<String, String> =
+            target.query_pairs().into_owned().collect();
+        assert_eq!(query["error"], "invalid_state");
+        assert_eq!(query["tab"], "1");
+        assert_eq!(target.fragment(), Some("section"));
+        for name in ["oidc_csrf", "oidc_nonce", "oidc_pkce", "oidc_return_to"] {
+            assert_cookie_cleared(&res, name);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn callback_with_provider_access_denied_returns_403() {
+        let fx = Fixture::new().await.unwrap();
+        let svc = test_app!(fx);
+
+        let res = test::call_service(
+            &svc,
+            test::TestRequest::get()
+                .uri("/auth/callback?error=access_denied")
+                .to_request(),
+        )
+        .await;
+
+        assert_eq!(res.status(), 403);
+        let body: AuthResponse = serde_json::from_slice(&test::read_body(res).await).unwrap();
+        assert!(!body.success);
+        assert_eq!(body.error.as_deref(), Some("access denied"));
+    }
+
+    #[tokio::test]
+    async fn callback_with_provider_access_denied_redirects_with_code() {
+        let fx = Fixture::new().await.unwrap();
+        let svc = test_app!(fx);
+
+        let req = test::TestRequest::get()
+            .uri("/auth/callback?error=access_denied")
+            .insert_header(("Cookie", "oidc_return_to=/app?tab=1"))
+            .to_request();
+        let res = test::call_service(&svc, req).await;
+
+        assert_eq!(res.status(), 302);
+        let target = Url::parse("http://localhost/")
+            .unwrap()
+            .join(&location(&res))
+            .unwrap();
+        let query: std::collections::HashMap<String, String> =
+            target.query_pairs().into_owned().collect();
+        assert_eq!(query["error"], "access_denied");
+        assert_eq!(query["tab"], "1");
+        assert_cookie_cleared(&res, "oidc_return_to");
+    }
+
+    #[tokio::test]
+    async fn callback_success_without_return_cookie_returns_json() -> anyhow::Result<()> {
         let fx = Fixture::new().await?;
         let svc = test_app!(fx);
         let login_res = test::call_service(
@@ -661,6 +1184,7 @@ mod tests {
         let res = test::call_service(&svc, req).await;
 
         assert_eq!(res.status(), 200);
+        assert!(res.response().headers().get(LOCATION).is_none());
         // The code reads the cookies before read_body consumes the response.
         let auth_cookie = res
             .response()
@@ -669,17 +1193,8 @@ mod tests {
             .expect("auth_token cookie must be set")
             .value()
             .to_string();
-        for name in ["oidc_csrf", "oidc_nonce", "oidc_pkce"] {
-            let cookie = res
-                .response()
-                .cookies()
-                .find(|c| c.name() == name)
-                .unwrap_or_else(|| panic!("{name} must be cleared"));
-            assert_eq!(
-                cookie.max_age(),
-                Some(Duration::ZERO),
-                "{name} must be cleared"
-            );
+        for name in ["oidc_csrf", "oidc_nonce", "oidc_pkce", "oidc_return_to"] {
+            assert_cookie_cleared(&res, name);
         }
 
         let body: AuthResponse = serde_json::from_slice(&test::read_body(res).await)?;
@@ -746,26 +1261,129 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn logout_clears_session_cookie() {
+    async fn logout_clears_auth_and_refresh_cookies() {
         let fx = Fixture::new().await.unwrap();
         let svc = test_app!(fx);
 
         let res = test::call_service(
             &svc,
-            test::TestRequest::post().uri("/auth/logout").to_request(),
+            test::TestRequest::post()
+                .uri("/auth/logout")
+                .insert_header(("Cookie", "refresh_token=r"))
+                .to_request(),
         )
         .await;
         assert_eq!(res.status(), 204);
-        let cookie = res
-            .response()
-            .cookies()
-            .find(|c| c.name() == "auth_token")
-            .expect("logout must clear auth_token");
-        assert_eq!(cookie.max_age(), Some(Duration::ZERO));
+        assert_cookie_cleared(&res, "auth_token");
+        assert_cookie_cleared(&res, "refresh_token");
     }
 
     #[tokio::test]
-    async fn callback_with_failing_exchange_is_401_without_leaking_details() {
+    async fn refresh_after_logout_returns_401() -> anyhow::Result<()> {
+        let fx = Fixture::new().await?;
+        let svc = test_app!(fx);
+        let auth_token = session_token(&fx, "alice", &fx.server.uri())?;
+        let mut jar = vec![
+            ("auth_token".to_string(), auth_token),
+            ("refresh_token".to_string(), "r".to_string()),
+        ];
+
+        let res = test::call_service(
+            &svc,
+            test::TestRequest::post()
+                .uri("/auth/logout")
+                .insert_header((
+                    "Cookie",
+                    jar.iter()
+                        .map(|(name, value)| format!("{name}={value}"))
+                        .collect::<Vec<_>>()
+                        .join("; "),
+                ))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), 204);
+        for cookie in res.response().cookies() {
+            if cookie.max_age() == Some(Duration::ZERO) {
+                jar.retain(|(name, _)| name != cookie.name());
+            }
+        }
+
+        let res = test::call_service(
+            &svc,
+            test::TestRequest::post()
+                .uri("/auth/refresh")
+                .insert_header((
+                    "Cookie",
+                    jar.iter()
+                        .map(|(name, value)| format!("{name}={value}"))
+                        .collect::<Vec<_>>()
+                        .join("; "),
+                ))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), 401);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn logout_returns_204_without_waiting_for_revocation() {
+        let fx = Fixture::new().await.unwrap();
+        let svc = test_app!(fx);
+
+        Mock::given(method("POST"))
+            .and(path("/revoke"))
+            .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(2)))
+            .mount(&fx.server)
+            .await;
+
+        let started = std::time::Instant::now();
+        let res = test::call_service(
+            &svc,
+            test::TestRequest::post()
+                .uri("/auth/logout")
+                .insert_header(("Cookie", "refresh_token=r"))
+                .to_request(),
+        )
+        .await;
+
+        assert_eq!(res.status(), 204);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "logout must not wait for the revocation request"
+        );
+    }
+
+    #[tokio::test]
+    async fn logout_revokes_refresh_token_when_provider_advertises_endpoint() {
+        let fx = Fixture::new().await.unwrap();
+        let svc = test_app!(fx);
+        assert!(fx.module.oidc_client.has_revocation_endpoint());
+
+        Mock::given(method("POST"))
+            .and(path("/revoke"))
+            .and(body_string_contains("token=refresh-token"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&fx.server)
+            .await;
+
+        let res = test::call_service(
+            &svc,
+            test::TestRequest::post()
+                .uri("/auth/logout")
+                .insert_header(("Cookie", "refresh_token=refresh-token"))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), 204);
+
+        wait_for_provider_request(&fx.server, "/revoke").await;
+    }
+
+    #[tokio::test]
+    async fn callback_failure_without_return_cookie_returns_json() {
         let fx = Fixture::new().await.unwrap();
         let svc = test_app!(fx);
         let login_res = test::call_service(
@@ -789,6 +1407,7 @@ mod tests {
         let res = test::call_service(&svc, req).await;
 
         assert_eq!(res.status(), 401);
+        assert!(res.response().headers().get(LOCATION).is_none());
         let body: AuthResponse = serde_json::from_slice(&test::read_body(res).await).unwrap();
         assert!(!body.success);
         // The details of a provider failure never reach the client.
