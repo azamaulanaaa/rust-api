@@ -12,7 +12,7 @@ use openidconnect::core::{CoreClient, CoreProviderMetadata, CoreResponseType};
 use openidconnect::{
     AuthenticationFlow, AuthorizationCode, ClientId, ClientSecret, CsrfToken, EndpointMaybeSet,
     EndpointNotSet, EndpointSet, JsonWebKeySet, Nonce, OAuth2TokenResponse, PkceCodeChallenge,
-    PkceCodeVerifier, RedirectUrl, RefreshToken, Scope, TokenResponse,
+    PkceCodeVerifier, RedirectUrl, RefreshToken, RevocationUrl, Scope, TokenResponse,
 };
 
 use thiserror::Error;
@@ -77,6 +77,10 @@ pub enum OidcError {
     /// The ID token failed signature, nonce, or claims validation.
     #[error("id token validation failed: {0}")]
     InvalidToken(String),
+
+    /// The provider rejected or did not complete token revocation.
+    #[error("token revocation failed: {0}")]
+    Revocation(String),
 }
 
 /// OpenID Connect client wrapping the discovered provider metadata:
@@ -91,6 +95,20 @@ pub struct OidcClient {
         EndpointMaybeSet,
         EndpointMaybeSet,
     >,
+    /// RFC 7009 client. It is present only when discovery advertises a
+    /// revocation endpoint.
+    revocation_client: Option<
+        CoreClient<
+            EndpointSet,
+            EndpointNotSet,
+            EndpointNotSet,
+            EndpointSet,
+            EndpointMaybeSet,
+            EndpointMaybeSet,
+        >,
+    >,
+    /// Client secret for the RFC 7009 revocation request.
+    client_secret: String,
     http_client: reqwest::Client,
     provider_metadata: CoreProviderMetadata,
     /// Original discovered issuer. It may contain a `{tenantid}` placeholder
@@ -149,8 +167,13 @@ impl OidcClient {
             .await
             .map_err(OidcError::HttpClient)?;
 
-        let raw_issuer = serde_json::from_str::<serde_json::Value>(&body)
-            .map_err(|e| OidcError::Discovery(e.to_string()))?
+        let discovery = serde_json::from_str::<serde_json::Value>(&body)
+            .map_err(|e| OidcError::Discovery(e.to_string()))?;
+        let revocation_endpoint = discovery
+            .get("revocation_endpoint")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let raw_issuer = discovery
             .get("issuer")
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| OidcError::Discovery("metadata missing issuer".to_string()))?
@@ -183,15 +206,33 @@ impl OidcClient {
             .map_err(|e| OidcError::Discovery(e.to_string()))?;
         let provider_metadata = provider_metadata.set_jwks(jwks);
 
+        let revocation_client = match revocation_endpoint {
+            Some(endpoint) => {
+                let revocation_url = RevocationUrl::new(endpoint).map_err(|e| {
+                    OidcError::Configuration(format!("invalid revocation endpoint: {e}"))
+                })?;
+                let client = CoreClient::from_provider_metadata(
+                    provider_metadata.clone(),
+                    ClientId::new(config.client_id.clone()),
+                    Some(ClientSecret::new(config.client_secret.clone())),
+                )
+                .set_revocation_url(revocation_url);
+                Some(client)
+            }
+            None => None,
+        };
+
         let client = CoreClient::from_provider_metadata(
             provider_metadata.clone(),
             ClientId::new(config.client_id),
-            Some(ClientSecret::new(config.client_secret)),
+            Some(ClientSecret::new(config.client_secret.clone())),
         )
         .set_redirect_uri(RedirectUrl::new(config.redirect_url.clone())?);
 
         Ok(Self {
             client,
+            revocation_client,
+            client_secret: config.client_secret,
             http_client,
             provider_metadata,
             issuer: raw_issuer,
@@ -363,6 +404,42 @@ impl OidcClient {
         secure_scheme(&self.redirect_url)
     }
 
+    /// Whether provider discovery advertises an RFC 7009 revocation endpoint.
+    pub fn has_revocation_endpoint(&self) -> bool {
+        self.revocation_client.is_some()
+    }
+
+    /// Revokes a refresh token with the provider's RFC 7009 endpoint.
+    ///
+    /// The call is a no-op when discovery has no revocation endpoint. The
+    /// request uses the same HTTP client as the token calls. That client
+    /// bounds the request with its timeout.
+    pub async fn revoke_token(&self, token: &str) -> Result<(), OidcError> {
+        let Some(client) = &self.revocation_client else {
+            return Ok(());
+        };
+        // The oauth2 client rejects a revocation URL that does not use https.
+        // A local provider can advertise an http endpoint, so this method
+        // sends the RFC 7009 form itself. It uses the configured client URL
+        // and the same client credentials.
+        let response = self
+            .http_client
+            .post(client.revocation_url().url().clone())
+            .basic_auth(client.client_id().as_str(), Some(&self.client_secret))
+            .form(&[("token", token), ("token_type_hint", "refresh_token")])
+            .send()
+            .await
+            .map_err(|e| OidcError::Revocation(e.to_string()))?;
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            Err(OidcError::Revocation(format!(
+                "provider returned {}",
+                response.status()
+            )))
+        }
+    }
+
     /// The provider's discovered issuer URL. It may contain a `{tenantid}`
     /// placeholder for multi-tenant providers.
     pub fn issuer(&self) -> &str {
@@ -433,6 +510,7 @@ mod tests {
             OidcError::Discovery("no issuer".into()).to_string(),
             OidcError::ExchangeFailure("400 from /token".into()).to_string(),
             OidcError::InvalidToken("aud mismatch".into()).to_string(),
+            OidcError::Revocation("400 from /revoke".into()).to_string(),
         ] {
             let first = rendered.chars().next().expect("non-empty display");
             assert!(

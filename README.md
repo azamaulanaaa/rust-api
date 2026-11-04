@@ -80,7 +80,7 @@ curl http://localhost:8080/ready
 
 ### Sign in
 
-Open `http://localhost:8080/auth/login` in a browser. Sign in at the provider. The callback returns an `AuthResponse` JSON body and sets the `auth_token` cookie. Copy the `token` value.
+Open `http://localhost:8080/auth/login` in a browser. Sign in at the provider. The callback returns an `AuthResponse` JSON body and sets the `auth_token` cookie. Copy the `token` value. When the login has a `return_to` parameter, the callback returns `302` to that relative path instead.
 
 ### Bootstrap the first admin
 
@@ -135,16 +135,34 @@ Each module brings its own middleware. Modules that need a subject require valid
 
 ### Authentication and sessions
 
-`GET /auth/login` starts the OIDC authorization-code flow with PKCE, CSRF state, and a nonce. The provider redirects to `/auth/callback`. The callback validates the response and sets the session cookies:
+`GET /auth/login` starts the OIDC authorization-code flow with PKCE, CSRF state, and a nonce. It accepts an optional `return_to` query parameter. The value must be a relative path that starts with one `/`. The route rejects absolute URLs, protocol-relative values (`//`), values with a scheme or a host, and values with a backslash. An invalid value returns `400` and does not start the provider redirect. A valid value is stored in the `oidc_return_to` cookie: `HttpOnly`, `SameSite=Lax`, `Path=/`, five-minute lifetime, and `Secure` on HTTPS. The provider redirects to `/auth/callback`.
+
+The callback validates the response, clears `oidc_csrf`, `oidc_nonce`, `oidc_pkce`, and `oidc_return_to` on every outcome, and sets the session cookies:
 
 - `auth_token`: the ID token. `HttpOnly`, `SameSite=Lax`, `Secure` on HTTPS, seven-day lifetime.
 - `refresh_token`: present only when the provider issues one. `HttpOnly`, `SameSite=Lax`, 30-day lifetime.
 
-The callback also returns the token in its JSON body, so a SPA can keep it in memory.
+Without `oidc_return_to`, the callback returns the token in its JSON body, so a SPA can keep it in memory. With `oidc_return_to`, the callback always returns `302` to the relative path. On failure it adds an `error` query parameter without an overwrite of an existing parameter and keeps the fragment. The stable error codes are:
+
+| Code | Condition | JSON status |
+|---|---|---|
+| `security_cookies_missing` | The OIDC security cookies are absent or expired. | `400` |
+| `invalid_state` | `state` does not match the CSRF cookie. | `401` |
+| `authentication_failed` | The code exchange failed, the provider sent no ID token, or the ID token is invalid. | `401` |
+| `access_denied` | The provider returned `error=access_denied`. | `403` |
+| `internal_error` | An unexpected callback failure occurred. | `500` |
+
+Provider detail stays in the server log. It does not go into the `Location` header. A new code is a contract change.
 
 Protected routes accept `Authorization: Bearer <token>` or the `auth_token` cookie. The header wins when both are present. An expired or invalid cookie does not block `/auth/*`. The request continues as anonymous, the protected handler returns `401`, and the response clears the stale cookie.
 
-`GET /auth/me` returns `sub`, `iss`, `aud`, and `exp`. Use it as the session guard. `POST /auth/logout` clears the `auth_token` cookie and always returns `204`.
+`GET /auth/me` returns `sub`, `iss`, `aud`, and `exp`. Use it as the session guard.
+
+`POST /auth/logout` clears `auth_token` and `refresh_token` and always returns `204`. An anonymous request and a failed revocation still return `204`. When the provider advertises a revocation endpoint, logout starts a best-effort RFC 7009 revocation of the refresh token and does not wait for the result. A revocation failure is logged. A refresh request that is already in flight can still set a new `auth_token` after logout.
+
+#### Same-site cookie limit
+
+`SameSite=Lax` cookies do not work for a SPA on a different registrable domain. The browser does not send the cookie on a cross-site `fetch`, and the SPA cannot read the `HttpOnly` callback cookie. The SPA and the API must be same-site. A different subdomain on the same registrable domain is same-site. A different registrable domain is not. A SPA on a different registrable domain must use the bearer token. There is no cross-site token handoff.
 
 See module `oidc` and module `http::middleware` in the rustdoc.
 
@@ -220,10 +238,10 @@ The crate does not ship external event delivery (webhooks), HTTP request idempot
 |---|---|---|---|
 | GET | `/health` | Liveness probe. Always `200`. | none |
 | GET | `/ready` | Readiness probe: policy lock, writer lease, fencing, and dependency probes | none |
-| GET | `/auth/login` | Start OIDC login and redirect to the provider | none |
-| GET | `/auth/callback` | OIDC authorization-code callback | none |
+| GET | `/auth/login` | Start OIDC login. Accepts an optional relative `return_to` and redirects to the provider | none |
+| GET | `/auth/callback` | OIDC callback. Returns JSON, or `302` to `return_to` | none |
 | GET | `/auth/me` | Session probe: `sub`, `iss`, `aud`, `exp` | session |
-| POST | `/auth/logout` | Clear the `auth_token` cookie. Always `204`. | none |
+| POST | `/auth/logout` | Clear `auth_token` and `refresh_token`; best-effort revocation. Always `204`. | none |
 | POST | `/auth/refresh` | Renew the session from the `refresh_token` cookie | refresh cookie |
 | POST | `/setup/admin` | One-time bootstrap: grant the caller `superadmin` | session |
 | GET | `/policy/rules` | List policy rules | session |
@@ -268,7 +286,7 @@ The optional `code` and `details` fields extend the body:
 
 A client can ignore both optional fields. The `error` field is always present. The server logs the cause and never serializes it. A malformed JSON body also uses this envelope.
 
-Some routes answer outside the envelope. `/auth/login` redirects to the provider. `/auth/callback` and `/auth/refresh` return an `AuthResponse`, because the SPA reads the token from it. `/openapi.json` and `/swagger-ui/*` return documents.
+Some routes answer outside the envelope. `/auth/login` redirects to the provider. `/auth/callback` returns an `AuthResponse`, or a `302` when the request has `oidc_return_to`. `/auth/refresh` returns an `AuthResponse`, because the SPA reads the token from it. `/openapi.json` and `/swagger-ui/*` return documents.
 
 ### OpenAPI and client generation
 
@@ -310,7 +328,7 @@ The `/v1` prefix is deferred until a breaking change exists. At that point, moun
 
 `POST /auth/refresh` reads the `refresh_token` cookie and calls the provider refresh grant. On success it returns `200` with an `AuthResponse`, sets a new `auth_token` cookie for seven days, and sets a rotated `refresh_token` cookie when the provider sends one. A missing cookie or a rejected refresh returns `401` with an `AuthResponse`.
 
-The login flow requests the `offline_access` scope, so the provider can issue a refresh token. If it does not, the client must run `/auth/login` again when the ID token expires. Call `/auth/refresh` before `exp` from `/auth/me`. If the call fails, redirect to login.
+The login flow requests the `offline_access` scope, so the provider can issue a refresh token. If it does not, the client must run `/auth/login` again when the ID token expires. Call `/auth/refresh` before `exp` from `/auth/me`. If the call fails, redirect to login. `POST /auth/logout` clears the `refresh_token` cookie, so a later refresh returns `401`.
 
 ## Client integration
 
@@ -320,7 +338,7 @@ The login flow requests the `offline_access` scope, so the provider can issue a 
 
 The routes in this section are the contract for a generic browser client. The client does not call `/policy/*` or `/setup/*`. These routes are stable for external SPA clients.
 
-All requests send `credentials: "include"`. The `auth_token` cookie is the primary credential. A client can also send `Authorization: Bearer <token>` from memory.
+All requests send `credentials: "include"`. The `auth_token` cookie is the primary credential. A client can also send `Authorization: Bearer <token>` from memory. The `SameSite=Lax` cookies require the SPA and the API to be same-site. See [Same-site cookie limit](#same-site-cookie-limit).
 
 | Area | Routes |
 |---|---|
@@ -330,10 +348,10 @@ All requests send `credentials: "include"`. The `auth_token` cookie is the prima
 
 #### Authentication
 
-- `GET /auth/login` is a browser navigation. The callback sets the session cookies.
+- `GET /auth/login` is a browser navigation. It accepts an optional relative `return_to` path. The callback sets the session cookies. With `return_to`, the callback returns `302` to that path. Without it, the callback returns an `AuthResponse` JSON body. A failed callback adds an `error` code to the redirect.
 - `GET /auth/me` returns `200` with `{ "sub", "iss", "aud", "exp" }`. A `401` means no session.
 - `POST /auth/refresh` returns `200` with a new `auth_token` cookie and an `AuthResponse` body. The client reads `success` and `token`. A rejected refresh returns `401`.
-- `POST /auth/logout` clears the cookie and returns `204`.
+- `POST /auth/logout` clears `auth_token` and `refresh_token` and returns `204`. The server starts a best-effort provider revocation of the refresh token.
 
 #### Replica sync
 
@@ -365,7 +383,7 @@ For a cross-origin deployment, add the frontend origin to `[http].allowed_origin
 
 ### SPA and PWA flow
 
-1. Send the browser to `GET /auth/login`. The callback sets the cookie and returns the token.
+1. Send the browser to `GET /auth/login?return_to=<encoded path>`. The callback returns `302` to that path and sets the cookies. Without `return_to`, read the token from the callback JSON body.
 2. Call `GET /auth/me` on app load. `200` means the session works. `401` means the session expired. Call `POST /auth/refresh` before `exp`. If refresh fails, redirect to login.
 3. Poll `GET /sync/status` with `If-None-Match`. `304` means nothing changed. `200` returns `prefix`, `applied_seq`, `head`, and a new `ETag`.
 4. When `applied_seq < head`, call `POST /sync/sync`. If it returns `pending: true`, repeat the call until `pending` is false. Poll `/sync/status` between calls when you need the current coverage.
@@ -379,7 +397,8 @@ const base = "https://api.example.com";
 let token = ""; // from /auth/callback, or rely on the auth_token cookie
 
 // 1. Login is a browser navigation, not fetch.
-window.location.href = `${base}/auth/login`;
+const returnTo = window.location.pathname + window.location.search;
+window.location.href = `${base}/auth/login?return_to=${encodeURIComponent(returnTo)}`;
 
 // 2. Session guard. Refresh before exp when the token is near expiry.
 const me = await fetch(`${base}/auth/me`, {
