@@ -34,7 +34,7 @@ This quickstart takes about five minutes. It assumes you have an S3-compatible b
 
 ### Prerequisites
 
-- Rust 1.88 or newer. `mise install` installs the declared toolchain.
+- Rust 1.89 or newer. `mise install` installs the declared toolchain.
 - An S3-compatible bucket. AWS S3, MinIO, and Cloudflare R2 work.
 - An OIDC provider. Keycloak, Entra ID, and Auth0 work. Register a client and set the redirect URI to `http://localhost:8080/auth/callback`.
 
