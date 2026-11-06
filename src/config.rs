@@ -638,6 +638,18 @@ mod tests {
     }
 
     #[test]
+    fn the_example_config_parses() {
+        // The README tells an operator to copy this file. A copy must parse
+        // and pass validation, or the first start fails.
+        let cfg = parse(include_str!("../config.example.toml"))
+            .expect("config.example.toml must parse and validate");
+        assert_eq!(cfg.public_address, "https://example.com");
+        assert_eq!(cfg.listen_port, 8080);
+        assert_eq!(cfg.s3.bucket, "my-bucket");
+        assert_eq!(cfg.s3.region, "us-east-1");
+    }
+
+    #[test]
     fn parses_minimal_config() {
         let toml = r#"
             public_address = "https://example.test"
