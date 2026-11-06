@@ -56,6 +56,17 @@ description = "Wildcard dependencies and duplicate versions"
 [tasks.deps]
 depends = ["licenses", "advisories", "bans"]
 
+[tasks.msrv-install]
+run = '''
+floor=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+if rustup run "$floor" rustc --version >/dev/null 2>&1; then
+  echo "Rust $floor is already installed"
+  exit 0
+fi
+rustup toolchain install "$floor" --profile minimal --no-self-update --force
+'''
+description = "Install the Rust version declared by Cargo.toml"
+
 [tasks.msrv]
 run = '''
 floor=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml | head -1)
