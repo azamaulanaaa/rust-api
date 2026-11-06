@@ -12,6 +12,14 @@ mise install
 
 mise provides Rust stable, zig, cargo-deny, cargo-dist, and cargo-llvm-cov.
 
+The MSRV job needs the Rust version declared by `rust-version` in `Cargo.toml`. Install it once:
+
+```bash
+mise run msrv-install
+```
+
+This command is safe to rerun. It repairs an interrupted toolchain install.
+
 ## Build
 
 ```bash
@@ -106,7 +114,7 @@ List the job names or show the help:
 .githooks/ci-local.sh --help
 ```
 
-The script skips a job when a required tool is missing. The warning names the tool and the install command. Run `mise install` to install the tools. The script also skips the MSRV job when the declared toolchain is not installed. It does not download the toolchain.
+The script skips a job when a required tool is missing. The warning names the tool and the install command. Run `mise install` to install the tools. The script also skips the MSRV job when the declared toolchain is not installed or is incomplete. It does not download the toolchain. Run `mise run msrv-install` to install it.
 
 Set `CI_LOCAL_STRICT=1` to turn every skip into a failure:
 

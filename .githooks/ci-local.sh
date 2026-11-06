@@ -70,12 +70,13 @@ skip_job() {
 
 toolchain_installed() {
     local want=$1
-    local escaped
-    escaped=${want//./\\.}
     if ! command -v rustup >/dev/null 2>&1; then
         return 1
     fi
-    rustup toolchain list 2>/dev/null | awk '{print $1}' | grep -Eq "^${escaped}([.-]|$)"
+    # Run the compiler rather than grepping `toolchain list`. An interrupted
+    # install leaves a directory that rustup lists but cannot load, and that
+    # state must be reported as missing rather than run.
+    rustup run "$want" rustc --version >/dev/null 2>&1
 }
 
 job_lint() {
@@ -112,7 +113,7 @@ job_msrv() {
         return 1
     fi
     if ! toolchain_installed "$floor"; then
-        skip_job msrv "The Rust $floor toolchain is not installed. This script does not download it. Run rustup toolchain install $floor."
+        skip_job msrv "The Rust $floor toolchain is not installed or is incomplete. This script does not download it. Run mise run msrv-install, or rustup toolchain install $floor --force."
         return 0
     fi
     step "cargo +$floor check --all-targets --all-features --locked"
