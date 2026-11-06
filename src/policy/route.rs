@@ -5,6 +5,9 @@
 //! touches. Rule endpoints use `rules`. Membership and listing endpoints
 //! use `user_groups`. A valid token alone is therefore not enough.
 
+// The route macros generate route-builder structs without doc comments.
+#![allow(missing_docs)]
+
 use std::sync::Arc;
 
 use actix_web::{HttpResponse, Responder, delete, get, post, web};

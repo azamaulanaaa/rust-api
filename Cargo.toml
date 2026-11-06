@@ -2,7 +2,7 @@
 name = "rust-api"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.89"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/azamaulanaaa/rust-api"
 
@@ -23,12 +23,8 @@ queue-rabbitmq = []
 # zstd 0.14 yet. This crate mounts `middleware::Compress`. The middleware
 # loses zstd response encoding and keeps brotli, gzip and deflate. Restore
 # `compress-zstd` when actix-http accepts zstd >= 0.14.3.
-actix-web = { version = "4.12", default-features = false, features = ["macros", "compress-brotli", "compress-gzip", "cookies", "http2", "unicode", "compat", "ws"] }
+actix-web = { version = "4.18", default-features = false, features = ["macros", "compress-brotli", "compress-gzip", "cookies", "http2", "unicode", "compat", "ws"] }
 actix-cors = "0.7"
-# Range, not a floor: actix-web-codegen 4.4.0 generates route structs
-# without docs, tripping `[lints.rust] missing_docs = "deny"`. Revisit on
-# 4.4.1+/actix-web 5.
-actix-web-codegen = ">=4.3.0, <4.4.0"
 bytes = "1.11"
 futures-util = "0.3"
 futures-channel = "0.3"

@@ -1,5 +1,8 @@
 //! Actix routes for the S3 backed FS module.
 
+// The route macros generate route-builder structs without doc comments.
+#![allow(missing_docs)]
+
 use std::sync::Arc;
 
 use actix_web::{HttpResponse, delete, get, post, put, web};
