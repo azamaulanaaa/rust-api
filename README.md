@@ -383,7 +383,7 @@ Example: `file_size = 2500`, `part_size = 1024`, and `file_total_parts = 3`. Par
 
 Errors use the envelope in [Auth and errors](#auth-and-errors). The client reads `error`, and the optional `code` and `details` fields. A missing `code` or `details` is safe. The client treats `401` as unauthenticated, `403` as forbidden, `404` as absent, `416` as a bad range, and `5xx` or network failures as retryable. An empty or non-JSON body uses a generic message.
 
-For a cross-origin deployment, add the frontend origin to `[http].allowed_origins` or `RUST_API_ALLOWED_ORIGINS`. Credentials are allowed. CORS exposes `ETag`, `Content-Range`, `Accept-Ranges`, and `X-Server-Time-Ms`. The local frontend origin is `http://localhost:5173`.
+For a cross-origin deployment, add the frontend origin to `[http].allowed_origins` or `RUST_API_ALLOWED_ORIGINS`. Credentials are allowed. CORS exposes `ETag`, `Content-Range`, `Accept-Ranges`, `Date`, and `X-Server-Time-Ms`. The local frontend origin is `http://localhost:5173`.
 
 ### SPA and PWA flow
 

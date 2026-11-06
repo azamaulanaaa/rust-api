@@ -118,9 +118,9 @@ pub fn health_routes(cfg: &mut web::ServiceConfig) {
 /// requests then succeed. Each origin must be an exact `http(s)` origin
 /// without a trailing slash. The function always allows credentials. The
 /// `auth_token` cookie and the `Authorization` bearer header work across
-/// origins. The function exposes the `ETag`, range, and server-time headers.
-/// The `/sync/db/*` conditional polls and the `/fs` ranged downloads work
-/// from the browser. A browser client can also read `X-Server-Time-Ms`.
+/// origins. The function exposes the `ETag`, range, `Date`, and server-time
+/// headers. The `/sync/db/*` conditional polls and the `/fs` ranged downloads
+/// work from the browser. A browser client can also read `X-Server-Time-Ms`.
 pub fn cors(allowed_origins: &[String]) -> actix_cors::Cors {
     use actix_web::http::header;
     let mut cors = actix_cors::Cors::default()
@@ -138,6 +138,7 @@ pub fn cors(allowed_origins: &[String]) -> actix_cors::Cors {
             header::ETAG,
             header::CONTENT_RANGE,
             header::ACCEPT_RANGES,
+            header::DATE,
         ])
         .expose_headers(vec![middleware::server_time::SERVER_TIME_HEADER])
         .supports_credentials()
@@ -571,9 +572,10 @@ mod tests {
         assert!(missing.headers().contains_key("x-server-time-ms"));
     }
 
-    /// CORS lets a browser read the server-time header.
+    /// CORS lets a browser read the server-time header and the `Date`
+    /// fallback.
     #[actix_web::test]
-    async fn cors_exposes_server_time() {
+    async fn cors_exposes_server_time_and_date() {
         let service = ApiService::new().with_cors_origins(vec!["https://app.example.com".into()]);
         let app = served!(service);
         let res = test::call_service(
@@ -589,12 +591,14 @@ mod tests {
             .get("access-control-expose-headers")
             .and_then(|v| v.to_str().ok())
             .expect("CORS expose header");
-        assert!(
-            exposed
-                .split(',')
-                .any(|h| h.trim().eq_ignore_ascii_case("x-server-time-ms")),
-            "server time is not exposed: {exposed}"
-        );
+        for name in ["x-server-time-ms", "date"] {
+            assert!(
+                exposed
+                    .split(',')
+                    .any(|h| h.trim().eq_ignore_ascii_case(name)),
+                "{name} is not exposed: {exposed}"
+            );
+        }
     }
 
     /// The documentation names `ApiService::configure` as the way for a host
