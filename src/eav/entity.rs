@@ -18,11 +18,18 @@
 //! A schema marker exists for the pinned schema and for each inherited schema.
 //! All scans stop at the `prefix:` to `prefix;` bound.
 //!
-//! # Scope
+//! # Entity events
 //!
 //! The store returns an [`EntityChange`].
-//! It does not write to the change feed.
-//! A later issue wires event delivery.
+//! A store with a change sink writes one [`EntityEvent`] to an outbox row.
+//! The outbox row commits in the same transaction as the entity rows.
+//! The store then flushes the outbox to the feed.
+//! A failure after the commit is [`EntityError::Feed`].
+//! The data and the outbox row stay committed in that case.
+//! The caller can call [`EntityStore::flush_outbox`] again.
+//! Delivery is at least once.
+//! A consumer must be idempotent.
+//!
 //! An update changes attributes only.
 //! A later operation changes the pinned schemas.
 
@@ -37,9 +44,13 @@ use tokio::sync::{Mutex, RwLock};
 use crate::eav::entity_error::EntityError;
 use crate::eav::error::SchemaError;
 use crate::eav::schema::{AttributeDef, AttributeType, EffectiveSchema, SchemaRef, SchemaRegistry};
+use crate::records::{AttributeChange, ChangeSink, EntityEvent, EntityEventKind, WalOp};
 
 /// Key prefix for entity rows.
 const ENTITY_PREFIX: &str = "entity:";
+
+/// Key prefix for pending outbox rows.
+const OUTBOX_PREFIX: &str = "outbox:";
 
 /// Suffix for the metadata row of an entity.
 const META_SUFFIX: &str = ":meta";
@@ -131,10 +142,50 @@ pub struct EntityChange {
     pub after: Option<Entity>,
 }
 
+/// Who made one change and why.
+///
+/// The store copies these values into the event.
+/// The actor is the subject that made the change.
+/// The correlation id groups events from one request or workflow.
+/// The causation id names the event that caused this change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteContext {
+    /// The subject that made the change.
+    pub actor: String,
+    /// Identifier that groups events from one request or workflow.
+    pub correlation_id: Option<String>,
+    /// Identifier of the event that caused this change.
+    pub causation_id: Option<String>,
+}
+
+impl WriteContext {
+    /// Creates a context for `actor` with no correlation id and no cause.
+    pub fn new(actor: impl Into<String>) -> Self {
+        Self {
+            actor: actor.into(),
+            correlation_id: None,
+            causation_id: None,
+        }
+    }
+
+    /// Sets the correlation id.
+    pub fn with_correlation_id(mut self, id: impl Into<String>) -> Self {
+        self.correlation_id = Some(id.into());
+        self
+    }
+
+    /// Sets the causation id.
+    pub fn with_causation_id(mut self, id: impl Into<String>) -> Self {
+        self.causation_id = Some(id.into());
+        self
+    }
+}
+
 /// A store of validated entities on one OxKV store.
 ///
 /// One write mutex serializes mutations.
 /// The mutex keeps versions and unique indexes free of races.
+/// One flush mutex serializes outbox delivery.
 #[derive(Clone)]
 pub struct EntityStore {
     /// Shared store handle.
@@ -143,6 +194,10 @@ pub struct EntityStore {
     schemas: SchemaRegistry,
     /// Serializes mutations, so two callers cannot claim one version.
     write_lock: Arc<Mutex<()>>,
+    /// Serializes outbox flushes, so one row is appended one time at once.
+    flush_lock: Arc<Mutex<()>>,
+    /// The change feed that receives committed entity events.
+    feed: Option<Arc<dyn ChangeSink>>,
 }
 
 impl EntityStore {
@@ -152,7 +207,19 @@ impl EntityStore {
             store: Arc::new(RwLock::new(store)),
             schemas,
             write_lock: Arc::new(Mutex::new(())),
+            flush_lock: Arc::new(Mutex::new(())),
+            feed: None,
         }
+    }
+
+    /// Attaches a [`ChangeSink`] for event delivery.
+    ///
+    /// A mutation then writes its event to the outbox in the same
+    /// transaction as the entity rows.
+    /// The mutation flushes the outbox after the commit.
+    pub fn with_change_sink(mut self, feed: Arc<dyn ChangeSink>) -> Self {
+        self.feed = Some(feed);
+        self
     }
 
     /// Creates an entity and returns the change.
@@ -161,8 +228,13 @@ impl EntityStore {
     /// It applies the schema defaults and checks every attribute.
     /// The metadata row, the attribute rows, and all index rows commit in
     /// one transaction.
+    /// With a feed, one outbox row commits in the same transaction.
     /// The first version is 1.
-    pub async fn create(&self, draft: EntityDraft) -> Result<EntityChange, EntityError> {
+    pub async fn create(
+        &self,
+        draft: EntityDraft,
+        ctx: &WriteContext,
+    ) -> Result<EntityChange, EntityError> {
         validate_name("entity id", &draft.id)?;
         let effective = self.resolve_schemas(&draft.schemas).await?;
         let merged = merge_schemas(&effective)?;
@@ -182,21 +254,31 @@ impl EntityStore {
             created_at: now,
             updated_at: now,
         };
-
-        let _write = self.write_lock.lock().await;
-        let g = self.store.write().await;
-        let tx = g.begin_tx().map_err(EntityError::Store)?;
-        if tx
-            .get_bytes(&meta_key(&entity.id))
-            .await
-            .map_err(EntityError::Store)?
-            .is_some()
-        {
-            return Err(EntityError::AlreadyExists(entity.id));
+        let pending = {
+            let _write = self.write_lock.lock().await;
+            let g = self.store.write().await;
+            let tx = g.begin_tx().map_err(EntityError::Store)?;
+            if tx
+                .get_bytes(&meta_key(&entity.id))
+                .await
+                .map_err(EntityError::Store)?
+                .is_some()
+            {
+                return Err(EntityError::AlreadyExists(entity.id));
+            }
+            let outbox =
+                self.prepare_outbox(None, Some(&entity), event_schema_ids(&effective), ctx)?;
+            check_unique_values(&tx, &entity, &merged.attributes).await?;
+            put_entity_rows(&tx, &entity, &merged).await?;
+            if let Some((key, bytes)) = &outbox {
+                tx.set_bytes(key, bytes).await.map_err(EntityError::Store)?;
+            }
+            tx.commit().await.map_err(EntityError::Store)?;
+            outbox.is_some()
+        };
+        if pending {
+            self.flush_after_commit().await?;
         }
-        check_unique_values(&tx, &entity, &merged.attributes).await?;
-        put_entity_rows(&tx, &entity, &merged).await?;
-        tx.commit().await.map_err(EntityError::Store)?;
         Ok(EntityChange {
             before: None,
             after: Some(entity),
@@ -224,64 +306,83 @@ impl EntityStore {
         id: &str,
         expected_version: u64,
         patch: EntityPatch,
+        ctx: &WriteContext,
     ) -> Result<EntityChange, EntityError> {
         validate_name("entity id", id)?;
         if patch.attributes.is_empty() {
             return Err(EntityError::Invalid("patch is empty".to_string()));
         }
 
-        let _write = self.write_lock.lock().await;
-        let g = self.store.write().await;
-        let tx = g.begin_tx().map_err(EntityError::Store)?;
-        let Some(before) = load_entity(&tx, id).await? else {
-            return Err(EntityError::NotFound(id.to_string()));
-        };
-        if before.version != expected_version {
-            return Err(EntityError::VersionConflict);
-        }
-
-        let effective = self.resolve_refs(&before.schemas).await?;
-        let merged = merge_schemas(&effective)?;
-        validate_defaults(&merged.attributes)?;
-        let mut attributes = before.attributes.clone();
-        for (key, value) in &patch.attributes {
-            if !merged.attributes.contains_key(key) {
-                return Err(EntityError::UnknownAttribute(key.clone()));
+        let (change, pending) = {
+            let _write = self.write_lock.lock().await;
+            let g = self.store.write().await;
+            let tx = g.begin_tx().map_err(EntityError::Store)?;
+            let Some(before) = load_entity(&tx, id).await? else {
+                return Err(EntityError::NotFound(id.to_string()));
+            };
+            if before.version != expected_version {
+                return Err(EntityError::VersionConflict);
             }
-            match value {
-                Some(value) => {
-                    attributes.insert(key.clone(), value.clone());
+
+            let effective = self.resolve_refs(&before.schemas).await?;
+            let merged = merge_schemas(&effective)?;
+            validate_defaults(&merged.attributes)?;
+            let mut attributes = before.attributes.clone();
+            for (key, value) in &patch.attributes {
+                if !merged.attributes.contains_key(key) {
+                    return Err(EntityError::UnknownAttribute(key.clone()));
                 }
-                None => {
-                    attributes.remove(key);
+                match value {
+                    Some(value) => {
+                        attributes.insert(key.clone(), value.clone());
+                    }
+                    None => {
+                        attributes.remove(key);
+                    }
                 }
             }
-        }
-        apply_defaults(&mut attributes, &merged.attributes)?;
-        check_types(&attributes, &merged.attributes)?;
-        check_required(&attributes, &merged.attributes)?;
+            apply_defaults(&mut attributes, &merged.attributes)?;
+            check_types(&attributes, &merged.attributes)?;
+            check_required(&attributes, &merged.attributes)?;
 
-        let version = before
-            .version
-            .checked_add(1)
-            .ok_or_else(|| EntityError::Internal("entity version overflow".to_string()))?;
-        let after = Entity {
-            id: id.to_string(),
-            version,
-            schemas: before.schemas.clone(),
-            attributes,
-            created_at: before.created_at,
-            updated_at: chrono::Utc::now().timestamp(),
+            let version = before
+                .version
+                .checked_add(1)
+                .ok_or_else(|| EntityError::Internal("entity version overflow".to_string()))?;
+            let after = Entity {
+                id: id.to_string(),
+                version,
+                schemas: before.schemas.clone(),
+                attributes,
+                created_at: before.created_at,
+                updated_at: chrono::Utc::now().timestamp(),
+            };
+            let outbox = self.prepare_outbox(
+                Some(&before),
+                Some(&after),
+                event_schema_ids(&effective),
+                ctx,
+            )?;
+
+            check_unique_values(&tx, &after, &merged.attributes).await?;
+            delete_mutable_rows(&tx, &before, &merged).await?;
+            put_entity_rows(&tx, &after, &merged).await?;
+            if let Some((key, bytes)) = &outbox {
+                tx.set_bytes(key, bytes).await.map_err(EntityError::Store)?;
+            }
+            tx.commit().await.map_err(EntityError::Store)?;
+            (
+                EntityChange {
+                    before: Some(before),
+                    after: Some(after),
+                },
+                outbox.is_some(),
+            )
         };
-
-        check_unique_values(&tx, &after, &merged.attributes).await?;
-        delete_mutable_rows(&tx, &before, &merged).await?;
-        put_entity_rows(&tx, &after, &merged).await?;
-        tx.commit().await.map_err(EntityError::Store)?;
-        Ok(EntityChange {
-            before: Some(before),
-            after: Some(after),
-        })
+        if pending {
+            self.flush_after_commit().await?;
+        }
+        Ok(change)
     }
 
     /// Deletes one entity and returns the change.
@@ -293,32 +394,112 @@ impl EntityStore {
         &self,
         id: &str,
         expected_version: u64,
+        ctx: &WriteContext,
     ) -> Result<EntityChange, EntityError> {
         validate_name("entity id", id)?;
-        let _write = self.write_lock.lock().await;
-        let g = self.store.write().await;
-        let tx = g.begin_tx().map_err(EntityError::Store)?;
-        let Some(before) = load_entity(&tx, id).await? else {
-            return Err(EntityError::NotFound(id.to_string()));
-        };
-        if before.version != expected_version {
-            return Err(EntityError::VersionConflict);
-        }
+        let (change, pending) = {
+            let _write = self.write_lock.lock().await;
+            let g = self.store.write().await;
+            let tx = g.begin_tx().map_err(EntityError::Store)?;
+            let Some(before) = load_entity(&tx, id).await? else {
+                return Err(EntityError::NotFound(id.to_string()));
+            };
+            if before.version != expected_version {
+                return Err(EntityError::VersionConflict);
+            }
 
-        let effective = self.resolve_refs(&before.schemas).await?;
-        let merged = merge_schemas(&effective)?;
-        delete_mutable_rows(&tx, &before, &merged).await?;
-        for schema_id in &merged.schema_ids {
-            tx.delete(&schema_index_key(schema_id, id))
-                .await
-                .map_err(EntityError::Store)?;
+            let effective = self.resolve_refs(&before.schemas).await?;
+            let merged = merge_schemas(&effective)?;
+            let outbox =
+                self.prepare_outbox(Some(&before), None, event_schema_ids(&effective), ctx)?;
+            delete_mutable_rows(&tx, &before, &merged).await?;
+            for schema_id in &merged.schema_ids {
+                tx.delete(&schema_index_key(schema_id, id))
+                    .await
+                    .map_err(EntityError::Store)?;
+            }
+            tx.delete(&meta_key(id)).await.map_err(EntityError::Store)?;
+            if let Some((key, bytes)) = &outbox {
+                tx.set_bytes(key, bytes).await.map_err(EntityError::Store)?;
+            }
+            tx.commit().await.map_err(EntityError::Store)?;
+            (
+                EntityChange {
+                    before: Some(before),
+                    after: None,
+                },
+                outbox.is_some(),
+            )
+        };
+        if pending {
+            self.flush_after_commit().await?;
         }
-        tx.delete(&meta_key(id)).await.map_err(EntityError::Store)?;
-        tx.commit().await.map_err(EntityError::Store)?;
-        Ok(EntityChange {
-            before: Some(before),
-            after: None,
-        })
+        Ok(change)
+    }
+
+    /// Delivers every pending outbox row to the change feed.
+    ///
+    /// The call returns `Ok(0)` when no feed is configured.
+    /// It reads the rows in key order.
+    /// For each row, it appends the event and then deletes the row.
+    /// It stops at the first append failure.
+    /// That row and every later row stay in the outbox.
+    /// The call does not hold the store write guard during the append.
+    ///
+    /// Delivery is at least once.
+    /// A crash after an append and before a delete can deliver one event
+    /// again.
+    /// A consumer must be idempotent.
+    pub async fn flush_outbox(&self) -> Result<usize, EntityError> {
+        let Some(feed) = &self.feed else {
+            return Ok(0);
+        };
+        let _flush = self.flush_lock.lock().await;
+        let rows = {
+            let g = self.store.read().await;
+            scan_prefix(&*g, OUTBOX_PREFIX).await?
+        };
+        let mut delivered = 0;
+        for row in rows {
+            let event: EntityEvent = serde_json::from_slice(&row.value)
+                .map_err(|e| EntityError::Internal(format!("outbox event is invalid: {e}")))?;
+            feed.append(WalOp::Entity { event })
+                .await
+                .map_err(|_| EntityError::Feed("entity feed append failed".to_string()))?;
+            let g = self.store.write().await;
+            g.delete(&row.key).await.map_err(EntityError::Store)?;
+            drop(g);
+            delivered += 1;
+        }
+        Ok(delivered)
+    }
+
+    /// Flushes the outbox after a commit.
+    ///
+    /// A flush failure is a delivery error.
+    /// The data and the outbox row stay committed.
+    async fn flush_after_commit(&self) -> Result<(), EntityError> {
+        self.flush_outbox()
+            .await
+            .map(|_| ())
+            .map_err(|_| EntityError::Feed("entity feed append failed".to_string()))
+    }
+
+    /// Builds an outbox row when a feed is configured.
+    fn prepare_outbox(
+        &self,
+        before: Option<&Entity>,
+        after: Option<&Entity>,
+        schemas: Vec<String>,
+        ctx: &WriteContext,
+    ) -> Result<Option<(String, Vec<u8>)>, EntityError> {
+        if self.feed.is_none() {
+            return Ok(None);
+        }
+        let event = build_event(before, after, schemas, ctx)?;
+        let key = outbox_key(&event.event_id);
+        let bytes = serde_json::to_vec(&event).map_err(|e| EntityError::Internal(e.to_string()))?;
+        Ok(Some((key, bytes)))
     }
 
     /// Lists the entities that pin `schema_id` or an inherited schema.
@@ -472,6 +653,97 @@ impl EntityStore {
         }
         Ok(false)
     }
+}
+
+/// Returns the schema ids that apply to one entity.
+///
+/// The list holds each pinned id and every ancestor id.
+/// The list is sorted and has no duplicates.
+fn event_schema_ids(effective: &[EffectiveSchema]) -> Vec<String> {
+    let mut ids = BTreeSet::new();
+    for schema in effective {
+        ids.insert(schema.id.clone());
+        ids.extend(schema.ancestors.iter().cloned());
+    }
+    ids.into_iter().collect()
+}
+
+/// Builds one entity event from the before and after states.
+///
+/// The event id is a fresh UUID v7 string.
+/// The correlation id falls back to the event id.
+fn build_event(
+    before: Option<&Entity>,
+    after: Option<&Entity>,
+    schemas: Vec<String>,
+    ctx: &WriteContext,
+) -> Result<EntityEvent, EntityError> {
+    let kind = match (before, after) {
+        (None, _) => EntityEventKind::Created,
+        (_, None) => EntityEventKind::Deleted,
+        _ => EntityEventKind::Updated,
+    };
+    let entity = after
+        .or(before)
+        .ok_or_else(|| EntityError::Internal("entity change has no state".to_string()))?;
+    let event_id = uuid::Uuid::now_v7().to_string();
+    let correlation_id = ctx
+        .correlation_id
+        .clone()
+        .unwrap_or_else(|| event_id.clone());
+    Ok(EntityEvent {
+        event_id,
+        entity_id: entity.id.clone(),
+        entity_version: entity.version,
+        kind,
+        schemas,
+        changed: changed_attributes(before, after)?,
+        actor: ctx.actor.clone(),
+        causation_id: ctx.causation_id.clone(),
+        correlation_id,
+        occurred_at: chrono::Utc::now().timestamp(),
+    })
+}
+
+/// Returns one change for each attribute whose value differs.
+///
+/// An absent value before the change sets `old` to `None`.
+/// An absent value after the change sets `new` to `None`.
+fn changed_attributes(
+    before: Option<&Entity>,
+    after: Option<&Entity>,
+) -> Result<Vec<AttributeChange>, EntityError> {
+    let empty: BTreeMap<String, AttributeValue> = BTreeMap::new();
+    let before_attrs = before.map(|entity| &entity.attributes).unwrap_or(&empty);
+    let after_attrs = after.map(|entity| &entity.attributes).unwrap_or(&empty);
+    let mut keys = BTreeSet::new();
+    keys.extend(before_attrs.keys().map(String::as_str));
+    keys.extend(after_attrs.keys().map(String::as_str));
+
+    let mut changes = Vec::new();
+    for key in keys {
+        let old = before_attrs.get(key);
+        let new = after_attrs.get(key);
+        if old == new {
+            continue;
+        }
+        changes.push(AttributeChange {
+            key: key.to_string(),
+            old: old.map(attribute_json).transpose()?,
+            new: new.map(attribute_json).transpose()?,
+        });
+    }
+    Ok(changes)
+}
+
+/// Returns the tagged JSON form of one attribute value.
+fn attribute_json(value: &AttributeValue) -> Result<serde_json::Value, EntityError> {
+    serde_json::to_value(value).map_err(|e| EntityError::Internal(e.to_string()))
+}
+
+/// The key for one pending outbox event.
+fn outbox_key(event_id: &str) -> String {
+    format!("{OUTBOX_PREFIX}{event_id}")
 }
 
 /// The merged attribute definitions of every pinned schema.
@@ -1066,6 +1338,10 @@ mod tests {
         AttributeValue::Integer(value)
     }
 
+    fn ctx() -> WriteContext {
+        WriteContext::new("tester")
+    }
+
     async fn all_keys(store: &OxKvStore) -> Vec<String> {
         store
             .gets_bytes(None, Direction::Next, (None, None))
@@ -1074,6 +1350,65 @@ mod tests {
             .into_iter()
             .map(|row| row.key)
             .collect()
+    }
+
+    async fn outbox_keys(store: &OxKvStore) -> Vec<String> {
+        all_keys(store)
+            .await
+            .into_iter()
+            .filter(|key| key.starts_with(OUTBOX_PREFIX))
+            .collect()
+    }
+
+    fn tagged(value: &AttributeValue) -> serde_json::Value {
+        serde_json::to_value(value).unwrap()
+    }
+
+    /// A [`ChangeSink`] test double that records every operation.
+    ///
+    /// The `failing` switch makes every append fail.
+    struct RecordingFeed {
+        ops: std::sync::Mutex<Vec<WalOp>>,
+        failing: std::sync::atomic::AtomicBool,
+    }
+
+    impl RecordingFeed {
+        fn new() -> Self {
+            Self {
+                ops: std::sync::Mutex::new(Vec::new()),
+                failing: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+
+        fn set_failing(&self, failing: bool) {
+            self.failing
+                .store(failing, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn ops(&self) -> Vec<WalOp> {
+            self.ops.lock().unwrap().clone()
+        }
+
+        fn events(&self) -> Vec<EntityEvent> {
+            self.ops()
+                .into_iter()
+                .filter_map(|op| match op {
+                    WalOp::Entity { event } => Some(event),
+                    _ => None,
+                })
+                .collect()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ChangeSink for RecordingFeed {
+        async fn append(&self, op: WalOp) -> anyhow::Result<()> {
+            if self.failing.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(anyhow::anyhow!("feed down"));
+            }
+            self.ops.lock().unwrap().push(op);
+            Ok(())
+        }
     }
 
     #[tokio::test]
@@ -1092,11 +1427,14 @@ mod tests {
             .unwrap();
 
         let change = store
-            .create(draft(
-                "e1",
-                &["person"],
-                vec![("name", s("Alice")), ("age", i(30))],
-            ))
+            .create(
+                draft(
+                    "e1",
+                    &["person"],
+                    vec![("name", s("Alice")), ("age", i(30))],
+                ),
+                &ctx(),
+            )
             .await
             .unwrap();
 
@@ -1105,7 +1443,7 @@ mod tests {
         assert_eq!(created.version, 1);
         assert_eq!(store.get("e1").await.unwrap(), Some(created.clone()));
 
-        let deleted = store.delete("e1", 1).await.unwrap();
+        let deleted = store.delete("e1", 1, &ctx()).await.unwrap();
         assert_eq!(deleted.before, Some(created));
         assert_eq!(deleted.after, None);
         assert_eq!(store.get("e1").await.unwrap(), None);
@@ -1123,7 +1461,7 @@ mod tests {
             .await
             .unwrap();
         let created = store
-            .create(draft("e1", &["person"], vec![("age", i(30))]))
+            .create(draft("e1", &["person"], vec![("age", i(30))]), &ctx())
             .await
             .unwrap()
             .after
@@ -1131,7 +1469,7 @@ mod tests {
         assert_eq!(created.version, 1);
 
         let changed = store
-            .update("e1", 1, patch(vec![("age", Some(i(31)))]))
+            .update("e1", 1, patch(vec![("age", Some(i(31)))]), &ctx())
             .await
             .unwrap()
             .after
@@ -1153,12 +1491,12 @@ mod tests {
             .await
             .unwrap();
         store
-            .create(draft("e1", &["person"], vec![("age", i(30))]))
+            .create(draft("e1", &["person"], vec![("age", i(30))]), &ctx())
             .await
             .unwrap();
 
         let result = store
-            .update("e1", 2, patch(vec![("age", Some(i(31)))]))
+            .update("e1", 2, patch(vec![("age", Some(i(31)))]), &ctx())
             .await;
 
         assert!(matches!(result, Err(EntityError::VersionConflict)));
@@ -1171,7 +1509,7 @@ mod tests {
     async fn unknown_schema_fails() {
         let (store, _registry, raw) = new_store().await;
 
-        let result = store.create(draft("e1", &["ghost"], vec![])).await;
+        let result = store.create(draft("e1", &["ghost"], vec![]), &ctx()).await;
 
         assert!(matches!(result, Err(EntityError::UnknownSchema(id)) if id == "ghost"));
         assert!(all_keys(&raw).await.is_empty());
@@ -1185,11 +1523,11 @@ mod tests {
             .await
             .unwrap();
         store
-            .create(draft("e1", &["person"], vec![]))
+            .create(draft("e1", &["person"], vec![]), &ctx())
             .await
             .unwrap();
 
-        let result = store.create(draft("e1", &["person"], vec![])).await;
+        let result = store.create(draft("e1", &["person"], vec![]), &ctx()).await;
 
         assert!(matches!(result, Err(EntityError::AlreadyExists(id)) if id == "e1"));
     }
@@ -1207,7 +1545,7 @@ mod tests {
             .unwrap();
 
         let result = store
-            .create(draft("e1", &["person"], vec![("ghost", s("x"))]))
+            .create(draft("e1", &["person"], vec![("ghost", s("x"))]), &ctx())
             .await;
 
         assert!(matches!(result, Err(EntityError::UnknownAttribute(key)) if key == "ghost"));
@@ -1226,7 +1564,7 @@ mod tests {
             .unwrap();
 
         let result = store
-            .create(draft("e1", &["person"], vec![("age", s("30"))]))
+            .create(draft("e1", &["person"], vec![("age", s("30"))]), &ctx())
             .await;
 
         assert!(matches!(result, Err(EntityError::TypeMismatch(key)) if key == "age"));
@@ -1251,7 +1589,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = store.create(draft("e1", &["person"], vec![])).await;
+        let result = store.create(draft("e1", &["person"], vec![]), &ctx()).await;
 
         assert!(matches!(result, Err(EntityError::MissingRequired(key)) if key == "name"));
     }
@@ -1276,7 +1614,7 @@ mod tests {
             .unwrap();
 
         let entity = store
-            .create(draft("e1", &["task"], vec![]))
+            .create(draft("e1", &["task"], vec![]), &ctx())
             .await
             .unwrap()
             .after
@@ -1300,7 +1638,7 @@ mod tests {
             .await
             .unwrap();
         store
-            .create(draft("e1", &["task"], vec![("title", s("one"))]))
+            .create(draft("e1", &["task"], vec![("title", s("one"))]), &ctx())
             .await
             .unwrap();
 
@@ -1309,6 +1647,7 @@ mod tests {
                 "e1",
                 1,
                 patch(vec![("title", Some(s("two"))), ("priority", Some(i(2)))]),
+                &ctx(),
             )
             .await
             .unwrap()
@@ -1318,7 +1657,12 @@ mod tests {
         assert_eq!(added.attributes["priority"], i(2));
 
         let removed = store
-            .update("e1", 2, patch(vec![("title", None), ("priority", None)]))
+            .update(
+                "e1",
+                2,
+                patch(vec![("title", None), ("priority", None)]),
+                &ctx(),
+            )
             .await
             .unwrap()
             .after
@@ -1351,12 +1695,12 @@ mod tests {
             .await
             .unwrap();
         store
-            .create(draft("e1", &["child"], vec![("tag", s("alpha"))]))
+            .create(draft("e1", &["child"], vec![("tag", s("alpha"))]), &ctx())
             .await
             .unwrap();
         assert!(!all_keys(&raw).await.is_empty());
 
-        store.delete("e1", 1).await.unwrap();
+        store.delete("e1", 1, &ctx()).await.unwrap();
 
         assert!(all_keys(&raw).await.is_empty());
     }
@@ -1369,7 +1713,10 @@ mod tests {
             .publish(schema("child", &["base"], vec![]))
             .await
             .unwrap();
-        store.create(draft("e1", &["child"], vec![])).await.unwrap();
+        store
+            .create(draft("e1", &["child"], vec![]), &ctx())
+            .await
+            .unwrap();
 
         let found = store.list_by_schema("base").await.unwrap();
 
@@ -1396,7 +1743,7 @@ mod tests {
             .await
             .unwrap();
         store
-            .create(draft("e1", &["task"], vec![("tag", s("alpha"))]))
+            .create(draft("e1", &["task"], vec![("tag", s("alpha"))]), &ctx())
             .await
             .unwrap();
 
@@ -1425,11 +1772,11 @@ mod tests {
             .await
             .unwrap();
         store
-            .create(draft("a", &["task"], vec![("tag", s("alpha"))]))
+            .create(draft("a", &["task"], vec![("tag", s("alpha"))]), &ctx())
             .await
             .unwrap();
         store
-            .create(draft("b", &["task"], vec![("tag", s("beta"))]))
+            .create(draft("b", &["task"], vec![("tag", s("beta"))]), &ctx())
             .await
             .unwrap();
         raw.set_bytes(&attr_index_key("tag", &s("alpha"), "b").unwrap(), b"")
@@ -1454,7 +1801,7 @@ mod tests {
             .await
             .unwrap();
         store
-            .create(draft("e1", &["task"], vec![("tag", s("alpha"))]))
+            .create(draft("e1", &["task"], vec![("tag", s("alpha"))]), &ctx())
             .await
             .unwrap();
 
@@ -1481,7 +1828,10 @@ mod tests {
             ))
             .await
             .unwrap();
-        store.create(draft("e1", &["task"], vec![])).await.unwrap();
+        store
+            .create(draft("e1", &["task"], vec![]), &ctx())
+            .await
+            .unwrap();
 
         let found = store.list_by_attribute("tag", &s("alpha")).await.unwrap();
 
@@ -1492,8 +1842,14 @@ mod tests {
     async fn list_returns_entities_sorted_by_id() {
         let (store, registry, _raw) = new_store().await;
         registry.publish(schema("task", &[], vec![])).await.unwrap();
-        store.create(draft("z", &["task"], vec![])).await.unwrap();
-        store.create(draft("a", &["task"], vec![])).await.unwrap();
+        store
+            .create(draft("z", &["task"], vec![]), &ctx())
+            .await
+            .unwrap();
+        store
+            .create(draft("a", &["task"], vec![]), &ctx())
+            .await
+            .unwrap();
 
         let entities = store.list().await.unwrap();
         let ids: Vec<&str> = entities.iter().map(|entity| entity.id.as_str()).collect();
@@ -1520,20 +1876,18 @@ mod tests {
             .await
             .unwrap();
         store
-            .create(draft(
-                "e1",
-                &["person"],
-                vec![("email", s("a@example.com"))],
-            ))
+            .create(
+                draft("e1", &["person"], vec![("email", s("a@example.com"))]),
+                &ctx(),
+            )
             .await
             .unwrap();
 
         let result = store
-            .create(draft(
-                "e2",
-                &["person"],
-                vec![("email", s("a@example.com"))],
-            ))
+            .create(
+                draft("e2", &["person"], vec![("email", s("a@example.com"))]),
+                &ctx(),
+            )
             .await;
 
         assert!(matches!(result, Err(EntityError::UniqueViolation(key)) if key == "email"));
@@ -1559,11 +1913,17 @@ mod tests {
             .await
             .unwrap();
         store
-            .create(draft("a", &["person"], vec![("email", s("a@example.com"))]))
+            .create(
+                draft("a", &["person"], vec![("email", s("a@example.com"))]),
+                &ctx(),
+            )
             .await
             .unwrap();
         store
-            .create(draft("b", &["person"], vec![("email", s("b@example.com"))]))
+            .create(
+                draft("b", &["person"], vec![("email", s("b@example.com"))]),
+                &ctx(),
+            )
             .await
             .unwrap();
         let old_hash = value_hash(&s("a@example.com")).unwrap();
@@ -1573,7 +1933,10 @@ mod tests {
 
         // The collision marker does not remove the marker of `a`.
         let duplicate = store
-            .create(draft("c", &["person"], vec![("email", s("a@example.com"))]))
+            .create(
+                draft("c", &["person"], vec![("email", s("a@example.com"))]),
+                &ctx(),
+            )
             .await;
         assert!(matches!(duplicate, Err(EntityError::UniqueViolation(key)) if key == "email"));
         assert!(
@@ -1586,11 +1949,19 @@ mod tests {
         // After `a` releases the value, the collision marker does not block
         // `c`.
         store
-            .update("a", 1, patch(vec![("email", Some(s("new@example.com")))]))
+            .update(
+                "a",
+                1,
+                patch(vec![("email", Some(s("new@example.com")))]),
+                &ctx(),
+            )
             .await
             .unwrap();
         store
-            .create(draft("c", &["person"], vec![("email", s("a@example.com"))]))
+            .create(
+                draft("c", &["person"], vec![("email", s("a@example.com"))]),
+                &ctx(),
+            )
             .await
             .unwrap();
 
@@ -1607,7 +1978,10 @@ mod tests {
         assert!(marker_c.is_some());
 
         let result = store
-            .create(draft("d", &["person"], vec![("email", s("a@example.com"))]))
+            .create(
+                draft("d", &["person"], vec![("email", s("a@example.com"))]),
+                &ctx(),
+            )
             .await;
 
         assert!(matches!(result, Err(EntityError::UniqueViolation(key)) if key == "email"));
@@ -1628,11 +2002,14 @@ mod tests {
             .await
             .unwrap();
         store
-            .create(draft(
-                "e1",
-                &["person"],
-                vec![("email", s("a@example.com")), ("name", s("Alice"))],
-            ))
+            .create(
+                draft(
+                    "e1",
+                    &["person"],
+                    vec![("email", s("a@example.com")), ("name", s("Alice"))],
+                ),
+                &ctx(),
+            )
             .await
             .unwrap();
 
@@ -1644,6 +2021,7 @@ mod tests {
                     ("email", Some(s("a@example.com"))),
                     ("name", Some(s("Bob"))),
                 ]),
+                &ctx(),
             )
             .await;
 
@@ -1670,24 +2048,27 @@ mod tests {
             .await
             .unwrap();
         store
-            .create(draft(
-                "e1",
-                &["person"],
-                vec![("email", s("a@example.com"))],
-            ))
+            .create(
+                draft("e1", &["person"], vec![("email", s("a@example.com"))]),
+                &ctx(),
+            )
             .await
             .unwrap();
         store
-            .create(draft(
-                "e2",
-                &["person"],
-                vec![("email", s("b@example.com"))],
-            ))
+            .create(
+                draft("e2", &["person"], vec![("email", s("b@example.com"))]),
+                &ctx(),
+            )
             .await
             .unwrap();
 
         let result = store
-            .update("e1", 1, patch(vec![("email", Some(s("b@example.com")))]))
+            .update(
+                "e1",
+                1,
+                patch(vec![("email", Some(s("b@example.com")))]),
+                &ctx(),
+            )
             .await;
 
         assert!(matches!(result, Err(EntityError::UniqueViolation(key)) if key == "email"));
@@ -1728,7 +2109,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = store.create(draft("e1", &["person"], vec![])).await;
+        let result = store.create(draft("e1", &["person"], vec![]), &ctx()).await;
 
         assert!(matches!(result, Err(EntityError::MissingRequired(_))));
         assert!(all_keys(&raw).await.is_empty());
@@ -1768,7 +2149,10 @@ mod tests {
             .await
             .unwrap();
         store
-            .create(draft("e1", &["left", "right"], vec![("tag", s("x"))]))
+            .create(
+                draft("e1", &["left", "right"], vec![("tag", s("x"))]),
+                &ctx(),
+            )
             .await
             .unwrap();
 
@@ -1776,7 +2160,10 @@ mod tests {
         assert_eq!(found.len(), 1);
 
         let result = store
-            .create(draft("e2", &["left", "right"], vec![("tag", s("x"))]))
+            .create(
+                draft("e2", &["left", "right"], vec![("tag", s("x"))]),
+                &ctx(),
+            )
             .await;
         assert!(matches!(result, Err(EntityError::UniqueViolation(_))));
     }
@@ -1802,7 +2189,10 @@ mod tests {
             .unwrap();
 
         let result = store
-            .create(draft("e1", &["left", "right"], vec![("tag", s("x"))]))
+            .create(
+                draft("e1", &["left", "right"], vec![("tag", s("x"))]),
+                &ctx(),
+            )
             .await;
 
         assert!(matches!(result, Err(EntityError::SchemaConflict(_))));
@@ -1825,7 +2215,7 @@ mod tests {
         ids.push("a".repeat(MAX_NAME_BYTES + 1));
 
         for id in ids {
-            let result = store.create(draft(&id, &["person"], vec![])).await;
+            let result = store.create(draft(&id, &["person"], vec![]), &ctx()).await;
             assert!(
                 matches!(result, Err(EntityError::Invalid(_))),
                 "entity id {id:?} must fail"
@@ -1841,9 +2231,9 @@ mod tests {
             .await
             .unwrap();
 
-        let empty = store.create(draft("e1", &[], vec![])).await;
+        let empty = store.create(draft("e1", &[], vec![]), &ctx()).await;
         let duplicate = store
-            .create(draft("e2", &["person", "person"], vec![]))
+            .create(draft("e2", &["person", "person"], vec![]), &ctx())
             .await;
 
         assert!(matches!(empty, Err(EntityError::Invalid(_))));
@@ -1859,5 +2249,253 @@ mod tests {
         assert_eq!(wire["value"], "hello");
         let back: AttributeValue = serde_json::from_value(wire).unwrap();
         assert_eq!(back, value);
+    }
+
+    #[tokio::test]
+    async fn create_update_and_delete_emit_events() {
+        let (store, registry, raw) = new_store().await;
+        registry
+            .publish(schema(
+                "person",
+                &[],
+                vec![
+                    attr("name", AttributeType::String),
+                    attr("age", AttributeType::Integer),
+                ],
+            ))
+            .await
+            .unwrap();
+        let feed = Arc::new(RecordingFeed::new());
+        let store = store.with_change_sink(feed.clone());
+
+        let create_ctx = WriteContext::new("alice").with_correlation_id("req-1");
+        store
+            .create(
+                draft(
+                    "e1",
+                    &["person"],
+                    vec![("name", s("Alice")), ("age", i(30))],
+                ),
+                &create_ctx,
+            )
+            .await
+            .unwrap();
+
+        let events = feed.events();
+        assert_eq!(events.len(), 1);
+        let created = &events[0];
+        assert_eq!(created.kind, EntityEventKind::Created);
+        assert_eq!(created.actor, "alice");
+        assert_eq!(created.entity_version, 1);
+        assert_eq!(created.correlation_id, "req-1");
+        assert_eq!(created.changed.len(), 2);
+        let age = created
+            .changed
+            .iter()
+            .find(|item| item.key == "age")
+            .unwrap();
+        assert_eq!(age.old, None);
+        assert_eq!(age.new, Some(tagged(&i(30))));
+        let name = created
+            .changed
+            .iter()
+            .find(|item| item.key == "name")
+            .unwrap();
+        assert_eq!(name.old, None);
+        assert_eq!(name.new, Some(tagged(&s("Alice"))));
+
+        let update_ctx = WriteContext::new("bob").with_causation_id("evt-0");
+        store
+            .update(
+                "e1",
+                1,
+                patch(vec![("name", Some(s("Bob"))), ("age", None)]),
+                &update_ctx,
+            )
+            .await
+            .unwrap();
+
+        let events = feed.events();
+        assert_eq!(events.len(), 2);
+        let updated = &events[1];
+        assert_eq!(updated.kind, EntityEventKind::Updated);
+        assert_eq!(updated.actor, "bob");
+        assert_eq!(updated.entity_version, 2);
+        assert_eq!(updated.causation_id.as_deref(), Some("evt-0"));
+        let age = updated
+            .changed
+            .iter()
+            .find(|item| item.key == "age")
+            .unwrap();
+        assert_eq!(age.old, Some(tagged(&i(30))));
+        assert_eq!(age.new, None);
+        let name = updated
+            .changed
+            .iter()
+            .find(|item| item.key == "name")
+            .unwrap();
+        assert_eq!(name.old, Some(tagged(&s("Alice"))));
+        assert_eq!(name.new, Some(tagged(&s("Bob"))));
+
+        let delete_ctx = WriteContext::new("carol");
+        store.delete("e1", 2, &delete_ctx).await.unwrap();
+
+        let events = feed.events();
+        assert_eq!(events.len(), 3);
+        let deleted = &events[2];
+        assert_eq!(deleted.kind, EntityEventKind::Deleted);
+        assert_eq!(deleted.actor, "carol");
+        assert_eq!(deleted.entity_version, 2);
+        assert_eq!(deleted.changed.len(), 1);
+        let name = deleted
+            .changed
+            .iter()
+            .find(|item| item.key == "name")
+            .unwrap();
+        assert_eq!(name.old, Some(tagged(&s("Bob"))));
+        assert_eq!(name.new, None);
+
+        assert!(outbox_keys(&raw).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn event_schemas_include_a_parent_schema() {
+        let (store, registry, _raw) = new_store().await;
+        registry.publish(schema("base", &[], vec![])).await.unwrap();
+        registry
+            .publish(schema("child", &["base"], vec![]))
+            .await
+            .unwrap();
+        let feed = Arc::new(RecordingFeed::new());
+        let store = store.with_change_sink(feed.clone());
+
+        store
+            .create(draft("e1", &["child"], vec![]), &ctx())
+            .await
+            .unwrap();
+
+        let events = feed.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].schemas,
+            vec!["base".to_string(), "child".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn correlation_id_defaults_to_the_event_id() {
+        let (store, registry, _raw) = new_store().await;
+        registry
+            .publish(schema("person", &[], vec![]))
+            .await
+            .unwrap();
+        let feed = Arc::new(RecordingFeed::new());
+        let store = store.with_change_sink(feed.clone());
+
+        store
+            .create(draft("e1", &["person"], vec![]), &ctx())
+            .await
+            .unwrap();
+
+        let events = feed.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].correlation_id, events[0].event_id);
+    }
+
+    #[tokio::test]
+    async fn outbox_is_empty_after_a_successful_append() {
+        let (store, registry, raw) = new_store().await;
+        registry
+            .publish(schema("person", &[], vec![]))
+            .await
+            .unwrap();
+        let feed = Arc::new(RecordingFeed::new());
+        let store = store.with_change_sink(feed.clone());
+
+        store
+            .create(draft("e1", &["person"], vec![]), &ctx())
+            .await
+            .unwrap();
+
+        assert_eq!(feed.events().len(), 1);
+        assert!(outbox_keys(&raw).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_failed_append_keeps_the_entity_and_the_outbox_row() {
+        let (store, registry, raw) = new_store().await;
+        registry
+            .publish(schema("person", &[], vec![]))
+            .await
+            .unwrap();
+        let feed = Arc::new(RecordingFeed::new());
+        feed.set_failing(true);
+        let store = store.with_change_sink(feed.clone());
+
+        let result = store.create(draft("e1", &["person"], vec![]), &ctx()).await;
+
+        assert!(matches!(result, Err(EntityError::Feed(_))));
+        assert!(store.get("e1").await.unwrap().is_some());
+        assert_eq!(outbox_keys(&raw).await.len(), 1);
+
+        feed.set_failing(false);
+        assert_eq!(store.flush_outbox().await.unwrap(), 1);
+        assert!(store.get("e1").await.unwrap().is_some());
+        assert!(outbox_keys(&raw).await.is_empty());
+        let events = feed.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].entity_id, "e1");
+    }
+
+    #[tokio::test]
+    async fn a_create_without_a_feed_writes_no_outbox_row() {
+        let (store, registry, raw) = new_store().await;
+        registry
+            .publish(schema("person", &[], vec![]))
+            .await
+            .unwrap();
+
+        store
+            .create(draft("e1", &["person"], vec![]), &ctx())
+            .await
+            .unwrap();
+
+        assert!(outbox_keys(&raw).await.is_empty());
+        assert_eq!(store.flush_outbox().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn events_flush_in_key_order() {
+        let (store, registry, raw) = new_store().await;
+        registry
+            .publish(schema("person", &[], vec![]))
+            .await
+            .unwrap();
+        let feed = Arc::new(RecordingFeed::new());
+        feed.set_failing(true);
+        let store = store.with_change_sink(feed.clone());
+
+        for id in ["e1", "e2", "e3"] {
+            let result = store.create(draft(id, &["person"], vec![]), &ctx()).await;
+            assert!(matches!(result, Err(EntityError::Feed(_))));
+        }
+        let mut keys = outbox_keys(&raw).await;
+        keys.sort();
+        assert_eq!(keys.len(), 3);
+        let expected: Vec<String> = keys
+            .iter()
+            .map(|key| key.strip_prefix(OUTBOX_PREFIX).unwrap().to_string())
+            .collect();
+
+        feed.set_failing(false);
+        assert_eq!(store.flush_outbox().await.unwrap(), 3);
+
+        let delivered: Vec<String> = feed
+            .events()
+            .into_iter()
+            .map(|event| event.event_id)
+            .collect();
+        assert_eq!(delivered, expected);
+        assert!(outbox_keys(&raw).await.is_empty());
     }
 }

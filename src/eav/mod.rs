@@ -13,8 +13,10 @@
 //! An update changes attributes only.
 //! A later operation changes the pinned schemas.
 //! The entity store returns an [`entity::EntityChange`].
-//! It does not write to the change feed.
-//! A later issue wires event delivery.
+//! With a change sink, it writes entity events through an outbox.
+//! The event row commits with the entity data.
+//! Delivery is at least once.
+//! A consumer must be idempotent.
 
 /// Entity storage, validation, and indexes.
 pub mod entity;
@@ -28,5 +30,7 @@ pub mod error;
 /// Versioned schema storage and inheritance.
 pub mod schema;
 
-pub use entity::{AttributeValue, Entity, EntityChange, EntityDraft, EntityPatch, EntityStore};
+pub use entity::{
+    AttributeValue, Entity, EntityChange, EntityDraft, EntityPatch, EntityStore, WriteContext,
+};
 pub use entity_error::EntityError;

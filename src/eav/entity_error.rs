@@ -48,4 +48,10 @@ pub enum EntityError {
     /// Data could not be encoded or decoded.
     #[error("entity serialization failed")]
     Internal(String),
+    /// The change feed did not accept a committed event.
+    ///
+    /// The entity data and the outbox row stay committed.
+    /// A later flush can deliver the event.
+    #[error("entity feed delivery failed")]
+    Feed(String),
 }
