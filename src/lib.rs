@@ -64,7 +64,8 @@ pub mod records;
 
 /// Generic Entity-Attribute-Value foundations.
 /// The module provides a versioned schema registry with inheritance.
-/// It has no entity storage, no HTTP routes, and no business rules.
+/// It also provides an entity store with typed attributes and indexes.
+/// It has no HTTP routes and no business rules.
 pub mod eav;
 
 /// OxKV store factory. The factory is prefix-scoped inside the configured
