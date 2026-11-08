@@ -30,6 +30,18 @@
 //! `sync` owns the durable implementation
 //! ([`Wal`](crate::sync::wal::Wal)) and the replica machinery. Neither side
 //! has to know that the other side exists.
+//!
+//! # Event families
+//!
+//! The feed carries three families of operation:
+//!
+//! - File and relation operations, such as [`WalOp::FileCreate`].
+//! - Policy operations, such as [`WalOp::PolicyRuleAdd`].
+//! - Entity operations, which carry one [`EntityEvent`].
+//!
+//! An entity operation records one change to one entity. The event states
+//! what changed and when. The record holds no entity data and no validation.
+//! A consumer can store the event or project it later.
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -90,14 +102,79 @@ pub struct FileRecord {
     pub created_at: i64,
 }
 
+/// What happened to an entity.
+///
+/// The kind is part of the wire format. A new variant is safe. An existing
+/// variant must not change its name.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum EntityEventKind {
+    /// The entity was created.
+    Created,
+    /// The entity was updated.
+    Updated,
+    /// The entity was deleted.
+    Deleted,
+    /// A schema was applied to the entity.
+    SchemaApplied,
+    /// A schema was removed from the entity.
+    SchemaRemoved,
+}
+
+/// One attribute that an entity event changed.
+///
+/// A missing value means that the attribute was absent. The pair states the
+/// change on its own. So a consumer does not read the entity to apply it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AttributeChange {
+    /// Name of the attribute.
+    pub key: String,
+    /// Value before the change. `None` means that the attribute was absent.
+    pub old: Option<serde_json::Value>,
+    /// Value after the change. `None` means that the attribute is absent.
+    pub new: Option<serde_json::Value>,
+}
+
+/// One change to one entity.
+///
+/// The event is a fact about the change, not the entity itself. It carries
+/// the entity version, the schemas that apply, and the changed attributes.
+/// A consumer can rebuild the order of changes from these fields.
+///
+/// The event holds no entity storage and no rules. A later replica
+/// projection decides how to apply the event.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EntityEvent {
+    /// Identifier of this event. The value is unique across the feed.
+    pub event_id: String,
+    /// Identifier of the entity that changed.
+    pub entity_id: String,
+    /// Version of the entity after the change.
+    pub entity_version: u64,
+    /// What happened to the entity.
+    pub kind: EntityEventKind,
+    /// Schemas that apply to the entity after the change.
+    pub schemas: Vec<String>,
+    /// Attributes that the event changed. The list is empty when the kind
+    /// changes no attribute, for example a schema operation.
+    pub changed: Vec<AttributeChange>,
+    /// The subject that made the change.
+    pub actor: String,
+    /// Identifier of the event that caused this change, when one exists.
+    pub causation_id: Option<String>,
+    /// Identifier that groups events from one request or workflow.
+    pub correlation_id: String,
+    /// Time of the change, in seconds since the Unix epoch.
+    pub occurred_at: i64,
+}
+
 /// An operation that is stored in the change feed.
 ///
-/// The operations on files and on relations carry enough data to apply them
-/// again on a replica. `FileCreate` carries the whole record. A rich policy
-/// operation carries the whole rule or link. So a replay can resync only the
-/// user or the row that the operation affected. The old operations
-/// `PolicyAdd` and `PolicyRemove` carry only an object. They always need a
-/// full rebuild.
+/// The operations on files, relations, policy, and entities carry enough
+/// data to apply them again on a replica. `FileCreate` carries the whole
+/// record. A rich policy operation carries the whole rule or link. So a
+/// replay can resync only the user or the row that the operation affected.
+/// The old operations `PolicyAdd` and `PolicyRemove` carry only an object.
+/// They always need a full rebuild.
 ///
 /// **Wire format.** The server encodes this type with `serde` into a durable
 /// log. So a new variant is safe, but an existing variant must not change
@@ -192,6 +269,15 @@ pub enum WalOp {
         /// The identifier of the file.
         file_id: String,
     },
+    /// One entity changed.
+    ///
+    /// This variant is new, so every existing variant is frozen. A reader
+    /// that does not know the variant treats the entry as corruption. Add a
+    /// consumer arm before a producer writes the variant.
+    Entity {
+        /// The change that happened.
+        event: EntityEvent,
+    },
 }
 
 impl WalOp {
@@ -282,11 +368,154 @@ mod tests {
             WalOp::PolicyAdd {
                 obj: "legacy".into(),
             },
+            WalOp::Entity {
+                event: sample_entity_event(),
+            },
         ];
         for op in ops {
             let bytes = serde_json::to_vec(&op).expect("serializes");
             let back: WalOp = serde_json::from_slice(&bytes).expect("deserializes");
             assert_eq!(back, op);
+        }
+    }
+
+    /// Builds one entity event with every field set.
+    fn sample_entity_event() -> EntityEvent {
+        EntityEvent {
+            event_id: "evt-1".into(),
+            entity_id: "invoice-1".into(),
+            entity_version: 3,
+            kind: EntityEventKind::Updated,
+            schemas: vec!["invoice".into(), "audited".into()],
+            changed: vec![
+                AttributeChange {
+                    key: "total".into(),
+                    old: Some(serde_json::json!(10)),
+                    new: Some(serde_json::json!(12)),
+                },
+                AttributeChange {
+                    key: "note".into(),
+                    old: None,
+                    new: Some(serde_json::json!("paid")),
+                },
+            ],
+            actor: "alice".into(),
+            causation_id: Some("evt-0".into()),
+            correlation_id: "req-1".into(),
+            occurred_at: 1_760_000_000,
+        }
+    }
+
+    /// An entity event must keep every field through the wire format.
+    ///
+    /// The feed is a durable log. A lost or reordered field changes the
+    /// fact that a consumer sees. So the test compares the decoded value and
+    /// the exact bytes.
+    #[test]
+    fn an_entity_event_round_trips_through_the_wire_format() {
+        let event = sample_entity_event();
+        let bytes = serde_json::to_vec(&event).expect("serializes");
+        let back: EntityEvent = serde_json::from_slice(&bytes).expect("deserializes");
+        assert_eq!(back, event);
+        let again = serde_json::to_vec(&back).expect("serializes");
+        assert_eq!(again, bytes);
+
+        // The names on the wire are part of the contract.
+        let wire: serde_json::Value = serde_json::from_slice(&bytes).expect("decodes");
+        assert_eq!(wire["kind"], "Updated");
+        assert_eq!(wire["changed"][1]["old"], serde_json::Value::Null);
+    }
+
+    /// Every entity event kind must survive the wire format.
+    ///
+    /// A kind that fails to decode makes a replay refuse the entry. So a new
+    /// kind needs a test at the same time as the variant.
+    #[test]
+    fn every_entity_event_kind_round_trips() {
+        for kind in [
+            EntityEventKind::Created,
+            EntityEventKind::Updated,
+            EntityEventKind::Deleted,
+            EntityEventKind::SchemaApplied,
+            EntityEventKind::SchemaRemoved,
+        ] {
+            let mut event = sample_entity_event();
+            event.kind = kind;
+            let bytes = serde_json::to_vec(&event).expect("serializes");
+            let back: EntityEvent = serde_json::from_slice(&bytes).expect("deserializes");
+            assert_eq!(back, event);
+            assert_eq!(back.kind, kind);
+        }
+    }
+
+    /// Only the two old policy marks are legacy.
+    ///
+    /// A replay refuses a range that holds a legacy mark. If a new operation
+    /// enters this class by mistake, one entity event forces a full rebuild
+    /// of every replica.
+    #[test]
+    fn legacy_policy_marks_are_the_only_legacy_ops() {
+        let legacy = [
+            WalOp::PolicyAdd { obj: "x".into() },
+            WalOp::PolicyRemove { obj: "x".into() },
+        ];
+        for op in legacy {
+            assert!(op.is_legacy_policy_mark());
+        }
+
+        let current = [
+            WalOp::PolicyRuleAdd {
+                sub: "s".into(),
+                obj: "o".into(),
+                act: "read".into(),
+            },
+            WalOp::PolicyRuleRemove {
+                sub: "s".into(),
+                obj: "o".into(),
+                act: "read".into(),
+            },
+            WalOp::GroupAdd {
+                user: "u".into(),
+                group: "g".into(),
+            },
+            WalOp::GroupRemove {
+                user: "u".into(),
+                group: "g".into(),
+            },
+            WalOp::GroupDelete { group: "g".into() },
+            WalOp::Attach {
+                row_type: "t".into(),
+                row_id: "1".into(),
+                file_id: "f".into(),
+            },
+            WalOp::Detach {
+                row_type: "t".into(),
+                row_id: "1".into(),
+                file_id: "f".into(),
+            },
+            WalOp::FileCreate {
+                rec: FileRecord {
+                    id: "f1".into(),
+                    name: "a.txt".into(),
+                    mimetype: "text/plain".into(),
+                    size: 7,
+                    s3_key: "files/f1".into(),
+                    owner_sub: "alice".into(),
+                    created_at: 42,
+                },
+            },
+            WalOp::FileDelete {
+                file_id: "f1".into(),
+            },
+            WalOp::Entity {
+                event: sample_entity_event(),
+            },
+        ];
+        for op in current {
+            assert!(
+                !op.is_legacy_policy_mark(),
+                "{op:?} was classified as a legacy policy mark"
+            );
         }
     }
 
