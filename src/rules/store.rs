@@ -18,6 +18,15 @@
 //! An upsert writes the rule row and its index markers in one transaction.
 //! The same transaction removes stale markers from an earlier trigger.
 //! A delete removes the rule row and its index markers in one transaction.
+//!
+//! # Cursor and execution markers
+//!
+//! `rule:cursor` holds the last change-feed sequence that the engine
+//! processed.
+//! `rule:exec:{rule_id}:{event_id}` is one execution marker.
+//! A marker stops a second run of one rule and one event.
+//! Execution markers grow without bound.
+//! A later cleanup job must remove old markers.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -37,6 +46,12 @@ const META_PREFIX: &str = "rule:meta:";
 
 /// Key prefix for rule index markers.
 const INDEX_PREFIX: &str = "rule:idx:";
+
+/// Key that holds the durable change-feed cursor.
+const CURSOR_KEY: &str = "rule:cursor";
+
+/// Key prefix for execution markers.
+const EXEC_PREFIX: &str = "rule:exec:";
 
 /// A store of rules on one OxKV store.
 ///
@@ -220,6 +235,59 @@ impl RuleStore {
         sort_rules(&mut rules);
         Ok(rules)
     }
+
+    /// Reads the durable change-feed cursor.
+    ///
+    /// A missing cursor is 0.
+    pub(crate) async fn cursor(&self) -> Result<u64, RuleError> {
+        let g = self.store.read().await;
+        let Some(bytes) = g.get_bytes(CURSOR_KEY).await.map_err(RuleError::Store)? else {
+            return Ok(0);
+        };
+        serde_json::from_slice(&bytes).map_err(|error| RuleError::Serialization(error.to_string()))
+    }
+
+    /// Writes the durable change-feed cursor.
+    pub(crate) async fn set_cursor(&self, seq: u64) -> Result<(), RuleError> {
+        let bytes = serde_json::to_vec(&seq)
+            .map_err(|error| RuleError::Serialization(error.to_string()))?;
+        let g = self.store.write().await;
+        g.set_bytes(CURSOR_KEY, &bytes)
+            .await
+            .map(|_| ())
+            .map_err(RuleError::Store)
+    }
+
+    /// True when an execution marker exists for one rule and one event.
+    pub(crate) async fn is_executed(
+        &self,
+        rule_id: &str,
+        event_id: &str,
+    ) -> Result<bool, RuleError> {
+        validate_identifier("rule id", rule_id)?;
+        let g = self.store.read().await;
+        Ok(g.get_bytes(&exec_key(rule_id, event_id))
+            .await
+            .map_err(RuleError::Store)?
+            .is_some())
+    }
+
+    /// Writes one execution marker with the current Unix time.
+    pub(crate) async fn mark_executed(
+        &self,
+        rule_id: &str,
+        event_id: &str,
+    ) -> Result<(), RuleError> {
+        validate_identifier("rule id", rule_id)?;
+        let now = chrono::Utc::now().timestamp();
+        let bytes = serde_json::to_vec(&now)
+            .map_err(|error| RuleError::Serialization(error.to_string()))?;
+        let g = self.store.write().await;
+        g.set_bytes(&exec_key(rule_id, event_id), &bytes)
+            .await
+            .map(|_| ())
+            .map_err(RuleError::Store)
+    }
 }
 
 /// Returns the stable lowercase key of one event kind.
@@ -302,6 +370,11 @@ fn prefix_scan_end(prefix: &str) -> String {
 /// The key that holds one rule.
 fn meta_key(id: &str) -> String {
     format!("{META_PREFIX}{id}")
+}
+
+/// The key that holds one execution marker.
+fn exec_key(rule_id: &str, event_id: &str) -> String {
+    format!("{EXEC_PREFIX}{rule_id}:{event_id}")
 }
 
 /// Sorts rules by priority in descending order and then by id.
