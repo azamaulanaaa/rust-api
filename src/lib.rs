@@ -62,6 +62,11 @@ pub mod sync;
 /// crate.
 pub mod records;
 
+/// Generic Entity-Attribute-Value foundations.
+/// The module provides a versioned schema registry with inheritance.
+/// It has no entity storage, no HTTP routes, and no business rules.
+pub mod eav;
+
 /// OxKV store factory. The factory is prefix-scoped inside the configured
 /// S3 bucket. It also creates the single-writer lease that guards a
 /// `[database].prefix` scope.
