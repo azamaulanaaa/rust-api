@@ -70,8 +70,9 @@ pub mod eav;
 
 /// Generic rules for entity events.
 /// A rule has a trigger, a condition, and an action reference.
-/// The module provides a durable rule store and an event match lookup.
-/// It runs no rule and executes no action.
+/// The module provides a durable rule store and a rule runner.
+/// The runner dispatches matching rules to registered actions.
+/// It also tails the durable change feed.
 /// It has no HTTP routes and no business rules.
 pub mod rules;
 

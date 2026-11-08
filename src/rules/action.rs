@@ -1,0 +1,46 @@
+//! Rule actions and the action context.
+//!
+//! A [`RuleAction`] is the only extension point of the rule engine.
+//! The engine finds an action by its kind and calls it for one rule and one
+//! event.
+//! The context holds owned values, so the trait needs no lifetime parameter.
+//! This module has no concrete action.
+
+use async_trait::async_trait;
+
+use crate::eav::entity::Entity;
+use crate::records::EntityEvent;
+use crate::rules::rule::Rule;
+
+/// The owned input of one rule action.
+///
+/// The engine builds one context for each rule that it runs.
+/// The entity is `None` when the entity is deleted.
+#[derive(Debug, Clone)]
+pub struct ActionContext {
+    /// The rule that matched.
+    pub rule: Rule,
+    /// The event that matched.
+    pub event: EntityEvent,
+    /// The current entity. `None` means that the entity is deleted.
+    pub entity: Option<Entity>,
+    /// The action parameters from the rule.
+    pub params: serde_json::Value,
+}
+
+/// One action that the rule engine can run.
+///
+/// An implementation must be idempotent.
+/// A crash can repeat one event.
+/// The engine can also retry one failed action.
+#[async_trait]
+pub trait RuleAction: Send + Sync {
+    /// Returns the action kind. The value must not be empty.
+    fn kind(&self) -> &str;
+
+    /// Runs this action for one context.
+    ///
+    /// A failure stops the engine for this event.
+    /// The engine writes no execution marker in that case.
+    async fn execute(&self, ctx: ActionContext) -> Result<(), anyhow::Error>;
+}
