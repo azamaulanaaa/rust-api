@@ -68,6 +68,13 @@ pub mod records;
 /// It has no HTTP routes and no business rules.
 pub mod eav;
 
+/// Generic rules for entity events.
+/// A rule has a trigger, a condition, and an action reference.
+/// The module provides a durable rule store and an event match lookup.
+/// It runs no rule and executes no action.
+/// It has no HTTP routes and no business rules.
+pub mod rules;
+
 /// OxKV store factory. The factory is prefix-scoped inside the configured
 /// S3 bucket. It also creates the single-writer lease that guards a
 /// `[database].prefix` scope.
