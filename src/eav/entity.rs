@@ -93,6 +93,30 @@ pub enum AttributeValue {
     EntityRef(String),
 }
 
+impl AttributeValue {
+    /// Returns the plain JSON value of this attribute.
+    ///
+    /// The result holds no storage type tag.
+    /// A string or an entity reference becomes a JSON string.
+    /// An integer, a float, or a timestamp becomes a JSON number.
+    /// A rule condition can then compare the value with a JSON literal.
+    pub fn as_json(&self) -> serde_json::Value {
+        match self {
+            Self::String(value) | Self::EntityRef(value) => {
+                serde_json::Value::String(value.clone())
+            }
+            Self::Integer(value) | Self::Timestamp(value) => {
+                serde_json::Value::Number((*value).into())
+            }
+            Self::Float(value) => serde_json::Number::from_f64(*value)
+                .map(serde_json::Value::Number)
+                .unwrap_or(serde_json::Value::Null),
+            Self::Boolean(value) => serde_json::Value::Bool(*value),
+            Self::Json(value) => value.clone(),
+        }
+    }
+}
+
 /// A new entity, before the store assigns a version.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EntityDraft {
@@ -2249,6 +2273,29 @@ mod tests {
         assert_eq!(wire["value"], "hello");
         let back: AttributeValue = serde_json::from_value(wire).unwrap();
         assert_eq!(back, value);
+    }
+
+    #[test]
+    fn attribute_values_become_plain_json() {
+        assert_eq!(
+            AttributeValue::String("a".to_string()).as_json(),
+            serde_json::json!("a")
+        );
+        assert_eq!(AttributeValue::Integer(7).as_json(), serde_json::json!(7));
+        assert_eq!(AttributeValue::Float(1.5).as_json(), serde_json::json!(1.5));
+        assert_eq!(
+            AttributeValue::Boolean(true).as_json(),
+            serde_json::json!(true)
+        );
+        assert_eq!(AttributeValue::Timestamp(9).as_json(), serde_json::json!(9));
+        assert_eq!(
+            AttributeValue::Json(serde_json::json!({"a": 1})).as_json(),
+            serde_json::json!({"a": 1})
+        );
+        assert_eq!(
+            AttributeValue::EntityRef("e2".to_string()).as_json(),
+            serde_json::json!("e2")
+        );
     }
 
     #[tokio::test]
