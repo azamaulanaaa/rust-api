@@ -15,14 +15,14 @@
 use std::fmt;
 
 use actix_web::{HttpResponse, delete, get, patch, post, web};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::eav::entity::{EntityPatch, WriteContext};
+use crate::eav::entity::{Entity, EntityPatch, WriteContext};
 use crate::eav::entity_error::EntityError;
 use crate::eav::error::SchemaError;
 use crate::eav::runtime::EavRuntime;
-use crate::eav::schema::SchemaDraft;
+use crate::eav::schema::{SchemaDef, SchemaDraft};
 use crate::http::{
     ApiModule,
     error::ApiError,
@@ -31,7 +31,7 @@ use crate::http::{
 use crate::policy::row::RowAuthorizer;
 use crate::policy::{Action, Authorizer, PolicyError};
 use crate::rules::error::RuleError;
-use crate::rules::rule::RuleDraft;
+use crate::rules::rule::{Rule, RuleDraft};
 
 /// The route prefix of this module.
 const EAV_PREFIX: &str = "/eav";
@@ -44,6 +44,10 @@ const ENTITIES: &str = "eav_entities";
 const RULES: &str = "eav_rules";
 /// The row type for one entity.
 const ENTITY_ROW: &str = "entity";
+/// The default page size of a list route.
+const DEFAULT_PAGE_LIMIT: usize = 50;
+/// The maximum page size of a list route.
+const MAX_PAGE_LIMIT: usize = 200;
 
 /// The API module that exposes the `/eav` routes.
 ///
@@ -89,6 +93,7 @@ impl ApiModule for EavApiModule {
             .service(get_effective_schema)
             .service(list_schema_children)
             .service(create_entity)
+            .service(list_entities)
             .service(get_entity)
             .service(patch_entity)
             .service(delete_entity)
@@ -107,6 +112,80 @@ impl ApiModule for EavApiModule {
 pub struct ExpectedVersionQuery {
     /// The version that the caller expects.
     pub expected_version: u64,
+}
+
+/// The paging query of a list route.
+///
+/// The default limit is 50.
+/// The maximum limit is 200.
+#[derive(Debug, Clone, Copy, Deserialize, utoipa::IntoParams)]
+pub struct PageQuery {
+    /// The page size. The default is 50. The maximum is 200.
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// The number of items to skip. The default is 0.
+    #[serde(default)]
+    pub offset: Option<usize>,
+}
+
+impl PageQuery {
+    /// Resolves the page window and checks the limit.
+    fn resolve(self) -> Result<(usize, usize), EavApiError> {
+        let limit = self.limit.unwrap_or(DEFAULT_PAGE_LIMIT);
+        if limit == 0 || limit > MAX_PAGE_LIMIT {
+            return Err(EavApiError::Invalid(Box::new(InvalidPageLimit)));
+        }
+        Ok((limit, self.offset.unwrap_or(0)))
+    }
+}
+
+/// A page of schemas.
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
+pub struct SchemaPage {
+    /// The schemas on this page.
+    pub items: Vec<SchemaDef>,
+    /// `Some` means the page was full and a following page may exist.
+    /// Fetch it and stop when the page is empty.
+    pub next_offset: Option<usize>,
+}
+
+/// A page of entities.
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
+pub struct EntityPage {
+    /// The entities on this page.
+    pub items: Vec<Entity>,
+    /// `Some` means the page was full and a following page may exist.
+    /// Fetch it and stop when the page is empty.
+    pub next_offset: Option<usize>,
+}
+
+/// A page of rules.
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
+pub struct RulePage {
+    /// The rules on this page.
+    pub items: Vec<Rule>,
+    /// `Some` means the page was full and a following page may exist.
+    /// Fetch it and stop when the page is empty.
+    pub next_offset: Option<usize>,
+}
+
+/// The source of a page limit outside the allowed range.
+#[derive(Debug)]
+struct InvalidPageLimit;
+
+impl fmt::Display for InvalidPageLimit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("limit must be between 1 and 200")
+    }
+}
+
+impl std::error::Error for InvalidPageLimit {}
+
+/// Returns the next offset when the page is full.
+///
+/// The call returns `None` when the page is not full.
+fn page_next_offset(offset: usize, len: usize, limit: usize) -> Option<usize> {
+    (len == limit).then_some(offset.saturating_add(len))
 }
 
 /// The body of the entity patch route.
@@ -347,16 +426,19 @@ async fn publish_schema(
     Ok(HttpResponse::Created().json(def))
 }
 
-#[utoipa::path(get, path = "/eav/schemas", tag = "eav", responses((status=200, body=Vec<crate::eav::schema::SchemaDef>), (status=401, body=crate::http::error::ErrorBody), (status=403, body=crate::http::error::ErrorBody), (status=500, body=crate::http::error::ErrorBody)))]
+#[utoipa::path(get, path = "/eav/schemas", tag = "eav", params(PageQuery), responses((status=200, body=SchemaPage), (status=400, body=crate::http::error::ErrorBody), (status=401, body=crate::http::error::ErrorBody), (status=403, body=crate::http::error::ErrorBody), (status=500, body=crate::http::error::ErrorBody)))]
 #[get("/schemas")]
 async fn list_schemas(
     runtime: web::Data<EavRuntime>,
     policy: web::Data<Authorizer>,
     claims: Validated<Claims>,
+    query: web::Query<PageQuery>,
 ) -> Result<HttpResponse, EavApiError> {
     require_management(&policy, &claims.sub, SCHEMAS, Action::Read).await?;
-    let schemas = runtime.schemas().list().await?;
-    Ok(HttpResponse::Ok().json(schemas))
+    let (limit, offset) = query.into_inner().resolve()?;
+    let items = runtime.schemas().list_page(limit, offset).await?;
+    let next_offset = page_next_offset(offset, items.len(), limit);
+    Ok(HttpResponse::Ok().json(SchemaPage { items, next_offset }))
 }
 
 #[utoipa::path(get, path = "/eav/schemas/{id}", tag = "eav", params(("id" = String, Path)), responses((status=200, body=crate::eav::schema::SchemaDef), (status=401, body=crate::http::error::ErrorBody), (status=403, body=crate::http::error::ErrorBody), (status=404, body=crate::http::error::ErrorBody), (status=500, body=crate::http::error::ErrorBody)))]
@@ -446,6 +528,36 @@ async fn create_entity(
     Ok(HttpResponse::Created().json(entity))
 }
 
+/// Lists one page of every entity.
+///
+/// The caller needs `read` on `eav_entities`.
+/// The handler then checks the row grant or the collection grant for each
+/// entity.
+/// It loads a raw page, filters the rows, and returns the visible items.
+/// `next_offset` comes from the number of raw rows that the page consumed.
+/// The next page can then contain fewer items than the limit.
+#[utoipa::path(get, path = "/eav/entities", tag = "eav", params(PageQuery), responses((status=200, body=EntityPage), (status=400, body=crate::http::error::ErrorBody), (status=401, body=crate::http::error::ErrorBody), (status=403, body=crate::http::error::ErrorBody), (status=500, body=crate::http::error::ErrorBody)))]
+#[get("/entities")]
+async fn list_entities(
+    runtime: web::Data<EavRuntime>,
+    policy: web::Data<Authorizer>,
+    claims: Validated<Claims>,
+    query: web::Query<PageQuery>,
+) -> Result<HttpResponse, EavApiError> {
+    require_management(&policy, &claims.sub, ENTITIES, Action::Read).await?;
+    let (limit, offset) = query.into_inner().resolve()?;
+    let raw = runtime.entities().list_page(limit, offset).await?;
+    let raw_len = raw.len();
+    let mut items = Vec::with_capacity(raw_len);
+    for entity in raw {
+        if can_read_entity(&policy, &claims.sub, &entity.id).await? {
+            items.push(entity);
+        }
+    }
+    let next_offset = page_next_offset(offset, raw_len, limit);
+    Ok(HttpResponse::Ok().json(EntityPage { items, next_offset }))
+}
+
 #[utoipa::path(get, path = "/eav/entities/{id}", tag = "eav", params(("id" = String, Path)), responses((status=200, body=crate::eav::entity::Entity), (status=401, body=crate::http::error::ErrorBody), (status=403, body=crate::http::error::ErrorBody), (status=404, body=crate::http::error::ErrorBody), (status=500, body=crate::http::error::ErrorBody)))]
 #[get("/entities/{id}")]
 async fn get_entity(
@@ -513,24 +625,31 @@ async fn delete_entity(
     Ok(HttpResponse::NoContent().finish())
 }
 
-#[utoipa::path(get, path = "/eav/schemas/{id}/entities", tag = "eav", params(("id" = String, Path)), responses((status=200, body=Vec<crate::eav::entity::Entity>), (status=401, body=crate::http::error::ErrorBody), (status=403, body=crate::http::error::ErrorBody), (status=500, body=crate::http::error::ErrorBody)))]
+#[utoipa::path(get, path = "/eav/schemas/{id}/entities", tag = "eav", params(("id" = String, Path), PageQuery), responses((status=200, body=EntityPage), (status=400, body=crate::http::error::ErrorBody), (status=401, body=crate::http::error::ErrorBody), (status=403, body=crate::http::error::ErrorBody), (status=500, body=crate::http::error::ErrorBody)))]
 #[get("/schemas/{id}/entities")]
 async fn list_schema_entities(
     runtime: web::Data<EavRuntime>,
     policy: web::Data<Authorizer>,
     claims: Validated<Claims>,
     path: web::Path<String>,
+    query: web::Query<PageQuery>,
 ) -> Result<HttpResponse, EavApiError> {
     require_management(&policy, &claims.sub, ENTITIES, Action::Read).await?;
     let id = path.into_inner();
-    let entities = runtime.entities().list_by_schema(&id).await?;
-    let mut visible = Vec::with_capacity(entities.len());
-    for entity in entities {
+    let (limit, offset) = query.into_inner().resolve()?;
+    let raw = runtime
+        .entities()
+        .list_by_schema_page(&id, limit, offset)
+        .await?;
+    let raw_len = raw.len();
+    let mut items = Vec::with_capacity(raw_len);
+    for entity in raw {
         if can_read_entity(&policy, &claims.sub, &entity.id).await? {
-            visible.push(entity);
+            items.push(entity);
         }
     }
-    Ok(HttpResponse::Ok().json(visible))
+    let next_offset = page_next_offset(offset, raw_len, limit);
+    Ok(HttpResponse::Ok().json(EntityPage { items, next_offset }))
 }
 
 #[utoipa::path(post, path = "/eav/rules", tag = "eav", request_body = RuleDraft, responses((status=201, body=crate::rules::rule::Rule), (status=400, body=crate::http::error::ErrorBody), (status=401, body=crate::http::error::ErrorBody), (status=403, body=crate::http::error::ErrorBody), (status=500, body=crate::http::error::ErrorBody)))]
@@ -552,16 +671,19 @@ async fn upsert_rule(
     Ok(HttpResponse::Created().json(rule))
 }
 
-#[utoipa::path(get, path = "/eav/rules", tag = "eav", responses((status=200, body=Vec<crate::rules::rule::Rule>), (status=401, body=crate::http::error::ErrorBody), (status=403, body=crate::http::error::ErrorBody), (status=500, body=crate::http::error::ErrorBody)))]
+#[utoipa::path(get, path = "/eav/rules", tag = "eav", params(PageQuery), responses((status=200, body=RulePage), (status=400, body=crate::http::error::ErrorBody), (status=401, body=crate::http::error::ErrorBody), (status=403, body=crate::http::error::ErrorBody), (status=500, body=crate::http::error::ErrorBody)))]
 #[get("/rules")]
 async fn list_rules(
     runtime: web::Data<EavRuntime>,
     policy: web::Data<Authorizer>,
     claims: Validated<Claims>,
+    query: web::Query<PageQuery>,
 ) -> Result<HttpResponse, EavApiError> {
     require_management(&policy, &claims.sub, RULES, Action::Read).await?;
-    let rules = runtime.rules().list().await?;
-    Ok(HttpResponse::Ok().json(rules))
+    let (limit, offset) = query.into_inner().resolve()?;
+    let items = runtime.rules().list_page(limit, offset).await?;
+    let next_offset = page_next_offset(offset, items.len(), limit);
+    Ok(HttpResponse::Ok().json(RulePage { items, next_offset }))
 }
 
 #[utoipa::path(get, path = "/eav/rules/{id}", tag = "eav", params(("id" = String, Path)), responses((status=200, body=crate::rules::rule::Rule), (status=401, body=crate::http::error::ErrorBody), (status=403, body=crate::http::error::ErrorBody), (status=404, body=crate::http::error::ErrorBody), (status=500, body=crate::http::error::ErrorBody)))]
@@ -788,6 +910,33 @@ mod tests {
         rule_body_with_action("record")
     }
 
+    async fn publish_task_schema(fx: &Fixture) -> anyhow::Result<()> {
+        fx.runtime
+            .schemas()
+            .publish(SchemaDraft {
+                id: "task".to_string(),
+                extends: Vec::new(),
+                attributes: Default::default(),
+            })
+            .await?;
+        Ok(())
+    }
+
+    async fn create_task(fx: &Fixture, id: &str) -> anyhow::Result<()> {
+        fx.runtime
+            .entities()
+            .create(
+                EntityDraft {
+                    id: id.to_string(),
+                    schemas: vec!["task".to_string()],
+                    attributes: Default::default(),
+                },
+                &WriteContext::new("alice"),
+            )
+            .await?;
+        Ok(())
+    }
+
     #[test]
     fn error_status_and_code_mapping() {
         for (error, status, code) in [
@@ -889,6 +1038,10 @@ mod tests {
             assert!(paths.contains_key(*route), "spec missing {route}");
         }
         assert!(
+            paths["/eav/entities"]["get"].is_object(),
+            "spec missing GET /eav/entities"
+        );
+        assert!(
             spec["tags"]
                 .as_array()
                 .expect("tags")
@@ -965,7 +1118,8 @@ mod tests {
         .await;
         assert_eq!(res.status(), http::StatusCode::OK);
         let schemas: Value = actix_test::read_body_json(res).await;
-        assert_eq!(schemas.as_array().map(Vec::len), Some(1));
+        assert_eq!(schemas["items"].as_array().map(Vec::len), Some(1));
+        assert!(schemas["next_offset"].is_null());
 
         for uri in [
             "/eav/schemas/invoice",
@@ -1040,7 +1194,8 @@ mod tests {
         .await;
         assert_eq!(res.status(), http::StatusCode::OK);
         let entities: Value = actix_test::read_body_json(res).await;
-        assert_eq!(entities.as_array().map(Vec::len), Some(1));
+        assert_eq!(entities["items"].as_array().map(Vec::len), Some(1));
+        assert!(entities["next_offset"].is_null());
 
         let res = actix_test::call_service(
             &app,
@@ -1075,7 +1230,8 @@ mod tests {
         .await;
         assert_eq!(res.status(), http::StatusCode::OK);
         let rules: Value = actix_test::read_body_json(res).await;
-        assert_eq!(rules.as_array().map(Vec::len), Some(1));
+        assert_eq!(rules["items"].as_array().map(Vec::len), Some(1));
+        assert!(rules["next_offset"].is_null());
 
         let res = actix_test::call_service(
             &app,
@@ -1113,6 +1269,117 @@ mod tests {
         )
         .await;
         assert_eq!(res.status(), http::StatusCode::NO_CONTENT);
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn global_entity_list_returns_page_envelopes() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        assert!(fx.engine.claim_superadmin("alice").await?);
+        publish_task_schema(&fx).await?;
+        for id in ["e1", "e2", "e3"] {
+            create_task(&fx, id).await?;
+        }
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::get().uri("/eav/entities?limit=2&offset=0"),
+                &token,
+            )
+            .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let page: Value = actix_test::read_body_json(res).await;
+        let ids: Vec<&str> = page["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .map(|item| item["id"].as_str().expect("id"))
+            .collect();
+        assert_eq!(ids, vec!["e1", "e2"]);
+        assert_eq!(page["next_offset"], 2);
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::get().uri("/eav/entities?limit=2&offset=2"),
+                &token,
+            )
+            .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let page: Value = actix_test::read_body_json(res).await;
+        assert_eq!(page["items"].as_array().map(Vec::len), Some(1));
+        assert!(page["next_offset"].is_null());
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::get().uri("/eav/entities?offset=99"),
+                &token,
+            )
+            .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let page: Value = actix_test::read_body_json(res).await;
+        assert_eq!(page["items"].as_array().map(Vec::len), Some(0));
+        assert!(page["next_offset"].is_null());
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn an_invalid_page_limit_is_400() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        assert!(fx.engine.claim_superadmin("alice").await?);
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+
+        for uri in ["/eav/schemas?limit=0", "/eav/schemas?limit=201"] {
+            let res = actix_test::call_service(
+                &app,
+                auth(actix_test::TestRequest::get().uri(uri), &token).to_request(),
+            )
+            .await;
+            assert_eq!(res.status(), http::StatusCode::BAD_REQUEST, "{uri}");
+            let body: crate::http::error::ErrorBody = actix_test::read_body_json(res).await;
+            assert_eq!(body.code.as_deref(), Some("invalid_request"), "{uri}");
+        }
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn can_read_entity_allows_a_row_grant_or_a_collection_grant() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        fx.engine
+            .assign_group("carol".into(), "row-readers".into())
+            .await?;
+        fx.engine
+            .add_rule("row-readers".into(), "entity:e1".into(), Action::Read)
+            .await?;
+        fx.engine
+            .assign_group("dave".into(), "collection-readers".into())
+            .await?;
+        fx.engine
+            .add_rule(
+                "collection-readers".into(),
+                "eav_entities".into(),
+                Action::Read,
+            )
+            .await?;
+
+        let auth = fx.engine.authorizer();
+        assert!(can_read_entity(&auth, "carol", "e1").await?);
+        assert!(!can_read_entity(&auth, "carol", "e2").await?);
+        assert!(can_read_entity(&auth, "dave", "e1").await?);
+        assert!(can_read_entity(&auth, "dave", "e2").await?);
         Ok(())
     }
 

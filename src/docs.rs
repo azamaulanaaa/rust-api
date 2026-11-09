@@ -43,6 +43,7 @@ use utoipa::OpenApi;
         crate::eav::route::get_effective_schema,
         crate::eav::route::list_schema_children,
         crate::eav::route::create_entity,
+        crate::eav::route::list_entities,
         crate::eav::route::get_entity,
         crate::eav::route::patch_entity,
         crate::eav::route::delete_entity,
@@ -66,6 +67,9 @@ use utoipa::OpenApi;
         crate::eav::entity::AttributeValue,
         crate::eav::route::EntityPatchRequest,
         crate::eav::route::RuleEnabledRequest,
+        crate::eav::route::SchemaPage,
+        crate::eav::route::EntityPage,
+        crate::eav::route::RulePage,
         crate::rules::rule::RuleDraft,
         crate::rules::rule::Rule,
         crate::rules::rule::RuleTrigger,
@@ -121,6 +125,20 @@ mod tests {
         assert!(required.iter().any(|value| value == "error"));
         assert!(!required.iter().any(|value| value == "code"));
         assert!(!required.iter().any(|value| value == "details"));
+    }
+
+    /// Each list route returns one of the page envelopes.
+    #[test]
+    fn page_envelopes_are_in_the_spec() {
+        let spec: Value =
+            serde_json::from_str(&ApiDoc::openapi().to_json().expect("spec serializes"))
+                .expect("spec is JSON");
+        let schemas = spec["components"]["schemas"]
+            .as_object()
+            .expect("component schemas");
+        for name in ["SchemaPage", "EntityPage", "RulePage"] {
+            assert!(schemas.contains_key(name), "spec missing {name}");
+        }
     }
 
     /// Guards the PWA contract. Every served route that the SPA code generator
