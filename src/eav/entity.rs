@@ -172,6 +172,7 @@ pub struct EntityChange {
 /// The actor is the subject that made the change.
 /// The correlation id groups events from one request or workflow.
 /// The causation id names the event that caused this change.
+/// The causation depth counts the links before this change.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WriteContext {
     /// The subject that made the change.
@@ -180,15 +181,20 @@ pub struct WriteContext {
     pub correlation_id: Option<String>,
     /// Identifier of the event that caused this change.
     pub causation_id: Option<String>,
+    /// Number of links in the causation chain before this change.
+    pub causation_depth: u32,
 }
 
 impl WriteContext {
     /// Creates a context for `actor` with no correlation id and no cause.
+    ///
+    /// The causation depth is 0, which marks a user-driven change.
     pub fn new(actor: impl Into<String>) -> Self {
         Self {
             actor: actor.into(),
             correlation_id: None,
             causation_id: None,
+            causation_depth: 0,
         }
     }
 
@@ -199,8 +205,20 @@ impl WriteContext {
     }
 
     /// Sets the causation id.
+    ///
+    /// The call does not change the causation depth.
     pub fn with_causation_id(mut self, id: impl Into<String>) -> Self {
         self.causation_id = Some(id.into());
+        self
+    }
+
+    /// Sets the causation id and the causation depth.
+    ///
+    /// An action that writes an entity uses this method.
+    /// The new depth is one more than the depth of the cause.
+    pub fn with_causation(mut self, id: impl Into<String>, depth: u32) -> Self {
+        self.causation_id = Some(id.into());
+        self.causation_depth = depth;
         self
     }
 }
@@ -696,6 +714,8 @@ fn event_schema_ids(effective: &[EffectiveSchema]) -> Vec<String> {
 ///
 /// The event id is a fresh UUID v7 string.
 /// The correlation id falls back to the event id.
+/// The snapshot holds the after state.
+/// A delete has no after state, so its snapshot holds the before state.
 fn build_event(
     before: Option<&Entity>,
     after: Option<&Entity>,
@@ -715,6 +735,13 @@ fn build_event(
         .correlation_id
         .clone()
         .unwrap_or_else(|| event_id.clone());
+    let snapshot = Some(
+        entity
+            .attributes
+            .iter()
+            .map(|(key, value)| (key.clone(), value.as_json()))
+            .collect(),
+    );
     Ok(EntityEvent {
         event_id,
         entity_id: entity.id.clone(),
@@ -724,7 +751,9 @@ fn build_event(
         changed: changed_attributes(before, after)?,
         actor: ctx.actor.clone(),
         causation_id: ctx.causation_id.clone(),
+        causation_depth: ctx.causation_depth,
         correlation_id,
+        snapshot,
         occurred_at: chrono::Utc::now().timestamp(),
     })
 }
@@ -2447,6 +2476,95 @@ mod tests {
         let events = feed.events();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].correlation_id, events[0].event_id);
+    }
+
+    /// A normal create records depth 0 and a snapshot of every attribute.
+    ///
+    /// The snapshot holds plain JSON.
+    /// A rule then reads the values without the storage type tag.
+    #[tokio::test]
+    async fn a_create_records_depth_zero_and_a_full_snapshot() {
+        let (store, registry, _raw) = new_store().await;
+        registry
+            .publish(schema(
+                "person",
+                &[],
+                vec![
+                    attr("name", AttributeType::String),
+                    attr("age", AttributeType::Integer),
+                ],
+            ))
+            .await
+            .unwrap();
+        let feed = Arc::new(RecordingFeed::new());
+        let store = store.with_change_sink(feed.clone());
+
+        store
+            .create(
+                draft(
+                    "e1",
+                    &["person"],
+                    vec![("name", s("Alice")), ("age", i(30))],
+                ),
+                &ctx(),
+            )
+            .await
+            .unwrap();
+
+        let events = feed.events();
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.causation_depth, 0);
+        let snapshot = event.snapshot.as_ref().expect("a new event has a snapshot");
+        assert_eq!(snapshot.len(), 2);
+        assert_eq!(snapshot["name"], serde_json::json!("Alice"));
+        assert_eq!(snapshot["age"], serde_json::json!(30));
+    }
+
+    /// A delete records the before state in its snapshot.
+    ///
+    /// The entity has no after state.
+    /// A rule must still compare the attributes that the event removed.
+    #[tokio::test]
+    async fn a_delete_records_the_before_state_in_the_snapshot() {
+        let (store, registry, _raw) = new_store().await;
+        registry
+            .publish(schema(
+                "person",
+                &[],
+                vec![
+                    attr("name", AttributeType::String),
+                    attr("age", AttributeType::Integer),
+                ],
+            ))
+            .await
+            .unwrap();
+        let feed = Arc::new(RecordingFeed::new());
+        let store = store.with_change_sink(feed.clone());
+        store
+            .create(
+                draft(
+                    "e1",
+                    &["person"],
+                    vec![("name", s("Alice")), ("age", i(30))],
+                ),
+                &ctx(),
+            )
+            .await
+            .unwrap();
+
+        store.delete("e1", 1, &ctx()).await.unwrap();
+
+        let events = feed.events();
+        assert_eq!(events.len(), 2);
+        let deleted = &events[1];
+        assert_eq!(deleted.kind, EntityEventKind::Deleted);
+        let snapshot = deleted
+            .snapshot
+            .as_ref()
+            .expect("a delete has a snapshot of the before state");
+        assert_eq!(snapshot["name"], serde_json::json!("Alice"));
+        assert_eq!(snapshot["age"], serde_json::json!(30));
     }
 
     #[tokio::test]
