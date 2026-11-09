@@ -17,6 +17,11 @@
 //! The event row commits with the entity data.
 //! Delivery is at least once.
 //! A consumer must be idempotent.
+//!
+//! [`runtime::EavRuntime`] builds the stores from one S3 config and prefix.
+//! It then starts the outbox relay and the rule runner.
+//! The runtime is opt-in.
+//! The binary starts it only when `eav.enabled` is true.
 
 /// Entity storage, validation, and indexes.
 pub mod entity;
@@ -27,6 +32,9 @@ pub mod entity_error;
 /// Error type for the schema registry.
 pub mod error;
 
+/// The background runtime for the EAV stores.
+pub mod runtime;
+
 /// Versioned schema storage and inheritance.
 pub mod schema;
 
@@ -34,3 +42,4 @@ pub use entity::{
     AttributeValue, Entity, EntityChange, EntityDraft, EntityPatch, EntityStore, WriteContext,
 };
 pub use entity_error::EntityError;
+pub use runtime::{EavRuntime, EavRuntimeConfig};
