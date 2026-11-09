@@ -169,6 +169,40 @@ pub struct Entity {
     pub updated_at: i64,
 }
 
+/// One reason that an entity fails a target schema version.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(tag = "kind", content = "detail", rename_all = "snake_case")]
+pub enum RevalidationIssue {
+    /// The entity stores an attribute that the target version does not define.
+    UnknownAttribute(String),
+    /// An attribute value does not match the target type.
+    TypeMismatch(String),
+    /// The target version requires an attribute that the entity lacks.
+    MissingRequired(String),
+    /// The effective target schemas conflict.
+    SchemaConflict(String),
+}
+
+/// One entity that fails a target schema version.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct InvalidEntity {
+    /// The entity id.
+    pub entity_id: String,
+    /// The first issue that the entity has.
+    pub issue: RevalidationIssue,
+}
+
+/// A dry-run result for one target schema version.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct RevalidationReport {
+    /// The number of entities that the call checked.
+    pub scanned: usize,
+    /// The number of entities that pass the target version.
+    pub compatible: usize,
+    /// The entities that fail the target version.
+    pub invalid: Vec<InvalidEntity>,
+}
+
 /// The before and after state of one entity change.
 ///
 /// This type is the seam for the later event-delivery issue.
@@ -624,6 +658,87 @@ impl EntityStore {
             }
         }
         Ok(entities)
+    }
+
+    /// Checks stored entities against a target schema version.
+    ///
+    /// The call reads at most `limit` entities that pin `schema_id`.
+    /// It changes no key, no entity version, and no pinned schema.
+    /// It records one issue for each invalid entity.
+    /// A missing target version is [`EntityError::UnknownSchema`].
+    pub async fn revalidation_report(
+        &self,
+        schema_id: &str,
+        target_version: u64,
+        limit: usize,
+    ) -> Result<RevalidationReport, EntityError> {
+        validate_name("schema id", schema_id)?;
+        if self
+            .schemas
+            .get(schema_id, target_version)
+            .await
+            .map_err(map_schema_error)?
+            .is_none()
+        {
+            return Err(EntityError::UnknownSchema(schema_id.to_string()));
+        }
+
+        let entities = self.list_by_schema_page(schema_id, limit, 0).await?;
+        let mut report = RevalidationReport {
+            scanned: 0,
+            compatible: 0,
+            invalid: Vec::new(),
+        };
+        for entity in entities {
+            if !entity.schemas.iter().any(|schema| schema.id == schema_id) {
+                continue;
+            }
+            report.scanned += 1;
+            match self
+                .revalidate_one(&entity, schema_id, target_version)
+                .await
+            {
+                Ok(()) => report.compatible += 1,
+                Err(issue) => report.invalid.push(InvalidEntity {
+                    entity_id: entity.id.clone(),
+                    issue,
+                }),
+            }
+        }
+        Ok(report)
+    }
+
+    /// Validates one entity against a candidate pinned list.
+    ///
+    /// The candidate replaces `schema_id` with `target_version`.
+    /// The call clones the attributes before it applies defaults.
+    async fn revalidate_one(
+        &self,
+        entity: &Entity,
+        schema_id: &str,
+        target_version: u64,
+    ) -> Result<(), RevalidationIssue> {
+        let refs: Vec<SchemaRef> = entity
+            .schemas
+            .iter()
+            .map(|schema| {
+                if schema.id == schema_id {
+                    SchemaRef {
+                        id: schema_id.to_string(),
+                        version: target_version,
+                    }
+                } else {
+                    schema.clone()
+                }
+            })
+            .collect();
+        let effective = self
+            .resolve_refs(&refs)
+            .await
+            .map_err(|error| RevalidationIssue::SchemaConflict(error.to_string()))?;
+        let merged = merge_schemas(&effective)
+            .map_err(|error| RevalidationIssue::SchemaConflict(error.to_string()))?;
+        validate_attributes(&entity.attributes, &merged.attributes)
     }
 
     /// Lists the entities with an indexed attribute equal to `value`.
@@ -1236,6 +1351,33 @@ fn check_required(
         }
     }
     Ok(())
+}
+
+/// Validates cloned attributes against a target attribute map.
+///
+/// The call applies defaults to the clone only.
+/// The call returns the first issue.
+fn validate_attributes(
+    attributes: &BTreeMap<String, AttributeValue>,
+    defs: &BTreeMap<String, AttributeDef>,
+) -> Result<(), RevalidationIssue> {
+    let mut candidate = attributes.clone();
+    check_known(&candidate, defs).map_err(revalidation_issue)?;
+    validate_defaults(defs).map_err(revalidation_issue)?;
+    apply_defaults(&mut candidate, defs).map_err(revalidation_issue)?;
+    check_types(&candidate, defs).map_err(revalidation_issue)?;
+    check_required(&candidate, defs).map_err(revalidation_issue)?;
+    Ok(())
+}
+
+/// Converts an entity error into one revalidation issue.
+fn revalidation_issue(error: EntityError) -> RevalidationIssue {
+    match error {
+        EntityError::UnknownAttribute(name) => RevalidationIssue::UnknownAttribute(name),
+        EntityError::TypeMismatch(name) => RevalidationIssue::TypeMismatch(name),
+        EntityError::MissingRequired(name) => RevalidationIssue::MissingRequired(name),
+        other => RevalidationIssue::SchemaConflict(other.to_string()),
+    }
 }
 
 /// Checks every unique value against the unique index.
@@ -3490,5 +3632,150 @@ mod tests {
         // A delete removes every marker of the entity.
         store.delete("e1", 3, &ctx()).await.unwrap();
         assert!(!store.is_timer_fired("e1", "due", 200).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn revalidation_accepts_an_entity_that_matches_the_new_version() {
+        let (store, registry, _raw) = new_store().await;
+        registry
+            .publish(schema(
+                "task",
+                &[],
+                vec![attr("title", AttributeType::String)],
+            ))
+            .await
+            .unwrap();
+        let created = store
+            .create(draft("e1", &["task"], vec![("title", s("one"))]), &ctx())
+            .await
+            .unwrap()
+            .after
+            .unwrap();
+        registry
+            .publish(schema(
+                "task",
+                &[],
+                vec![
+                    attr("title", AttributeType::String),
+                    attr("note", AttributeType::String),
+                ],
+            ))
+            .await
+            .unwrap();
+
+        let report = store.revalidation_report("task", 2, 100).await.unwrap();
+
+        assert_eq!(report.scanned, 1);
+        assert_eq!(report.compatible, 1);
+        assert!(report.invalid.is_empty());
+        assert_eq!(store.get("e1").await.unwrap(), Some(created));
+    }
+
+    #[tokio::test]
+    async fn revalidation_reports_a_missing_required_attribute() {
+        let (store, registry, _raw) = new_store().await;
+        registry
+            .publish(schema(
+                "task",
+                &[],
+                vec![attr("title", AttributeType::String)],
+            ))
+            .await
+            .unwrap();
+        store
+            .create(draft("e1", &["task"], vec![("title", s("one"))]), &ctx())
+            .await
+            .unwrap();
+        registry
+            .publish(schema(
+                "task",
+                &[],
+                vec![
+                    attr("title", AttributeType::String),
+                    full_attr("owner", AttributeType::String, true, false, false, None),
+                ],
+            ))
+            .await
+            .unwrap();
+
+        let report = store.revalidation_report("task", 2, 100).await.unwrap();
+
+        assert_eq!(report.scanned, 1);
+        assert_eq!(report.compatible, 0);
+        assert_eq!(report.invalid.len(), 1);
+        assert_eq!(report.invalid[0].entity_id, "e1");
+        assert_eq!(
+            report.invalid[0].issue,
+            RevalidationIssue::MissingRequired("owner".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn revalidation_reports_a_type_change() {
+        let (store, registry, _raw) = new_store().await;
+        registry
+            .publish(schema(
+                "task",
+                &[],
+                vec![attr("total", AttributeType::Integer)],
+            ))
+            .await
+            .unwrap();
+        store
+            .create(draft("e1", &["task"], vec![("total", i(10))]), &ctx())
+            .await
+            .unwrap();
+        registry
+            .publish(schema(
+                "task",
+                &[],
+                vec![attr("total", AttributeType::String)],
+            ))
+            .await
+            .unwrap();
+
+        let report = store.revalidation_report("task", 2, 100).await.unwrap();
+
+        assert_eq!(report.compatible, 0);
+        assert_eq!(
+            report.invalid[0].issue,
+            RevalidationIssue::TypeMismatch("total".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn revalidation_reports_a_removed_attribute() {
+        let (store, registry, _raw) = new_store().await;
+        registry
+            .publish(schema(
+                "task",
+                &[],
+                vec![attr("title", AttributeType::String)],
+            ))
+            .await
+            .unwrap();
+        store
+            .create(draft("e1", &["task"], vec![("title", s("one"))]), &ctx())
+            .await
+            .unwrap();
+        registry.publish(schema("task", &[], vec![])).await.unwrap();
+
+        let report = store.revalidation_report("task", 2, 100).await.unwrap();
+
+        assert_eq!(report.compatible, 0);
+        assert_eq!(
+            report.invalid[0].issue,
+            RevalidationIssue::UnknownAttribute("title".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn revalidation_rejects_a_missing_target_version() {
+        let (store, registry, _raw) = new_store().await;
+        registry.publish(schema("task", &[], vec![])).await.unwrap();
+
+        let result = store.revalidation_report("task", 2, 100).await;
+
+        assert!(matches!(result, Err(EntityError::UnknownSchema(id)) if id == "task"));
     }
 }
