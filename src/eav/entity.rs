@@ -218,6 +218,25 @@ pub struct MigrationReport {
     pub dry_run: bool,
 }
 
+/// The counts from one atomic schema migration batch.
+#[derive(Debug, Default)]
+struct MigrationBatchResult {
+    /// The number of entities that the batch migrated.
+    migrated: usize,
+    /// The number of entities that already pin the target version.
+    unchanged: usize,
+    /// The entities that fail the target version.
+    invalid: Vec<InvalidEntity>,
+}
+
+/// One meta row and one optional outbox row for a batch write.
+struct SchemaMigrationWrite {
+    /// The entity after the migration.
+    entity: Entity,
+    /// The outbox key and bytes, when a feed is configured.
+    outbox: Option<(String, Vec<u8>)>,
+}
+
 /// The before and after state of one entity change.
 ///
 /// This type is the seam for the later event-delivery issue.
@@ -758,7 +777,9 @@ impl EntityStore {
     /// A valid entity that already pins `target_version` counts as unchanged.
     /// Any other valid entity counts as migrated.
     /// A dry run writes no key and no event.
-    /// An apply writes the meta row and the outbox row in one transaction.
+    /// An apply writes every meta row and every outbox row in one transaction.
+    /// A stale entity version aborts the batch with no write.
+    /// A store error aborts the batch with no write.
     /// A missing target version is [`EntityError::UnknownSchema`].
     /// A `limit` of 0 returns an empty report.
     pub async fn migrate_schema(
@@ -792,58 +813,74 @@ impl EntityStore {
         }
 
         let entities = self.list_by_schema_page(schema_id, limit, 0).await?;
-        for entity in entities {
-            if !entity.schemas.iter().any(|schema| schema.id == schema_id) {
-                continue;
-            }
-            report.scanned += 1;
-            match self
-                .revalidate_one(&entity, schema_id, target_version)
-                .await
-            {
-                Ok(()) => {
-                    if entity
-                        .schemas
-                        .iter()
-                        .any(|schema| schema.id == schema_id && schema.version == target_version)
-                    {
-                        report.unchanged += 1;
-                    } else {
-                        report.migrated += 1;
-                        if !dry_run {
-                            self.apply_schema_migration(&entity, schema_id, target_version, ctx)
-                                .await?;
+        if dry_run {
+            for entity in entities {
+                if !entity.schemas.iter().any(|schema| schema.id == schema_id) {
+                    continue;
+                }
+                report.scanned += 1;
+                match self
+                    .revalidate_one(&entity, schema_id, target_version)
+                    .await
+                {
+                    Ok(()) => {
+                        if entity.schemas.iter().any(|schema| {
+                            schema.id == schema_id && schema.version == target_version
+                        }) {
+                            report.unchanged += 1;
+                        } else {
+                            report.migrated += 1;
                         }
                     }
+                    Err(issue) => report.invalid.push(InvalidEntity {
+                        entity_id: entity.id.clone(),
+                        issue,
+                    }),
                 }
-                Err(issue) => report.invalid.push(InvalidEntity {
-                    entity_id: entity.id.clone(),
-                    issue,
-                }),
             }
+            return Ok(report);
         }
+
+        let candidates: Vec<Entity> = entities
+            .into_iter()
+            .filter(|entity| entity.schemas.iter().any(|schema| schema.id == schema_id))
+            .collect();
+        report.scanned = candidates.len();
+        let applied = self
+            .apply_schema_migration_batch(&candidates, schema_id, target_version, ctx)
+            .await?;
+        report.migrated = applied.migrated;
+        report.unchanged = applied.unchanged;
+        report.invalid = applied.invalid;
         Ok(report)
     }
 
-    /// Re-pins one entity to a target schema version.
+    /// Applies one target schema version to one batch of entities.
     ///
-    /// The call reads the entity again under the write lock.
-    /// It writes the meta row and the outbox row in one transaction.
-    /// It changes no attribute row and no index row.
-    /// The call flushes the outbox after the commit.
-    async fn apply_schema_migration(
+    /// The call holds the write lock for the whole batch.
+    /// It reloads each entity and rejects a stale version.
+    /// An invalid entity goes into `invalid` and is skipped.
+    /// It builds every after entity and every outbox row in memory.
+    /// One transaction writes every row, or it writes no row.
+    /// The call flushes the outbox one time after the commit.
+    async fn apply_schema_migration_batch(
         &self,
-        entity: &Entity,
+        entities: &[Entity],
         schema_id: &str,
         target_version: u64,
         ctx: &WriteContext,
-    ) -> Result<(), EntityError> {
-        let pending = {
-            let _write = self.write_lock.lock().await;
-            let g = self.store.write().await;
-            let tx = g.begin_tx().map_err(EntityError::Store)?;
-            let Some(current) = load_entity(&tx, &entity.id).await? else {
-                return Ok(());
+    ) -> Result<MigrationBatchResult, EntityError> {
+        let _write = self.write_lock.lock().await;
+        let mut result = MigrationBatchResult::default();
+        let mut writes: Vec<SchemaMigrationWrite> = Vec::new();
+
+        for entity in entities {
+            let current = {
+                let g = self.store.read().await;
+                load_entity(&*g, &entity.id).await?
+            };
+            let Some(current) = current else {
+                return Err(EntityError::VersionConflict);
             };
             // Reject a stale decision.
             // Another write changed the entity after the validation.
@@ -852,14 +889,28 @@ impl EntityStore {
                 return Err(EntityError::VersionConflict);
             }
             if !current.schemas.iter().any(|schema| schema.id == schema_id) {
-                return Ok(());
+                continue;
+            }
+            match self
+                .revalidate_one(&current, schema_id, target_version)
+                .await
+            {
+                Ok(()) => {}
+                Err(issue) => {
+                    result.invalid.push(InvalidEntity {
+                        entity_id: current.id.clone(),
+                        issue,
+                    });
+                    continue;
+                }
             }
             if current
                 .schemas
                 .iter()
                 .any(|schema| schema.id == schema_id && schema.version == target_version)
             {
-                return Ok(());
+                result.unchanged += 1;
+                continue;
             }
             let schemas: Vec<SchemaRef> = current
                 .schemas
@@ -890,17 +941,33 @@ impl EntityStore {
             let effective = self.resolve_refs(&after.schemas).await?;
             let outbox =
                 self.prepare_schema_applied_outbox(&after, event_schema_ids(&effective), ctx)?;
-            put_meta_row(&tx, &after).await?;
-            if let Some((key, bytes)) = &outbox {
-                tx.set_bytes(key, bytes).await.map_err(EntityError::Store)?;
+            result.migrated += 1;
+            writes.push(SchemaMigrationWrite {
+                entity: after,
+                outbox,
+            });
+        }
+
+        if writes.is_empty() {
+            return Ok(result);
+        }
+
+        let pending = writes.iter().any(|write| write.outbox.is_some());
+        {
+            let g = self.store.write().await;
+            let tx = g.begin_tx().map_err(EntityError::Store)?;
+            for write in &writes {
+                put_meta_row(&tx, &write.entity).await?;
+                if let Some((key, bytes)) = &write.outbox {
+                    tx.set_bytes(key, bytes).await.map_err(EntityError::Store)?;
+                }
             }
             tx.commit().await.map_err(EntityError::Store)?;
-            outbox.is_some()
-        };
+        }
         if pending {
             self.flush_after_commit().await?;
         }
-        Ok(())
+        Ok(result)
     }
 
     /// Validates one entity against a candidate pinned list.
@@ -4321,7 +4388,7 @@ mod tests {
             .unwrap();
 
         let result = store
-            .apply_schema_migration(&stale, "task", 2, &ctx())
+            .apply_schema_migration_batch(std::slice::from_ref(&stale), "task", 2, &ctx())
             .await;
 
         assert!(matches!(result, Err(EntityError::VersionConflict)));
@@ -4329,5 +4396,311 @@ mod tests {
         assert_eq!(entity.version, 2);
         assert_eq!(entity.schemas[0].version, 1);
         assert_eq!(entity.attributes["title"], s("two"));
+    }
+
+    #[tokio::test]
+    async fn a_migration_batch_repins_two_entities_and_emits_two_events() {
+        let (store, registry, raw) = new_store().await;
+        registry
+            .publish(schema(
+                "task",
+                &[],
+                vec![attr("title", AttributeType::String)],
+            ))
+            .await
+            .unwrap();
+        for id in ["e1", "e2"] {
+            store
+                .create(draft(id, &["task"], vec![("title", s(id))]), &ctx())
+                .await
+                .unwrap();
+        }
+        registry
+            .publish(schema(
+                "task",
+                &[],
+                vec![
+                    attr("title", AttributeType::String),
+                    attr("note", AttributeType::String),
+                ],
+            ))
+            .await
+            .unwrap();
+        let feed = Arc::new(RecordingFeed::new());
+        let store = store.with_change_sink(feed.clone());
+
+        let report = store
+            .migrate_schema("task", 2, 100, false, &ctx())
+            .await
+            .unwrap();
+
+        assert_eq!(report.scanned, 2);
+        assert_eq!(report.migrated, 2);
+        assert_eq!(report.unchanged, 0);
+        assert!(report.invalid.is_empty());
+        for id in ["e1", "e2"] {
+            let entity = store.get(id).await.unwrap().unwrap();
+            assert_eq!(entity.version, 2);
+            assert_eq!(
+                entity.schemas,
+                vec![SchemaRef {
+                    id: "task".to_string(),
+                    version: 2,
+                }]
+            );
+        }
+        let events = feed.events();
+        assert_eq!(events.len(), 2);
+        assert!(
+            events
+                .iter()
+                .all(|event| event.kind == EntityEventKind::SchemaApplied)
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.entity_id == "e1")
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.entity_id == "e2")
+                .count(),
+            1
+        );
+        assert!(outbox_keys(&raw).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_migration_batch_skips_one_invalid_entity_and_repins_the_valid_one() {
+        let (store, registry, raw) = new_store().await;
+        registry
+            .publish(schema(
+                "task",
+                &[],
+                vec![
+                    attr("title", AttributeType::String),
+                    attr("owner", AttributeType::String),
+                ],
+            ))
+            .await
+            .unwrap();
+        store
+            .create(
+                draft(
+                    "e1",
+                    &["task"],
+                    vec![("title", s("one")), ("owner", s("alice"))],
+                ),
+                &ctx(),
+            )
+            .await
+            .unwrap();
+        store
+            .create(draft("e2", &["task"], vec![("title", s("two"))]), &ctx())
+            .await
+            .unwrap();
+        registry
+            .publish(schema(
+                "task",
+                &[],
+                vec![
+                    attr("title", AttributeType::String),
+                    full_attr("owner", AttributeType::String, true, false, false, None),
+                ],
+            ))
+            .await
+            .unwrap();
+        let feed = Arc::new(RecordingFeed::new());
+        let store = store.with_change_sink(feed.clone());
+
+        let report = store
+            .migrate_schema("task", 2, 100, false, &ctx())
+            .await
+            .unwrap();
+
+        assert_eq!(report.scanned, 2);
+        assert_eq!(report.migrated, 1);
+        assert_eq!(report.unchanged, 0);
+        assert_eq!(report.invalid.len(), 1);
+        assert_eq!(report.invalid[0].entity_id, "e2");
+        assert_eq!(
+            report.invalid[0].issue,
+            RevalidationIssue::MissingRequired("owner".to_string())
+        );
+        let valid = store.get("e1").await.unwrap().unwrap();
+        assert_eq!(valid.version, 2);
+        assert_eq!(valid.schemas[0].version, 2);
+        let invalid = store.get("e2").await.unwrap().unwrap();
+        assert_eq!(invalid.version, 1);
+        assert_eq!(invalid.schemas[0].version, 1);
+        let events = feed.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].entity_id, "e1");
+        assert!(outbox_keys(&raw).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_migration_dry_run_writes_no_key_and_no_event() {
+        let (store, registry, raw) = new_store().await;
+        registry
+            .publish(schema(
+                "task",
+                &[],
+                vec![attr("title", AttributeType::String)],
+            ))
+            .await
+            .unwrap();
+        for id in ["e1", "e2"] {
+            store
+                .create(draft(id, &["task"], vec![("title", s(id))]), &ctx())
+                .await
+                .unwrap();
+        }
+        registry
+            .publish(schema(
+                "task",
+                &[],
+                vec![
+                    attr("title", AttributeType::String),
+                    attr("note", AttributeType::String),
+                ],
+            ))
+            .await
+            .unwrap();
+        let feed = Arc::new(RecordingFeed::new());
+        let store = store.with_change_sink(feed.clone());
+
+        let report = store
+            .migrate_schema("task", 2, 100, true, &ctx())
+            .await
+            .unwrap();
+
+        assert_eq!(report.scanned, 2);
+        assert_eq!(report.migrated, 2);
+        assert!(report.dry_run);
+        for id in ["e1", "e2"] {
+            let entity = store.get(id).await.unwrap().unwrap();
+            assert_eq!(entity.version, 1);
+            assert_eq!(entity.schemas[0].version, 1);
+        }
+        assert!(feed.events().is_empty());
+        assert!(outbox_keys(&raw).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_stale_version_leaves_every_entity_in_the_batch_unchanged() {
+        let (store, registry, _raw) = new_store().await;
+        registry
+            .publish(schema(
+                "task",
+                &[],
+                vec![attr("title", AttributeType::String)],
+            ))
+            .await
+            .unwrap();
+        for id in ["e1", "e2"] {
+            store
+                .create(draft(id, &["task"], vec![("title", s(id))]), &ctx())
+                .await
+                .unwrap();
+        }
+        let checked = store.list_by_schema("task").await.unwrap();
+        assert_eq!(checked.len(), 2);
+        registry
+            .publish(schema(
+                "task",
+                &[],
+                vec![
+                    attr("title", AttributeType::String),
+                    attr("note", AttributeType::String),
+                ],
+            ))
+            .await
+            .unwrap();
+        store
+            .update("e2", 1, patch(vec![("title", Some(s("two")))]), &ctx())
+            .await
+            .unwrap();
+        let feed = Arc::new(RecordingFeed::new());
+        let store = store.with_change_sink(feed.clone());
+
+        let result = store
+            .apply_schema_migration_batch(&checked, "task", 2, &ctx())
+            .await;
+
+        assert!(matches!(result, Err(EntityError::VersionConflict)));
+        let first = store.get("e1").await.unwrap().unwrap();
+        assert_eq!(first.version, 1);
+        assert_eq!(first.schemas[0].version, 1);
+        let second = store.get("e2").await.unwrap().unwrap();
+        assert_eq!(second.version, 2);
+        assert_eq!(second.schemas[0].version, 1);
+        assert!(feed.events().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_store_failure_leaves_every_entity_in_the_batch_unchanged() {
+        use oxkv::Hooks as _;
+
+        struct RejectMetaKey(String);
+
+        #[async_trait::async_trait]
+        impl oxkv::Validator for RejectMetaKey {
+            async fn validate(
+                &self,
+                _ctx: &dyn oxkv::StoreView,
+                key: &str,
+                _value: &[u8],
+            ) -> Result<(), oxkv::StoreError> {
+                if key == self.0 {
+                    return Err(oxkv::StoreError::Other("write rejected".to_string()));
+                }
+                Ok(())
+            }
+        }
+
+        let (store, registry, raw) = new_store().await;
+        registry
+            .publish(schema(
+                "task",
+                &[],
+                vec![attr("title", AttributeType::String)],
+            ))
+            .await
+            .unwrap();
+        for id in ["e1", "e2"] {
+            store
+                .create(draft(id, &["task"], vec![("title", s(id))]), &ctx())
+                .await
+                .unwrap();
+        }
+        registry
+            .publish(schema(
+                "task",
+                &[],
+                vec![
+                    attr("title", AttributeType::String),
+                    attr("note", AttributeType::String),
+                ],
+            ))
+            .await
+            .unwrap();
+        let feed = Arc::new(RecordingFeed::new());
+        let store = store.with_change_sink(feed.clone());
+        raw.add_validator(RejectMetaKey(meta_key("e2")));
+
+        let result = store.migrate_schema("task", 2, 100, false, &ctx()).await;
+
+        assert!(matches!(result, Err(EntityError::Store(_))));
+        for id in ["e1", "e2"] {
+            let entity = store.get(id).await.unwrap().unwrap();
+            assert_eq!(entity.version, 1);
+            assert_eq!(entity.schemas[0].version, 1);
+        }
+        assert!(feed.events().is_empty());
+        assert!(outbox_keys(&raw).await.is_empty());
     }
 }
