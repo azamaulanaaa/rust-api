@@ -13,8 +13,12 @@
 //! - `idx:schema:{schema_id}:{entity_id}` is an empty schema marker.
 //! - `idx:attr:{key}:{hash}:{entity_id}` is an empty attribute marker.
 //! - `idx:unique:{key}:{hash}:{entity_id}` is a unique value marker.
+//! - `idx:time:{key}:{encoded_ts}:{entity_id}` is an empty time marker.
+//! - `timer:fired:{entity_id}:{key}:{encoded_ts}` is a fired timer marker.
 //!
 //! The `hash` is the lowercase SHA-256 hex of the canonical tagged JSON value.
+//! The `encoded_ts` is the timestamp XORed with the sign bit, as 16 hex digits.
+//! Lexicographic key order then equals numeric time order.
 //! A schema marker exists for the pinned schema and for each inherited schema.
 //! All scans stop at the `prefix:` to `prefix;` bound.
 //!
@@ -66,6 +70,12 @@ const ATTR_INDEX_PREFIX: &str = "idx:attr:";
 
 /// Key prefix for unique index markers.
 const UNIQUE_INDEX_PREFIX: &str = "idx:unique:";
+
+/// Key prefix for time index markers.
+const TIME_INDEX_PREFIX: &str = "idx:time:";
+
+/// Key prefix for fired timer markers.
+const TIMER_MARKER_PREFIX: &str = "timer:fired:";
 
 /// Maximum size of an entity id or an attribute name, in bytes.
 const MAX_NAME_BYTES: usize = 128;
@@ -411,6 +421,7 @@ impl EntityStore {
             )?;
 
             check_unique_values(&tx, &after, &merged.attributes).await?;
+            delete_changed_timer_markers(&tx, &before, &after, &merged).await?;
             delete_mutable_rows(&tx, &before, &merged).await?;
             put_entity_rows(&tx, &after, &merged).await?;
             if let Some((key, bytes)) = &outbox {
@@ -459,6 +470,7 @@ impl EntityStore {
             let outbox =
                 self.prepare_outbox(Some(&before), None, event_schema_ids(&effective), ctx)?;
             delete_mutable_rows(&tx, &before, &merged).await?;
+            delete_all_timer_markers(&tx, &before, &merged).await?;
             for schema_id in &merged.schema_ids {
                 tx.delete(&schema_index_key(schema_id, id))
                     .await
@@ -609,6 +621,165 @@ impl EntityStore {
         }
         entities.sort_by(|a, b| a.id.cmp(&b.id));
         Ok(entities)
+    }
+
+    /// Returns the attribute keys that have a time index row.
+    ///
+    /// The result is sorted and has no duplicates.
+    /// An attribute key contains no colon.
+    pub async fn time_keys(&self) -> Result<Vec<String>, EntityError> {
+        let g = self.store.read().await;
+        let rows = scan_prefix(&*g, TIME_INDEX_PREFIX).await?;
+        let mut keys = BTreeSet::new();
+        for row in rows {
+            let Some(rest) = row.key.strip_prefix(TIME_INDEX_PREFIX) else {
+                continue;
+            };
+            let Some((key, _)) = rest.split_once(':') else {
+                continue;
+            };
+            if !key.is_empty() {
+                keys.insert(key.to_string());
+            }
+        }
+        Ok(keys.into_iter().collect())
+    }
+
+    /// Lists the entities whose indexed timestamp `key` is due.
+    ///
+    /// The call scans only the `idx:time:{key}:` family.
+    /// The scan stops at the inclusive upper bound for `at_or_before`.
+    /// The result is in time order.
+    /// An entity appears only when its current value for `key` is a
+    /// [`AttributeValue::Timestamp`] at or before `at_or_before`.
+    /// That check drops a stale index row.
+    /// A `limit` of 0 returns an empty list.
+    pub async fn list_due(
+        &self,
+        key: &str,
+        at_or_before: i64,
+        limit: usize,
+    ) -> Result<Vec<Entity>, EntityError> {
+        validate_name("attribute name", key)?;
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let g = self.store.read().await;
+        let prefix = format!("{TIME_INDEX_PREFIX}{key}:");
+        let upper = format!("{prefix}{};", encode_timestamp(at_or_before));
+        let cursor = (Some(prefix.clone()), Some(upper));
+        let rows = g
+            .gets_bytes(None, Direction::Next, cursor)
+            .await
+            .map_err(EntityError::Store)?;
+        let mut entities = Vec::new();
+        let mut seen = BTreeSet::new();
+        for row in rows {
+            let Some(rest) = row.key.strip_prefix(&prefix) else {
+                continue;
+            };
+            let Some((encoded, id)) = rest.split_once(':') else {
+                continue;
+            };
+            if encoded.len() != 16 || id.is_empty() || !seen.insert(id.to_string()) {
+                continue;
+            }
+            let Some(entity) = load_entity(&*g, id).await? else {
+                continue;
+            };
+            if let Some(AttributeValue::Timestamp(value)) = entity.attributes.get(key)
+                && *value <= at_or_before
+            {
+                entities.push(entity);
+            }
+            if entities.len() >= limit {
+                break;
+            }
+        }
+        Ok(entities)
+    }
+
+    /// Emits one timer event for a due value and appends it to the feed.
+    ///
+    /// The event has kind [`EntityEventKind::Timer`].
+    /// It has an empty `changed` list and a snapshot of the current entity.
+    /// The event id is stable for one entity, key, and due value.
+    /// The call appends through the change feed and writes no outbox row.
+    pub async fn emit_timer(
+        &self,
+        entity: &Entity,
+        key: &str,
+        due_at: i64,
+        now: i64,
+    ) -> Result<EntityEvent, EntityError> {
+        let Some(feed) = &self.feed else {
+            return Err(EntityError::Feed(
+                "timer event needs a change feed".to_string(),
+            ));
+        };
+        validate_name("attribute name", key)?;
+        let effective = self.resolve_refs(&entity.schemas).await?;
+        let event_id = format!("timer-{}-{key}-{}", entity.id, encode_timestamp(due_at));
+        let snapshot = Some(
+            entity
+                .attributes
+                .iter()
+                .map(|(name, value)| (name.clone(), value.as_json()))
+                .collect(),
+        );
+        let event = EntityEvent {
+            event_id: event_id.clone(),
+            entity_id: entity.id.clone(),
+            entity_version: entity.version,
+            kind: EntityEventKind::Timer,
+            schemas: event_schema_ids(&effective),
+            changed: Vec::new(),
+            actor: "system:timer".to_string(),
+            causation_id: None,
+            causation_depth: 0,
+            correlation_id: event_id,
+            snapshot,
+            occurred_at: now,
+        };
+        feed.append(WalOp::Entity {
+            event: event.clone(),
+        })
+        .await
+        .map_err(|_| EntityError::Feed("timer feed append failed".to_string()))?;
+        Ok(event)
+    }
+
+    /// True when a timer marker exists for one entity, key, and due value.
+    pub async fn is_timer_fired(
+        &self,
+        entity_id: &str,
+        key: &str,
+        due_at: i64,
+    ) -> Result<bool, EntityError> {
+        let g = self.store.read().await;
+        Ok(g.get_bytes(&timer_marker_key(entity_id, key, due_at))
+            .await
+            .map_err(EntityError::Store)?
+            .is_some())
+    }
+
+    /// Writes a timer marker for one entity, key, and due value.
+    ///
+    /// The value is the current Unix time as JSON.
+    /// The call is idempotent.
+    pub async fn mark_timer_fired(
+        &self,
+        entity_id: &str,
+        key: &str,
+        due_at: i64,
+    ) -> Result<(), EntityError> {
+        let now = chrono::Utc::now().timestamp();
+        let bytes = serde_json::to_vec(&now).map_err(|e| EntityError::Internal(e.to_string()))?;
+        let g = self.store.write().await;
+        g.set_bytes(&timer_marker_key(entity_id, key, due_at), &bytes)
+            .await
+            .map(|_| ())
+            .map_err(EntityError::Store)
     }
 
     /// Lists every entity, sorted by id.
@@ -1081,6 +1252,14 @@ where
                 .await
                 .map_err(EntityError::Store)?;
         }
+        if is_time_attribute(def)
+            && let AttributeValue::Timestamp(timestamp) = value
+        {
+            store
+                .set_bytes(&time_index_key(key, *timestamp, &entity.id), b"")
+                .await
+                .map_err(EntityError::Store)?;
+        }
         if def.unique {
             store
                 .set_bytes(
@@ -1127,8 +1306,72 @@ where
                 .await
                 .map_err(EntityError::Store)?;
         }
+        if is_time_attribute(def)
+            && let AttributeValue::Timestamp(timestamp) = value
+        {
+            store
+                .delete(&time_index_key(key, *timestamp, &entity.id))
+                .await
+                .map_err(EntityError::Store)?;
+        }
         if def.unique {
             delete_unique_if_owned(store, key, value, &entity.id).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Deletes the timer markers of timestamp values that changed.
+///
+/// A removed attribute also counts as a change.
+/// The marker of an unchanged value stays, so the value fires one time only.
+async fn delete_changed_timer_markers<S>(
+    store: &S,
+    before: &Entity,
+    after: &Entity,
+    merged: &MergedSchema,
+) -> Result<(), EntityError>
+where
+    S: GetSet + ?Sized,
+{
+    for (key, value) in &before.attributes {
+        let Some(def) = merged.attributes.get(key) else {
+            continue;
+        };
+        if !is_time_attribute(def) || after.attributes.get(key) == Some(value) {
+            continue;
+        }
+        if let AttributeValue::Timestamp(timestamp) = value {
+            store
+                .delete(&timer_marker_key(&before.id, key, *timestamp))
+                .await
+                .map_err(EntityError::Store)?;
+        }
+    }
+    Ok(())
+}
+
+/// Deletes every timer marker of one entity.
+async fn delete_all_timer_markers<S>(
+    store: &S,
+    entity: &Entity,
+    merged: &MergedSchema,
+) -> Result<(), EntityError>
+where
+    S: GetSet + ?Sized,
+{
+    for (key, value) in &entity.attributes {
+        let Some(def) = merged.attributes.get(key) else {
+            continue;
+        };
+        if !is_time_attribute(def) {
+            continue;
+        }
+        if let AttributeValue::Timestamp(timestamp) = value {
+            store
+                .delete(&timer_marker_key(&entity.id, key, *timestamp))
+                .await
+                .map_err(EntityError::Store)?;
         }
     }
     Ok(())
@@ -1263,6 +1506,35 @@ fn unique_prefix(key: &str, hash: &str) -> String {
     format!("{UNIQUE_INDEX_PREFIX}{key}:{hash}:")
 }
 
+/// The marker key for one indexed timestamp value.
+fn time_index_key(key: &str, timestamp: i64, entity_id: &str) -> String {
+    format!(
+        "{TIME_INDEX_PREFIX}{key}:{}:{entity_id}",
+        encode_timestamp(timestamp)
+    )
+}
+
+/// The marker key for one fired timer value.
+fn timer_marker_key(entity_id: &str, key: &str, timestamp: i64) -> String {
+    format!(
+        "{TIMER_MARKER_PREFIX}{entity_id}:{key}:{}",
+        encode_timestamp(timestamp)
+    )
+}
+
+/// Encodes a timestamp so that key order equals numeric time order.
+///
+/// The call XORs the `i64` bits with the sign bit.
+/// The result is 16 lowercase hex digits.
+fn encode_timestamp(value: i64) -> String {
+    format!("{:016x}", (value as u64) ^ 0x8000_0000_0000_0000)
+}
+
+/// True when an attribute is an indexed timestamp.
+fn is_time_attribute(def: &AttributeDef) -> bool {
+    def.ty == AttributeType::Timestamp && def.indexed
+}
+
 /// Returns the lowercase SHA-256 hex of the canonical tagged JSON value.
 fn value_hash(value: &AttributeValue) -> Result<String, EntityError> {
     let bytes = serde_json::to_vec(value).map_err(|e| EntityError::Internal(e.to_string()))?;
@@ -1393,6 +1665,10 @@ mod tests {
 
     fn i(value: i64) -> AttributeValue {
         AttributeValue::Integer(value)
+    }
+
+    fn t(value: i64) -> AttributeValue {
+        AttributeValue::Timestamp(value)
     }
 
     fn ctx() -> WriteContext {
@@ -2666,5 +2942,330 @@ mod tests {
             .collect();
         assert_eq!(delivered, expected);
         assert!(outbox_keys(&raw).await.is_empty());
+    }
+
+    /// An indexed timestamp writes one time row with the biased encoding.
+    #[tokio::test]
+    async fn an_indexed_timestamp_writes_a_time_index_row() {
+        let (store, registry, raw) = new_store().await;
+        registry
+            .publish(schema(
+                "task",
+                &[],
+                vec![full_attr(
+                    "due",
+                    AttributeType::Timestamp,
+                    false,
+                    true,
+                    false,
+                    None,
+                )],
+            ))
+            .await
+            .unwrap();
+        store
+            .create(draft("e1", &["task"], vec![("due", t(100))]), &ctx())
+            .await
+            .unwrap();
+
+        let keys = all_keys(&raw).await;
+        assert!(keys.contains(&time_index_key("due", 100, "e1")));
+        assert!(keys.contains(&"idx:time:due:8000000000000064:e1".to_string()));
+    }
+
+    /// A non-indexed timestamp and a non-timestamp attribute write no time row.
+    #[tokio::test]
+    async fn only_an_indexed_timestamp_writes_a_time_row() {
+        let (store, registry, raw) = new_store().await;
+        registry
+            .publish(schema(
+                "task",
+                &[],
+                vec![
+                    full_attr("due", AttributeType::Timestamp, false, false, false, None),
+                    full_attr("tag", AttributeType::String, false, true, false, None),
+                ],
+            ))
+            .await
+            .unwrap();
+        store
+            .create(
+                draft("e1", &["task"], vec![("due", t(100)), ("tag", s("alpha"))]),
+                &ctx(),
+            )
+            .await
+            .unwrap();
+
+        let keys = all_keys(&raw).await;
+        assert!(
+            keys.iter().all(|key| !key.starts_with(TIME_INDEX_PREFIX)),
+            "a time row exists for an attribute that is not an indexed timestamp"
+        );
+    }
+
+    #[tokio::test]
+    async fn time_keys_returns_the_unique_sorted_keys() {
+        let (store, registry, _raw) = new_store().await;
+        registry
+            .publish(schema(
+                "task",
+                &[],
+                vec![
+                    full_attr("start", AttributeType::Timestamp, false, true, false, None),
+                    full_attr("due", AttributeType::Timestamp, false, true, false, None),
+                ],
+            ))
+            .await
+            .unwrap();
+        store
+            .create(
+                draft("e1", &["task"], vec![("due", t(100)), ("start", t(50))]),
+                &ctx(),
+            )
+            .await
+            .unwrap();
+        store
+            .create(
+                draft("e2", &["task"], vec![("due", t(200)), ("start", t(60))]),
+                &ctx(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.time_keys().await.unwrap(),
+            vec!["due".to_string(), "start".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn list_due_returns_due_entities_in_time_order_with_a_limit() {
+        let (store, registry, raw) = new_store().await;
+        registry
+            .publish(schema(
+                "task",
+                &[],
+                vec![full_attr(
+                    "due",
+                    AttributeType::Timestamp,
+                    false,
+                    true,
+                    false,
+                    None,
+                )],
+            ))
+            .await
+            .unwrap();
+        for (id, due) in [("e1", 50), ("e2", 10), ("e3", 100)] {
+            store
+                .create(draft(id, &["task"], vec![("due", t(due))]), &ctx())
+                .await
+                .unwrap();
+        }
+
+        let due = store.list_due("due", 60, 100).await.unwrap();
+        let ids: Vec<&str> = due.iter().map(|entity| entity.id.as_str()).collect();
+        assert_eq!(ids, vec!["e2", "e1"]);
+
+        let limited = store.list_due("due", 60, 1).await.unwrap();
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited[0].id, "e2");
+
+        assert!(store.list_due("due", 60, 0).await.unwrap().is_empty());
+
+        // A stale row below the bound must not return the entity when the
+        // current value is above the bound.
+        raw.set_bytes(&time_index_key("due", 10, "e1"), b"")
+            .await
+            .unwrap();
+        let stale = store.list_due("due", 20, 100).await.unwrap();
+        assert!(stale.iter().all(|entity| entity.id != "e1"));
+    }
+
+    #[tokio::test]
+    async fn update_moves_the_time_row_and_delete_removes_it() {
+        let (store, registry, raw) = new_store().await;
+        registry
+            .publish(schema(
+                "task",
+                &[],
+                vec![full_attr(
+                    "due",
+                    AttributeType::Timestamp,
+                    false,
+                    true,
+                    false,
+                    None,
+                )],
+            ))
+            .await
+            .unwrap();
+        store
+            .create(draft("e1", &["task"], vec![("due", t(100))]), &ctx())
+            .await
+            .unwrap();
+
+        store
+            .update("e1", 1, patch(vec![("due", Some(t(200)))]), &ctx())
+            .await
+            .unwrap();
+        let keys = all_keys(&raw).await;
+        assert!(!keys.contains(&time_index_key("due", 100, "e1")));
+        assert!(keys.contains(&time_index_key("due", 200, "e1")));
+
+        store.delete("e1", 2, &ctx()).await.unwrap();
+        let keys = all_keys(&raw).await;
+        assert!(
+            keys.iter().all(|key| !key.starts_with(TIME_INDEX_PREFIX)),
+            "a delete left a time row behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn emit_timer_appends_one_timer_event_with_a_stable_id() {
+        let (store, registry, raw) = new_store().await;
+        registry
+            .publish(schema(
+                "task",
+                &[],
+                vec![full_attr(
+                    "due",
+                    AttributeType::Timestamp,
+                    false,
+                    true,
+                    false,
+                    None,
+                )],
+            ))
+            .await
+            .unwrap();
+        let feed = Arc::new(RecordingFeed::new());
+        let store = store.with_change_sink(feed.clone());
+        let entity = store
+            .create(draft("e1", &["task"], vec![("due", t(100))]), &ctx())
+            .await
+            .unwrap()
+            .after
+            .unwrap();
+
+        let event = store.emit_timer(&entity, "due", 100, 1_234).await.unwrap();
+
+        assert_eq!(event.kind, EntityEventKind::Timer);
+        assert_eq!(event.entity_id, "e1");
+        assert_eq!(event.entity_version, 1);
+        assert_eq!(event.schemas, vec!["task".to_string()]);
+        assert!(event.changed.is_empty());
+        assert_eq!(
+            event.snapshot.as_ref().unwrap()["due"],
+            serde_json::json!(100)
+        );
+        assert_eq!(event.actor, "system:timer");
+        assert_eq!(event.causation_id, None);
+        assert_eq!(event.causation_depth, 0);
+        assert_eq!(event.occurred_at, 1_234);
+        assert_eq!(event.event_id, "timer-e1-due-8000000000000064");
+        assert_eq!(event.correlation_id, event.event_id);
+        assert!(!event.event_id.contains(':'));
+
+        let events = feed.events();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1], event);
+        assert!(outbox_keys(&raw).await.is_empty());
+
+        let again = store.emit_timer(&entity, "due", 100, 1_234).await.unwrap();
+        assert_eq!(again.event_id, event.event_id);
+    }
+
+    #[tokio::test]
+    async fn emit_timer_needs_a_change_feed() {
+        let (store, registry, _raw) = new_store().await;
+        registry
+            .publish(schema(
+                "task",
+                &[],
+                vec![full_attr(
+                    "due",
+                    AttributeType::Timestamp,
+                    false,
+                    true,
+                    false,
+                    None,
+                )],
+            ))
+            .await
+            .unwrap();
+        let entity = store
+            .create(draft("e1", &["task"], vec![("due", t(100))]), &ctx())
+            .await
+            .unwrap()
+            .after
+            .unwrap();
+
+        let result = store.emit_timer(&entity, "due", 100, 1_234).await;
+
+        assert!(matches!(result, Err(EntityError::Feed(_))));
+    }
+
+    #[tokio::test]
+    async fn a_timer_marker_is_idempotent() {
+        let (store, _registry, raw) = new_store().await;
+
+        assert!(!store.is_timer_fired("e1", "due", 100).await.unwrap());
+        store.mark_timer_fired("e1", "due", 100).await.unwrap();
+        assert!(store.is_timer_fired("e1", "due", 100).await.unwrap());
+        store.mark_timer_fired("e1", "due", 100).await.unwrap();
+        assert!(store.is_timer_fired("e1", "due", 100).await.unwrap());
+
+        let bytes = raw
+            .get_bytes(&timer_marker_key("e1", "due", 100))
+            .await
+            .unwrap()
+            .unwrap();
+        let fired_at: i64 = serde_json::from_slice(&bytes).unwrap();
+        assert!(fired_at > 0);
+    }
+
+    #[tokio::test]
+    async fn update_and_delete_remove_timer_markers() {
+        let (store, registry, _raw) = new_store().await;
+        registry
+            .publish(schema(
+                "task",
+                &[],
+                vec![
+                    full_attr("due", AttributeType::Timestamp, false, true, false, None),
+                    attr("title", AttributeType::String),
+                ],
+            ))
+            .await
+            .unwrap();
+        store
+            .create(
+                draft("e1", &["task"], vec![("due", t(100)), ("title", s("one"))]),
+                &ctx(),
+            )
+            .await
+            .unwrap();
+        store.mark_timer_fired("e1", "due", 100).await.unwrap();
+
+        // An update that keeps the value keeps the marker.
+        store
+            .update("e1", 1, patch(vec![("title", Some(s("two")))]), &ctx())
+            .await
+            .unwrap();
+        assert!(store.is_timer_fired("e1", "due", 100).await.unwrap());
+
+        // An update that changes the value removes the old marker.
+        store
+            .update("e1", 2, patch(vec![("due", Some(t(200)))]), &ctx())
+            .await
+            .unwrap();
+        assert!(!store.is_timer_fired("e1", "due", 100).await.unwrap());
+        store.mark_timer_fired("e1", "due", 200).await.unwrap();
+        assert!(store.is_timer_fired("e1", "due", 200).await.unwrap());
+
+        // A delete removes every marker of the entity.
+        store.delete("e1", 3, &ctx()).await.unwrap();
+        assert!(!store.is_timer_fired("e1", "due", 200).await.unwrap());
     }
 }
