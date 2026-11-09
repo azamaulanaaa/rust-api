@@ -760,11 +760,9 @@ async fn upsert_rule(
 ) -> Result<HttpResponse, EavApiError> {
     require_management(&policy, &claims.sub, RULES, Action::Write).await?;
     let draft = body.into_inner();
-    if !runtime.engine().has_action(&draft.action.kind) {
-        return Err(EavApiError::from(RuleError::UnknownAction(
-            draft.action.kind,
-        )));
-    }
+    runtime
+        .engine()
+        .validate_action(&draft.action.kind, &draft.action.params)?;
     let rule = runtime.rules().upsert(draft).await?;
     Ok(HttpResponse::Created().json(rule))
 }
@@ -863,6 +861,7 @@ mod tests {
     use crate::http::middleware::jwks::test_support::{rsa_key, sign_rs256, spawn_jwks};
     use crate::policy::PolicyEngine;
     use crate::rules::action::{ActionContext, RuleAction};
+    use crate::rules::webhook::WebhookAction;
     use crate::sync::wal::Wal;
 
     const KID: &str = "eav-route-test-kid";
@@ -955,7 +954,16 @@ mod tests {
         };
         let prefix = test_prefix("eav-route");
         let wal = Wal::new(build_s3_store(&s3, &format!("{prefix}/wal")).await?);
-        let runtime = EavRuntime::build(&s3, &prefix, wal, vec![Arc::new(NoopAction)]).await?;
+        let runtime = EavRuntime::build(
+            &s3,
+            &prefix,
+            wal,
+            vec![
+                Arc::new(NoopAction),
+                Arc::new(WebhookAction::new(vec![server.address().to_string()])),
+            ],
+        )
+        .await?;
         let engine =
             PolicyEngine::init_s3(build_test_store(&test_prefix("eav-route-policy")).await).await?;
         Ok(Fixture {
@@ -1010,6 +1018,12 @@ mod tests {
 
     fn rule_body() -> Value {
         rule_body_with_action("record")
+    }
+
+    fn rule_body_with_params(kind: &str, params: Value) -> Value {
+        let mut body = rule_body_with_action(kind);
+        body["action"]["params"] = params;
+        body
     }
 
     async fn publish_task_schema(fx: &Fixture) -> anyhow::Result<()> {
@@ -1549,6 +1563,51 @@ mod tests {
                 actix_test::TestRequest::post()
                     .uri("/eav/rules")
                     .set_json(rule_body()),
+                &token,
+            )
+            .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::CREATED);
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn webhook_rule_checks_the_allowlist() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        assert!(fx.engine.claim_superadmin("alice").await?);
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::post()
+                    .uri("/eav/rules")
+                    .set_json(rule_body_with_params(
+                        "webhook",
+                        json!({"url": "https://example.com/hook"}),
+                    )),
+                &token,
+            )
+            .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::BAD_REQUEST);
+        let body: crate::http::error::ErrorBody = actix_test::read_body_json(res).await;
+        assert_eq!(body.code.as_deref(), Some("invalid_request"));
+        assert!(!body.error.contains("example.com"), "{}", body.error);
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::post()
+                    .uri("/eav/rules")
+                    .set_json(rule_body_with_params(
+                        "webhook",
+                        json!({"url": format!("{}/hook", fx.server.uri())}),
+                    )),
                 &token,
             )
             .to_request(),
