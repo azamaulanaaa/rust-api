@@ -9,6 +9,9 @@
 //! It carries an `ETag`, so a repeat poll can return `304`.
 //! `GET /eav/sync/events` returns the entity events after a cursor.
 //! Each event carries its snapshot, so the client needs no extra read.
+//! `GET /eav/sync/snapshot` returns one page of entity state for the first
+//! load of an offline client.
+//! The client then reads the events feed for each change.
 //!
 //! The events route checks one collection grant.
 //! Without the collection grant, it checks a row grant for each event.
@@ -21,7 +24,10 @@ use actix_web::{
 };
 use serde::Serialize;
 
-use crate::eav::route::{ENTITIES, ENTITY_ROW, EavApiError};
+use crate::eav::entity::Entity;
+use crate::eav::route::{
+    ENTITIES, ENTITY_ROW, EavApiError, PageQuery, can_read_entity, page_next_offset,
+};
 use crate::eav::runtime::EavRuntime;
 use crate::fs::error::FsError;
 use crate::http::middleware::jwt::{Claims, Validated};
@@ -61,6 +67,26 @@ pub struct SyncEventsResponse {
     /// Otherwise it is the current head.
     pub next: u64,
     /// The head of the change log at the time of the call.
+    pub head: u64,
+}
+
+/// One page of entity state for the first load of an offline client.
+///
+/// The route filters the raw page with the grants of the caller.
+/// A filtered page can then hold fewer items than the limit.
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
+pub struct SnapshotPage {
+    /// The entities on this page that the caller can read.
+    pub items: Vec<Entity>,
+    /// `Some` means the raw page was full and a following page may exist.
+    ///
+    /// The value comes from the raw page length, not from `items`.
+    /// A filtered page can then hold fewer items than the limit.
+    /// Fetch the next page and stop when the page is empty.
+    pub next_offset: Option<usize>,
+    /// The head of the change log at the time of the call.
+    ///
+    /// The client passes this value as `since` to the events feed.
     pub head: u64,
 }
 
@@ -241,6 +267,57 @@ pub(crate) async fn events(
     Ok(HttpResponse::Ok().json(SyncEventsResponse { events, next, head }))
 }
 
+/// Returns one page of entity state.
+///
+/// The caller needs a valid session.
+/// The route needs no collection Casbin permission.
+/// A collection read exposes every entity.
+/// A row grant exposes only that entity.
+/// The route reads a raw page and filters each row.
+/// `next_offset` comes from the raw page length.
+/// A filtered page can then hold fewer items than the limit.
+/// A matching `If-None-Match` returns `304` with no body.
+#[utoipa::path(get, path = "/eav/sync/snapshot", tag = "eav", params(PageQuery), responses((status = 200, body = SnapshotPage), (status = 304, description = "not modified"), (status = 400, body = crate::http::error::ErrorBody), (status = 401, body = crate::http::error::ErrorBody), (status = 500, body = crate::http::error::ErrorBody)))]
+#[get("/sync/snapshot")]
+pub(crate) async fn snapshot(
+    runtime: web::Data<EavRuntime>,
+    policy: web::Data<Authorizer>,
+    claims: Validated<Claims>,
+    query: web::Query<PageQuery>,
+    req: HttpRequest,
+) -> Result<HttpResponse, EavApiError> {
+    let (limit, offset) = query.into_inner().resolve()?;
+    let head = runtime.wal().head().await.map_err(internal)?;
+    let etag = status_etag(head);
+    if let Some(header) = req
+        .headers()
+        .get(IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        && etag_matches(header, &etag)
+    {
+        return Ok(HttpResponse::NotModified()
+            .insert_header((ETAG, etag))
+            .finish());
+    }
+
+    let raw = runtime.entities().list_page(limit, offset).await?;
+    let raw_len = raw.len();
+    let mut items = Vec::with_capacity(raw_len);
+    for entity in raw {
+        if can_read_entity(&policy, &claims.sub, &entity.id).await? {
+            items.push(entity);
+        }
+    }
+    let next_offset = page_next_offset(offset, raw_len, limit);
+    Ok(HttpResponse::Ok()
+        .insert_header((ETAG, etag))
+        .json(SnapshotPage {
+            items,
+            next_offset,
+            head,
+        }))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -396,6 +473,33 @@ mod tests {
                 obj: "entity:e1".to_string(),
                 act: "read".to_string(),
             })
+            .await?;
+        Ok(())
+    }
+
+    async fn publish_task_schema(fx: &Fixture) -> anyhow::Result<()> {
+        fx.runtime
+            .schemas()
+            .publish(SchemaDraft {
+                id: "task".to_string(),
+                extends: Vec::new(),
+                attributes: Default::default(),
+            })
+            .await?;
+        Ok(())
+    }
+
+    async fn create_entity(fx: &Fixture, id: &str) -> anyhow::Result<()> {
+        fx.runtime
+            .entities()
+            .create(
+                EntityDraft {
+                    id: id.to_string(),
+                    schemas: vec!["task".to_string()],
+                    attributes: Default::default(),
+                },
+                &crate::eav::entity::WriteContext::new("alice"),
+            )
             .await?;
         Ok(())
     }
@@ -624,7 +728,7 @@ mod tests {
         let module = fx.module().await?;
         let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
 
-        for uri in ["/eav/sync/status", "/eav/sync/events"] {
+        for uri in ["/eav/sync/status", "/eav/sync/events", "/eav/sync/snapshot"] {
             let res = actix_test::call_service(
                 &app,
                 actix_test::TestRequest::get().uri(uri).to_request(),
@@ -658,6 +762,146 @@ mod tests {
         assert_eq!(res.status(), http::StatusCode::OK);
         let body: Value = actix_test::read_body_json(res).await;
         assert_eq!(body["events"].as_array().map(Vec::len), Some(1));
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn snapshot_returns_the_page_envelope() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        publish_task_schema(&fx).await?;
+        create_entity(&fx, "e1").await?;
+        create_entity(&fx, "e2").await?;
+        grant_collection_read(&fx, "alice").await?;
+        let head = fx.runtime.wal().head().await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+
+        let res = get_route!(&app, "/eav/sync/snapshot", &fx.token("alice")?).await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let etag = res
+            .headers()
+            .get(ETAG)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert_eq!(etag, format!("\"{head}\""));
+        let body: Value = actix_test::read_body_json(res).await;
+        let items = body["items"].as_array().expect("items");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["id"], "e1");
+        assert_eq!(items[1]["id"], "e2");
+        assert!(body["next_offset"].is_null());
+        assert_eq!(body["head"], head);
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn a_second_snapshot_page_uses_the_next_offset() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        publish_task_schema(&fx).await?;
+        create_entity(&fx, "e1").await?;
+        create_entity(&fx, "e2").await?;
+        create_entity(&fx, "e3").await?;
+        grant_collection_read(&fx, "alice").await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+
+        let res = get_route!(&app, "/eav/sync/snapshot?limit=2", &token).await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let body: Value = actix_test::read_body_json(res).await;
+        let items = body["items"].as_array().expect("items");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["id"], "e1");
+        assert_eq!(items[1]["id"], "e2");
+        assert_eq!(body["next_offset"], 2);
+
+        let res = get_route!(&app, "/eav/sync/snapshot?limit=2&offset=2", &token).await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let body: Value = actix_test::read_body_json(res).await;
+        let items = body["items"].as_array().expect("items");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["id"], "e3");
+        assert!(body["next_offset"].is_null());
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn a_row_grant_user_sees_only_its_snapshot_entity() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        publish_task_schema(&fx).await?;
+        create_entity(&fx, "e1").await?;
+        create_entity(&fx, "e2").await?;
+        grant_row_read(&fx, "carol", "e1").await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+
+        let res = get_route!(&app, "/eav/sync/snapshot", &fx.token("carol")?).await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let body: Value = actix_test::read_body_json(res).await;
+        let items = body["items"].as_array().expect("items");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["id"], "e1");
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn a_user_with_no_permission_gets_an_empty_snapshot_page() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        publish_task_schema(&fx).await?;
+        create_entity(&fx, "e1").await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+
+        let res = get_route!(&app, "/eav/sync/snapshot", &fx.token("bob")?).await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let body: Value = actix_test::read_body_json(res).await;
+        assert_eq!(body["items"].as_array().map(Vec::len), Some(0));
+        assert_eq!(body["head"], 1);
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn a_matching_snapshot_if_none_match_returns_304() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        publish_task_schema(&fx).await?;
+        create_entity(&fx, "e1").await?;
+        grant_collection_read(&fx, "alice").await?;
+        let head = fx.runtime.wal().head().await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::get()
+                    .uri("/eav/sync/snapshot")
+                    .insert_header((IF_NONE_MATCH, format!("\"{head}\""))),
+                &fx.token("alice")?,
+            )
+            .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::NOT_MODIFIED);
+        let body = actix_test::read_body(res).await;
+        assert!(body.is_empty());
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn an_invalid_snapshot_limit_is_400() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        grant_collection_read(&fx, "alice").await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+
+        for uri in ["/eav/sync/snapshot?limit=0", "/eav/sync/snapshot?limit=201"] {
+            let res = get_route!(&app, uri, &token).await;
+            assert_eq!(res.status(), http::StatusCode::BAD_REQUEST, "{uri}");
+            let body: crate::http::error::ErrorBody = actix_test::read_body_json(res).await;
+            assert_eq!(body.code.as_deref(), Some("invalid_request"), "{uri}");
+        }
         Ok(())
     }
 
