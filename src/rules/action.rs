@@ -8,7 +8,7 @@
 
 use async_trait::async_trait;
 
-use crate::eav::entity::Entity;
+use crate::eav::entity::{Entity, WriteContext};
 use crate::records::EntityEvent;
 use crate::rules::rule::Rule;
 
@@ -26,6 +26,23 @@ pub struct ActionContext {
     pub entity: Option<Entity>,
     /// The action parameters from the rule.
     pub params: serde_json::Value,
+}
+
+impl ActionContext {
+    /// Returns a write context for an entity that this action writes.
+    ///
+    /// The context uses `actor` as the subject.
+    /// It carries the event id as the causation id.
+    /// It sets the causation depth to one more than the depth of the event.
+    ///
+    /// An action that writes an entity must use this context.
+    /// That is how the depth guard sees the chain.
+    pub fn child_write_context(&self, actor: impl Into<String>) -> WriteContext {
+        WriteContext::new(actor).with_causation(
+            self.event.event_id.clone(),
+            self.event.causation_depth.saturating_add(1),
+        )
+    }
 }
 
 /// One action that the rule engine can run.
