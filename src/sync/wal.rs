@@ -265,7 +265,12 @@ mod tests {
             }],
             actor: "alice".into(),
             causation_id: None,
+            causation_depth: 0,
             correlation_id: "req-1".into(),
+            snapshot: Some(std::collections::BTreeMap::from([(
+                "total".into(),
+                serde_json::json!(10),
+            )])),
             occurred_at: 1_760_000_000,
         };
         wal.append(WalOp::Entity {
