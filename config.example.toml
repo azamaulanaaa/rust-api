@@ -120,6 +120,19 @@ sample_ratio = 1.0
 # Concurrent downloads of /sync/db/{object}. 0 disables the gate. Default: 0.
 # max_concurrent_downloads = 0
 
+[eav]
+# Start the EAV background runtime. It relays the entity outbox and runs
+# matching rules. Default: false.
+# enabled = false
+
+# Pause in milliseconds between outbox flushes. Must be above 0.
+# Default: 1000.
+# outbox_interval_ms = 1000
+
+# Pause in milliseconds between rule runner polls. Must be above 0.
+# Default: 200.
+# rule_poll_interval_ms = 200
+
 # Optional — RabbitMQ connection for the job queue. Only used when the
 # binary is built with the `queue-rabbitmq` cargo feature.
 # [rabbitmq]
