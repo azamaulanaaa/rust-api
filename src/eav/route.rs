@@ -115,7 +115,8 @@ impl ApiModule for EavApiModule {
             .service(delete_rule)
             .service(set_rule_enabled)
             .service(crate::eav::sync::status)
-            .service(crate::eav::sync::events);
+            .service(crate::eav::sync::events)
+            .service(crate::eav::sync::snapshot);
         cfg.service(scope);
     }
 }
@@ -143,7 +144,7 @@ pub struct PageQuery {
 
 impl PageQuery {
     /// Resolves the page window and checks the limit.
-    fn resolve(self) -> Result<(usize, usize), EavApiError> {
+    pub(crate) fn resolve(self) -> Result<(usize, usize), EavApiError> {
         let limit = self.limit.unwrap_or(DEFAULT_PAGE_LIMIT);
         if limit == 0 || limit > MAX_PAGE_LIMIT {
             return Err(EavApiError::Invalid(Box::new(InvalidPageLimit)));
@@ -287,7 +288,7 @@ impl std::error::Error for InvalidMigrateLimit {}
 /// Returns the next offset when the page is full.
 ///
 /// The call returns `None` when the page is not full.
-fn page_next_offset(offset: usize, len: usize, limit: usize) -> Option<usize> {
+pub(crate) fn page_next_offset(offset: usize, len: usize, limit: usize) -> Option<usize> {
     (len == limit).then_some(offset.saturating_add(len))
 }
 
