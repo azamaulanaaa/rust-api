@@ -26,6 +26,7 @@ use rust_api::{
     http::{ApiService, middleware::jwt::Claims},
     oidc::{OidcClient, OidcConfig, route::OidcApiModule},
     policy::{PolicyEngine, admin, route::PolicyApiModule, setup::SetupApiModule},
+    queue::{QueueWorker, durable::DurableQueue},
     rules::builtin::{LogAction, NoopAction},
     rules::webhook::WebhookAction,
     sync::{route::SyncApiModule, snapshot::SnapshotManager, wal::Wal},
@@ -274,6 +275,8 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
     // Read the EAV settings before the code moves other config fields.
     let eav_enabled = config.eav.enabled;
     let eav_config = config.eav.runtime_config();
+    let webhook_signing_secret = config.eav.webhook_signing_secret.clone();
+    let webhook_max_attempts = config.eav.webhook_max_attempts;
 
     let telemetry = telemetry::init(
         verbose,
@@ -357,16 +360,37 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
     // built-in `noop` and `log` actions. A host application adds its own
     // actions through `EavRuntime::build`. The module and the background loops
     // share one runtime handle.
-    let (eav_api_module, eav_handle) = if eav_enabled {
+    let (eav_api_module, eav_handle, webhook_worker) = if eav_enabled {
+        // The webhook worker uses one durable queue under `{prefix}/eav-queue`.
+        let queue_store = rust_api::db::build_s3_store(
+            &s3_client_config,
+            &domain_prefix(&db_prefix, "eav-queue"),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("build EAV queue OxKvStore: {e}"))?;
+        let queue: Arc<dyn rust_api::queue::JobQueue> = Arc::new(DurableQueue::new(Arc::new(
+            tokio::sync::RwLock::new(queue_store),
+        )));
+        let signing_secret = webhook_signing_secret
+            .as_ref()
+            .map(|secret| secret.as_bytes().to_vec());
+        let webhook = WebhookAction::new(config.eav.webhook_allowed_hosts.clone()).with_queue(
+            queue.clone(),
+            signing_secret,
+            webhook_max_attempts,
+        );
+        let worker = QueueWorker::new(
+            queue,
+            vec![Arc::new(webhook.job_handler())],
+            "eav-webhook".to_string(),
+        );
+        let worker_cancel = cancel.clone();
+        let worker_handle = tokio::spawn(async move { worker.run(worker_cancel).await });
         let runtime = rust_api::eav::runtime::EavRuntime::build(
             &s3_client_config,
             &db_prefix,
             wal.clone(),
-            vec![
-                Arc::new(NoopAction),
-                Arc::new(LogAction),
-                Arc::new(WebhookAction::new(config.eav.webhook_allowed_hosts.clone())),
-            ],
+            vec![Arc::new(NoopAction), Arc::new(LogAction), Arc::new(webhook)],
         )
         .await
         .context("build the EAV runtime")?;
@@ -376,9 +400,9 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
             oidc_api_module.middleware(),
         );
         let handle = runtime.spawn(cancel.clone(), eav_config);
-        (Some(module), Some(handle))
+        (Some(module), Some(handle), Some(worker_handle))
     } else {
-        (None, None)
+        (None, None, None)
     };
 
     // Applications append their own reactive services here. The starter kit
@@ -548,6 +572,14 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
             Ok(Ok(())) => {}
             Ok(Err(error)) => tracing::error!(?error, "EAV runtime failed"),
             Err(error) => tracing::error!(?error, "EAV runtime task failed"),
+        }
+    }
+
+    // The worker observes the shared token and exits after one poll.
+    if let Some(handle) = webhook_worker {
+        match handle.await {
+            Ok(()) => {}
+            Err(error) => tracing::error!(?error, "webhook worker task failed"),
         }
     }
 
