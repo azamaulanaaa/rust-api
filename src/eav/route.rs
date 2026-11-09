@@ -542,7 +542,13 @@ async fn upsert_rule(
     body: web::Json<RuleDraft>,
 ) -> Result<HttpResponse, EavApiError> {
     require_management(&policy, &claims.sub, RULES, Action::Write).await?;
-    let rule = runtime.rules().upsert(body.into_inner()).await?;
+    let draft = body.into_inner();
+    if !runtime.engine().has_action(&draft.action.kind) {
+        return Err(EavApiError::from(RuleError::UnknownAction(
+            draft.action.kind,
+        )));
+    }
+    let rule = runtime.rules().upsert(draft).await?;
     Ok(HttpResponse::Created().json(rule))
 }
 
@@ -621,6 +627,8 @@ impl std::error::Error for MissingState {}
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use actix_web::{App, http, test as actix_test};
     use jsonwebtoken::EncodingKey;
     use serde_json::{Value, json};
@@ -634,6 +642,7 @@ mod tests {
     use crate::fs::s3::{S3Backend, S3ClientConfig};
     use crate::http::middleware::jwks::test_support::{rsa_key, sign_rs256, spawn_jwks};
     use crate::policy::PolicyEngine;
+    use crate::rules::action::{ActionContext, RuleAction};
     use crate::sync::wal::Wal;
 
     const KID: &str = "eav-route-test-kid";
@@ -653,6 +662,20 @@ mod tests {
         "/eav/rules/{id}",
         "/eav/rules/{id}/enabled",
     ];
+
+    /// A no-op action for the route tests.
+    struct NoopAction;
+
+    #[async_trait::async_trait]
+    impl RuleAction for NoopAction {
+        fn kind(&self) -> &str {
+            "record"
+        }
+
+        async fn execute(&self, _ctx: ActionContext) -> Result<(), anyhow::Error> {
+            Ok(())
+        }
+    }
 
     struct Fixture {
         server: wiremock::MockServer,
@@ -708,7 +731,7 @@ mod tests {
         };
         let prefix = test_prefix("eav-route");
         let wal = Wal::new(build_s3_store(&s3, &format!("{prefix}/wal")).await?);
-        let runtime = EavRuntime::build(&s3, &prefix, wal, Vec::new()).await?;
+        let runtime = EavRuntime::build(&s3, &prefix, wal, vec![Arc::new(NoopAction)]).await?;
         let engine =
             PolicyEngine::init_s3(build_test_store(&test_prefix("eav-route-policy")).await).await?;
         Ok(Fixture {
@@ -746,7 +769,7 @@ mod tests {
         })
     }
 
-    fn rule_body() -> Value {
+    fn rule_body_with_action(kind: &str) -> Value {
         json!({
             "id": "alpha",
             "name": "alpha",
@@ -757,8 +780,12 @@ mod tests {
                 "schemas": ["invoice"]
             },
             "condition": "Always",
-            "action": {"kind": "log", "params": {}}
+            "action": {"kind": kind, "params": {}}
         })
+    }
+
+    fn rule_body() -> Value {
+        rule_body_with_action("record")
     }
 
     #[test]
@@ -1086,6 +1113,45 @@ mod tests {
         )
         .await;
         assert_eq!(res.status(), http::StatusCode::NO_CONTENT);
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn unknown_rule_action_is_400_and_record_succeeds() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        assert!(fx.engine.claim_superadmin("alice").await?);
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::post()
+                    .uri("/eav/rules")
+                    .set_json(rule_body_with_action("ghost")),
+                &token,
+            )
+            .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::BAD_REQUEST);
+        let body: crate::http::error::ErrorBody = actix_test::read_body_json(res).await;
+        assert_eq!(body.code.as_deref(), Some("invalid_request"));
+        assert!(!body.error.contains("ghost"), "{}", body.error);
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::post()
+                    .uri("/eav/rules")
+                    .set_json(rule_body()),
+                &token,
+            )
+            .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::CREATED);
         Ok(())
     }
 
