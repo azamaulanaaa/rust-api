@@ -42,6 +42,8 @@ use utoipa::OpenApi;
         crate::eav::route::get_schema_version,
         crate::eav::route::get_effective_schema,
         crate::eav::route::list_schema_children,
+        crate::eav::route::diff_schema,
+        crate::eav::route::revalidate_schema,
         crate::eav::route::create_entity,
         crate::eav::route::list_entities,
         crate::eav::route::get_entity,
@@ -61,12 +63,18 @@ use utoipa::OpenApi;
         crate::eav::schema::AttributeDef,
         crate::eav::schema::AttributeType,
         crate::eav::schema::SchemaRef,
+        crate::eav::schema::AttributeTransition,
+        crate::eav::schema::SchemaDiff,
         crate::eav::entity::EntityDraft,
         crate::eav::entity::EntityPatch,
         crate::eav::entity::Entity,
         crate::eav::entity::AttributeValue,
+        crate::eav::entity::RevalidationIssue,
+        crate::eav::entity::InvalidEntity,
+        crate::eav::entity::RevalidationReport,
         crate::eav::route::EntityPatchRequest,
         crate::eav::route::RuleEnabledRequest,
+        crate::eav::route::RevalidateRequest,
         crate::eav::route::SchemaPage,
         crate::eav::route::EntityPage,
         crate::eav::route::RulePage,
@@ -141,6 +149,27 @@ mod tests {
         }
     }
 
+    /// The schema evolution types appear in the components.
+    #[test]
+    fn schema_evolution_types_are_in_the_spec() {
+        let spec: Value =
+            serde_json::from_str(&ApiDoc::openapi().to_json().expect("spec serializes"))
+                .expect("spec is JSON");
+        let schemas = spec["components"]["schemas"]
+            .as_object()
+            .expect("component schemas");
+        for name in [
+            "SchemaDiff",
+            "AttributeTransition",
+            "RevalidationReport",
+            "InvalidEntity",
+            "RevalidationIssue",
+            "RevalidateRequest",
+        ] {
+            assert!(schemas.contains_key(name), "spec missing {name}");
+        }
+    }
+
     /// Guards the PWA contract. Every served route that the SPA code generator
     /// uses must appear in the specification. Drift therefore breaks this
     /// test instead of the front end at run time.
@@ -186,6 +215,8 @@ mod tests {
             "/eav/schemas/{id}/versions/{version}",
             "/eav/schemas/{id}/effective/{version}",
             "/eav/schemas/{id}/children",
+            "/eav/schemas/{id}/diff",
+            "/eav/schemas/{id}/revalidate",
             "/eav/schemas/{id}/entities",
             "/eav/entities",
             "/eav/entities/{id}",
