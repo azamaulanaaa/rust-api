@@ -39,7 +39,7 @@ pub mod webhook;
 
 pub use action::{ActionContext, RuleAction};
 pub use builtin::{LogAction, NoopAction};
-pub use engine::{ExecutionOutcome, RuleEngine, RuleExecution};
+pub use engine::{ExecutionOutcome, RuleEngine, RuleExecution, RuleObserver};
 pub use error::RuleError;
 pub use rule::{ActionRef, CompareOp, Condition, Rule, RuleDraft, RuleId, RuleTrigger};
 pub use store::RuleStore;

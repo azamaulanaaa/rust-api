@@ -11,6 +11,8 @@ use opentelemetry::KeyValue;
 use opentelemetry::global;
 use opentelemetry::metrics::{Counter, Gauge, Histogram, Meter};
 
+use crate::rules::engine::{ExecutionOutcome, RuleObserver};
+
 /// The meter name for the EAV metrics.
 const METER: &str = "rust-api.eav";
 
@@ -139,6 +141,23 @@ impl Default for EavMetrics {
     }
 }
 
+impl RuleObserver for EavMetrics {
+    /// Records a rule result.
+    ///
+    /// Only [`ExecutionOutcome::Executed`] increments the executed counter.
+    /// No other outcome increments the failed counter.
+    fn on_execution(&self, outcome: ExecutionOutcome) {
+        if outcome == ExecutionOutcome::Executed {
+            self.record_rule_executed();
+        }
+    }
+
+    /// Records one failed rule action.
+    fn on_action_failure(&self) {
+        self.record_rule_failed();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -165,5 +184,19 @@ mod tests {
         let second = first.clone();
 
         second.record_rule_executed();
+    }
+
+    #[test]
+    fn the_observer_methods_run_for_each_outcome() {
+        let metrics = EavMetrics::new();
+        for outcome in [
+            ExecutionOutcome::Executed,
+            ExecutionOutcome::ConditionFalse,
+            ExecutionOutcome::AlreadyExecuted,
+            ExecutionOutcome::CausationLimit,
+        ] {
+            metrics.on_execution(outcome);
+        }
+        metrics.on_action_failure();
     }
 }

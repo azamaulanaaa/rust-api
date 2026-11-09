@@ -120,7 +120,8 @@ impl EavRuntime {
         let rules = RuleStore::new(rule_store);
         let metrics = EavMetrics::global();
         let engine = RuleEngine::new(rules.clone(), entities.clone(), actions)
-            .context("build the EAV rule engine")?;
+            .context("build the EAV rule engine")?
+            .with_observer(Arc::new(metrics.clone()));
 
         Ok(Self {
             schemas,
