@@ -33,6 +33,9 @@ pub mod entity_error;
 /// Error type for the schema registry.
 pub mod error;
 
+/// Metrics helpers for the EAV runtime.
+pub mod metrics;
+
 /// Actix routes for schemas, entities, and rules.
 pub mod route;
 
@@ -49,4 +52,5 @@ pub use entity::{
     AttributeValue, Entity, EntityChange, EntityDraft, EntityPatch, EntityStore, WriteContext,
 };
 pub use entity_error::EntityError;
+pub use metrics::EavMetrics;
 pub use runtime::{EavRuntime, EavRuntimeConfig};

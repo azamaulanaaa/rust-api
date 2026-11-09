@@ -581,6 +581,15 @@ impl EntityStore {
         Ok(delivered)
     }
 
+    /// Returns the number of pending outbox rows.
+    ///
+    /// The call scans only the `outbox:` family.
+    /// A failed scan returns the store error.
+    pub async fn outbox_count(&self) -> Result<usize, EntityError> {
+        let g = self.store.read().await;
+        Ok(scan_prefix(&*g, OUTBOX_PREFIX).await?.len())
+    }
+
     /// Flushes the outbox after a commit.
     ///
     /// A flush failure is a delivery error.
@@ -3518,6 +3527,28 @@ mod tests {
 
         assert!(outbox_keys(&raw).await.is_empty());
         assert_eq!(store.flush_outbox().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn outbox_count_reports_the_pending_rows() {
+        let (store, registry, _raw) = new_store().await;
+        registry
+            .publish(schema("person", &[], vec![]))
+            .await
+            .unwrap();
+        let feed = Arc::new(RecordingFeed::new());
+        feed.set_failing(true);
+        let store = store.with_change_sink(feed.clone());
+
+        for id in ["e1", "e2", "e3"] {
+            let result = store.create(draft(id, &["person"], vec![]), &ctx()).await;
+            assert!(matches!(result, Err(EntityError::Feed(_))));
+        }
+        assert_eq!(store.outbox_count().await.unwrap(), 3);
+
+        feed.set_failing(false);
+        assert_eq!(store.flush_outbox().await.unwrap(), 3);
+        assert_eq!(store.outbox_count().await.unwrap(), 0);
     }
 
     #[tokio::test]
