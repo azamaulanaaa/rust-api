@@ -141,6 +141,14 @@ sample_ratio = 1.0
 # Keep it longer than any replay window for WAL events. Default: 2592000.
 # execution_retention_secs = 2592000
 
+# Pause in milliseconds between due timer passes. Must be above 0.
+# Default: 1000.
+# timer_interval_ms = 1000
+
+# Largest number of due entities to read for each time index key.
+# Must be above 0. Default: 100.
+# timer_batch = 100
+
 # Optional — RabbitMQ connection for the job queue. Only used when the
 # binary is built with the `queue-rabbitmq` cargo feature.
 # [rabbitmq]

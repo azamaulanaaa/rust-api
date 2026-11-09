@@ -342,6 +342,12 @@ impl Config {
         if self.eav.execution_retention_secs == 0 {
             anyhow::bail!("eav.execution_retention_secs must be greater than 0");
         }
+        if self.eav.timer_interval_ms == 0 {
+            anyhow::bail!("eav.timer_interval_ms must be greater than 0");
+        }
+        if self.eav.timer_batch == 0 {
+            anyhow::bail!("eav.timer_batch must be greater than 0");
+        }
         #[cfg(feature = "queue-rabbitmq")]
         if let Some(url) = &self.rabbitmq.url {
             let parsed: url::Url = url
@@ -548,6 +554,12 @@ pub struct EavConfig {
     /// Retention window in seconds for execution markers.
     #[serde(default = "default_eav_execution_retention_secs")]
     pub execution_retention_secs: u64,
+    /// Pause in milliseconds between due timer passes.
+    #[serde(default = "default_eav_timer_interval_ms")]
+    pub timer_interval_ms: u64,
+    /// Largest number of due entities to read for each time index key.
+    #[serde(default = "default_eav_timer_batch")]
+    pub timer_batch: usize,
 }
 
 impl Default for EavConfig {
@@ -558,6 +570,7 @@ impl Default for EavConfig {
     /// The rule runner polls every 200 milliseconds.
     /// The marker cleanup runs every hour.
     /// Execution markers stay for 30 days.
+    /// The timer pass runs every second and reads 100 entities for each key.
     fn default() -> Self {
         Self {
             enabled: false,
@@ -565,6 +578,8 @@ impl Default for EavConfig {
             rule_poll_interval_ms: default_eav_rule_poll_interval_ms(),
             gc_interval_ms: default_eav_gc_interval_ms(),
             execution_retention_secs: default_eav_execution_retention_secs(),
+            timer_interval_ms: default_eav_timer_interval_ms(),
+            timer_batch: default_eav_timer_batch(),
         }
     }
 }
@@ -579,6 +594,8 @@ impl EavConfig {
             rule_poll_interval: Duration::from_millis(self.rule_poll_interval_ms),
             gc_interval: Duration::from_millis(self.gc_interval_ms),
             execution_retention: Duration::from_secs(self.execution_retention_secs),
+            timer_interval: Duration::from_millis(self.timer_interval_ms),
+            timer_batch: self.timer_batch,
         }
     }
 }
@@ -597,6 +614,14 @@ fn default_eav_gc_interval_ms() -> u64 {
 
 fn default_eav_execution_retention_secs() -> u64 {
     2_592_000
+}
+
+fn default_eav_timer_interval_ms() -> u64 {
+    1000
+}
+
+fn default_eav_timer_batch() -> usize {
+    100
 }
 
 /// Signing keys for the capability token, which is a file delegation JWT.
@@ -1245,6 +1270,8 @@ mod tests {
         assert_eq!(cfg.eav.rule_poll_interval_ms, 200);
         assert_eq!(cfg.eav.gc_interval_ms, 3_600_000);
         assert_eq!(cfg.eav.execution_retention_secs, 2_592_000);
+        assert_eq!(cfg.eav.timer_interval_ms, 1000);
+        assert_eq!(cfg.eav.timer_batch, 100);
         assert_eq!(cfg.eav, EavConfig::default());
     }
 
@@ -1254,7 +1281,8 @@ mod tests {
             "region = \"us-east-1\"",
             "region = \"us-east-1\"\n[eav]\nenabled = true\n\
              outbox_interval_ms = 2500\nrule_poll_interval_ms = 50\n\
-             gc_interval_ms = 9000\nexecution_retention_secs = 120",
+             gc_interval_ms = 9000\nexecution_retention_secs = 120\n\
+             timer_interval_ms = 750\ntimer_batch = 25",
         );
         let cfg = parse(&toml).expect("explicit EAV values must parse");
 
@@ -1263,11 +1291,15 @@ mod tests {
         assert_eq!(cfg.eav.rule_poll_interval_ms, 50);
         assert_eq!(cfg.eav.gc_interval_ms, 9000);
         assert_eq!(cfg.eav.execution_retention_secs, 120);
+        assert_eq!(cfg.eav.timer_interval_ms, 750);
+        assert_eq!(cfg.eav.timer_batch, 25);
         let runtime = cfg.eav.runtime_config();
         assert_eq!(runtime.outbox_interval, Duration::from_millis(2500));
         assert_eq!(runtime.rule_poll_interval, Duration::from_millis(50));
         assert_eq!(runtime.gc_interval, Duration::from_millis(9000));
         assert_eq!(runtime.execution_retention, Duration::from_secs(120));
+        assert_eq!(runtime.timer_interval, Duration::from_millis(750));
+        assert_eq!(runtime.timer_batch, 25);
     }
 
     #[test]
@@ -1313,6 +1345,29 @@ mod tests {
         assert!(
             err.contains("eav.execution_retention_secs"),
             "a zero retention must name its field, got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_zero_eav_timer_value_fails() {
+        let bad_interval = minimal_toml().replace(
+            "region = \"us-east-1\"",
+            "region = \"us-east-1\"\n[eav]\ntimer_interval_ms = 0",
+        );
+        let err = validation_error(&bad_interval);
+        assert!(
+            err.contains("eav.timer_interval_ms"),
+            "a zero timer interval must name its field, got: {err}"
+        );
+
+        let bad_batch = minimal_toml().replace(
+            "region = \"us-east-1\"",
+            "region = \"us-east-1\"\n[eav]\ntimer_batch = 0",
+        );
+        let err = validation_error(&bad_batch);
+        assert!(
+            err.contains("eav.timer_batch"),
+            "a zero timer batch must name its field, got: {err}"
         );
     }
 
