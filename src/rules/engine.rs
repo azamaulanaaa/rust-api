@@ -109,6 +109,13 @@ impl RuleEngine {
         })
     }
 
+    /// Returns true when the engine has a registered action of `kind`.
+    ///
+    /// A rule can name only a registered kind.
+    pub fn has_action(&self, kind: &str) -> bool {
+        self.actions.contains_key(kind)
+    }
+
     /// Sets the maximum causation depth.
     ///
     /// The maximum is inclusive.
@@ -892,6 +899,15 @@ mod tests {
             Err(RuleError::Wal(message)) if message.contains("ahead")
         ));
         assert_eq!(stores.rules.cursor().await.unwrap(), 5);
+    }
+
+    #[tokio::test]
+    async fn has_action_reports_the_registered_kinds() {
+        let stores = stores().await;
+        let engine = engine(&stores, vec![Arc::new(RecordingAction::new("record"))]);
+
+        assert!(engine.has_action("record"));
+        assert!(!engine.has_action("ghost"));
     }
 
     #[tokio::test]
