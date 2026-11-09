@@ -153,6 +153,14 @@ sample_ratio = 1.0
 # An empty list rejects every webhook rule. Default: empty.
 # webhook_allowed_hosts = ["example.com", "example.com:8443"]
 
+# Optional HMAC-SHA256 secret for webhook signing. It must have at least
+# 32 bytes. Default: none, which sends no signature header.
+# webhook_signing_secret = "change-me-32-bytes-or-longer"
+
+# Maximum delivery attempts for one webhook job. It must be within 1..=20.
+# Default: 5.
+# webhook_max_attempts = 5
+
 # Optional — RabbitMQ connection for the job queue. Only used when the
 # binary is built with the `queue-rabbitmq` cargo feature.
 # [rabbitmq]
