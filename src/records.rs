@@ -118,6 +118,11 @@ pub enum EntityEventKind {
     SchemaApplied,
     /// A schema was removed from the entity.
     SchemaRemoved,
+    /// A time-based timer fired for one timestamp attribute.
+    ///
+    /// The event has an empty `changed` list and a snapshot.
+    /// The runtime emits one event for each due value.
+    Timer,
 }
 
 /// One attribute that an entity event changed.
@@ -486,6 +491,7 @@ mod tests {
             EntityEventKind::Deleted,
             EntityEventKind::SchemaApplied,
             EntityEventKind::SchemaRemoved,
+            EntityEventKind::Timer,
         ] {
             let mut event = sample_entity_event();
             event.kind = kind;
