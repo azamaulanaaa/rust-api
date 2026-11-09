@@ -500,7 +500,10 @@ mod tests {
     /// that waits an hour receives a burst that matches the wait.
     #[test]
     fn refill_is_capped_at_capacity() {
-        let bucket = TokenBucket::new(2, 600_000);
+        // The low rate keeps the three calls in one refill window. A rate of
+        // 60 per minute gives one token per second. The three calls take
+        // microseconds, so no token arrives between them.
+        let bucket = TokenBucket::new(2, 60);
         assert!(bucket.take("a"));
         assert!(bucket.take("a"));
         assert!(!bucket.take("a"));
