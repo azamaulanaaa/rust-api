@@ -126,6 +126,30 @@ pub struct EffectiveSchema {
     pub attributes: BTreeMap<String, AttributeDef>,
 }
 
+/// One attribute definition before and after a schema change.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct AttributeTransition {
+    /// The definition in the source version.
+    pub from: AttributeDef,
+    /// The definition in the target version.
+    pub to: AttributeDef,
+}
+
+/// The differences between two schema versions.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct SchemaDiff {
+    /// The attributes that the target version adds, keyed by name.
+    pub added: BTreeMap<String, AttributeDef>,
+    /// The attributes that the target version removes, keyed by name.
+    pub removed: BTreeMap<String, AttributeDef>,
+    /// The attributes that differ between the versions, keyed by name.
+    pub changed: BTreeMap<String, AttributeTransition>,
+    /// False when the target version breaks a stored entity.
+    pub compatible: bool,
+    /// One stable code for each breaking change.
+    pub breaking: Vec<String>,
+}
+
 /// A registry of versioned EAV schemas on one OxKV store.
 #[derive(Clone)]
 pub struct SchemaRegistry {
@@ -318,6 +342,87 @@ impl SchemaRegistry {
             return Ok(None);
         };
         Ok(Some(flatten(&*g, &root).await?))
+    }
+
+    /// Compares two effective schema versions.
+    ///
+    /// The call returns `None` when either version does not exist.
+    /// An added required attribute without a default breaks the target.
+    /// A removed attribute, a type change, a new required flag, and a new
+    /// unique flag break the target.
+    /// A default change, an index change, and a removed required flag are
+    /// additive.
+    pub async fn diff(
+        &self,
+        id: &str,
+        from: u64,
+        to: u64,
+    ) -> Result<Option<SchemaDiff>, SchemaError> {
+        validate_name("schema id", id)?;
+        let Some(source) = self.effective(id, from).await? else {
+            return Ok(None);
+        };
+        let Some(target) = self.effective(id, to).await? else {
+            return Ok(None);
+        };
+
+        let mut added = BTreeMap::new();
+        let mut removed = BTreeMap::new();
+        let mut changed = BTreeMap::new();
+        for (name, def) in &target.attributes {
+            match source.attributes.get(name) {
+                None => {
+                    added.insert(name.clone(), def.clone());
+                }
+                Some(old) if old != def => {
+                    changed.insert(
+                        name.clone(),
+                        AttributeTransition {
+                            from: old.clone(),
+                            to: def.clone(),
+                        },
+                    );
+                }
+                Some(_) => {}
+            }
+        }
+        for (name, def) in &source.attributes {
+            if !target.attributes.contains_key(name) {
+                removed.insert(name.clone(), def.clone());
+            }
+        }
+
+        let mut breaking = Vec::new();
+        for name in removed.keys() {
+            breaking.push(format!("attribute-removed:{name}"));
+        }
+        for (name, def) in &added {
+            if def.required && def.default.is_none() {
+                breaking.push(format!("required-added:{name}"));
+            }
+        }
+        for (name, transition) in &changed {
+            if transition.from.ty != transition.to.ty {
+                breaking.push(format!("type-changed:{name}"));
+            }
+            if !transition.from.required
+                && transition.to.required
+                && transition.to.default.is_none()
+            {
+                breaking.push(format!("required-added:{name}"));
+            }
+            if !transition.from.unique && transition.to.unique {
+                breaking.push(format!("unique-added:{name}"));
+            }
+        }
+
+        Ok(Some(SchemaDiff {
+            added,
+            removed,
+            changed,
+            compatible: breaking.is_empty(),
+            breaking,
+        }))
     }
 
     /// Lists the schemas whose latest version extends `id`.
@@ -1034,5 +1139,240 @@ mod tests {
         let result: Result<SchemaDraft, _> = serde_json::from_str(json);
 
         assert!(result.is_err(), "duplicate JSON attribute names must fail");
+    }
+
+    fn full_attr(
+        name: &str,
+        ty: AttributeType,
+        required: bool,
+        indexed: bool,
+        unique: bool,
+        default: Option<serde_json::Value>,
+    ) -> AttributeDef {
+        AttributeDef {
+            name: name.to_string(),
+            ty,
+            required,
+            indexed,
+            unique,
+            default,
+        }
+    }
+
+    async fn diff_for(v1: Vec<AttributeDef>, v2: Vec<AttributeDef>) -> SchemaDiff {
+        let reg = new_registry().await;
+        reg.publish(draft("user", &[], v1)).await.unwrap();
+        reg.publish(draft("user", &[], v2)).await.unwrap();
+        reg.diff("user", 1, 2).await.unwrap().unwrap()
+    }
+
+    #[tokio::test]
+    async fn diff_of_equal_versions_is_empty_and_compatible() {
+        let diff = diff_for(
+            vec![attr("email", AttributeType::String)],
+            vec![attr("email", AttributeType::String)],
+        )
+        .await;
+
+        assert!(diff.added.is_empty());
+        assert!(diff.removed.is_empty());
+        assert!(diff.changed.is_empty());
+        assert!(diff.compatible);
+        assert!(diff.breaking.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_added_optional_attribute_is_compatible() {
+        let diff = diff_for(vec![], vec![attr("email", AttributeType::String)]).await;
+
+        assert!(diff.added.contains_key("email"));
+        assert!(diff.compatible);
+    }
+
+    #[tokio::test]
+    async fn an_added_required_attribute_without_a_default_is_breaking() {
+        let diff = diff_for(
+            vec![],
+            vec![full_attr(
+                "email",
+                AttributeType::String,
+                true,
+                false,
+                false,
+                None,
+            )],
+        )
+        .await;
+
+        assert!(!diff.compatible);
+        assert_eq!(diff.breaking, vec!["required-added:email"]);
+    }
+
+    #[tokio::test]
+    async fn an_added_required_attribute_with_a_default_is_compatible() {
+        let diff = diff_for(
+            vec![],
+            vec![full_attr(
+                "email",
+                AttributeType::String,
+                true,
+                false,
+                false,
+                Some(serde_json::json!("none")),
+            )],
+        )
+        .await;
+
+        assert!(diff.compatible);
+    }
+
+    #[tokio::test]
+    async fn a_removed_attribute_is_breaking() {
+        let diff = diff_for(vec![attr("email", AttributeType::String)], vec![]).await;
+
+        assert!(diff.removed.contains_key("email"));
+        assert!(!diff.compatible);
+        assert_eq!(diff.breaking, vec!["attribute-removed:email"]);
+    }
+
+    #[tokio::test]
+    async fn a_type_change_is_breaking() {
+        let diff = diff_for(
+            vec![attr("total", AttributeType::Integer)],
+            vec![attr("total", AttributeType::String)],
+        )
+        .await;
+
+        assert!(diff.changed.contains_key("total"));
+        assert!(!diff.compatible);
+        assert_eq!(diff.breaking, vec!["type-changed:total"]);
+    }
+
+    #[tokio::test]
+    async fn a_new_required_flag_without_a_default_is_breaking() {
+        let diff = diff_for(
+            vec![attr("expires_at", AttributeType::Timestamp)],
+            vec![full_attr(
+                "expires_at",
+                AttributeType::Timestamp,
+                true,
+                false,
+                false,
+                None,
+            )],
+        )
+        .await;
+
+        assert!(!diff.compatible);
+        assert_eq!(diff.breaking, vec!["required-added:expires_at"]);
+    }
+
+    #[tokio::test]
+    async fn a_new_required_flag_with_a_default_is_compatible() {
+        let diff = diff_for(
+            vec![attr("expires_at", AttributeType::Timestamp)],
+            vec![full_attr(
+                "expires_at",
+                AttributeType::Timestamp,
+                true,
+                false,
+                false,
+                Some(serde_json::json!(0)),
+            )],
+        )
+        .await;
+
+        assert!(diff.compatible);
+    }
+
+    #[tokio::test]
+    async fn a_new_unique_flag_is_breaking() {
+        let diff = diff_for(
+            vec![attr("email", AttributeType::String)],
+            vec![full_attr(
+                "email",
+                AttributeType::String,
+                false,
+                false,
+                true,
+                None,
+            )],
+        )
+        .await;
+
+        assert!(!diff.compatible);
+        assert_eq!(diff.breaking, vec!["unique-added:email"]);
+    }
+
+    #[tokio::test]
+    async fn a_default_change_is_compatible() {
+        let diff = diff_for(
+            vec![full_attr(
+                "status",
+                AttributeType::String,
+                false,
+                false,
+                false,
+                Some(serde_json::json!("new")),
+            )],
+            vec![full_attr(
+                "status",
+                AttributeType::String,
+                false,
+                false,
+                false,
+                Some(serde_json::json!("open")),
+            )],
+        )
+        .await;
+
+        assert!(diff.changed.contains_key("status"));
+        assert!(diff.compatible);
+    }
+
+    #[tokio::test]
+    async fn an_index_change_is_compatible() {
+        let diff = diff_for(
+            vec![attr("tag", AttributeType::String)],
+            vec![full_attr(
+                "tag",
+                AttributeType::String,
+                false,
+                true,
+                false,
+                None,
+            )],
+        )
+        .await;
+
+        assert!(diff.compatible);
+    }
+
+    #[tokio::test]
+    async fn a_removed_required_flag_is_compatible() {
+        let diff = diff_for(
+            vec![full_attr(
+                "name",
+                AttributeType::String,
+                true,
+                false,
+                false,
+                None,
+            )],
+            vec![attr("name", AttributeType::String)],
+        )
+        .await;
+
+        assert!(diff.compatible);
+    }
+
+    #[tokio::test]
+    async fn diff_returns_none_for_a_missing_version() {
+        let reg = new_registry().await;
+        reg.publish(draft("user", &[], vec![])).await.unwrap();
+
+        assert!(reg.diff("user", 1, 2).await.unwrap().is_none());
+        assert!(reg.diff("user", 0, 1).await.unwrap().is_none());
+        assert!(reg.diff("ghost", 1, 2).await.unwrap().is_none());
     }
 }
