@@ -34,9 +34,13 @@ pub mod rule;
 /// Durable rule storage and index lookup.
 pub mod store;
 
+/// The outbound webhook action.
+pub mod webhook;
+
 pub use action::{ActionContext, RuleAction};
 pub use builtin::{LogAction, NoopAction};
 pub use engine::{ExecutionOutcome, RuleEngine, RuleExecution};
 pub use error::RuleError;
 pub use rule::{ActionRef, CompareOp, Condition, Rule, RuleDraft, RuleId, RuleTrigger};
 pub use store::RuleStore;
+pub use webhook::WebhookAction;
