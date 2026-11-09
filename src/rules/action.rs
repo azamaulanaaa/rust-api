@@ -55,6 +55,14 @@ pub trait RuleAction: Send + Sync {
     /// Returns the action kind. The value must not be empty.
     fn kind(&self) -> &str;
 
+    /// Checks the action parameters before the rule is stored.
+    ///
+    /// The API calls this check before it stores a rule.
+    /// The default accepts every parameter.
+    fn validate(&self, _params: &serde_json::Value) -> Result<(), anyhow::Error> {
+        Ok(())
+    }
+
     /// Runs this action for one context.
     ///
     /// A failure stops the engine for this event.

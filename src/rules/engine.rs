@@ -116,6 +116,22 @@ impl RuleEngine {
         self.actions.contains_key(kind)
     }
 
+    /// Checks the parameters for one registered action kind.
+    ///
+    /// The API calls this check before it stores a rule.
+    /// An unknown kind returns [`RuleError::UnknownAction`].
+    /// A failed check returns [`RuleError::Invalid`] with a generic message.
+    /// The message never repeats the parameter or the URL.
+    pub fn validate_action(&self, kind: &str, params: &serde_json::Value) -> Result<(), RuleError> {
+        let action = self
+            .actions
+            .get(kind)
+            .ok_or_else(|| RuleError::UnknownAction(kind.to_string()))?;
+        action
+            .validate(params)
+            .map_err(|_| RuleError::Invalid("rule action parameters are not valid".to_string()))
+    }
+
     /// Sets the maximum causation depth.
     ///
     /// The maximum is inclusive.
@@ -321,6 +337,24 @@ mod tests {
             if self.failing.load(Ordering::SeqCst) {
                 return Err(anyhow::anyhow!("recording action failed"));
             }
+            Ok(())
+        }
+    }
+
+    /// A [`RuleAction`] test double that rejects every parameter value.
+    struct RejectingAction;
+
+    #[async_trait::async_trait]
+    impl RuleAction for RejectingAction {
+        fn kind(&self) -> &str {
+            "reject"
+        }
+
+        fn validate(&self, _params: &serde_json::Value) -> Result<(), anyhow::Error> {
+            Err(anyhow::anyhow!("the test action rejects the parameters"))
+        }
+
+        async fn execute(&self, _ctx: ActionContext) -> Result<(), anyhow::Error> {
             Ok(())
         }
     }
@@ -908,6 +942,46 @@ mod tests {
 
         assert!(engine.has_action("record"));
         assert!(!engine.has_action("ghost"));
+    }
+
+    #[tokio::test]
+    async fn validate_action_rejects_an_unknown_kind() {
+        let stores = stores().await;
+        let engine = engine(&stores, vec![Arc::new(RecordingAction::new("record"))]);
+
+        let result = engine.validate_action("ghost", &serde_json::json!({}));
+
+        assert!(matches!(
+            result,
+            Err(RuleError::UnknownAction(kind)) if kind == "ghost"
+        ));
+    }
+
+    #[tokio::test]
+    async fn validate_action_accepts_a_default_valid_action() {
+        let stores = stores().await;
+        let engine = engine(&stores, vec![Arc::new(RecordingAction::new("record"))]);
+
+        let result = engine.validate_action("record", &serde_json::json!({ "any": "value" }));
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn validate_action_rejects_a_failed_check_with_a_generic_error() {
+        let stores = stores().await;
+        let engine = engine(&stores, vec![Arc::new(RejectingAction)]);
+        let params = serde_json::json!({ "url": "https://secret.example/hook" });
+
+        let result = engine.validate_action("reject", &params);
+
+        match result {
+            Err(RuleError::Invalid(message)) => {
+                assert_eq!(message, "rule action parameters are not valid");
+                assert!(!message.contains("secret.example"));
+            }
+            other => panic!("expected a generic invalid error, got {other:?}"),
+        }
     }
 
     #[tokio::test]
