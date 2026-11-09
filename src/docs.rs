@@ -58,6 +58,7 @@ use utoipa::OpenApi;
         crate::eav::route::set_rule_enabled,
         crate::eav::sync::status,
         crate::eav::sync::events,
+        crate::eav::sync::snapshot,
     ),
     components(schemas(
         crate::eav::schema::SchemaDraft,
@@ -87,6 +88,7 @@ use utoipa::OpenApi;
         crate::eav::sync::SyncEvent,
         crate::eav::sync::SyncEventsResponse,
         crate::eav::sync::SyncEventsQuery,
+        crate::eav::sync::SnapshotPage,
         crate::rules::rule::RuleDraft,
         crate::rules::rule::Rule,
         crate::rules::rule::RuleTrigger,
@@ -197,6 +199,7 @@ mod tests {
             "SyncEvent",
             "SyncEventsResponse",
             "SyncEventsQuery",
+            "SnapshotPage",
         ] {
             assert!(schemas.contains_key(name), "spec missing {name}");
         }
@@ -258,6 +261,7 @@ mod tests {
             "/eav/rules/{id}/enabled",
             "/eav/sync/status",
             "/eav/sync/events",
+            "/eav/sync/snapshot",
         ] {
             assert!(paths.contains_key(route), "spec missing {route}");
         }

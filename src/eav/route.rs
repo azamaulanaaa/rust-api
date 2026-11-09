@@ -962,6 +962,7 @@ mod tests {
         "/eav/rules/{id}/enabled",
         "/eav/sync/status",
         "/eav/sync/events",
+        "/eav/sync/snapshot",
     ];
 
     /// A no-op action for the route tests.
