@@ -26,6 +26,7 @@ use rust_api::{
     http::{ApiService, middleware::jwt::Claims},
     oidc::{OidcClient, OidcConfig, route::OidcApiModule},
     policy::{PolicyEngine, admin, route::PolicyApiModule, setup::SetupApiModule},
+    rules::builtin::{LogAction, NoopAction},
     sync::{route::SyncApiModule, snapshot::SnapshotManager, wal::Wal},
     telemetry,
 };
@@ -351,15 +352,16 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
     // of being dropped mid-flight.
     let cancel = tokio_util::sync::CancellationToken::new();
 
-    // Start the optional EAV runtime and API module. The binary registers no
-    // actions yet. A host application adds actions through `EavRuntime::build`.
-    // The module and the background loops share one runtime handle.
+    // Start the optional EAV runtime and API module. The binary registers the
+    // built-in `noop` and `log` actions. A host application adds its own
+    // actions through `EavRuntime::build`. The module and the background loops
+    // share one runtime handle.
     let (eav_api_module, eav_handle) = if eav_enabled {
         let runtime = rust_api::eav::runtime::EavRuntime::build(
             &s3_client_config,
             &db_prefix,
             wal.clone(),
-            Vec::new(),
+            vec![Arc::new(NoopAction), Arc::new(LogAction)],
         )
         .await
         .context("build the EAV runtime")?;
