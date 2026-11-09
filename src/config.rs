@@ -351,6 +351,20 @@ impl Config {
         for host in &self.eav.webhook_allowed_hosts {
             validate_webhook_allowed_host(host)?;
         }
+        if let Some(secret) = &self.eav.webhook_signing_secret {
+            if secret.is_empty() {
+                anyhow::bail!("eav.webhook_signing_secret must not be empty");
+            }
+            if secret.len() < 32 {
+                anyhow::bail!("eav.webhook_signing_secret must be at least 32 bytes");
+            }
+        }
+        if !(1..=20).contains(&self.eav.webhook_max_attempts) {
+            anyhow::bail!(
+                "eav.webhook_max_attempts must be within 1..=20 (got {})",
+                self.eav.webhook_max_attempts
+            );
+        }
         #[cfg(feature = "queue-rabbitmq")]
         if let Some(url) = &self.rabbitmq.url {
             let parsed: url::Url = url
@@ -570,6 +584,18 @@ pub struct EavConfig {
     /// An empty list rejects every webhook rule.
     #[serde(default)]
     pub webhook_allowed_hosts: Vec<String>,
+    /// Optional HMAC-SHA256 secret for webhook signing.
+    ///
+    /// The value must have at least 32 bytes.
+    /// The default is `None`, which sends no signature header.
+    #[serde(default)]
+    pub webhook_signing_secret: Option<String>,
+    /// Maximum delivery attempts for one webhook job.
+    ///
+    /// The value must be within `1..=20`.
+    /// The default is 5.
+    #[serde(default = "default_eav_webhook_max_attempts")]
+    pub webhook_max_attempts: u32,
 }
 
 impl Default for EavConfig {
@@ -582,6 +608,8 @@ impl Default for EavConfig {
     /// Execution markers stay for 30 days.
     /// The timer pass runs every second and reads 100 entities for each key.
     /// The webhook allowlist is empty.
+    /// Webhook signing is off.
+    /// One webhook job has up to 5 attempts.
     fn default() -> Self {
         Self {
             enabled: false,
@@ -592,6 +620,8 @@ impl Default for EavConfig {
             timer_interval_ms: default_eav_timer_interval_ms(),
             timer_batch: default_eav_timer_batch(),
             webhook_allowed_hosts: Vec::new(),
+            webhook_signing_secret: None,
+            webhook_max_attempts: default_eav_webhook_max_attempts(),
         }
     }
 }
@@ -634,6 +664,10 @@ fn default_eav_timer_interval_ms() -> u64 {
 
 fn default_eav_timer_batch() -> usize {
     100
+}
+
+fn default_eav_webhook_max_attempts() -> u32 {
+    5
 }
 
 /// Checks one webhook allowlist entry.
@@ -1320,6 +1354,8 @@ mod tests {
         assert_eq!(cfg.eav.timer_interval_ms, 1000);
         assert_eq!(cfg.eav.timer_batch, 100);
         assert!(cfg.eav.webhook_allowed_hosts.is_empty());
+        assert!(cfg.eav.webhook_signing_secret.is_none());
+        assert_eq!(cfg.eav.webhook_max_attempts, 5);
         assert_eq!(cfg.eav, EavConfig::default());
     }
 
@@ -1331,7 +1367,9 @@ mod tests {
              outbox_interval_ms = 2500\nrule_poll_interval_ms = 50\n\
              gc_interval_ms = 9000\nexecution_retention_secs = 120\n\
              timer_interval_ms = 750\ntimer_batch = 25\n\
-             webhook_allowed_hosts = [\"example.com\", \"example.com:8443\"]",
+             webhook_allowed_hosts = [\"example.com\", \"example.com:8443\"]\n\
+             webhook_signing_secret = \"0123456789abcdef0123456789abcdef\"\n\
+             webhook_max_attempts = 7",
         );
         let cfg = parse(&toml).expect("explicit EAV values must parse");
 
@@ -1346,6 +1384,11 @@ mod tests {
             cfg.eav.webhook_allowed_hosts,
             vec!["example.com".to_string(), "example.com:8443".to_string()]
         );
+        assert_eq!(
+            cfg.eav.webhook_signing_secret.as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+        assert_eq!(cfg.eav.webhook_max_attempts, 7);
         let runtime = cfg.eav.runtime_config();
         assert_eq!(runtime.outbox_interval, Duration::from_millis(2500));
         assert_eq!(runtime.rule_poll_interval, Duration::from_millis(50));
@@ -1374,6 +1417,51 @@ mod tests {
                 err.contains("eav.webhook_allowed_hosts"),
                 "entry {entry:?} must name its field, got: {err}"
             );
+        }
+    }
+
+    #[test]
+    fn a_short_webhook_signing_secret_fails() {
+        for secret in ["", "short", "0123456789abcdef0123456789abcde"] {
+            let toml = minimal_toml().replace(
+                "region = \"us-east-1\"",
+                &format!("region = \"us-east-1\"\n[eav]\nwebhook_signing_secret = {secret:?}"),
+            );
+            let err = validation_error(&toml);
+            assert!(
+                err.contains("eav.webhook_signing_secret"),
+                "secret {secret:?} must name its field, got: {err}"
+            );
+        }
+
+        let ok = minimal_toml().replace(
+            "region = \"us-east-1\"",
+            "region = \"us-east-1\"\n[eav]\n\
+             webhook_signing_secret = \"0123456789abcdef0123456789abcdef\"",
+        );
+        assert!(parse(&ok).is_ok(), "a 32 byte secret must pass");
+    }
+
+    #[test]
+    fn a_webhook_max_attempts_outside_the_range_fails() {
+        for value in ["0", "21"] {
+            let toml = minimal_toml().replace(
+                "region = \"us-east-1\"",
+                &format!("region = \"us-east-1\"\n[eav]\nwebhook_max_attempts = {value}"),
+            );
+            let err = validation_error(&toml);
+            assert!(
+                err.contains("eav.webhook_max_attempts"),
+                "value {value} must name its field, got: {err}"
+            );
+        }
+
+        for value in ["1", "20"] {
+            let toml = minimal_toml().replace(
+                "region = \"us-east-1\"",
+                &format!("region = \"us-east-1\"\n[eav]\nwebhook_max_attempts = {value}"),
+            );
+            assert!(parse(&toml).is_ok(), "value {value} must pass");
         }
     }
 
