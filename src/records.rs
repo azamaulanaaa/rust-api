@@ -129,7 +129,7 @@ pub enum EntityEventKind {
 ///
 /// A missing value means that the attribute was absent. The pair states the
 /// change on its own. So a consumer does not read the entity to apply it.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
 pub struct AttributeChange {
     /// Name of the attribute.
     pub key: String,
@@ -147,7 +147,7 @@ pub struct AttributeChange {
 ///
 /// The event holds no entity storage and no rules. A later replica
 /// projection decides how to apply the event.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
 pub struct EntityEvent {
     /// Identifier of this event. The value is unique across the feed.
     pub event_id: String,

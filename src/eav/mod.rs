@@ -42,6 +42,9 @@ pub mod runtime;
 /// Versioned schema storage and inheritance.
 pub mod schema;
 
+/// Per-user entity change feed for clients.
+pub mod sync;
+
 pub use entity::{
     AttributeValue, Entity, EntityChange, EntityDraft, EntityPatch, EntityStore, WriteContext,
 };
