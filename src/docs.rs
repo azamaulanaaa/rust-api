@@ -44,6 +44,7 @@ use utoipa::OpenApi;
         crate::eav::route::list_schema_children,
         crate::eav::route::diff_schema,
         crate::eav::route::revalidate_schema,
+        crate::eav::route::migrate_schema,
         crate::eav::route::create_entity,
         crate::eav::route::list_entities,
         crate::eav::route::get_entity,
@@ -74,9 +75,11 @@ use utoipa::OpenApi;
         crate::eav::entity::RevalidationIssue,
         crate::eav::entity::InvalidEntity,
         crate::eav::entity::RevalidationReport,
+        crate::eav::entity::MigrationReport,
         crate::eav::route::EntityPatchRequest,
         crate::eav::route::RuleEnabledRequest,
         crate::eav::route::RevalidateRequest,
+        crate::eav::route::MigrateRequest,
         crate::eav::route::SchemaPage,
         crate::eav::route::EntityPage,
         crate::eav::route::RulePage,
@@ -173,6 +176,8 @@ mod tests {
             "InvalidEntity",
             "RevalidationIssue",
             "RevalidateRequest",
+            "MigrationReport",
+            "MigrateRequest",
         ] {
             assert!(schemas.contains_key(name), "spec missing {name}");
         }
@@ -244,6 +249,7 @@ mod tests {
             "/eav/schemas/{id}/children",
             "/eav/schemas/{id}/diff",
             "/eav/schemas/{id}/revalidate",
+            "/eav/schemas/{id}/migrate",
             "/eav/schemas/{id}/entities",
             "/eav/entities",
             "/eav/entities/{id}",
