@@ -8,8 +8,8 @@
 //! - `rule:idx:{event_kind}:{schema_id}:{rule_id}` is an empty marker.
 //!
 //! The event kind key is stable and lowercase.
-//! The keys are `created`, `updated`, `deleted`, `schema_applied`, and
-//! `schema_removed`.
+//! The keys are `created`, `updated`, `deleted`, `schema_applied`,
+//! `schema_removed`, and `timer`.
 //! All scans stop at the `prefix:` to `prefix;` bound.
 //!
 //! # Writes
@@ -361,6 +361,7 @@ fn event_kind_key(kind: EntityEventKind) -> &'static str {
         EntityEventKind::Deleted => "deleted",
         EntityEventKind::SchemaApplied => "schema_applied",
         EntityEventKind::SchemaRemoved => "schema_removed",
+        EntityEventKind::Timer => "timer",
     }
 }
 
@@ -589,6 +590,28 @@ mod tests {
         assert!(
             store
                 .matching(&event(EntityEventKind::Created, &["contact"], &[]))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_timer_trigger_matches_a_timer_event() {
+        let store = new_store().await;
+        let mut rule = draft("alpha");
+        rule.trigger.events = vec![EntityEventKind::Timer];
+        store.upsert(rule).await.unwrap();
+
+        let matches = store
+            .matching(&event(EntityEventKind::Timer, &["invoice"], &[]))
+            .await
+            .unwrap();
+
+        assert_eq!(matches.len(), 1);
+        assert!(
+            store
+                .matching(&event(EntityEventKind::Created, &["invoice"], &[]))
                 .await
                 .unwrap()
                 .is_empty()
