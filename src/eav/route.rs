@@ -39,11 +39,11 @@ const EAV_PREFIX: &str = "/eav";
 /// The Casbin object for schema management.
 const SCHEMAS: &str = "eav_schemas";
 /// The Casbin object for entity management.
-const ENTITIES: &str = "eav_entities";
+pub(crate) const ENTITIES: &str = "eav_entities";
 /// The Casbin object for rule management.
 const RULES: &str = "eav_rules";
 /// The row type for one entity.
-const ENTITY_ROW: &str = "entity";
+pub(crate) const ENTITY_ROW: &str = "entity";
 /// The default page size of a list route.
 const DEFAULT_PAGE_LIMIT: usize = 50;
 /// The maximum page size of a list route.
@@ -108,7 +108,9 @@ impl ApiModule for EavApiModule {
             .service(list_rules)
             .service(get_rule)
             .service(delete_rule)
-            .service(set_rule_enabled);
+            .service(set_rule_enabled)
+            .service(crate::eav::sync::status)
+            .service(crate::eav::sync::events);
         cfg.service(scope);
     }
 }
@@ -450,7 +452,11 @@ async fn require_entity(
 }
 
 /// Returns true when the caller can read one entity.
-async fn can_read_entity(policy: &Authorizer, sub: &str, id: &str) -> Result<bool, EavApiError> {
+pub(crate) async fn can_read_entity(
+    policy: &Authorizer,
+    sub: &str,
+    id: &str,
+) -> Result<bool, EavApiError> {
     if policy
         .authorize_row(sub, ENTITY_ROW, id, Action::Read)
         .await
@@ -877,6 +883,8 @@ mod tests {
         "/eav/rules",
         "/eav/rules/{id}",
         "/eav/rules/{id}/enabled",
+        "/eav/sync/status",
+        "/eav/sync/events",
     ];
 
     /// A no-op action for the route tests.
