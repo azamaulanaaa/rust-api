@@ -19,6 +19,9 @@
 /// Rule actions and the action context.
 pub mod action;
 
+/// Built-in actions for tests and dry runs.
+pub mod builtin;
+
 /// The generic rule runner.
 pub mod engine;
 
@@ -32,6 +35,7 @@ pub mod rule;
 pub mod store;
 
 pub use action::{ActionContext, RuleAction};
+pub use builtin::{LogAction, NoopAction};
 pub use engine::{ExecutionOutcome, RuleEngine, RuleExecution};
 pub use error::RuleError;
 pub use rule::{ActionRef, CompareOp, Condition, Rule, RuleDraft, RuleId, RuleTrigger};
