@@ -15,7 +15,7 @@
 //! It adds no business rules.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use tokio::task::JoinHandle;
@@ -23,6 +23,7 @@ use tokio::task::JoinHandle;
 use crate::CancelToken;
 use crate::db::build_s3_store;
 use crate::eav::entity::{AttributeValue, EntityStore};
+use crate::eav::metrics::EavMetrics;
 use crate::eav::schema::SchemaRegistry;
 use crate::fs::s3::S3ClientConfig;
 use crate::rules::action::RuleAction;
@@ -84,6 +85,8 @@ pub struct EavRuntime {
     engine: RuleEngine,
     /// The shared change feed.
     wal: Wal,
+    /// The OpenTelemetry instruments for the runtime.
+    metrics: EavMetrics,
 }
 
 impl EavRuntime {
@@ -115,6 +118,7 @@ impl EavRuntime {
         let entities =
             EntityStore::new(entity_store, schemas.clone()).with_change_sink(Arc::new(wal.clone()));
         let rules = RuleStore::new(rule_store);
+        let metrics = EavMetrics::global();
         let engine = RuleEngine::new(rules.clone(), entities.clone(), actions)
             .context("build the EAV rule engine")?;
 
@@ -124,6 +128,7 @@ impl EavRuntime {
             rules,
             engine,
             wal,
+            metrics,
         })
     }
 
@@ -152,6 +157,11 @@ impl EavRuntime {
         &self.wal
     }
 
+    /// Returns the runtime metrics.
+    pub fn metrics(&self) -> &EavMetrics {
+        &self.metrics
+    }
+
     /// Emits a timer event for each due timestamp value and returns the count.
     ///
     /// The call reads every time index key.
@@ -163,6 +173,7 @@ impl EavRuntime {
     /// The rule engine execution marker stops a duplicate action.
     pub async fn fire_due_timers(&self, now: i64, limit: usize) -> anyhow::Result<usize> {
         let mut emitted = 0;
+        let mut due_count = 0;
         for key in self
             .entities
             .time_keys()
@@ -174,6 +185,7 @@ impl EavRuntime {
                 .list_due(&key, now, limit)
                 .await
                 .context("list the due EAV entities")?;
+            due_count += due.len() as u64;
             for entity in due {
                 let Some(AttributeValue::Timestamp(due_at)) = entity.attributes.get(&key) else {
                     continue;
@@ -198,6 +210,7 @@ impl EavRuntime {
                 emitted += 1;
             }
         }
+        self.metrics.record_timer_due(due_count);
         Ok(emitted)
     }
 
@@ -277,10 +290,21 @@ impl EavRuntime {
             if cancel.is_cancelled() {
                 return Ok(());
             }
-            self.entities
-                .flush_outbox()
-                .await
-                .context("flush the EAV entity outbox")?;
+            let started = Instant::now();
+            let flushed = self.entities.flush_outbox().await;
+            let elapsed = started.elapsed();
+            match flushed {
+                Ok(count) => {
+                    self.metrics.record_outbox_flush(count as u64, elapsed);
+                    if let Ok(pending) = self.entities.outbox_count().await {
+                        self.metrics.record_outbox_pending(pending as u64);
+                    }
+                }
+                Err(error) => {
+                    self.metrics.record_outbox_failure();
+                    return Err(error).context("flush the EAV entity outbox");
+                }
+            }
         }
     }
 
@@ -337,8 +361,15 @@ impl EavRuntime {
                 return Ok(());
             }
             let now = chrono::Utc::now().timestamp();
-            if let Err(error) = self.fire_due_timers(now, batch).await {
-                tracing::warn!(?error, "EAV due timer pass failed");
+            let started = Instant::now();
+            match self.fire_due_timers(now, batch).await {
+                Ok(fired) => self
+                    .metrics
+                    .record_timer_fired(fired as u64, started.elapsed()),
+                Err(error) => {
+                    self.metrics.record_timer_failure();
+                    tracing::warn!(?error, "EAV due timer pass failed");
+                }
             }
         }
     }
