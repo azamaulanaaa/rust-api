@@ -1,9 +1,10 @@
 //! The EAV background runtime.
 //!
 //! [`EavRuntime`] builds the schema, entity, and rule stores.
-//! It then starts two loops.
+//! It then starts three loops.
 //! One loop relays the entity outbox to the change feed.
-//! The other loop runs the matching rules.
+//! One loop runs the matching rules.
+//! One loop deletes old rule execution markers.
 //!
 //! A host application builds the runtime with [`EavRuntime::build`].
 //! The call takes the actions that the rule engine dispatches.
@@ -35,6 +36,10 @@ pub struct EavRuntimeConfig {
     pub outbox_interval: Duration,
     /// The pause between rule runner polls.
     pub rule_poll_interval: Duration,
+    /// The pause between execution marker cleanups.
+    pub gc_interval: Duration,
+    /// The retention window for execution markers.
+    pub execution_retention: Duration,
 }
 
 impl Default for EavRuntimeConfig {
@@ -42,10 +47,14 @@ impl Default for EavRuntimeConfig {
     ///
     /// The outbox relay runs every second.
     /// The rule runner polls every 200 milliseconds.
+    /// The marker cleanup runs every hour.
+    /// Execution markers stay for 30 days.
     fn default() -> Self {
         Self {
             outbox_interval: Duration::from_secs(1),
             rule_poll_interval: Duration::from_millis(200),
+            gc_interval: Duration::from_secs(3_600),
+            execution_retention: Duration::from_secs(2_592_000),
         }
     }
 }
@@ -135,10 +144,13 @@ impl EavRuntime {
         &self.wal
     }
 
-    /// Runs the outbox relay and the rule runner until `cancel` fires.
+    /// Runs the outbox relay, the rule runner, and the marker cleanup until
+    /// `cancel` fires.
     ///
-    /// The call runs both loops at the same time.
-    /// The first failure stops the runtime and returns the error.
+    /// The call runs all three loops at the same time.
+    /// The first failure of the outbox relay or the rule runner stops the
+    /// runtime and returns the error.
+    /// The marker cleanup is best effort. It logs a warning and continues.
     /// The outbox relay flushes the pending entity events.
     /// The rule runner tails the shared change feed.
     /// Each loop stops when `cancel` is cancelled.
@@ -154,9 +166,15 @@ impl EavRuntime {
                 .await
                 .map_err(|error| anyhow::anyhow!("EAV rule runner failed: {error}"))
         };
+        let cleanup = self.run_execution_gc(
+            cancel.clone(),
+            config.gc_interval,
+            config.execution_retention,
+        );
         tokio::select! {
             result = relay => result,
             result = runner => result,
+            result = cleanup => result,
         }
     }
 
@@ -203,6 +221,45 @@ impl EavRuntime {
                 .await
                 .context("flush the EAV entity outbox")?;
         }
+    }
+
+    /// Deletes old execution markers until `cancel` fires.
+    ///
+    /// The call sleeps for `interval` between passes.
+    /// It deletes the markers older than `retention`.
+    /// A failed cleanup logs a warning and continues.
+    /// A zero interval becomes one second. A zero retention becomes one second.
+    async fn run_execution_gc<C: CancelToken>(
+        &self,
+        cancel: C,
+        interval: Duration,
+        retention: Duration,
+    ) -> anyhow::Result<()> {
+        let interval = nonzero_duration(interval);
+        let retention = nonzero_duration(retention);
+        let retention = i64::try_from(retention.as_secs()).unwrap_or(i64::MAX);
+        loop {
+            if cancel.is_cancelled() {
+                return Ok(());
+            }
+            tokio::time::sleep(interval).await;
+            if cancel.is_cancelled() {
+                return Ok(());
+            }
+            let older_than = chrono::Utc::now().timestamp().saturating_sub(retention);
+            if let Err(error) = self.rules.gc_executions(older_than).await {
+                tracing::warn!(?error, "EAV execution marker cleanup failed");
+            }
+        }
+    }
+}
+
+/// Returns `duration`, or one second when it is zero.
+fn nonzero_duration(duration: Duration) -> Duration {
+    if duration.is_zero() {
+        Duration::from_secs(1)
+    } else {
+        duration
     }
 }
 
@@ -330,6 +387,8 @@ mod tests {
         EavRuntimeConfig {
             outbox_interval: Duration::from_millis(2),
             rule_poll_interval: Duration::from_millis(2),
+            gc_interval: Duration::from_millis(2),
+            execution_retention: Duration::from_secs(1),
         }
     }
 
@@ -375,6 +434,37 @@ mod tests {
         let runtime = build_runtime(Vec::new()).await;
         let cancel = Arc::new(AtomicBool::new(false));
         let handle = runtime.spawn(cancel.clone(), short_config());
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        cancel.store(true, Ordering::SeqCst);
+
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[test]
+    fn nonzero_duration_replaces_zero_and_keeps_other_values() {
+        assert_eq!(nonzero_duration(Duration::ZERO), Duration::from_secs(1));
+        assert_eq!(
+            nonzero_duration(Duration::from_millis(5)),
+            Duration::from_millis(5)
+        );
+    }
+
+    #[tokio::test]
+    async fn run_stops_when_the_token_fires_with_zero_gc_settings() {
+        let runtime = build_runtime(Vec::new()).await;
+        let config = EavRuntimeConfig {
+            outbox_interval: Duration::from_millis(2),
+            rule_poll_interval: Duration::from_millis(2),
+            gc_interval: Duration::ZERO,
+            execution_retention: Duration::ZERO,
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let handle = runtime.spawn(cancel.clone(), config);
 
         tokio::time::sleep(Duration::from_millis(10)).await;
         cancel.store(true, Ordering::SeqCst);
