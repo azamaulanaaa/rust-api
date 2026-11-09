@@ -48,6 +48,10 @@ const ENTITY_ROW: &str = "entity";
 const DEFAULT_PAGE_LIMIT: usize = 50;
 /// The maximum page size of a list route.
 const MAX_PAGE_LIMIT: usize = 200;
+/// The default count of entities that a revalidation checks.
+const DEFAULT_REVALIDATE_LIMIT: usize = 100;
+/// The maximum count of entities that a revalidation checks.
+const MAX_REVALIDATE_LIMIT: usize = 500;
 
 /// The API module that exposes the `/eav` routes.
 ///
@@ -92,6 +96,8 @@ impl ApiModule for EavApiModule {
             .service(get_schema_version)
             .service(get_effective_schema)
             .service(list_schema_children)
+            .service(diff_schema)
+            .service(revalidate_schema)
             .service(create_entity)
             .service(list_entities)
             .service(get_entity)
@@ -139,6 +145,39 @@ impl PageQuery {
     }
 }
 
+/// The query of the schema diff route.
+#[derive(Debug, Clone, Copy, Deserialize, utoipa::IntoParams)]
+pub struct SchemaDiffQuery {
+    /// The source version.
+    pub from: u64,
+    /// The target version.
+    pub to: u64,
+}
+
+/// The body of the schema revalidation route.
+///
+/// The default limit is 100.
+/// The maximum limit is 500.
+#[derive(Debug, Clone, Copy, Deserialize, utoipa::ToSchema)]
+pub struct RevalidateRequest {
+    /// The target schema version.
+    pub target_version: u64,
+    /// The maximum number of entities to check. The default is 100. The maximum is 500.
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+impl RevalidateRequest {
+    /// Resolves the limit and checks its range.
+    fn resolve(self) -> Result<(u64, usize), EavApiError> {
+        let limit = self.limit.unwrap_or(DEFAULT_REVALIDATE_LIMIT);
+        if limit == 0 || limit > MAX_REVALIDATE_LIMIT {
+            return Err(EavApiError::Invalid(Box::new(InvalidRevalidateLimit)));
+        }
+        Ok((self.target_version, limit))
+    }
+}
+
 /// A page of schemas.
 #[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
 pub struct SchemaPage {
@@ -180,6 +219,18 @@ impl fmt::Display for InvalidPageLimit {
 }
 
 impl std::error::Error for InvalidPageLimit {}
+
+/// The source of a revalidation limit outside the allowed range.
+#[derive(Debug)]
+struct InvalidRevalidateLimit;
+
+impl fmt::Display for InvalidRevalidateLimit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("limit must be between 1 and 500")
+    }
+}
+
+impl std::error::Error for InvalidRevalidateLimit {}
 
 /// Returns the next offset when the page is full.
 ///
@@ -509,6 +560,47 @@ async fn list_schema_children(
     Ok(HttpResponse::Ok().json(children))
 }
 
+#[utoipa::path(get, path = "/eav/schemas/{id}/diff", tag = "eav", params(("id" = String, Path), SchemaDiffQuery), responses((status=200, body=crate::eav::schema::SchemaDiff), (status=401, body=crate::http::error::ErrorBody), (status=403, body=crate::http::error::ErrorBody), (status=404, body=crate::http::error::ErrorBody), (status=500, body=crate::http::error::ErrorBody)))]
+#[get("/schemas/{id}/diff")]
+async fn diff_schema(
+    runtime: web::Data<EavRuntime>,
+    policy: web::Data<Authorizer>,
+    claims: Validated<Claims>,
+    path: web::Path<String>,
+    query: web::Query<SchemaDiffQuery>,
+) -> Result<HttpResponse, EavApiError> {
+    require_management(&policy, &claims.sub, SCHEMAS, Action::Read).await?;
+    require_management(&policy, &claims.sub, ENTITIES, Action::Read).await?;
+    let id = path.into_inner();
+    let query = query.into_inner();
+    let diff = runtime
+        .schemas()
+        .diff(&id, query.from, query.to)
+        .await?
+        .ok_or_else(EavApiError::not_found)?;
+    Ok(HttpResponse::Ok().json(diff))
+}
+
+#[utoipa::path(post, path = "/eav/schemas/{id}/revalidate", tag = "eav", params(("id" = String, Path)), request_body = RevalidateRequest, responses((status=200, body=crate::eav::entity::RevalidationReport), (status=400, body=crate::http::error::ErrorBody), (status=401, body=crate::http::error::ErrorBody), (status=403, body=crate::http::error::ErrorBody), (status=404, body=crate::http::error::ErrorBody), (status=500, body=crate::http::error::ErrorBody)))]
+#[post("/schemas/{id}/revalidate")]
+async fn revalidate_schema(
+    runtime: web::Data<EavRuntime>,
+    policy: web::Data<Authorizer>,
+    claims: Validated<Claims>,
+    path: web::Path<String>,
+    body: web::Json<RevalidateRequest>,
+) -> Result<HttpResponse, EavApiError> {
+    require_management(&policy, &claims.sub, SCHEMAS, Action::Read).await?;
+    require_management(&policy, &claims.sub, ENTITIES, Action::Read).await?;
+    let id = path.into_inner();
+    let (target_version, limit) = body.into_inner().resolve()?;
+    let report = runtime
+        .entities()
+        .revalidation_report(&id, target_version, limit)
+        .await?;
+    Ok(HttpResponse::Ok().json(report))
+}
+
 #[utoipa::path(post, path = "/eav/entities", tag = "eav", request_body = crate::eav::entity::EntityDraft, responses((status=201, body=crate::eav::entity::Entity), (status=400, body=crate::http::error::ErrorBody), (status=401, body=crate::http::error::ErrorBody), (status=403, body=crate::http::error::ErrorBody), (status=409, body=crate::http::error::ErrorBody), (status=500, body=crate::http::error::ErrorBody)))]
 #[post("/entities")]
 async fn create_entity(
@@ -777,6 +869,8 @@ mod tests {
         "/eav/schemas/{id}/versions/{version}",
         "/eav/schemas/{id}/effective/{version}",
         "/eav/schemas/{id}/children",
+        "/eav/schemas/{id}/diff",
+        "/eav/schemas/{id}/revalidate",
         "/eav/schemas/{id}/entities",
         "/eav/entities",
         "/eav/entities/{id}",
@@ -933,6 +1027,40 @@ mod tests {
                 },
                 &WriteContext::new("alice"),
             )
+            .await?;
+        Ok(())
+    }
+
+    fn attr(name: &str, ty: AttributeType) -> AttributeDef {
+        AttributeDef {
+            name: name.to_string(),
+            ty,
+            required: false,
+            indexed: false,
+            unique: false,
+            default: None,
+        }
+    }
+
+    fn required_attr(name: &str, ty: AttributeType) -> AttributeDef {
+        AttributeDef {
+            required: true,
+            ..attr(name, ty)
+        }
+    }
+
+    async fn publish_schema_version(
+        fx: &Fixture,
+        id: &str,
+        attrs: Vec<AttributeDef>,
+    ) -> anyhow::Result<()> {
+        fx.runtime
+            .schemas()
+            .publish(SchemaDraft {
+                id: id.to_string(),
+                extends: Vec::new(),
+                attributes: attrs.into_iter().map(|a| (a.name.clone(), a)).collect(),
+            })
             .await?;
         Ok(())
     }
@@ -1581,6 +1709,212 @@ mod tests {
         )
         .await;
         assert_eq!(res.status(), http::StatusCode::NOT_FOUND);
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn schema_diff_returns_the_diff_and_compatibility_flag() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        assert!(fx.engine.claim_superadmin("alice").await?);
+        publish_schema_version(
+            &fx,
+            "invoice",
+            vec![
+                attr("total", AttributeType::Integer),
+                attr("memo", AttributeType::String),
+            ],
+        )
+        .await?;
+        publish_schema_version(
+            &fx,
+            "invoice",
+            vec![
+                attr("total", AttributeType::Integer),
+                required_attr("owner", AttributeType::String),
+            ],
+        )
+        .await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::get().uri("/eav/schemas/invoice/diff?from=1&to=2"),
+                &token,
+            )
+            .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let diff: Value = actix_test::read_body_json(res).await;
+        assert_eq!(diff["compatible"], false);
+        assert!(diff["added"].get("owner").is_some());
+        assert!(diff["removed"].get("memo").is_some());
+        let breaking: Vec<&str> = diff["breaking"]
+            .as_array()
+            .expect("breaking list")
+            .iter()
+            .map(|code| code.as_str().expect("code"))
+            .collect();
+        assert!(breaking.contains(&"attribute-removed:memo"));
+        assert!(breaking.contains(&"required-added:owner"));
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::get().uri("/eav/schemas/invoice/diff?from=1&to=1"),
+                &token,
+            )
+            .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let diff: Value = actix_test::read_body_json(res).await;
+        assert_eq!(diff["compatible"], true);
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn schema_diff_with_a_missing_version_is_404() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        assert!(fx.engine.claim_superadmin("alice").await?);
+        publish_schema_version(&fx, "invoice", vec![attr("total", AttributeType::Integer)]).await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::get().uri("/eav/schemas/invoice/diff?from=1&to=9"),
+                &token,
+            )
+            .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::NOT_FOUND);
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn revalidation_returns_the_report() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        assert!(fx.engine.claim_superadmin("alice").await?);
+        publish_schema_version(&fx, "invoice", vec![attr("total", AttributeType::Integer)]).await?;
+        fx.runtime
+            .entities()
+            .create(
+                EntityDraft {
+                    id: "e1".to_string(),
+                    schemas: vec!["invoice".to_string()],
+                    attributes: [("total".to_string(), AttributeValue::Integer(10))]
+                        .into_iter()
+                        .collect(),
+                },
+                &WriteContext::new("alice"),
+            )
+            .await?;
+        publish_schema_version(
+            &fx,
+            "invoice",
+            vec![
+                attr("total", AttributeType::Integer),
+                required_attr("owner", AttributeType::String),
+            ],
+        )
+        .await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::post()
+                    .uri("/eav/schemas/invoice/revalidate")
+                    .set_json(json!({"target_version": 2})),
+                &token,
+            )
+            .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let report: Value = actix_test::read_body_json(res).await;
+        assert_eq!(report["scanned"], 1);
+        assert_eq!(report["compatible"], 0);
+        assert_eq!(report["invalid"].as_array().map(Vec::len), Some(1));
+        assert_eq!(report["invalid"][0]["entity_id"], "e1");
+        assert_eq!(report["invalid"][0]["issue"]["kind"], "missing_required");
+        assert_eq!(report["invalid"][0]["issue"]["detail"], "owner");
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn revalidation_rejects_an_invalid_limit() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        assert!(fx.engine.claim_superadmin("alice").await?);
+        publish_schema_version(&fx, "invoice", vec![attr("total", AttributeType::Integer)]).await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+
+        for limit in [0, 501] {
+            let res = actix_test::call_service(
+                &app,
+                auth(
+                    actix_test::TestRequest::post()
+                        .uri("/eav/schemas/invoice/revalidate")
+                        .set_json(json!({"target_version": 1, "limit": limit})),
+                    &token,
+                )
+                .to_request(),
+            )
+            .await;
+            assert_eq!(res.status(), http::StatusCode::BAD_REQUEST, "limit {limit}");
+            let body: crate::http::error::ErrorBody = actix_test::read_body_json(res).await;
+            assert_eq!(
+                body.code.as_deref(),
+                Some("invalid_request"),
+                "limit {limit}"
+            );
+        }
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn schema_evolution_routes_require_read_permission() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        assert!(fx.engine.claim_superadmin("alice").await?);
+        publish_schema_version(&fx, "invoice", vec![attr("total", AttributeType::Integer)]).await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("bob")?;
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::get().uri("/eav/schemas/invoice/diff?from=1&to=1"),
+                &token,
+            )
+            .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::FORBIDDEN);
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::post()
+                    .uri("/eav/schemas/invoice/revalidate")
+                    .set_json(json!({"target_version": 1})),
+                &token,
+            )
+            .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::FORBIDDEN);
         Ok(())
     }
 }
