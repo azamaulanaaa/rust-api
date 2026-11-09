@@ -161,8 +161,27 @@ pub struct EntityEvent {
     pub actor: String,
     /// Identifier of the event that caused this change, when one exists.
     pub causation_id: Option<String>,
+    /// Number of links in the causation chain before this event.
+    ///
+    /// The value is 0 for a user-driven change.
+    /// An action that writes an entity adds 1 to the depth of its cause.
+    ///
+    /// This field is additive.
+    /// An old entry decodes with depth 0.
+    #[serde(default)]
+    pub causation_depth: u32,
     /// Identifier that groups events from one request or workflow.
     pub correlation_id: String,
+    /// Plain JSON attribute state at the event version.
+    ///
+    /// `None` means that an old event has no snapshot.
+    /// A rule condition reads this map, so the rule sees the state at the
+    /// event.
+    ///
+    /// This field is additive.
+    /// An old entry decodes with no snapshot.
+    #[serde(default)]
+    pub snapshot: Option<std::collections::BTreeMap<String, serde_json::Value>>,
     /// Time of the change, in seconds since the Unix epoch.
     pub occurred_at: i64,
 }
@@ -401,7 +420,12 @@ mod tests {
             ],
             actor: "alice".into(),
             causation_id: Some("evt-0".into()),
+            causation_depth: 2,
             correlation_id: "req-1".into(),
+            snapshot: Some(std::collections::BTreeMap::from([
+                ("note".into(), serde_json::json!("paid")),
+                ("total".into(), serde_json::json!(12)),
+            ])),
             occurred_at: 1_760_000_000,
         }
     }
@@ -424,6 +448,30 @@ mod tests {
         let wire: serde_json::Value = serde_json::from_slice(&bytes).expect("decodes");
         assert_eq!(wire["kind"], "Updated");
         assert_eq!(wire["changed"][1]["old"], serde_json::Value::Null);
+    }
+
+    /// An old entity event must decode with depth 0 and no snapshot.
+    ///
+    /// The two new fields are additive.
+    /// A durable entry from an older version has neither field.
+    #[test]
+    fn an_old_entity_event_decodes_with_the_new_defaults() {
+        let old = br#"{
+            "event_id": "evt-1",
+            "entity_id": "invoice-1",
+            "entity_version": 1,
+            "kind": "Created",
+            "schemas": ["invoice"],
+            "changed": [],
+            "actor": "alice",
+            "causation_id": null,
+            "correlation_id": "req-1",
+            "occurred_at": 1760000000
+        }"#;
+        let event: EntityEvent = serde_json::from_slice(old).expect("an old event still decodes");
+
+        assert_eq!(event.causation_depth, 0);
+        assert_eq!(event.snapshot, None);
     }
 
     /// Every entity event kind must survive the wire format.

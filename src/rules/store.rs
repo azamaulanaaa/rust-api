@@ -441,7 +441,9 @@ mod tests {
                 .collect(),
             actor: "alice".to_string(),
             causation_id: None,
+            causation_depth: 0,
             correlation_id: "req-1".to_string(),
+            snapshot: None,
             occurred_at: 2,
         }
     }
