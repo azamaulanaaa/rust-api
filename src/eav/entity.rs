@@ -585,6 +585,47 @@ impl EntityStore {
         Ok(entities)
     }
 
+    /// Lists one page of the entities that pin `schema_id` or an inherited schema.
+    ///
+    /// The result is sorted by entity id.
+    /// The call skips `offset` ids.
+    /// It then loads at most `limit` entities.
+    /// A `limit` of 0 returns an empty list.
+    pub async fn list_by_schema_page(
+        &self,
+        schema_id: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<Entity>, EntityError> {
+        validate_name("schema id", schema_id)?;
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let g = self.store.read().await;
+        let prefix = format!("{SCHEMA_INDEX_PREFIX}{schema_id}:");
+        let max = offset.saturating_add(limit);
+        let markers = scan_prefix_bounded(&*g, &prefix, max).await?;
+        let mut ids = Vec::new();
+        let mut seen = BTreeSet::new();
+        for marker in markers {
+            let Some(id) = marker.key.strip_prefix(&prefix) else {
+                continue;
+            };
+            if id.is_empty() || id.contains(':') || !seen.insert(id.to_string()) {
+                continue;
+            }
+            ids.push(id.to_string());
+        }
+        ids.sort();
+        let mut entities = Vec::with_capacity(limit.min(ids.len()));
+        for id in ids.iter().skip(offset).take(limit) {
+            if let Some(entity) = load_entity(&*g, id).await? {
+                entities.push(entity);
+            }
+        }
+        Ok(entities)
+    }
+
     /// Lists the entities with an indexed attribute equal to `value`.
     ///
     /// The call returns an error when no applied schema indexes `key`.
@@ -802,6 +843,42 @@ impl EntityStore {
             }
         }
         entities.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(entities)
+    }
+
+    /// Lists one page of every entity.
+    ///
+    /// The result is sorted by id.
+    /// The call skips `offset` ids.
+    /// It then loads at most `limit` entities.
+    /// A `limit` of 0 returns an empty list.
+    pub async fn list_page(&self, limit: usize, offset: usize) -> Result<Vec<Entity>, EntityError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let g = self.store.read().await;
+        let rows = scan_prefix(&*g, ENTITY_PREFIX).await?;
+        let mut ids = Vec::new();
+        for row in rows {
+            let Some(rest) = row.key.strip_prefix(ENTITY_PREFIX) else {
+                continue;
+            };
+            let Some(id) = rest.strip_suffix(META_SUFFIX) else {
+                continue;
+            };
+            if id.is_empty() || id.contains(':') {
+                continue;
+            }
+            ids.push(id.to_string());
+        }
+        ids.sort();
+        ids.dedup();
+        let mut entities = Vec::with_capacity(limit.min(ids.len()));
+        for id in ids.iter().skip(offset).take(limit) {
+            if let Some(entity) = load_entity(&*g, id).await? {
+                entities.push(entity);
+            }
+        }
         Ok(entities)
     }
 
@@ -1451,6 +1528,24 @@ where
     let cursor = (Some(prefix.to_string()), Some(prefix_scan_end(prefix)));
     store
         .gets_bytes(None, Direction::Next, cursor)
+        .await
+        .map_err(EntityError::Store)
+}
+
+/// Scans at most `limit` rows of a key range that ends at the `prefix:` bound.
+async fn scan_prefix_bounded<S>(
+    store: &S,
+    prefix: &str,
+    limit: usize,
+) -> Result<Vec<KeyValue>, EntityError>
+where
+    S: GetSet + ?Sized,
+{
+    debug_assert!(prefix.ends_with(':'));
+    let max = u32::try_from(limit).ok();
+    let cursor = (Some(prefix.to_string()), Some(prefix_scan_end(prefix)));
+    store
+        .gets_bytes(max, Direction::Next, cursor)
         .await
         .map_err(EntityError::Store)
 }
@@ -2188,6 +2283,134 @@ mod tests {
         let ids: Vec<&str> = entities.iter().map(|entity| entity.id.as_str()).collect();
 
         assert_eq!(ids, vec!["a", "z"]);
+    }
+
+    #[tokio::test]
+    async fn list_page_returns_the_first_page() {
+        let (store, registry, _raw) = new_store().await;
+        registry.publish(schema("task", &[], vec![])).await.unwrap();
+        for id in ["a", "b", "c", "d"] {
+            store
+                .create(draft(id, &["task"], vec![]), &ctx())
+                .await
+                .unwrap();
+        }
+
+        let page = store.list_page(2, 0).await.unwrap();
+        let ids: Vec<&str> = page.iter().map(|entity| entity.id.as_str()).collect();
+
+        assert_eq!(ids, vec!["a", "b"]);
+    }
+
+    #[tokio::test]
+    async fn list_page_returns_the_second_page() {
+        let (store, registry, _raw) = new_store().await;
+        registry.publish(schema("task", &[], vec![])).await.unwrap();
+        for id in ["a", "b", "c", "d"] {
+            store
+                .create(draft(id, &["task"], vec![]), &ctx())
+                .await
+                .unwrap();
+        }
+
+        let page = store.list_page(2, 2).await.unwrap();
+        let ids: Vec<&str> = page.iter().map(|entity| entity.id.as_str()).collect();
+
+        assert_eq!(ids, vec!["c", "d"]);
+    }
+
+    #[tokio::test]
+    async fn list_page_offset_past_the_end_is_empty() {
+        let (store, registry, _raw) = new_store().await;
+        registry.publish(schema("task", &[], vec![])).await.unwrap();
+        store
+            .create(draft("a", &["task"], vec![]), &ctx())
+            .await
+            .unwrap();
+
+        let page = store.list_page(2, 9).await.unwrap();
+
+        assert!(page.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_page_with_limit_zero_is_empty() {
+        let (store, registry, _raw) = new_store().await;
+        registry.publish(schema("task", &[], vec![])).await.unwrap();
+        store
+            .create(draft("a", &["task"], vec![]), &ctx())
+            .await
+            .unwrap();
+
+        let page = store.list_page(0, 0).await.unwrap();
+
+        assert!(page.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_page_keeps_the_id_order_across_pages() {
+        let (store, registry, _raw) = new_store().await;
+        registry.publish(schema("task", &[], vec![])).await.unwrap();
+        for id in ["a", "b", "c", "d", "e"] {
+            store
+                .create(draft(id, &["task"], vec![]), &ctx())
+                .await
+                .unwrap();
+        }
+
+        let mut paged = store.list_page(2, 0).await.unwrap();
+        paged.extend(store.list_page(2, 2).await.unwrap());
+        paged.extend(store.list_page(2, 4).await.unwrap());
+
+        assert_eq!(paged, store.list().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn list_by_schema_page_returns_sorted_pages() {
+        let (store, registry, _raw) = new_store().await;
+        registry.publish(schema("task", &[], vec![])).await.unwrap();
+        for id in ["a", "b", "c", "d"] {
+            store
+                .create(draft(id, &["task"], vec![]), &ctx())
+                .await
+                .unwrap();
+        }
+
+        let first = store.list_by_schema_page("task", 2, 0).await.unwrap();
+        let second = store.list_by_schema_page("task", 2, 2).await.unwrap();
+        let first_ids: Vec<&str> = first.iter().map(|entity| entity.id.as_str()).collect();
+        let second_ids: Vec<&str> = second.iter().map(|entity| entity.id.as_str()).collect();
+
+        assert_eq!(first_ids, vec!["a", "b"]);
+        assert_eq!(second_ids, vec!["c", "d"]);
+    }
+
+    #[tokio::test]
+    async fn list_by_schema_page_offset_past_the_end_is_empty() {
+        let (store, registry, _raw) = new_store().await;
+        registry.publish(schema("task", &[], vec![])).await.unwrap();
+        store
+            .create(draft("a", &["task"], vec![]), &ctx())
+            .await
+            .unwrap();
+
+        let page = store.list_by_schema_page("task", 2, 9).await.unwrap();
+
+        assert!(page.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_by_schema_page_with_limit_zero_is_empty() {
+        let (store, registry, _raw) = new_store().await;
+        registry.publish(schema("task", &[], vec![])).await.unwrap();
+        store
+            .create(draft("a", &["task"], vec![]), &ctx())
+            .await
+            .unwrap();
+
+        let page = store.list_by_schema_page("task", 0, 0).await.unwrap();
+
+        assert!(page.is_empty());
     }
 
     #[tokio::test]
