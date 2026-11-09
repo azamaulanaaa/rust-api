@@ -16,7 +16,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::bail;
 use async_trait::async_trait;
@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use url::Url;
 
+use crate::eav::metrics::EavMetrics;
 use crate::queue::{Job, JobHandler, JobQueue};
 use crate::records::{AttributeChange, EntityEventKind};
 use crate::rules::action::{ActionContext, RuleAction};
@@ -40,6 +41,18 @@ const MAX_URL_BYTES: usize = 2048;
 
 /// The request timeout in seconds.
 const TIMEOUT_SECS: u64 = 10;
+
+/// Records the result of one webhook delivery.
+///
+/// The call adds one to the delivered or the failed counter.
+fn record_delivery(succeeded: bool, elapsed: Duration) {
+    let metrics = EavMetrics::global();
+    if succeeded {
+        metrics.record_webhook_delivered(elapsed);
+    } else {
+        metrics.record_webhook_failure();
+    }
+}
 
 /// An action that posts one event to an allowlisted host.
 ///
@@ -152,7 +165,8 @@ impl RuleAction for WebhookAction {
         let Some(queue) = &self.queue else {
             let body = serde_json::to_vec(&payload)
                 .map_err(|_| anyhow::anyhow!("webhook payload is not valid"))?;
-            return send_webhook(
+            let started = Instant::now();
+            let result = send_webhook(
                 &self.client,
                 url,
                 &body,
@@ -161,6 +175,8 @@ impl RuleAction for WebhookAction {
                 self.signing_secret.as_deref(),
             )
             .await;
+            record_delivery(result.is_ok(), started.elapsed());
+            return result;
         };
         let envelope = WebhookJobPayload {
             url: url.to_string(),
@@ -241,6 +257,23 @@ impl JobHandler for WebhookJobHandler {
     /// A 2xx status is a success.
     /// Any other status or a network error returns an error.
     async fn handle(&self, job: &Job) -> Result<Option<Vec<u8>>, anyhow::Error> {
+        let started = Instant::now();
+        let result = self.deliver(job).await;
+        record_delivery(result.is_ok(), started.elapsed());
+        result
+    }
+}
+
+impl WebhookJobHandler {
+    /// Delivers one queued webhook and returns the handler result.
+    ///
+    /// The call decodes the job body.
+    /// It validates the URL again against the allowlist.
+    /// It posts the body with the event, rule, and user-agent headers.
+    /// It adds the `X-Signature` header when a signing secret exists.
+    /// A 2xx status is a success.
+    /// Any other status or a network error returns an error.
+    async fn deliver(&self, job: &Job) -> Result<Option<Vec<u8>>, anyhow::Error> {
         let envelope: WebhookJobPayload = serde_json::from_slice(&job.payload)
             .map_err(|_| anyhow::anyhow!("webhook job payload is not valid"))?;
         let url = Url::parse(&envelope.url)
