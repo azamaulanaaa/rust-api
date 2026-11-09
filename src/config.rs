@@ -336,6 +336,12 @@ impl Config {
         if self.eav.rule_poll_interval_ms == 0 {
             anyhow::bail!("eav.rule_poll_interval_ms must be greater than 0");
         }
+        if self.eav.gc_interval_ms == 0 {
+            anyhow::bail!("eav.gc_interval_ms must be greater than 0");
+        }
+        if self.eav.execution_retention_secs == 0 {
+            anyhow::bail!("eav.execution_retention_secs must be greater than 0");
+        }
         #[cfg(feature = "queue-rabbitmq")]
         if let Some(url) = &self.rabbitmq.url {
             let parsed: url::Url = url
@@ -536,6 +542,12 @@ pub struct EavConfig {
     /// Pause in milliseconds between rule runner polls.
     #[serde(default = "default_eav_rule_poll_interval_ms")]
     pub rule_poll_interval_ms: u64,
+    /// Pause in milliseconds between execution marker cleanups.
+    #[serde(default = "default_eav_gc_interval_ms")]
+    pub gc_interval_ms: u64,
+    /// Retention window in seconds for execution markers.
+    #[serde(default = "default_eav_execution_retention_secs")]
+    pub execution_retention_secs: u64,
 }
 
 impl Default for EavConfig {
@@ -544,11 +556,15 @@ impl Default for EavConfig {
     /// The runtime is off.
     /// The outbox relay runs every second.
     /// The rule runner polls every 200 milliseconds.
+    /// The marker cleanup runs every hour.
+    /// Execution markers stay for 30 days.
     fn default() -> Self {
         Self {
             enabled: false,
             outbox_interval_ms: default_eav_outbox_interval_ms(),
             rule_poll_interval_ms: default_eav_rule_poll_interval_ms(),
+            gc_interval_ms: default_eav_gc_interval_ms(),
+            execution_retention_secs: default_eav_execution_retention_secs(),
         }
     }
 }
@@ -561,6 +577,8 @@ impl EavConfig {
         rust_api::eav::runtime::EavRuntimeConfig {
             outbox_interval: Duration::from_millis(self.outbox_interval_ms),
             rule_poll_interval: Duration::from_millis(self.rule_poll_interval_ms),
+            gc_interval: Duration::from_millis(self.gc_interval_ms),
+            execution_retention: Duration::from_secs(self.execution_retention_secs),
         }
     }
 }
@@ -571,6 +589,14 @@ fn default_eav_outbox_interval_ms() -> u64 {
 
 fn default_eav_rule_poll_interval_ms() -> u64 {
     200
+}
+
+fn default_eav_gc_interval_ms() -> u64 {
+    3_600_000
+}
+
+fn default_eav_execution_retention_secs() -> u64 {
+    2_592_000
 }
 
 /// Signing keys for the capability token, which is a file delegation JWT.
@@ -1217,6 +1243,8 @@ mod tests {
         assert!(!cfg.eav.enabled);
         assert_eq!(cfg.eav.outbox_interval_ms, 1000);
         assert_eq!(cfg.eav.rule_poll_interval_ms, 200);
+        assert_eq!(cfg.eav.gc_interval_ms, 3_600_000);
+        assert_eq!(cfg.eav.execution_retention_secs, 2_592_000);
         assert_eq!(cfg.eav, EavConfig::default());
     }
 
@@ -1225,16 +1253,21 @@ mod tests {
         let toml = minimal_toml().replace(
             "region = \"us-east-1\"",
             "region = \"us-east-1\"\n[eav]\nenabled = true\n\
-             outbox_interval_ms = 2500\nrule_poll_interval_ms = 50",
+             outbox_interval_ms = 2500\nrule_poll_interval_ms = 50\n\
+             gc_interval_ms = 9000\nexecution_retention_secs = 120",
         );
         let cfg = parse(&toml).expect("explicit EAV values must parse");
 
         assert!(cfg.eav.enabled);
         assert_eq!(cfg.eav.outbox_interval_ms, 2500);
         assert_eq!(cfg.eav.rule_poll_interval_ms, 50);
+        assert_eq!(cfg.eav.gc_interval_ms, 9000);
+        assert_eq!(cfg.eav.execution_retention_secs, 120);
         let runtime = cfg.eav.runtime_config();
         assert_eq!(runtime.outbox_interval, Duration::from_millis(2500));
         assert_eq!(runtime.rule_poll_interval, Duration::from_millis(50));
+        assert_eq!(runtime.gc_interval, Duration::from_millis(9000));
+        assert_eq!(runtime.execution_retention, Duration::from_secs(120));
     }
 
     #[test]
@@ -1257,6 +1290,29 @@ mod tests {
         assert!(
             err.contains("eav.rule_poll_interval_ms"),
             "a zero rule poll interval must name its field, got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_zero_eav_cleanup_value_fails() {
+        let bad_gc = minimal_toml().replace(
+            "region = \"us-east-1\"",
+            "region = \"us-east-1\"\n[eav]\ngc_interval_ms = 0",
+        );
+        let err = validation_error(&bad_gc);
+        assert!(
+            err.contains("eav.gc_interval_ms"),
+            "a zero gc interval must name its field, got: {err}"
+        );
+
+        let bad_retention = minimal_toml().replace(
+            "region = \"us-east-1\"",
+            "region = \"us-east-1\"\n[eav]\nexecution_retention_secs = 0",
+        );
+        let err = validation_error(&bad_retention);
+        assert!(
+            err.contains("eav.execution_retention_secs"),
+            "a zero retention must name its field, got: {err}"
         );
     }
 

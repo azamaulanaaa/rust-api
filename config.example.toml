@@ -133,6 +133,14 @@ sample_ratio = 1.0
 # Default: 200.
 # rule_poll_interval_ms = 200
 
+# Pause in milliseconds between execution marker cleanups. Must be above 0.
+# Default: 3600000.
+# gc_interval_ms = 3600000
+
+# Retention window in seconds for execution markers. Must be above 0.
+# Keep it longer than any replay window for WAL events. Default: 2592000.
+# execution_retention_secs = 2592000
+
 # Optional — RabbitMQ connection for the job queue. Only used when the
 # binary is built with the `queue-rabbitmq` cargo feature.
 # [rabbitmq]
