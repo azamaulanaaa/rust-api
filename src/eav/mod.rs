@@ -36,6 +36,9 @@ pub mod error;
 /// Metrics helpers for the EAV runtime.
 pub mod metrics;
 
+/// Stored per-user entity replicas.
+pub mod replica;
+
 /// Actix routes for schemas, entities, and rules.
 pub mod route;
 

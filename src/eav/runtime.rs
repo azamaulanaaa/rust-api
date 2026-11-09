@@ -24,6 +24,7 @@ use crate::CancelToken;
 use crate::db::build_s3_store;
 use crate::eav::entity::{AttributeValue, EntityStore};
 use crate::eav::metrics::EavMetrics;
+use crate::eav::replica::ReplicaStore;
 use crate::eav::schema::SchemaRegistry;
 use crate::fs::s3::S3ClientConfig;
 use crate::rules::action::RuleAction;
@@ -81,6 +82,8 @@ pub struct EavRuntime {
     entities: EntityStore,
     /// The durable rule store.
     rules: RuleStore,
+    /// The stored per-user entity replicas.
+    replicas: ReplicaStore,
     /// The rule runner.
     engine: RuleEngine,
     /// The shared change feed.
@@ -96,6 +99,7 @@ impl EavRuntime {
     /// The schema store lives at `{db_prefix}/eav/schema`.
     /// The entity store lives at `{db_prefix}/eav/entity`.
     /// The rule store lives at `{db_prefix}/eav/rules`.
+    /// The replica store lives at `{db_prefix}/eav/replica`.
     /// The entity store writes its events to `wal`.
     /// The rule engine uses the given actions.
     pub async fn build(
@@ -113,11 +117,15 @@ impl EavRuntime {
         let rule_store = build_s3_store(s3, &domain_prefix(db_prefix, "rules"))
             .await
             .context("build the EAV rule store")?;
+        let replica_store = build_s3_store(s3, &domain_prefix(db_prefix, "replica"))
+            .await
+            .context("build the EAV replica store")?;
 
         let schemas = SchemaRegistry::new(schema_store);
         let entities =
             EntityStore::new(entity_store, schemas.clone()).with_change_sink(Arc::new(wal.clone()));
         let rules = RuleStore::new(rule_store);
+        let replicas = ReplicaStore::new(replica_store);
         let metrics = EavMetrics::global();
         let engine = RuleEngine::new(rules.clone(), entities.clone(), actions)
             .context("build the EAV rule engine")?
@@ -127,6 +135,7 @@ impl EavRuntime {
             schemas,
             entities,
             rules,
+            replicas,
             engine,
             wal,
             metrics,
@@ -146,6 +155,11 @@ impl EavRuntime {
     /// Returns the rule store.
     pub fn rules(&self) -> &RuleStore {
         &self.rules
+    }
+
+    /// Returns the stored per-user entity replicas.
+    pub fn replicas(&self) -> &ReplicaStore {
+        &self.replicas
     }
 
     /// Returns the rule engine.
