@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use oxkv::{GetSet as _, Store as _, Transaction as _};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
-use tracing::instrument;
+use tracing::{debug, instrument};
 use uuid::Uuid;
 
 use super::{Job, JobId, JobStatus, LeasedJob, QueueError, QueueMetrics, RetryPolicy};
@@ -120,6 +120,39 @@ impl DurableQueue {
         drop(g);
         let bytes = bytes.ok_or(QueueError::NotFound(id))?;
         serde_json::from_slice(&bytes).map_err(|e| QueueError::Store(e.to_string()))
+    }
+
+    /// Returns all dead-lettered jobs.
+    ///
+    /// The function scans the `job:` family. It returns only jobs with the
+    /// `Dead` status. The result is sorted by completion time, newest first.
+    /// The function skips rows that do not decode.
+    pub async fn dead_jobs(&self) -> Result<Vec<Job>, QueueError> {
+        let handle = Arc::clone(&self.store);
+        let g = handle.read().await;
+        let kvs = g
+            .gets_bytes(None, oxkv::Direction::Next, (None, None))
+            .await
+            .map_err(|e| QueueError::Store(e.to_string()))?;
+        drop(g);
+        let mut dead: Vec<(i64, Job)> = Vec::new();
+        for kv in &kvs {
+            if !kv.key.starts_with("job:") {
+                continue;
+            }
+            match serde_json::from_slice::<StoredJob>(&kv.value) {
+                Ok(sj) => {
+                    if let JobStatus::Dead { finished_at, .. } = sj.status {
+                        dead.push((finished_at, sj.job));
+                    }
+                }
+                Err(e) => {
+                    debug!(key = %kv.key, error = %e, "skipping job row that does not decode");
+                }
+            }
+        }
+        dead.sort_by_key(|a| std::cmp::Reverse(a.0));
+        Ok(dead.into_iter().map(|(_, job)| job).collect())
     }
 }
 
@@ -503,5 +536,119 @@ mod tests {
         j2.idempotency_key = Some("key-1".to_string());
         let id2 = q.enqueue(j2).await.unwrap();
         assert_eq!(id1, id2);
+    }
+
+    async fn put_job(q: &DurableQueue, job: Job, status: JobStatus) {
+        use oxkv::{Store as _, Transaction as _};
+        let id = job.id;
+        let sj = StoredJob { job, status };
+        let val = serde_json::to_vec(&sj).unwrap();
+        let g = q.store.write().await;
+        let tx = g.begin_tx().unwrap();
+        tx.set_bytes(&DurableQueue::job_key(id), &val)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dead_jobs_returns_empty_when_no_job_is_dead() {
+        let q = queue().await;
+        q.enqueue(job("work")).await.unwrap();
+        let dead = q.dead_jobs().await.unwrap();
+        assert!(dead.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dead_jobs_lists_a_dead_job() {
+        let q = queue().await;
+        let j = job("work");
+        let id = j.id;
+        put_job(
+            &q,
+            j,
+            JobStatus::Dead {
+                error: "boom".to_string(),
+                finished_at: 10,
+            },
+        )
+        .await;
+        let dead = q.dead_jobs().await.unwrap();
+        assert_eq!(dead.len(), 1);
+        assert_eq!(dead[0].id, id);
+    }
+
+    #[tokio::test]
+    async fn dead_jobs_ignores_a_succeeded_job() {
+        let q = queue().await;
+        put_job(
+            &q,
+            job("work"),
+            JobStatus::Succeeded {
+                result: None,
+                finished_at: 10,
+            },
+        )
+        .await;
+        let dead = q.dead_jobs().await.unwrap();
+        assert!(dead.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dead_jobs_sorts_newest_first() {
+        let q = queue().await;
+        let older = job("older");
+        let older_id = older.id;
+        let newer = job("newer");
+        let newer_id = newer.id;
+        put_job(
+            &q,
+            older,
+            JobStatus::Dead {
+                error: "old".to_string(),
+                finished_at: 10,
+            },
+        )
+        .await;
+        put_job(
+            &q,
+            newer,
+            JobStatus::Dead {
+                error: "new".to_string(),
+                finished_at: 20,
+            },
+        )
+        .await;
+        let dead = q.dead_jobs().await.unwrap();
+        assert_eq!(dead.len(), 2);
+        assert_eq!(dead[0].id, newer_id);
+        assert_eq!(dead[1].id, older_id);
+    }
+
+    #[tokio::test]
+    async fn dead_jobs_skips_rows_that_do_not_decode() {
+        let q = queue().await;
+        let j = job("work");
+        let id = j.id;
+        put_job(
+            &q,
+            j,
+            JobStatus::Dead {
+                error: "boom".to_string(),
+                finished_at: 10,
+            },
+        )
+        .await;
+        let bad_id = Uuid::now_v7();
+        let g = q.store.write().await;
+        let tx = g.begin_tx().unwrap();
+        tx.set_bytes(&DurableQueue::job_key(bad_id), b"not json")
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        drop(g);
+        let dead = q.dead_jobs().await.unwrap();
+        assert_eq!(dead.len(), 1);
+        assert_eq!(dead[0].id, id);
     }
 }

@@ -243,6 +243,47 @@ mod tests {
         Ok(())
     }
 
+    /// An entity event must append and read back unchanged.
+    ///
+    /// Entity events are a new family in the feed. The store treats them
+    /// like every other operation.
+    #[tokio::test]
+    async fn entity_events_append_and_range() -> anyhow::Result<()> {
+        use crate::records::{AttributeChange, EntityEvent, EntityEventKind};
+
+        let wal = test_wal().await;
+        let event = EntityEvent {
+            event_id: "evt-1".into(),
+            entity_id: "invoice-1".into(),
+            entity_version: 1,
+            kind: EntityEventKind::Created,
+            schemas: vec!["invoice".into()],
+            changed: vec![AttributeChange {
+                key: "total".into(),
+                old: None,
+                new: Some(serde_json::json!(10)),
+            }],
+            actor: "alice".into(),
+            causation_id: None,
+            causation_depth: 0,
+            correlation_id: "req-1".into(),
+            snapshot: Some(std::collections::BTreeMap::from([(
+                "total".into(),
+                serde_json::json!(10),
+            )])),
+            occurred_at: 1_760_000_000,
+        };
+        wal.append(WalOp::Entity {
+            event: event.clone(),
+        })
+        .await?;
+
+        let entries = wal.range(1, 1).await?;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].op, WalOp::Entity { event });
+        Ok(())
+    }
+
     #[tokio::test]
     async fn range_fails_loudly_on_gaps_and_garbage() -> anyhow::Result<()> {
         let wal = test_wal().await;

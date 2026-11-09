@@ -412,10 +412,12 @@ impl PolicyEngine {
 
     /// Atomically grants `user_id` the [`SUPERADMIN_ROLE`], provided no user
     /// holds that role yet. The function also adds the permission rules that
-    /// the role needs to manage policies. Those rules are `read` and `write`
-    /// on `rules` and on `user_groups`. Without those rules, a fresh
-    /// bootstrap would return `201` and still get `403` on every
-    /// `/policy/*` call.
+    /// the role needs to manage policies and EAV data.
+    /// Those rules are `read` and `write` on `rules` and on `user_groups`.
+    /// They are `read`, `write`, and `delete` on `eav_schemas`,
+    /// `eav_entities`, and `eav_rules`.
+    /// Without those rules, a fresh bootstrap would return `201` and still
+    /// get `403` on the management routes.
     ///
     /// The function returns `false` when the bootstrap already completed. The
     /// check and the write share one lock, so two concurrent first-time
@@ -478,6 +480,15 @@ impl PolicyEngine {
             ("rules", Action::Write),
             ("user_groups", Action::Read),
             ("user_groups", Action::Write),
+            ("eav_schemas", Action::Read),
+            ("eav_schemas", Action::Write),
+            ("eav_schemas", Action::Delete),
+            ("eav_entities", Action::Read),
+            ("eav_entities", Action::Write),
+            ("eav_entities", Action::Delete),
+            ("eav_rules", Action::Read),
+            ("eav_rules", Action::Write),
+            ("eav_rules", Action::Delete),
         ] {
             if ef
                 .add_policy(vec![
@@ -1073,9 +1084,25 @@ mod tests {
         let engine = engine().await;
 
         assert!(engine.claim_superadmin("alice").await.unwrap());
-        // The subject that the bootstrap grants can now manage policies.
-        for obj in ["rules", "user_groups"] {
-            for act in [Action::Read, Action::Write] {
+        // The subject that the bootstrap grants can now manage policies
+        // and EAV data.
+        for (obj, acts) in [
+            ("rules", &[Action::Read, Action::Write][..]),
+            ("user_groups", &[Action::Read, Action::Write][..]),
+            (
+                "eav_schemas",
+                &[Action::Read, Action::Write, Action::Delete][..],
+            ),
+            (
+                "eav_entities",
+                &[Action::Read, Action::Write, Action::Delete][..],
+            ),
+            (
+                "eav_rules",
+                &[Action::Read, Action::Write, Action::Delete][..],
+            ),
+        ] {
+            for &act in acts {
                 assert!(
                     engine.authorize("alice", obj, act).await.unwrap(),
                     "superadmin should hold {act} on {obj}"
@@ -1116,6 +1143,24 @@ mod tests {
         assert!(
             engine
                 .authorize("alice", "user_groups", Action::Write)
+                .await
+                .unwrap()
+        );
+        assert!(
+            engine
+                .authorize("alice", "eav_schemas", Action::Delete)
+                .await
+                .unwrap()
+        );
+        assert!(
+            engine
+                .authorize("alice", "eav_entities", Action::Write)
+                .await
+                .unwrap()
+        );
+        assert!(
+            engine
+                .authorize("alice", "eav_rules", Action::Read)
                 .await
                 .unwrap()
         );

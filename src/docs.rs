@@ -36,8 +36,73 @@ use utoipa::OpenApi;
         crate::sync::route::status_handler,
         crate::sync::route::sync_handler,
         crate::sync::route::object_handler,
+        crate::eav::route::publish_schema,
+        crate::eav::route::list_schemas,
+        crate::eav::route::get_schema,
+        crate::eav::route::get_schema_version,
+        crate::eav::route::get_effective_schema,
+        crate::eav::route::list_schema_children,
+        crate::eav::route::diff_schema,
+        crate::eav::route::revalidate_schema,
+        crate::eav::route::migrate_schema,
+        crate::eav::route::create_entity,
+        crate::eav::route::list_entities,
+        crate::eav::route::get_entity,
+        crate::eav::route::patch_entity,
+        crate::eav::route::delete_entity,
+        crate::eav::route::list_schema_entities,
+        crate::eav::route::upsert_rule,
+        crate::eav::route::list_rules,
+        crate::eav::route::get_rule,
+        crate::eav::route::delete_rule,
+        crate::eav::route::set_rule_enabled,
+        crate::eav::sync::status,
+        crate::eav::sync::events,
+        crate::eav::sync::snapshot,
+        crate::eav::sync::build_replica,
+        crate::eav::sync::replica,
+        crate::eav::sync::replica_status,
     ),
     components(schemas(
+        crate::eav::schema::SchemaDraft,
+        crate::eav::schema::SchemaDef,
+        crate::eav::schema::EffectiveSchema,
+        crate::eav::schema::AttributeDef,
+        crate::eav::schema::AttributeType,
+        crate::eav::schema::SchemaRef,
+        crate::eav::schema::AttributeTransition,
+        crate::eav::schema::SchemaDiff,
+        crate::eav::entity::EntityDraft,
+        crate::eav::entity::EntityPatch,
+        crate::eav::entity::Entity,
+        crate::eav::entity::AttributeValue,
+        crate::eav::entity::RevalidationIssue,
+        crate::eav::entity::InvalidEntity,
+        crate::eav::entity::RevalidationReport,
+        crate::eav::entity::MigrationReport,
+        crate::eav::route::EntityPatchRequest,
+        crate::eav::route::RuleEnabledRequest,
+        crate::eav::route::RevalidateRequest,
+        crate::eav::route::MigrateRequest,
+        crate::eav::route::SchemaPage,
+        crate::eav::route::EntityPage,
+        crate::eav::route::RulePage,
+        crate::eav::sync::SyncStatusResponse,
+        crate::eav::sync::SyncEvent,
+        crate::eav::sync::SyncEventsResponse,
+        crate::eav::sync::SyncEventsQuery,
+        crate::eav::sync::SnapshotPage,
+        crate::eav::sync::ReplicaBuildResponse,
+        crate::eav::sync::ReplicaStatusResponse,
+        crate::rules::rule::RuleDraft,
+        crate::rules::rule::Rule,
+        crate::rules::rule::RuleTrigger,
+        crate::rules::rule::Condition,
+        crate::rules::rule::CompareOp,
+        crate::rules::rule::ActionRef,
+        crate::records::EntityEventKind,
+        crate::records::EntityEvent,
+        crate::records::AttributeChange,
         crate::fs::model::InitRequest,
         crate::fs::model::CompleteRequest,
         crate::fs::model::FileMetadata,
@@ -60,7 +125,7 @@ use utoipa::OpenApi;
         crate::sync::route::SyncStatusResponse,
         crate::sync::route::SyncAdvanceResponse,
     )),
-    tags((name = "health"), (name = "auth"), (name = "setup"), (name = "fs"), (name = "policy"), (name = "sync"))
+    tags((name = "health"), (name = "auth"), (name = "setup"), (name = "fs"), (name = "policy"), (name = "sync"), (name = "eav"))
 )]
 pub struct ApiDoc;
 
@@ -86,6 +151,65 @@ mod tests {
         assert!(required.iter().any(|value| value == "error"));
         assert!(!required.iter().any(|value| value == "code"));
         assert!(!required.iter().any(|value| value == "details"));
+    }
+
+    /// Each list route returns one of the page envelopes.
+    #[test]
+    fn page_envelopes_are_in_the_spec() {
+        let spec: Value =
+            serde_json::from_str(&ApiDoc::openapi().to_json().expect("spec serializes"))
+                .expect("spec is JSON");
+        let schemas = spec["components"]["schemas"]
+            .as_object()
+            .expect("component schemas");
+        for name in ["SchemaPage", "EntityPage", "RulePage"] {
+            assert!(schemas.contains_key(name), "spec missing {name}");
+        }
+    }
+
+    /// The schema evolution types appear in the components.
+    #[test]
+    fn schema_evolution_types_are_in_the_spec() {
+        let spec: Value =
+            serde_json::from_str(&ApiDoc::openapi().to_json().expect("spec serializes"))
+                .expect("spec is JSON");
+        let schemas = spec["components"]["schemas"]
+            .as_object()
+            .expect("component schemas");
+        for name in [
+            "SchemaDiff",
+            "AttributeTransition",
+            "RevalidationReport",
+            "InvalidEntity",
+            "RevalidationIssue",
+            "RevalidateRequest",
+            "MigrationReport",
+            "MigrateRequest",
+        ] {
+            assert!(schemas.contains_key(name), "spec missing {name}");
+        }
+    }
+
+    /// The entity sync types appear in the components.
+    #[test]
+    fn entity_sync_types_are_in_the_spec() {
+        let spec: Value =
+            serde_json::from_str(&ApiDoc::openapi().to_json().expect("spec serializes"))
+                .expect("spec is JSON");
+        let schemas = spec["components"]["schemas"]
+            .as_object()
+            .expect("component schemas");
+        for name in [
+            "SyncStatusResponse",
+            "SyncEvent",
+            "SyncEventsResponse",
+            "SyncEventsQuery",
+            "SnapshotPage",
+            "ReplicaBuildResponse",
+            "ReplicaStatusResponse",
+        ] {
+            assert!(schemas.contains_key(name), "spec missing {name}");
+        }
     }
 
     /// Guards the PWA contract. Every served route that the SPA code generator
@@ -128,6 +252,25 @@ mod tests {
             "/sync/status",
             "/sync/sync",
             "/sync/db/{object}",
+            "/eav/schemas",
+            "/eav/schemas/{id}",
+            "/eav/schemas/{id}/versions/{version}",
+            "/eav/schemas/{id}/effective/{version}",
+            "/eav/schemas/{id}/children",
+            "/eav/schemas/{id}/diff",
+            "/eav/schemas/{id}/revalidate",
+            "/eav/schemas/{id}/migrate",
+            "/eav/schemas/{id}/entities",
+            "/eav/entities",
+            "/eav/entities/{id}",
+            "/eav/rules",
+            "/eav/rules/{id}",
+            "/eav/rules/{id}/enabled",
+            "/eav/sync/status",
+            "/eav/sync/events",
+            "/eav/sync/snapshot",
+            "/eav/sync/replica",
+            "/eav/sync/replica/status",
         ] {
             assert!(paths.contains_key(route), "spec missing {route}");
         }

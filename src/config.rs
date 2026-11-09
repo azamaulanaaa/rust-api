@@ -5,7 +5,7 @@
 //! over the value in the file. See [`ENV_CLIENT_SECRET`],
 //! [`ENV_S3_ACCESS_KEY_ID`], and [`ENV_S3_SECRET_ACCESS_KEY`].
 
-use std::{fs, path::Path};
+use std::{fs, path::Path, time::Duration};
 
 use anyhow::Context;
 use serde::Deserialize;
@@ -41,6 +41,9 @@ pub struct Config {
     /// Cost limits. Each limit is off by default. See [`LimitsConfig`].
     #[serde(default)]
     pub limits: LimitsConfig,
+    /// EAV background runtime settings. The runtime is off by default.
+    #[serde(default)]
+    pub eav: EavConfig,
 
     /// RabbitMQ connection settings. Only present with the
     /// `queue-rabbitmq` cargo feature.
@@ -327,6 +330,41 @@ impl Config {
                 );
             }
         }
+        if self.eav.outbox_interval_ms == 0 {
+            anyhow::bail!("eav.outbox_interval_ms must be greater than 0");
+        }
+        if self.eav.rule_poll_interval_ms == 0 {
+            anyhow::bail!("eav.rule_poll_interval_ms must be greater than 0");
+        }
+        if self.eav.gc_interval_ms == 0 {
+            anyhow::bail!("eav.gc_interval_ms must be greater than 0");
+        }
+        if self.eav.execution_retention_secs == 0 {
+            anyhow::bail!("eav.execution_retention_secs must be greater than 0");
+        }
+        if self.eav.timer_interval_ms == 0 {
+            anyhow::bail!("eav.timer_interval_ms must be greater than 0");
+        }
+        if self.eav.timer_batch == 0 {
+            anyhow::bail!("eav.timer_batch must be greater than 0");
+        }
+        for host in &self.eav.webhook_allowed_hosts {
+            validate_webhook_allowed_host(host)?;
+        }
+        if let Some(secret) = &self.eav.webhook_signing_secret {
+            if secret.is_empty() {
+                anyhow::bail!("eav.webhook_signing_secret must not be empty");
+            }
+            if secret.len() < 32 {
+                anyhow::bail!("eav.webhook_signing_secret must be at least 32 bytes");
+            }
+        }
+        if !(1..=20).contains(&self.eav.webhook_max_attempts) {
+            anyhow::bail!(
+                "eav.webhook_max_attempts must be within 1..=20 (got {})",
+                self.eav.webhook_max_attempts
+            );
+        }
         #[cfg(feature = "queue-rabbitmq")]
         if let Some(url) = &self.rabbitmq.url {
             let parsed: url::Url = url
@@ -510,6 +548,161 @@ impl LimitsConfig {
             self.rate_burst
         }
     }
+}
+
+/// Settings for the optional EAV background runtime.
+///
+/// The runtime is off by default.
+/// When it is on, it relays the entity outbox and runs matching rules.
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct EavConfig {
+    /// Starts the EAV runtime when true.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Pause in milliseconds between outbox flushes.
+    #[serde(default = "default_eav_outbox_interval_ms")]
+    pub outbox_interval_ms: u64,
+    /// Pause in milliseconds between rule runner polls.
+    #[serde(default = "default_eav_rule_poll_interval_ms")]
+    pub rule_poll_interval_ms: u64,
+    /// Pause in milliseconds between execution marker cleanups.
+    #[serde(default = "default_eav_gc_interval_ms")]
+    pub gc_interval_ms: u64,
+    /// Retention window in seconds for execution markers.
+    #[serde(default = "default_eav_execution_retention_secs")]
+    pub execution_retention_secs: u64,
+    /// Pause in milliseconds between due timer passes.
+    #[serde(default = "default_eav_timer_interval_ms")]
+    pub timer_interval_ms: u64,
+    /// Largest number of due entities to read for each time index key.
+    #[serde(default = "default_eav_timer_batch")]
+    pub timer_batch: usize,
+    /// The hosts that a webhook rule can call.
+    ///
+    /// Each entry is a host or a `host:port` pair.
+    /// The value is empty by default.
+    /// An empty list rejects every webhook rule.
+    #[serde(default)]
+    pub webhook_allowed_hosts: Vec<String>,
+    /// Optional HMAC-SHA256 secret for webhook signing.
+    ///
+    /// The value must have at least 32 bytes.
+    /// The default is `None`, which sends no signature header.
+    #[serde(default)]
+    pub webhook_signing_secret: Option<String>,
+    /// Maximum delivery attempts for one webhook job.
+    ///
+    /// The value must be within `1..=20`.
+    /// The default is 5.
+    #[serde(default = "default_eav_webhook_max_attempts")]
+    pub webhook_max_attempts: u32,
+}
+
+impl Default for EavConfig {
+    /// Returns the default settings.
+    ///
+    /// The runtime is off.
+    /// The outbox relay runs every second.
+    /// The rule runner polls every 200 milliseconds.
+    /// The marker cleanup runs every hour.
+    /// Execution markers stay for 30 days.
+    /// The timer pass runs every second and reads 100 entities for each key.
+    /// The webhook allowlist is empty.
+    /// Webhook signing is off.
+    /// One webhook job has up to 5 attempts.
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            outbox_interval_ms: default_eav_outbox_interval_ms(),
+            rule_poll_interval_ms: default_eav_rule_poll_interval_ms(),
+            gc_interval_ms: default_eav_gc_interval_ms(),
+            execution_retention_secs: default_eav_execution_retention_secs(),
+            timer_interval_ms: default_eav_timer_interval_ms(),
+            timer_batch: default_eav_timer_batch(),
+            webhook_allowed_hosts: Vec::new(),
+            webhook_signing_secret: None,
+            webhook_max_attempts: default_eav_webhook_max_attempts(),
+        }
+    }
+}
+
+impl EavConfig {
+    /// Converts the settings into an [`EavRuntimeConfig`].
+    ///
+    /// [`EavRuntimeConfig`]: rust_api::eav::runtime::EavRuntimeConfig
+    pub fn runtime_config(&self) -> rust_api::eav::runtime::EavRuntimeConfig {
+        rust_api::eav::runtime::EavRuntimeConfig {
+            outbox_interval: Duration::from_millis(self.outbox_interval_ms),
+            rule_poll_interval: Duration::from_millis(self.rule_poll_interval_ms),
+            gc_interval: Duration::from_millis(self.gc_interval_ms),
+            execution_retention: Duration::from_secs(self.execution_retention_secs),
+            timer_interval: Duration::from_millis(self.timer_interval_ms),
+            timer_batch: self.timer_batch,
+        }
+    }
+}
+
+fn default_eav_outbox_interval_ms() -> u64 {
+    1000
+}
+
+fn default_eav_rule_poll_interval_ms() -> u64 {
+    200
+}
+
+fn default_eav_gc_interval_ms() -> u64 {
+    3_600_000
+}
+
+fn default_eav_execution_retention_secs() -> u64 {
+    2_592_000
+}
+
+fn default_eav_timer_interval_ms() -> u64 {
+    1000
+}
+
+fn default_eav_timer_batch() -> usize {
+    100
+}
+
+fn default_eav_webhook_max_attempts() -> u32 {
+    5
+}
+
+/// Checks one webhook allowlist entry.
+///
+/// The value must be a host with an optional port.
+/// It must not hold a scheme, a path, whitespace, or user information.
+fn validate_webhook_allowed_host(entry: &str) -> anyhow::Result<()> {
+    if entry.is_empty() {
+        anyhow::bail!("eav.webhook_allowed_hosts has an empty entry");
+    }
+    if entry.chars().any(char::is_whitespace) {
+        anyhow::bail!("eav.webhook_allowed_hosts entry {entry:?} contains whitespace");
+    }
+    if entry.contains('@') {
+        anyhow::bail!("eav.webhook_allowed_hosts entry {entry:?} contains user information");
+    }
+    if entry.contains('/') || entry.contains('?') || entry.contains('#') {
+        anyhow::bail!(
+            "eav.webhook_allowed_hosts entry {entry:?} must not contain a scheme or a path"
+        );
+    }
+    let candidate = if entry.matches(':').count() > 1 && !entry.starts_with('[') {
+        format!("http://[{entry}]")
+    } else {
+        format!("http://{entry}")
+    };
+    let parsed = url::Url::parse(&candidate).map_err(|_| {
+        anyhow::anyhow!("eav.webhook_allowed_hosts entry {entry:?} is not a valid host")
+    })?;
+    if parsed.host_str().is_none() || parsed.path() != "/" {
+        anyhow::bail!(
+            "eav.webhook_allowed_hosts entry {entry:?} is not a valid host with an optional port"
+        );
+    }
+    Ok(())
 }
 
 /// Signing keys for the capability token, which is a file delegation JWT.
@@ -1141,6 +1334,206 @@ mod tests {
     /// The lease TTL decides how long a crashed writer blocks its
     /// replacement. The default must therefore be a real value, not zero. A
     /// value of zero silently disables single-writer enforcement.
+    #[test]
+    fn the_eav_section_is_optional() {
+        // A config without an [eav] section parses.
+        let cfg = parse(&minimal_toml()).expect("the EAV section is optional");
+
+        assert!(!cfg.eav.enabled);
+    }
+
+    #[test]
+    fn eav_defaults_apply() {
+        let cfg = parse(&minimal_toml()).expect("should parse");
+
+        assert!(!cfg.eav.enabled);
+        assert_eq!(cfg.eav.outbox_interval_ms, 1000);
+        assert_eq!(cfg.eav.rule_poll_interval_ms, 200);
+        assert_eq!(cfg.eav.gc_interval_ms, 3_600_000);
+        assert_eq!(cfg.eav.execution_retention_secs, 2_592_000);
+        assert_eq!(cfg.eav.timer_interval_ms, 1000);
+        assert_eq!(cfg.eav.timer_batch, 100);
+        assert!(cfg.eav.webhook_allowed_hosts.is_empty());
+        assert!(cfg.eav.webhook_signing_secret.is_none());
+        assert_eq!(cfg.eav.webhook_max_attempts, 5);
+        assert_eq!(cfg.eav, EavConfig::default());
+    }
+
+    #[test]
+    fn explicit_eav_values_parse() {
+        let toml = minimal_toml().replace(
+            "region = \"us-east-1\"",
+            "region = \"us-east-1\"\n[eav]\nenabled = true\n\
+             outbox_interval_ms = 2500\nrule_poll_interval_ms = 50\n\
+             gc_interval_ms = 9000\nexecution_retention_secs = 120\n\
+             timer_interval_ms = 750\ntimer_batch = 25\n\
+             webhook_allowed_hosts = [\"example.com\", \"example.com:8443\"]\n\
+             webhook_signing_secret = \"0123456789abcdef0123456789abcdef\"\n\
+             webhook_max_attempts = 7",
+        );
+        let cfg = parse(&toml).expect("explicit EAV values must parse");
+
+        assert!(cfg.eav.enabled);
+        assert_eq!(cfg.eav.outbox_interval_ms, 2500);
+        assert_eq!(cfg.eav.rule_poll_interval_ms, 50);
+        assert_eq!(cfg.eav.gc_interval_ms, 9000);
+        assert_eq!(cfg.eav.execution_retention_secs, 120);
+        assert_eq!(cfg.eav.timer_interval_ms, 750);
+        assert_eq!(cfg.eav.timer_batch, 25);
+        assert_eq!(
+            cfg.eav.webhook_allowed_hosts,
+            vec!["example.com".to_string(), "example.com:8443".to_string()]
+        );
+        assert_eq!(
+            cfg.eav.webhook_signing_secret.as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+        assert_eq!(cfg.eav.webhook_max_attempts, 7);
+        let runtime = cfg.eav.runtime_config();
+        assert_eq!(runtime.outbox_interval, Duration::from_millis(2500));
+        assert_eq!(runtime.rule_poll_interval, Duration::from_millis(50));
+        assert_eq!(runtime.gc_interval, Duration::from_millis(9000));
+        assert_eq!(runtime.execution_retention, Duration::from_secs(120));
+        assert_eq!(runtime.timer_interval, Duration::from_millis(750));
+        assert_eq!(runtime.timer_batch, 25);
+    }
+
+    #[test]
+    fn an_invalid_webhook_allowed_host_fails() {
+        for entry in [
+            "",
+            "https://example.com",
+            "example.com/path",
+            "exam ple.com",
+            "user@example.com",
+            "example.com:99999",
+        ] {
+            let toml = minimal_toml().replace(
+                "region = \"us-east-1\"",
+                &format!("region = \"us-east-1\"\n[eav]\nwebhook_allowed_hosts = [{entry:?}]"),
+            );
+            let err = validation_error(&toml);
+            assert!(
+                err.contains("eav.webhook_allowed_hosts"),
+                "entry {entry:?} must name its field, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_short_webhook_signing_secret_fails() {
+        for secret in ["", "short", "0123456789abcdef0123456789abcde"] {
+            let toml = minimal_toml().replace(
+                "region = \"us-east-1\"",
+                &format!("region = \"us-east-1\"\n[eav]\nwebhook_signing_secret = {secret:?}"),
+            );
+            let err = validation_error(&toml);
+            assert!(
+                err.contains("eav.webhook_signing_secret"),
+                "secret {secret:?} must name its field, got: {err}"
+            );
+        }
+
+        let ok = minimal_toml().replace(
+            "region = \"us-east-1\"",
+            "region = \"us-east-1\"\n[eav]\n\
+             webhook_signing_secret = \"0123456789abcdef0123456789abcdef\"",
+        );
+        assert!(parse(&ok).is_ok(), "a 32 byte secret must pass");
+    }
+
+    #[test]
+    fn a_webhook_max_attempts_outside_the_range_fails() {
+        for value in ["0", "21"] {
+            let toml = minimal_toml().replace(
+                "region = \"us-east-1\"",
+                &format!("region = \"us-east-1\"\n[eav]\nwebhook_max_attempts = {value}"),
+            );
+            let err = validation_error(&toml);
+            assert!(
+                err.contains("eav.webhook_max_attempts"),
+                "value {value} must name its field, got: {err}"
+            );
+        }
+
+        for value in ["1", "20"] {
+            let toml = minimal_toml().replace(
+                "region = \"us-east-1\"",
+                &format!("region = \"us-east-1\"\n[eav]\nwebhook_max_attempts = {value}"),
+            );
+            assert!(parse(&toml).is_ok(), "value {value} must pass");
+        }
+    }
+
+    #[test]
+    fn a_zero_eav_interval_fails() {
+        let bad_outbox = minimal_toml().replace(
+            "region = \"us-east-1\"",
+            "region = \"us-east-1\"\n[eav]\noutbox_interval_ms = 0",
+        );
+        let err = validation_error(&bad_outbox);
+        assert!(
+            err.contains("eav.outbox_interval_ms"),
+            "a zero outbox interval must name its field, got: {err}"
+        );
+
+        let bad_poll = minimal_toml().replace(
+            "region = \"us-east-1\"",
+            "region = \"us-east-1\"\n[eav]\nrule_poll_interval_ms = 0",
+        );
+        let err = validation_error(&bad_poll);
+        assert!(
+            err.contains("eav.rule_poll_interval_ms"),
+            "a zero rule poll interval must name its field, got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_zero_eav_cleanup_value_fails() {
+        let bad_gc = minimal_toml().replace(
+            "region = \"us-east-1\"",
+            "region = \"us-east-1\"\n[eav]\ngc_interval_ms = 0",
+        );
+        let err = validation_error(&bad_gc);
+        assert!(
+            err.contains("eav.gc_interval_ms"),
+            "a zero gc interval must name its field, got: {err}"
+        );
+
+        let bad_retention = minimal_toml().replace(
+            "region = \"us-east-1\"",
+            "region = \"us-east-1\"\n[eav]\nexecution_retention_secs = 0",
+        );
+        let err = validation_error(&bad_retention);
+        assert!(
+            err.contains("eav.execution_retention_secs"),
+            "a zero retention must name its field, got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_zero_eav_timer_value_fails() {
+        let bad_interval = minimal_toml().replace(
+            "region = \"us-east-1\"",
+            "region = \"us-east-1\"\n[eav]\ntimer_interval_ms = 0",
+        );
+        let err = validation_error(&bad_interval);
+        assert!(
+            err.contains("eav.timer_interval_ms"),
+            "a zero timer interval must name its field, got: {err}"
+        );
+
+        let bad_batch = minimal_toml().replace(
+            "region = \"us-east-1\"",
+            "region = \"us-east-1\"\n[eav]\ntimer_batch = 0",
+        );
+        let err = validation_error(&bad_batch);
+        assert!(
+            err.contains("eav.timer_batch"),
+            "a zero timer batch must name its field, got: {err}"
+        );
+    }
+
     #[test]
     fn writer_lease_ttl_defaults_on_and_can_be_disabled() {
         let cfg = parse(&minimal_toml()).expect("should parse");
