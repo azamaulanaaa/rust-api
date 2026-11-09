@@ -62,6 +62,21 @@ pub mod sync;
 /// crate.
 pub mod records;
 
+/// Generic Entity-Attribute-Value foundations.
+/// The module provides a versioned schema registry with inheritance.
+/// It also provides an entity store with typed attributes and indexes.
+/// The `/eav` API exposes management routes for schemas, entities, and rules.
+/// The module adds no concrete actions and no business rules.
+pub mod eav;
+
+/// Generic rules for entity events.
+/// A rule has a trigger, a condition, and an action reference.
+/// The module provides a durable rule store and a rule runner.
+/// The runner dispatches matching rules to registered actions.
+/// It also tails the durable change feed.
+/// It has no HTTP routes and no business rules.
+pub mod rules;
+
 /// OxKV store factory. The factory is prefix-scoped inside the configured
 /// S3 bucket. It also creates the single-writer lease that guards a
 /// `[database].prefix` scope.

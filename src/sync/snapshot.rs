@@ -923,6 +923,12 @@ impl SnapshotManager {
             WalOp::FileDelete { file_id } => {
                 dst.delete_file(file_id).await?;
             }
+            WalOp::Entity { .. } => {
+                // An entity event does not change a file or a policy
+                // replica. A future entity replica projection must handle
+                // this variant. Until then the event is not an error, and
+                // it does not force a rebuild.
+            }
             WalOp::Attach {
                 row_type,
                 row_id,

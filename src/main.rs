@@ -21,10 +21,14 @@ use clap::{Parser, Subcommand};
 use url::Url;
 
 use rust_api::{
+    eav::route::EavApiModule,
     fs::{FsEngine, TokenKeys, route::FsApiModule, s3::S3ClientConfig, store::FsStore},
     http::{ApiService, middleware::jwt::Claims},
     oidc::{OidcClient, OidcConfig, route::OidcApiModule},
     policy::{PolicyEngine, admin, route::PolicyApiModule, setup::SetupApiModule},
+    queue::{QueueWorker, durable::DurableQueue},
+    rules::builtin::{LogAction, NoopAction},
+    rules::webhook::WebhookAction,
     sync::{route::SyncApiModule, snapshot::SnapshotManager, wal::Wal},
     telemetry,
 };
@@ -268,6 +272,11 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
     let db_prefix = config.database.prefix.trim_matches('/').to_string();
     let mirror_master = config.database.mirror_master;
     let lease_ttl = config.database.writer_lease_ttl_secs;
+    // Read the EAV settings before the code moves other config fields.
+    let eav_enabled = config.eav.enabled;
+    let eav_config = config.eav.runtime_config();
+    let webhook_signing_secret = config.eav.webhook_signing_secret.clone();
+    let webhook_max_attempts = config.eav.webhook_max_attempts;
 
     let telemetry = telemetry::init(
         verbose,
@@ -346,6 +355,56 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
     // cancelled after the server stops serving, so the tasks exit instead
     // of being dropped mid-flight.
     let cancel = tokio_util::sync::CancellationToken::new();
+
+    // Start the optional EAV runtime and API module. The binary registers the
+    // built-in `noop` and `log` actions. A host application adds its own
+    // actions through `EavRuntime::build`. The module and the background loops
+    // share one runtime handle.
+    let (eav_api_module, eav_handle, webhook_worker) = if eav_enabled {
+        // The webhook worker uses one durable queue under `{prefix}/eav-queue`.
+        let queue_store = rust_api::db::build_s3_store(
+            &s3_client_config,
+            &domain_prefix(&db_prefix, "eav-queue"),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("build EAV queue OxKvStore: {e}"))?;
+        let queue: Arc<dyn rust_api::queue::JobQueue> = Arc::new(DurableQueue::new(Arc::new(
+            tokio::sync::RwLock::new(queue_store),
+        )));
+        let signing_secret = webhook_signing_secret
+            .as_ref()
+            .map(|secret| secret.as_bytes().to_vec());
+        let webhook = WebhookAction::new(config.eav.webhook_allowed_hosts.clone()).with_queue(
+            queue.clone(),
+            signing_secret,
+            webhook_max_attempts,
+        );
+        let worker = QueueWorker::new(
+            queue,
+            vec![Arc::new(webhook.job_handler())],
+            "eav-webhook".to_string(),
+        );
+        let worker_cancel = cancel.clone();
+        let worker_handle = tokio::spawn(async move { worker.run(worker_cancel).await });
+        let runtime = rust_api::eav::runtime::EavRuntime::build(
+            &s3_client_config,
+            &db_prefix,
+            wal.clone(),
+            vec![Arc::new(NoopAction), Arc::new(LogAction), Arc::new(webhook)],
+        )
+        .await
+        .context("build the EAV runtime")?;
+        let module = EavApiModule::new(
+            runtime.clone(),
+            policy_engine.authorizer(),
+            oidc_api_module.middleware(),
+        );
+        let handle = runtime.spawn(cancel.clone(), eav_config);
+        (Some(module), Some(handle), Some(worker_handle))
+    } else {
+        (None, None, None)
+    };
+
     // Applications append their own reactive services here. The starter kit
     // ships none, so the list stays empty. Each entry implements
     // `rust_api::reactive::ReactiveService`.
@@ -468,7 +527,7 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
     // the lease is claimed and before the server listens takes the path of
     // the early error. On that path, the best-effort release of the `Drop`
     // of the guard is all that there is.
-    let served = ApiService::new()
+    let mut service = ApiService::new()
         .with_cors_origins(config.http.allowed_origins.clone())
         .with_rate_limit(rust_api::limits::TokenBucket::new(
             config.limits.burst_or_rate(),
@@ -479,9 +538,11 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
         .register_module(Box::new(setup_api_module))
         .register_module(Box::new(policy_api_module))
         .register_module(Box::new(fs_api_module))
-        .register_module(Box::new(sync_api_module))
-        .start(listen_addr.into())
-        .await;
+        .register_module(Box::new(sync_api_module));
+    if let Some(module) = eav_api_module {
+        service = service.register_module(Box::new(module));
+    }
+    let served = service.start(listen_addr.into()).await;
 
     // This is the orderly release, and the code awaits it. `start` returns
     // on SIGTERM, which is the path that drains the server. So this is the
@@ -502,6 +563,23 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
     for handle in reactive_handles {
         if let Ok(Err(error)) = handle.await {
             tracing::error!(?error, "reactive service failed");
+        }
+    }
+
+    // Stop the optional EAV runtime with the other background tasks.
+    if let Some(handle) = eav_handle {
+        match handle.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => tracing::error!(?error, "EAV runtime failed"),
+            Err(error) => tracing::error!(?error, "EAV runtime task failed"),
+        }
+    }
+
+    // The worker observes the shared token and exits after one poll.
+    if let Some(handle) = webhook_worker {
+        match handle.await {
+            Ok(()) => {}
+            Err(error) => tracing::error!(?error, "webhook worker task failed"),
         }
     }
 
