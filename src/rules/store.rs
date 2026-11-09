@@ -25,8 +25,14 @@
 //! processed.
 //! `rule:exec:{rule_id}:{event_id}` is one execution marker.
 //! A marker stops a second run of one rule and one event.
-//! Execution markers grow without bound.
-//! A later cleanup job must remove old markers.
+//! [`RuleStore::gc_executions`] deletes old markers.
+//!
+//! # Cleanup safety
+//!
+//! A delete of a marker can permit a duplicate action.
+//! The duplicate happens when a replay of an old WAL event arrives after
+//! the cursor is reset.
+//! The retention window must be longer than any replay window.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -287,6 +293,63 @@ impl RuleStore {
             .await
             .map(|_| ())
             .map_err(RuleError::Store)
+    }
+
+    /// Deletes execution markers older than `older_than`.
+    ///
+    /// The call scans only the `rule:exec:` key family.
+    /// Each marker holds a JSON Unix timestamp in seconds.
+    /// The call deletes a marker when its timestamp is less than `older_than`.
+    /// A marker that does not decode stays in place.
+    /// The call logs a warning for that marker and continues the pass.
+    /// The return value is the number of deleted markers.
+    ///
+    /// # Duplicate actions
+    ///
+    /// A delete can permit a duplicate action.
+    /// The duplicate happens when a replay of an old WAL event arrives after
+    /// the cursor is reset.
+    /// The retention window must be longer than any replay window.
+    pub async fn gc_executions(&self, older_than: i64) -> Result<usize, RuleError> {
+        let expired = {
+            let g = self.store.read().await;
+            let rows = scan_prefix(&*g, EXEC_PREFIX).await?;
+            let mut keys = Vec::new();
+            for row in rows {
+                match serde_json::from_slice::<i64>(&row.value) {
+                    Ok(timestamp) if timestamp < older_than => keys.push(row.key),
+                    Ok(_) => {}
+                    Err(_) => {
+                        tracing::warn!(
+                            key = %row.key,
+                            "rule execution marker does not decode; keep it"
+                        );
+                    }
+                }
+            }
+            keys
+        };
+
+        if expired.is_empty() {
+            return Ok(0);
+        }
+
+        let _publish = self.publish_lock.lock().await;
+        let g = self.store.write().await;
+        let tx = g.begin_tx().map_err(RuleError::Store)?;
+        for key in &expired {
+            tx.delete(key).await.map_err(RuleError::Store)?;
+        }
+        tx.commit().await.map_err(RuleError::Store)?;
+        Ok(expired.len())
+    }
+
+    /// Returns the number of execution markers.
+    ///
+    /// The call counts the rows in the `rule:exec:` key family.
+    pub async fn execution_count(&self) -> Result<usize, RuleError> {
+        let g = self.store.read().await;
+        Ok(scan_prefix(&*g, EXEC_PREFIX).await?.len())
     }
 }
 
@@ -645,6 +708,60 @@ mod tests {
             keys.iter().all(|key| !key.starts_with(RULE_PREFIX)),
             "a delete left a rule key behind"
         );
+    }
+
+    async fn put_execution_marker(store: &OxKvStore, rule_id: &str, event_id: &str, at: i64) {
+        let bytes = serde_json::to_vec(&at).unwrap();
+        store
+            .set_bytes(&exec_key(rule_id, event_id), &bytes)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn gc_executions_deletes_old_markers() {
+        let (store, raw) = store_with_raw().await;
+        put_execution_marker(&raw, "alpha", "evt-old", 100).await;
+
+        let deleted = store.gc_executions(200).await.unwrap();
+
+        assert_eq!(deleted, 1);
+        assert!(!store.is_executed("alpha", "evt-old").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn gc_executions_keeps_new_markers() {
+        let (store, raw) = store_with_raw().await;
+        put_execution_marker(&raw, "alpha", "evt-new", 300).await;
+
+        let deleted = store.gc_executions(200).await.unwrap();
+
+        assert_eq!(deleted, 0);
+        assert!(store.is_executed("alpha", "evt-new").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn gc_executions_keeps_unreadable_markers() {
+        let (store, raw) = store_with_raw().await;
+        raw.set_bytes(&exec_key("alpha", "evt-bad"), b"not-json")
+            .await
+            .unwrap();
+
+        let deleted = store.gc_executions(200).await.unwrap();
+
+        assert_eq!(deleted, 0);
+        assert!(store.is_executed("alpha", "evt-bad").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn execution_count_returns_the_marker_count() {
+        let (store, raw) = store_with_raw().await;
+        assert_eq!(store.execution_count().await.unwrap(), 0);
+
+        put_execution_marker(&raw, "alpha", "evt-1", 100).await;
+        put_execution_marker(&raw, "beta", "evt-2", 300).await;
+
+        assert_eq!(store.execution_count().await.unwrap(), 2);
     }
 
     #[tokio::test]
