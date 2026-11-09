@@ -27,6 +27,7 @@ use rust_api::{
     oidc::{OidcClient, OidcConfig, route::OidcApiModule},
     policy::{PolicyEngine, admin, route::PolicyApiModule, setup::SetupApiModule},
     rules::builtin::{LogAction, NoopAction},
+    rules::webhook::WebhookAction,
     sync::{route::SyncApiModule, snapshot::SnapshotManager, wal::Wal},
     telemetry,
 };
@@ -361,7 +362,11 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
             &s3_client_config,
             &db_prefix,
             wal.clone(),
-            vec![Arc::new(NoopAction), Arc::new(LogAction)],
+            vec![
+                Arc::new(NoopAction),
+                Arc::new(LogAction),
+                Arc::new(WebhookAction::new(config.eav.webhook_allowed_hosts.clone())),
+            ],
         )
         .await
         .context("build the EAV runtime")?;
