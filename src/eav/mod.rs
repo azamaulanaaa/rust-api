@@ -1,7 +1,8 @@
 //! Generic Entity-Attribute-Value foundations.
 //!
-//! This module holds a schema registry and an entity store.
-//! It has no HTTP routes and no business rules.
+//! This module holds a schema registry, an entity store, and the `/eav` API.
+//! The API exposes management routes for schemas, entities, and rules.
+//! It adds no concrete actions and no business rules.
 //! [`schema::SchemaRegistry`] stores immutable schema versions on OxKV.
 //! A schema can extend other schemas.
 //! [`schema::SchemaRegistry::effective`] flattens the inheritance chain into
@@ -31,6 +32,9 @@ pub mod entity_error;
 
 /// Error type for the schema registry.
 pub mod error;
+
+/// Actix routes for schemas, entities, and rules.
+pub mod route;
 
 /// The background runtime for the EAV stores.
 pub mod runtime;

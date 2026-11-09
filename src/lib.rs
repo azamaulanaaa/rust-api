@@ -65,7 +65,8 @@ pub mod records;
 /// Generic Entity-Attribute-Value foundations.
 /// The module provides a versioned schema registry with inheritance.
 /// It also provides an entity store with typed attributes and indexes.
-/// It has no HTTP routes and no business rules.
+/// The `/eav` API exposes management routes for schemas, entities, and rules.
+/// The module adds no concrete actions and no business rules.
 pub mod eav;
 
 /// Generic rules for entity events.
