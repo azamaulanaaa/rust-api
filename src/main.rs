@@ -21,6 +21,7 @@ use clap::{Parser, Subcommand};
 use url::Url;
 
 use rust_api::{
+    eav::route::EavApiModule,
     fs::{FsEngine, TokenKeys, route::FsApiModule, s3::S3ClientConfig, store::FsStore},
     http::{ApiService, middleware::jwt::Claims},
     oidc::{OidcClient, OidcConfig, route::OidcApiModule},
@@ -350,9 +351,10 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
     // of being dropped mid-flight.
     let cancel = tokio_util::sync::CancellationToken::new();
 
-    // Start the optional EAV runtime. The binary registers no actions yet.
-    // A host application adds actions through `EavRuntime::build`.
-    let eav_handle = if eav_enabled {
+    // Start the optional EAV runtime and API module. The binary registers no
+    // actions yet. A host application adds actions through `EavRuntime::build`.
+    // The module and the background loops share one runtime handle.
+    let (eav_api_module, eav_handle) = if eav_enabled {
         let runtime = rust_api::eav::runtime::EavRuntime::build(
             &s3_client_config,
             &db_prefix,
@@ -361,9 +363,15 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
         )
         .await
         .context("build the EAV runtime")?;
-        Some(runtime.spawn(cancel.clone(), eav_config))
+        let module = EavApiModule::new(
+            runtime.clone(),
+            policy_engine.authorizer(),
+            oidc_api_module.middleware(),
+        );
+        let handle = runtime.spawn(cancel.clone(), eav_config);
+        (Some(module), Some(handle))
     } else {
-        None
+        (None, None)
     };
 
     // Applications append their own reactive services here. The starter kit
@@ -488,7 +496,7 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
     // the lease is claimed and before the server listens takes the path of
     // the early error. On that path, the best-effort release of the `Drop`
     // of the guard is all that there is.
-    let served = ApiService::new()
+    let mut service = ApiService::new()
         .with_cors_origins(config.http.allowed_origins.clone())
         .with_rate_limit(rust_api::limits::TokenBucket::new(
             config.limits.burst_or_rate(),
@@ -499,9 +507,11 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
         .register_module(Box::new(setup_api_module))
         .register_module(Box::new(policy_api_module))
         .register_module(Box::new(fs_api_module))
-        .register_module(Box::new(sync_api_module))
-        .start(listen_addr.into())
-        .await;
+        .register_module(Box::new(sync_api_module));
+    if let Some(module) = eav_api_module {
+        service = service.register_module(Box::new(module));
+    }
+    let served = service.start(listen_addr.into()).await;
 
     // This is the orderly release, and the code awaits it. `start` returns
     // on SIGTERM, which is the path that drains the server. So this is the
