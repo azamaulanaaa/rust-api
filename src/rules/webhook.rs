@@ -1,8 +1,11 @@
 //! An outbound webhook action.
 //!
 //! The action sends one JSON `POST` request for one rule event.
-//! Delivery is at least once.
-//! The `X-Event-Id` header lets the receiver deduplicate.
+//! The action can send the request directly.
+//! The action can also enqueue a `webhook.deliver` job.
+//! The queue retries a failed job.
+//! The queue idempotency key deduplicates one rule and one event.
+//! The receiver must deduplicate on the `X-Event-Id` header.
 //! The action adds no business logic.
 //!
 //! A strict host allowlist limits the destinations.
@@ -11,15 +14,26 @@
 //! A compromised allowlisted host remains trusted.
 //! The action cannot stop that host from reading the payload.
 
+use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::bail;
 use async_trait::async_trait;
-use serde::Serialize;
+use hmac::{Hmac, Mac};
+use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 use url::Url;
 
+use crate::queue::{Job, JobHandler, JobQueue};
 use crate::records::{AttributeChange, EntityEventKind};
 use crate::rules::action::{ActionContext, RuleAction};
+
+/// The job kind for one webhook delivery.
+const JOB_KIND: &str = "webhook.deliver";
+
+/// The default maximum number of delivery attempts.
+const DEFAULT_MAX_ATTEMPTS: u32 = 5;
 
 /// The maximum length of a webhook URL in bytes.
 const MAX_URL_BYTES: usize = 2048;
@@ -31,12 +45,29 @@ const TIMEOUT_SECS: u64 = 10;
 ///
 /// The action builds one client with a 10 second timeout.
 /// The client follows no redirects.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct WebhookAction {
     /// The parsed allowlist entries.
     allowed_hosts: Vec<AllowedHost>,
     /// The shared HTTP client.
     client: reqwest::Client,
+    /// The optional queue for durable delivery.
+    queue: Option<Arc<dyn JobQueue>>,
+    /// The optional HMAC-SHA256 signing secret.
+    signing_secret: Option<Vec<u8>>,
+    /// The maximum number of delivery attempts.
+    max_attempts: u32,
+}
+
+impl std::fmt::Debug for WebhookAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WebhookAction")
+            .field("allowed_hosts", &self.allowed_hosts)
+            .field("has_queue", &self.queue.is_some())
+            .field("has_signing_secret", &self.signing_secret.is_some())
+            .field("max_attempts", &self.max_attempts)
+            .finish()
+    }
 }
 
 impl WebhookAction {
@@ -44,6 +75,7 @@ impl WebhookAction {
     ///
     /// Each entry is a host or a `host:port` pair.
     /// An empty list rejects every webhook rule.
+    /// The direct mode uses no queue and no signing secret.
     pub fn new(allowed_hosts: Vec<String>) -> Self {
         let allowed_hosts = allowed_hosts
             .iter()
@@ -52,19 +84,35 @@ impl WebhookAction {
         Self {
             allowed_hosts,
             client: build_client(),
+            queue: None,
+            signing_secret: None,
+            max_attempts: DEFAULT_MAX_ATTEMPTS,
         }
     }
 
-    /// Returns true when the URL host and port are in the allowlist.
-    fn allows(&self, host: &str, port: Option<u16>) -> bool {
-        let host = normalize_host(host);
-        self.allowed_hosts.iter().any(|allowed| {
-            allowed.host == host
-                && match allowed.port {
-                    None => true,
-                    Some(expected) => port == Some(expected),
-                }
-        })
+    /// Uses the shared queue for delivery.
+    ///
+    /// The queue retries a failed job.
+    /// The call stores the optional HMAC secret and the maximum attempt count.
+    pub fn with_queue(
+        mut self,
+        queue: Arc<dyn JobQueue>,
+        signing_secret: Option<Vec<u8>>,
+        max_attempts: u32,
+    ) -> Self {
+        self.queue = Some(queue);
+        self.signing_secret = signing_secret;
+        self.max_attempts = max_attempts;
+        self
+    }
+
+    /// Builds the job handler for the queue path.
+    ///
+    /// The handler holds the allowlist, the HTTP client, and the signing
+    /// secret.
+    pub fn job_handler(&self) -> WebhookJobHandler {
+        WebhookJobHandler::new(self.client.clone(), self.signing_secret.clone())
+            .with_allowed_hosts(self.allowed_hosts.clone())
     }
 }
 
@@ -82,26 +130,7 @@ impl RuleAction for WebhookAction {
     /// and a host that is not in the allowlist.
     fn validate(&self, params: &serde_json::Value) -> Result<(), anyhow::Error> {
         let url = url_from_params(params)?;
-        if url.scheme() != "http" && url.scheme() != "https" {
-            bail!("webhook URL must use http or https");
-        }
-        if !url.username().is_empty() || url.password().is_some() {
-            bail!("webhook URL must not contain user information");
-        }
-        let Some(host) = url.host_str() else {
-            bail!("webhook URL has no host");
-        };
-        if url.fragment().is_some() {
-            bail!("webhook URL must not contain a fragment");
-        }
-        let host = normalize_host(host);
-        if url.scheme() == "http" && !is_loopback(&host) {
-            bail!("webhook URL must use https for this host");
-        }
-        if !self.allows(&host, url.port_or_known_default()) {
-            bail!("webhook host is not allowed");
-        }
-        Ok(())
+        validate_url(&url, &self.allowed_hosts)
     }
 
     async fn execute(&self, ctx: ActionContext) -> Result<(), anyhow::Error> {
@@ -120,24 +149,125 @@ impl RuleAction for WebhookAction {
             causation_id: ctx.event.causation_id.as_deref(),
             params: &ctx.params,
         };
-        let response = self
-            .client
-            .post(url)
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .header("X-Event-Id", ctx.event.event_id.as_str())
-            .header("X-Rule-Id", ctx.rule.id.as_str())
-            .header(reqwest::header::USER_AGENT, "rust-api-eav")
-            .json(&payload)
-            .send()
+        let Some(queue) = &self.queue else {
+            let body = serde_json::to_vec(&payload)
+                .map_err(|_| anyhow::anyhow!("webhook payload is not valid"))?;
+            return send_webhook(
+                &self.client,
+                url,
+                &body,
+                ctx.event.event_id.as_str(),
+                ctx.rule.id.as_str(),
+                self.signing_secret.as_deref(),
+            )
+            .await;
+        };
+        let envelope = WebhookJobPayload {
+            url: url.to_string(),
+            body: serde_json::to_value(&payload)
+                .map_err(|_| anyhow::anyhow!("webhook payload is not valid"))?,
+        };
+        let body = serde_json::to_vec(&envelope)
+            .map_err(|_| anyhow::anyhow!("webhook job payload is not valid"))?;
+        let now = chrono::Utc::now().timestamp();
+        let job = Job {
+            id: uuid::Uuid::now_v7(),
+            kind: JOB_KIND.to_string(),
+            payload: body,
+            priority: 0,
+            attempt: 0,
+            max_attempts: self.max_attempts.max(1),
+            created_at: now,
+            scheduled_at: now,
+            idempotency_key: Some(format!("webhook:{}:{}", ctx.rule.id, ctx.event.event_id)),
+            headers: BTreeMap::new(),
+        };
+        queue
+            .enqueue(job)
             .await
-            .map_err(|_| anyhow::anyhow!("webhook request failed"))?;
-        if !response.status().is_success() {
-            return Err(anyhow::anyhow!(
-                "webhook returned status {}",
-                response.status().as_u16()
-            ));
-        }
+            .map_err(|error| anyhow::anyhow!("webhook job enqueue failed: {error}"))?;
         Ok(())
+    }
+}
+
+/// A job handler that delivers one queued webhook.
+///
+/// The handler holds the allowlist, the HTTP client, and the signing secret.
+#[derive(Clone)]
+pub struct WebhookJobHandler {
+    /// The parsed allowlist entries.
+    allowed_hosts: Vec<AllowedHost>,
+    /// The shared HTTP client.
+    client: reqwest::Client,
+    /// The optional HMAC-SHA256 signing secret.
+    signing_secret: Option<Vec<u8>>,
+}
+
+impl WebhookJobHandler {
+    /// Creates a handler from the HTTP client and the signing secret.
+    ///
+    /// The handler starts with an empty allowlist.
+    /// Use [`WebhookJobHandler::with_allowed_hosts`] to add entries.
+    pub fn new(client: reqwest::Client, signing_secret: Option<Vec<u8>>) -> Self {
+        Self {
+            allowed_hosts: Vec::new(),
+            client,
+            signing_secret,
+        }
+    }
+
+    /// Adds the parsed allowlist entries.
+    ///
+    /// Each entry is a host or a `host:port` pair.
+    /// An empty list rejects every webhook job.
+    fn with_allowed_hosts(mut self, allowed_hosts: Vec<AllowedHost>) -> Self {
+        self.allowed_hosts = allowed_hosts;
+        self
+    }
+}
+
+#[async_trait]
+impl JobHandler for WebhookJobHandler {
+    fn kind(&self) -> &'static str {
+        JOB_KIND
+    }
+
+    /// Delivers one queued webhook.
+    ///
+    /// The call decodes the job body.
+    /// It validates the URL again against the allowlist.
+    /// It posts the body with the event, rule, and user-agent headers.
+    /// It adds the `X-Signature` header when a signing secret exists.
+    /// A 2xx status is a success.
+    /// Any other status or a network error returns an error.
+    async fn handle(&self, job: &Job) -> Result<Option<Vec<u8>>, anyhow::Error> {
+        let envelope: WebhookJobPayload = serde_json::from_slice(&job.payload)
+            .map_err(|_| anyhow::anyhow!("webhook job payload is not valid"))?;
+        let url = Url::parse(&envelope.url)
+            .map_err(|_| anyhow::anyhow!("webhook job URL is not valid"))?;
+        validate_url(&url, &self.allowed_hosts)?;
+        let event_id = envelope
+            .body
+            .get("event_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("webhook job body has no event id"))?;
+        let rule_id = envelope
+            .body
+            .get("rule_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("webhook job body has no rule id"))?;
+        let body = serde_json::to_vec(&envelope.body)
+            .map_err(|_| anyhow::anyhow!("webhook job body is not valid"))?;
+        send_webhook(
+            &self.client,
+            url,
+            &body,
+            event_id,
+            rule_id,
+            self.signing_secret.as_deref(),
+        )
+        .await?;
+        Ok(None)
     }
 }
 
@@ -170,6 +300,15 @@ struct WebhookPayload<'a> {
     params: &'a serde_json::Value,
 }
 
+/// The stored payload of one webhook job.
+#[derive(Debug, Serialize, Deserialize)]
+struct WebhookJobPayload {
+    /// The target URL.
+    url: String,
+    /// The request body.
+    body: serde_json::Value,
+}
+
 /// One parsed allowlist entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AllowedHost {
@@ -177,6 +316,99 @@ struct AllowedHost {
     host: String,
     /// The optional port. `None` matches any port.
     port: Option<u16>,
+}
+
+/// Sends one webhook request.
+///
+/// The call signs the exact body bytes when a secret exists.
+/// It returns an error for any status that is not 2xx.
+async fn send_webhook(
+    client: &reqwest::Client,
+    url: Url,
+    body: &[u8],
+    event_id: &str,
+    rule_id: &str,
+    signing_secret: Option<&[u8]>,
+) -> Result<(), anyhow::Error> {
+    let mut request = client
+        .post(url)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .header("X-Event-Id", event_id)
+        .header("X-Rule-Id", rule_id)
+        .header(reqwest::header::USER_AGENT, "rust-api-eav")
+        .body(body.to_vec());
+    if let Some(secret) = signing_secret {
+        request = request.header("X-Signature", signature_header(secret, body)?);
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|_| anyhow::anyhow!("webhook request failed"))?;
+    if !response.status().is_success() {
+        return Err(anyhow::anyhow!(
+            "webhook returned status {}",
+            response.status().as_u16()
+        ));
+    }
+    Ok(())
+}
+
+/// Signs one body with HMAC-SHA256.
+///
+/// The call returns the `sha256=<hex>` header value.
+fn signature_header(secret: &[u8], body: &[u8]) -> Result<String, anyhow::Error> {
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret)
+        .map_err(|_| anyhow::anyhow!("webhook signing secret is not valid"))?;
+    mac.update(body);
+    let bytes = mac.finalize().into_bytes();
+    let mut header = String::with_capacity(7 + bytes.len() * 2);
+    header.push_str("sha256=");
+    for byte in bytes.iter() {
+        use std::fmt::Write as _;
+        let _ = write!(header, "{byte:02x}");
+    }
+    Ok(header)
+}
+
+/// Checks one URL against the allowlist.
+///
+/// The call accepts `http` and `https`.
+/// It accepts `http` only for a loopback host in the allowlist.
+/// It rejects user information, a missing host, a fragment, a long URL,
+/// and a host that is not in the allowlist.
+fn validate_url(url: &Url, allowed_hosts: &[AllowedHost]) -> Result<(), anyhow::Error> {
+    if url.scheme() != "http" && url.scheme() != "https" {
+        bail!("webhook URL must use http or https");
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        bail!("webhook URL must not contain user information");
+    }
+    let Some(host) = url.host_str() else {
+        bail!("webhook URL has no host");
+    };
+    if url.fragment().is_some() {
+        bail!("webhook URL must not contain a fragment");
+    }
+    let host = normalize_host(host);
+    if url.scheme() == "http" && !is_loopback(&host) {
+        bail!("webhook URL must use https for this host");
+    }
+    if !allows(allowed_hosts, &host, url.port_or_known_default()) {
+        bail!("webhook host is not allowed");
+    }
+    Ok(())
+}
+
+/// Returns true when the URL host and port are in the allowlist.
+fn allows(allowed_hosts: &[AllowedHost], host: &str, port: Option<u16>) -> bool {
+    let host = normalize_host(host);
+    allowed_hosts.iter().any(|allowed| {
+        allowed.host == host
+            && match allowed.port {
+                None => true,
+                Some(expected) => port == Some(expected),
+            }
+    })
 }
 
 /// Parses one allowlist entry as a host or a `host:port` pair.
@@ -255,6 +487,7 @@ fn build_client() -> reqwest::Client {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::time::Duration;
 
     use serde_json::json;
     use wiremock::matchers::{method, path};
@@ -264,6 +497,7 @@ mod tests {
     use crate::db::{build_test_store, test_prefix};
     use crate::eav::entity::EntityStore;
     use crate::eav::schema::SchemaRegistry;
+    use crate::queue::{JobQueue, MemoryQueue};
     use crate::records::{AttributeChange, EntityEvent};
     use crate::rules::engine::RuleEngine;
     use crate::rules::rule::{ActionRef, Condition, Rule, RuleTrigger};
@@ -323,6 +557,11 @@ mod tests {
             vec![Arc::new(action)],
         )
         .expect("webhook action kind is valid")
+    }
+
+    /// Returns a fixed signing secret for the tests.
+    fn secret() -> Vec<u8> {
+        b"0123456789abcdef0123456789abcdef".to_vec()
     }
 
     #[test]
@@ -502,5 +741,158 @@ mod tests {
 
         let good = engine.validate_action("webhook", &json!({"url": "https://example.com/hook"}));
         assert!(good.is_ok());
+    }
+
+    #[tokio::test]
+    async fn the_queue_action_enqueues_one_job_with_the_expected_fields() {
+        let queue = Arc::new(MemoryQueue::new());
+        let action = WebhookAction::new(vec!["example.com".to_string()]).with_queue(
+            queue.clone(),
+            Some(secret()),
+            7,
+        );
+        let params = json!({"url": "https://example.com/hook"});
+
+        action.execute(context(params, "evt-1")).await.unwrap();
+
+        let leased = queue
+            .reserve("test", 10, Duration::from_secs(30))
+            .await
+            .unwrap();
+        assert_eq!(leased.len(), 1);
+        let job = &leased[0].job;
+        assert_eq!(job.kind, JOB_KIND);
+        assert_eq!(job.priority, 0);
+        assert_eq!(job.attempt, 0);
+        assert_eq!(job.max_attempts, 7);
+        assert_eq!(job.idempotency_key.as_deref(), Some("webhook:alpha:evt-1"));
+        let envelope: WebhookJobPayload = serde_json::from_slice(&job.payload).unwrap();
+        assert_eq!(envelope.url, "https://example.com/hook");
+        assert_eq!(envelope.body["event_id"], "evt-1");
+        assert_eq!(envelope.body["rule_id"], "alpha");
+        assert!(envelope.body.get("snapshot").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_second_enqueue_of_the_same_event_keeps_one_job() {
+        let queue = Arc::new(MemoryQueue::new());
+        let action =
+            WebhookAction::new(vec!["example.com".to_string()]).with_queue(queue.clone(), None, 5);
+        let params = json!({"url": "https://example.com/hook"});
+
+        action
+            .execute(context(params.clone(), "evt-1"))
+            .await
+            .unwrap();
+        action.execute(context(params, "evt-1")).await.unwrap();
+
+        let leased = queue
+            .reserve("test", 10, Duration::from_secs(30))
+            .await
+            .unwrap();
+        assert_eq!(leased.len(), 1);
+        assert_eq!(
+            leased[0].job.idempotency_key.as_deref(),
+            Some("webhook:alpha:evt-1")
+        );
+    }
+
+    #[tokio::test]
+    async fn the_handler_posts_the_body_and_headers() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/hook"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let queue = Arc::new(MemoryQueue::new());
+        let action = WebhookAction::new(vec![server.address().to_string()]).with_queue(
+            queue.clone(),
+            Some(secret()),
+            5,
+        );
+        let params = json!({"url": format!("{}/hook", server.uri())});
+        action.execute(context(params, "evt-1")).await.unwrap();
+        let handler = action.job_handler();
+        let leased = queue
+            .reserve("test", 10, Duration::from_secs(30))
+            .await
+            .unwrap();
+
+        handler.handle(&leased[0].job).await.unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        assert_eq!(
+            request
+                .headers
+                .get("x-event-id")
+                .and_then(|value| value.to_str().ok()),
+            Some("evt-1")
+        );
+        assert_eq!(
+            request
+                .headers
+                .get("x-rule-id")
+                .and_then(|value| value.to_str().ok()),
+            Some("alpha")
+        );
+        assert_eq!(
+            request
+                .headers
+                .get("user-agent")
+                .and_then(|value| value.to_str().ok()),
+            Some("rust-api-eav")
+        );
+        let expected = signature_header(&secret(), &request.body).unwrap();
+        assert_eq!(
+            request
+                .headers
+                .get("x-signature")
+                .and_then(|value| value.to_str().ok()),
+            Some(expected.as_str())
+        );
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(body["rule_id"], "alpha");
+        assert_eq!(body["event_id"], "evt-1");
+        assert_eq!(body["entity_id"], "e1");
+        assert_eq!(body["params"]["url"], format!("{}/hook", server.uri()));
+        assert!(body.get("snapshot").is_none());
+    }
+
+    #[tokio::test]
+    async fn the_handler_rejects_a_500_response() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/hook"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let queue = Arc::new(MemoryQueue::new());
+        let action = WebhookAction::new(vec![server.address().to_string()]).with_queue(
+            queue.clone(),
+            None,
+            5,
+        );
+        let params = json!({"url": format!("{}/hook", server.uri())});
+        action.execute(context(params, "evt-1")).await.unwrap();
+        let handler = action.job_handler();
+        let leased = queue
+            .reserve("test", 10, Duration::from_secs(30))
+            .await
+            .unwrap();
+
+        assert!(handler.handle(&leased[0].job).await.is_err());
+    }
+
+    #[test]
+    fn hmac_signing_matches_a_known_vector() {
+        let header = signature_header(b"secret", b"body").unwrap();
+
+        assert_eq!(
+            header,
+            "sha256=dc46983557fea127b43af721467eb9b3fde2338fe3e14f51952aa8478c13d355"
+        );
     }
 }
