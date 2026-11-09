@@ -158,6 +158,21 @@ impl RuleStore {
         Ok(rules)
     }
 
+    /// Lists one page of rules.
+    ///
+    /// The result is sorted by priority in descending order.
+    /// Two rules with the same priority are sorted by id.
+    /// The call skips `offset` rules.
+    /// It then returns at most `limit` rules.
+    /// A `limit` of 0 returns an empty list.
+    pub async fn list_page(&self, limit: usize, offset: usize) -> Result<Vec<Rule>, RuleError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let rules = self.list().await?;
+        Ok(rules.into_iter().skip(offset).take(limit).collect())
+    }
+
     /// Deletes one rule.
     ///
     /// The call removes the rule row and its index markers in one
@@ -565,6 +580,70 @@ mod tests {
             .collect();
 
         assert_eq!(ids, vec!["c", "a", "b"]);
+    }
+
+    #[tokio::test]
+    async fn list_page_returns_the_first_page() {
+        let store = new_store().await;
+        for id in ["a", "b", "c", "d"] {
+            store.upsert(draft(id)).await.unwrap();
+        }
+
+        let page = store.list_page(2, 0).await.unwrap();
+        let ids: Vec<String> = page.into_iter().map(|rule| rule.id).collect();
+
+        assert_eq!(ids, vec!["a", "b"]);
+    }
+
+    #[tokio::test]
+    async fn list_page_returns_the_second_page() {
+        let store = new_store().await;
+        for id in ["a", "b", "c", "d"] {
+            store.upsert(draft(id)).await.unwrap();
+        }
+
+        let page = store.list_page(2, 2).await.unwrap();
+        let ids: Vec<String> = page.into_iter().map(|rule| rule.id).collect();
+
+        assert_eq!(ids, vec!["c", "d"]);
+    }
+
+    #[tokio::test]
+    async fn list_page_offset_past_the_end_is_empty() {
+        let store = new_store().await;
+        store.upsert(draft("a")).await.unwrap();
+
+        let page = store.list_page(2, 9).await.unwrap();
+
+        assert!(page.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_page_with_limit_zero_is_empty() {
+        let store = new_store().await;
+        store.upsert(draft("a")).await.unwrap();
+
+        let page = store.list_page(0, 0).await.unwrap();
+
+        assert!(page.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_page_keeps_priority_then_id_order() {
+        let store = new_store().await;
+        for (id, priority) in [("b", 5), ("a", 5), ("c", 9), ("d", 1)] {
+            let mut rule = draft(id);
+            rule.priority = priority;
+            store.upsert(rule).await.unwrap();
+        }
+
+        let page = store.list_page(2, 0).await.unwrap();
+        let ids: Vec<String> = page.into_iter().map(|rule| rule.id).collect();
+        let second = store.list_page(2, 2).await.unwrap();
+        let second_ids: Vec<String> = second.into_iter().map(|rule| rule.id).collect();
+
+        assert_eq!(ids, vec!["c", "a"]);
+        assert_eq!(second_ids, vec!["b", "d"]);
     }
 
     #[tokio::test]
