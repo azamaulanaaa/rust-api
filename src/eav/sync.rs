@@ -13,14 +13,20 @@
 //! load of an offline client.
 //! The client then reads the events feed for each change.
 //!
+//! `POST /eav/sync/replica` stores a JSON snapshot for the caller.
+//! `GET /eav/sync/replica` returns the stored snapshot.
+//! `GET /eav/sync/replica/status` reports the log head and the stored head.
+//! The client applies the events after the stored head.
+//! The replica is a point-in-time snapshot, not an incremental store.
+//!
 //! The events route checks one collection grant.
 //! Without the collection grant, it checks a row grant for each event.
 //! A caller sees only the events that it can read.
 
 use actix_web::{
     HttpRequest, HttpResponse, get,
-    http::header::{ETAG, IF_NONE_MATCH},
-    web,
+    http::header::{CONTENT_TYPE, ETAG, IF_NONE_MATCH},
+    post, web,
 };
 use serde::Serialize;
 
@@ -39,6 +45,8 @@ use crate::records::{EntityEvent, WalEntry, WalOp};
 const DEFAULT_LIMIT: usize = 100;
 /// The largest number of events in one page.
 const MAX_LIMIT: usize = 500;
+/// The number of entities that a replica build reads in one page.
+const REPLICA_PAGE: usize = 500;
 
 /// The current head of the entity change feed.
 #[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
@@ -88,6 +96,24 @@ pub struct SnapshotPage {
     ///
     /// The client passes this value as `since` to the events feed.
     pub head: u64,
+}
+
+/// The result of a replica build.
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
+pub struct ReplicaBuildResponse {
+    /// The change-log head at the time of the build.
+    pub head: u64,
+    /// The number of visible entities in the replica.
+    pub count: usize,
+}
+
+/// The current change-log head and the stored replica head.
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
+pub struct ReplicaStatusResponse {
+    /// The current head of the change log.
+    pub head: u64,
+    /// The head of the stored replica, or `None` when no replica exists.
+    pub built_head: Option<u64>,
 }
 
 /// The query of the events route.
@@ -316,6 +342,107 @@ pub(crate) async fn snapshot(
             next_offset,
             head,
         }))
+}
+
+/// The source of a missing replica.
+#[derive(Debug)]
+struct MissingReplica;
+
+impl std::fmt::Display for MissingReplica {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("replica does not exist")
+    }
+}
+
+impl std::error::Error for MissingReplica {}
+
+/// Builds a stored replica for the caller.
+///
+/// The caller needs a valid session.
+/// The route reads the current change-log head first.
+/// It then reads every entity in pages of 500.
+/// It keeps only the entities that the caller can read.
+/// The build replaces the previous replica for the same subject.
+/// The client applies the events after the returned `head`.
+#[utoipa::path(post, path = "/eav/sync/replica", tag = "eav", responses((status = 200, body = ReplicaBuildResponse), (status = 401, body = crate::http::error::ErrorBody), (status = 500, body = crate::http::error::ErrorBody)))]
+#[post("/sync/replica")]
+pub(crate) async fn build_replica(
+    runtime: web::Data<EavRuntime>,
+    policy: web::Data<Authorizer>,
+    claims: Validated<Claims>,
+) -> Result<HttpResponse, EavApiError> {
+    let head = runtime.wal().head().await.map_err(internal)?;
+    let mut items = Vec::new();
+    let mut offset = 0;
+    loop {
+        let page = runtime.entities().list_page(REPLICA_PAGE, offset).await?;
+        let len = page.len();
+        for entity in page {
+            if can_read_entity(&policy, &claims.sub, &entity.id).await? {
+                items.push(entity);
+            }
+        }
+        if len < REPLICA_PAGE {
+            break;
+        }
+        offset = offset.saturating_add(len);
+    }
+    let data = serde_json::to_vec(&items).map_err(|e| EavApiError::Internal(Box::new(e)))?;
+    let count = items.len();
+    runtime.replicas().put(&claims.sub, head, data).await?;
+    Ok(HttpResponse::Ok().json(ReplicaBuildResponse { head, count }))
+}
+
+/// Returns the stored replica of the caller.
+///
+/// The caller needs a valid session.
+/// A missing replica returns `404`.
+/// The route sets `ETag` and `X-Replica-Head` to the stored head.
+/// A match on `If-None-Match` returns `304` with no body.
+/// The client applies the events after the stored head.
+#[utoipa::path(get, path = "/eav/sync/replica", tag = "eav", responses((status = 200, body = Vec<Entity>, content_type = "application/json"), (status = 304, description = "not modified"), (status = 401, body = crate::http::error::ErrorBody), (status = 404, body = crate::http::error::ErrorBody), (status = 500, body = crate::http::error::ErrorBody)))]
+#[get("/sync/replica")]
+pub(crate) async fn replica(
+    runtime: web::Data<EavRuntime>,
+    claims: Validated<Claims>,
+    req: HttpRequest,
+) -> Result<HttpResponse, EavApiError> {
+    let Some((head, data)) = runtime.replicas().get(&claims.sub).await? else {
+        return Err(EavApiError::NotFound(Box::new(MissingReplica)));
+    };
+    let etag = status_etag(head);
+    if let Some(header) = req
+        .headers()
+        .get(IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        && etag_matches(header, &etag)
+    {
+        return Ok(HttpResponse::NotModified()
+            .insert_header((ETAG, etag))
+            .finish());
+    }
+    Ok(HttpResponse::Ok()
+        .insert_header((ETAG, etag))
+        .insert_header(("X-Replica-Head", head.to_string()))
+        .insert_header((CONTENT_TYPE, "application/json"))
+        .body(data))
+}
+
+/// Returns the change-log head and the stored replica head.
+///
+/// The caller needs a valid session.
+/// The route sets no `ETag`.
+/// The client applies the events after `built_head`.
+/// A `built_head` of `None` means that no replica exists.
+#[utoipa::path(get, path = "/eav/sync/replica/status", tag = "eav", responses((status = 200, body = ReplicaStatusResponse), (status = 401, body = crate::http::error::ErrorBody), (status = 500, body = crate::http::error::ErrorBody)))]
+#[get("/sync/replica/status")]
+pub(crate) async fn replica_status(
+    runtime: web::Data<EavRuntime>,
+    claims: Validated<Claims>,
+) -> Result<HttpResponse, EavApiError> {
+    let head = runtime.wal().head().await.map_err(internal)?;
+    let built_head = runtime.replicas().status(&claims.sub).await?;
+    Ok(HttpResponse::Ok().json(ReplicaStatusResponse { head, built_head }))
 }
 
 #[cfg(test)]
@@ -905,6 +1032,260 @@ mod tests {
         Ok(())
     }
 
+    #[actix_web::test]
+    async fn a_replica_build_stores_the_visible_entity_list() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        publish_task_schema(&fx).await?;
+        create_entity(&fx, "e1").await?;
+        create_entity(&fx, "e2").await?;
+        grant_collection_read(&fx, "alice").await?;
+        let head = fx.runtime.wal().head().await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::post().uri("/eav/sync/replica"),
+                &token,
+            )
+            .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let body: Value = actix_test::read_body_json(res).await;
+        assert_eq!(body["head"], head);
+        assert_eq!(body["count"], 2);
+
+        let res = get_route!(&app, "/eav/sync/replica", &token).await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        assert_eq!(
+            res.headers()
+                .get(CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json")
+        );
+        let etag = format!("\"{head}\"");
+        assert_eq!(
+            res.headers().get(ETAG).and_then(|v| v.to_str().ok()),
+            Some(etag.as_str())
+        );
+        let replica_head = head.to_string();
+        assert_eq!(
+            res.headers()
+                .get("X-Replica-Head")
+                .and_then(|v| v.to_str().ok()),
+            Some(replica_head.as_str())
+        );
+        let items: Vec<Value> = actix_test::read_body_json(res).await;
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["id"], "e1");
+        assert_eq!(items[1]["id"], "e2");
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn a_row_grant_user_gets_only_its_entity_in_the_replica() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        publish_task_schema(&fx).await?;
+        create_entity(&fx, "e1").await?;
+        create_entity(&fx, "e2").await?;
+        grant_row_read(&fx, "carol", "e1").await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("carol")?;
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::post().uri("/eav/sync/replica"),
+                &token,
+            )
+            .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let body: Value = actix_test::read_body_json(res).await;
+        assert_eq!(body["count"], 1);
+
+        let res = get_route!(&app, "/eav/sync/replica", &token).await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let items: Vec<Value> = actix_test::read_body_json(res).await;
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["id"], "e1");
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn a_user_with_no_permission_gets_an_empty_replica() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        publish_task_schema(&fx).await?;
+        create_entity(&fx, "e1").await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("bob")?;
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::post().uri("/eav/sync/replica"),
+                &token,
+            )
+            .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let body: Value = actix_test::read_body_json(res).await;
+        assert_eq!(body["count"], 0);
+
+        let res = get_route!(&app, "/eav/sync/replica", &token).await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let items: Vec<Value> = actix_test::read_body_json(res).await;
+        assert!(items.is_empty());
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn a_missing_replica_is_404() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+
+        let res = get_route!(&app, "/eav/sync/replica", &fx.token("alice")?).await;
+        assert_eq!(res.status(), http::StatusCode::NOT_FOUND);
+        let body: crate::http::error::ErrorBody = actix_test::read_body_json(res).await;
+        assert_eq!(body.code.as_deref(), Some("not_found"));
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn a_matching_replica_if_none_match_returns_304() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        publish_task_schema(&fx).await?;
+        create_entity(&fx, "e1").await?;
+        grant_collection_read(&fx, "alice").await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::post().uri("/eav/sync/replica"),
+                &token,
+            )
+            .to_request(),
+        )
+        .await;
+        let body: Value = actix_test::read_body_json(res).await;
+        let head = body["head"].as_u64().expect("head");
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::get()
+                    .uri("/eav/sync/replica")
+                    .insert_header((IF_NONE_MATCH, format!("\"{head}\""))),
+                &token,
+            )
+            .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::NOT_MODIFIED);
+        let body = actix_test::read_body(res).await;
+        assert!(body.is_empty());
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn replica_status_reports_both_heads() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        publish_task_schema(&fx).await?;
+        create_entity(&fx, "e1").await?;
+        grant_collection_read(&fx, "alice").await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+
+        let res = get_route!(&app, "/eav/sync/replica/status", &token).await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let body: Value = actix_test::read_body_json(res).await;
+        let head = body["head"].as_u64().expect("head");
+        assert_eq!(head, fx.runtime.wal().head().await?);
+        assert!(body["built_head"].is_null());
+
+        actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::post().uri("/eav/sync/replica"),
+                &token,
+            )
+            .to_request(),
+        )
+        .await;
+
+        let res = get_route!(&app, "/eav/sync/replica/status", &token).await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let body: Value = actix_test::read_body_json(res).await;
+        assert_eq!(body["head"], head);
+        assert_eq!(body["built_head"], head);
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn a_rebuild_replaces_the_snapshot_and_raises_the_built_head() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        publish_task_schema(&fx).await?;
+        create_entity(&fx, "e1").await?;
+        grant_collection_read(&fx, "alice").await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::post().uri("/eav/sync/replica"),
+                &token,
+            )
+            .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let first: Value = actix_test::read_body_json(res).await;
+        let first_head = first["head"].as_u64().expect("head");
+
+        create_entity(&fx, "e2").await?;
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::post().uri("/eav/sync/replica"),
+                &token,
+            )
+            .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let second: Value = actix_test::read_body_json(res).await;
+        let second_head = second["head"].as_u64().expect("head");
+        assert!(second_head > first_head);
+
+        let res = get_route!(&app, "/eav/sync/replica", &token).await;
+        let etag = format!("\"{second_head}\"");
+        assert_eq!(
+            res.headers().get(ETAG).and_then(|v| v.to_str().ok()),
+            Some(etag.as_str())
+        );
+        let items: Vec<Value> = actix_test::read_body_json(res).await;
+        assert_eq!(items.len(), 2);
+
+        let res = get_route!(&app, "/eav/sync/replica/status", &token).await;
+        let body: Value = actix_test::read_body_json(res).await;
+        assert_eq!(body["built_head"], second_head);
+        Ok(())
+    }
+
     #[test]
     fn openapi_includes_sync_paths_and_schemas() {
         let spec: Value =
@@ -914,6 +1295,8 @@ mod tests {
         assert!(paths.contains_key("/eav/sync/status"));
         assert!(paths.contains_key("/eav/sync/events"));
         assert!(paths.contains_key("/eav/sync/snapshot"));
+        assert!(paths.contains_key("/eav/sync/replica"));
+        assert!(paths.contains_key("/eav/sync/replica/status"));
         let schemas = spec["components"]["schemas"]
             .as_object()
             .expect("component schemas");
@@ -923,6 +1306,8 @@ mod tests {
             "SyncEventsResponse",
             "SyncEventsQuery",
             "SnapshotPage",
+            "ReplicaBuildResponse",
+            "ReplicaStatusResponse",
             "EntityEvent",
             "AttributeChange",
         ] {
