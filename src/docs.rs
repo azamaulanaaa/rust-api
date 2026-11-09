@@ -55,6 +55,8 @@ use utoipa::OpenApi;
         crate::eav::route::get_rule,
         crate::eav::route::delete_rule,
         crate::eav::route::set_rule_enabled,
+        crate::eav::sync::status,
+        crate::eav::sync::events,
     ),
     components(schemas(
         crate::eav::schema::SchemaDraft,
@@ -78,6 +80,10 @@ use utoipa::OpenApi;
         crate::eav::route::SchemaPage,
         crate::eav::route::EntityPage,
         crate::eav::route::RulePage,
+        crate::eav::sync::SyncStatusResponse,
+        crate::eav::sync::SyncEvent,
+        crate::eav::sync::SyncEventsResponse,
+        crate::eav::sync::SyncEventsQuery,
         crate::rules::rule::RuleDraft,
         crate::rules::rule::Rule,
         crate::rules::rule::RuleTrigger,
@@ -85,6 +91,8 @@ use utoipa::OpenApi;
         crate::rules::rule::CompareOp,
         crate::rules::rule::ActionRef,
         crate::records::EntityEventKind,
+        crate::records::EntityEvent,
+        crate::records::AttributeChange,
         crate::fs::model::InitRequest,
         crate::fs::model::CompleteRequest,
         crate::fs::model::FileMetadata,
@@ -170,6 +178,25 @@ mod tests {
         }
     }
 
+    /// The entity sync types appear in the components.
+    #[test]
+    fn entity_sync_types_are_in_the_spec() {
+        let spec: Value =
+            serde_json::from_str(&ApiDoc::openapi().to_json().expect("spec serializes"))
+                .expect("spec is JSON");
+        let schemas = spec["components"]["schemas"]
+            .as_object()
+            .expect("component schemas");
+        for name in [
+            "SyncStatusResponse",
+            "SyncEvent",
+            "SyncEventsResponse",
+            "SyncEventsQuery",
+        ] {
+            assert!(schemas.contains_key(name), "spec missing {name}");
+        }
+    }
+
     /// Guards the PWA contract. Every served route that the SPA code generator
     /// uses must appear in the specification. Drift therefore breaks this
     /// test instead of the front end at run time.
@@ -223,6 +250,8 @@ mod tests {
             "/eav/rules",
             "/eav/rules/{id}",
             "/eav/rules/{id}/enabled",
+            "/eav/sync/status",
+            "/eav/sync/events",
         ] {
             assert!(paths.contains_key(route), "spec missing {route}");
         }
