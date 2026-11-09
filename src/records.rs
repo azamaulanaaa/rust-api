@@ -106,7 +106,7 @@ pub struct FileRecord {
 ///
 /// The kind is part of the wire format. A new variant is safe. An existing
 /// variant must not change its name.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
 pub enum EntityEventKind {
     /// The entity was created.
     Created,
