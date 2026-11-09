@@ -57,6 +57,18 @@ pub struct RuleExecution {
     pub outcome: ExecutionOutcome,
 }
 
+/// Observes the result of one rule execution.
+///
+/// The engine calls the observer for every rule result.
+/// The observer must be thread safe.
+pub trait RuleObserver: Send + Sync {
+    /// Records the result of one rule.
+    fn on_execution(&self, outcome: ExecutionOutcome);
+
+    /// Records one action failure.
+    fn on_action_failure(&self);
+}
+
 /// The generic rule runner.
 ///
 /// The engine holds one action for each registered kind.
@@ -75,6 +87,8 @@ pub struct RuleEngine {
     /// The maximum is inclusive.
     /// A depth above the maximum is a runaway chain.
     max_causation_depth: u32,
+    /// The optional observer for rule results.
+    observer: Option<Arc<dyn RuleObserver>>,
     /// Serializes processing, so one rule and one event run one time.
     process_lock: Arc<Mutex<()>>,
 }
@@ -105,6 +119,7 @@ impl RuleEngine {
             entities,
             actions: by_kind,
             max_causation_depth: DEFAULT_MAX_CAUSATION_DEPTH,
+            observer: None,
             process_lock: Arc::new(Mutex::new(())),
         })
     }
@@ -141,6 +156,26 @@ impl RuleEngine {
         self
     }
 
+    /// Sets the observer for rule results.
+    pub fn with_observer(mut self, observer: Arc<dyn RuleObserver>) -> Self {
+        self.observer = Some(observer);
+        self
+    }
+
+    /// Records one rule result when an observer exists.
+    fn observe(&self, outcome: ExecutionOutcome) {
+        if let Some(observer) = &self.observer {
+            observer.on_execution(outcome);
+        }
+    }
+
+    /// Records one action failure when an observer exists.
+    fn observe_action_failure(&self) {
+        if let Some(observer) = &self.observer {
+            observer.on_action_failure();
+        }
+    }
+
     /// Runs the matching rules for one entity event.
     ///
     /// The call loads the current entity first.
@@ -164,9 +199,13 @@ impl RuleEngine {
         if event.causation_depth > self.max_causation_depth {
             return Ok(rules
                 .into_iter()
-                .map(|rule| RuleExecution {
-                    rule_id: rule.id,
-                    outcome: ExecutionOutcome::CausationLimit,
+                .map(|rule| {
+                    let outcome = ExecutionOutcome::CausationLimit;
+                    self.observe(outcome);
+                    RuleExecution {
+                        rule_id: rule.id,
+                        outcome,
+                    }
                 })
                 .collect());
         }
@@ -174,20 +213,25 @@ impl RuleEngine {
 
         for rule in rules {
             if self.rules.is_executed(&rule.id, &event.event_id).await? {
+                let outcome = ExecutionOutcome::AlreadyExecuted;
+                self.observe(outcome);
                 executions.push(RuleExecution {
                     rule_id: rule.id,
-                    outcome: ExecutionOutcome::AlreadyExecuted,
+                    outcome,
                 });
                 continue;
             }
             if !rule.condition.eval(entity.as_ref(), event) {
+                let outcome = ExecutionOutcome::ConditionFalse;
+                self.observe(outcome);
                 executions.push(RuleExecution {
                     rule_id: rule.id,
-                    outcome: ExecutionOutcome::ConditionFalse,
+                    outcome,
                 });
                 continue;
             }
             let Some(action) = self.actions.get(&rule.action.kind) else {
+                self.observe_action_failure();
                 return Err(RuleError::UnknownAction(rule.action.kind.clone()));
             };
             let kind = rule.action.kind.clone();
@@ -197,14 +241,16 @@ impl RuleEngine {
                 entity: entity.clone(),
                 params: rule.action.params.clone(),
             };
-            action
-                .execute(ctx)
-                .await
-                .map_err(|_| RuleError::Action(kind))?;
+            action.execute(ctx).await.map_err(|_| {
+                self.observe_action_failure();
+                RuleError::Action(kind)
+            })?;
             self.rules.mark_executed(&rule.id, &event.event_id).await?;
+            let outcome = ExecutionOutcome::Executed;
+            self.observe(outcome);
             executions.push(RuleExecution {
                 rule_id: rule.id,
-                outcome: ExecutionOutcome::Executed,
+                outcome,
             });
         }
         Ok(executions)
@@ -278,7 +324,7 @@ fn map_wal_error(error: crate::fs::error::FsError) -> RuleError {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use tokio::sync::Notify;
 
@@ -341,9 +387,41 @@ mod tests {
         }
     }
 
+    /// A [`RuleObserver`] test double that records each result.
+    struct RecordingObserver {
+        outcomes: std::sync::Mutex<Vec<ExecutionOutcome>>,
+        failures: AtomicUsize,
+    }
+
+    impl RecordingObserver {
+        fn new() -> Self {
+            Self {
+                outcomes: std::sync::Mutex::new(Vec::new()),
+                failures: AtomicUsize::new(0),
+            }
+        }
+
+        fn outcomes(&self) -> Vec<ExecutionOutcome> {
+            self.outcomes.lock().unwrap().clone()
+        }
+
+        fn failures(&self) -> usize {
+            self.failures.load(Ordering::SeqCst)
+        }
+    }
+
+    impl RuleObserver for RecordingObserver {
+        fn on_execution(&self, outcome: ExecutionOutcome) {
+            self.outcomes.lock().unwrap().push(outcome);
+        }
+
+        fn on_action_failure(&self) {
+            self.failures.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
     /// A [`RuleAction`] test double that rejects every parameter value.
     struct RejectingAction;
-
     #[async_trait::async_trait]
     impl RuleAction for RejectingAction {
         fn kind(&self) -> &str {
@@ -486,6 +564,76 @@ mod tests {
         assert_eq!(executions[0].rule_id, "alpha");
         assert_eq!(executions[0].outcome, ExecutionOutcome::Executed);
         assert_eq!(recorder.records().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_recording_observer_sees_each_result() {
+        let stores = stores().await;
+        let recorder = Arc::new(RecordingAction::new("record"));
+        let observer = Arc::new(RecordingObserver::new());
+        let engine = engine(&stores, vec![recorder.clone()]).with_observer(observer.clone());
+        make_entity(&stores.entities).await;
+        stores.rules.upsert(draft("alpha", "record")).await.unwrap();
+        let created = event(EntityEventKind::Created);
+
+        engine.process(&created).await.unwrap();
+        engine.process(&created).await.unwrap();
+        assert_eq!(
+            observer.outcomes(),
+            vec![
+                ExecutionOutcome::Executed,
+                ExecutionOutcome::AlreadyExecuted
+            ]
+        );
+        assert_eq!(observer.failures(), 0);
+
+        recorder.set_failing(true);
+        let mut failed = event(EntityEventKind::Created);
+        failed.event_id = "evt-2".to_string();
+        let result = engine.process(&failed).await;
+
+        assert!(matches!(result, Err(RuleError::Action(_))));
+        assert_eq!(observer.failures(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_recording_observer_sees_a_condition_false_and_a_causation_limit() {
+        let stores = stores().await;
+        let recorder = Arc::new(RecordingAction::new("record"));
+        let observer = Arc::new(RecordingObserver::new());
+        let subject = engine(&stores, vec![recorder.clone()]).with_observer(observer.clone());
+        make_entity(&stores.entities).await;
+        let mut rule = draft("alpha", "record");
+        rule.condition = Condition::Compare {
+            key: "total".to_string(),
+            op: CompareOp::Gt,
+            value: serde_json::json!(100),
+        };
+        stores.rules.upsert(rule).await.unwrap();
+
+        subject
+            .process(&event(EntityEventKind::Created))
+            .await
+            .unwrap();
+        assert_eq!(observer.outcomes(), vec![ExecutionOutcome::ConditionFalse]);
+        assert_eq!(observer.failures(), 0);
+
+        let limited = engine(&stores, vec![recorder.clone()])
+            .with_max_causation_depth(0)
+            .with_observer(observer.clone());
+        let mut deep = event(EntityEventKind::Created);
+        deep.event_id = "evt-2".to_string();
+        deep.causation_depth = 1;
+        limited.process(&deep).await.unwrap();
+
+        assert_eq!(
+            observer.outcomes(),
+            vec![
+                ExecutionOutcome::ConditionFalse,
+                ExecutionOutcome::CausationLimit
+            ]
+        );
+        assert!(recorder.records().is_empty());
     }
 
     #[tokio::test]
