@@ -4,7 +4,7 @@
 //! The keys are `schema:head:{id}`, `schema:version:{id}:{version}`, and
 //! `schema:child:{parent}:{child}`.
 //! A head key holds the latest version as JSON `u64`.
-//! A version key holds one [`SchemaDef`] as JSON.
+//! A version key holds one [`SchemaDef`](crate::eav::schema::SchemaDef) as JSON.
 //! A child key is an empty marker.
 //! All scans stop at the `schema;` bound, so a scan reads only this family.
 

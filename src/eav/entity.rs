@@ -25,7 +25,7 @@
 //! # Entity events
 //!
 //! The store returns an [`EntityChange`].
-//! A store with a change sink writes one [`EntityEvent`] to an outbox row.
+//! A store with a change sink writes one [`EntityEvent`](crate::records::EntityEvent) to an outbox row.
 //! The outbox row commits in the same transaction as the entity rows.
 //! The store then flushes the outbox to the feed.
 //! A failure after the commit is [`EntityError::Feed`].

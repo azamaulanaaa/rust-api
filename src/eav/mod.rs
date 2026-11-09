@@ -3,23 +3,23 @@
 //! This module holds a schema registry, an entity store, and the `/eav` API.
 //! The API exposes management routes for schemas, entities, and rules.
 //! It adds no concrete actions and no business rules.
-//! [`schema::SchemaRegistry`] stores immutable schema versions on OxKV.
+//! [`schema::SchemaRegistry`](crate::eav::schema::SchemaRegistry) stores immutable schema versions on OxKV.
 //! A schema can extend other schemas.
-//! [`schema::SchemaRegistry::effective`] flattens the inheritance chain into
+//! [`schema::SchemaRegistry::effective`](crate::eav::schema::SchemaRegistry::effective) flattens the inheritance chain into
 //! one attribute map.
-//! [`entity::EntityStore`] stores validated entities with typed attributes,
+//! [`entity::EntityStore`](crate::eav::entity::EntityStore) stores validated entities with typed attributes,
 //! plus schema, attribute, and unique indexes.
 //!
 //! An entity pins one or more schema versions.
 //! An update changes attributes only.
 //! A later operation changes the pinned schemas.
-//! The entity store returns an [`entity::EntityChange`].
+//! The entity store returns an [`entity::EntityChange`](crate::eav::entity::EntityChange).
 //! With a change sink, it writes entity events through an outbox.
 //! The event row commits with the entity data.
 //! Delivery is at least once.
 //! A consumer must be idempotent.
 //!
-//! [`runtime::EavRuntime`] builds the stores from one S3 config and prefix.
+//! [`runtime::EavRuntime`](crate::eav::runtime::EavRuntime) builds the stores from one S3 config and prefix.
 //! It then starts the outbox relay and the rule runner.
 //! The runtime is opt-in.
 //! The binary starts it only when `eav.enabled` is true.

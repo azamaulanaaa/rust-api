@@ -5,12 +5,12 @@
 //! The condition tests one entity state and one event.
 //! The action reference names one registered action.
 //!
-//! [`store::RuleStore`] stores rules on OxKV.
+//! [`store::RuleStore`](crate::rules::store::RuleStore) stores rules on OxKV.
 //! It keeps one index marker for each trigger event and schema pair.
 //! It lists the rules that match one event.
 //!
-//! [`engine::RuleEngine`] runs the matching rules through an action.
-//! [`action::RuleAction`] is the only extension point.
+//! [`engine::RuleEngine`](crate::rules::engine::RuleEngine) runs the matching rules through an action.
+//! [`action::RuleAction`](crate::rules::action::RuleAction) is the only extension point.
 //! The engine also tails the durable change feed.
 //! Delivery is at least once, so an action must be idempotent.
 //!
