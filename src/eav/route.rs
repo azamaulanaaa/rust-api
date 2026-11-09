@@ -52,6 +52,10 @@ const MAX_PAGE_LIMIT: usize = 200;
 const DEFAULT_REVALIDATE_LIMIT: usize = 100;
 /// The maximum count of entities that a revalidation checks.
 const MAX_REVALIDATE_LIMIT: usize = 500;
+/// The default count of entities that a migration checks.
+const DEFAULT_MIGRATE_LIMIT: usize = 100;
+/// The maximum count of entities that a migration checks.
+const MAX_MIGRATE_LIMIT: usize = 500;
 
 /// The API module that exposes the `/eav` routes.
 ///
@@ -98,6 +102,7 @@ impl ApiModule for EavApiModule {
             .service(list_schema_children)
             .service(diff_schema)
             .service(revalidate_schema)
+            .service(migrate_schema)
             .service(create_entity)
             .service(list_entities)
             .service(get_entity)
@@ -180,6 +185,39 @@ impl RevalidateRequest {
     }
 }
 
+/// The body of the schema migration route.
+///
+/// The default limit is 100.
+/// The maximum limit is 500.
+/// The default for `dry_run` is true.
+#[derive(Debug, Clone, Copy, Deserialize, utoipa::ToSchema)]
+pub struct MigrateRequest {
+    /// The target schema version.
+    pub target_version: u64,
+    /// The maximum number of entities to check. The default is 100. The maximum is 500.
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// True to report the changes without a write. The default is true.
+    #[serde(default = "default_dry_run")]
+    pub dry_run: bool,
+}
+
+/// The default value of the migration dry-run flag.
+fn default_dry_run() -> bool {
+    true
+}
+
+impl MigrateRequest {
+    /// Resolves the limit and checks its range.
+    fn resolve(self) -> Result<(u64, usize, bool), EavApiError> {
+        let limit = self.limit.unwrap_or(DEFAULT_MIGRATE_LIMIT);
+        if limit == 0 || limit > MAX_MIGRATE_LIMIT {
+            return Err(EavApiError::Invalid(Box::new(InvalidMigrateLimit)));
+        }
+        Ok((self.target_version, limit, self.dry_run))
+    }
+}
+
 /// A page of schemas.
 #[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
 pub struct SchemaPage {
@@ -233,6 +271,18 @@ impl fmt::Display for InvalidRevalidateLimit {
 }
 
 impl std::error::Error for InvalidRevalidateLimit {}
+
+/// The source of a migration limit outside the allowed range.
+#[derive(Debug)]
+struct InvalidMigrateLimit;
+
+impl fmt::Display for InvalidMigrateLimit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("limit must be between 1 and 500")
+    }
+}
+
+impl std::error::Error for InvalidMigrateLimit {}
 
 /// Returns the next offset when the page is full.
 ///
@@ -607,6 +657,32 @@ async fn revalidate_schema(
     Ok(HttpResponse::Ok().json(report))
 }
 
+#[utoipa::path(post, path = "/eav/schemas/{id}/migrate", tag = "eav", params(("id" = String, Path)), request_body = MigrateRequest, responses((status=200, body=crate::eav::entity::MigrationReport), (status=400, body=crate::http::error::ErrorBody), (status=401, body=crate::http::error::ErrorBody), (status=403, body=crate::http::error::ErrorBody), (status=404, body=crate::http::error::ErrorBody), (status=500, body=crate::http::error::ErrorBody)))]
+#[post("/schemas/{id}/migrate")]
+async fn migrate_schema(
+    runtime: web::Data<EavRuntime>,
+    policy: web::Data<Authorizer>,
+    claims: Validated<Claims>,
+    path: web::Path<String>,
+    body: web::Json<MigrateRequest>,
+) -> Result<HttpResponse, EavApiError> {
+    require_management(&policy, &claims.sub, SCHEMAS, Action::Write).await?;
+    require_management(&policy, &claims.sub, ENTITIES, Action::Write).await?;
+    let id = path.into_inner();
+    let (target_version, limit, dry_run) = body.into_inner().resolve()?;
+    let report = runtime
+        .entities()
+        .migrate_schema(
+            &id,
+            target_version,
+            limit,
+            dry_run,
+            &WriteContext::new(claims.sub.clone()),
+        )
+        .await?;
+    Ok(HttpResponse::Ok().json(report))
+}
+
 #[utoipa::path(post, path = "/eav/entities", tag = "eav", request_body = crate::eav::entity::EntityDraft, responses((status=201, body=crate::eav::entity::Entity), (status=400, body=crate::http::error::ErrorBody), (status=401, body=crate::http::error::ErrorBody), (status=403, body=crate::http::error::ErrorBody), (status=409, body=crate::http::error::ErrorBody), (status=500, body=crate::http::error::ErrorBody)))]
 #[post("/entities")]
 async fn create_entity(
@@ -876,6 +952,7 @@ mod tests {
         "/eav/schemas/{id}/children",
         "/eav/schemas/{id}/diff",
         "/eav/schemas/{id}/revalidate",
+        "/eav/schemas/{id}/migrate",
         "/eav/schemas/{id}/entities",
         "/eav/entities",
         "/eav/entities/{id}",
@@ -1982,6 +2059,243 @@ mod tests {
         )
         .await;
         assert_eq!(res.status(), http::StatusCode::FORBIDDEN);
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn schema_migration_returns_the_report_and_defaults_to_a_dry_run() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        assert!(fx.engine.claim_superadmin("alice").await?);
+        publish_schema_version(&fx, "invoice", vec![attr("total", AttributeType::Integer)]).await?;
+        fx.runtime
+            .entities()
+            .create(
+                EntityDraft {
+                    id: "e1".to_string(),
+                    schemas: vec!["invoice".to_string()],
+                    attributes: [("total".to_string(), AttributeValue::Integer(10))]
+                        .into_iter()
+                        .collect(),
+                },
+                &WriteContext::new("alice"),
+            )
+            .await?;
+        publish_schema_version(
+            &fx,
+            "invoice",
+            vec![
+                attr("total", AttributeType::Integer),
+                attr("memo", AttributeType::String),
+            ],
+        )
+        .await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::post()
+                    .uri("/eav/schemas/invoice/migrate")
+                    .set_json(json!({"target_version": 2})),
+                &token,
+            )
+            .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let report: Value = actix_test::read_body_json(res).await;
+        assert_eq!(report["scanned"], 1);
+        assert_eq!(report["migrated"], 1);
+        assert_eq!(report["unchanged"], 0);
+        assert_eq!(report["dry_run"], true);
+        let entity = fx
+            .runtime
+            .entities()
+            .get("e1")
+            .await?
+            .expect("entity exists");
+        assert_eq!(entity.version, 1);
+        assert_eq!(entity.schemas[0].version, 1);
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::post()
+                    .uri("/eav/schemas/invoice/migrate")
+                    .set_json(json!({
+                        "target_version": 2,
+                        "limit": 100,
+                        "dry_run": false
+                    })),
+                &token,
+            )
+            .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let report: Value = actix_test::read_body_json(res).await;
+        assert_eq!(report["migrated"], 1);
+        assert_eq!(report["dry_run"], false);
+        let entity = fx
+            .runtime
+            .entities()
+            .get("e1")
+            .await?
+            .expect("entity exists");
+        assert_eq!(entity.version, 2);
+        assert_eq!(entity.schemas[0].version, 2);
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn schema_migration_with_a_missing_version_is_404() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        assert!(fx.engine.claim_superadmin("alice").await?);
+        publish_schema_version(&fx, "invoice", vec![attr("total", AttributeType::Integer)]).await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::post()
+                    .uri("/eav/schemas/invoice/migrate")
+                    .set_json(json!({"target_version": 9})),
+                &token,
+            )
+            .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::NOT_FOUND);
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn schema_migration_rejects_an_invalid_limit() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        assert!(fx.engine.claim_superadmin("alice").await?);
+        publish_schema_version(&fx, "invoice", vec![attr("total", AttributeType::Integer)]).await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+
+        for limit in [0, 501] {
+            let res = actix_test::call_service(
+                &app,
+                auth(
+                    actix_test::TestRequest::post()
+                        .uri("/eav/schemas/invoice/migrate")
+                        .set_json(json!({"target_version": 1, "limit": limit})),
+                    &token,
+                )
+                .to_request(),
+            )
+            .await;
+            assert_eq!(res.status(), http::StatusCode::BAD_REQUEST, "limit {limit}");
+            let body: crate::http::error::ErrorBody = actix_test::read_body_json(res).await;
+            assert_eq!(
+                body.code.as_deref(),
+                Some("invalid_request"),
+                "limit {limit}"
+            );
+        }
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn schema_migration_requires_write_on_schemas_and_entities() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        publish_schema_version(&fx, "invoice", vec![attr("total", AttributeType::Integer)]).await?;
+        fx.runtime
+            .entities()
+            .create(
+                EntityDraft {
+                    id: "e1".to_string(),
+                    schemas: vec!["invoice".to_string()],
+                    attributes: [("total".to_string(), AttributeValue::Integer(10))]
+                        .into_iter()
+                        .collect(),
+                },
+                &WriteContext::new("alice"),
+            )
+            .await?;
+        publish_schema_version(
+            &fx,
+            "invoice",
+            vec![
+                attr("total", AttributeType::Integer),
+                attr("memo", AttributeType::String),
+            ],
+        )
+        .await?;
+
+        fx.engine
+            .assign_group("carol".into(), "schema-writers".into())
+            .await?;
+        fx.engine
+            .add_rule("schema-writers".into(), "eav_schemas".into(), Action::Write)
+            .await?;
+        fx.engine
+            .assign_group("dave".into(), "entity-writers".into())
+            .await?;
+        fx.engine
+            .add_rule(
+                "entity-writers".into(),
+                "eav_entities".into(),
+                Action::Write,
+            )
+            .await?;
+        fx.engine
+            .assign_group("erin".into(), "migration-writers".into())
+            .await?;
+        fx.engine
+            .add_rule(
+                "migration-writers".into(),
+                "eav_schemas".into(),
+                Action::Write,
+            )
+            .await?;
+        fx.engine
+            .add_rule(
+                "migration-writers".into(),
+                "eav_entities".into(),
+                Action::Write,
+            )
+            .await?;
+
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+
+        for sub in ["carol", "dave"] {
+            let res = actix_test::call_service(
+                &app,
+                auth(
+                    actix_test::TestRequest::post()
+                        .uri("/eav/schemas/invoice/migrate")
+                        .set_json(json!({"target_version": 2})),
+                    &fx.token(sub)?,
+                )
+                .to_request(),
+            )
+            .await;
+            assert_eq!(res.status(), http::StatusCode::FORBIDDEN, "{sub}");
+        }
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::post()
+                    .uri("/eav/schemas/invoice/migrate")
+                    .set_json(json!({"target_version": 2})),
+                &fx.token("erin")?,
+            )
+            .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::OK);
         Ok(())
     }
 }
