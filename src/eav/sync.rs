@@ -82,7 +82,7 @@ pub struct SnapshotPage {
     ///
     /// The value comes from the raw page length, not from `items`.
     /// A filtered page can then hold fewer items than the limit.
-    /// Fetch the next page and stop when the page is empty.
+    /// Continue while `next_offset` is `Some`.
     pub next_offset: Option<usize>,
     /// The head of the change log at the time of the call.
     ///
@@ -913,6 +913,7 @@ mod tests {
         let paths = spec["paths"].as_object().expect("paths");
         assert!(paths.contains_key("/eav/sync/status"));
         assert!(paths.contains_key("/eav/sync/events"));
+        assert!(paths.contains_key("/eav/sync/snapshot"));
         let schemas = spec["components"]["schemas"]
             .as_object()
             .expect("component schemas");
@@ -921,6 +922,7 @@ mod tests {
             "SyncEvent",
             "SyncEventsResponse",
             "SyncEventsQuery",
+            "SnapshotPage",
             "EntityEvent",
             "AttributeChange",
         ] {
