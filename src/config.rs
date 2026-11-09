@@ -348,6 +348,9 @@ impl Config {
         if self.eav.timer_batch == 0 {
             anyhow::bail!("eav.timer_batch must be greater than 0");
         }
+        for host in &self.eav.webhook_allowed_hosts {
+            validate_webhook_allowed_host(host)?;
+        }
         #[cfg(feature = "queue-rabbitmq")]
         if let Some(url) = &self.rabbitmq.url {
             let parsed: url::Url = url
@@ -560,6 +563,13 @@ pub struct EavConfig {
     /// Largest number of due entities to read for each time index key.
     #[serde(default = "default_eav_timer_batch")]
     pub timer_batch: usize,
+    /// The hosts that a webhook rule can call.
+    ///
+    /// Each entry is a host or a `host:port` pair.
+    /// The value is empty by default.
+    /// An empty list rejects every webhook rule.
+    #[serde(default)]
+    pub webhook_allowed_hosts: Vec<String>,
 }
 
 impl Default for EavConfig {
@@ -571,6 +581,7 @@ impl Default for EavConfig {
     /// The marker cleanup runs every hour.
     /// Execution markers stay for 30 days.
     /// The timer pass runs every second and reads 100 entities for each key.
+    /// The webhook allowlist is empty.
     fn default() -> Self {
         Self {
             enabled: false,
@@ -580,6 +591,7 @@ impl Default for EavConfig {
             execution_retention_secs: default_eav_execution_retention_secs(),
             timer_interval_ms: default_eav_timer_interval_ms(),
             timer_batch: default_eav_timer_batch(),
+            webhook_allowed_hosts: Vec::new(),
         }
     }
 }
@@ -622,6 +634,41 @@ fn default_eav_timer_interval_ms() -> u64 {
 
 fn default_eav_timer_batch() -> usize {
     100
+}
+
+/// Checks one webhook allowlist entry.
+///
+/// The value must be a host with an optional port.
+/// It must not hold a scheme, a path, whitespace, or user information.
+fn validate_webhook_allowed_host(entry: &str) -> anyhow::Result<()> {
+    if entry.is_empty() {
+        anyhow::bail!("eav.webhook_allowed_hosts has an empty entry");
+    }
+    if entry.chars().any(char::is_whitespace) {
+        anyhow::bail!("eav.webhook_allowed_hosts entry {entry:?} contains whitespace");
+    }
+    if entry.contains('@') {
+        anyhow::bail!("eav.webhook_allowed_hosts entry {entry:?} contains user information");
+    }
+    if entry.contains('/') || entry.contains('?') || entry.contains('#') {
+        anyhow::bail!(
+            "eav.webhook_allowed_hosts entry {entry:?} must not contain a scheme or a path"
+        );
+    }
+    let candidate = if entry.matches(':').count() > 1 && !entry.starts_with('[') {
+        format!("http://[{entry}]")
+    } else {
+        format!("http://{entry}")
+    };
+    let parsed = url::Url::parse(&candidate).map_err(|_| {
+        anyhow::anyhow!("eav.webhook_allowed_hosts entry {entry:?} is not a valid host")
+    })?;
+    if parsed.host_str().is_none() || parsed.path() != "/" {
+        anyhow::bail!(
+            "eav.webhook_allowed_hosts entry {entry:?} is not a valid host with an optional port"
+        );
+    }
+    Ok(())
 }
 
 /// Signing keys for the capability token, which is a file delegation JWT.
@@ -1272,6 +1319,7 @@ mod tests {
         assert_eq!(cfg.eav.execution_retention_secs, 2_592_000);
         assert_eq!(cfg.eav.timer_interval_ms, 1000);
         assert_eq!(cfg.eav.timer_batch, 100);
+        assert!(cfg.eav.webhook_allowed_hosts.is_empty());
         assert_eq!(cfg.eav, EavConfig::default());
     }
 
@@ -1282,7 +1330,8 @@ mod tests {
             "region = \"us-east-1\"\n[eav]\nenabled = true\n\
              outbox_interval_ms = 2500\nrule_poll_interval_ms = 50\n\
              gc_interval_ms = 9000\nexecution_retention_secs = 120\n\
-             timer_interval_ms = 750\ntimer_batch = 25",
+             timer_interval_ms = 750\ntimer_batch = 25\n\
+             webhook_allowed_hosts = [\"example.com\", \"example.com:8443\"]",
         );
         let cfg = parse(&toml).expect("explicit EAV values must parse");
 
@@ -1293,6 +1342,10 @@ mod tests {
         assert_eq!(cfg.eav.execution_retention_secs, 120);
         assert_eq!(cfg.eav.timer_interval_ms, 750);
         assert_eq!(cfg.eav.timer_batch, 25);
+        assert_eq!(
+            cfg.eav.webhook_allowed_hosts,
+            vec!["example.com".to_string(), "example.com:8443".to_string()]
+        );
         let runtime = cfg.eav.runtime_config();
         assert_eq!(runtime.outbox_interval, Duration::from_millis(2500));
         assert_eq!(runtime.rule_poll_interval, Duration::from_millis(50));
@@ -1300,6 +1353,28 @@ mod tests {
         assert_eq!(runtime.execution_retention, Duration::from_secs(120));
         assert_eq!(runtime.timer_interval, Duration::from_millis(750));
         assert_eq!(runtime.timer_batch, 25);
+    }
+
+    #[test]
+    fn an_invalid_webhook_allowed_host_fails() {
+        for entry in [
+            "",
+            "https://example.com",
+            "example.com/path",
+            "exam ple.com",
+            "user@example.com",
+            "example.com:99999",
+        ] {
+            let toml = minimal_toml().replace(
+                "region = \"us-east-1\"",
+                &format!("region = \"us-east-1\"\n[eav]\nwebhook_allowed_hosts = [{entry:?}]"),
+            );
+            let err = validation_error(&toml);
+            assert!(
+                err.contains("eav.webhook_allowed_hosts"),
+                "entry {entry:?} must name its field, got: {err}"
+            );
+        }
     }
 
     #[test]
