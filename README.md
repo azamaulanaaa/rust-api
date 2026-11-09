@@ -19,7 +19,7 @@ For module documentation, run `cargo doc --no-deps --open`. Start with [`http`](
 | Section | What it covers |
 |---|---|
 | [Quickstart](#quickstart) | Zero to a working API call |
-| [Concepts](#concepts) | Modules, auth, files, sync, queues, and hooks |
+| [Concepts](#concepts) | Modules, auth, files, sync, EAV, rules, queues, and hooks |
 | [API reference](#api-reference) | Endpoints, errors, OpenAPI, versioning, renewal |
 | [Client integration](#client-integration) | SPA contract, flow, TypeScript example, sync contract |
 | [Configuration](#configuration) | Config file, environment overrides, limits |
@@ -124,6 +124,8 @@ Each module brings its own middleware. Modules that need a subject require valid
 | `fs` | Multipart uploads, temp files, relations, capability tokens, garbage collection |
 | `sync` | Replica manager, WAL, `/sync/*` |
 | `records` | Change-feed types: `FileRecord`, `WalOp`, `ChangeSink` |
+| `eav` | Versioned EAV schemas, entity store, change feed, per-user replicas, `/eav/*` |
+| `rules` | Rule store, runner, built-in actions, webhook delivery |
 | `queue` | Queue traits, memory and durable backends, worker, RabbitMQ seam |
 | `reactive` | Extension point for store hooks and background services |
 | `audit` | `AuditEvent`, `AuditSink`, and a tracing sink |
@@ -228,7 +230,47 @@ The job queue lives in `src/queue.rs`. It provides `MemoryQueue` for tests, `Dur
 
 `audit::AuditEvent` and `audit::AuditSink` record mutations. `TracingAuditSink` writes each event at info level. The binary does not install a sink. `retry::retry_with_backoff` retries transient failures with exponential backoff.
 
-The crate does not ship external event delivery (webhooks), HTTP request idempotency-key storage, or soft delete. If an application adds them, deliver events at least once and make receivers idempotent on a stable event id. Replay the stored response for a repeated idempotency key, and reject a different payload with the same key as a conflict. Detach files when a row is soft-deleted, and keep the tombstone TTL and the 24-hour orphan TTL ordered, so a restore does not find the bytes already collected.
+The crate does not ship HTTP request idempotency-key storage or soft delete. If an application adds them, replay the stored response for a repeated idempotency key, and reject a different payload with the same key as a conflict. Detach files when a row is soft-deleted, and keep the tombstone TTL and the 24-hour orphan TTL ordered, so a restore does not find the bytes already collected.
+
+### Entity-attribute-value (EAV)
+
+The `eav` module supplies generic entity storage. It adds no business rules.
+
+The schema registry stores immutable schema versions. A schema can extend other schemas. The registry flattens the inheritance chain into one effective schema for each version. A child attribute can override an inherited attribute of the same type. A different type is a conflict. An inheritance path is limited to 16 schemas.
+
+The entity store keeps validated entities with typed attributes. An entity pins one or more exact schema versions. The store checks every attribute against the merged effective schema. It keeps schema, attribute, and unique indexes.
+
+The `/eav` management API covers schemas, entities, and rules. List routes use paging. `limit` defaults to 50 and cannot exceed 200. `offset` defaults to 0.
+
+Schema evolution has three steps. `GET /eav/schemas/{id}/diff` reports added, removed, and changed attributes and marks breaking changes. `POST /eav/schemas/{id}/revalidate` checks stored entities against a target version without a write. `POST /eav/schemas/{id}/migrate` repins stored entities to a target version. A migration is a dry run unless `dry_run` is false.
+
+The entity store writes one change event to an outbox row in the same transaction as the entity data. A background relay flushes the outbox to the shared change feed. Delivery is at least once, so a consumer must be idempotent. Clients read the feed through `/eav/sync/events` and load the initial state through `/eav/sync/snapshot`.
+
+The module also stores one per-user entity replica. `POST /eav/sync/replica` builds a point-in-time JSON snapshot of the entities that the caller can read. The client then applies the entity change feed after the stored head. This replica differs from the file replica under `/sync`. The `/sync` replica mirrors file records and relations as prefix-scoped store objects. The EAV replica is one JSON snapshot in the EAV replica store. It is not an incremental store.
+
+### Rules and automation
+
+The `rules` module runs actions for entity events. It adds no business rules.
+
+A rule has a trigger, a condition, and an action reference. The trigger selects event kinds and schemas. The condition tests entity state and the changed attributes. A condition tree is limited to 16 levels. The action reference names one registered action and holds its parameters.
+
+The durable rule store lives on OxKV and keeps an index for each trigger event and schema pair. The runner tails the shared change feed and runs the matching enabled rules in priority order.
+
+| Action | Effect |
+|---|---|
+| `noop` | Changes no state. Use it in tests and dry runs. |
+| `log` | Writes one log line with the rule and event identifiers. |
+| `webhook` | Posts one JSON event to an allowlisted host. |
+
+The webhook action uses a strict host allowlist. Each entry is a host or a `host:port` pair. The client follows no redirects. It accepts `http` only for a loopback host. When a signing secret is set, the action sends `X-Signature: sha256=<hex>` over the exact body bytes. The action can send directly or enqueue a durable `webhook.deliver` job. The queue retries a failed job up to `webhook_max_attempts` and then dead-letters it. The job idempotency key deduplicates one rule and one event. The receiver must deduplicate on the `X-Event-Id` header.
+
+The runtime also processes timers. A timestamp attribute with an index forms a time index. Each pass emits one timer event for each due timestamp value. A fired marker stops a duplicate event for the same entity, key, and value. A new timestamp value allows a new timer event.
+
+Delivery is at least once, so every action must be idempotent. A successful action writes one execution marker for the rule and event. A later delivery skips that pair. A failed action writes no marker, so a retry can run it again. The runtime deletes markers after `execution_retention_secs`.
+
+An action can write an entity, and that write can start another rule. The causation depth stops such a chain. The default maximum depth is 8 and is inclusive. An event above the maximum runs no action and writes no marker.
+
+Metrics cover rule execution (`eav.rules.executed`, `eav.rules.failed`) and webhook delivery (`eav.webhook.delivered`, `eav.webhook.failed`, `eav.webhook.delivery_duration`).
 
 ## API reference
 
@@ -267,6 +309,32 @@ The crate does not ship external event delivery (webhooks), HTTP request idempot
 | GET | `/sync/status` | Replica pointer and coverage `ETag` | session |
 | POST | `/sync/sync` | Advance the replica toward the WAL head | session |
 | GET | `/sync/db/{object}` | One replica object with `ETag` and `If-None-Match` | session |
+| POST | `/eav/schemas` | Publish a new immutable schema version | session |
+| GET | `/eav/schemas` | Paged list of the latest schema version per schema | session |
+| GET | `/eav/schemas/{id}` | Get the latest version of a schema | session |
+| GET | `/eav/schemas/{id}/versions/{version}` | Get one exact schema version | session |
+| GET | `/eav/schemas/{id}/effective/{version}` | Get one version with inherited attributes flattened | session |
+| GET | `/eav/schemas/{id}/children` | List the schemas whose latest version extends this schema | session |
+| GET | `/eav/schemas/{id}/diff` | Compare two effective schema versions with `from` and `to` | session |
+| POST | `/eav/schemas/{id}/revalidate` | Check stored entities against a target version without a write | session |
+| POST | `/eav/schemas/{id}/migrate` | Repin stored entities to a target version. The default is a dry run. | session |
+| POST | `/eav/entities` | Create one validated entity | session |
+| GET | `/eav/entities` | Paged list of entities | session |
+| GET | `/eav/entities/{id}` | Get one entity | session |
+| PATCH | `/eav/entities/{id}` | Update attributes with an expected version | session |
+| DELETE | `/eav/entities/{id}` | Delete one entity with `expected_version` | session |
+| GET | `/eav/schemas/{id}/entities` | Paged list of the entities that pin a schema | session |
+| POST | `/eav/rules` | Create or replace one rule | session |
+| GET | `/eav/rules` | Paged list of rules | session |
+| GET | `/eav/rules/{id}` | Get one rule | session |
+| DELETE | `/eav/rules/{id}` | Delete one rule | session |
+| POST | `/eav/rules/{id}/enabled` | Enable or disable one rule | session |
+| GET | `/eav/sync/status` | Entity change feed head with `ETag` | session |
+| GET | `/eav/sync/events` | Entity events after a `since` cursor | session |
+| GET | `/eav/sync/snapshot` | One page of entity state for an offline client | session |
+| POST | `/eav/sync/replica` | Build and store the caller's entity replica | session |
+| GET | `/eav/sync/replica` | Read the caller's stored entity replica | session |
+| GET | `/eav/sync/replica/status` | Change feed head and stored replica head | session |
 | GET | `/openapi.json` | OpenAPI 3.1 document | none |
 | GET | `/swagger-ui/` | Swagger UI for the document | none |
 
@@ -529,6 +597,25 @@ All limits default to off (`0`). Choose values for your egress budget and client
 `max_concurrent_downloads` is the control that matters. One replica object can be a multi-hundred-megabyte SST read. A rate limit does not bound concurrent reads. The response body holds the permit, so a client that stops reading keeps its slot until it disconnects.
 
 The rate limiter keys on the peer address, not the subject. Clients behind one NAT share a budget. See module `limits` in the rustdoc.
+
+### EAV and rules
+
+The `[eav]` section controls the optional EAV runtime and the webhook action. `[eav].enabled` gates the runtime. The default is `false`, so the server starts no EAV background loops and mounts no `/eav` module.
+
+| Key | Default | Effect |
+|---|---|---|
+| `enabled` | `false` | Starts the EAV runtime and the `/eav` module. |
+| `outbox_interval_ms` | `1000` | Pause between entity outbox flushes. |
+| `rule_poll_interval_ms` | `200` | Pause between rule runner polls. |
+| `gc_interval_ms` | `3600000` | Pause between execution marker cleanups. |
+| `execution_retention_secs` | `2592000` | Retention window for execution markers. |
+| `timer_interval_ms` | `1000` | Pause between due timer passes. |
+| `timer_batch` | `100` | Largest number of due entities read for each time index key. |
+| `webhook_allowed_hosts` | empty | Hosts that a webhook rule can call. Each entry is a host or a `host:port` pair. |
+| `webhook_signing_secret` | none | Optional HMAC-SHA256 secret of at least 32 bytes. When set, adds the `X-Signature` header. |
+| `webhook_max_attempts` | `5` | Maximum delivery attempts for one webhook job, from 1 to 20. |
+
+The webhook allowlist is empty by default. Every webhook rule is rejected until an operator adds a host. A webhook job that uses all of its attempts is dead-lettered.
 
 ## Operations
 
