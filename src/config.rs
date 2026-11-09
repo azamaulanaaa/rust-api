@@ -5,7 +5,7 @@
 //! over the value in the file. See [`ENV_CLIENT_SECRET`],
 //! [`ENV_S3_ACCESS_KEY_ID`], and [`ENV_S3_SECRET_ACCESS_KEY`].
 
-use std::{fs, path::Path};
+use std::{fs, path::Path, time::Duration};
 
 use anyhow::Context;
 use serde::Deserialize;
@@ -41,6 +41,9 @@ pub struct Config {
     /// Cost limits. Each limit is off by default. See [`LimitsConfig`].
     #[serde(default)]
     pub limits: LimitsConfig,
+    /// EAV background runtime settings. The runtime is off by default.
+    #[serde(default)]
+    pub eav: EavConfig,
 
     /// RabbitMQ connection settings. Only present with the
     /// `queue-rabbitmq` cargo feature.
@@ -327,6 +330,12 @@ impl Config {
                 );
             }
         }
+        if self.eav.outbox_interval_ms == 0 {
+            anyhow::bail!("eav.outbox_interval_ms must be greater than 0");
+        }
+        if self.eav.rule_poll_interval_ms == 0 {
+            anyhow::bail!("eav.rule_poll_interval_ms must be greater than 0");
+        }
         #[cfg(feature = "queue-rabbitmq")]
         if let Some(url) = &self.rabbitmq.url {
             let parsed: url::Url = url
@@ -510,6 +519,58 @@ impl LimitsConfig {
             self.rate_burst
         }
     }
+}
+
+/// Settings for the optional EAV background runtime.
+///
+/// The runtime is off by default.
+/// When it is on, it relays the entity outbox and runs matching rules.
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct EavConfig {
+    /// Starts the EAV runtime when true.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Pause in milliseconds between outbox flushes.
+    #[serde(default = "default_eav_outbox_interval_ms")]
+    pub outbox_interval_ms: u64,
+    /// Pause in milliseconds between rule runner polls.
+    #[serde(default = "default_eav_rule_poll_interval_ms")]
+    pub rule_poll_interval_ms: u64,
+}
+
+impl Default for EavConfig {
+    /// Returns the default settings.
+    ///
+    /// The runtime is off.
+    /// The outbox relay runs every second.
+    /// The rule runner polls every 200 milliseconds.
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            outbox_interval_ms: default_eav_outbox_interval_ms(),
+            rule_poll_interval_ms: default_eav_rule_poll_interval_ms(),
+        }
+    }
+}
+
+impl EavConfig {
+    /// Converts the settings into an [`EavRuntimeConfig`].
+    ///
+    /// [`EavRuntimeConfig`]: rust_api::eav::runtime::EavRuntimeConfig
+    pub fn runtime_config(&self) -> rust_api::eav::runtime::EavRuntimeConfig {
+        rust_api::eav::runtime::EavRuntimeConfig {
+            outbox_interval: Duration::from_millis(self.outbox_interval_ms),
+            rule_poll_interval: Duration::from_millis(self.rule_poll_interval_ms),
+        }
+    }
+}
+
+fn default_eav_outbox_interval_ms() -> u64 {
+    1000
+}
+
+fn default_eav_rule_poll_interval_ms() -> u64 {
+    200
 }
 
 /// Signing keys for the capability token, which is a file delegation JWT.
@@ -1141,6 +1202,64 @@ mod tests {
     /// The lease TTL decides how long a crashed writer blocks its
     /// replacement. The default must therefore be a real value, not zero. A
     /// value of zero silently disables single-writer enforcement.
+    #[test]
+    fn the_eav_section_is_optional() {
+        // A config without an [eav] section parses.
+        let cfg = parse(&minimal_toml()).expect("the EAV section is optional");
+
+        assert!(!cfg.eav.enabled);
+    }
+
+    #[test]
+    fn eav_defaults_apply() {
+        let cfg = parse(&minimal_toml()).expect("should parse");
+
+        assert!(!cfg.eav.enabled);
+        assert_eq!(cfg.eav.outbox_interval_ms, 1000);
+        assert_eq!(cfg.eav.rule_poll_interval_ms, 200);
+        assert_eq!(cfg.eav, EavConfig::default());
+    }
+
+    #[test]
+    fn explicit_eav_values_parse() {
+        let toml = minimal_toml().replace(
+            "region = \"us-east-1\"",
+            "region = \"us-east-1\"\n[eav]\nenabled = true\n\
+             outbox_interval_ms = 2500\nrule_poll_interval_ms = 50",
+        );
+        let cfg = parse(&toml).expect("explicit EAV values must parse");
+
+        assert!(cfg.eav.enabled);
+        assert_eq!(cfg.eav.outbox_interval_ms, 2500);
+        assert_eq!(cfg.eav.rule_poll_interval_ms, 50);
+        let runtime = cfg.eav.runtime_config();
+        assert_eq!(runtime.outbox_interval, Duration::from_millis(2500));
+        assert_eq!(runtime.rule_poll_interval, Duration::from_millis(50));
+    }
+
+    #[test]
+    fn a_zero_eav_interval_fails() {
+        let bad_outbox = minimal_toml().replace(
+            "region = \"us-east-1\"",
+            "region = \"us-east-1\"\n[eav]\noutbox_interval_ms = 0",
+        );
+        let err = validation_error(&bad_outbox);
+        assert!(
+            err.contains("eav.outbox_interval_ms"),
+            "a zero outbox interval must name its field, got: {err}"
+        );
+
+        let bad_poll = minimal_toml().replace(
+            "region = \"us-east-1\"",
+            "region = \"us-east-1\"\n[eav]\nrule_poll_interval_ms = 0",
+        );
+        let err = validation_error(&bad_poll);
+        assert!(
+            err.contains("eav.rule_poll_interval_ms"),
+            "a zero rule poll interval must name its field, got: {err}"
+        );
+    }
+
     #[test]
     fn writer_lease_ttl_defaults_on_and_can_be_disabled() {
         let cfg = parse(&minimal_toml()).expect("should parse");
