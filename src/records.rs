@@ -35,9 +35,9 @@
 //!
 //! The feed carries three families of operation:
 //!
-//! - File and relation operations, such as [`WalOp::FileCreate`].
-//! - Policy operations, such as [`WalOp::PolicyRuleAdd`].
-//! - Entity operations, which carry one [`EntityEvent`].
+//! - File and relation operations, such as [`WalOp::FileCreate`](crate::records::WalOp::FileCreate).
+//! - Policy operations, such as [`WalOp::PolicyRuleAdd`](crate::records::WalOp::PolicyRuleAdd).
+//! - Entity operations, which carry one [`EntityEvent`](crate::records::EntityEvent).
 //!
 //! An entity operation records one change to one entity. The event states
 //! what changed and when. The record holds no entity data and no validation.

@@ -223,7 +223,7 @@ impl WebhookJobHandler {
     /// Creates a handler from the HTTP client and the signing secret.
     ///
     /// The handler starts with an empty allowlist.
-    /// Use [`WebhookJobHandler::with_allowed_hosts`] to add entries.
+    /// Use [`WebhookAction::job_handler`](crate::rules::webhook::WebhookAction::job_handler) to add allowlist entries.
     pub fn new(client: reqwest::Client, signing_secret: Option<Vec<u8>>) -> Self {
         Self {
             allowed_hosts: Vec::new(),
