@@ -116,7 +116,10 @@ impl ApiModule for EavApiModule {
             .service(set_rule_enabled)
             .service(crate::eav::sync::status)
             .service(crate::eav::sync::events)
-            .service(crate::eav::sync::snapshot);
+            .service(crate::eav::sync::snapshot)
+            .service(crate::eav::sync::build_replica)
+            .service(crate::eav::sync::replica)
+            .service(crate::eav::sync::replica_status);
         cfg.service(scope);
     }
 }
@@ -963,6 +966,8 @@ mod tests {
         "/eav/sync/status",
         "/eav/sync/events",
         "/eav/sync/snapshot",
+        "/eav/sync/replica",
+        "/eav/sync/replica/status",
     ];
 
     /// A no-op action for the route tests.

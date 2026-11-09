@@ -59,6 +59,9 @@ use utoipa::OpenApi;
         crate::eav::sync::status,
         crate::eav::sync::events,
         crate::eav::sync::snapshot,
+        crate::eav::sync::build_replica,
+        crate::eav::sync::replica,
+        crate::eav::sync::replica_status,
     ),
     components(schemas(
         crate::eav::schema::SchemaDraft,
@@ -89,6 +92,8 @@ use utoipa::OpenApi;
         crate::eav::sync::SyncEventsResponse,
         crate::eav::sync::SyncEventsQuery,
         crate::eav::sync::SnapshotPage,
+        crate::eav::sync::ReplicaBuildResponse,
+        crate::eav::sync::ReplicaStatusResponse,
         crate::rules::rule::RuleDraft,
         crate::rules::rule::Rule,
         crate::rules::rule::RuleTrigger,
@@ -200,6 +205,8 @@ mod tests {
             "SyncEventsResponse",
             "SyncEventsQuery",
             "SnapshotPage",
+            "ReplicaBuildResponse",
+            "ReplicaStatusResponse",
         ] {
             assert!(schemas.contains_key(name), "spec missing {name}");
         }
@@ -262,6 +269,8 @@ mod tests {
             "/eav/sync/status",
             "/eav/sync/events",
             "/eav/sync/snapshot",
+            "/eav/sync/replica",
+            "/eav/sync/replica/status",
         ] {
             assert!(paths.contains_key(route), "spec missing {route}");
         }
