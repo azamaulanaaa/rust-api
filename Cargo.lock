@@ -2947,6 +2947,7 @@ dependencies = [
  "clap",
  "futures-channel",
  "futures-util",
+ "hmac",
  "jsonwebtoken",
  "object_store",
  "openidconnect",
