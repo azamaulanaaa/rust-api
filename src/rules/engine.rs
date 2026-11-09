@@ -8,8 +8,9 @@
 //! An action can write an entity.
 //! That write can create another event, and that event can match a rule
 //! again.
-//! This module has no loop guard.
-//! A later issue must add a causation-depth guard.
+//! A causation-depth guard stops such a chain.
+//! The maximum depth is inclusive.
+//! A depth above the maximum is a runaway chain.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -27,6 +28,11 @@ use crate::rules::rule::validate_identifier;
 use crate::rules::store::RuleStore;
 use crate::sync::wal::Wal;
 
+/// The default maximum causation depth.
+///
+/// A chain deeper than this value is a runaway chain.
+const DEFAULT_MAX_CAUSATION_DEPTH: u32 = 8;
+
 /// The result of one rule for one event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecutionOutcome {
@@ -36,6 +42,10 @@ pub enum ExecutionOutcome {
     ConditionFalse,
     /// An execution marker already exists, so the engine ran no action.
     AlreadyExecuted,
+    /// The event depth is above the maximum, so the engine ran no action.
+    ///
+    /// The engine wrote no execution marker.
+    CausationLimit,
 }
 
 /// One rule result from [`RuleEngine::process`].
@@ -60,6 +70,11 @@ pub struct RuleEngine {
     entities: EntityStore,
     /// The registered actions, keyed by kind.
     actions: HashMap<String, Arc<dyn RuleAction>>,
+    /// The maximum causation depth that can run an action.
+    ///
+    /// The maximum is inclusive.
+    /// A depth above the maximum is a runaway chain.
+    max_causation_depth: u32,
     /// Serializes processing, so one rule and one event run one time.
     process_lock: Arc<Mutex<()>>,
 }
@@ -89,8 +104,18 @@ impl RuleEngine {
             rules,
             entities,
             actions: by_kind,
+            max_causation_depth: DEFAULT_MAX_CAUSATION_DEPTH,
             process_lock: Arc::new(Mutex::new(())),
         })
+    }
+
+    /// Sets the maximum causation depth.
+    ///
+    /// The maximum is inclusive.
+    /// A depth above the maximum is a runaway chain.
+    pub fn with_max_causation_depth(mut self, max: u32) -> Self {
+        self.max_causation_depth = max;
+        self
     }
 
     /// Runs the matching rules for one entity event.
@@ -98,7 +123,10 @@ impl RuleEngine {
     /// The call loads the current entity first.
     /// A deleted entity gives `None`.
     /// It then lists the enabled matching rules in priority order.
-    /// For each rule it checks the execution marker, evaluates the
+    /// If the event depth is above the maximum, it returns one
+    /// [`ExecutionOutcome::CausationLimit`] for each matching rule.
+    /// It then runs no action and writes no marker.
+    /// Otherwise, for each rule it checks the execution marker, evaluates the
     /// condition, finds the action, and calls the action.
     /// A successful action writes the marker for this rule and event.
     /// A failed action writes no marker, so a later retry can run it again.
@@ -110,6 +138,15 @@ impl RuleEngine {
             .await
             .map_err(map_entity_error)?;
         let rules = self.rules.matching(event).await?;
+        if event.causation_depth > self.max_causation_depth {
+            return Ok(rules
+                .into_iter()
+                .map(|rule| RuleExecution {
+                    rule_id: rule.id,
+                    outcome: ExecutionOutcome::CausationLimit,
+                })
+                .collect());
+        }
         let mut executions = Vec::with_capacity(rules.len());
 
         for rule in rules {
@@ -367,7 +404,9 @@ mod tests {
             changed: Vec::new(),
             actor: "tester".to_string(),
             causation_id: None,
+            causation_depth: 0,
             correlation_id: "req-1".to_string(),
+            snapshot: None,
             occurred_at: 1,
         }
     }
@@ -446,6 +485,108 @@ mod tests {
         assert_eq!(executions[0].outcome, ExecutionOutcome::ConditionFalse);
         assert!(recorder.records().is_empty());
         assert!(!stores.rules.is_executed("alpha", "evt-1").await.unwrap());
+    }
+
+    /// A depth equal to the maximum still runs the action.
+    ///
+    /// The maximum is inclusive.
+    #[tokio::test]
+    async fn a_depth_equal_to_the_maximum_runs_the_action() {
+        let stores = stores().await;
+        let recorder = Arc::new(RecordingAction::new("record"));
+        let engine = engine(&stores, vec![recorder.clone()]).with_max_causation_depth(2);
+        make_entity(&stores.entities).await;
+        stores.rules.upsert(draft("alpha", "record")).await.unwrap();
+        let mut ev = event(EntityEventKind::Created);
+        ev.causation_depth = 2;
+
+        let executions = engine.process(&ev).await.unwrap();
+
+        assert_eq!(executions[0].outcome, ExecutionOutcome::Executed);
+        assert_eq!(recorder.records().len(), 1);
+    }
+
+    /// A depth above the maximum returns `CausationLimit`.
+    ///
+    /// The engine runs no action and writes no marker.
+    #[tokio::test]
+    async fn a_depth_above_the_maximum_returns_causation_limit() {
+        let stores = stores().await;
+        let recorder = Arc::new(RecordingAction::new("record"));
+        let engine = engine(&stores, vec![recorder.clone()]).with_max_causation_depth(2);
+        make_entity(&stores.entities).await;
+        stores.rules.upsert(draft("alpha", "record")).await.unwrap();
+        let mut ev = event(EntityEventKind::Created);
+        ev.causation_depth = 3;
+
+        let executions = engine.process(&ev).await.unwrap();
+
+        assert_eq!(executions.len(), 1);
+        assert_eq!(executions[0].rule_id, "alpha");
+        assert_eq!(executions[0].outcome, ExecutionOutcome::CausationLimit);
+        assert!(recorder.records().is_empty());
+        assert!(!stores.rules.is_executed("alpha", "evt-1").await.unwrap());
+    }
+
+    /// `run` advances the cursor for an over-depth event.
+    ///
+    /// The guard returns a result, not an error.
+    /// The entry is therefore complete and the cursor can move.
+    #[tokio::test]
+    async fn run_advances_the_cursor_for_an_over_depth_event() {
+        let stores = stores().await;
+        let recorder = Arc::new(RecordingAction::new("record"));
+        let engine = engine(&stores, vec![recorder.clone()]).with_max_causation_depth(1);
+        make_entity(&stores.entities).await;
+        stores.rules.upsert(draft("alpha", "record")).await.unwrap();
+        let wal = test_wal().await;
+        let mut ev = event(EntityEventKind::Created);
+        ev.causation_depth = 2;
+        wal.append(WalOp::Entity { event: ev }).await.unwrap();
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let handle = tokio::spawn({
+            let engine = engine.clone();
+            let wal = wal.clone();
+            let cancel = cancel.clone();
+            async move { engine.run(&wal, cancel, Duration::from_millis(5)).await }
+        });
+
+        wait_for_cursor(&stores.rules, 1).await;
+        cancel.store(true, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        assert!(recorder.records().is_empty());
+        assert_eq!(stores.rules.cursor().await.unwrap(), 1);
+        assert!(!stores.rules.is_executed("alpha", "evt-1").await.unwrap());
+    }
+
+    /// The action helper adds one to the depth and carries the event id.
+    ///
+    /// An action that writes an entity must use this context.
+    #[tokio::test]
+    async fn child_write_context_increments_the_depth_and_carries_the_event_id() {
+        let stores = stores().await;
+        let recorder = Arc::new(RecordingAction::new("record"));
+        let engine = engine(&stores, vec![recorder.clone()]);
+        make_entity(&stores.entities).await;
+        stores.rules.upsert(draft("alpha", "record")).await.unwrap();
+
+        engine
+            .process(&event(EntityEventKind::Created))
+            .await
+            .unwrap();
+
+        let records = recorder.records();
+        let child = records[0].child_write_context("writer");
+
+        assert_eq!(child.actor, "writer");
+        assert_eq!(child.causation_id.as_deref(), Some("evt-1"));
+        assert_eq!(child.causation_depth, 1);
     }
 
     #[tokio::test]

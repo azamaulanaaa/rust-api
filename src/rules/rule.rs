@@ -167,28 +167,32 @@ pub enum Condition {
 impl Condition {
     /// Returns the result of this condition for `entity` and `event`.
     ///
-    /// A missing attribute makes `Compare` and `Exists` false.
+    /// `Compare` and `Exists` read `event.snapshot` when it is `Some`.
+    /// The event-time state then decides, not a newer entity.
+    /// They read the current entity only when the snapshot is `None`.
+    /// A missing attribute makes both conditions false.
     /// A deleted entity passes `None` as `entity`.
     /// In that case only [`Condition::Always`], [`Condition::Changed`], and
-    /// logical combinations can be true.
+    /// logical combinations can be true, unless the snapshot supplies the
+    /// attribute.
     pub fn eval(&self, entity: Option<&Entity>, event: &EntityEvent) -> bool {
         match self {
             Self::Always => true,
             Self::All(children) => children.iter().all(|child| child.eval(entity, event)),
             Self::Any(children) => children.iter().any(|child| child.eval(entity, event)),
             Self::Not(child) => !child.eval(entity, event),
-            Self::Compare { key, op, value } => {
-                let Some(entity) = entity else {
-                    return false;
-                };
-                let Some(actual) = entity.attributes.get(key) else {
-                    return false;
-                };
-                compare_values(&actual.as_json(), *op, value)
-            }
-            Self::Exists { key } => {
-                entity.is_some_and(|entity| entity.attributes.contains_key(key))
-            }
+            Self::Compare { key, op, value } => match &event.snapshot {
+                Some(snapshot) => snapshot
+                    .get(key)
+                    .is_some_and(|actual| compare_values(actual, *op, value)),
+                None => entity
+                    .and_then(|entity| entity.attributes.get(key))
+                    .is_some_and(|actual| compare_values(&actual.as_json(), *op, value)),
+            },
+            Self::Exists { key } => match &event.snapshot {
+                Some(snapshot) => snapshot.contains_key(key),
+                None => entity.is_some_and(|entity| entity.attributes.contains_key(key)),
+            },
             Self::Changed { key } => event.changed.iter().any(|change| change.key == *key),
         }
     }
@@ -351,7 +355,9 @@ mod tests {
                 .collect(),
             actor: "alice".to_string(),
             causation_id: None,
+            causation_depth: 0,
             correlation_id: "req-1".to_string(),
+            snapshot: None,
             occurred_at: 2,
         }
     }
@@ -513,6 +519,68 @@ mod tests {
                 key: "label".to_string()
             }
             .eval(Some(&e), &ev)
+        );
+    }
+
+    /// A snapshot decides the comparison, even when the entity has changed.
+    ///
+    /// The event-time state is the fact that the rule must see.
+    /// The current entity may already hold a newer value.
+    #[test]
+    fn a_condition_reads_the_snapshot_and_not_a_newer_entity() {
+        let e = entity(vec![("total", AttributeValue::Integer(20))]);
+        let mut ev = event(vec![]);
+        ev.snapshot = Some(BTreeMap::from([(
+            "total".to_string(),
+            serde_json::json!(10),
+        )]));
+
+        assert!(compare("total", CompareOp::Eq, serde_json::json!(10)).eval(Some(&e), &ev));
+        assert!(!compare("total", CompareOp::Eq, serde_json::json!(20)).eval(Some(&e), &ev));
+        assert!(
+            Condition::Exists {
+                key: "total".to_string()
+            }
+            .eval(Some(&e), &ev)
+        );
+    }
+
+    /// An old event has no snapshot, so the condition reads the entity.
+    ///
+    /// The fallback keeps an old durable event usable.
+    #[test]
+    fn an_old_event_without_a_snapshot_uses_the_current_entity() {
+        let e = entity(vec![("total", AttributeValue::Integer(20))]);
+        let ev = event(vec![]);
+        assert_eq!(ev.snapshot, None);
+
+        assert!(compare("total", CompareOp::Eq, serde_json::json!(20)).eval(Some(&e), &ev));
+        assert!(
+            Condition::Exists {
+                key: "total".to_string()
+            }
+            .eval(Some(&e), &ev)
+        );
+    }
+
+    /// A delete has no current entity, but its snapshot holds the before state.
+    ///
+    /// A rule can then compare the attributes that the delete removed.
+    #[test]
+    fn a_deleted_event_with_a_snapshot_compares_the_before_state() {
+        let mut ev = event(vec!["total"]);
+        ev.kind = EntityEventKind::Deleted;
+        ev.snapshot = Some(BTreeMap::from([(
+            "total".to_string(),
+            serde_json::json!(10),
+        )]));
+
+        assert!(compare("total", CompareOp::Eq, serde_json::json!(10)).eval(None, &ev));
+        assert!(
+            Condition::Exists {
+                key: "total".to_string()
+            }
+            .eval(None, &ev)
         );
     }
 
