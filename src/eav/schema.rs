@@ -268,6 +268,40 @@ impl SchemaRegistry {
         Ok(out)
     }
 
+    /// Lists one page of the latest schema versions.
+    ///
+    /// The result is sorted by id.
+    /// The call skips `offset` schemas.
+    /// It then loads at most `limit` versions.
+    /// A `limit` of 0 returns an empty list.
+    pub async fn list_page(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<SchemaDef>, SchemaError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let g = self.store.read().await;
+        let max = offset.saturating_add(limit);
+        let mut heads = scan_prefix_bounded(&*g, HEAD_PREFIX, max).await?;
+        heads.sort_by(|a, b| a.key.cmp(&b.key));
+        let mut out = Vec::with_capacity(limit.min(heads.len()));
+        for head in heads.iter().skip(offset).take(limit) {
+            let id = head
+                .key
+                .strip_prefix(HEAD_PREFIX)
+                .ok_or_else(|| SchemaError::Internal("schema head key is malformed".to_string()))?;
+            let version: u64 = serde_json::from_slice(&head.value)
+                .map_err(|e| SchemaError::Internal(e.to_string()))?;
+            let def = load_version(&*g, id, version).await?.ok_or_else(|| {
+                SchemaError::Internal("schema head points to a missing version".to_string())
+            })?;
+            out.push(def);
+        }
+        Ok(out)
+    }
+
     /// Reads one schema version with all inherited attributes flattened.
     ///
     /// The call returns `None` when the version does not exist.
@@ -494,6 +528,24 @@ where
     let cursor = (Some(prefix.to_string()), Some(prefix_scan_end(prefix)));
     store
         .gets_bytes(None, Direction::Next, cursor)
+        .await
+        .map_err(SchemaError::Store)
+}
+
+/// Scans at most `limit` rows of a key range that ends at the `prefix:` bound.
+async fn scan_prefix_bounded<S>(
+    store: &S,
+    prefix: &str,
+    limit: usize,
+) -> Result<Vec<KeyValue>, SchemaError>
+where
+    S: GetSet + ?Sized,
+{
+    debug_assert!(prefix.starts_with(SCHEMA_PREFIX));
+    let max = u32::try_from(limit).ok();
+    let cursor = (Some(prefix.to_string()), Some(prefix_scan_end(prefix)));
+    store
+        .gets_bytes(max, Direction::Next, cursor)
         .await
         .map_err(SchemaError::Store)
 }
@@ -816,6 +868,66 @@ mod tests {
         assert_eq!(ids, vec!["a", "b"]);
         assert_eq!(list[0].version, 2);
         assert_eq!(list[1].version, 1);
+    }
+
+    #[tokio::test]
+    async fn list_page_returns_the_first_page() {
+        let reg = new_registry().await;
+        for id in ["a", "b", "c", "d"] {
+            reg.publish(draft(id, &[], vec![])).await.unwrap();
+        }
+
+        let page = reg.list_page(2, 0).await.unwrap();
+        let ids: Vec<&str> = page.iter().map(|def| def.id.as_str()).collect();
+
+        assert_eq!(ids, vec!["a", "b"]);
+    }
+
+    #[tokio::test]
+    async fn list_page_returns_the_second_page() {
+        let reg = new_registry().await;
+        for id in ["a", "b", "c", "d"] {
+            reg.publish(draft(id, &[], vec![])).await.unwrap();
+        }
+
+        let page = reg.list_page(2, 2).await.unwrap();
+        let ids: Vec<&str> = page.iter().map(|def| def.id.as_str()).collect();
+
+        assert_eq!(ids, vec!["c", "d"]);
+    }
+
+    #[tokio::test]
+    async fn list_page_offset_past_the_end_is_empty() {
+        let reg = new_registry().await;
+        reg.publish(draft("a", &[], vec![])).await.unwrap();
+
+        let page = reg.list_page(2, 9).await.unwrap();
+
+        assert!(page.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_page_with_limit_zero_is_empty() {
+        let reg = new_registry().await;
+        reg.publish(draft("a", &[], vec![])).await.unwrap();
+
+        let page = reg.list_page(0, 0).await.unwrap();
+
+        assert!(page.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_page_keeps_the_id_order_across_pages() {
+        let reg = new_registry().await;
+        for id in ["a", "b", "c", "d", "e"] {
+            reg.publish(draft(id, &[], vec![])).await.unwrap();
+        }
+
+        let mut paged = reg.list_page(2, 0).await.unwrap();
+        paged.extend(reg.list_page(2, 2).await.unwrap());
+        paged.extend(reg.list_page(2, 4).await.unwrap());
+
+        assert_eq!(paged, reg.list().await.unwrap());
     }
 
     #[tokio::test]
