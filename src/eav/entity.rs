@@ -74,7 +74,7 @@ const MAX_NAME_BYTES: usize = 128;
 ///
 /// The serde form is adjacent and tagged.
 /// The `type` field makes the type explicit on the wire.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum AttributeValue {
     /// A UTF-8 string.
@@ -118,7 +118,7 @@ impl AttributeValue {
 }
 
 /// A new entity, before the store assigns a version.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct EntityDraft {
     /// The entity id.
     pub id: String,
@@ -132,14 +132,18 @@ pub struct EntityDraft {
 ///
 /// A `Some` value sets the attribute.
 /// A `None` value removes the attribute.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct EntityPatch {
     /// The changes, keyed by attribute name.
+    ///
+    /// The OpenAPI schema names the value type.
+    /// A JSON `null` removes the attribute.
+    #[schema(value_type = BTreeMap<String, AttributeValue>)]
     pub attributes: BTreeMap<String, Option<AttributeValue>>,
 }
 
 /// One stored entity.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct Entity {
     /// The entity id.
     pub id: String,

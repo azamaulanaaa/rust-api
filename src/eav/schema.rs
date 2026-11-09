@@ -36,7 +36,7 @@ const MAX_NAME_BYTES: usize = 128;
 const MAX_DEPTH: usize = 16;
 
 /// The storage type of one attribute.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AttributeType {
     /// A UTF-8 string.
@@ -56,7 +56,7 @@ pub enum AttributeType {
 }
 
 /// The definition of one attribute.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct AttributeDef {
     /// The attribute name.
     pub name: String,
@@ -77,7 +77,7 @@ pub struct AttributeDef {
 }
 
 /// A new schema version, before the registry assigns a version.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct SchemaDraft {
     /// The schema id.
     pub id: String,
@@ -90,7 +90,7 @@ pub struct SchemaDraft {
 }
 
 /// A pinned reference to one schema version.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct SchemaRef {
     /// The schema id.
     pub id: String,
@@ -99,7 +99,7 @@ pub struct SchemaRef {
 }
 
 /// One immutable schema version.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct SchemaDef {
     /// The schema id.
     pub id: String,
@@ -114,7 +114,7 @@ pub struct SchemaDef {
 }
 
 /// A schema with all inherited attributes in one map.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct EffectiveSchema {
     /// The schema id.
     pub id: String,

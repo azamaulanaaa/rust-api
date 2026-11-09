@@ -28,7 +28,7 @@ const MAX_DEPTH: usize = 16;
 pub type RuleId = String;
 
 /// A new rule, before the store assigns a version.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct RuleDraft {
     /// The rule id.
     pub id: RuleId,
@@ -83,7 +83,7 @@ impl RuleDraft {
 }
 
 /// A stored rule.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct Rule {
     /// The rule id.
     pub id: RuleId,
@@ -111,7 +111,7 @@ pub struct Rule {
 ///
 /// A rule matches an event when the event kind is in `events` and any event
 /// schema is in `schemas`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct RuleTrigger {
     /// The event kinds that start the rule.
     pub events: Vec<EntityEventKind>,
@@ -133,15 +133,18 @@ impl RuleTrigger {
 }
 
 /// A condition on an entity or an event.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub enum Condition {
     /// Always true.
     Always,
     /// True when every child is true.
+    #[schema(no_recursion)]
     All(Vec<Condition>),
     /// True when one or more children are true.
+    #[schema(no_recursion)]
     Any(Vec<Condition>),
     /// True when the child is false.
+    #[schema(no_recursion)]
     Not(Box<Condition>),
     /// Compares one attribute with a JSON value.
     Compare {
@@ -210,7 +213,7 @@ impl Condition {
 }
 
 /// The comparison operator of a [`Condition::Compare`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub enum CompareOp {
     /// Equal.
     Eq,
@@ -227,7 +230,7 @@ pub enum CompareOp {
 }
 
 /// A reference to an action. This type is data only.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ActionRef {
     /// The action kind.
     pub kind: String,
