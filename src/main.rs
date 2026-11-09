@@ -268,6 +268,9 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
     let db_prefix = config.database.prefix.trim_matches('/').to_string();
     let mirror_master = config.database.mirror_master;
     let lease_ttl = config.database.writer_lease_ttl_secs;
+    // Read the EAV settings before the code moves other config fields.
+    let eav_enabled = config.eav.enabled;
+    let eav_config = config.eav.runtime_config();
 
     let telemetry = telemetry::init(
         verbose,
@@ -346,6 +349,23 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
     // cancelled after the server stops serving, so the tasks exit instead
     // of being dropped mid-flight.
     let cancel = tokio_util::sync::CancellationToken::new();
+
+    // Start the optional EAV runtime. The binary registers no actions yet.
+    // A host application adds actions through `EavRuntime::build`.
+    let eav_handle = if eav_enabled {
+        let runtime = rust_api::eav::runtime::EavRuntime::build(
+            &s3_client_config,
+            &db_prefix,
+            wal.clone(),
+            Vec::new(),
+        )
+        .await
+        .context("build the EAV runtime")?;
+        Some(runtime.spawn(cancel.clone(), eav_config))
+    } else {
+        None
+    };
+
     // Applications append their own reactive services here. The starter kit
     // ships none, so the list stays empty. Each entry implements
     // `rust_api::reactive::ReactiveService`.
@@ -502,6 +522,15 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
     for handle in reactive_handles {
         if let Ok(Err(error)) = handle.await {
             tracing::error!(?error, "reactive service failed");
+        }
+    }
+
+    // Stop the optional EAV runtime with the other background tasks.
+    if let Some(handle) = eav_handle {
+        match handle.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => tracing::error!(?error, "EAV runtime failed"),
+            Err(error) => tracing::error!(?error, "EAV runtime task failed"),
         }
     }
 
