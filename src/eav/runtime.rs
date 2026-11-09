@@ -1,10 +1,11 @@
 //! The EAV background runtime.
 //!
 //! [`EavRuntime`] builds the schema, entity, and rule stores.
-//! It then starts three loops.
+//! It then starts four loops.
 //! One loop relays the entity outbox to the change feed.
 //! One loop runs the matching rules.
 //! One loop deletes old rule execution markers.
+//! One loop fires the due timers.
 //!
 //! A host application builds the runtime with [`EavRuntime::build`].
 //! The call takes the actions that the rule engine dispatches.
@@ -21,7 +22,7 @@ use tokio::task::JoinHandle;
 
 use crate::CancelToken;
 use crate::db::build_s3_store;
-use crate::eav::entity::EntityStore;
+use crate::eav::entity::{AttributeValue, EntityStore};
 use crate::eav::schema::SchemaRegistry;
 use crate::fs::s3::S3ClientConfig;
 use crate::rules::action::RuleAction;
@@ -40,6 +41,10 @@ pub struct EavRuntimeConfig {
     pub gc_interval: Duration,
     /// The retention window for execution markers.
     pub execution_retention: Duration,
+    /// The pause between due timer passes.
+    pub timer_interval: Duration,
+    /// The largest number of due entities to read for each key.
+    pub timer_batch: usize,
 }
 
 impl Default for EavRuntimeConfig {
@@ -49,12 +54,15 @@ impl Default for EavRuntimeConfig {
     /// The rule runner polls every 200 milliseconds.
     /// The marker cleanup runs every hour.
     /// Execution markers stay for 30 days.
+    /// The timer pass runs every second and reads 100 entities for each key.
     fn default() -> Self {
         Self {
             outbox_interval: Duration::from_secs(1),
             rule_poll_interval: Duration::from_millis(200),
             gc_interval: Duration::from_secs(3_600),
             execution_retention: Duration::from_secs(2_592_000),
+            timer_interval: Duration::from_secs(1),
+            timer_batch: 100,
         }
     }
 }
@@ -144,15 +152,66 @@ impl EavRuntime {
         &self.wal
     }
 
-    /// Runs the outbox relay, the rule runner, and the marker cleanup until
-    /// `cancel` fires.
+    /// Emits a timer event for each due timestamp value and returns the count.
     ///
-    /// The call runs all three loops at the same time.
+    /// The call reads every time index key.
+    /// For each key it reads at most `limit` due entities.
+    /// A fired marker for the same entity, key, and value is skipped.
+    /// The call writes the event and then the marker.
+    /// A failed marker write returns the error.
+    /// The next pass then emits the same event again.
+    /// The rule engine execution marker stops a duplicate action.
+    pub async fn fire_due_timers(&self, now: i64, limit: usize) -> anyhow::Result<usize> {
+        let mut emitted = 0;
+        for key in self
+            .entities
+            .time_keys()
+            .await
+            .context("read the EAV time keys")?
+        {
+            let due = self
+                .entities
+                .list_due(&key, now, limit)
+                .await
+                .context("list the due EAV entities")?;
+            for entity in due {
+                let Some(AttributeValue::Timestamp(due_at)) = entity.attributes.get(&key) else {
+                    continue;
+                };
+                let due_at = *due_at;
+                if self
+                    .entities
+                    .is_timer_fired(&entity.id, &key, due_at)
+                    .await
+                    .context("read the EAV timer marker")?
+                {
+                    continue;
+                }
+                self.entities
+                    .emit_timer(&entity, &key, due_at, now)
+                    .await
+                    .context("emit an EAV timer event")?;
+                self.entities
+                    .mark_timer_fired(&entity.id, &key, due_at)
+                    .await
+                    .context("write the EAV timer marker")?;
+                emitted += 1;
+            }
+        }
+        Ok(emitted)
+    }
+
+    /// Runs the outbox relay, the rule runner, the marker cleanup, and the
+    /// timer pass until `cancel` fires.
+    ///
+    /// The call runs all four loops at the same time.
     /// The first failure of the outbox relay or the rule runner stops the
     /// runtime and returns the error.
-    /// The marker cleanup is best effort. It logs a warning and continues.
+    /// The marker cleanup and the timer pass are best effort.
+    /// They log a warning and continue.
     /// The outbox relay flushes the pending entity events.
     /// The rule runner tails the shared change feed.
+    /// The timer pass emits the due timer events.
     /// Each loop stops when `cancel` is cancelled.
     pub async fn run<C: CancelToken>(
         &self,
@@ -171,10 +230,12 @@ impl EavRuntime {
             config.gc_interval,
             config.execution_retention,
         );
+        let timers = self.run_timers(cancel.clone(), config.timer_interval, config.timer_batch);
         tokio::select! {
             result = relay => result,
             result = runner => result,
             result = cleanup => result,
+            result = timers => result,
         }
     }
 
@@ -249,6 +310,35 @@ impl EavRuntime {
             let older_than = chrono::Utc::now().timestamp().saturating_sub(retention);
             if let Err(error) = self.rules.gc_executions(older_than).await {
                 tracing::warn!(?error, "EAV execution marker cleanup failed");
+            }
+        }
+    }
+
+    /// Fires the due timers until `cancel` fires.
+    ///
+    /// The call sleeps for `interval` between passes.
+    /// A failed pass logs a warning and continues.
+    /// A zero interval becomes one second.
+    /// A zero batch becomes 1.
+    async fn run_timers<C: CancelToken>(
+        &self,
+        cancel: C,
+        interval: Duration,
+        batch: usize,
+    ) -> anyhow::Result<()> {
+        let interval = nonzero_duration(interval);
+        let batch = batch.max(1);
+        loop {
+            if cancel.is_cancelled() {
+                return Ok(());
+            }
+            tokio::time::sleep(interval).await;
+            if cancel.is_cancelled() {
+                return Ok(());
+            }
+            let now = chrono::Utc::now().timestamp();
+            if let Err(error) = self.fire_due_timers(now, batch).await {
+                tracing::warn!(?error, "EAV due timer pass failed");
             }
         }
     }
@@ -376,6 +466,32 @@ mod tests {
         }
     }
 
+    fn timer_schema() -> SchemaDraft {
+        SchemaDraft {
+            id: "timer".to_string(),
+            extends: Vec::new(),
+            attributes: BTreeMap::from([(
+                "due".to_string(),
+                AttributeDef {
+                    name: "due".to_string(),
+                    ty: AttributeType::Timestamp,
+                    required: false,
+                    indexed: true,
+                    unique: false,
+                    default: None,
+                },
+            )]),
+        }
+    }
+
+    fn timer_entity(id: &str, due: i64) -> EntityDraft {
+        EntityDraft {
+            id: id.to_string(),
+            schemas: vec!["timer".to_string()],
+            attributes: BTreeMap::from([("due".to_string(), AttributeValue::Timestamp(due))]),
+        }
+    }
+
     async fn build_runtime(actions: Vec<Arc<dyn RuleAction>>) -> EavRuntime {
         let s3 = memory_s3();
         let prefix = test_prefix("eav-runtime");
@@ -389,6 +505,8 @@ mod tests {
             rule_poll_interval: Duration::from_millis(2),
             gc_interval: Duration::from_millis(2),
             execution_retention: Duration::from_secs(1),
+            timer_interval: Duration::from_millis(2),
+            timer_batch: 100,
         }
     }
 
@@ -430,6 +548,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fire_due_timers_emits_one_event_per_due_value_and_not_again() {
+        let runtime = build_runtime(Vec::new()).await;
+        runtime.schemas().publish(timer_schema()).await.unwrap();
+        runtime
+            .entities()
+            .create(timer_entity("e1", 100), &WriteContext::new("tester"))
+            .await
+            .unwrap();
+
+        assert_eq!(runtime.fire_due_timers(100, 100).await.unwrap(), 1);
+        assert_eq!(runtime.fire_due_timers(100, 100).await.unwrap(), 0);
+        assert_eq!(runtime.wal().head().await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_new_timestamp_value_allows_a_new_timer_event() {
+        let runtime = build_runtime(Vec::new()).await;
+        runtime.schemas().publish(timer_schema()).await.unwrap();
+        runtime
+            .entities()
+            .create(timer_entity("e1", 100), &WriteContext::new("tester"))
+            .await
+            .unwrap();
+        assert_eq!(runtime.fire_due_timers(100, 100).await.unwrap(), 1);
+
+        runtime
+            .entities()
+            .update(
+                "e1",
+                1,
+                crate::eav::entity::EntityPatch {
+                    attributes: BTreeMap::from([(
+                        "due".to_string(),
+                        Some(AttributeValue::Timestamp(50)),
+                    )]),
+                },
+                &WriteContext::new("tester"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(runtime.fire_due_timers(100, 100).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_zero_limit_emits_no_timer_event() {
+        let runtime = build_runtime(Vec::new()).await;
+        runtime.schemas().publish(timer_schema()).await.unwrap();
+        runtime
+            .entities()
+            .create(timer_entity("e1", 100), &WriteContext::new("tester"))
+            .await
+            .unwrap();
+
+        assert_eq!(runtime.fire_due_timers(100, 0).await.unwrap(), 0);
+        assert_eq!(runtime.wal().head().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_timer_rule_runs_through_the_runtime() {
+        let recorder = Arc::new(RecordingAction::new("record"));
+        let runtime = build_runtime(vec![recorder.clone()]).await;
+        runtime.schemas().publish(timer_schema()).await.unwrap();
+        let mut timer_rule = rule();
+        timer_rule.trigger.events = vec![EntityEventKind::Timer];
+        timer_rule.trigger.schemas = vec!["timer".to_string()];
+        runtime.rules().upsert(timer_rule).await.unwrap();
+        let now = chrono::Utc::now().timestamp();
+        runtime
+            .entities()
+            .create(timer_entity("e1", now - 10), &WriteContext::new("tester"))
+            .await
+            .unwrap();
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let handle = runtime.spawn(cancel.clone(), short_config());
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while recorder.records().is_empty() {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        cancel.store(true, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        let records = recorder.records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].rule.id, "alpha");
+        assert_eq!(records[0].event.kind, EntityEventKind::Timer);
+    }
+
+    #[tokio::test]
     async fn run_stops_when_the_token_fires() {
         let runtime = build_runtime(Vec::new()).await;
         let cancel = Arc::new(AtomicBool::new(false));
@@ -462,6 +679,8 @@ mod tests {
             rule_poll_interval: Duration::from_millis(2),
             gc_interval: Duration::ZERO,
             execution_retention: Duration::ZERO,
+            timer_interval: Duration::ZERO,
+            timer_batch: 0,
         };
         let cancel = Arc::new(AtomicBool::new(false));
         let handle = runtime.spawn(cancel.clone(), config);
