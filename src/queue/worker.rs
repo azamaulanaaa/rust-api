@@ -24,8 +24,21 @@ pub struct QueueWorker {
     lease: Duration,
     /// Poll interval when idle.
     poll_interval: Duration,
+    /// Base delay for the first retry.
+    retry_base: Duration,
+    /// Maximum delay between retries.
+    retry_max: Duration,
     /// Metrics for the worker.
     metrics: QueueMetrics,
+}
+
+/// Returns the retry delay for an attempt.
+///
+/// The first failure uses `base`. Each later failure doubles the delay.
+/// The result is capped at `max`.
+pub fn retry_delay(attempt: u32, base: Duration, max: Duration) -> Duration {
+    let multiplier = 1u32.checked_shl(attempt).unwrap_or(u32::MAX);
+    base.saturating_mul(multiplier).min(max)
 }
 
 impl QueueWorker {
@@ -42,6 +55,8 @@ impl QueueWorker {
             batch_size: 4,
             lease: Duration::from_secs(30),
             poll_interval: Duration::from_millis(200),
+            retry_base: Duration::from_secs(1),
+            retry_max: Duration::from_secs(60),
             metrics: QueueMetrics::new("worker"),
         }
     }
@@ -61,6 +76,18 @@ impl QueueWorker {
     /// Sets the poll interval.
     pub fn with_poll_interval(mut self, interval: Duration) -> Self {
         self.poll_interval = interval;
+        self
+    }
+
+    /// Sets the base retry delay.
+    pub fn with_retry_base(mut self, base: Duration) -> Self {
+        self.retry_base = base;
+        self
+    }
+
+    /// Sets the maximum retry delay.
+    pub fn with_retry_max(mut self, max: Duration) -> Self {
+        self.retry_max = max;
         self
     }
 
@@ -160,20 +187,55 @@ impl QueueWorker {
             }
             Err(e) => {
                 warn!(error = %e, "job failed");
+                let delay = retry_delay(job.attempt, self.retry_base, self.retry_max);
                 let _ = self
                     .queue
-                    .nack(
-                        job_id,
-                        &e.to_string(),
-                        RetryPolicy::Retry {
-                            delay: Duration::from_secs(1),
-                        },
-                    )
+                    .nack(job_id, &e.to_string(), RetryPolicy::Retry { delay })
                     .await;
                 self.metrics.record_failed();
             }
         }
         self.metrics.record_processing_duration(elapsed);
         span.in_scope(|| info!(job_id = %job_id, elapsed = elapsed, "job processed"));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retry_delay_uses_base_for_the_first_failure() {
+        let base = Duration::from_secs(1);
+        let max = Duration::from_secs(60);
+        assert_eq!(retry_delay(0, base, max), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn retry_delay_doubles_for_the_second_failure() {
+        let base = Duration::from_secs(1);
+        let max = Duration::from_secs(60);
+        assert_eq!(retry_delay(1, base, max), Duration::from_secs(2));
+    }
+
+    #[test]
+    fn retry_delay_doubles_again_for_the_third_failure() {
+        let base = Duration::from_secs(1);
+        let max = Duration::from_secs(60);
+        assert_eq!(retry_delay(2, base, max), Duration::from_secs(4));
+    }
+
+    #[test]
+    fn retry_delay_caps_the_delay_at_max() {
+        let base = Duration::from_secs(1);
+        let max = Duration::from_secs(60);
+        assert_eq!(retry_delay(10, base, max), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn retry_delay_handles_a_large_attempt_without_overflow() {
+        let base = Duration::from_secs(1);
+        let max = Duration::from_secs(60);
+        assert_eq!(retry_delay(u32::MAX, base, max), Duration::from_secs(60));
     }
 }
