@@ -47,13 +47,41 @@
 //! An existing store can lack the entity markers.
 //! [`EntityStore::list_after`] then backfills them one time.
 //! The `idx:entity-meta:backfilled` marker records that pass.
-//! The pass holds the write lock, so a create or a delete cannot race it.
+//! The pass reads 200 `entity:` rows in one page.
+//! A test build reads 2 rows in one page.
+//! Each page holds the write lock and the store write guard.
+//! The pass writes the page markers, commits, and releases both guards.
+//! It re-checks each metadata row inside the page lock.
+//! The cursor is the last key plus a NUL byte, so a deleted key does not
+//! reset progress.
+//! The memory bound is one page of rows.
+//! A concurrent create or delete writes its own markers on the normal path.
 //! A store without the markers still returns entity pages after the pass.
 //!
 //! An existing store can also lack the reverse reference markers.
 //! [`EntityStore::delete`] then backfills them one time.
 //! The `idx:ref-meta:backfilled` marker records that pass.
-//! The pass holds the write lock, so an entity write cannot race it.
+//! The pass reads 200 entity markers in one page.
+//! A test build reads 2 entity markers in one page.
+//! Each page holds the write lock and the store write guard.
+//! The pass writes the page markers, commits, and releases both guards.
+//! It re-checks that the entity marker and the entity row exist inside the
+//! page lock.
+//! The cursor is the last key plus a NUL byte.
+//! The memory bound is one page of entity ids and the attributes of one
+//! entity.
+//!
+//! An existing store can also lack the time key markers.
+//! [`EntityStore::time_keys`] then backfills them one time.
+//! The `idx:time-key-meta:backfilled` marker records that pass.
+//! The pass reads 200 `idx:time:` rows in one page.
+//! A test build reads 2 rows in one page.
+//! Each page holds the write lock and the store write guard.
+//! The pass writes the page markers, commits, and releases both guards.
+//! It re-checks that a time row still exists for each key inside the page
+//! lock.
+//! The cursor is the last key plus a NUL byte.
+//! The memory bound is one page of keys.
 //!
 //! A delete scans the `idx:ref:{id}:` family before it writes.
 //! A distinct source other than `id` blocks the delete with
@@ -165,8 +193,18 @@ const REF_META_PREFIX: &str = "idx:ref-meta:";
 /// Key suffix for the one-time reverse reference backfill marker.
 const REF_BACKFILL_SUFFIX: &str = "backfilled";
 
-/// Maximum number of entity markers that one reference backfill page reads.
-const REF_BACKFILL_PAGE: usize = 200;
+/// Maximum number of rows that one lazy backfill page reads.
+#[cfg(not(test))]
+const BACKFILL_PAGE: usize = 200;
+
+/// Maximum number of rows that one lazy backfill page reads.
+#[cfg(test)]
+const BACKFILL_PAGE: usize = 2;
+
+/// A test hook that runs after a lazy backfill page releases its locks.
+#[cfg(test)]
+type BackfillPageHook =
+    Arc<dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync>;
 
 /// Key prefix for attribute index markers.
 const ATTR_INDEX_PREFIX: &str = "idx:attr:";
@@ -454,6 +492,13 @@ pub struct EntityStore {
     /// The largest outbox batch that a flush read in a test.
     #[cfg(test)]
     outbox_batch_peak: Arc<std::sync::atomic::AtomicUsize>,
+    /// The number of lazy backfill pages that committed in a test.
+    #[cfg(test)]
+    backfill_page_commits: Arc<std::sync::atomic::AtomicUsize>,
+    /// A hook that runs after a lazy backfill page releases its locks in a
+    /// test.
+    #[cfg(test)]
+    backfill_page_hook: Arc<std::sync::Mutex<Option<BackfillPageHook>>>,
 }
 
 impl EntityStore {
@@ -470,7 +515,48 @@ impl EntityStore {
             outbox_delete_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
             outbox_batch_peak: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            backfill_page_commits: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            backfill_page_hook: Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    /// Records one committed lazy backfill page in a test.
+    #[cfg(test)]
+    fn note_backfill_page(&self) {
+        self.backfill_page_commits
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Records one committed lazy backfill page.
+    #[cfg(not(test))]
+    fn note_backfill_page(&self) {}
+
+    /// Runs the test hook that stands in for a write between two pages.
+    #[cfg(test)]
+    async fn run_backfill_page_hook(&self) {
+        let hook = self
+            .backfill_page_hook
+            .lock()
+            .expect("backfill page hook lock")
+            .clone();
+        if let Some(hook) = hook {
+            hook().await;
+        }
+    }
+
+    /// Runs the hook that stands in for a write between two pages.
+    #[cfg(not(test))]
+    async fn run_backfill_page_hook(&self) {}
+
+    /// Sets the test hook that runs after a lazy backfill page.
+    #[cfg(test)]
+    fn set_backfill_page_hook(&self, hook: Option<BackfillPageHook>) {
+        *self
+            .backfill_page_hook
+            .lock()
+            .expect("backfill page hook lock") = hook;
     }
 
     /// Sets whether a write checks that every `EntityRef` target exists.
@@ -1526,47 +1612,118 @@ impl EntityStore {
 
     /// Returns the attribute keys that have a time index row.
     ///
-    /// The call scans only the `idx:time-key:` family.
+    /// The call scans only the `idx:time-key:` family after the backfill.
     /// The result is sorted and has no duplicates.
     /// An attribute key contains no colon.
     /// A delete keeps the key marker. A stale marker costs one empty scan.
     /// The `idx:time-key-meta:backfilled` marker records the one-time
-    /// backfill. When it is absent, the call scans the `idx:time:` family one
-    /// time. It writes every missing key marker and the backfill marker. It
-    /// returns the union of the marker keys and the scanned keys.
+    /// backfill. When it is absent, the call scans the `idx:time:` family in
+    /// pages. It writes every missing key marker and the backfill marker. It
+    /// returns the marker keys.
     /// The backfill runs at most one time per store.
+    /// Each page holds the write lock and the store write guard.
+    /// The call reads 200 `idx:time:` rows in one page. A test build reads 2.
+    /// It re-checks that a time row still exists for each key inside the page
+    /// lock, writes the page markers, commits, and releases both guards.
+    /// The cursor is the last key plus a NUL byte, so a deleted key does not
+    /// reset progress.
+    /// It writes the backfill marker last, under the write lock.
+    /// The memory bound is one page of keys.
     pub async fn time_keys(&self) -> Result<Vec<String>, EntityError> {
         let backfill_marker = time_key_backfill_marker();
-        let g = self.store.read().await;
-        let markers: BTreeSet<String> =
-            time_key_marker_keys(scan_prefix(&*g, TIME_KEY_INDEX_PREFIX).await?)
-                .into_iter()
-                .collect();
-        let backfilled = g
-            .get_bytes(&backfill_marker)
-            .await
-            .map_err(EntityError::Store)?
-            .is_some();
-        if backfilled {
-            return Ok(markers.into_iter().collect());
+        {
+            let g = self.store.read().await;
+            if g.get_bytes(&backfill_marker)
+                .await
+                .map_err(EntityError::Store)?
+                .is_some()
+            {
+                return Ok(time_key_marker_keys(
+                    scan_prefix(&*g, TIME_KEY_INDEX_PREFIX).await?,
+                ));
+            }
         }
-        let keys = time_row_keys(scan_prefix(&*g, TIME_INDEX_PREFIX).await?);
-        drop(g);
 
-        let mut all = markers.clone();
-        all.extend(keys);
-        let g = self.store.write().await;
-        for key in &all {
-            if !markers.contains(key) {
-                g.set_bytes(&time_key_index_key(key), b"")
+        let end = prefix_scan_end(TIME_INDEX_PREFIX);
+        let max = u32::try_from(BACKFILL_PAGE).ok();
+        let mut cursor = TIME_INDEX_PREFIX.to_string();
+        loop {
+            let page = {
+                let _write = self.write_lock.lock().await;
+                let g = self.store.write().await;
+                if g.get_bytes(&backfill_marker)
+                    .await
+                    .map_err(EntityError::Store)?
+                    .is_some()
+                {
+                    None
+                } else {
+                    let rows = g
+                        .gets_bytes(
+                            max,
+                            Direction::Next,
+                            (Some(cursor.clone()), Some(end.clone())),
+                        )
+                        .await
+                        .map_err(EntityError::Store)?;
+                    if rows.is_empty() {
+                        None
+                    } else {
+                        let full = rows.len() == BACKFILL_PAGE;
+                        let last = rows.last().map(|row| row.key.clone()).unwrap_or_default();
+                        let keys = time_row_keys(rows);
+                        let tx = g.begin_tx().map_err(EntityError::Store)?;
+                        for key in &keys {
+                            let prefix = format!("{TIME_INDEX_PREFIX}{key}:");
+                            // Re-check the source row inside the page lock.
+                            if scan_prefix_bounded(&tx, &prefix, 1).await?.is_empty() {
+                                continue;
+                            }
+                            let marker_key = time_key_index_key(key);
+                            if tx
+                                .get_bytes(&marker_key)
+                                .await
+                                .map_err(EntityError::Store)?
+                                .is_none()
+                            {
+                                tx.set_bytes(&marker_key, b"")
+                                    .await
+                                    .map_err(EntityError::Store)?;
+                            }
+                        }
+                        tx.commit().await.map_err(EntityError::Store)?;
+                        self.note_backfill_page();
+                        Some((last, full))
+                    }
+                }
+            };
+            let Some((last, full)) = page else {
+                break;
+            };
+            self.run_backfill_page_hook().await;
+            if !full {
+                break;
+            }
+            cursor = format!("{last}\0");
+        }
+
+        {
+            let _write = self.write_lock.lock().await;
+            let g = self.store.write().await;
+            if g.get_bytes(&backfill_marker)
+                .await
+                .map_err(EntityError::Store)?
+                .is_none()
+            {
+                g.set_bytes(&backfill_marker, b"")
                     .await
                     .map_err(EntityError::Store)?;
             }
         }
-        g.set_bytes(&backfill_marker, b"")
-            .await
-            .map_err(EntityError::Store)?;
-        Ok(all.into_iter().collect())
+        let g = self.store.read().await;
+        Ok(time_key_marker_keys(
+            scan_prefix(&*g, TIME_KEY_INDEX_PREFIX).await?,
+        ))
     }
 
     /// Lists the entities whose indexed timestamp `key` is due.
@@ -1787,12 +1944,17 @@ impl EntityStore {
     /// Backfills the entity index markers one time.
     ///
     /// The call returns early when the backfill marker exists.
-    /// It takes the write lock and then the store write guard.
-    /// It re-checks the marker inside the lock.
-    /// It scans every `entity:{id}:meta` row and writes each missing marker.
-    /// It writes the backfill marker last.
+    /// It scans the `entity:` family in pages.
+    /// Each page holds the write lock and the store write guard.
+    /// The call reads 200 `entity:` rows in one page. A test build reads 2.
+    /// It re-checks each metadata row inside the page lock.
+    /// It writes the page markers, commits, and releases both guards.
+    /// The cursor is the last key plus a NUL byte, so a deleted key does not
+    /// reset progress.
+    /// It writes the backfill marker last, under the write lock.
     /// A crash before the last write retries on the next call.
     /// Every write is idempotent.
+    /// The memory bound is one page of rows.
     async fn backfill_entity_index(&self) -> Result<(), EntityError> {
         let marker = entity_backfill_marker();
         {
@@ -1806,34 +1968,84 @@ impl EntityStore {
             }
         }
 
+        let end = prefix_scan_end(ENTITY_PREFIX);
+        let max = u32::try_from(BACKFILL_PAGE).ok();
+        let mut cursor = ENTITY_PREFIX.to_string();
+        loop {
+            let page = {
+                let _write = self.write_lock.lock().await;
+                let g = self.store.write().await;
+                if g.get_bytes(&marker)
+                    .await
+                    .map_err(EntityError::Store)?
+                    .is_some()
+                {
+                    None
+                } else {
+                    let rows = g
+                        .gets_bytes(
+                            max,
+                            Direction::Next,
+                            (Some(cursor.clone()), Some(end.clone())),
+                        )
+                        .await
+                        .map_err(EntityError::Store)?;
+                    if rows.is_empty() {
+                        None
+                    } else {
+                        let full = rows.len() == BACKFILL_PAGE;
+                        let last = rows.last().map(|row| row.key.clone()).unwrap_or_default();
+                        let tx = g.begin_tx().map_err(EntityError::Store)?;
+                        for row in &rows {
+                            let Some(rest) = row.key.strip_prefix(ENTITY_PREFIX) else {
+                                continue;
+                            };
+                            let Some(id) = rest.strip_suffix(META_SUFFIX) else {
+                                continue;
+                            };
+                            if id.is_empty() || id.contains(':') {
+                                continue;
+                            }
+                            // Re-check the source row inside the page lock.
+                            if tx
+                                .get_bytes(&meta_key(id))
+                                .await
+                                .map_err(EntityError::Store)?
+                                .is_none()
+                            {
+                                continue;
+                            }
+                            tx.set_bytes(&entity_index_key(id), b"")
+                                .await
+                                .map_err(EntityError::Store)?;
+                        }
+                        tx.commit().await.map_err(EntityError::Store)?;
+                        self.note_backfill_page();
+                        Some((last, full))
+                    }
+                }
+            };
+            let Some((last, full)) = page else {
+                break;
+            };
+            self.run_backfill_page_hook().await;
+            if !full {
+                break;
+            }
+            cursor = format!("{last}\0");
+        }
+
         let _write = self.write_lock.lock().await;
         let g = self.store.write().await;
         if g.get_bytes(&marker)
             .await
             .map_err(EntityError::Store)?
-            .is_some()
+            .is_none()
         {
-            return Ok(());
-        }
-        let rows = scan_prefix(&*g, ENTITY_PREFIX).await?;
-        let mut seen = BTreeSet::new();
-        for row in rows {
-            let Some(rest) = row.key.strip_prefix(ENTITY_PREFIX) else {
-                continue;
-            };
-            let Some(id) = rest.strip_suffix(META_SUFFIX) else {
-                continue;
-            };
-            if id.is_empty() || id.contains(':') || !seen.insert(id.to_string()) {
-                continue;
-            }
-            g.set_bytes(&entity_index_key(id), b"")
+            g.set_bytes(&marker, b"")
                 .await
                 .map_err(EntityError::Store)?;
         }
-        g.set_bytes(&marker, b"")
-            .await
-            .map_err(EntityError::Store)?;
         Ok(())
     }
 
@@ -1842,18 +2054,17 @@ impl EntityStore {
     /// The call returns early when the `idx:ref-meta:backfilled` marker
     /// exists.
     /// It first ensures that the entity index markers exist.
-    /// It takes the write lock and then the store write guard.
-    /// It re-checks the marker inside the lock.
     /// It pages every entity marker in id order.
-    /// The page holds at most [`REF_BACKFILL_PAGE`] ids.
+    /// Each page holds the write lock and the store write guard.
+    /// The call reads 200 entity markers in one page. A test build reads 2.
     /// For each entity, the call resolves the pinned schemas and merges them.
-    /// It then writes one marker for each `EntityRef` attribute.
-    /// It writes the backfill marker last.
+    /// It re-checks the entity marker and the entity row inside the page lock.
+    /// It then writes one marker for each `EntityRef` attribute, commits, and
+    /// releases both guards.
+    /// The cursor is the last key plus a NUL byte.
+    /// It writes the backfill marker last, under the write lock.
     /// A crash before that write retries on the next call.
     /// Every marker write is idempotent.
-    ///
-    /// The call holds the write lock for the whole pass, so an entity write
-    /// cannot race it.
     /// The memory bound is one page of entity ids and the attributes of one
     /// entity.
     async fn backfill_ref_index(&self) -> Result<(), EntityError> {
@@ -1870,53 +2081,84 @@ impl EntityStore {
         }
 
         self.backfill_entity_index().await?;
+        let end = prefix_scan_end(ENTITY_INDEX_PREFIX);
+        let max = u32::try_from(BACKFILL_PAGE).ok();
+        let mut cursor = ENTITY_INDEX_PREFIX.to_string();
+        loop {
+            let page = {
+                let _write = self.write_lock.lock().await;
+                let g = self.store.write().await;
+                if g.get_bytes(&marker)
+                    .await
+                    .map_err(EntityError::Store)?
+                    .is_some()
+                {
+                    None
+                } else {
+                    let rows = g
+                        .gets_bytes(
+                            max,
+                            Direction::Next,
+                            (Some(cursor.clone()), Some(end.clone())),
+                        )
+                        .await
+                        .map_err(EntityError::Store)?;
+                    if rows.is_empty() {
+                        None
+                    } else {
+                        let full = rows.len() == BACKFILL_PAGE;
+                        let last = rows.last().map(|row| row.key.clone()).unwrap_or_default();
+                        let tx = g.begin_tx().map_err(EntityError::Store)?;
+                        for row in &rows {
+                            let Some(id) = row.key.strip_prefix(ENTITY_INDEX_PREFIX) else {
+                                continue;
+                            };
+                            if id.is_empty() || id.contains(':') {
+                                continue;
+                            }
+                            // Re-check the source entity inside the page lock.
+                            if tx
+                                .get_bytes(&entity_index_key(id))
+                                .await
+                                .map_err(EntityError::Store)?
+                                .is_none()
+                            {
+                                continue;
+                            }
+                            let Some(entity) = load_entity(&tx, id).await? else {
+                                continue;
+                            };
+                            let effective = self.resolve_refs(&entity.schemas).await?;
+                            let merged = merge_schemas(&effective)?;
+                            put_ref_rows(&tx, &entity, &merged).await?;
+                        }
+                        tx.commit().await.map_err(EntityError::Store)?;
+                        self.note_backfill_page();
+                        Some((last, full))
+                    }
+                }
+            };
+            let Some((last, full)) = page else {
+                break;
+            };
+            self.run_backfill_page_hook().await;
+            if !full {
+                break;
+            }
+            cursor = format!("{last}\0");
+        }
+
         let _write = self.write_lock.lock().await;
         let g = self.store.write().await;
         if g.get_bytes(&marker)
             .await
             .map_err(EntityError::Store)?
-            .is_some()
+            .is_none()
         {
-            return Ok(());
-        }
-        let end = prefix_scan_end(ENTITY_INDEX_PREFIX);
-        let max = u32::try_from(REF_BACKFILL_PAGE).ok();
-        let mut cursor = ENTITY_INDEX_PREFIX.to_string();
-        loop {
-            let rows = g
-                .gets_bytes(
-                    max,
-                    Direction::Next,
-                    (Some(cursor.clone()), Some(end.clone())),
-                )
+            g.set_bytes(&marker, b"")
                 .await
                 .map_err(EntityError::Store)?;
-            let full = rows.len() == REF_BACKFILL_PAGE;
-            let Some(last) = rows.last() else {
-                break;
-            };
-            for row in &rows {
-                let Some(id) = row.key.strip_prefix(ENTITY_INDEX_PREFIX) else {
-                    continue;
-                };
-                if id.is_empty() || id.contains(':') {
-                    continue;
-                }
-                let Some(entity) = load_entity(&*g, id).await? else {
-                    continue;
-                };
-                let effective = self.resolve_refs(&entity.schemas).await?;
-                let merged = merge_schemas(&effective)?;
-                put_ref_rows(&*g, &entity, &merged).await?;
-            }
-            if !full {
-                break;
-            }
-            cursor = format!("{}\0", last.key);
         }
-        g.set_bytes(&marker, b"")
-            .await
-            .map_err(EntityError::Store)?;
         Ok(())
     }
 
@@ -1950,10 +2192,13 @@ impl EntityStore {
     /// An old store can lack the entity markers.
     /// The call then backfills every missing marker one time.
     /// The `idx:entity-meta:backfilled` marker records the pass.
-    /// The pass takes the write lock and the store write guard.
-    /// It re-checks the marker inside the lock.
-    /// It scans the `entity:` family and writes one marker for each meta row.
-    /// It writes the backfill marker last.
+    /// The pass reads 200 `entity:` rows in one page.
+    /// A test build reads 2 rows in one page.
+    /// Each page holds the write lock and the store write guard.
+    /// The pass writes the page markers, commits, and releases both guards.
+    /// It re-checks each metadata row inside the page lock.
+    /// The cursor is the last key plus a NUL byte.
+    /// It writes the backfill marker last, under the write lock.
     /// A crash before that write retries on the next call.
     /// Every write is idempotent.
     /// The call then scans only the `idx:entity:` family.
@@ -3141,6 +3386,7 @@ mod tests {
     use super::*;
     use crate::db::{build_test_store, test_prefix};
     use crate::eav::schema::SchemaDraft;
+    use std::sync::atomic::Ordering;
 
     async fn new_store() -> (EntityStore, SchemaRegistry, OxKvStore) {
         let registry =
@@ -4311,6 +4557,102 @@ mod tests {
                     .is_some()
             );
         }
+        assert!(
+            raw.get_bytes(&entity_backfill_marker())
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// The entity index backfill covers several pages and lists every entity.
+    ///
+    /// The page counter shows that more than one page committed.
+    /// It does not observe the lock state directly. The lock release is a
+    /// structural property of the page loop.
+    #[tokio::test]
+    async fn list_after_backfills_more_entities_than_one_page() {
+        let (store, registry, raw) = new_store().await;
+        registry.publish(schema("task", &[], vec![])).await.unwrap();
+        let ids = ["a", "b", "c", "d", "e", "f"];
+        for id in ids {
+            store
+                .create(draft(id, &["task"], vec![]), &ctx())
+                .await
+                .unwrap();
+        }
+        for id in ids {
+            raw.delete(&entity_index_key(id)).await.unwrap();
+        }
+        raw.delete(&entity_backfill_marker()).await.unwrap();
+        store.backfill_page_commits.store(0, Ordering::SeqCst);
+
+        let (page, next) = store.list_after(10, None).await.unwrap();
+        let listed: Vec<&str> = page.iter().map(|entity| entity.id.as_str()).collect();
+
+        assert_eq!(listed, ids.to_vec());
+        assert_eq!(next, None);
+        assert!(store.backfill_page_commits.load(Ordering::SeqCst) > 1);
+
+        // A second call keeps the marker and commits no page.
+        store.backfill_page_commits.store(0, Ordering::SeqCst);
+        let (page, next) = store.list_after(10, None).await.unwrap();
+        let listed: Vec<&str> = page.iter().map(|entity| entity.id.as_str()).collect();
+        assert_eq!(listed, ids.to_vec());
+        assert_eq!(next, None);
+        assert_eq!(store.backfill_page_commits.load(Ordering::SeqCst), 0);
+        assert!(
+            raw.get_bytes(&entity_backfill_marker())
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// A marker is not written for an entity that is deleted between pages.
+    #[tokio::test]
+    async fn the_entity_index_backfill_skips_an_entity_deleted_between_pages() {
+        let (store, registry, raw) = new_store().await;
+        registry.publish(schema("task", &[], vec![])).await.unwrap();
+        let ids = ["a", "b", "c", "d", "e", "f"];
+        for id in ids {
+            store
+                .create(draft(id, &["task"], vec![]), &ctx())
+                .await
+                .unwrap();
+        }
+        for id in ids {
+            raw.delete(&entity_index_key(id)).await.unwrap();
+        }
+        raw.delete(&entity_backfill_marker()).await.unwrap();
+
+        let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hook_store = store.clone();
+        let hook_fired = fired.clone();
+        store.set_backfill_page_hook(Some(Arc::new(move || {
+            let hook_store = hook_store.clone();
+            let hook_fired = hook_fired.clone();
+            Box::pin(async move {
+                if !hook_fired.swap(true, Ordering::SeqCst) {
+                    hook_store.delete("e", 1, false, &ctx()).await.unwrap();
+                }
+            })
+        })));
+
+        let (page, next) = store.list_after(10, None).await.unwrap();
+        store.set_backfill_page_hook(None);
+
+        let listed: Vec<&str> = page.iter().map(|entity| entity.id.as_str()).collect();
+
+        assert!(fired.load(Ordering::SeqCst));
+        assert_eq!(listed, vec!["a", "b", "c", "d", "f"]);
+        assert_eq!(next, None);
+        assert!(
+            raw.get_bytes(&entity_index_key("e"))
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert!(
             raw.get_bytes(&entity_backfill_marker())
                 .await
@@ -6072,6 +6414,55 @@ mod tests {
         );
     }
 
+    /// The time key backfill writes every distinct key across several pages.
+    ///
+    /// The page counter shows that more than one page committed.
+    /// It does not observe the lock state directly. The lock release is a
+    /// structural property of the page loop.
+    #[tokio::test]
+    async fn time_keys_backfills_more_keys_than_one_page() {
+        let (store, registry, raw) = new_store().await;
+        registry.publish(schema("task", &[], vec![])).await.unwrap();
+        let keys = ["alpha", "beta", "delta", "epsilon", "gamma"];
+        for (offset, key) in keys.iter().enumerate() {
+            raw.set_bytes(&time_index_key(key, offset as i64, "e1"), b"")
+                .await
+                .unwrap();
+        }
+        assert!(
+            !all_keys(&raw)
+                .await
+                .iter()
+                .any(|key| key.starts_with(TIME_KEY_INDEX_PREFIX))
+        );
+        store.backfill_page_commits.store(0, Ordering::SeqCst);
+
+        let found = store.time_keys().await.unwrap();
+
+        assert_eq!(found, keys.map(str::to_string).to_vec());
+        assert!(store.backfill_page_commits.load(Ordering::SeqCst) > 1);
+        let markers: Vec<String> = all_keys(&raw)
+            .await
+            .into_iter()
+            .filter(|key| key.starts_with(TIME_KEY_INDEX_PREFIX))
+            .collect();
+        assert_eq!(markers.len(), keys.len());
+
+        // A second call keeps the marker and commits no page.
+        store.backfill_page_commits.store(0, Ordering::SeqCst);
+        assert_eq!(
+            store.time_keys().await.unwrap(),
+            keys.map(str::to_string).to_vec()
+        );
+        assert_eq!(store.backfill_page_commits.load(Ordering::SeqCst), 0);
+        assert!(
+            raw.get_bytes(&time_key_backfill_marker())
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
     #[tokio::test]
     async fn list_due_returns_due_entities_in_time_order_with_a_limit() {
         let (store, registry, raw) = new_store().await;
@@ -7681,6 +8072,56 @@ mod tests {
             ref_markers(&raw)
                 .await
                 .contains(&"idx:ref:c1:o1:customer".to_string())
+        );
+    }
+
+    /// The ref backfill writes every marker across several pages.
+    ///
+    /// The page counter shows that more than one page committed.
+    /// It does not observe the lock state directly. The lock release is a
+    /// structural property of the page loop.
+    #[tokio::test]
+    async fn the_first_delete_backfills_more_entities_than_one_page() {
+        let (store, _, raw) = reference_store(true).await;
+        let targets = ["c1", "c2", "c3", "c4", "c5"];
+        for target in targets {
+            store.create(customer(target), &ctx()).await.unwrap();
+        }
+        for (index, target) in targets.iter().enumerate() {
+            let order_id = format!("o{}", index + 1);
+            store
+                .create(order(&order_id, target), &ctx())
+                .await
+                .unwrap();
+        }
+        for key in all_keys(&raw).await {
+            if key.starts_with(REF_INDEX_PREFIX) {
+                raw.delete(&key).await.unwrap();
+            }
+        }
+        raw.delete(&ref_backfill_marker()).await.unwrap();
+        assert!(ref_markers(&raw).await.is_empty());
+        store.backfill_page_commits.store(0, Ordering::SeqCst);
+
+        let error = store.delete("c1", 1, false, &ctx()).await.unwrap_err();
+
+        assert!(matches!(error, EntityError::Referenced { count: 1, .. }));
+        assert!(store.backfill_page_commits.load(Ordering::SeqCst) > 1);
+        for (index, target) in targets.iter().enumerate() {
+            let expected = format!("idx:ref:{target}:o{}:customer", index + 1);
+            assert!(ref_markers(&raw).await.contains(&expected));
+        }
+
+        // A present marker keeps its value and commits no page.
+        store.create(customer("c9"), &ctx()).await.unwrap();
+        store.backfill_page_commits.store(0, Ordering::SeqCst);
+        store.delete("c9", 1, false, &ctx()).await.unwrap();
+        assert_eq!(store.backfill_page_commits.load(Ordering::SeqCst), 0);
+        assert!(
+            raw.get_bytes(&ref_backfill_marker())
+                .await
+                .unwrap()
+                .is_some()
         );
     }
 
