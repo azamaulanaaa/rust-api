@@ -40,6 +40,7 @@ use std::sync::Arc;
 use oxkv::{Direction, GetSet, KeyValue, OxKvStore, Store as _, Transaction as _};
 use tokio::sync::{Mutex, RwLock};
 
+use crate::eav::MAX_PAGE_OFFSET;
 use crate::records::{EntityEvent, EntityEventKind};
 use crate::rules::error::RuleError;
 use crate::rules::rule::{Rule, RuleDraft, RuleTrigger, validate_identifier};
@@ -165,7 +166,14 @@ impl RuleStore {
     /// The call skips `offset` rules.
     /// It then returns at most `limit` rules.
     /// A `limit` of 0 returns an empty list.
+    /// An offset above `MAX_PAGE_OFFSET` returns an invalid-input error.
+    /// Rules support offset paging only.
     pub async fn list_page(&self, limit: usize, offset: usize) -> Result<Vec<Rule>, RuleError> {
+        if offset > MAX_PAGE_OFFSET {
+            return Err(RuleError::Invalid(format!(
+                "offset must be at most {MAX_PAGE_OFFSET}. Rules support offset paging only."
+            )));
+        }
         if limit == 0 {
             return Ok(Vec::new());
         }
@@ -616,6 +624,16 @@ mod tests {
         let page = store.list_page(2, 9).await.unwrap();
 
         assert!(page.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_page_rejects_an_offset_above_the_maximum() {
+        let store = new_store().await;
+        store.upsert(draft("a")).await.unwrap();
+
+        let result = store.list_page(2, MAX_PAGE_OFFSET + 1).await;
+
+        assert!(matches!(result, Err(RuleError::Invalid(_))));
     }
 
     #[tokio::test]
