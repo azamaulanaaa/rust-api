@@ -2369,6 +2369,14 @@ mod tests {
         let fx = fixture().await?;
         assert!(fx.engine.claim_superadmin("alice").await?);
         publish_task_schema(&fx).await?;
+        fx.runtime
+            .schemas()
+            .publish(SchemaDraft {
+                id: "other".to_string(),
+                extends: Vec::new(),
+                attributes: Default::default(),
+            })
+            .await?;
         create_task(&fx, "e1").await?;
         create_task(&fx, "e2").await?;
         let module = fx.module().await?;
