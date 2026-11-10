@@ -242,6 +242,20 @@ The entity store keeps validated entities with typed attributes. An entity pins 
 
 The `/eav` management API covers schemas, entities, and rules. List routes use paging. `limit` defaults to 50 and cannot exceed 200. `offset` defaults to 0.
 
+`POST /eav/entities/query` finds entities by an indexed attribute value. `limit` defaults to 50 and is in the range 1 to 200. An empty `after` starts at the first page. The response returns the next cursor in `next`. An attribute that no applied schema indexes returns `400`.
+
+```sh
+curl -sS -X POST http://localhost:8080/eav/entities/query \
+  -H 'content-type: application/json' \
+  -b "auth_token=$TOKEN" \
+  -d '{
+    "attribute": "email",
+    "value": {"type": "string", "value": "a@example.com"},
+    "limit": 50,
+    "after": ""
+  }'
+```
+
 Schema evolution has three steps. `GET /eav/schemas/{id}/diff` reports added, removed, and changed attributes and marks breaking changes. `POST /eav/schemas/{id}/revalidate` checks stored entities against a target version without a write. `POST /eav/schemas/{id}/migrate` repins stored entities to a target version. A migration is a dry run unless `dry_run` is false.
 
 The entity store writes one change event to an outbox row in the same transaction as the entity data. A background relay flushes the outbox to the shared change feed. Delivery is at least once, so a consumer must be idempotent. Clients read the feed through `/eav/sync/events` and load the initial state through `/eav/sync/snapshot`.
@@ -320,6 +334,7 @@ Metrics cover rule execution (`eav.rules.executed`, `eav.rules.failed`) and webh
 | POST | `/eav/schemas/{id}/migrate` | Repin stored entities to a target version. The default is a dry run. | session |
 | POST | `/eav/entities` | Create one validated entity | session |
 | GET | `/eav/entities` | Paged list of entities | session |
+| POST | `/eav/entities/query` | Paged query of entities by an indexed attribute value | session |
 | GET | `/eav/entities/{id}` | Get one entity | session |
 | PATCH | `/eav/entities/{id}` | Update attributes with an expected version | session |
 | DELETE | `/eav/entities/{id}` | Delete one entity with `expected_version` | session |
