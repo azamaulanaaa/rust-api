@@ -386,6 +386,11 @@ pub struct EntityStore {
     flush_lock: Arc<Mutex<()>>,
     /// The change feed that receives committed entity events.
     feed: Option<Arc<dyn ChangeSink>>,
+    /// True when a write checks that every `EntityRef` target exists.
+    ///
+    /// The check is on by default.
+    /// A host can turn it off for a store that holds legacy references.
+    check_entity_refs: bool,
 }
 
 impl EntityStore {
@@ -397,7 +402,66 @@ impl EntityStore {
             write_lock: Arc::new(Mutex::new(())),
             flush_lock: Arc::new(Mutex::new(())),
             feed: None,
+            check_entity_refs: true,
         }
+    }
+
+    /// Sets whether a write checks that every `EntityRef` target exists.
+    ///
+    /// The default is `true`.
+    /// With `false`, the write still validates each target as an entity id.
+    /// It skips only the existence read.
+    pub fn with_entity_ref_check(mut self, check: bool) -> Self {
+        self.check_entity_refs = check;
+        self
+    }
+
+    /// Checks every `EntityRef` value in one write.
+    ///
+    /// The call validates each target as an entity id.
+    /// With the reference check on, it also requires that the target exists.
+    /// A self-reference is valid, because the entity is about to exist.
+    /// The call reads one row for each distinct target.
+    async fn check_entity_refs<S>(
+        &self,
+        store: &S,
+        entity_id: &str,
+        attributes: &BTreeMap<String, AttributeValue>,
+        defs: &BTreeMap<String, AttributeDef>,
+    ) -> Result<(), EntityError>
+    where
+        S: GetSet + ?Sized,
+    {
+        let mut targets = BTreeSet::new();
+        for (name, value) in attributes {
+            if !defs
+                .get(name)
+                .is_some_and(|def| def.ty == AttributeType::EntityRef)
+            {
+                continue;
+            }
+            let AttributeValue::EntityRef(target) = value else {
+                continue;
+            };
+            validate_name("entity id", target)?;
+            if target != entity_id {
+                targets.insert((name.clone(), target.clone()));
+            }
+        }
+        if !self.check_entity_refs {
+            return Ok(());
+        }
+        for (name, target) in targets {
+            if store
+                .get_bytes(&meta_key(&target))
+                .await
+                .map_err(EntityError::Store)?
+                .is_none()
+            {
+                return Err(EntityError::DanglingRef(name, target));
+            }
+        }
+        Ok(())
     }
 
     /// Attaches a [`ChangeSink`] for event delivery.
@@ -457,6 +521,8 @@ impl EntityStore {
             {
                 return Err(EntityError::AlreadyExists(entity.id));
             }
+            self.check_entity_refs(&tx, &entity.id, &entity.attributes, &merged.attributes)
+                .await?;
             let outbox =
                 self.prepare_outbox(None, Some(&entity), event_schema_ids(&effective), ctx)?;
             check_unique_values(&tx, &entity, &merged.attributes).await?;
@@ -557,6 +623,8 @@ impl EntityStore {
                 created_at: before.created_at,
                 updated_at: chrono::Utc::now().timestamp(),
             };
+            self.check_entity_refs(&tx, &after.id, &after.attributes, &merged.attributes)
+                .await?;
             let outbox = self.prepare_outbox(
                 Some(&before),
                 Some(&after),
@@ -1143,6 +1211,12 @@ impl EntityStore {
                 updated_at: chrono::Utc::now().timestamp(),
             };
             let effective = self.resolve_refs(&after.schemas).await?;
+            let merged = merge_schemas(&effective)?;
+            {
+                let g = self.store.read().await;
+                self.check_entity_refs(&*g, &after.id, &after.attributes, &merged.attributes)
+                    .await?;
+            }
             let outbox =
                 self.prepare_schema_applied_outbox(&after, event_schema_ids(&effective), ctx)?;
             result.migrated += 1;
@@ -6418,5 +6492,205 @@ mod tests {
         }
         assert!(feed.events().is_empty());
         assert!(outbox_keys(&raw).await.is_empty());
+    }
+
+    async fn reference_store(check: bool) -> (EntityStore, SchemaRegistry) {
+        let registry = SchemaRegistry::new(build_test_store(&test_prefix("eav-ref-schema")).await);
+        let raw = build_test_store(&test_prefix("eav-ref")).await;
+        let store = EntityStore::new(raw, registry.clone()).with_entity_ref_check(check);
+        registry
+            .publish(schema(
+                "customer",
+                &[],
+                vec![attr("name", AttributeType::String)],
+            ))
+            .await
+            .unwrap();
+        registry
+            .publish(schema(
+                "order",
+                &[],
+                vec![attr("customer", AttributeType::EntityRef)],
+            ))
+            .await
+            .unwrap();
+        (store, registry)
+    }
+
+    fn customer(id: &str) -> EntityDraft {
+        draft(id, &["customer"], vec![("name", s(id))])
+    }
+
+    fn order(id: &str, target: &str) -> EntityDraft {
+        draft(
+            id,
+            &["order"],
+            vec![("customer", AttributeValue::EntityRef(target.to_string()))],
+        )
+    }
+
+    #[tokio::test]
+    async fn a_dangling_reference_is_rejected_on_create() {
+        let (store, _) = reference_store(true).await;
+
+        let error = store
+            .create(order("o1", "missing"), &ctx())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                &error,
+                EntityError::DanglingRef(name, target)
+                    if name == "customer" && target == "missing"
+            ),
+            "unexpected error: {error}"
+        );
+        assert!(store.get("o1").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_reference_to_an_existing_entity_and_a_self_reference_are_accepted() {
+        let (store, registry) = reference_store(true).await;
+        store.create(customer("c1"), &ctx()).await.unwrap();
+
+        store.create(order("o1", "c1"), &ctx()).await.unwrap();
+        registry
+            .publish(schema(
+                "node",
+                &[],
+                vec![attr("parent", AttributeType::EntityRef)],
+            ))
+            .await
+            .unwrap();
+        store
+            .create(
+                draft(
+                    "n1",
+                    &["node"],
+                    vec![("parent", AttributeValue::EntityRef("n1".to_string()))],
+                ),
+                &ctx(),
+            )
+            .await
+            .unwrap();
+
+        let stored = store.get("o1").await.unwrap().unwrap();
+        assert_eq!(
+            stored.attributes.get("customer"),
+            Some(&AttributeValue::EntityRef("c1".to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn an_update_to_a_missing_reference_keeps_the_old_row() {
+        let (store, _) = reference_store(true).await;
+        store.create(customer("c1"), &ctx()).await.unwrap();
+        store.create(order("o1", "c1"), &ctx()).await.unwrap();
+        let patch = EntityPatch {
+            attributes: [(
+                "customer".to_string(),
+                Some(AttributeValue::EntityRef("missing".to_string())),
+            )]
+            .into_iter()
+            .collect(),
+        };
+
+        let error = store.update("o1", 1, patch, &ctx()).await.unwrap_err();
+
+        assert!(matches!(error, EntityError::DanglingRef(_, _)));
+        let stored = store.get("o1").await.unwrap().unwrap();
+        assert_eq!(stored.version, 1);
+        assert_eq!(
+            stored.attributes.get("customer"),
+            Some(&AttributeValue::EntityRef("c1".to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn the_check_can_be_turned_off_but_the_target_form_is_still_checked() {
+        let (store, _) = reference_store(false).await;
+
+        store.create(order("o1", "missing"), &ctx()).await.unwrap();
+        let error = store
+            .create(order("o2", "bad:id"), &ctx())
+            .await
+            .unwrap_err();
+
+        assert!(store.get("o1").await.unwrap().is_some());
+        assert!(matches!(error, EntityError::Invalid(_)));
+    }
+
+    #[tokio::test]
+    async fn a_default_reference_to_a_missing_entity_is_rejected() {
+        let (store, registry) = reference_store(true).await;
+        registry
+            .publish(schema(
+                "ticket",
+                &[],
+                vec![full_attr(
+                    "owner",
+                    AttributeType::EntityRef,
+                    false,
+                    false,
+                    false,
+                    Some(serde_json::json!("missing")),
+                )],
+            ))
+            .await
+            .unwrap();
+
+        let error = store
+            .create(draft("t1", &["ticket"], vec![]), &ctx())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, EntityError::DanglingRef(_, _)));
+        assert!(store.get("t1").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_delete_does_not_remove_a_reference() {
+        let (store, _) = reference_store(true).await;
+        store.create(customer("c1"), &ctx()).await.unwrap();
+        store.create(order("o1", "c1"), &ctx()).await.unwrap();
+
+        store.delete("c1", 1, &ctx()).await.unwrap();
+
+        let stored = store.get("o1").await.unwrap().unwrap();
+        assert_eq!(
+            stored.attributes.get("customer"),
+            Some(&AttributeValue::EntityRef("c1".to_string()))
+        );
+        let error = store.create(order("o2", "c1"), &ctx()).await.unwrap_err();
+        assert!(matches!(error, EntityError::DanglingRef(_, _)));
+    }
+
+    #[tokio::test]
+    async fn a_migration_that_introduces_a_dangling_reference_writes_no_row() {
+        let (store, registry) = reference_store(true).await;
+        store.create(customer("c1"), &ctx()).await.unwrap();
+        store.create(order("o1", "c1"), &ctx()).await.unwrap();
+        store.delete("c1", 1, &ctx()).await.unwrap();
+        registry
+            .publish(schema(
+                "order",
+                &[],
+                vec![
+                    attr("customer", AttributeType::EntityRef),
+                    attr("note", AttributeType::String),
+                ],
+            ))
+            .await
+            .unwrap();
+
+        let result = store
+            .migrate_schema("order", 2, 100, None, false, &ctx())
+            .await;
+
+        assert!(matches!(result, Err(EntityError::DanglingRef(_, _))));
+        let stored = store.get("o1").await.unwrap().unwrap();
+        assert_eq!(stored.version, 1);
+        assert_eq!(stored.schemas[0].version, 1);
     }
 }
