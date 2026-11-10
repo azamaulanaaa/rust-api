@@ -161,6 +161,11 @@ sample_ratio = 1.0
 # Default: 5.
 # webhook_max_attempts = 5
 
+# Allows webhook delivery to a private, loopback, or link-local address.
+# The action still resolves the host and pins the address. Set this value to
+# true only for an intentional internal webhook. Default: false.
+# webhook_allow_private_hosts = false
+
 # Optional — RabbitMQ connection for the job queue. Only used when the
 # binary is built with the `queue-rabbitmq` cargo feature.
 # [rabbitmq]

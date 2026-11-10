@@ -297,6 +297,7 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
     let eav_config = config.eav.runtime_config();
     let webhook_signing_secret = config.eav.webhook_signing_secret.clone();
     let webhook_max_attempts = config.eav.webhook_max_attempts;
+    let webhook_allow_private_hosts = config.eav.webhook_allow_private_hosts;
 
     let telemetry = telemetry::init(
         verbose,
@@ -394,11 +395,9 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
         let signing_secret = webhook_signing_secret
             .as_ref()
             .map(|secret| secret.as_bytes().to_vec());
-        let webhook = WebhookAction::new(config.eav.webhook_allowed_hosts.clone()).with_queue(
-            queue.clone(),
-            signing_secret,
-            webhook_max_attempts,
-        );
+        let webhook = WebhookAction::new(config.eav.webhook_allowed_hosts.clone())
+            .allow_private_hosts(webhook_allow_private_hosts)
+            .with_queue(queue.clone(), signing_secret, webhook_max_attempts);
         let worker = QueueWorker::new(
             queue,
             vec![Arc::new(webhook.job_handler())],
