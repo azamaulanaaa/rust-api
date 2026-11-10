@@ -387,7 +387,8 @@ impl SchemaRegistry {
     /// The scan reads only the `schema:head:` family.
     /// It starts after the `after` id when the caller gives a cursor.
     /// The call returns the versions and the cursor for the next page.
-    /// The cursor is the last id of a full page.
+    /// The scan reads one extra id as a look-ahead.
+    /// The cursor is the last id of the page when the extra id exists.
     /// The cursor is `None` when the scan is exhausted.
     /// A stale or unknown cursor returns the ids after its sort position.
     /// A `limit` of 0 returns an empty list and no cursor.
@@ -407,13 +408,12 @@ impl SchemaRegistry {
             }
             None => HEAD_PREFIX.to_string(),
         };
-        let max = u32::try_from(limit).ok();
+        let max = u32::try_from(limit.saturating_add(1)).ok();
         let cursor = (Some(start), Some(prefix_scan_end(HEAD_PREFIX)));
         let heads = g
             .gets_bytes(max, Direction::Next, cursor)
             .await
             .map_err(SchemaError::Store)?;
-        let full = heads.len() == limit;
         let mut rows = Vec::with_capacity(heads.len());
         for head in heads {
             let Some(id) = head.key.strip_prefix(HEAD_PREFIX) else {
@@ -427,7 +427,9 @@ impl SchemaRegistry {
             rows.push((id.to_string(), version));
         }
         rows.sort_by(|a, b| a.0.cmp(&b.0));
-        let next = if full {
+        let has_more = rows.len() > limit;
+        rows.truncate(limit);
+        let next = if has_more {
             rows.last().map(|(id, _)| id.clone())
         } else {
             None
@@ -1220,6 +1222,88 @@ mod tests {
 
         assert_eq!(ids, vec!["a", "b", "c", "d", "e"]);
         assert_eq!(pages, 3);
+    }
+
+    #[tokio::test]
+    async fn list_after_full_final_page_returns_no_cursor() {
+        let reg = new_registry().await;
+        for id in ["a", "b", "c", "d"] {
+            reg.publish(draft(id, &[], vec![])).await.unwrap();
+        }
+
+        let (first, next) = reg.list_after(2, None).await.unwrap();
+        let first_ids: Vec<&str> = first.iter().map(|def| def.id.as_str()).collect();
+        assert_eq!(first_ids, vec!["a", "b"]);
+        assert_eq!(next.as_deref(), Some("b"));
+
+        let (second, next) = reg.list_after(2, next.as_deref()).await.unwrap();
+        let second_ids: Vec<&str> = second.iter().map(|def| def.id.as_str()).collect();
+        assert_eq!(second_ids, vec!["c", "d"]);
+        assert_eq!(next, None);
+
+        let mut all: Vec<String> = first.into_iter().map(|def| def.id).collect();
+        all.extend(second.into_iter().map(|def| def.id));
+        assert_eq!(all, vec!["a", "b", "c", "d"]);
+    }
+
+    #[tokio::test]
+    async fn list_after_pages_five_schemas_with_a_short_final_page() {
+        let reg = new_registry().await;
+        for id in ["a", "b", "c", "d", "e"] {
+            reg.publish(draft(id, &[], vec![])).await.unwrap();
+        }
+
+        let (first, next) = reg.list_after(2, None).await.unwrap();
+        let first_ids: Vec<&str> = first.iter().map(|def| def.id.as_str()).collect();
+        assert_eq!(first_ids, vec!["a", "b"]);
+        assert_eq!(next.as_deref(), Some("b"));
+
+        let (second, next) = reg.list_after(2, next.as_deref()).await.unwrap();
+        let second_ids: Vec<&str> = second.iter().map(|def| def.id.as_str()).collect();
+        assert_eq!(second_ids, vec!["c", "d"]);
+        assert_eq!(next.as_deref(), Some("d"));
+
+        let (third, next) = reg.list_after(2, next.as_deref()).await.unwrap();
+        let third_ids: Vec<&str> = third.iter().map(|def| def.id.as_str()).collect();
+        assert_eq!(third_ids, vec!["e"]);
+        assert_eq!(next, None);
+
+        let mut all: Vec<String> = first.into_iter().map(|def| def.id).collect();
+        all.extend(second.into_iter().map(|def| def.id));
+        all.extend(third.into_iter().map(|def| def.id));
+        assert_eq!(all, vec!["a", "b", "c", "d", "e"]);
+    }
+
+    #[tokio::test]
+    async fn list_after_pages_three_schemas_with_a_short_final_page() {
+        let reg = new_registry().await;
+        for id in ["a", "b", "c"] {
+            reg.publish(draft(id, &[], vec![])).await.unwrap();
+        }
+
+        let (first, next) = reg.list_after(2, None).await.unwrap();
+        let first_ids: Vec<&str> = first.iter().map(|def| def.id.as_str()).collect();
+        assert_eq!(first_ids, vec!["a", "b"]);
+        assert_eq!(next.as_deref(), Some("b"));
+
+        let (second, next) = reg.list_after(2, next.as_deref()).await.unwrap();
+        let second_ids: Vec<&str> = second.iter().map(|def| def.id.as_str()).collect();
+        assert_eq!(second_ids, vec!["c"]);
+        assert_eq!(next, None);
+
+        let mut all: Vec<String> = first.into_iter().map(|def| def.id).collect();
+        all.extend(second.into_iter().map(|def| def.id));
+        assert_eq!(all, vec!["a", "b", "c"]);
+    }
+
+    #[tokio::test]
+    async fn list_after_empty_registry_returns_no_cursor() {
+        let reg = new_registry().await;
+
+        let (page, next) = reg.list_after(2, None).await.unwrap();
+
+        assert!(page.is_empty());
+        assert_eq!(next, None);
     }
 
     #[tokio::test]
