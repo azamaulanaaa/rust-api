@@ -262,6 +262,26 @@ async fn import_policy(
     Ok(())
 }
 
+/// Returns `true` when this instance can serve writes.
+///
+/// The policy lock, the lease, the fencing state, and the dependency health
+/// keep their existing behaviour.
+/// `eav_failed` is `None` when the EAV runtime is disabled.
+/// A `Some(true)` value means that the EAV runtime stopped after an error.
+fn readiness_state(
+    policy_unlocked: bool,
+    lease_lost: bool,
+    primary_loss: bool,
+    dependencies_healthy: bool,
+    eav_failed: Option<bool>,
+) -> bool {
+    policy_unlocked
+        && !lease_lost
+        && !primary_loss
+        && dependencies_healthy
+        && !eav_failed.unwrap_or(false)
+}
+
 /// Runs the HTTP listener until stopped.
 async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
     let config = config::Config::try_from(config_path)?;
@@ -360,7 +380,7 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
     // built-in `noop` and `log` actions. A host application adds its own
     // actions through `EavRuntime::build`. The module and the background loops
     // share one runtime handle.
-    let (eav_api_module, eav_handle, webhook_worker) = if eav_enabled {
+    let (eav_api_module, eav_handle, webhook_worker, eav_failure_latch) = if eav_enabled {
         // The webhook worker uses one durable queue under `{prefix}/eav-queue`.
         let queue_store = rust_api::db::build_s3_store(
             &s3_client_config,
@@ -400,9 +420,15 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
             oidc_api_module.middleware(),
         );
         let handle = runtime.spawn(cancel.clone(), eav_config);
-        (Some(module), Some(handle), Some(worker_handle))
+        let failure_latch = runtime.failure_latch();
+        (
+            Some(module),
+            Some(handle),
+            Some(worker_handle),
+            Some(failure_latch),
+        )
     } else {
-        (None, None, None)
+        (None, None, None, None)
     };
 
     // Applications append their own reactive services here. The starter kit
@@ -496,12 +522,14 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
     // happens when a writer still holds it. It also fails when the
     // single-writer lease is lost. A lost lease means that a successor now
     // owns the prefix. This process must stop taking traffic. The startup of
-    // the server already checks S3, OIDC, JWKS, and the lease.
+    // the server already checks S3, OIDC, JWKS, and the lease. When the EAV
+    // runtime is enabled, the check also fails when its failure latch is set.
     let readiness: rust_api::http::health::ReadyCheck = Arc::new({
         let policy_engine = policy_engine.clone();
         let dependency_health = dependency_health.clone();
+        let eav_failure_latch = eav_failure_latch.clone();
         move || {
-            // Four separate reasons mean that this instance cannot serve
+            // Five separate reasons mean that this instance cannot serve
             // writes. Any one of them is enough to take it out of the
             // rotation:
             //
@@ -516,10 +544,17 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
             //   `fencing` reports it on its own.
             // - An external dependency (S3 or OIDC) failed its last
             //   background probe.
-            policy_engine.is_unlocked()
-                && !lease_lost.load(std::sync::atomic::Ordering::Relaxed)
-                && !rust_api::fencing::primary_loss()
-                && dependency_health.is_healthy()
+            // - The EAV runtime stopped after an error, so entity events no
+            //   longer flow. A disabled EAV runtime leaves this check out.
+            readiness_state(
+                policy_engine.is_unlocked(),
+                lease_lost.load(std::sync::atomic::Ordering::Relaxed),
+                rust_api::fencing::primary_loss(),
+                dependency_health.is_healthy(),
+                eav_failure_latch
+                    .as_ref()
+                    .map(|latch| latch.load(std::sync::atomic::Ordering::Relaxed)),
+            )
         }
     });
     // The function builds the server first, so that it can start the
@@ -739,6 +774,32 @@ force_path_style = true
         assert_eq!(domain_prefix("oxkv", "policy"), "oxkv/policy");
         assert_eq!(domain_prefix("oxkv", "fs"), "oxkv/fs");
         assert_eq!(domain_prefix("oxkv", "wal"), "oxkv/wal");
+    }
+
+    /// A dead EAV runtime takes the instance out of the rotation.
+    ///
+    /// The test reads a shared latch, so it covers the same path that the
+    /// readiness closure uses. A disabled EAV runtime supplies `None` and
+    /// leaves the other checks unchanged.
+    #[test]
+    fn a_dead_eav_runtime_makes_the_instance_not_ready() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let latch = Arc::new(AtomicBool::new(false));
+        let read = |latch: &Arc<AtomicBool>| Some(latch.load(Ordering::Relaxed));
+
+        assert!(readiness_state(true, false, false, true, read(&latch)));
+        latch.store(true, Ordering::Relaxed);
+        assert!(!readiness_state(true, false, false, true, read(&latch)));
+
+        // A disabled EAV runtime supplies `None`.
+        assert!(readiness_state(true, false, false, true, None));
+
+        // The new latch does not change the other reasons.
+        assert!(!readiness_state(false, false, false, true, None));
+        assert!(!readiness_state(true, true, false, true, None));
+        assert!(!readiness_state(true, false, true, true, None));
+        assert!(!readiness_state(true, false, false, false, None));
     }
 
     /// The `[s3]` section of the config file becomes the type that the engine
