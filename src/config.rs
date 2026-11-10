@@ -353,6 +353,16 @@ impl Config {
         if self.eav.execution_retention_secs == 0 {
             anyhow::bail!("eav.execution_retention_secs must be greater than 0");
         }
+        if self.eav.retention_below_safe_floor() {
+            tracing::warn!(
+                field = "eav.execution_retention_secs",
+                value = self.eav.execution_retention_secs,
+                recommended = MIN_SAFE_RETENTION_SECS,
+                "eav.execution_retention_secs is below the safe floor. Set it to at least \
+                 {MIN_SAFE_RETENTION_SECS} seconds (7 days). A shorter window can delete a \
+                 marker before a replay reads it, so the action can run twice."
+            );
+        }
         if self.eav.timer_interval_ms == 0 {
             anyhow::bail!("eav.timer_interval_ms must be greater than 0");
         }
@@ -567,6 +577,15 @@ impl LimitsConfig {
     }
 }
 
+/// Minimum safe retention for execution markers, in seconds.
+///
+/// The value is 7 days.
+/// A shorter window can delete a marker before a rule replay reads it.
+/// The replay then runs the action a second time.
+/// The config validation warns when the value is below this floor.
+/// It does not reject the value.
+pub const MIN_SAFE_RETENTION_SECS: u64 = 604_800;
+
 /// Settings for the optional EAV background runtime.
 ///
 /// The runtime is off by default.
@@ -672,6 +691,15 @@ impl Default for EavConfig {
 }
 
 impl EavConfig {
+    /// Returns true when the marker retention is below
+    /// [`MIN_SAFE_RETENTION_SECS`].
+    ///
+    /// The rule uses this helper.
+    /// A test can then check the rule without a log capture.
+    pub fn retention_below_safe_floor(&self) -> bool {
+        self.execution_retention_secs < MIN_SAFE_RETENTION_SECS
+    }
+
     /// Converts the settings into an [`EavRuntimeConfig`].
     ///
     /// [`EavRuntimeConfig`]: rust_api::eav::runtime::EavRuntimeConfig
@@ -1422,6 +1450,51 @@ mod tests {
         assert_eq!(cfg.eav.webhook_max_attempts, 5);
         assert!(!cfg.eav.webhook_allow_private_hosts);
         assert_eq!(cfg.eav, EavConfig::default());
+    }
+
+    #[test]
+    fn retention_below_the_safe_floor_is_detected() {
+        let mut cfg = EavConfig::default();
+
+        for value in [1, MIN_SAFE_RETENTION_SECS - 1] {
+            cfg.execution_retention_secs = value;
+            assert!(
+                cfg.retention_below_safe_floor(),
+                "value {value} must be below the safe floor"
+            );
+        }
+
+        for value in [MIN_SAFE_RETENTION_SECS, MIN_SAFE_RETENTION_SECS + 1] {
+            cfg.execution_retention_secs = value;
+            assert!(
+                !cfg.retention_below_safe_floor(),
+                "value {value} must be at or above the safe floor"
+            );
+        }
+    }
+
+    #[test]
+    fn a_retention_below_the_safe_floor_warns_but_does_not_fail() {
+        let short = MIN_SAFE_RETENTION_SECS - 1;
+        let toml = minimal_toml().replace(
+            "region = \"us-east-1\"",
+            &format!("region = \"us-east-1\"\n[eav]\nexecution_retention_secs = {short}"),
+        );
+        let cfg = parse(&toml).expect("a short retention must not fail validation");
+
+        assert_eq!(cfg.eav.execution_retention_secs, short);
+        assert!(cfg.eav.retention_below_safe_floor());
+
+        let at_floor = minimal_toml().replace(
+            "region = \"us-east-1\"",
+            &format!(
+                "region = \"us-east-1\"\n[eav]\nexecution_retention_secs = \
+                 {MIN_SAFE_RETENTION_SECS}"
+            ),
+        );
+        let cfg = parse(&at_floor).expect("the safe floor must pass validation");
+
+        assert!(!cfg.eav.retention_below_safe_floor());
     }
 
     #[test]

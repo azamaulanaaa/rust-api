@@ -241,6 +241,8 @@ The schema registry stores immutable schema versions. A schema can extend other 
 
 The entity store keeps validated entities with typed attributes. An entity pins one or more exact schema versions. The store checks every attribute against the merged effective schema. It keeps schema, attribute, and unique indexes.
 
+The attribute index and the unique constraint key on the attribute name only. They do not include a schema id. An attribute index and a unique constraint therefore apply across every schema that uses the name. A unique value blocks a second entity in any schema with that attribute name. Use a distinct name when two schemas must not share the domain.
+
 An `EntityRef` attribute holds the id of another entity. A write validates the target id and requires that the target exists. A self-reference is valid. The check reads one row for each distinct target. Set `check_entity_refs = false` to keep the id validation and skip the existence read. The store keeps a reverse reference index. A delete counts the distinct entities that reference the target. A target with references returns `409` with code `conflict` and changes nothing. Set `force=true` to delete the target and leave the references dangling. A self-reference does not block the delete. An old store gets the reverse markers one time at the first delete. A writer can learn whether an entity id exists.
 
 | Status | Code | Condition |
@@ -250,6 +252,8 @@ An `EntityRef` attribute holds the id of another entity. A write validates the t
 | `409` | `conflict` | Another entity references the target and `force` is false. |
 
 The `/eav` management API covers schemas, entities, and rules. List routes use paging. `limit` defaults to 50 and cannot exceed 200. `offset` defaults to 0 and cannot exceed 1000. A larger offset returns `400`. Use cursor paging with `after` to page deeper. `GET /eav/rules` supports offset paging only, so an `after` cursor on that route returns `400`. `GET /eav/schemas/{id}/entities` returns `404` for an unknown schema id. A known schema returns the normal entity page.
+
+`GET /eav/entities` needs `read` on `eav_entities`. `POST /eav/entities/query` has no collection check. It filters each row with the row grant and returns only the entities that the caller can read. A caller with no grant gets an empty page from query, not `403`.
 
 `POST /eav/entities/query` finds entities by an indexed attribute value. `limit` defaults to 50 and is in the range 1 to 200. An empty `after` starts at the first page. The response returns the next cursor in `next`. An attribute that no applied schema indexes returns `400`.
 
@@ -269,7 +273,7 @@ Schema evolution has three steps. `GET /eav/schemas/{id}/diff` reports added, re
 
 The entity store writes one change event to an outbox row in the same transaction as the entity data. A background relay flushes the outbox to the shared change feed. Delivery is at least once, so a consumer must be idempotent. Clients read the feed through `/eav/sync/events` and load the initial state through `/eav/sync/snapshot`.
 
-The module also stores one per-user entity replica. `POST /eav/sync/replica` builds a head-anchored snapshot of the entities that the caller can read, in ordered chunks. The build reads the feed head first. It then pages the entities. A change that commits after the head can appear in the snapshot. The client applies the feed events after the returned `head`. An apply must be idempotent and version-aware. Each build increments the stored generation, including a rebuild at the same head. The build response returns the new `generation`. `GET /eav/sync/replica` returns the full snapshot as one JSON array. This full read is for compatibility. It sets `X-Replica-Head` and `X-Replica-Generation`. `GET /eav/sync/replica?chunk=N` returns one stored chunk. The chunk response sets `X-Replica-Head`, `X-Replica-Generation`, `X-Replica-Chunk`, and `X-Replica-Chunks`, and its body carries `generation`. Read chunks from 0 until `next` is null. A client that pages chunks must compare the generation across the pages. The client must restart at chunk 0 when the generation changes, because the pages then come from two different builds. The build filters with the grants at build time. Each read filters again with the current grants. The snapshot gives no authorization cache, so a policy change takes effect on the next read. The read sets no `ETag` and ignores `If-None-Match`. The response depends on the current grants, so it has no stable validator. This replica differs from the file replica under `/sync`. The `/sync` replica mirrors file records and relations as prefix-scoped store objects. The EAV replica is a chunked JSON snapshot in the EAV replica store. It is not an incremental store.
+The module also stores one per-user entity replica. `POST /eav/sync/replica` builds a head-anchored snapshot of the entities that the caller can read, in ordered chunks. The build reads the feed head first. It then pages the entities. A change that commits after the head can appear in the snapshot. The client applies the feed events after the returned `head`. An apply must be idempotent and version-aware. Each build increments the stored generation, including a rebuild at the same head. The build response returns the new `generation`. `GET /eav/sync/replica` returns the full snapshot as one JSON array. This full read is for compatibility. It sets `X-Replica-Head` and `X-Replica-Generation`. `GET /eav/sync/replica?chunk=N` returns one stored chunk. The chunk response sets `X-Replica-Head`, `X-Replica-Generation`, `X-Replica-Chunk`, and `X-Replica-Chunks`, and its body carries `generation`. Read chunks from 0 until `next` is null. A client that pages chunks must compare the generation across the pages. The client must restart at chunk 0 when the generation changes, because the pages then come from two different builds. The build filters with the grants at build time. Each read filters again with the current grants. The snapshot gives no authorization cache, so a policy change takes effect on the next read. The read sets no `ETag` and ignores `If-None-Match`. The response depends on the current grants, so it has no stable validator. `DELETE /eav/sync/replica` removes the stored replica of the caller. The reset removes the snapshot, the chunks, the manifest, the generation, and the head in one transaction. A reset returns `204` when a replica existed. A reset returns `404` when the caller has no replica. The caller needs no management grant, because a user owns their replica. After a WAL reset, call the reset route, then build a new replica. This replica differs from the file replica under `/sync`. The `/sync` replica mirrors file records and relations as prefix-scoped store objects. The EAV replica is a chunked JSON snapshot in the EAV replica store. It is not an incremental store.
 
 ```bash
 curl -s -H "Authorization: Bearer $TOKEN" \
@@ -351,8 +355,8 @@ Metrics cover rule execution (`eav.rules.executed`, `eav.rules.failed`) and webh
 | POST | `/eav/schemas/{id}/revalidate` | Check stored entities against a target version without a write | session |
 | POST | `/eav/schemas/{id}/migrate` | Repin stored entities to a target version. The default is a dry run. A dry run needs read on schemas and entities. A real run needs write on both. | session |
 | POST | `/eav/entities` | Create one validated entity | session |
-| GET | `/eav/entities` | Paged list of entities | session |
-| POST | `/eav/entities/query` | Paged query of entities by an indexed attribute value | session |
+| GET | `/eav/entities` | Paged list of entities. Needs collection read on `eav_entities`. | session |
+| POST | `/eav/entities/query` | Paged query of entities by an indexed attribute value. Filters each row with the row grant. A caller with no grant gets an empty page, not `403`. | session |
 | GET | `/eav/entities/{id}` | Get one entity | session |
 | PATCH | `/eav/entities/{id}` | Update attributes with an expected version | session |
 | DELETE | `/eav/entities/{id}` | Delete one entity with `expected_version`, or a referenced entity with `force=true` | session |
@@ -366,6 +370,7 @@ Metrics cover rule execution (`eav.rules.executed`, `eav.rules.failed`) and webh
 | GET | `/eav/sync/events` | Entity events after a `since` cursor | session |
 | GET | `/eav/sync/snapshot` | One page of entity state for an offline client | session |
 | POST | `/eav/sync/replica` | Build and store the caller's entity replica | session |
+| DELETE | `/eav/sync/replica` | Remove the caller's stored replica. A reset returns `204`, or `404` when no replica exists. | session |
 | GET | `/eav/sync/replica` | Read the stored replica as a JSON array with the current grants, or one chunk object with `?chunk=N` | session |
 | GET | `/eav/sync/replica/status` | Change feed head and stored replica head | session |
 | GET | `/openapi.json` | OpenAPI 3.1 document | none |
@@ -642,7 +647,7 @@ The `[eav]` section controls the optional EAV runtime and the webhook action. `[
 | `outbox_interval_ms` | `1000` | Pause between entity outbox flushes. |
 | `rule_poll_interval_ms` | `200` | Pause between rule runner polls. |
 | `gc_interval_ms` | `3600000` | Pause between execution marker cleanups. |
-| `execution_retention_secs` | `2592000` | Retention window for execution markers. |
+| `execution_retention_secs` | `2592000` | Retention window for execution markers. A value below `604800` (7 days) logs a warning. |
 | `timer_interval_ms` | `1000` | Pause between due timer passes. |
 | `timer_batch` | `100` | Largest number of due entities read for each time index key. |
 | `max_causation_depth` | `8` | Maximum causation depth for a rule chain, from 1 to 64. The maximum is inclusive. |
@@ -651,6 +656,8 @@ The `[eav]` section controls the optional EAV runtime and the webhook action. `[
 | `webhook_signing_secret` | none | Optional HMAC-SHA256 secret of at least 32 bytes. When set, adds the `X-Signature` header. |
 | `webhook_max_attempts` | `5` | Maximum delivery attempts for one webhook job, from 1 to 20. |
 | `webhook_allow_private_hosts` | `false` | Allows webhook delivery to a non-global address. The action still resolves and pins the address. |
+
+`execution_retention_secs` must stay above zero. The server logs a warning when the value is below 604800 seconds (7 days). A shorter window can delete an execution marker before a rule replay reads it, so the action can run twice. The server does not reject the value. The default is 2592000 seconds (30 days).
 
 The webhook allowlist is empty by default. Every webhook rule is rejected until an operator adds a host. A webhook job that uses all of its attempts is dead-lettered.
 
@@ -716,7 +723,7 @@ Restore the policy, the EAV stores, and the WAL together, from one point in time
 6. EAV replicas
 7. WAL
 
-The rule store holds the cursor into the WAL. Restore the WAL with the rule store. If you restore the rule store without the WAL, reset the rule cursor and the stored replica heads. A reset feed with an old replica head needs a replica reset or a fresh build.
+The rule store holds the cursor into the WAL. Restore the WAL with the rule store. If you restore the rule store without the WAL, reset the rule cursor and the stored replica heads. A reset feed with an old replica head needs `DELETE /eav/sync/replica`, then a new build.
 
 There is no automated backup job and no restore drill in this repository. Rehearse both.
 
@@ -934,6 +941,10 @@ cargo bench --bench eav -- --quick
 ## Development
 
 Build, test, lint, documentation, and commit rules are in [CONTRIBUTING.md](CONTRIBUTING.md). This section covers the test suites and releases. See [Performance](#performance) for the benchmark suite.
+
+### Configuration tests
+
+The configuration module is part of the binary target. Run its tests with `cargo test --bin rust-api config`. A `cargo test --lib config` filter runs no configuration test.
 
 ### Integration tests
 
