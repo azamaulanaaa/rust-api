@@ -80,6 +80,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, RwLock};
 
+use crate::eav::MAX_PAGE_OFFSET;
 use crate::eav::entity_error::EntityError;
 use crate::eav::error::SchemaError;
 use crate::eav::schema::{AttributeDef, AttributeType, EffectiveSchema, SchemaRef, SchemaRegistry};
@@ -1715,7 +1716,14 @@ impl EntityStore {
     /// It then loads at most `limit` entities.
     /// The call scans at most `offset + limit` entity markers.
     /// A `limit` of 0 returns an empty list.
+    /// An offset above `MAX_PAGE_OFFSET` returns an invalid-input error.
+    /// Use `after` for a deeper page.
     pub async fn list_page(&self, limit: usize, offset: usize) -> Result<Vec<Entity>, EntityError> {
+        if offset > MAX_PAGE_OFFSET {
+            return Err(EntityError::Invalid(format!(
+                "offset must be at most {MAX_PAGE_OFFSET}. Use after to page deeper."
+            )));
+        }
         if limit == 0 {
             return Ok(Vec::new());
         }
@@ -3647,6 +3655,20 @@ mod tests {
         let page = store.list_page(2, 9).await.unwrap();
 
         assert!(page.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_page_rejects_an_offset_above_the_maximum() {
+        let (store, registry, _raw) = new_store().await;
+        registry.publish(schema("task", &[], vec![])).await.unwrap();
+        store
+            .create(draft("a", &["task"], vec![]), &ctx())
+            .await
+            .unwrap();
+
+        let result = store.list_page(2, MAX_PAGE_OFFSET + 1).await;
+
+        assert!(matches!(result, Err(EntityError::Invalid(_))));
     }
 
     #[tokio::test]
