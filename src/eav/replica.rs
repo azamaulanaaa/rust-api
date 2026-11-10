@@ -1,6 +1,10 @@
 //! Stored per-user entity replicas.
 //!
-//! A replica is a point-in-time JSON snapshot, not an incremental store.
+//! A replica is a head-anchored JSON snapshot, not an incremental store.
+//! The build reads the feed head first. It then pages the entities.
+//! A change that commits after the head can appear in the snapshot.
+//! The client applies the events after the returned head.
+//! An apply must be idempotent and version-aware.
 //! The client builds one replica, then applies the event feed for each delta.
 //! The store keeps one head row, one manifest row, and one row for each chunk.
 //! The head row names the manifest, and the manifest names the chunk count.

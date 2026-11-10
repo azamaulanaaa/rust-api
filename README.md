@@ -243,7 +243,7 @@ The entity store keeps validated entities with typed attributes. An entity pins 
 
 An `EntityRef` attribute holds the id of another entity. A write validates the target id and requires that the target exists. A self-reference is valid. The check reads one row for each distinct target. Set `check_entity_refs = false` to keep the id validation and skip the existence read. A delete does not check reverse references, so a delete can leave a dangling reference. A writer can learn whether an entity id exists.
 
-The `/eav` management API covers schemas, entities, and rules. List routes use paging. `limit` defaults to 50 and cannot exceed 200. `offset` defaults to 0.
+The `/eav` management API covers schemas, entities, and rules. List routes use paging. `limit` defaults to 50 and cannot exceed 200. `offset` defaults to 0 and cannot exceed 1000. A larger offset returns `400`. Use cursor paging with `after` to page deeper. `GET /eav/rules` supports offset paging only, so an `after` cursor on that route returns `400`.
 
 `POST /eav/entities/query` finds entities by an indexed attribute value. `limit` defaults to 50 and is in the range 1 to 200. An empty `after` starts at the first page. The response returns the next cursor in `next`. An attribute that no applied schema indexes returns `400`.
 
@@ -263,7 +263,7 @@ Schema evolution has three steps. `GET /eav/schemas/{id}/diff` reports added, re
 
 The entity store writes one change event to an outbox row in the same transaction as the entity data. A background relay flushes the outbox to the shared change feed. Delivery is at least once, so a consumer must be idempotent. Clients read the feed through `/eav/sync/events` and load the initial state through `/eav/sync/snapshot`.
 
-The module also stores one per-user entity replica. `POST /eav/sync/replica` builds a point-in-time snapshot of the entities that the caller can read, in ordered chunks. The client then applies the entity change feed after the stored head. `GET /eav/sync/replica` returns the full snapshot as one JSON array. This full read is for compatibility. `GET /eav/sync/replica?chunk=N` returns one stored chunk. Read chunks from 0 until `next` is null. This replica differs from the file replica under `/sync`. The `/sync` replica mirrors file records and relations as prefix-scoped store objects. The EAV replica is a chunked JSON snapshot in the EAV replica store. It is not an incremental store.
+The module also stores one per-user entity replica. `POST /eav/sync/replica` builds a head-anchored snapshot of the entities that the caller can read, in ordered chunks. The build reads the feed head first. It then pages the entities. A change that commits after the head can appear in the snapshot. The client applies the feed events after the returned `head`. An apply must be idempotent and version-aware. `GET /eav/sync/replica` returns the full snapshot as one JSON array. This full read is for compatibility. `GET /eav/sync/replica?chunk=N` returns one stored chunk. Read chunks from 0 until `next` is null. The build filters with the grants at build time. Each read filters again with the current grants. The snapshot gives no authorization cache, so a policy change takes effect on the next read. The read sets no `ETag` and ignores `If-None-Match`. The response depends on the current grants, so it has no stable validator. This replica differs from the file replica under `/sync`. The `/sync` replica mirrors file records and relations as prefix-scoped store objects. The EAV replica is a chunked JSON snapshot in the EAV replica store. It is not an incremental store.
 
 ```bash
 curl -s -H "Authorization: Bearer $TOKEN" \
@@ -288,7 +288,7 @@ The durable rule store lives on OxKV and keeps an index for each trigger event a
 | `log` | Writes one log line with the rule and event identifiers. |
 | `webhook` | Posts one JSON event to an allowlisted host. |
 
-The webhook action uses a strict host allowlist. Each entry is a host or a `host:port` pair. The client follows no redirects. It accepts `http` only for a loopback host. Before each request, the action resolves the host and rejects a non-public address unless `webhook_allow_private_hosts` is `true`. The action pins the resolved address to the HTTP client, and the URL keeps the host name for TLS certificate validation. When a signing secret is set, the action sends `X-Signature: sha256=<hex>` over the exact body bytes. The action can send directly or enqueue a durable `webhook.deliver` job. The queue retries a failed job up to `webhook_max_attempts` and then dead-letters it. The job idempotency key deduplicates one rule and one event. The receiver must deduplicate on the `X-Event-Id` header.
+The webhook action uses a strict host allowlist. Each entry is a host or a `host:port` pair. The client follows no redirects. It accepts `http` only for a loopback host. Rule validation rejects a URL that the delivery path would reject for a static reason. It rejects a non-public literal address unless `webhook_allow_private_hosts` is `true`. It rejects `http` for a non-loopback host. Validation does not do a DNS lookup. Before each request, the action resolves the host and rejects an address that is not global unless `webhook_allow_private_hosts` is `true`. The rejected IPv4 ranges are loopback, private, link-local, carrier-grade NAT, IETF assignment, 6to4 relay, benchmarking, documentation, and reserved. The rejected IPv6 ranges are loopback, link-local, unique-local, 6to4, Teredo, NAT64, documentation, discard-only, and ORCHID. The action pins the resolved address to the HTTP client, and the URL keeps the host name for TLS certificate validation. When a signing secret is set, the action sends `X-Signature: sha256=<hex>` over the exact body bytes. The action can send directly or enqueue a durable `webhook.deliver` job. The queue retries a failed job up to `webhook_max_attempts` and then dead-letters it. The job idempotency key deduplicates one rule and one event. The receiver must deduplicate on the `X-Event-Id` header.
 
 The runtime also processes timers. A timestamp attribute with an index forms a time index. Each pass emits one timer event for each due timestamp value. A fired marker stops a duplicate event for the same entity, key, and value. A new timestamp value allows a new timer event.
 
@@ -307,7 +307,7 @@ Metrics cover rule execution (`eav.rules.executed`, `eav.rules.failed`) and webh
 | Method | Path | Description | Auth |
 |---|---|---|---|
 | GET | `/health` | Liveness probe. Always `200`. | none |
-| GET | `/ready` | Readiness probe: policy lock, writer lease, fencing, and dependency probes | none |
+| GET | `/ready` | Readiness probe: policy lock, writer lease, fencing, dependency probes, and the EAV failure latch | none |
 | GET | `/auth/login` | Start OIDC login. Accepts an optional relative `return_to` and redirects to the provider | none |
 | GET | `/auth/callback` | OIDC callback. Returns JSON, or `302` to `return_to` | none |
 | GET | `/auth/me` | Session probe: `sub`, `iss`, `aud`, `exp` | session |
@@ -360,7 +360,7 @@ Metrics cover rule execution (`eav.rules.executed`, `eav.rules.failed`) and webh
 | GET | `/eav/sync/events` | Entity events after a `since` cursor | session |
 | GET | `/eav/sync/snapshot` | One page of entity state for an offline client | session |
 | POST | `/eav/sync/replica` | Build and store the caller's entity replica | session |
-| GET | `/eav/sync/replica` | Read the stored replica, or one chunk with `?chunk=N` | session |
+| GET | `/eav/sync/replica` | Read the stored replica with the current grants, or one chunk with `?chunk=N` | session |
 | GET | `/eav/sync/replica/status` | Change feed head and stored replica head | session |
 | GET | `/openapi.json` | OpenAPI 3.1 document | none |
 | GET | `/swagger-ui/` | Swagger UI for the document | none |
@@ -642,11 +642,11 @@ The `[eav]` section controls the optional EAV runtime and the webhook action. `[
 | `webhook_allowed_hosts` | empty | Hosts that a webhook rule can call. Each entry is a host or a `host:port` pair. |
 | `webhook_signing_secret` | none | Optional HMAC-SHA256 secret of at least 32 bytes. When set, adds the `X-Signature` header. |
 | `webhook_max_attempts` | `5` | Maximum delivery attempts for one webhook job, from 1 to 20. |
-| `webhook_allow_private_hosts` | `false` | Allows webhook delivery to a private, loopback, or link-local address. The action still resolves and pins the address. |
+| `webhook_allow_private_hosts` | `false` | Allows webhook delivery to a non-global address. The action still resolves and pins the address. |
 
 The webhook allowlist is empty by default. Every webhook rule is rejected until an operator adds a host. A webhook job that uses all of its attempts is dead-lettered.
 
-The webhook action resolves the host before each request. It rejects the request when any resolved address is not public. The action pins the resolved address to the HTTP client, so a second DNS answer cannot change the target. The URL keeps the host name, so TLS certificate validation stays in effect. Set `webhook_allow_private_hosts = true` only for an intentional internal webhook.
+The webhook action resolves the host before each request. It rejects the request when any resolved address is not global. The rejected ranges include loopback, private, link-local, carrier-grade NAT, IETF assignment, 6to4 relay, benchmarking, documentation, and reserved IPv4 ranges. They also include loopback, link-local, unique-local, 6to4, Teredo, NAT64, documentation, discard-only, and ORCHID IPv6 ranges. Rule validation applies the static part of this rule without a DNS lookup. The action pins the resolved address to the HTTP client, so a second DNS answer cannot change the target. The URL keeps the host name, so TLS certificate validation stays in effect. Set `webhook_allow_private_hosts = true` only for an intentional internal webhook.
 
 ## Operations
 
@@ -676,6 +676,9 @@ See modules `lease` and `fencing` in the rustdoc for the protocol.
 - The server lost the writer lease.
 - A primary prefix was fenced.
 - The last background probe of S3 or OIDC failed.
+- An EAV background loop failed, so the failure latch is set.
+
+Each EAV background loop runs under a supervisor. An outbox relay, rule runner, marker cleanup, or timer pass failure sets the failure latch, and the supervisor logs it at `error` level. The supervisor restarts that loop with exponential backoff from 1 second up to 60 seconds. The other loops keep running. `/ready` returns `503` while the latch is set. Restart the process, or read the `EAV background loop failed` log entry.
 
 Wire `/ready` to a Kubernetes readiness probe or a load balancer health check. A route that nothing reads does not remove the instance from rotation. This matters most for fencing, because no client sees that error.
 
@@ -687,8 +690,25 @@ Wire `/ready` to a Kubernetes readiness probe or a load balancer health check. A
 |---|---|---|
 | Policy rules | `{db}/policy` | `rust-api policy import` (see [Policy export and import](#policy-export-and-import)). The import is idempotent. |
 | File metadata and relations | `{db}/fs` | Copy the prefix objects back. Use S3 bucket versioning, or copy prefixes between buckets. |
+| EAV schemas | `{db}/eav/schema` | Copy the prefix objects back. The store holds the versioned schemas. |
+| EAV entities | `{db}/eav/entity` | Copy the prefix objects back. The store holds the entities, attributes, indexes, and outbox. |
+| EAV rules | `{db}/eav/rules` | Copy the prefix objects back. The store holds the rules, the change-feed cursor, and the execution markers. |
+| EAV webhook queue | `{db}/eav-queue` | Copy the prefix objects back. The store holds the durable webhook job queue. |
+| EAV replicas | `{db}/eav/replica` | Copy the prefix objects back. The store holds the per-user chunked snapshots. |
 | Change feed | `{db}/wal` | Nothing. It is a replay log. A fresh prefix replays from zero. |
 | File bytes | User buckets | Your own S3 lifecycle rules. |
+
+Restore the policy, the EAV stores, and the WAL together, from one point in time. When the queue is enabled, include the durable webhook job queue. Restore them in this order:
+
+1. Policy
+2. EAV schemas
+3. EAV entities
+4. EAV rules
+5. EAV webhook queue (when the queue is enabled)
+6. EAV replicas
+7. WAL
+
+The rule store holds the cursor into the WAL. Restore the WAL with the rule store. If you restore the rule store without the WAL, reset the rule cursor and the stored replica heads. A reset feed with an old replica head needs a replica reset or a fresh build.
 
 There is no automated backup job and no restore drill in this repository. Rehearse both.
 
