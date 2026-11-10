@@ -295,6 +295,7 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
     // Read the EAV settings before the code moves other config fields.
     let eav_enabled = config.eav.enabled;
     let eav_config = config.eav.runtime_config();
+    let eav_max_causation_depth = config.eav.max_causation_depth;
     let webhook_signing_secret = config.eav.webhook_signing_secret.clone();
     let webhook_max_attempts = config.eav.webhook_max_attempts;
     let webhook_allow_private_hosts = config.eav.webhook_allow_private_hosts;
@@ -411,6 +412,7 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
             wal.clone(),
             vec![Arc::new(NoopAction), Arc::new(LogAction), Arc::new(webhook)],
             config.eav.check_entity_refs,
+            eav_max_causation_depth,
         )
         .await
         .context("build the EAV runtime")?;

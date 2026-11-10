@@ -1336,6 +1336,7 @@ mod tests {
                 ),
             ],
             true,
+            8,
         )
         .await?;
         let engine =

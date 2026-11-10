@@ -784,7 +784,7 @@ mod tests {
         let prefix = test_prefix("eav-sync");
         let wal = Wal::new(build_s3_store(&s3, &format!("{prefix}/wal")).await?);
         let runtime =
-            EavRuntime::build(&s3, &prefix, wal, vec![Arc::new(NoopAction)], true).await?;
+            EavRuntime::build(&s3, &prefix, wal, vec![Arc::new(NoopAction)], true, 8).await?;
         let engine =
             PolicyEngine::init_s3(build_test_store(&test_prefix("eav-sync-policy")).await).await?;
         Ok(Fixture {
