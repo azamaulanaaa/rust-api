@@ -23,6 +23,9 @@
 //!   time row.
 //! - `idx:time-key-meta:backfilled` is an empty backfill marker.
 //! - `timer:fired:{entity_id}:{key}:{encoded_ts}` is a fired timer marker.
+//! - `outbox-meta:pending` holds the pending outbox row count as JSON `u64`.
+//!   The key is not in the `outbox:` family, so an outbox scan does not
+//!   include it.
 //!
 //! The `hash` is the lowercase SHA-256 hex of the canonical tagged JSON value.
 //! The `encoded_ts` is the timestamp XORed with the sign bit, as 16 hex digits.
@@ -51,6 +54,17 @@
 //! Delivery is at least once.
 //! A consumer must be idempotent.
 //!
+//! The `outbox-meta:pending` counter holds the number of pending outbox
+//! rows.
+//! A write increments the counter in the transaction that writes the outbox
+//! row.
+//! A flush decrements the counter in the same write guard as the row delete.
+//! The counter is always equal to the number of `outbox:` rows.
+//! When the counter key is absent, [`EntityStore::outbox_count`] scans the
+//! `outbox:` family one time and writes the exact count.
+//! The backfill runs at most once.
+//! A crash before the counter write retries safely.
+//!
 //! An update changes attributes only.
 //! A later operation changes the pinned schemas.
 
@@ -72,6 +86,12 @@ const ENTITY_PREFIX: &str = "entity:";
 
 /// Key prefix for pending outbox rows.
 const OUTBOX_PREFIX: &str = "outbox:";
+
+/// Key for the durable pending outbox row counter.
+///
+/// The key does not start with [`OUTBOX_PREFIX`], so an outbox scan does not
+/// count it as a row.
+const OUTBOX_PENDING_KEY: &str = "outbox-meta:pending";
 
 /// Suffix for the metadata row of an entity.
 const META_SUFFIX: &str = ":meta";
@@ -441,6 +461,9 @@ impl EntityStore {
                 self.prepare_outbox(None, Some(&entity), event_schema_ids(&effective), ctx)?;
             check_unique_values(&tx, &entity, &merged.attributes).await?;
             put_entity_rows(&tx, &entity, &merged).await?;
+            if outbox.is_some() {
+                increment_outbox_pending(&tx, 1).await?;
+            }
             if let Some((key, bytes)) = &outbox {
                 tx.set_bytes(key, bytes).await.map_err(EntityError::Store)?;
             }
@@ -545,6 +568,9 @@ impl EntityStore {
             delete_changed_timer_markers(&tx, &before, &after, &merged).await?;
             delete_mutable_rows(&tx, &before, &merged).await?;
             put_entity_rows(&tx, &after, &merged).await?;
+            if outbox.is_some() {
+                increment_outbox_pending(&tx, 1).await?;
+            }
             if let Some((key, bytes)) = &outbox {
                 tx.set_bytes(key, bytes).await.map_err(EntityError::Store)?;
             }
@@ -607,6 +633,9 @@ impl EntityStore {
                 .await
                 .map_err(EntityError::Store)?;
             tx.delete(&meta_key(id)).await.map_err(EntityError::Store)?;
+            if outbox.is_some() {
+                increment_outbox_pending(&tx, 1).await?;
+            }
             if let Some((key, bytes)) = &outbox {
                 tx.set_bytes(key, bytes).await.map_err(EntityError::Store)?;
             }
@@ -631,12 +660,18 @@ impl EntityStore {
     /// Delivers every pending outbox row to the change feed.
     ///
     /// The call returns `Ok(0)` when no feed is configured.
+    /// Before it reads the rows, the call ensures that the
+    /// `outbox-meta:pending` counter exists.
+    /// An old store without the counter gets the one-time backfill.
     /// It reads the rows in key order.
     /// For each row, it appends the event and then deletes the row.
+    /// It decrements the counter in the same write guard as the delete.
+    /// The counter never goes below zero.
     /// It stops at the first append failure.
     /// That row and every later row stay in the outbox.
     /// The call does not hold the store write guard during the append.
     ///
+    /// The counter is equal to the number of `outbox:` rows.
     /// Delivery is at least once.
     /// A crash after an append and before a delete can deliver one event
     /// again.
@@ -646,6 +681,7 @@ impl EntityStore {
             return Ok(0);
         };
         let _flush = self.flush_lock.lock().await;
+        self.ensure_outbox_pending().await?;
         let rows = {
             let g = self.store.read().await;
             scan_prefix(&*g, OUTBOX_PREFIX).await?
@@ -659,6 +695,7 @@ impl EntityStore {
                 .map_err(|_| EntityError::Feed("entity feed append failed".to_string()))?;
             let g = self.store.write().await;
             g.delete(&row.key).await.map_err(EntityError::Store)?;
+            decrement_outbox_pending(&*g, 1).await?;
             drop(g);
             delivered += 1;
         }
@@ -667,11 +704,44 @@ impl EntityStore {
 
     /// Returns the number of pending outbox rows.
     ///
-    /// The call scans only the `outbox:` family.
-    /// A failed scan returns the store error.
+    /// The call reads the `outbox-meta:pending` counter.
+    /// The counter is equal to the number of `outbox:` rows.
+    /// A normal call does not scan the outbox family.
+    /// When the counter key is absent, the call takes the write lock and the
+    /// store write guard.
+    /// It re-checks the key inside the guard.
+    /// It then scans the `outbox:` family one time and writes the exact count.
+    /// The backfill runs at most once.
+    /// A crash before the counter write retries safely.
     pub async fn outbox_count(&self) -> Result<usize, EntityError> {
-        let g = self.store.read().await;
-        Ok(scan_prefix(&*g, OUTBOX_PREFIX).await?.len())
+        let count = self.ensure_outbox_pending().await?;
+        Ok(usize::try_from(count).unwrap_or(usize::MAX))
+    }
+
+    /// Returns the pending outbox count and backfills the key when absent.
+    ///
+    /// The call reads the counter on the normal path.
+    /// When the key is absent, it takes the write lock and the store write
+    /// guard, re-checks the key, scans the `outbox:` family one time, and
+    /// writes the exact count.
+    /// The backfill runs at most once.
+    /// A crash before the counter write retries safely.
+    async fn ensure_outbox_pending(&self) -> Result<u64, EntityError> {
+        {
+            let g = self.store.read().await;
+            if let Some(count) = read_outbox_pending(&*g).await? {
+                return Ok(count);
+            }
+        }
+
+        let _write = self.write_lock.lock().await;
+        let g = self.store.write().await;
+        if let Some(count) = read_outbox_pending(&*g).await? {
+            return Ok(count);
+        }
+        let count = u64::try_from(scan_prefix(&*g, OUTBOX_PREFIX).await?.len()).unwrap_or(u64::MAX);
+        write_outbox_pending(&*g, count).await?;
+        Ok(count)
     }
 
     /// Flushes the outbox after a commit.
@@ -993,7 +1063,8 @@ impl EntityStore {
     /// It reloads each entity and rejects a stale version.
     /// An invalid entity goes into `invalid` and is skipped.
     /// It builds every after entity and every outbox row in memory.
-    /// One transaction writes every row, or it writes no row.
+    /// One transaction writes every row and increments the pending counter,
+    /// or it writes no row.
     /// The call flushes the outbox one time after the commit.
     /// A feed failure after the commit leaves the outbox rows for the relay.
     async fn apply_schema_migration_batch(
@@ -1086,9 +1157,14 @@ impl EntityStore {
         }
 
         let pending = writes.iter().any(|write| write.outbox.is_some());
+        let outbox_rows = writes.iter().filter(|write| write.outbox.is_some()).count();
         {
             let g = self.store.write().await;
             let tx = g.begin_tx().map_err(EntityError::Store)?;
+            if outbox_rows > 0 {
+                increment_outbox_pending(&tx, u64::try_from(outbox_rows).unwrap_or(u64::MAX))
+                    .await?;
+            }
             for write in &writes {
                 put_meta_row(&tx, &write.entity).await?;
                 if let Some((key, bytes)) = &write.outbox {
@@ -1097,6 +1173,7 @@ impl EntityStore {
             }
             tx.commit().await.map_err(EntityError::Store)?;
         }
+        drop(_write);
         if pending && let Err(error) = self.flush_after_commit().await {
             tracing::warn!(
                 %error,
@@ -1798,6 +1875,73 @@ fn attribute_json(value: &AttributeValue) -> Result<serde_json::Value, EntityErr
 /// The key for one pending outbox event.
 fn outbox_key(event_id: &str) -> String {
     format!("{OUTBOX_PREFIX}{event_id}")
+}
+
+/// The key that holds the durable pending outbox row count.
+fn outbox_pending_key() -> &'static str {
+    OUTBOX_PENDING_KEY
+}
+
+/// Reads the pending outbox count.
+///
+/// The call returns `None` when the counter key is absent.
+async fn read_outbox_pending<S>(store: &S) -> Result<Option<u64>, EntityError>
+where
+    S: GetSet + ?Sized,
+{
+    let Some(bytes) = store
+        .get_bytes(outbox_pending_key())
+        .await
+        .map_err(EntityError::Store)?
+    else {
+        return Ok(None);
+    };
+    let count = serde_json::from_slice(&bytes)
+        .map_err(|e| EntityError::Internal(format!("outbox counter is invalid: {e}")))?;
+    Ok(Some(count))
+}
+
+/// Writes the pending outbox count as JSON.
+async fn write_outbox_pending<S>(store: &S, count: u64) -> Result<(), EntityError>
+where
+    S: GetSet + ?Sized,
+{
+    let bytes = serde_json::to_vec(&count).map_err(|e| EntityError::Internal(e.to_string()))?;
+    store
+        .set_bytes(outbox_pending_key(), &bytes)
+        .await
+        .map(|_| ())
+        .map_err(EntityError::Store)
+}
+
+/// Adds `delta` to the pending outbox count.
+///
+/// When the counter key is absent, the call counts the outbox rows one time.
+/// The caller must run the call in the same transaction as the outbox row
+/// writes and before those writes.
+/// The count then excludes the new rows.
+/// The addition saturates at [`u64::MAX`].
+async fn increment_outbox_pending<S>(store: &S, delta: u64) -> Result<(), EntityError>
+where
+    S: GetSet + ?Sized,
+{
+    let current = match read_outbox_pending(store).await? {
+        Some(count) => count,
+        None => u64::try_from(scan_prefix(store, OUTBOX_PREFIX).await?.len()).unwrap_or(u64::MAX),
+    };
+    write_outbox_pending(store, current.saturating_add(delta)).await
+}
+
+/// Subtracts `delta` from the pending outbox count.
+///
+/// The subtraction saturates at zero.
+/// The counter never goes below zero.
+async fn decrement_outbox_pending<S>(store: &S, delta: u64) -> Result<(), EntityError>
+where
+    S: GetSet + ?Sized,
+{
+    let current = read_outbox_pending(store).await?.unwrap_or(0);
+    write_outbox_pending(store, current.saturating_sub(delta)).await
 }
 
 /// The merged attribute definitions of every pinned schema.
@@ -2678,6 +2822,14 @@ mod tests {
             .into_iter()
             .filter(|key| key.starts_with(OUTBOX_PREFIX))
             .collect()
+    }
+
+    async fn pending_counter(store: &OxKvStore) -> Option<u64> {
+        store
+            .get_bytes(outbox_pending_key())
+            .await
+            .unwrap()
+            .map(|bytes| serde_json::from_slice(&bytes).unwrap())
     }
 
     fn tagged(value: &AttributeValue) -> serde_json::Value {
@@ -4622,6 +4774,166 @@ mod tests {
         feed.set_failing(false);
         assert_eq!(store.flush_outbox().await.unwrap(), 3);
         assert_eq!(store.outbox_count().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn outbox_count_tracks_create_update_and_delete() {
+        let (store, registry, raw) = new_store().await;
+        registry
+            .publish(schema(
+                "person",
+                &[],
+                vec![attr("age", AttributeType::Integer)],
+            ))
+            .await
+            .unwrap();
+        let feed = Arc::new(RecordingFeed::new());
+        feed.set_failing(true);
+        let store = store.with_change_sink(feed.clone());
+
+        store
+            .create(draft("e1", &["person"], vec![("age", i(30))]), &ctx())
+            .await
+            .unwrap();
+        assert_eq!(store.outbox_count().await.unwrap(), 1);
+
+        store
+            .update("e1", 1, patch(vec![("age", Some(i(31)))]), &ctx())
+            .await
+            .unwrap();
+        assert_eq!(store.outbox_count().await.unwrap(), 2);
+
+        store.delete("e1", 2, &ctx()).await.unwrap();
+        assert_eq!(store.outbox_count().await.unwrap(), 3);
+
+        assert_eq!(outbox_keys(&raw).await.len(), 3);
+        assert_eq!(pending_counter(&raw).await, Some(3));
+    }
+
+    #[tokio::test]
+    async fn flush_outbox_decrements_the_pending_counter() {
+        let (store, registry, raw) = new_store().await;
+        registry
+            .publish(schema("person", &[], vec![]))
+            .await
+            .unwrap();
+        let feed = Arc::new(RecordingFeed::new());
+        feed.set_failing(true);
+        let store = store.with_change_sink(feed.clone());
+
+        for id in ["e1", "e2"] {
+            store
+                .create(draft(id, &["person"], vec![]), &ctx())
+                .await
+                .unwrap();
+        }
+        assert_eq!(store.outbox_count().await.unwrap(), 2);
+
+        feed.set_failing(false);
+        assert_eq!(store.flush_outbox().await.unwrap(), 2);
+        assert_eq!(store.outbox_count().await.unwrap(), 0);
+        assert_eq!(pending_counter(&raw).await, Some(0));
+    }
+
+    #[tokio::test]
+    async fn outbox_count_backfills_a_missing_counter() {
+        let (store, registry, raw) = new_store().await;
+        registry
+            .publish(schema("person", &[], vec![]))
+            .await
+            .unwrap();
+        let feed = Arc::new(RecordingFeed::new());
+        feed.set_failing(true);
+        let store = store.with_change_sink(feed.clone());
+
+        for id in ["e1", "e2", "e3"] {
+            store
+                .create(draft(id, &["person"], vec![]), &ctx())
+                .await
+                .unwrap();
+        }
+        raw.delete(outbox_pending_key()).await.unwrap();
+        assert_eq!(pending_counter(&raw).await, None);
+
+        assert_eq!(store.outbox_count().await.unwrap(), 3);
+        assert_eq!(pending_counter(&raw).await, Some(3));
+        assert_eq!(store.outbox_count().await.unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn flush_outbox_backfills_a_missing_counter() {
+        let (store, registry, raw) = new_store().await;
+        registry
+            .publish(schema("person", &[], vec![]))
+            .await
+            .unwrap();
+        let feed = Arc::new(RecordingFeed::new());
+        feed.set_failing(true);
+        let store = store.with_change_sink(feed.clone());
+
+        for id in ["e1", "e2", "e3"] {
+            store
+                .create(draft(id, &["person"], vec![]), &ctx())
+                .await
+                .unwrap();
+        }
+        raw.delete(outbox_pending_key()).await.unwrap();
+        assert_eq!(pending_counter(&raw).await, None);
+
+        feed.set_failing(false);
+        assert_eq!(store.flush_outbox().await.unwrap(), 3);
+        assert_eq!(store.outbox_count().await.unwrap(), 0);
+        assert_eq!(pending_counter(&raw).await, Some(0));
+    }
+
+    #[tokio::test]
+    async fn outbox_count_without_a_feed_stays_zero() {
+        let (store, registry, raw) = new_store().await;
+        registry
+            .publish(schema("person", &[], vec![]))
+            .await
+            .unwrap();
+
+        store
+            .create(draft("e1", &["person"], vec![]), &ctx())
+            .await
+            .unwrap();
+        assert_eq!(pending_counter(&raw).await, None);
+
+        assert_eq!(store.outbox_count().await.unwrap(), 0);
+        assert_eq!(pending_counter(&raw).await, Some(0));
+
+        store
+            .create(draft("e2", &["person"], vec![]), &ctx())
+            .await
+            .unwrap();
+        assert_eq!(store.outbox_count().await.unwrap(), 0);
+        assert_eq!(pending_counter(&raw).await, Some(0));
+    }
+
+    #[tokio::test]
+    async fn a_failed_feed_append_keeps_the_pending_counter() {
+        let (store, registry, raw) = new_store().await;
+        registry
+            .publish(schema("person", &[], vec![]))
+            .await
+            .unwrap();
+        let feed = Arc::new(RecordingFeed::new());
+        let store = store.with_change_sink(feed.clone());
+
+        feed.fail_next(1);
+        store
+            .create(draft("e1", &["person"], vec![]), &ctx())
+            .await
+            .unwrap();
+        assert_eq!(store.outbox_count().await.unwrap(), 1);
+        assert_eq!(pending_counter(&raw).await, Some(1));
+
+        feed.fail_next(1);
+        assert!(store.flush_outbox().await.is_err());
+        assert_eq!(store.outbox_count().await.unwrap(), 1);
+        assert_eq!(pending_counter(&raw).await, Some(1));
+        assert_eq!(outbox_keys(&raw).await.len(), 1);
     }
 
     #[tokio::test]
