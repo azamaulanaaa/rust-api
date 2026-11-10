@@ -18,7 +18,10 @@
 //! `GET /eav/sync/replica?chunk=N` returns one page of the stored snapshot.
 //! `GET /eav/sync/replica/status` reports the log head and the stored head.
 //! The client applies the events after the stored head.
-//! The replica is a point-in-time snapshot, not an incremental store.
+//! The replica is a head-anchored snapshot, not an incremental store.
+//! The build reads the feed head first, then pages the entities.
+//! A change that commits after the head can appear in the snapshot.
+//! An apply must be idempotent and version-aware.
 //! The full read is for compatibility.
 //! Use the chunk read to page a large replica.
 //!
@@ -433,12 +436,14 @@ impl std::error::Error for MissingReplica {}
 /// The caller needs a valid session.
 /// The route reads the current change-log head first.
 /// It then reads every entity in id order with a cursor.
+/// A change that commits after the head can appear in the snapshot.
 /// It keeps only the entities that the caller can read.
 /// It serializes the entities into ordered JSON chunks.
 /// Each chunk holds at most `REPLICA_CHUNK_ENTITIES` entities.
 /// The build replaces the previous replica and its chunks for the same
 /// subject.
 /// The client applies the events after the returned `head`.
+/// An apply must be idempotent and version-aware.
 /// A newer build can commit first.
 /// The route then reads a fresh feed head and builds one more time.
 /// A second stale result returns `409`.
