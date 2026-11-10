@@ -300,6 +300,17 @@ impl SchemaRegistry {
         load_version(&*g, id, version).await
     }
 
+    /// Reports whether a schema exists.
+    ///
+    /// The call reads only the head key.
+    /// It does not load the schema version.
+    /// Use this call when a route needs the existence status and no schema data.
+    pub async fn exists(&self, id: &str) -> Result<bool, SchemaError> {
+        validate_name("schema id", id)?;
+        let g = self.store.read().await;
+        Ok(read_head(&*g, id).await?.is_some())
+    }
+
     /// Reads the latest schema version.
     ///
     /// The call returns `None` when the schema does not exist.
