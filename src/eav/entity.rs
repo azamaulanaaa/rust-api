@@ -1044,7 +1044,8 @@ impl EntityStore {
     /// The result is sorted by entity id.
     /// The scan starts after the `after` id when the caller gives a cursor.
     /// The call returns the entities and the cursor for the next page.
-    /// The cursor is the last id of a full page.
+    /// The scan reads one extra id as a look-ahead.
+    /// The cursor is the last id of the page when the extra id exists.
     /// The cursor is `None` when the scan is exhausted.
     /// A `limit` of 0 returns an empty list and no cursor.
     pub async fn list_by_schema_after(
@@ -1066,13 +1067,12 @@ impl EntityStore {
             }
             None => prefix.clone(),
         };
-        let max = u32::try_from(limit).ok();
+        let max = u32::try_from(limit.saturating_add(1)).ok();
         let cursor = (Some(start), Some(prefix_scan_end(&prefix)));
         let markers = g
             .gets_bytes(max, Direction::Next, cursor)
             .await
             .map_err(EntityError::Store)?;
-        let full = markers.len() == limit;
         let mut ids = Vec::new();
         let mut seen = BTreeSet::new();
         for marker in markers {
@@ -1085,8 +1085,10 @@ impl EntityStore {
             ids.push(id.to_string());
         }
         ids.sort();
-        let next = if full { ids.last().cloned() } else { None };
-        let mut entities = Vec::with_capacity(limit.min(ids.len()));
+        let has_more = ids.len() > limit;
+        ids.truncate(limit);
+        let next = if has_more { ids.last().cloned() } else { None };
+        let mut entities = Vec::with_capacity(ids.len());
         for id in &ids {
             if let Some(entity) = load_entity(&*g, id).await? {
                 entities.push(entity);
@@ -1428,7 +1430,9 @@ impl EntityStore {
     /// The scan starts after the `after` id when the caller gives a cursor.
     /// The scan verifies each hash match against the exact value.
     /// The result is in entity id order.
-    /// The call returns the cursor for the next page when the page is full.
+    /// The scan reads one extra matching entity as a look-ahead.
+    /// The call returns the cursor for the next page only when the extra
+    /// entity exists.
     /// The cursor is `None` when the scan is exhausted.
     /// A `limit` of 0 returns an empty list and no cursor.
     /// The call returns [`EntityError::NotIndexed`] when no applied schema
@@ -1464,7 +1468,8 @@ impl EntityStore {
             }
             None => prefix.clone(),
         };
-        let max = u32::try_from(limit).ok();
+        let target = limit.saturating_add(1);
+        let max = u32::try_from(target).ok();
         let mut entities = Vec::new();
         let mut seen = BTreeSet::new();
         loop {
@@ -1476,7 +1481,7 @@ impl EntityStore {
                 )
                 .await
                 .map_err(EntityError::Store)?;
-            let full = rows.len() == limit;
+            let full = rows.len() == target;
             for row in &rows {
                 start = format!("{}\0", row.key);
                 let Some(id) = row.key.strip_prefix(&prefix) else {
@@ -1489,14 +1494,19 @@ impl EntityStore {
                     && entity.attributes.get(key) == Some(value)
                 {
                     entities.push(entity);
+                    if entities.len() >= target {
+                        break;
+                    }
                 }
             }
-            if entities.len() >= limit || !full {
+            if entities.len() >= target || !full {
                 break;
             }
         }
         entities.sort_by(|a, b| a.id.cmp(&b.id));
-        let next = if entities.len() >= limit {
+        let has_more = entities.len() > limit;
+        entities.truncate(limit);
+        let next = if has_more {
             entities.last().map(|entity| entity.id.clone())
         } else {
             None
@@ -1939,7 +1949,8 @@ impl EntityStore {
     /// The call then scans only the `idx:entity:` family.
     /// It starts after the `after` id when the caller gives a cursor.
     /// The call returns the entities and the cursor for the next page.
-    /// The cursor is the last id of a full page.
+    /// The scan reads one extra id as a look-ahead.
+    /// The cursor is the last id of the page when the extra id exists.
     /// The cursor is `None` when the scan is exhausted.
     /// A stale or unknown cursor returns the ids after its sort position.
     /// A `limit` of 0 returns an empty list and no cursor.
@@ -1960,13 +1971,12 @@ impl EntityStore {
             }
             None => ENTITY_INDEX_PREFIX.to_string(),
         };
-        let max = u32::try_from(limit).ok();
+        let max = u32::try_from(limit.saturating_add(1)).ok();
         let cursor = (Some(start), Some(prefix_scan_end(ENTITY_INDEX_PREFIX)));
         let markers = g
             .gets_bytes(max, Direction::Next, cursor)
             .await
             .map_err(EntityError::Store)?;
-        let full = markers.len() == limit;
         let mut ids = Vec::with_capacity(markers.len());
         let mut seen = BTreeSet::new();
         for marker in markers {
@@ -1979,7 +1989,9 @@ impl EntityStore {
             ids.push(id.to_string());
         }
         ids.sort();
-        let next = if full { ids.last().cloned() } else { None };
+        let has_more = ids.len() > limit;
+        ids.truncate(limit);
+        let next = if has_more { ids.last().cloned() } else { None };
         let mut entities = Vec::with_capacity(ids.len());
         for id in &ids {
             if let Some(entity) = load_entity(&*g, id).await? {
@@ -3873,6 +3885,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_by_attribute_after_full_final_page_returns_no_cursor() {
+        let (store, registry, _raw) = new_store().await;
+        registry
+            .publish(schema(
+                "task",
+                &[],
+                vec![full_attr(
+                    "tag",
+                    AttributeType::String,
+                    false,
+                    true,
+                    false,
+                    None,
+                )],
+            ))
+            .await
+            .unwrap();
+        for id in ["e1", "e2", "e3", "e4"] {
+            store
+                .create(draft(id, &["task"], vec![("tag", s("alpha"))]), &ctx())
+                .await
+                .unwrap();
+        }
+
+        let (first, next) = store
+            .list_by_attribute_after("tag", &s("alpha"), 2, None)
+            .await
+            .unwrap();
+        let first_ids: Vec<&str> = first.iter().map(|entity| entity.id.as_str()).collect();
+        assert_eq!(first_ids, vec!["e1", "e2"]);
+        assert_eq!(next.as_deref(), Some("e2"));
+
+        let (second, next) = store
+            .list_by_attribute_after("tag", &s("alpha"), 2, next.as_deref())
+            .await
+            .unwrap();
+        let second_ids: Vec<&str> = second.iter().map(|entity| entity.id.as_str()).collect();
+        assert_eq!(second_ids, vec!["e3", "e4"]);
+        assert_eq!(next, None);
+
+        let mut all: Vec<String> = first.into_iter().map(|entity| entity.id).collect();
+        all.extend(second.into_iter().map(|entity| entity.id));
+        assert_eq!(all, vec!["e1", "e2", "e3", "e4"]);
+    }
+
+    #[tokio::test]
     async fn list_by_attribute_after_ignores_a_hash_collision_with_a_different_value() {
         let (store, registry, raw) = new_store().await;
         registry
@@ -4093,6 +4151,101 @@ mod tests {
 
         assert_eq!(ids, vec!["a", "b", "c", "d", "e"]);
         assert_eq!(pages, 3);
+    }
+
+    #[tokio::test]
+    async fn list_after_full_final_page_returns_no_cursor() {
+        let (store, registry, _raw) = new_store().await;
+        registry.publish(schema("task", &[], vec![])).await.unwrap();
+        for id in ["a", "b", "c", "d"] {
+            store
+                .create(draft(id, &["task"], vec![]), &ctx())
+                .await
+                .unwrap();
+        }
+
+        let (first, next) = store.list_after(2, None).await.unwrap();
+        let first_ids: Vec<&str> = first.iter().map(|entity| entity.id.as_str()).collect();
+        assert_eq!(first_ids, vec!["a", "b"]);
+        assert_eq!(next.as_deref(), Some("b"));
+
+        let (second, next) = store.list_after(2, next.as_deref()).await.unwrap();
+        let second_ids: Vec<&str> = second.iter().map(|entity| entity.id.as_str()).collect();
+        assert_eq!(second_ids, vec!["c", "d"]);
+        assert_eq!(next, None);
+
+        let mut all: Vec<String> = first.into_iter().map(|entity| entity.id).collect();
+        all.extend(second.into_iter().map(|entity| entity.id));
+        assert_eq!(all, vec!["a", "b", "c", "d"]);
+    }
+
+    #[tokio::test]
+    async fn list_after_pages_five_entities_with_a_short_final_page() {
+        let (store, registry, _raw) = new_store().await;
+        registry.publish(schema("task", &[], vec![])).await.unwrap();
+        for id in ["a", "b", "c", "d", "e"] {
+            store
+                .create(draft(id, &["task"], vec![]), &ctx())
+                .await
+                .unwrap();
+        }
+
+        let (first, next) = store.list_after(2, None).await.unwrap();
+        let first_ids: Vec<&str> = first.iter().map(|entity| entity.id.as_str()).collect();
+        assert_eq!(first_ids, vec!["a", "b"]);
+        assert_eq!(next.as_deref(), Some("b"));
+
+        let (second, next) = store.list_after(2, next.as_deref()).await.unwrap();
+        let second_ids: Vec<&str> = second.iter().map(|entity| entity.id.as_str()).collect();
+        assert_eq!(second_ids, vec!["c", "d"]);
+        assert_eq!(next.as_deref(), Some("d"));
+
+        let (third, next) = store.list_after(2, next.as_deref()).await.unwrap();
+        let third_ids: Vec<&str> = third.iter().map(|entity| entity.id.as_str()).collect();
+        assert_eq!(third_ids, vec!["e"]);
+        assert_eq!(next, None);
+
+        let mut all: Vec<String> = first.into_iter().map(|entity| entity.id).collect();
+        all.extend(second.into_iter().map(|entity| entity.id));
+        all.extend(third.into_iter().map(|entity| entity.id));
+        assert_eq!(all, vec!["a", "b", "c", "d", "e"]);
+    }
+
+    #[tokio::test]
+    async fn list_after_pages_three_entities_with_a_short_final_page() {
+        let (store, registry, _raw) = new_store().await;
+        registry.publish(schema("task", &[], vec![])).await.unwrap();
+        for id in ["a", "b", "c"] {
+            store
+                .create(draft(id, &["task"], vec![]), &ctx())
+                .await
+                .unwrap();
+        }
+
+        let (first, next) = store.list_after(2, None).await.unwrap();
+        let first_ids: Vec<&str> = first.iter().map(|entity| entity.id.as_str()).collect();
+        assert_eq!(first_ids, vec!["a", "b"]);
+        assert_eq!(next.as_deref(), Some("b"));
+
+        let (second, next) = store.list_after(2, next.as_deref()).await.unwrap();
+        let second_ids: Vec<&str> = second.iter().map(|entity| entity.id.as_str()).collect();
+        assert_eq!(second_ids, vec!["c"]);
+        assert_eq!(next, None);
+
+        let mut all: Vec<String> = first.into_iter().map(|entity| entity.id).collect();
+        all.extend(second.into_iter().map(|entity| entity.id));
+        assert_eq!(all, vec!["a", "b", "c"]);
+    }
+
+    #[tokio::test]
+    async fn list_after_empty_store_returns_no_cursor() {
+        let (store, registry, _raw) = new_store().await;
+        registry.publish(schema("task", &[], vec![])).await.unwrap();
+
+        let (page, next) = store.list_after(2, None).await.unwrap();
+
+        assert!(page.is_empty());
+        assert_eq!(next, None);
     }
 
     #[tokio::test]
@@ -4333,7 +4486,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_by_schema_after_skips_exactly_the_cursor() {
+    async fn list_by_schema_after_skips_exactly_the_cursor_and_returns_no_cursor() {
         let (store, registry, _raw) = new_store().await;
         registry.publish(schema("task", &[], vec![])).await.unwrap();
         for id in ["a", "ab", "b"] {
@@ -4350,7 +4503,47 @@ mod tests {
         let ids: Vec<&str> = page.iter().map(|entity| entity.id.as_str()).collect();
 
         assert_eq!(ids, vec!["ab", "b"]);
+        assert_eq!(next, None);
+    }
+
+    #[tokio::test]
+    async fn list_by_schema_after_full_final_page_returns_no_cursor() {
+        let (store, registry, _raw) = new_store().await;
+        registry.publish(schema("task", &[], vec![])).await.unwrap();
+        for id in ["a", "b", "c", "d"] {
+            store
+                .create(draft(id, &["task"], vec![]), &ctx())
+                .await
+                .unwrap();
+        }
+
+        let (first, next) = store.list_by_schema_after("task", 2, None).await.unwrap();
+        let first_ids: Vec<&str> = first.iter().map(|entity| entity.id.as_str()).collect();
+        assert_eq!(first_ids, vec!["a", "b"]);
         assert_eq!(next.as_deref(), Some("b"));
+
+        let (second, next) = store
+            .list_by_schema_after("task", 2, next.as_deref())
+            .await
+            .unwrap();
+        let second_ids: Vec<&str> = second.iter().map(|entity| entity.id.as_str()).collect();
+        assert_eq!(second_ids, vec!["c", "d"]);
+        assert_eq!(next, None);
+
+        let mut all: Vec<String> = first.into_iter().map(|entity| entity.id).collect();
+        all.extend(second.into_iter().map(|entity| entity.id));
+        assert_eq!(all, vec!["a", "b", "c", "d"]);
+    }
+
+    #[tokio::test]
+    async fn list_by_schema_after_empty_store_returns_no_cursor() {
+        let (store, registry, _raw) = new_store().await;
+        registry.publish(schema("task", &[], vec![])).await.unwrap();
+
+        let (page, next) = store.list_by_schema_after("task", 2, None).await.unwrap();
+
+        assert!(page.is_empty());
+        assert_eq!(next, None);
     }
 
     #[tokio::test]

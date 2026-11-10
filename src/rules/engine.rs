@@ -1019,6 +1019,29 @@ mod tests {
         assert!(!stores.rules.is_executed("alpha", "evt-1").await.unwrap());
     }
 
+    /// The default maximum is 8, and the maximum is inclusive.
+    ///
+    /// The config default and the engine default must agree.
+    #[tokio::test]
+    async fn the_default_maximum_causation_depth_is_eight() {
+        let stores = stores().await;
+        let recorder = Arc::new(RecordingAction::new("record"));
+        let engine = engine(&stores, vec![recorder.clone()]);
+        make_entity(&stores.entities).await;
+        stores.rules.upsert(draft("alpha", "record")).await.unwrap();
+
+        let mut at_default = event(EntityEventKind::Created);
+        at_default.causation_depth = 8;
+        let executions = engine.process(&at_default).await.unwrap();
+        assert_eq!(executions[0].outcome, ExecutionOutcome::Executed);
+
+        let mut above_default = event(EntityEventKind::Created);
+        above_default.event_id = "evt-2".to_string();
+        above_default.causation_depth = 9;
+        let executions = engine.process(&above_default).await.unwrap();
+        assert_eq!(executions[0].outcome, ExecutionOutcome::CausationLimit);
+    }
+
     /// A depth equal to the maximum still runs the action.
     ///
     /// The maximum is inclusive.

@@ -142,12 +142,15 @@ impl EavRuntime {
     /// The rule engine uses the given actions.
     /// The entity store checks that each `EntityRef` target exists when
     /// `check_entity_refs` is true.
+    /// The rule engine runs an action only when the event depth is at most
+    /// `max_causation_depth`.
     pub async fn build(
         s3: &S3ClientConfig,
         db_prefix: &str,
         wal: Wal,
         actions: Vec<Arc<dyn RuleAction>>,
         check_entity_refs: bool,
+        max_causation_depth: u32,
     ) -> anyhow::Result<Self> {
         let schema_store = build_s3_store(s3, &domain_prefix(db_prefix, "schema"))
             .await
@@ -171,6 +174,7 @@ impl EavRuntime {
         let metrics = EavMetrics::global();
         let engine = RuleEngine::new(rules.clone(), entities.clone(), actions)
             .context("build the EAV rule engine")?
+            .with_max_causation_depth(max_causation_depth)
             .with_observer(Arc::new(metrics.clone()));
 
         Ok(Self {
@@ -614,6 +618,7 @@ mod tests {
     use crate::fs::s3::S3Backend;
     use crate::records::{ChangeSink, EntityEventKind, WalOp};
     use crate::rules::action::ActionContext;
+    use crate::rules::engine::ExecutionOutcome;
     use crate::rules::rule::{ActionRef, Condition, RuleDraft, RuleTrigger};
 
     /// A [`RuleAction`] test double that records each context.
@@ -730,10 +735,17 @@ mod tests {
     }
 
     async fn build_runtime(actions: Vec<Arc<dyn RuleAction>>) -> EavRuntime {
+        build_runtime_with_max_causation_depth(actions, 8).await
+    }
+
+    async fn build_runtime_with_max_causation_depth(
+        actions: Vec<Arc<dyn RuleAction>>,
+        max_causation_depth: u32,
+    ) -> EavRuntime {
         let s3 = memory_s3();
         let prefix = test_prefix("eav-runtime");
         let wal = Wal::new(build_s3_store(&s3, &format!("{prefix}/wal")).await.unwrap());
-        EavRuntime::build(&s3, &prefix, wal, actions, true)
+        EavRuntime::build(&s3, &prefix, wal, actions, true, max_causation_depth)
             .await
             .unwrap()
     }
@@ -973,6 +985,54 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].rule.id, "alpha");
         assert_eq!(records[0].event.entity_id, "e1");
+    }
+
+    /// The configured value must reach the rule engine through the runtime
+    /// build.
+    ///
+    /// A depth at the configured value runs the action.
+    /// A depth above the configured value returns `CausationLimit`.
+    #[tokio::test]
+    async fn the_runtime_rules_with_the_configured_max_causation_depth() {
+        let recorder = Arc::new(RecordingAction::new("record"));
+        let runtime = build_runtime_with_max_causation_depth(vec![recorder.clone()], 2).await;
+        runtime.schemas().publish(schema()).await.unwrap();
+        runtime.rules().upsert(rule()).await.unwrap();
+        runtime
+            .entities()
+            .create(entity(), &WriteContext::new("tester"))
+            .await
+            .unwrap();
+
+        let head = runtime.wal().head().await.unwrap();
+        let entry = runtime
+            .wal()
+            .range(head, head)
+            .await
+            .unwrap()
+            .pop()
+            .expect("the create event must be in the feed");
+        let WalOp::Entity { event } = entry.op else {
+            panic!("the create event must be an entity op");
+        };
+
+        let mut at_limit = event.clone();
+        at_limit.event_id = "depth-at-limit".to_string();
+        at_limit.causation_depth = 2;
+        let executions = runtime.engine().process(&at_limit).await.unwrap();
+        assert_eq!(executions[0].outcome, ExecutionOutcome::Executed);
+        assert_eq!(recorder.records().len(), 1);
+
+        let mut above = event;
+        above.event_id = "depth-above-limit".to_string();
+        above.causation_depth = 3;
+        let executions = runtime.engine().process(&above).await.unwrap();
+        assert_eq!(executions[0].outcome, ExecutionOutcome::CausationLimit);
+        assert_eq!(
+            recorder.records().len(),
+            1,
+            "a depth above the configured value must run no action"
+        );
     }
 
     #[tokio::test]

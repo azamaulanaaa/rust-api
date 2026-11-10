@@ -62,7 +62,7 @@ region = "us-east-1"
 
 Replace `client_secret`, `issuer_url`, `bucket`, and `region`. For MinIO or R2, add `endpoint_url` and set `force_path_style = true` under `[s3]`.
 
-You can keep secrets out of the file. Set `RUST_API_CLIENT_SECRET`, `RUST_API_S3_ACCESS_KEY_ID`, and `RUST_API_S3_SECRET_ACCESS_KEY` instead. A non-empty environment value wins over the file.
+You can keep secrets out of the file. Set `RUST_API_CLIENT_SECRET`, `RUST_API_S3_ACCESS_KEY_ID`, `RUST_API_S3_SECRET_ACCESS_KEY`, and `RUST_API_EAV_WEBHOOK_SIGNING_SECRET` instead. A non-empty environment value wins over the file.
 
 The database prefix defaults to `oxkv`. See [Configuration](#configuration) and [config.example.toml](config.example.toml) for every field.
 
@@ -249,7 +249,7 @@ An `EntityRef` attribute holds the id of another entity. A write validates the t
 | `409` | `conflict` | `expected_version` does not match the stored version. |
 | `409` | `conflict` | Another entity references the target and `force` is false. |
 
-The `/eav` management API covers schemas, entities, and rules. List routes use paging. `limit` defaults to 50 and cannot exceed 200. `offset` defaults to 0 and cannot exceed 1000. A larger offset returns `400`. Use cursor paging with `after` to page deeper. `GET /eav/rules` supports offset paging only, so an `after` cursor on that route returns `400`.
+The `/eav` management API covers schemas, entities, and rules. List routes use paging. `limit` defaults to 50 and cannot exceed 200. `offset` defaults to 0 and cannot exceed 1000. A larger offset returns `400`. Use cursor paging with `after` to page deeper. `GET /eav/rules` supports offset paging only, so an `after` cursor on that route returns `400`. `GET /eav/schemas/{id}/entities` returns `404` for an unknown schema id. A known schema returns the normal entity page.
 
 `POST /eav/entities/query` finds entities by an indexed attribute value. `limit` defaults to 50 and is in the range 1 to 200. An empty `after` starts at the first page. The response returns the next cursor in `next`. An attribute that no applied schema indexes returns `400`.
 
@@ -265,7 +265,7 @@ curl -sS -X POST http://localhost:8080/eav/entities/query \
   }'
 ```
 
-Schema evolution has three steps. `GET /eav/schemas/{id}/diff` reports added, removed, and changed attributes and marks breaking changes. `POST /eav/schemas/{id}/revalidate` checks stored entities against a target version without a write. `POST /eav/schemas/{id}/migrate` repins stored entities to a target version. A migration is a dry run unless `dry_run` is false.
+Schema evolution has three steps. `GET /eav/schemas/{id}/diff` reports added, removed, and changed attributes and marks breaking changes. `POST /eav/schemas/{id}/revalidate` checks stored entities against a target version without a write. `POST /eav/schemas/{id}/migrate` repins stored entities to a target version. A migration is a dry run unless `dry_run` is false. A dry run needs `read` on `eav_schemas` and `eav_entities`. A real run needs `write` on both objects.
 
 The entity store writes one change event to an outbox row in the same transaction as the entity data. A background relay flushes the outbox to the shared change feed. Delivery is at least once, so a consumer must be idempotent. Clients read the feed through `/eav/sync/events` and load the initial state through `/eav/sync/snapshot`.
 
@@ -300,7 +300,7 @@ The runtime also processes timers. A timestamp attribute with an index forms a t
 
 Delivery is at least once, so every action must be idempotent. A successful action writes one execution marker for the rule and event. A later delivery skips that pair. A failed action writes no marker, so a retry can run it again. The runtime deletes markers after `execution_retention_secs`.
 
-An action can write an entity, and that write can start another rule. The causation depth stops such a chain. The default maximum depth is 8 and is inclusive. An event above the maximum runs no action and writes no marker.
+An action can write an entity, and that write can start another rule. The causation depth stops such a chain. Set `[eav].max_causation_depth` to a value from 1 to 64. The default is 8. The maximum is inclusive. An event above the maximum runs no action and writes no marker.
 
 Metrics cover rule execution (`eav.rules.executed`, `eav.rules.failed`) and webhook delivery (`eav.webhook.delivered`, `eav.webhook.failed`, `eav.webhook.delivery_duration`).
 
@@ -349,14 +349,14 @@ Metrics cover rule execution (`eav.rules.executed`, `eav.rules.failed`) and webh
 | GET | `/eav/schemas/{id}/children` | List the schemas whose latest version extends this schema | session |
 | GET | `/eav/schemas/{id}/diff` | Compare two effective schema versions with `from` and `to` | session |
 | POST | `/eav/schemas/{id}/revalidate` | Check stored entities against a target version without a write | session |
-| POST | `/eav/schemas/{id}/migrate` | Repin stored entities to a target version. The default is a dry run. | session |
+| POST | `/eav/schemas/{id}/migrate` | Repin stored entities to a target version. The default is a dry run. A dry run needs read on schemas and entities. A real run needs write on both. | session |
 | POST | `/eav/entities` | Create one validated entity | session |
 | GET | `/eav/entities` | Paged list of entities | session |
 | POST | `/eav/entities/query` | Paged query of entities by an indexed attribute value | session |
 | GET | `/eav/entities/{id}` | Get one entity | session |
 | PATCH | `/eav/entities/{id}` | Update attributes with an expected version | session |
 | DELETE | `/eav/entities/{id}` | Delete one entity with `expected_version`, or a referenced entity with `force=true` | session |
-| GET | `/eav/schemas/{id}/entities` | Paged list of the entities that pin a schema | session |
+| GET | `/eav/schemas/{id}/entities` | Paged list of the entities that pin a schema. An unknown schema returns `404`. | session |
 | POST | `/eav/rules` | Create or replace one rule | session |
 | GET | `/eav/rules` | Paged list of rules | session |
 | GET | `/eav/rules/{id}` | Get one rule | session |
@@ -366,7 +366,7 @@ Metrics cover rule execution (`eav.rules.executed`, `eav.rules.failed`) and webh
 | GET | `/eav/sync/events` | Entity events after a `since` cursor | session |
 | GET | `/eav/sync/snapshot` | One page of entity state for an offline client | session |
 | POST | `/eav/sync/replica` | Build and store the caller's entity replica | session |
-| GET | `/eav/sync/replica` | Read the stored replica with the current grants, or one chunk with `?chunk=N` | session |
+| GET | `/eav/sync/replica` | Read the stored replica as a JSON array with the current grants, or one chunk object with `?chunk=N` | session |
 | GET | `/eav/sync/replica/status` | Change feed head and stored replica head | session |
 | GET | `/openapi.json` | OpenAPI 3.1 document | none |
 | GET | `/swagger-ui/` | Swagger UI for the document | none |
@@ -614,6 +614,7 @@ A variable that is present and not empty wins over the file.
 | `RUST_API_S3_SECRET_ACCESS_KEY` | `s3.secret_access_key` |
 | `RUST_API_CAPABILITY_SECRET` | `capability.secret` |
 | `RUST_API_CAPABILITY_SECRET_PREV` | `capability.previous_secret` |
+| `RUST_API_EAV_WEBHOOK_SIGNING_SECRET` | `eav.webhook_signing_secret` |
 | `RUST_API_ALLOWED_ORIGINS` | `http.allowed_origins`, comma-separated |
 | `RUST_API_RABBITMQ_URL` | `rabbitmq.url`, with the `queue-rabbitmq` feature |
 
@@ -644,6 +645,7 @@ The `[eav]` section controls the optional EAV runtime and the webhook action. `[
 | `execution_retention_secs` | `2592000` | Retention window for execution markers. |
 | `timer_interval_ms` | `1000` | Pause between due timer passes. |
 | `timer_batch` | `100` | Largest number of due entities read for each time index key. |
+| `max_causation_depth` | `8` | Maximum causation depth for a rule chain, from 1 to 64. The maximum is inclusive. |
 | `check_entity_refs` | `true` | Checks that each `EntityRef` target exists on a write. With `false`, a write still validates the target form. |
 | `webhook_allowed_hosts` | empty | Hosts that a webhook rule can call. Each entry is a host or a `host:port` pair. |
 | `webhook_signing_secret` | none | Optional HMAC-SHA256 secret of at least 32 bytes. When set, adds the `X-Signature` header. |
