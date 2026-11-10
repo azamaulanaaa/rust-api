@@ -216,12 +216,17 @@ impl EavRuntime {
     ///
     /// The call reads every time index key.
     /// For each key it reads at most `limit` due entities.
-    /// A fired marker for the same entity, key, and value is skipped.
-    /// The call writes the event and then the marker.
-    /// A failed marker write returns the error.
+    /// The call emits the timer event first.
+    /// It then retires the time index row and writes the fired marker in one
+    /// transaction.
+    /// A retire that returns `false` means the value changed after the read,
+    /// and the call does not count the timer as emitted.
+    /// When a fired marker already exists for a due value, the call retires
+    /// the row without an event.
+    /// That drain removes rows that fired before retirement existed, so an
+    /// upgraded store recovers.
+    /// A failed retire returns the error.
     /// The next pass then emits the same event again.
-    /// A marker write returns false when the value changed after the read.
-    /// The call counts only a written marker.
     /// The event is already written, and a duplicate event is idempotent.
     /// The rule engine execution marker stops a duplicate action.
     pub async fn fire_due_timers(&self, now: i64, limit: usize) -> anyhow::Result<usize> {
@@ -250,20 +255,26 @@ impl EavRuntime {
                     .await
                     .context("read the EAV timer marker")?
                 {
+                    // The row fired before the timer retire existed.
+                    // Remove it without a second event.
+                    self.entities
+                        .retire_timer(&entity.id, &key, due_at)
+                        .await
+                        .context("retire the EAV timer row")?;
                     continue;
                 }
                 self.entities
                     .emit_timer(&entity, &key, due_at, now)
                     .await
                     .context("emit an EAV timer event")?;
-                let marked = self
+                let retired = self
                     .entities
-                    .mark_timer_fired(&entity.id, &key, due_at)
+                    .retire_timer(&entity.id, &key, due_at)
                     .await
-                    .context("write the EAV timer marker")?;
+                    .context("retire the EAV timer row")?;
                 // A false result means the value changed after the read.
                 // The event stays idempotent, and the next pass reads the new value.
-                emitted += usize::from(marked);
+                emitted += usize::from(retired);
             }
         }
         self.metrics.record_timer_due(due_count);
@@ -775,6 +786,156 @@ mod tests {
 
         assert_eq!(runtime.fire_due_timers(100, 0).await.unwrap(), 0);
         assert_eq!(runtime.wal().head().await.unwrap(), 1);
+    }
+
+    /// Returns the entity ids of every timer event in the WAL.
+    async fn timer_event_ids(runtime: &EavRuntime) -> Vec<String> {
+        let head = runtime.wal().head().await.unwrap();
+        if head == 0 {
+            return Vec::new();
+        }
+        runtime
+            .wal()
+            .range(1, head)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|entry| match entry.op {
+                WalOp::Entity { event } if event.kind == EntityEventKind::Timer => {
+                    Some(event.entity_id)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_retired_timer_row_lets_the_next_pass_reach_later_entities() {
+        let runtime = build_runtime(Vec::new()).await;
+        runtime.schemas().publish(timer_schema()).await.unwrap();
+        for (id, due) in [("e1", 100), ("e2", 101), ("e3", 102)] {
+            runtime
+                .entities()
+                .create(timer_entity(id, due), &WriteContext::new("tester"))
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(runtime.fire_due_timers(102, 2).await.unwrap(), 2);
+        let remaining = runtime.entities().list_due("due", 102, 100).await.unwrap();
+        let ids: Vec<&str> = remaining.iter().map(|entity| entity.id.as_str()).collect();
+        assert_eq!(ids, vec!["e3"]);
+
+        assert_eq!(runtime.fire_due_timers(102, 2).await.unwrap(), 1);
+        assert!(
+            runtime
+                .entities()
+                .list_due("due", 102, 100)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(runtime.fire_due_timers(102, 2).await.unwrap(), 0);
+
+        let mut events = timer_event_ids(&runtime).await;
+        events.sort();
+        assert_eq!(events, vec!["e1", "e2", "e3"]);
+        assert_eq!(runtime.wal().head().await.unwrap(), 6);
+    }
+
+    #[tokio::test]
+    async fn a_small_limit_retires_due_rows_on_every_pass() {
+        let runtime = build_runtime(Vec::new()).await;
+        runtime.schemas().publish(timer_schema()).await.unwrap();
+        for (index, id) in ["e1", "e2", "e3", "e4", "e5"].iter().enumerate() {
+            runtime
+                .entities()
+                .create(
+                    timer_entity(id, 100 + index as i64),
+                    &WriteContext::new("tester"),
+                )
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(runtime.fire_due_timers(200, 2).await.unwrap(), 2);
+        assert_eq!(
+            runtime
+                .entities()
+                .list_due("due", 200, 100)
+                .await
+                .unwrap()
+                .len(),
+            3
+        );
+        assert_eq!(runtime.fire_due_timers(200, 2).await.unwrap(), 2);
+        assert_eq!(
+            runtime
+                .entities()
+                .list_due("due", 200, 100)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(runtime.fire_due_timers(200, 2).await.unwrap(), 1);
+        assert!(
+            runtime
+                .entities()
+                .list_due("due", 200, 100)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_upgraded_store_drains_a_fired_row_without_a_second_event() {
+        let runtime = build_runtime(Vec::new()).await;
+        runtime.schemas().publish(timer_schema()).await.unwrap();
+        runtime
+            .entities()
+            .create(timer_entity("e1", 100), &WriteContext::new("tester"))
+            .await
+            .unwrap();
+        // Simulate a store that fired the value before timer retire existed.
+        assert!(
+            runtime
+                .entities()
+                .mark_timer_fired("e1", "due", 100)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            runtime
+                .entities()
+                .list_due("due", 100, 100)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        let before = runtime.wal().head().await.unwrap();
+
+        assert_eq!(runtime.fire_due_timers(100, 100).await.unwrap(), 0);
+
+        assert_eq!(runtime.wal().head().await.unwrap(), before);
+        assert!(timer_event_ids(&runtime).await.is_empty());
+        assert!(
+            runtime
+                .entities()
+                .is_timer_fired("e1", "due", 100)
+                .await
+                .unwrap()
+        );
+        assert!(
+            runtime
+                .entities()
+                .list_due("due", 100, 100)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
