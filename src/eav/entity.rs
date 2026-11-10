@@ -15,6 +15,9 @@
 //! - `idx:attr:{key}:{hash}:{entity_id}` is an empty attribute marker.
 //! - `idx:unique:{key}:{hash}:{entity_id}` is a unique value marker.
 //! - `idx:time:{key}:{encoded_ts}:{entity_id}` is an empty time marker.
+//! - `idx:time-key:{key}` is an empty marker for an attribute key with a
+//!   time row.
+//! - `idx:time-key-meta:backfilled` is an empty backfill marker.
 //! - `timer:fired:{entity_id}:{key}:{encoded_ts}` is a fired timer marker.
 //!
 //! The `hash` is the lowercase SHA-256 hex of the canonical tagged JSON value.
@@ -84,6 +87,15 @@ const UNIQUE_INDEX_PREFIX: &str = "idx:unique:";
 
 /// Key prefix for time index markers.
 const TIME_INDEX_PREFIX: &str = "idx:time:";
+
+/// Key prefix for time key markers.
+const TIME_KEY_INDEX_PREFIX: &str = "idx:time-key:";
+
+/// Key prefix for time key metadata.
+const TIME_KEY_META_PREFIX: &str = "idx:time-key-meta:";
+
+/// Key suffix for the one-time time key backfill marker.
+const TIME_KEY_BACKFILL_SUFFIX: &str = "backfilled";
 
 /// Key prefix for fired timer markers.
 const TIMER_MARKER_PREFIX: &str = "timer:fired:";
@@ -1152,24 +1164,47 @@ impl EntityStore {
 
     /// Returns the attribute keys that have a time index row.
     ///
+    /// The call scans only the `idx:time-key:` family.
     /// The result is sorted and has no duplicates.
     /// An attribute key contains no colon.
+    /// A delete keeps the key marker. A stale marker costs one empty scan.
+    /// The `idx:time-key-meta:backfilled` marker records the one-time
+    /// backfill. When it is absent, the call scans the `idx:time:` family one
+    /// time. It writes every missing key marker and the backfill marker. It
+    /// returns the union of the marker keys and the scanned keys.
+    /// The backfill runs at most one time per store.
     pub async fn time_keys(&self) -> Result<Vec<String>, EntityError> {
+        let backfill_marker = time_key_backfill_marker();
         let g = self.store.read().await;
-        let rows = scan_prefix(&*g, TIME_INDEX_PREFIX).await?;
-        let mut keys = BTreeSet::new();
-        for row in rows {
-            let Some(rest) = row.key.strip_prefix(TIME_INDEX_PREFIX) else {
-                continue;
-            };
-            let Some((key, _)) = rest.split_once(':') else {
-                continue;
-            };
-            if !key.is_empty() {
-                keys.insert(key.to_string());
+        let markers: BTreeSet<String> =
+            time_key_marker_keys(scan_prefix(&*g, TIME_KEY_INDEX_PREFIX).await?)
+                .into_iter()
+                .collect();
+        let backfilled = g
+            .get_bytes(&backfill_marker)
+            .await
+            .map_err(EntityError::Store)?
+            .is_some();
+        if backfilled {
+            return Ok(markers.into_iter().collect());
+        }
+        let keys = time_row_keys(scan_prefix(&*g, TIME_INDEX_PREFIX).await?);
+        drop(g);
+
+        let mut all = markers.clone();
+        all.extend(keys);
+        let g = self.store.write().await;
+        for key in &all {
+            if !markers.contains(key) {
+                g.set_bytes(&time_key_index_key(key), b"")
+                    .await
+                    .map_err(EntityError::Store)?;
             }
         }
-        Ok(keys.into_iter().collect())
+        g.set_bytes(&backfill_marker, b"")
+            .await
+            .map_err(EntityError::Store)?;
+        Ok(all.into_iter().collect())
     }
 
     /// Lists the entities whose indexed timestamp `key` is due.
@@ -1962,6 +1997,10 @@ where
                 .set_bytes(&time_index_key(key, *timestamp, &entity.id), b"")
                 .await
                 .map_err(EntityError::Store)?;
+            store
+                .set_bytes(&time_key_index_key(key), b"")
+                .await
+                .map_err(EntityError::Store)?;
         }
         if def.unique {
             store
@@ -2238,6 +2277,47 @@ fn time_index_key(key: &str, timestamp: i64, entity_id: &str) -> String {
         "{TIME_INDEX_PREFIX}{key}:{}:{entity_id}",
         encode_timestamp(timestamp)
     )
+}
+
+/// The marker key for one attribute key with a time row.
+fn time_key_index_key(key: &str) -> String {
+    format!("{TIME_KEY_INDEX_PREFIX}{key}")
+}
+
+/// The marker key for the one-time time key backfill.
+fn time_key_backfill_marker() -> String {
+    format!("{TIME_KEY_META_PREFIX}{TIME_KEY_BACKFILL_SUFFIX}")
+}
+
+/// Returns the sorted attribute keys of a set of time key markers.
+fn time_key_marker_keys(rows: Vec<KeyValue>) -> Vec<String> {
+    let mut keys = BTreeSet::new();
+    for row in rows {
+        let Some(key) = row.key.strip_prefix(TIME_KEY_INDEX_PREFIX) else {
+            continue;
+        };
+        if !key.is_empty() {
+            keys.insert(key.to_string());
+        }
+    }
+    keys.into_iter().collect()
+}
+
+/// Returns the sorted attribute keys of a set of time rows.
+fn time_row_keys(rows: Vec<KeyValue>) -> Vec<String> {
+    let mut keys = BTreeSet::new();
+    for row in rows {
+        let Some(rest) = row.key.strip_prefix(TIME_INDEX_PREFIX) else {
+            continue;
+        };
+        let Some((key, _)) = rest.split_once(':') else {
+            continue;
+        };
+        if !key.is_empty() {
+            keys.insert(key.to_string());
+        }
+    }
+    keys.into_iter().collect()
 }
 
 /// The marker key for one fired timer value.
@@ -4204,6 +4284,199 @@ mod tests {
         assert_eq!(
             store.time_keys().await.unwrap(),
             vec!["due".to_string(), "start".to_string()]
+        );
+    }
+
+    /// One indexed timestamp writes one key marker.
+    #[tokio::test]
+    async fn time_keys_returns_the_key_after_one_indexed_timestamp() {
+        let (store, registry, raw) = new_store().await;
+        registry
+            .publish(schema(
+                "task",
+                &[],
+                vec![full_attr(
+                    "due",
+                    AttributeType::Timestamp,
+                    false,
+                    true,
+                    false,
+                    None,
+                )],
+            ))
+            .await
+            .unwrap();
+        create_task(&store, "e1", 100).await;
+
+        assert_eq!(store.time_keys().await.unwrap(), vec!["due".to_string()]);
+        assert!(all_keys(&raw).await.contains(&time_key_index_key("due")));
+    }
+
+    /// Two entities with the same key and value write one key marker.
+    #[tokio::test]
+    async fn time_keys_returns_one_key_after_a_second_matching_entity() {
+        let (store, registry, raw) = new_store().await;
+        registry
+            .publish(schema(
+                "task",
+                &[],
+                vec![full_attr(
+                    "due",
+                    AttributeType::Timestamp,
+                    false,
+                    true,
+                    false,
+                    None,
+                )],
+            ))
+            .await
+            .unwrap();
+        create_task(&store, "e1", 100).await;
+        create_task(&store, "e2", 100).await;
+
+        assert_eq!(store.time_keys().await.unwrap(), vec!["due".to_string()]);
+        let markers: Vec<String> = all_keys(&raw)
+            .await
+            .into_iter()
+            .filter(|key| key.starts_with(TIME_KEY_INDEX_PREFIX))
+            .collect();
+        assert_eq!(markers, vec![time_key_index_key("due")]);
+    }
+
+    /// Two different indexed timestamp keys come back in sorted order.
+    #[tokio::test]
+    async fn time_keys_returns_two_keys_in_sorted_order() {
+        let (store, registry, _raw) = new_store().await;
+        registry
+            .publish(schema(
+                "task",
+                &[],
+                vec![
+                    full_attr("start", AttributeType::Timestamp, false, true, false, None),
+                    full_attr("due", AttributeType::Timestamp, false, true, false, None),
+                ],
+            ))
+            .await
+            .unwrap();
+        store
+            .create(
+                draft("e1", &["task"], vec![("start", t(50)), ("due", t(100))]),
+                &ctx(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.time_keys().await.unwrap(),
+            vec!["due".to_string(), "start".to_string()]
+        );
+    }
+
+    /// A delete keeps the key marker and the next scan succeeds.
+    #[tokio::test]
+    async fn time_keys_returns_the_key_after_every_entity_is_deleted() {
+        let (store, registry, raw) = new_store().await;
+        registry
+            .publish(schema(
+                "task",
+                &[],
+                vec![full_attr(
+                    "due",
+                    AttributeType::Timestamp,
+                    false,
+                    true,
+                    false,
+                    None,
+                )],
+            ))
+            .await
+            .unwrap();
+        create_task(&store, "e1", 100).await;
+        create_task(&store, "e2", 200).await;
+
+        store.delete("e1", 1, &ctx()).await.unwrap();
+        store.delete("e2", 1, &ctx()).await.unwrap();
+
+        let keys = store.time_keys().await.unwrap();
+        assert_eq!(keys, vec!["due".to_string()]);
+        assert!(all_keys(&raw).await.contains(&time_key_index_key("due")));
+    }
+
+    /// An old store with no key marker gets the marker on the first call.
+    #[tokio::test]
+    async fn time_keys_backfills_the_marker_for_an_old_store() {
+        let (store, registry, raw) = new_store().await;
+        registry.publish(schema("task", &[], vec![])).await.unwrap();
+        raw.set_bytes(&time_index_key("due", 100, "e1"), b"")
+            .await
+            .unwrap();
+        assert!(!all_keys(&raw).await.contains(&time_key_index_key("due")));
+
+        assert_eq!(store.time_keys().await.unwrap(), vec!["due".to_string()]);
+
+        let marker = raw.get_bytes(&time_key_index_key("due")).await.unwrap();
+        assert_eq!(marker.as_deref(), Some(&b""[..]));
+        assert_eq!(store.time_keys().await.unwrap(), vec!["due".to_string()]);
+    }
+
+    /// A mixed store gets the missing marker and the backfill marker.
+    #[tokio::test]
+    async fn time_keys_backfills_a_mixed_store_one_time() {
+        let (store, registry, raw) = new_store().await;
+        registry.publish(schema("task", &[], vec![])).await.unwrap();
+        raw.set_bytes(&time_index_key("beta", 100, "e1"), b"")
+            .await
+            .unwrap();
+        raw.set_bytes(&time_key_index_key("alpha"), b"")
+            .await
+            .unwrap();
+        assert!(
+            raw.get_bytes(&time_key_backfill_marker())
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        assert_eq!(
+            store.time_keys().await.unwrap(),
+            vec!["alpha".to_string(), "beta".to_string()]
+        );
+
+        assert!(all_keys(&raw).await.contains(&time_key_index_key("beta")));
+        assert!(
+            raw.get_bytes(&time_key_backfill_marker())
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// A second call returns every marker key after the backfill marker.
+    #[tokio::test]
+    async fn time_keys_keeps_every_key_after_the_backfill_marker_exists() {
+        let (store, registry, raw) = new_store().await;
+        registry.publish(schema("task", &[], vec![])).await.unwrap();
+        raw.set_bytes(&time_index_key("beta", 100, "e1"), b"")
+            .await
+            .unwrap();
+        raw.set_bytes(&time_key_index_key("alpha"), b"")
+            .await
+            .unwrap();
+        let first = store.time_keys().await.unwrap();
+        assert_eq!(first, vec!["alpha".to_string(), "beta".to_string()]);
+        assert!(
+            raw.get_bytes(&time_key_backfill_marker())
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        raw.delete(&time_index_key("beta", 100, "e1"))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.time_keys().await.unwrap(),
+            vec!["alpha".to_string(), "beta".to_string()]
         );
     }
 
