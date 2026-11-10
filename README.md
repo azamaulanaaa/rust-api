@@ -25,6 +25,7 @@ For module documentation, run `cargo doc --no-deps --open`. Start with [`http`](
 | [Configuration](#configuration) | Config file, environment overrides, limits |
 | [Operations](#operations) | Lease, readiness, backups, GC, telemetry, migration |
 | [Extending the server](#extending-the-server) | Custom modules and embedding |
+| [Performance](#performance) | EAV benchmark suite |
 | [Development](#development) | Tests, benchmarks, releases |
 | [License](#license) | License terms |
 
@@ -873,9 +874,25 @@ HttpServer::new(move || {
 
 `svc.configure` returns `Result<_, DuplicateRoutePrefix>`. The actix configure closure returns `()`, so handle the error at that point. Build one `App` per worker, as `HttpServer::new` does here. Mount `http::docs::config` last. A catch-all mount registered earlier can shadow your modules.
 
+## Performance
+
+The EAV benchmarks cover six hot paths: entity create, entity read, entity list paging, indexed attribute query, cached effective schema, and outbox count. Each group uses an in-memory scratch store and a fixed seed. The suite needs no S3 bucket and no network. The benchmark target is `benches/eav.rs`. Run every new benchmark through `cargo bench --bench eav`.
+
+Run the full suite:
+
+```bash
+cargo bench --bench eav
+```
+
+Run a quick smoke test:
+
+```bash
+cargo bench --bench eav -- --quick
+```
+
 ## Development
 
-Build, test, lint, documentation, and commit rules are in [CONTRIBUTING.md](CONTRIBUTING.md). This section covers only the test suites, benchmarks, and releases.
+Build, test, lint, documentation, and commit rules are in [CONTRIBUTING.md](CONTRIBUTING.md). This section covers the test suites and releases. See [Performance](#performance) for the benchmark suite.
 
 ### Integration tests
 
@@ -920,23 +937,6 @@ cargo test --test contract gc -- --ignored
 ```
 
 Contract tests mutate real buckets. Use a dedicated bucket and clean it between runs.
-
-### Benchmarks
-
-Criterion benchmarks measure the three hot paths that scale with data size:
-
-- `sync_replay`: replay a bounded WAL range into one replica.
-- `replica_build`: filter, diff, and commit one full replica.
-- `policy_eval`: one Casbin decision, including row and file checks.
-
-```bash
-cargo bench
-cargo bench sync_replay
-cargo bench replica_build/1000_ops
-cargo bench policy_eval/1000_rules
-```
-
-CI baselines on 2 vCPU, 4 GiB RAM, and an in-memory store: `sync_replay` 12 ms at 1,000 ops and 95 ms at 10,000 ops, `replica_build` 450 ms cold and 180 ms warm at 10,000 files, and `policy_eval` 80 µs at 1,000 rules and 620 µs at 10,000 rules. A change above 10% needs an explanation in the commit message.
 
 ### Releases
 
