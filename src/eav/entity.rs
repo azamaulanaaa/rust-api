@@ -13,6 +13,9 @@
 //! - `idx:entity:{entity_id}` is an empty entity marker.
 //! - `idx:schema:{schema_id}:{entity_id}` is an empty schema marker.
 //! - `idx:attr:{key}:{hash}:{entity_id}` is an empty attribute marker.
+//! - `idx:attr-key:{key}` is an empty marker that records that the attribute
+//!   is indexed. The marker is permanent. A stale marker only allows an
+//!   empty result.
 //! - `idx:unique:{key}:{hash}:{entity_id}` is a unique value marker.
 //! - `idx:time:{key}:{encoded_ts}:{entity_id}` is an empty time marker.
 //! - `idx:time-key:{key}` is an empty marker for an attribute key with a
@@ -81,6 +84,9 @@ const SCHEMA_INDEX_PREFIX: &str = "idx:schema:";
 
 /// Key prefix for attribute index markers.
 const ATTR_INDEX_PREFIX: &str = "idx:attr:";
+
+/// Key prefix for the marker of an indexed attribute key.
+const ATTR_KEY_PREFIX: &str = "idx:attr-key:";
 
 /// Key prefix for unique index markers.
 const UNIQUE_INDEX_PREFIX: &str = "idx:unique:";
@@ -1126,6 +1132,8 @@ impl EntityStore {
 
     /// Lists the entities with an indexed attribute equal to `value`.
     ///
+    /// The call checks the permanent key marker before it reads the schema.
+    /// A stale marker only allows an empty result.
     /// The call returns an error when no applied schema indexes `key`.
     /// The result is sorted by entity id.
     pub async fn list_by_attribute(
@@ -1133,33 +1141,94 @@ impl EntityStore {
         key: &str,
         value: &AttributeValue,
     ) -> Result<Vec<Entity>, EntityError> {
+        let (entities, _) = self
+            .list_by_attribute_after(key, value, usize::MAX, None)
+            .await?;
+        Ok(entities)
+    }
+
+    /// Lists one page of the entities with an indexed attribute equal to `value`.
+    ///
+    /// The key marker is permanent.
+    /// A present marker skips the schema check.
+    /// A stale marker only allows an empty result.
+    /// The scan starts after the `after` id when the caller gives a cursor.
+    /// The scan verifies each hash match against the exact value.
+    /// The result is in entity id order.
+    /// The call returns the cursor for the next page when the page is full.
+    /// The cursor is `None` when the scan is exhausted.
+    /// A `limit` of 0 returns an empty list and no cursor.
+    /// The call returns [`EntityError::NotIndexed`] when no applied schema
+    /// indexes `key`.
+    pub async fn list_by_attribute_after(
+        &self,
+        key: &str,
+        value: &AttributeValue,
+        limit: usize,
+        after: Option<&str>,
+    ) -> Result<(Vec<Entity>, Option<String>), EntityError> {
         validate_name("attribute name", key)?;
+        if limit == 0 {
+            return Ok((Vec::new(), None));
+        }
         let hash = value_hash(value)?;
         let g = self.store.read().await;
-        let family = format!("{ATTR_INDEX_PREFIX}{key}:");
-        if scan_prefix(&*g, &family).await?.is_empty() && !self.attribute_is_indexed(key).await? {
+        let marker_present = g
+            .get_bytes(&attr_key_index_key(key))
+            .await
+            .map_err(EntityError::Store)?
+            .is_some();
+        if !marker_present && !self.attribute_is_indexed(key).await? {
             return Err(EntityError::NotIndexed(key.to_string()));
         }
 
-        let prefix = format!("{family}{hash}:");
-        let markers = scan_prefix(&*g, &prefix).await?;
+        let prefix = format!("{ATTR_INDEX_PREFIX}{key}:{hash}:");
+        let end = prefix_scan_end(&prefix);
+        let mut start = match after {
+            Some(cursor) => {
+                validate_name("entity id", cursor)?;
+                format!("{prefix}{cursor}\0")
+            }
+            None => prefix.clone(),
+        };
+        let max = u32::try_from(limit).ok();
         let mut entities = Vec::new();
         let mut seen = BTreeSet::new();
-        for marker in markers {
-            let Some(id) = marker.key.strip_prefix(&prefix) else {
-                continue;
-            };
-            if id.is_empty() || id.contains(':') || !seen.insert(id.to_string()) {
-                continue;
+        loop {
+            let rows = g
+                .gets_bytes(
+                    max,
+                    Direction::Next,
+                    (Some(start.clone()), Some(end.clone())),
+                )
+                .await
+                .map_err(EntityError::Store)?;
+            let full = rows.len() == limit;
+            for row in &rows {
+                start = format!("{}\0", row.key);
+                let Some(id) = row.key.strip_prefix(&prefix) else {
+                    continue;
+                };
+                if id.is_empty() || id.contains(':') || !seen.insert(id.to_string()) {
+                    continue;
+                }
+                if let Some(entity) = load_entity(&*g, id).await?
+                    && entity.attributes.get(key) == Some(value)
+                {
+                    entities.push(entity);
+                }
             }
-            if let Some(entity) = load_entity(&*g, id).await?
-                && entity.attributes.get(key) == Some(value)
-            {
-                entities.push(entity);
+            if entities.len() >= limit || !full {
+                break;
             }
         }
         entities.sort_by(|a, b| a.id.cmp(&b.id));
-        Ok(entities)
+        let next = if entities.len() >= limit {
+            entities.last().map(|entity| entity.id.clone())
+        } else {
+            None
+        };
+        Ok((entities, next))
     }
 
     /// Returns the attribute keys that have a time index row.
@@ -1989,6 +2058,10 @@ where
                 .set_bytes(&attr_index_key(key, value, &entity.id)?, b"")
                 .await
                 .map_err(EntityError::Store)?;
+            store
+                .set_bytes(&attr_key_index_key(key), b"")
+                .await
+                .map_err(EntityError::Store)?;
         }
         if is_time_attribute(def)
             && let AttributeValue::Timestamp(timestamp) = value
@@ -2259,6 +2332,11 @@ fn attr_index_key(
         "{ATTR_INDEX_PREFIX}{key}:{}:{entity_id}",
         value_hash(value)?
     ))
+}
+
+/// The marker key for one indexed attribute key.
+fn attr_key_index_key(key: &str) -> String {
+    format!("{ATTR_KEY_PREFIX}{key}")
 }
 
 /// The marker key for one unique attribute value and entity.
@@ -2848,7 +2926,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_removes_entity_and_index_markers() {
+    async fn delete_removes_value_markers_and_keeps_the_key_marker() {
         let (store, registry, raw) = new_store().await;
         registry
             .publish(schema(
@@ -2877,7 +2955,9 @@ mod tests {
 
         store.delete("e1", 1, &ctx()).await.unwrap();
 
-        assert!(all_keys(&raw).await.is_empty());
+        assert_eq!(all_keys(&raw).await, vec![attr_key_index_key("tag")]);
+        let found = store.list_by_attribute("tag", &s("alpha")).await.unwrap();
+        assert!(found.is_empty());
     }
 
     #[tokio::test]
@@ -3011,6 +3091,146 @@ mod tests {
         let found = store.list_by_attribute("tag", &s("alpha")).await.unwrap();
 
         assert!(found.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_indexed_write_adds_the_attribute_key_marker() {
+        let (store, registry, raw) = new_store().await;
+        registry
+            .publish(schema(
+                "task",
+                &[],
+                vec![full_attr(
+                    "tag",
+                    AttributeType::String,
+                    false,
+                    true,
+                    false,
+                    None,
+                )],
+            ))
+            .await
+            .unwrap();
+        store
+            .create(draft("e1", &["task"], vec![("tag", s("alpha"))]), &ctx())
+            .await
+            .unwrap();
+
+        assert!(
+            raw.get_bytes(&attr_key_index_key("tag"))
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let found = store.list_by_attribute("tag", &s("alpha")).await.unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, "e1");
+    }
+
+    #[tokio::test]
+    async fn list_by_attribute_accepts_the_key_marker_without_a_family_scan() {
+        let (store, _registry, raw) = new_store().await;
+        raw.set_bytes(&attr_key_index_key("ghost"), b"")
+            .await
+            .unwrap();
+
+        let found = store.list_by_attribute("ghost", &s("alpha")).await.unwrap();
+
+        assert!(found.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_by_attribute_after_pages_without_duplicates() {
+        let (store, registry, _raw) = new_store().await;
+        registry
+            .publish(schema(
+                "task",
+                &[],
+                vec![full_attr(
+                    "tag",
+                    AttributeType::String,
+                    false,
+                    true,
+                    false,
+                    None,
+                )],
+            ))
+            .await
+            .unwrap();
+        for id in ["e1", "e2", "e3"] {
+            store
+                .create(draft(id, &["task"], vec![("tag", s("alpha"))]), &ctx())
+                .await
+                .unwrap();
+        }
+        store
+            .create(draft("e4", &["task"], vec![("tag", s("beta"))]), &ctx())
+            .await
+            .unwrap();
+
+        let (first, next) = store
+            .list_by_attribute_after("tag", &s("alpha"), 2, None)
+            .await
+            .unwrap();
+        let first_ids: Vec<&str> = first.iter().map(|entity| entity.id.as_str()).collect();
+        assert_eq!(first_ids, vec!["e1", "e2"]);
+        assert_eq!(next.as_deref(), Some("e2"));
+
+        let (second, next) = store
+            .list_by_attribute_after("tag", &s("alpha"), 2, next.as_deref())
+            .await
+            .unwrap();
+        let second_ids: Vec<&str> = second.iter().map(|entity| entity.id.as_str()).collect();
+        assert_eq!(second_ids, vec!["e3"]);
+        assert!(next.is_none());
+
+        let mut all: Vec<String> = first
+            .into_iter()
+            .chain(second)
+            .map(|entity| entity.id)
+            .collect();
+        all.sort();
+        assert_eq!(all, vec!["e1", "e2", "e3"]);
+    }
+
+    #[tokio::test]
+    async fn list_by_attribute_after_ignores_a_hash_collision_with_a_different_value() {
+        let (store, registry, raw) = new_store().await;
+        registry
+            .publish(schema(
+                "task",
+                &[],
+                vec![full_attr(
+                    "tag",
+                    AttributeType::String,
+                    false,
+                    true,
+                    false,
+                    None,
+                )],
+            ))
+            .await
+            .unwrap();
+        store
+            .create(draft("a", &["task"], vec![("tag", s("alpha"))]), &ctx())
+            .await
+            .unwrap();
+        store
+            .create(draft("b", &["task"], vec![("tag", s("beta"))]), &ctx())
+            .await
+            .unwrap();
+        raw.set_bytes(&attr_index_key("tag", &s("alpha"), "b").unwrap(), b"")
+            .await
+            .unwrap();
+
+        let (found, next) = store
+            .list_by_attribute_after("tag", &s("alpha"), 2, None)
+            .await
+            .unwrap();
+        let ids: Vec<&str> = found.iter().map(|entity| entity.id.as_str()).collect();
+
+        assert_eq!(ids, vec!["a"]);
+        assert!(next.is_none());
     }
 
     #[tokio::test]
