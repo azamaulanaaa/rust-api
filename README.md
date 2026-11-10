@@ -263,7 +263,7 @@ Schema evolution has three steps. `GET /eav/schemas/{id}/diff` reports added, re
 
 The entity store writes one change event to an outbox row in the same transaction as the entity data. A background relay flushes the outbox to the shared change feed. Delivery is at least once, so a consumer must be idempotent. Clients read the feed through `/eav/sync/events` and load the initial state through `/eav/sync/snapshot`.
 
-The module also stores one per-user entity replica. `POST /eav/sync/replica` builds a point-in-time snapshot of the entities that the caller can read, in ordered chunks. The client then applies the entity change feed after the stored head. `GET /eav/sync/replica` returns the full snapshot as one JSON array. This full read is for compatibility. `GET /eav/sync/replica?chunk=N` returns one stored chunk. Read chunks from 0 until `next` is null. This replica differs from the file replica under `/sync`. The `/sync` replica mirrors file records and relations as prefix-scoped store objects. The EAV replica is a chunked JSON snapshot in the EAV replica store. It is not an incremental store.
+The module also stores one per-user entity replica. `POST /eav/sync/replica` builds a point-in-time snapshot of the entities that the caller can read, in ordered chunks. The client then applies the entity change feed after the stored head. `GET /eav/sync/replica` returns the full snapshot as one JSON array. This full read is for compatibility. `GET /eav/sync/replica?chunk=N` returns one stored chunk. Read chunks from 0 until `next` is null. The build filters with the grants at build time. Each read filters again with the current grants. The snapshot gives no authorization cache, so a policy change takes effect on the next read. The read sets no `ETag` and ignores `If-None-Match`. The response depends on the current grants, so it has no stable validator. This replica differs from the file replica under `/sync`. The `/sync` replica mirrors file records and relations as prefix-scoped store objects. The EAV replica is a chunked JSON snapshot in the EAV replica store. It is not an incremental store.
 
 ```bash
 curl -s -H "Authorization: Bearer $TOKEN" \
@@ -360,7 +360,7 @@ Metrics cover rule execution (`eav.rules.executed`, `eav.rules.failed`) and webh
 | GET | `/eav/sync/events` | Entity events after a `since` cursor | session |
 | GET | `/eav/sync/snapshot` | One page of entity state for an offline client | session |
 | POST | `/eav/sync/replica` | Build and store the caller's entity replica | session |
-| GET | `/eav/sync/replica` | Read the stored replica, or one chunk with `?chunk=N` | session |
+| GET | `/eav/sync/replica` | Read the stored replica with the current grants, or one chunk with `?chunk=N` | session |
 | GET | `/eav/sync/replica/status` | Change feed head and stored replica head | session |
 | GET | `/openapi.json` | OpenAPI 3.1 document | none |
 | GET | `/swagger-ui/` | Swagger UI for the document | none |

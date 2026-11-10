@@ -22,6 +22,13 @@
 //! The full read is for compatibility.
 //! Use the chunk read to page a large replica.
 //!
+//! The build filters with the grants at build time.
+//! Each replica read filters again with the current grants.
+//! The snapshot gives no authorization cache.
+//! A policy change takes effect on the next read.
+//! The replica read sets no `ETag`, because the response depends on the
+//! current grants and has no stable validator.
+//!
 //! The events route checks one collection grant.
 //! Without the collection grant, it checks a row grant for each event.
 //! A caller sees only the events that it can read.
@@ -212,6 +219,29 @@ impl std::error::Error for CursorAhead {}
 /// Converts a change-log failure to a sanitized server error.
 fn internal(error: FsError) -> EavApiError {
     EavApiError::Internal(Box::new(error))
+}
+
+/// Decodes one stored replica chunk into entities.
+fn decode_chunk(chunk: &[u8]) -> Result<Vec<Entity>, EavApiError> {
+    serde_json::from_slice(chunk).map_err(|e| EavApiError::Internal(Box::new(e)))
+}
+
+/// Keeps only the entities that the caller can read.
+///
+/// The route calls this function on every read.
+/// The function does not cache an authorization decision.
+async fn filter_readable(
+    policy: &Authorizer,
+    sub: &str,
+    items: Vec<Entity>,
+) -> Result<Vec<Entity>, EavApiError> {
+    let mut visible = Vec::with_capacity(items.len());
+    for entity in items {
+        if can_read_entity(policy, sub, &entity.id).await? {
+            visible.push(entity);
+        }
+    }
+    Ok(visible)
 }
 
 /// Returns the quoted `ETag` for one head value.
@@ -516,45 +546,37 @@ impl std::error::Error for ReplicaChunkOutOfRange {}
 ///
 /// The caller needs a valid session.
 /// A missing replica returns `404`.
-/// Without a `chunk` parameter, the route returns every entity as one JSON
-/// array and sets `ETag` and `X-Replica-Head` to the stored head.
+/// The route filters every entity with the current grants.
+/// A caller with no read grant gets an empty list or an empty page.
+/// The snapshot gives no authorization cache.
+/// A policy change takes effect on the next read.
+/// Without a `chunk` parameter, the route returns every permitted entity as
+/// one JSON array and sets `X-Replica-Head` to the stored head.
 /// With `chunk=N`, the route returns one stored chunk and sets
 /// `X-Replica-Head`, `X-Replica-Chunk`, and `X-Replica-Chunks`.
-/// A match on `If-None-Match` returns `304` with no body.
+/// The route sets no `ETag` and ignores `If-None-Match`.
+/// The response depends on the current grants, so it has no stable validator.
 /// An out-of-range `chunk` returns `400`.
 /// The client applies the events after the stored head.
-#[utoipa::path(get, path = "/eav/sync/replica", tag = "eav", params(ReplicaChunkQuery), responses((status = 200, body = Vec<Entity>, content_type = "application/json"), (status = 304, description = "not modified"), (status = 400, body = crate::http::error::ErrorBody), (status = 401, body = crate::http::error::ErrorBody), (status = 404, body = crate::http::error::ErrorBody), (status = 500, body = crate::http::error::ErrorBody)))]
+#[utoipa::path(get, path = "/eav/sync/replica", tag = "eav", params(ReplicaChunkQuery), responses((status = 200, body = Vec<Entity>, content_type = "application/json"), (status = 400, body = crate::http::error::ErrorBody), (status = 401, body = crate::http::error::ErrorBody), (status = 404, body = crate::http::error::ErrorBody), (status = 500, body = crate::http::error::ErrorBody)))]
 #[get("/sync/replica")]
 pub(crate) async fn replica(
     runtime: web::Data<EavRuntime>,
+    policy: web::Data<Authorizer>,
     claims: Validated<Claims>,
-    req: HttpRequest,
     query: web::Query<ReplicaChunkQuery>,
 ) -> Result<HttpResponse, EavApiError> {
     let Some(index) = query.into_inner().chunk else {
         let Some(stored) = runtime.replicas().get(&claims.sub).await? else {
             return Err(EavApiError::NotFound(Box::new(MissingReplica)));
         };
-        let etag = status_etag(stored.head);
-        if let Some(header) = req
-            .headers()
-            .get(IF_NONE_MATCH)
-            .and_then(|value| value.to_str().ok())
-            && etag_matches(header, &etag)
-        {
-            return Ok(HttpResponse::NotModified()
-                .insert_header((ETAG, etag))
-                .finish());
-        }
         let mut items: Vec<Entity> = Vec::new();
         for chunk in stored.chunks {
-            let mut page: Vec<Entity> =
-                serde_json::from_slice(&chunk).map_err(|e| EavApiError::Internal(Box::new(e)))?;
-            items.append(&mut page);
+            items.extend(decode_chunk(&chunk)?);
         }
+        let items = filter_readable(&policy, &claims.sub, items).await?;
         let data = serde_json::to_vec(&items).map_err(|e| EavApiError::Internal(Box::new(e)))?;
         return Ok(HttpResponse::Ok()
-            .insert_header((ETAG, etag))
             .insert_header(("X-Replica-Head", stored.head.to_string()))
             .insert_header((CONTENT_TYPE, "application/json"))
             .body(data));
@@ -566,22 +588,10 @@ pub(crate) async fn replica(
         }
         return Err(EavApiError::Invalid(Box::new(ReplicaChunkOutOfRange)));
     };
-    let etag = format!("\"{}-{index}\"", chunk.head);
-    if let Some(header) = req
-        .headers()
-        .get(IF_NONE_MATCH)
-        .and_then(|value| value.to_str().ok())
-        && etag_matches(header, &etag)
-    {
-        return Ok(HttpResponse::NotModified()
-            .insert_header((ETAG, etag))
-            .finish());
-    }
-    let items: Vec<Entity> =
-        serde_json::from_slice(&chunk.data).map_err(|e| EavApiError::Internal(Box::new(e)))?;
+    let items = decode_chunk(&chunk.data)?;
+    let items = filter_readable(&policy, &claims.sub, items).await?;
     let next = (index + 1 < chunk.chunks).then_some(index + 1);
     Ok(HttpResponse::Ok()
-        .insert_header((ETAG, etag))
         .insert_header(("X-Replica-Head", chunk.head.to_string()))
         .insert_header(("X-Replica-Chunk", index.to_string()))
         .insert_header(("X-Replica-Chunks", chunk.chunks.to_string()))
@@ -818,6 +828,28 @@ mod tests {
             .await?;
         fx.engine
             .add_rule(
+                "row-readers".to_string(),
+                format!("entity:{entity_id}"),
+                Action::Read,
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn revoke_collection_read(fx: &Fixture) -> anyhow::Result<()> {
+        fx.engine
+            .remove_rule(
+                "collection-readers".to_string(),
+                ENTITIES.to_string(),
+                Action::Read,
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn revoke_row_read(fx: &Fixture, entity_id: &str) -> anyhow::Result<()> {
+        fx.engine
+            .remove_rule(
                 "row-readers".to_string(),
                 format!("entity:{entity_id}"),
                 Action::Read,
@@ -1279,10 +1311,9 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("application/json")
         );
-        let etag = format!("\"{head}\"");
-        assert_eq!(
-            res.headers().get(ETAG).and_then(|v| v.to_str().ok()),
-            Some(etag.as_str())
+        assert!(
+            res.headers().get(ETAG).is_none(),
+            "replica read sets no ETag"
         );
         let replica_head = head.to_string();
         assert_eq!(
@@ -1396,6 +1427,272 @@ mod tests {
     }
 
     #[actix_web::test]
+    async fn a_replica_read_drops_collection_read_after_revocation() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        publish_task_schema(&fx).await?;
+        for id in ["e1", "e2", "e3"] {
+            create_entity(&fx, id).await?;
+        }
+        grant_collection_read(&fx, "alice").await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::post().uri("/eav/sync/replica"),
+                &token,
+            )
+            .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let built: Value = actix_test::read_body_json(res).await;
+        assert_eq!(built["count"], 3);
+        let head = built["head"].as_u64().expect("head");
+
+        let res = get_route!(&app, "/eav/sync/replica/status", &token).await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let body: Value = actix_test::read_body_json(res).await;
+        assert_eq!(body["built_head"], head);
+
+        revoke_collection_read(&fx).await?;
+        grant_row_read(&fx, "alice", "e1").await?;
+
+        let res = get_route!(&app, "/eav/sync/replica", &token).await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let items: Vec<Value> = actix_test::read_body_json(res).await;
+        let ids: Vec<&str> = items
+            .iter()
+            .map(|item| item["id"].as_str().expect("id"))
+            .collect();
+        assert_eq!(ids, ["e1"]);
+
+        let res = get_route!(&app, "/eav/sync/replica/status", &token).await;
+        let body: Value = actix_test::read_body_json(res).await;
+        assert_eq!(body["built_head"], head);
+
+        revoke_row_read(&fx, "e1").await?;
+        let res = get_route!(&app, "/eav/sync/replica", &token).await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let items: Vec<Value> = actix_test::read_body_json(res).await;
+        assert!(items.is_empty());
+
+        let stored = fx
+            .runtime
+            .replicas()
+            .get("alice")
+            .await?
+            .expect("stored replica");
+        assert_eq!(stored.head, head);
+        let stored_count: usize = stored
+            .chunks
+            .iter()
+            .map(|chunk| {
+                serde_json::from_slice::<Vec<Value>>(chunk)
+                    .expect("stored chunk")
+                    .len()
+            })
+            .sum();
+        assert_eq!(stored_count, 3);
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn a_replica_chunk_read_drops_collection_read_after_revocation() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        publish_task_schema(&fx).await?;
+        for id in ["e1", "e2", "e3", "e4"] {
+            create_entity(&fx, id).await?;
+        }
+        grant_collection_read(&fx, "alice").await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::post().uri("/eav/sync/replica"),
+                &token,
+            )
+            .to_request(),
+        )
+        .await;
+        let built: Value = actix_test::read_body_json(res).await;
+        assert_eq!(built["chunks"], 2);
+        let head = built["head"].as_u64().expect("head");
+
+        revoke_collection_read(&fx).await?;
+        grant_row_read(&fx, "alice", "e1").await?;
+        grant_row_read(&fx, "alice", "e3").await?;
+
+        let res = get_route!(&app, "/eav/sync/replica?chunk=0", &token).await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let body: Value = actix_test::read_body_json(res).await;
+        assert_eq!(body["head"], head);
+        assert_eq!(body["chunk"], 0);
+        assert_eq!(body["chunks"], 2);
+        assert_eq!(body["next"], 1);
+        let items = body["items"].as_array().expect("items");
+        let ids: Vec<&str> = items
+            .iter()
+            .map(|item| item["id"].as_str().expect("id"))
+            .collect();
+        assert_eq!(ids, ["e1"]);
+
+        let res = get_route!(&app, "/eav/sync/replica?chunk=1", &token).await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let body: Value = actix_test::read_body_json(res).await;
+        assert_eq!(body["head"], head);
+        assert_eq!(body["chunk"], 1);
+        assert_eq!(body["chunks"], 2);
+        assert!(body["next"].is_null());
+        let items = body["items"].as_array().expect("items");
+        let ids: Vec<&str> = items
+            .iter()
+            .map(|item| item["id"].as_str().expect("id"))
+            .collect();
+        assert_eq!(ids, ["e3"]);
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn a_replica_read_omits_an_entity_after_a_row_grant_removal() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        publish_task_schema(&fx).await?;
+        create_entity(&fx, "e1").await?;
+        create_entity(&fx, "e2").await?;
+        grant_row_read(&fx, "carol", "e1").await?;
+        grant_row_read(&fx, "carol", "e2").await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("carol")?;
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::post().uri("/eav/sync/replica"),
+                &token,
+            )
+            .to_request(),
+        )
+        .await;
+        let built: Value = actix_test::read_body_json(res).await;
+        assert_eq!(built["count"], 2);
+
+        revoke_row_read(&fx, "e2").await?;
+
+        let res = get_route!(&app, "/eav/sync/replica", &token).await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let items: Vec<Value> = actix_test::read_body_json(res).await;
+        let ids: Vec<&str> = items
+            .iter()
+            .map(|item| item["id"].as_str().expect("id"))
+            .collect();
+        assert_eq!(ids, ["e1"]);
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn a_collection_read_user_still_gets_every_replica_entity() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        publish_task_schema(&fx).await?;
+        for id in ["e1", "e2", "e3"] {
+            create_entity(&fx, id).await?;
+        }
+        grant_collection_read(&fx, "alice").await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+
+        actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::post().uri("/eav/sync/replica"),
+                &token,
+            )
+            .to_request(),
+        )
+        .await;
+
+        let res = get_route!(&app, "/eav/sync/replica", &token).await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let items: Vec<Value> = actix_test::read_body_json(res).await;
+        let ids: Vec<&str> = items
+            .iter()
+            .map(|item| item["id"].as_str().expect("id"))
+            .collect();
+        assert_eq!(ids, ["e1", "e2", "e3"]);
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn a_filtered_replica_pages_every_permitted_entity_once() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        publish_task_schema(&fx).await?;
+        for id in ["e1", "e2", "e3", "e4", "e5"] {
+            create_entity(&fx, id).await?;
+        }
+        grant_collection_read(&fx, "alice").await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::post().uri("/eav/sync/replica"),
+                &token,
+            )
+            .to_request(),
+        )
+        .await;
+        let built: Value = actix_test::read_body_json(res).await;
+        assert_eq!(built["chunks"], 3);
+
+        revoke_collection_read(&fx).await?;
+        for id in ["e1", "e3", "e5"] {
+            grant_row_read(&fx, "alice", id).await?;
+        }
+
+        let mut seen = Vec::new();
+        let mut chunk = 0;
+        loop {
+            let res = get_route!(
+                &app,
+                format!("/eav/sync/replica?chunk={chunk}").as_str(),
+                &token
+            )
+            .await;
+            assert_eq!(res.status(), http::StatusCode::OK);
+            assert_eq!(
+                res.headers()
+                    .get("X-Replica-Chunk")
+                    .and_then(|value| value.to_str().ok()),
+                Some(chunk.to_string().as_str())
+            );
+            assert_eq!(
+                res.headers()
+                    .get("X-Replica-Chunks")
+                    .and_then(|value| value.to_str().ok()),
+                Some("3")
+            );
+            let body: Value = actix_test::read_body_json(res).await;
+            for item in body["items"].as_array().expect("items") {
+                seen.push(item["id"].as_str().expect("id").to_string());
+            }
+            match body["next"].as_u64() {
+                Some(next) => chunk = next,
+                None => break,
+            }
+        }
+        assert_eq!(seen, ["e1", "e3", "e5"]);
+        Ok(())
+    }
+
+    #[actix_web::test]
     async fn a_missing_replica_is_404() -> anyhow::Result<()> {
         let fx = fixture().await?;
         let module = fx.module().await?;
@@ -1409,10 +1706,11 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn a_matching_replica_if_none_match_returns_304() -> anyhow::Result<()> {
+    async fn a_replica_conditional_read_ignores_if_none_match_and_filters() -> anyhow::Result<()> {
         let fx = fixture().await?;
         publish_task_schema(&fx).await?;
         create_entity(&fx, "e1").await?;
+        create_entity(&fx, "e2").await?;
         grant_collection_read(&fx, "alice").await?;
         let module = fx.module().await?;
         let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
@@ -1430,6 +1728,9 @@ mod tests {
         let body: Value = actix_test::read_body_json(res).await;
         let head = body["head"].as_u64().expect("head");
 
+        revoke_collection_read(&fx).await?;
+        grant_row_read(&fx, "alice", "e1").await?;
+
         let res = actix_test::call_service(
             &app,
             auth(
@@ -1441,9 +1742,15 @@ mod tests {
             .to_request(),
         )
         .await;
-        assert_eq!(res.status(), http::StatusCode::NOT_MODIFIED);
+        assert_eq!(res.status(), http::StatusCode::OK);
+        assert!(
+            res.headers().get(ETAG).is_none(),
+            "replica read sets no ETag"
+        );
         let body = actix_test::read_body(res).await;
-        assert!(body.is_empty());
+        let items: Vec<Value> = serde_json::from_slice(&body)?;
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["id"], "e1");
         Ok(())
     }
 
@@ -1521,10 +1828,9 @@ mod tests {
         assert!(second_head > first_head);
 
         let res = get_route!(&app, "/eav/sync/replica", &token).await;
-        let etag = format!("\"{second_head}\"");
-        assert_eq!(
-            res.headers().get(ETAG).and_then(|v| v.to_str().ok()),
-            Some(etag.as_str())
+        assert!(
+            res.headers().get(ETAG).is_none(),
+            "replica read sets no ETag"
         );
         let items: Vec<Value> = actix_test::read_body_json(res).await;
         assert_eq!(items.len(), 2);
@@ -1676,10 +1982,12 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn a_replica_chunk_read_supports_304() -> anyhow::Result<()> {
+    async fn a_replica_chunk_conditional_read_ignores_if_none_match_and_filters()
+    -> anyhow::Result<()> {
         let fx = fixture().await?;
         publish_task_schema(&fx).await?;
         create_entity(&fx, "e1").await?;
+        create_entity(&fx, "e2").await?;
         grant_collection_read(&fx, "alice").await?;
         let module = fx.module().await?;
         let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
@@ -1695,24 +2003,49 @@ mod tests {
         .await;
 
         let res = get_route!(&app, "/eav/sync/replica?chunk=0", &token).await;
-        let etag = res
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let head = res
             .headers()
-            .get(ETAG)
+            .get("X-Replica-Head")
             .and_then(|value| value.to_str().ok())
-            .expect("etag")
+            .expect("head header")
             .to_string();
+        assert!(
+            res.headers().get(ETAG).is_none(),
+            "replica read sets no ETag"
+        );
+
+        revoke_collection_read(&fx).await?;
+        grant_row_read(&fx, "alice", "e1").await?;
+
         let res = actix_test::call_service(
             &app,
             auth(
                 actix_test::TestRequest::get()
                     .uri("/eav/sync/replica?chunk=0")
-                    .insert_header((IF_NONE_MATCH, etag)),
+                    .insert_header((IF_NONE_MATCH, format!("\"{head}-0\""))),
                 &token,
             )
             .to_request(),
         )
         .await;
-        assert_eq!(res.status(), http::StatusCode::NOT_MODIFIED);
+        assert_eq!(res.status(), http::StatusCode::OK);
+        assert!(
+            res.headers().get(ETAG).is_none(),
+            "replica read sets no ETag"
+        );
+        assert_eq!(
+            res.headers()
+                .get("X-Replica-Head")
+                .and_then(|value| value.to_str().ok()),
+            Some(head.as_str())
+        );
+        let body: Value = actix_test::read_body_json(res).await;
+        let items = body["items"].as_array().expect("items");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["id"], "e1");
+        assert_eq!(body["chunk"], 0);
+        assert_eq!(body["chunks"], 1);
         Ok(())
     }
 
