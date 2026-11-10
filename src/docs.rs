@@ -96,6 +96,8 @@ use utoipa::OpenApi;
         crate::eav::sync::SyncEventsQuery,
         crate::eav::sync::SnapshotPage,
         crate::eav::sync::ReplicaBuildResponse,
+        crate::eav::sync::ReplicaChunkQuery,
+        crate::eav::sync::ReplicaChunkResponse,
         crate::eav::sync::ReplicaStatusResponse,
         crate::rules::rule::RuleDraft,
         crate::rules::rule::Rule,
@@ -209,6 +211,8 @@ mod tests {
             "SyncEventsQuery",
             "SnapshotPage",
             "ReplicaBuildResponse",
+            "ReplicaChunkQuery",
+            "ReplicaChunkResponse",
             "ReplicaStatusResponse",
         ] {
             assert!(schemas.contains_key(name), "spec missing {name}");
