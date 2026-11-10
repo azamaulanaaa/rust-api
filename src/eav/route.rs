@@ -121,6 +121,7 @@ impl ApiModule for EavApiModule {
             .service(crate::eav::sync::snapshot)
             .service(crate::eav::sync::build_replica)
             .service(crate::eav::sync::replica)
+            .service(crate::eav::sync::reset_replica)
             .service(crate::eav::sync::replica_status);
         cfg.service(scope);
     }
