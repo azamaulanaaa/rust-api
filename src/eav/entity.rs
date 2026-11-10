@@ -27,10 +27,11 @@
 //! The store returns an [`EntityChange`].
 //! A store with a change sink writes one [`EntityEvent`](crate::records::EntityEvent) to an outbox row.
 //! The outbox row commits in the same transaction as the entity rows.
+//! The write succeeds when the entity rows and the outbox row commit.
 //! The store then flushes the outbox to the feed.
-//! A failure after the commit is [`EntityError::Feed`].
-//! The data and the outbox row stay committed in that case.
-//! The caller can call [`EntityStore::flush_outbox`] again.
+//! A feed failure after the commit leaves the outbox row for the relay.
+//! The call still returns success.
+//! [`EntityStore::flush_outbox`] can deliver the row again.
 //! Delivery is at least once.
 //! A consumer must be idempotent.
 //!
@@ -201,6 +202,9 @@ pub struct RevalidationReport {
     pub compatible: usize,
     /// The entities that fail the target version.
     pub invalid: Vec<InvalidEntity>,
+    /// The id to resume after for the next page.
+    /// `None` means the pass is complete.
+    pub next: Option<String>,
 }
 
 /// The result of one schema migration.
@@ -216,6 +220,9 @@ pub struct MigrationReport {
     pub invalid: Vec<InvalidEntity>,
     /// True when the call wrote no key and no event.
     pub dry_run: bool,
+    /// The id to resume after for the next page.
+    /// `None` means the pass is complete.
+    pub next: Option<String>,
 }
 
 /// The counts from one atomic schema migration batch.
@@ -353,6 +360,9 @@ impl EntityStore {
     /// The metadata row, the attribute rows, and all index rows commit in
     /// one transaction.
     /// With a feed, one outbox row commits in the same transaction.
+    /// The write succeeds when the entity rows and the outbox row commit.
+    /// A feed failure after the commit leaves the outbox row for the relay.
+    /// The call still returns success.
     /// The first version is 1.
     pub async fn create(
         &self,
@@ -400,8 +410,11 @@ impl EntityStore {
             tx.commit().await.map_err(EntityError::Store)?;
             outbox.is_some()
         };
-        if pending {
-            self.flush_after_commit().await?;
+        if pending && let Err(error) = self.flush_after_commit().await {
+            tracing::warn!(
+                %error,
+                "entity outbox flush failed after commit; the relay will deliver the event"
+            );
         }
         Ok(EntityChange {
             before: None,
@@ -425,6 +438,9 @@ impl EntityStore {
     /// The call applies the schema defaults after the patch and checks every
     /// attribute.
     /// The version increases by one.
+    /// The write succeeds when the entity rows and the outbox row commit.
+    /// A feed failure after the commit leaves the outbox row for the relay.
+    /// The call still returns success.
     pub async fn update(
         &self,
         id: &str,
@@ -504,8 +520,11 @@ impl EntityStore {
                 outbox.is_some(),
             )
         };
-        if pending {
-            self.flush_after_commit().await?;
+        if pending && let Err(error) = self.flush_after_commit().await {
+            tracing::warn!(
+                %error,
+                "entity outbox flush failed after commit; the relay will deliver the event"
+            );
         }
         Ok(change)
     }
@@ -515,6 +534,9 @@ impl EntityStore {
     /// The expected version must match the stored version.
     /// A mismatch is a version conflict and changes nothing.
     /// The call removes the metadata row and every attribute and index row.
+    /// The write succeeds when the entity rows and the outbox row commit.
+    /// A feed failure after the commit leaves the outbox row for the relay.
+    /// The call still returns success.
     pub async fn delete(
         &self,
         id: &str,
@@ -557,8 +579,11 @@ impl EntityStore {
                 outbox.is_some(),
             )
         };
-        if pending {
-            self.flush_after_commit().await?;
+        if pending && let Err(error) = self.flush_after_commit().await {
+            tracing::warn!(
+                %error,
+                "entity outbox flush failed after commit; the relay will deliver the event"
+            );
         }
         Ok(change)
     }
@@ -611,13 +636,15 @@ impl EntityStore {
 
     /// Flushes the outbox after a commit.
     ///
-    /// A flush failure is a delivery error.
-    /// The data and the outbox row stay committed.
-    async fn flush_after_commit(&self) -> Result<(), EntityError> {
-        self.flush_outbox()
-            .await
-            .map(|_| ())
-            .map_err(|_| EntityError::Feed("entity feed append failed".to_string()))
+    /// The transaction already made the write durable, so this call is best
+    /// effort.
+    /// The call returns the number of delivered rows.
+    /// A feed or store failure returns an error.
+    /// The error does not cancel the write.
+    /// The outbox row stays committed for [`EntityStore::flush_outbox`].
+    /// The relay delivers that row later.
+    async fn flush_after_commit(&self) -> Result<usize, EntityError> {
+        self.flush_outbox().await
     }
 
     /// Builds an outbox row when a feed is configured.
@@ -721,17 +748,76 @@ impl EntityStore {
         Ok(entities)
     }
 
+    /// Lists one page of the entities that pin `schema_id` or an inherited schema.
+    ///
+    /// The result is sorted by entity id.
+    /// The scan starts after the `after` id when the caller gives a cursor.
+    /// The call returns the entities and the cursor for the next page.
+    /// The cursor is the last id of a full page.
+    /// The cursor is `None` when the scan is exhausted.
+    /// A `limit` of 0 returns an empty list and no cursor.
+    pub async fn list_by_schema_after(
+        &self,
+        schema_id: &str,
+        limit: usize,
+        after: Option<&str>,
+    ) -> Result<(Vec<Entity>, Option<String>), EntityError> {
+        validate_name("schema id", schema_id)?;
+        if limit == 0 {
+            return Ok((Vec::new(), None));
+        }
+        let g = self.store.read().await;
+        let prefix = format!("{SCHEMA_INDEX_PREFIX}{schema_id}:");
+        let start = match after {
+            Some(cursor) => {
+                validate_name("entity id", cursor)?;
+                format!("{prefix}{cursor}\0")
+            }
+            None => prefix.clone(),
+        };
+        let max = u32::try_from(limit).ok();
+        let cursor = (Some(start), Some(prefix_scan_end(&prefix)));
+        let markers = g
+            .gets_bytes(max, Direction::Next, cursor)
+            .await
+            .map_err(EntityError::Store)?;
+        let full = markers.len() == limit;
+        let mut ids = Vec::new();
+        let mut seen = BTreeSet::new();
+        for marker in markers {
+            let Some(id) = marker.key.strip_prefix(&prefix) else {
+                continue;
+            };
+            if id.is_empty() || id.contains(':') || !seen.insert(id.to_string()) {
+                continue;
+            }
+            ids.push(id.to_string());
+        }
+        ids.sort();
+        let next = if full { ids.last().cloned() } else { None };
+        let mut entities = Vec::with_capacity(limit.min(ids.len()));
+        for id in &ids {
+            if let Some(entity) = load_entity(&*g, id).await? {
+                entities.push(entity);
+            }
+        }
+        Ok((entities, next))
+    }
+
     /// Checks stored entities against a target schema version.
     ///
     /// The call reads at most `limit` entities that pin `schema_id`.
+    /// The scan starts after the `after` id when the caller gives a cursor.
     /// It changes no key, no entity version, and no pinned schema.
     /// It records one issue for each invalid entity.
+    /// The report holds the cursor for the next page.
     /// A missing target version is [`EntityError::UnknownSchema`].
     pub async fn revalidation_report(
         &self,
         schema_id: &str,
         target_version: u64,
         limit: usize,
+        after: Option<&str>,
     ) -> Result<RevalidationReport, EntityError> {
         validate_name("schema id", schema_id)?;
         if self
@@ -744,11 +830,12 @@ impl EntityStore {
             return Err(EntityError::UnknownSchema(schema_id.to_string()));
         }
 
-        let entities = self.list_by_schema_page(schema_id, limit, 0).await?;
+        let (entities, next) = self.list_by_schema_after(schema_id, limit, after).await?;
         let mut report = RevalidationReport {
             scanned: 0,
             compatible: 0,
             invalid: Vec::new(),
+            next,
         };
         for entity in entities {
             if !entity.schemas.iter().any(|schema| schema.id == schema_id) {
@@ -772,6 +859,7 @@ impl EntityStore {
     /// Applies one target schema version to compatible entities.
     ///
     /// The call reads at most `limit` entities that pin `schema_id`.
+    /// The scan starts after the `after` id when the caller gives a cursor.
     /// It checks each entity with the target version.
     /// An invalid entity stays unchanged and goes into `invalid`.
     /// A valid entity that already pins `target_version` counts as unchanged.
@@ -781,12 +869,14 @@ impl EntityStore {
     /// A stale entity version aborts the batch with no write.
     /// A store error aborts the batch with no write.
     /// A missing target version is [`EntityError::UnknownSchema`].
+    /// The report holds the cursor for the next page.
     /// A `limit` of 0 returns an empty report.
     pub async fn migrate_schema(
         &self,
         schema_id: &str,
         target_version: u64,
         limit: usize,
+        after: Option<&str>,
         dry_run: bool,
         ctx: &WriteContext,
     ) -> Result<MigrationReport, EntityError> {
@@ -807,12 +897,14 @@ impl EntityStore {
             unchanged: 0,
             invalid: Vec::new(),
             dry_run,
+            next: None,
         };
         if limit == 0 {
             return Ok(report);
         }
 
-        let entities = self.list_by_schema_page(schema_id, limit, 0).await?;
+        let (entities, next) = self.list_by_schema_after(schema_id, limit, after).await?;
+        report.next = next;
         if dry_run {
             for entity in entities {
                 if !entity.schemas.iter().any(|schema| schema.id == schema_id) {
@@ -863,6 +955,7 @@ impl EntityStore {
     /// It builds every after entity and every outbox row in memory.
     /// One transaction writes every row, or it writes no row.
     /// The call flushes the outbox one time after the commit.
+    /// A feed failure after the commit leaves the outbox rows for the relay.
     async fn apply_schema_migration_batch(
         &self,
         entities: &[Entity],
@@ -964,8 +1057,11 @@ impl EntityStore {
             }
             tx.commit().await.map_err(EntityError::Store)?;
         }
-        if pending {
-            self.flush_after_commit().await?;
+        if pending && let Err(error) = self.flush_after_commit().await {
+            tracing::warn!(
+                %error,
+                "entity outbox flush failed after commit; the relay will deliver the event"
+            );
         }
         Ok(result)
     }
@@ -1183,6 +1279,12 @@ impl EntityStore {
 
     /// Writes a timer marker for one entity, key, and due value.
     ///
+    /// The call takes the write lock and then the store write guard.
+    /// It reloads the entity inside the lock.
+    /// It writes the marker only when the entity exists and its current value
+    /// for `key` is [`AttributeValue::Timestamp`] with `due_at`.
+    /// The call returns `true` when it writes the marker.
+    /// It returns `false` when the entity is absent or the value differs.
     /// The value is the current Unix time as JSON.
     /// The call is idempotent.
     pub async fn mark_timer_fired(
@@ -1190,13 +1292,20 @@ impl EntityStore {
         entity_id: &str,
         key: &str,
         due_at: i64,
-    ) -> Result<(), EntityError> {
+    ) -> Result<bool, EntityError> {
         let now = chrono::Utc::now().timestamp();
         let bytes = serde_json::to_vec(&now).map_err(|e| EntityError::Internal(e.to_string()))?;
+        let _write = self.write_lock.lock().await;
         let g = self.store.write().await;
+        let Some(entity) = load_entity(&*g, entity_id).await? else {
+            return Ok(false);
+        };
+        if entity.attributes.get(key) != Some(&AttributeValue::Timestamp(due_at)) {
+            return Ok(false);
+        }
         g.set_bytes(&timer_marker_key(entity_id, key, due_at), &bytes)
             .await
-            .map(|_| ())
+            .map(|_| true)
             .map_err(EntityError::Store)
     }
 
@@ -2234,6 +2343,32 @@ mod tests {
         WriteContext::new("tester")
     }
 
+    /// Builds a store with one `task` schema that has a timestamp `due`
+    /// and a string `title`.
+    async fn timer_store() -> (EntityStore, OxKvStore) {
+        let (store, registry, raw) = new_store().await;
+        registry
+            .publish(schema(
+                "task",
+                &[],
+                vec![
+                    full_attr("due", AttributeType::Timestamp, false, true, false, None),
+                    attr("title", AttributeType::String),
+                ],
+            ))
+            .await
+            .unwrap();
+        (store, raw)
+    }
+
+    /// Creates one `task` entity with a `due` value.
+    async fn create_task(store: &EntityStore, id: &str, due: i64) {
+        store
+            .create(draft(id, &["task"], vec![("due", t(due))]), &ctx())
+            .await
+            .unwrap();
+    }
+
     async fn all_keys(store: &OxKvStore) -> Vec<String> {
         store
             .gets_bytes(None, Direction::Next, (None, None))
@@ -2258,23 +2393,30 @@ mod tests {
 
     /// A [`ChangeSink`] test double that records every operation.
     ///
-    /// The `failing` switch makes every append fail.
+    /// `fail_next` makes a given number of appends fail.
     struct RecordingFeed {
         ops: std::sync::Mutex<Vec<WalOp>>,
-        failing: std::sync::atomic::AtomicBool,
+        failures: std::sync::atomic::AtomicUsize,
     }
 
     impl RecordingFeed {
         fn new() -> Self {
             Self {
                 ops: std::sync::Mutex::new(Vec::new()),
-                failing: std::sync::atomic::AtomicBool::new(false),
+                failures: std::sync::atomic::AtomicUsize::new(0),
             }
         }
 
         fn set_failing(&self, failing: bool) {
-            self.failing
-                .store(failing, std::sync::atomic::Ordering::SeqCst);
+            self.failures.store(
+                if failing { usize::MAX } else { 0 },
+                std::sync::atomic::Ordering::SeqCst,
+            );
+        }
+
+        fn fail_next(&self, count: usize) {
+            self.failures
+                .store(count, std::sync::atomic::Ordering::SeqCst);
         }
 
         fn ops(&self) -> Vec<WalOp> {
@@ -2295,7 +2437,10 @@ mod tests {
     #[async_trait::async_trait]
     impl ChangeSink for RecordingFeed {
         async fn append(&self, op: WalOp) -> anyhow::Result<()> {
-            if self.failing.load(std::sync::atomic::Ordering::SeqCst) {
+            let remaining = self.failures.load(std::sync::atomic::Ordering::SeqCst);
+            if remaining > 0 {
+                self.failures
+                    .store(remaining - 1, std::sync::atomic::Ordering::SeqCst);
                 return Err(anyhow::anyhow!("feed down"));
             }
             self.ops.lock().unwrap().push(op);
@@ -2875,6 +3020,60 @@ mod tests {
         let page = store.list_by_schema_page("task", 0, 0).await.unwrap();
 
         assert!(page.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_by_schema_after_skips_exactly_the_cursor() {
+        let (store, registry, _raw) = new_store().await;
+        registry.publish(schema("task", &[], vec![])).await.unwrap();
+        for id in ["a", "ab", "b"] {
+            store
+                .create(draft(id, &["task"], vec![]), &ctx())
+                .await
+                .unwrap();
+        }
+
+        let (page, next) = store
+            .list_by_schema_after("task", 2, Some("a"))
+            .await
+            .unwrap();
+        let ids: Vec<&str> = page.iter().map(|entity| entity.id.as_str()).collect();
+
+        assert_eq!(ids, vec!["ab", "b"]);
+        assert_eq!(next.as_deref(), Some("b"));
+    }
+
+    #[tokio::test]
+    async fn list_by_schema_after_returns_no_cursor_for_a_partial_page() {
+        let (store, registry, _raw) = new_store().await;
+        registry.publish(schema("task", &[], vec![])).await.unwrap();
+        for id in ["a", "b", "c"] {
+            store
+                .create(draft(id, &["task"], vec![]), &ctx())
+                .await
+                .unwrap();
+        }
+
+        let (page, next) = store.list_by_schema_after("task", 5, None).await.unwrap();
+        let ids: Vec<&str> = page.iter().map(|entity| entity.id.as_str()).collect();
+
+        assert_eq!(ids, vec!["a", "b", "c"]);
+        assert_eq!(next, None);
+    }
+
+    #[tokio::test]
+    async fn list_by_schema_after_with_limit_zero_is_empty() {
+        let (store, registry, _raw) = new_store().await;
+        registry.publish(schema("task", &[], vec![])).await.unwrap();
+        store
+            .create(draft("a", &["task"], vec![]), &ctx())
+            .await
+            .unwrap();
+
+        let (page, next) = store.list_by_schema_after("task", 0, None).await.unwrap();
+
+        assert!(page.is_empty());
+        assert_eq!(next, None);
     }
 
     #[tokio::test]
@@ -3554,29 +3753,140 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_failed_append_keeps_the_entity_and_the_outbox_row() {
+    async fn a_create_succeeds_when_the_feed_append_fails() {
         let (store, registry, raw) = new_store().await;
         registry
             .publish(schema("person", &[], vec![]))
             .await
             .unwrap();
         let feed = Arc::new(RecordingFeed::new());
-        feed.set_failing(true);
         let store = store.with_change_sink(feed.clone());
 
-        let result = store.create(draft("e1", &["person"], vec![]), &ctx()).await;
+        feed.fail_next(1);
+        let change = store
+            .create(draft("e1", &["person"], vec![]), &ctx())
+            .await
+            .unwrap();
 
-        assert!(matches!(result, Err(EntityError::Feed(_))));
+        assert!(change.after.is_some());
         assert!(store.get("e1").await.unwrap().is_some());
+        assert_eq!(store.outbox_count().await.unwrap(), 1);
         assert_eq!(outbox_keys(&raw).await.len(), 1);
 
-        feed.set_failing(false);
         assert_eq!(store.flush_outbox().await.unwrap(), 1);
         assert!(store.get("e1").await.unwrap().is_some());
-        assert!(outbox_keys(&raw).await.is_empty());
+        assert_eq!(store.outbox_count().await.unwrap(), 0);
         let events = feed.events();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].entity_id, "e1");
+    }
+
+    #[tokio::test]
+    async fn an_update_succeeds_when_the_feed_append_fails() {
+        let (store, registry, _raw) = new_store().await;
+        registry
+            .publish(schema(
+                "person",
+                &[],
+                vec![attr("age", AttributeType::Integer)],
+            ))
+            .await
+            .unwrap();
+        let feed = Arc::new(RecordingFeed::new());
+        let store = store.with_change_sink(feed.clone());
+        store
+            .create(draft("e1", &["person"], vec![("age", i(30))]), &ctx())
+            .await
+            .unwrap();
+        assert_eq!(store.outbox_count().await.unwrap(), 0);
+
+        feed.fail_next(1);
+        let change = store
+            .update("e1", 1, patch(vec![("age", Some(i(31)))]), &ctx())
+            .await
+            .unwrap();
+
+        assert_eq!(change.after.unwrap().version, 2);
+        assert_eq!(
+            store.get("e1").await.unwrap().unwrap().attributes["age"],
+            i(31)
+        );
+        assert_eq!(store.outbox_count().await.unwrap(), 1);
+
+        assert_eq!(store.flush_outbox().await.unwrap(), 1);
+        assert_eq!(store.outbox_count().await.unwrap(), 0);
+        assert_eq!(feed.events().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_delete_succeeds_when_the_feed_append_fails() {
+        let (store, registry, _raw) = new_store().await;
+        registry
+            .publish(schema("person", &[], vec![]))
+            .await
+            .unwrap();
+        let feed = Arc::new(RecordingFeed::new());
+        let store = store.with_change_sink(feed.clone());
+        store
+            .create(draft("e1", &["person"], vec![]), &ctx())
+            .await
+            .unwrap();
+        assert_eq!(store.outbox_count().await.unwrap(), 0);
+
+        feed.fail_next(1);
+        let change = store.delete("e1", 1, &ctx()).await.unwrap();
+
+        assert_eq!(change.after, None);
+        assert!(store.get("e1").await.unwrap().is_none());
+        assert_eq!(store.outbox_count().await.unwrap(), 1);
+
+        assert_eq!(store.flush_outbox().await.unwrap(), 1);
+        assert_eq!(store.outbox_count().await.unwrap(), 0);
+        assert_eq!(feed.events().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_later_flush_delivers_a_pending_row() {
+        let (store, registry, _raw) = new_store().await;
+        registry
+            .publish(schema("person", &[], vec![]))
+            .await
+            .unwrap();
+        let feed = Arc::new(RecordingFeed::new());
+        let store = store.with_change_sink(feed.clone());
+
+        feed.fail_next(1);
+        store
+            .create(draft("e1", &["person"], vec![]), &ctx())
+            .await
+            .unwrap();
+        assert_eq!(store.outbox_count().await.unwrap(), 1);
+        assert!(feed.events().is_empty());
+
+        assert_eq!(store.flush_outbox().await.unwrap(), 1);
+        assert_eq!(store.outbox_count().await.unwrap(), 0);
+        let events = feed.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].entity_id, "e1");
+    }
+
+    #[tokio::test]
+    async fn a_successful_write_flushes_immediately() {
+        let (store, registry, _raw) = new_store().await;
+        registry
+            .publish(schema("person", &[], vec![]))
+            .await
+            .unwrap();
+        let feed = Arc::new(RecordingFeed::new());
+        let store = store.with_change_sink(feed.clone());
+
+        store
+            .create(draft("e1", &["person"], vec![]), &ctx())
+            .await
+            .unwrap();
+
+        assert_eq!(store.outbox_count().await.unwrap(), 0);
+        assert_eq!(feed.events().len(), 1);
     }
 
     #[tokio::test]
@@ -3608,8 +3918,10 @@ mod tests {
         let store = store.with_change_sink(feed.clone());
 
         for id in ["e1", "e2", "e3"] {
-            let result = store.create(draft(id, &["person"], vec![]), &ctx()).await;
-            assert!(matches!(result, Err(EntityError::Feed(_))));
+            store
+                .create(draft(id, &["person"], vec![]), &ctx())
+                .await
+                .unwrap();
         }
         assert_eq!(store.outbox_count().await.unwrap(), 3);
 
@@ -3630,8 +3942,10 @@ mod tests {
         let store = store.with_change_sink(feed.clone());
 
         for id in ["e1", "e2", "e3"] {
-            let result = store.create(draft(id, &["person"], vec![]), &ctx()).await;
-            assert!(matches!(result, Err(EntityError::Feed(_))));
+            store
+                .create(draft(id, &["person"], vec![]), &ctx())
+                .await
+                .unwrap();
         }
         let mut keys = outbox_keys(&raw).await;
         keys.sort();
@@ -3917,12 +4231,13 @@ mod tests {
 
     #[tokio::test]
     async fn a_timer_marker_is_idempotent() {
-        let (store, _registry, raw) = new_store().await;
+        let (store, raw) = timer_store().await;
+        create_task(&store, "e1", 100).await;
 
         assert!(!store.is_timer_fired("e1", "due", 100).await.unwrap());
-        store.mark_timer_fired("e1", "due", 100).await.unwrap();
+        assert!(store.mark_timer_fired("e1", "due", 100).await.unwrap());
         assert!(store.is_timer_fired("e1", "due", 100).await.unwrap());
-        store.mark_timer_fired("e1", "due", 100).await.unwrap();
+        assert!(store.mark_timer_fired("e1", "due", 100).await.unwrap());
         assert!(store.is_timer_fired("e1", "due", 100).await.unwrap());
 
         let bytes = raw
@@ -3932,6 +4247,68 @@ mod tests {
             .unwrap();
         let fired_at: i64 = serde_json::from_slice(&bytes).unwrap();
         assert!(fired_at > 0);
+    }
+
+    #[tokio::test]
+    async fn a_timer_marker_is_written_for_the_current_value() {
+        let (store, _raw) = timer_store().await;
+        create_task(&store, "e1", 100).await;
+
+        assert!(store.mark_timer_fired("e1", "due", 100).await.unwrap());
+        assert!(store.is_timer_fired("e1", "due", 100).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_timer_marker_for_an_old_value_is_not_written() {
+        let (store, _raw) = timer_store().await;
+        create_task(&store, "e1", 100).await;
+        assert!(store.mark_timer_fired("e1", "due", 100).await.unwrap());
+
+        store
+            .update("e1", 1, patch(vec![("due", Some(t(200)))]), &ctx())
+            .await
+            .unwrap();
+
+        assert!(!store.mark_timer_fired("e1", "due", 100).await.unwrap());
+        assert!(!store.is_timer_fired("e1", "due", 100).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_timer_fires_again_after_the_value_returns() {
+        let (store, _raw) = timer_store().await;
+        create_task(&store, "e1", 100).await;
+        assert!(store.mark_timer_fired("e1", "due", 100).await.unwrap());
+        store
+            .update("e1", 1, patch(vec![("due", Some(t(200)))]), &ctx())
+            .await
+            .unwrap();
+        assert!(!store.mark_timer_fired("e1", "due", 100).await.unwrap());
+        store
+            .update("e1", 2, patch(vec![("due", Some(t(100)))]), &ctx())
+            .await
+            .unwrap();
+
+        assert!(!store.is_timer_fired("e1", "due", 100).await.unwrap());
+        assert!(store.mark_timer_fired("e1", "due", 100).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_timer_marker_for_a_deleted_entity_is_not_written() {
+        let (store, _raw) = timer_store().await;
+        create_task(&store, "e1", 100).await;
+        store.delete("e1", 1, &ctx()).await.unwrap();
+
+        assert!(!store.mark_timer_fired("e1", "due", 100).await.unwrap());
+        assert!(!store.is_timer_fired("e1", "due", 100).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_timer_marker_for_a_value_the_entity_never_had_is_not_written() {
+        let (store, _raw) = timer_store().await;
+        create_task(&store, "e1", 100).await;
+
+        assert!(!store.mark_timer_fired("e1", "due", 999).await.unwrap());
+        assert!(!store.is_timer_fired("e1", "due", 999).await.unwrap());
     }
 
     #[tokio::test]
@@ -4007,7 +4384,10 @@ mod tests {
             .await
             .unwrap();
 
-        let report = store.revalidation_report("task", 2, 100).await.unwrap();
+        let report = store
+            .revalidation_report("task", 2, 100, None)
+            .await
+            .unwrap();
 
         assert_eq!(report.scanned, 1);
         assert_eq!(report.compatible, 1);
@@ -4042,7 +4422,10 @@ mod tests {
             .await
             .unwrap();
 
-        let report = store.revalidation_report("task", 2, 100).await.unwrap();
+        let report = store
+            .revalidation_report("task", 2, 100, None)
+            .await
+            .unwrap();
 
         assert_eq!(report.scanned, 1);
         assert_eq!(report.compatible, 0);
@@ -4078,7 +4461,10 @@ mod tests {
             .await
             .unwrap();
 
-        let report = store.revalidation_report("task", 2, 100).await.unwrap();
+        let report = store
+            .revalidation_report("task", 2, 100, None)
+            .await
+            .unwrap();
 
         assert_eq!(report.compatible, 0);
         assert_eq!(
@@ -4104,7 +4490,10 @@ mod tests {
             .unwrap();
         registry.publish(schema("task", &[], vec![])).await.unwrap();
 
-        let report = store.revalidation_report("task", 2, 100).await.unwrap();
+        let report = store
+            .revalidation_report("task", 2, 100, None)
+            .await
+            .unwrap();
 
         assert_eq!(report.compatible, 0);
         assert_eq!(
@@ -4118,7 +4507,7 @@ mod tests {
         let (store, registry, _raw) = new_store().await;
         registry.publish(schema("task", &[], vec![])).await.unwrap();
 
-        let result = store.revalidation_report("task", 2, 100).await;
+        let result = store.revalidation_report("task", 2, 100, None).await;
 
         assert!(matches!(result, Err(EntityError::UnknownSchema(id)) if id == "task"));
     }
@@ -4153,7 +4542,7 @@ mod tests {
             .unwrap();
 
         let report = store
-            .migrate_schema("task", 2, 100, true, &ctx())
+            .migrate_schema("task", 2, 100, None, true, &ctx())
             .await
             .unwrap();
 
@@ -4198,7 +4587,7 @@ mod tests {
             .with_causation("evt-0", 1);
 
         let report = store
-            .migrate_schema("task", 2, 100, false, &write_ctx)
+            .migrate_schema("task", 2, 100, None, false, &write_ctx)
             .await
             .unwrap();
 
@@ -4266,7 +4655,7 @@ mod tests {
             .unwrap();
 
         let report = store
-            .migrate_schema("task", 2, 100, false, &ctx())
+            .migrate_schema("task", 2, 100, None, false, &ctx())
             .await
             .unwrap();
 
@@ -4298,7 +4687,7 @@ mod tests {
             .unwrap();
 
         let report = store
-            .migrate_schema("task", 1, 100, false, &ctx())
+            .migrate_schema("task", 1, 100, None, false, &ctx())
             .await
             .unwrap();
 
@@ -4328,14 +4717,15 @@ mod tests {
             .unwrap();
 
         let limited = store
-            .migrate_schema("task", 2, 2, true, &ctx())
+            .migrate_schema("task", 2, 2, None, true, &ctx())
             .await
             .unwrap();
         assert_eq!(limited.scanned, 2);
         assert_eq!(limited.migrated, 2);
+        assert_eq!(limited.next.as_deref(), Some("b"));
 
         let empty = store
-            .migrate_schema("task", 2, 0, true, &ctx())
+            .migrate_schema("task", 2, 0, None, true, &ctx())
             .await
             .unwrap();
         assert_eq!(empty.scanned, 0);
@@ -4343,6 +4733,129 @@ mod tests {
         assert_eq!(empty.unchanged, 0);
         assert!(empty.invalid.is_empty());
         assert!(empty.dry_run);
+        assert_eq!(empty.next, None);
+    }
+
+    #[tokio::test]
+    async fn a_migration_pages_through_every_entity_by_cursor() {
+        let (store, registry, _raw) = new_store().await;
+        registry.publish(schema("task", &[], vec![])).await.unwrap();
+        for id in ["a", "b", "c", "d", "e"] {
+            store
+                .create(draft(id, &["task"], vec![]), &ctx())
+                .await
+                .unwrap();
+        }
+        registry
+            .publish(schema(
+                "task",
+                &[],
+                vec![attr("title", AttributeType::String)],
+            ))
+            .await
+            .unwrap();
+
+        let mut after = None;
+        let mut migrated = 0;
+        let mut pages = 0;
+        loop {
+            let report = store
+                .migrate_schema("task", 2, 2, after.as_deref(), false, &ctx())
+                .await
+                .unwrap();
+            migrated += report.migrated;
+            after = report.next;
+            pages += 1;
+            assert!(pages <= 10, "the cursor loop did not terminate");
+            if after.is_none() {
+                break;
+            }
+        }
+
+        assert_eq!(migrated, 5);
+        assert_eq!(pages, 3);
+        for id in ["a", "b", "c", "d", "e"] {
+            let entity = store.get(id).await.unwrap().unwrap();
+            assert_eq!(entity.version, 2);
+            assert_eq!(
+                entity.schemas,
+                vec![SchemaRef {
+                    id: "task".to_string(),
+                    version: 2,
+                }]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_migration_that_reads_a_partial_page_returns_no_cursor() {
+        let (store, registry, _raw) = new_store().await;
+        registry.publish(schema("task", &[], vec![])).await.unwrap();
+        for id in ["a", "b", "c"] {
+            store
+                .create(draft(id, &["task"], vec![]), &ctx())
+                .await
+                .unwrap();
+        }
+        registry
+            .publish(schema(
+                "task",
+                &[],
+                vec![attr("title", AttributeType::String)],
+            ))
+            .await
+            .unwrap();
+
+        let report = store
+            .migrate_schema("task", 2, 5, None, true, &ctx())
+            .await
+            .unwrap();
+
+        assert_eq!(report.scanned, 3);
+        assert_eq!(report.next, None);
+    }
+
+    #[tokio::test]
+    async fn a_revalidation_pages_through_every_entity_by_cursor() {
+        let (store, registry, _raw) = new_store().await;
+        registry.publish(schema("task", &[], vec![])).await.unwrap();
+        for id in ["a", "b", "c", "d", "e"] {
+            store
+                .create(draft(id, &["task"], vec![]), &ctx())
+                .await
+                .unwrap();
+        }
+        registry
+            .publish(schema(
+                "task",
+                &[],
+                vec![attr("title", AttributeType::String)],
+            ))
+            .await
+            .unwrap();
+
+        let mut after = None;
+        let mut scanned = 0;
+        let mut compatible = 0;
+        let mut pages = 0;
+        loop {
+            let report = store
+                .revalidation_report("task", 2, 2, after.as_deref())
+                .await
+                .unwrap();
+            scanned += report.scanned;
+            compatible += report.compatible;
+            after = report.next;
+            pages += 1;
+            assert!(pages <= 10, "the cursor loop did not terminate");
+            if after.is_none() {
+                break;
+            }
+        }
+
+        assert_eq!(scanned, 5);
+        assert_eq!(compatible, 5);
+        assert_eq!(pages, 3);
     }
 
     #[tokio::test]
@@ -4350,7 +4863,9 @@ mod tests {
         let (store, registry, _raw) = new_store().await;
         registry.publish(schema("task", &[], vec![])).await.unwrap();
 
-        let result = store.migrate_schema("task", 2, 100, true, &ctx()).await;
+        let result = store
+            .migrate_schema("task", 2, 100, None, true, &ctx())
+            .await;
 
         assert!(matches!(result, Err(EntityError::UnknownSchema(id)) if id == "task"));
     }
@@ -4430,7 +4945,7 @@ mod tests {
         let store = store.with_change_sink(feed.clone());
 
         let report = store
-            .migrate_schema("task", 2, 100, false, &ctx())
+            .migrate_schema("task", 2, 100, None, false, &ctx())
             .await
             .unwrap();
 
@@ -4517,7 +5032,7 @@ mod tests {
         let store = store.with_change_sink(feed.clone());
 
         let report = store
-            .migrate_schema("task", 2, 100, false, &ctx())
+            .migrate_schema("task", 2, 100, None, false, &ctx())
             .await
             .unwrap();
 
@@ -4574,7 +5089,7 @@ mod tests {
         let store = store.with_change_sink(feed.clone());
 
         let report = store
-            .migrate_schema("task", 2, 100, true, &ctx())
+            .migrate_schema("task", 2, 100, None, true, &ctx())
             .await
             .unwrap();
 
@@ -4692,7 +5207,9 @@ mod tests {
         let store = store.with_change_sink(feed.clone());
         raw.add_validator(RejectMetaKey(meta_key("e2")));
 
-        let result = store.migrate_schema("task", 2, 100, false, &ctx()).await;
+        let result = store
+            .migrate_schema("task", 2, 100, None, false, &ctx())
+            .await;
 
         assert!(matches!(result, Err(EntityError::Store(_))));
         for id in ["e1", "e2"] {
