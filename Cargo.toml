@@ -74,8 +74,13 @@ clap = { version = "4.5", features = ["derive"] }
 thiserror = "2.0"
 
 [dev-dependencies]
+criterion = { version = "0.5", features = ["async_tokio"] }
 rsa = "0.9"
 wiremock = "0.6"
+
+[[bench]]
+name = "eav"
+harness = false
 
 # Enforce rustdoc on every public item across all targets (lib + bin).
 [lints.rust]
