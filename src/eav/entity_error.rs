@@ -45,6 +45,16 @@ pub enum EntityError {
     /// The entity does not exist.
     #[error("entity not found: {0}")]
     NotFound(String),
+    /// A replica build is older than the stored replica.
+    ///
+    /// The stored head and data stay unchanged.
+    #[error("stale replica head: stored {stored}, incoming {incoming}")]
+    StaleHead {
+        /// The head of the stored replica.
+        stored: u64,
+        /// The head of the rejected build.
+        incoming: u64,
+    },
     /// Data could not be encoded or decoded.
     #[error("entity serialization failed")]
     Internal(String),
