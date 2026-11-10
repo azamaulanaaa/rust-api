@@ -7,6 +7,14 @@
 //! A version key holds one [`SchemaDef`](crate::eav::schema::SchemaDef) as JSON.
 //! A child key is an empty marker.
 //! All scans stop at the `schema;` bound, so a scan reads only this family.
+//!
+//! A [`SchemaRegistry`](crate::eav::schema::SchemaRegistry) also caches every
+//! effective schema that
+//! [`SchemaRegistry::effective`](crate::eav::schema::SchemaRegistry::effective)
+//! builds. The cache is per registry instance,
+//! and a clone of the registry shares that cache.
+//! Schema versions are immutable, so a cache entry never changes and no code
+//! invalidates it. A new schema version gets a new cache key.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -157,6 +165,10 @@ pub struct SchemaRegistry {
     store: Arc<RwLock<OxKvStore>>,
     /// Serializes publishes, so two callers cannot claim one version.
     publish_lock: Arc<Mutex<()>>,
+    /// Effective schemas keyed by exact schema id and version.
+    ///
+    /// An entry is immutable, because a schema version is immutable.
+    cache: Arc<RwLock<HashMap<(String, u64), EffectiveSchema>>>,
 }
 
 impl SchemaRegistry {
@@ -165,6 +177,7 @@ impl SchemaRegistry {
         Self {
             store: Arc::new(RwLock::new(store)),
             publish_lock: Arc::new(Mutex::new(())),
+            cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -331,17 +344,33 @@ impl SchemaRegistry {
     /// The call returns `None` when the version does not exist.
     /// A child attribute overrides an inherited attribute with the same type.
     /// A different type is a type conflict.
+    ///
+    /// The result is cached under the exact schema id and version.
+    /// A cache hit returns a clone of the stored result without a store read.
+    /// A cache entry is immutable, because a schema version is immutable.
+    /// The cache belongs to this registry instance, and a clone of the
+    /// registry shares the same cache.
     pub async fn effective(
         &self,
         id: &str,
         version: u64,
     ) -> Result<Option<EffectiveSchema>, SchemaError> {
         validate_name("schema id", id)?;
+        let key = (id.to_string(), version);
+        let cached = self.cache.read().await.get(&key).cloned();
+        if let Some(cached) = cached {
+            return Ok(Some(cached));
+        }
+
         let g = self.store.read().await;
         let Some(root) = load_version(&*g, id, version).await? else {
             return Ok(None);
         };
-        Ok(Some(flatten(&*g, &root).await?))
+        let effective = flatten(&*g, &root).await?;
+        drop(g);
+
+        self.cache.write().await.insert(key, effective.clone());
+        Ok(Some(effective))
     }
 
     /// Compares two effective schema versions.
@@ -1374,5 +1403,139 @@ mod tests {
         assert!(reg.diff("user", 1, 2).await.unwrap().is_none());
         assert!(reg.diff("user", 0, 1).await.unwrap().is_none());
         assert!(reg.diff("ghost", 1, 2).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn effective_returns_equal_results_for_the_same_version() {
+        let reg = new_registry().await;
+        reg.publish(draft(
+            "user",
+            &[],
+            vec![attr("email", AttributeType::String)],
+        ))
+        .await
+        .unwrap();
+
+        let first = reg.effective("user", 1).await.unwrap();
+        let second = reg.effective("user", 1).await.unwrap();
+
+        assert_eq!(first, second);
+        assert!(first.is_some());
+        assert_eq!(reg.cache.read().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn effective_keeps_versions_isolated_after_a_publish() {
+        let reg = new_registry().await;
+        reg.publish(draft(
+            "user",
+            &[],
+            vec![attr("email", AttributeType::String)],
+        ))
+        .await
+        .unwrap();
+
+        let v1_before = reg.effective("user", 1).await.unwrap().unwrap();
+        assert_eq!(v1_before.attributes.len(), 1);
+
+        reg.publish(draft(
+            "user",
+            &[],
+            vec![
+                attr("email", AttributeType::String),
+                attr("age", AttributeType::Integer),
+            ],
+        ))
+        .await
+        .unwrap();
+
+        let v1_after = reg.effective("user", 1).await.unwrap().unwrap();
+        let v2 = reg.effective("user", 2).await.unwrap().unwrap();
+
+        assert_eq!(v1_after, v1_before);
+        assert_eq!(v1_after.attributes.len(), 1);
+        assert!(!v1_after.attributes.contains_key("age"));
+        assert_eq!(v2.attributes.len(), 2);
+        assert!(v2.attributes.contains_key("age"));
+    }
+
+    #[tokio::test]
+    async fn child_effective_result_is_cached_independently_from_the_parent() {
+        let reg = new_registry().await;
+        reg.publish(draft(
+            "base",
+            &[],
+            vec![attr("base_only", AttributeType::String)],
+        ))
+        .await
+        .unwrap();
+        reg.publish(draft(
+            "child",
+            &["base"],
+            vec![attr("child_only", AttributeType::String)],
+        ))
+        .await
+        .unwrap();
+
+        let parent = reg.effective("base", 1).await.unwrap().unwrap();
+        let child = reg.effective("child", 1).await.unwrap().unwrap();
+
+        assert!(parent.attributes.contains_key("base_only"));
+        assert!(!parent.attributes.contains_key("child_only"));
+        assert!(child.attributes.contains_key("base_only"));
+        assert!(child.attributes.contains_key("child_only"));
+
+        let cache = reg.cache.read().await;
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.get(&("base".to_string(), 1)), Some(&parent));
+        assert_eq!(cache.get(&("child".to_string(), 1)), Some(&child));
+    }
+
+    #[tokio::test]
+    async fn effective_returns_none_for_a_missing_version_and_caches_nothing() {
+        let reg = new_registry().await;
+        reg.publish(draft("user", &[], vec![])).await.unwrap();
+
+        assert!(reg.effective("user", 2).await.unwrap().is_none());
+        assert!(reg.effective("ghost", 1).await.unwrap().is_none());
+        assert!(reg.cache.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn effective_returns_a_cached_entry_before_it_reads_the_store() {
+        let reg = new_registry().await;
+        let sentinel = EffectiveSchema {
+            id: "ghost".to_string(),
+            version: 7,
+            ancestors: Vec::new(),
+            attributes: BTreeMap::new(),
+        };
+        reg.cache
+            .write()
+            .await
+            .insert(("ghost".to_string(), 7), sentinel.clone());
+
+        assert_eq!(reg.effective("ghost", 7).await.unwrap(), Some(sentinel));
+        assert!(reg.effective("ghost", 8).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_registry_clone_shares_the_cache() {
+        let reg = new_registry().await;
+        reg.publish(draft(
+            "user",
+            &[],
+            vec![attr("email", AttributeType::String)],
+        ))
+        .await
+        .unwrap();
+        let clone = reg.clone();
+
+        assert!(Arc::ptr_eq(&reg.cache, &clone.cache));
+
+        let from_clone = clone.effective("user", 1).await.unwrap().unwrap();
+        assert_eq!(reg.cache.read().await.len(), 1);
+        assert_eq!(reg.effective("user", 1).await.unwrap(), Some(from_clone));
+        assert_eq!(reg.cache.read().await.len(), 1);
     }
 }
