@@ -25,6 +25,14 @@
 //! The full read is for compatibility.
 //! Use the chunk read to page a large replica.
 //!
+//! Each build increments the stored generation, including an equal-head build.
+//! The full read sets `X-Replica-Generation`.
+//! The chunk read sets `X-Replica-Generation` and returns `generation` in the
+//! body.
+//! A client that pages chunks must compare the generation across the pages.
+//! The client must restart at chunk 0 when the generation changes, because the
+//! pages then come from two different builds.
+//!
 //! The build filters with the grants at build time.
 //! Each replica read filters again with the current grants.
 //! The snapshot gives no authorization cache.
@@ -155,6 +163,8 @@ pub struct SnapshotPage {
 pub struct ReplicaBuildResponse {
     /// The change-log head at the time of the build.
     pub head: u64,
+    /// The build generation of the stored replica.
+    pub generation: u64,
     /// The number of visible entities in the replica.
     pub count: usize,
     /// The number of stored chunks.
@@ -174,6 +184,8 @@ pub struct ReplicaChunkQuery {
 pub struct ReplicaChunkResponse {
     /// The head of the stored replica.
     pub head: u64,
+    /// The build generation of the stored replica.
+    pub generation: u64,
     /// The zero-based index of this chunk.
     pub chunk: usize,
     /// The number of chunks in the stored replica.
@@ -512,6 +524,7 @@ impl std::error::Error for MissingReplica {}
 /// Each chunk holds at most `REPLICA_CHUNK_ENTITIES` entities.
 /// The build replaces the previous replica and its chunks for the same
 /// subject.
+/// The build increments the replica generation and returns it.
 /// The client applies the events after the returned `head`.
 /// An apply must be idempotent and version-aware.
 /// A newer build can commit first.
@@ -562,9 +575,10 @@ pub(crate) async fn build_replica(
         }
         let chunk_count = chunks.len();
         match runtime.replicas().put(&claims.sub, head, chunks).await {
-            Ok(()) => {
+            Ok(generation) => {
                 return Ok(HttpResponse::Ok().json(ReplicaBuildResponse {
                     head,
+                    generation,
                     count,
                     chunks: chunk_count,
                 }));
@@ -596,9 +610,14 @@ impl std::error::Error for ReplicaChunkOutOfRange {}
 /// The snapshot gives no authorization cache.
 /// A policy change takes effect on the next read.
 /// Without a `chunk` parameter, the route returns every permitted entity as
-/// one JSON array and sets `X-Replica-Head` to the stored head.
+/// one JSON array and sets `X-Replica-Head` and `X-Replica-Generation`.
 /// With `chunk=N`, the route returns one stored chunk and sets
-/// `X-Replica-Head`, `X-Replica-Chunk`, and `X-Replica-Chunks`.
+/// `X-Replica-Head`, `X-Replica-Generation`, `X-Replica-Chunk`, and
+/// `X-Replica-Chunks`.
+/// The chunk response also carries `generation` in its body.
+/// A client that pages chunks must compare the generation across the pages.
+/// The client must restart at chunk 0 when the generation changes, because the
+/// pages then come from two different builds.
 /// The route sets no `ETag` and ignores `If-None-Match`.
 /// The response depends on the current grants, so it has no stable validator.
 /// An out-of-range `chunk` returns `400`.
@@ -623,6 +642,7 @@ pub(crate) async fn replica(
         let data = serde_json::to_vec(&items).map_err(|e| EavApiError::Internal(Box::new(e)))?;
         return Ok(HttpResponse::Ok()
             .insert_header(("X-Replica-Head", stored.head.to_string()))
+            .insert_header(("X-Replica-Generation", stored.generation.to_string()))
             .insert_header((CONTENT_TYPE, "application/json"))
             .body(data));
     };
@@ -638,10 +658,12 @@ pub(crate) async fn replica(
     let next = (index + 1 < chunk.chunks).then_some(index + 1);
     Ok(HttpResponse::Ok()
         .insert_header(("X-Replica-Head", chunk.head.to_string()))
+        .insert_header(("X-Replica-Generation", chunk.generation.to_string()))
         .insert_header(("X-Replica-Chunk", index.to_string()))
         .insert_header(("X-Replica-Chunks", chunk.chunks.to_string()))
         .json(ReplicaChunkResponse {
             head: chunk.head,
+            generation: chunk.generation,
             chunk: index,
             chunks: chunk.chunks,
             items,
@@ -1547,7 +1569,9 @@ mod tests {
         assert_eq!(res.status(), http::StatusCode::OK);
         let body: Value = actix_test::read_body_json(res).await;
         assert_eq!(body["head"], head);
+        assert_eq!(body["generation"], 1);
         assert_eq!(body["count"], 2);
+        let generation = body["generation"].as_u64().expect("generation");
 
         let res = get_route!(&app, "/eav/sync/replica", &token).await;
         assert_eq!(res.status(), http::StatusCode::OK);
@@ -1567,6 +1591,14 @@ mod tests {
                 .get("X-Replica-Head")
                 .and_then(|v| v.to_str().ok()),
             Some(replica_head.as_str())
+        );
+        let replica_generation = generation.to_string();
+        assert_eq!(
+            res.headers()
+                .get("X-Replica-Generation")
+                .and_then(|v| v.to_str().ok()),
+            Some(replica_generation.as_str()),
+            "the full read sets X-Replica-Generation"
         );
         let items: Vec<Value> = actix_test::read_body_json(res).await;
         assert_eq!(items.len(), 2);
@@ -2120,6 +2152,7 @@ mod tests {
             fx.runtime.replicas().get("alice").await?,
             Some(crate::eav::replica::ReplicaSnapshot {
                 head: future,
+                generation: 1,
                 chunks: vec![b"newer".to_vec()],
             })
         );
@@ -2151,6 +2184,7 @@ mod tests {
         let built: Value = actix_test::read_body_json(res).await;
         assert_eq!(built["count"], 5);
         assert_eq!(built["chunks"], 3);
+        let generation = built["generation"].as_u64().expect("generation");
 
         let res = get_route!(&app, "/eav/sync/replica", &token).await;
         assert_eq!(res.status(), http::StatusCode::OK);
@@ -2183,8 +2217,19 @@ mod tests {
                     .and_then(|value| value.to_str().ok()),
                 Some("3")
             );
+            assert_eq!(
+                res.headers()
+                    .get("X-Replica-Generation")
+                    .and_then(|value| value.to_str().ok()),
+                Some(generation.to_string().as_str()),
+                "every chunk of one build has the same generation header"
+            );
             let body: Value = actix_test::read_body_json(res).await;
             assert_eq!(body["chunk"], chunk);
+            assert_eq!(
+                body["generation"], generation,
+                "every chunk of one build has the same generation"
+            );
             let items = body["items"].as_array().expect("items");
             for item in items {
                 seen.push(item["id"].as_str().expect("id").to_string());
@@ -2195,6 +2240,95 @@ mod tests {
             }
         }
         assert_eq!(seen, ["e1", "e2", "e3", "e4", "e5"]);
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn a_rebuild_between_two_chunk_reads_changes_the_generation() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        publish_task_schema(&fx).await?;
+        for id in ["e1", "e2", "e3"] {
+            create_entity(&fx, id).await?;
+        }
+        grant_collection_read(&fx, "alice").await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::post().uri("/eav/sync/replica"),
+                &token,
+            )
+            .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let first: Value = actix_test::read_body_json(res).await;
+        let head = first["head"].as_u64().expect("head");
+        let first_generation = first["generation"].as_u64().expect("generation");
+        assert_eq!(first["chunks"], 2);
+
+        let res = get_route!(&app, "/eav/sync/replica?chunk=0", &token).await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let first_header = res
+            .headers()
+            .get("X-Replica-Generation")
+            .and_then(|value| value.to_str().ok())
+            .expect("generation header")
+            .to_string();
+        let body: Value = actix_test::read_body_json(res).await;
+        assert_eq!(body["chunk"], 0);
+        assert_eq!(body["generation"], first_generation);
+
+        // A rebuild with no new entity keeps the head and replaces the
+        // snapshot at that same head.
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::post().uri("/eav/sync/replica"),
+                &token,
+            )
+            .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let second: Value = actix_test::read_body_json(res).await;
+        let second_head = second["head"].as_u64().expect("head");
+        let second_generation = second["generation"].as_u64().expect("generation");
+        assert_eq!(second_head, head, "the rebuild kept the same head");
+        assert!(
+            second_generation > first_generation,
+            "the rebuild must increment the generation"
+        );
+
+        let res = get_route!(&app, "/eav/sync/replica?chunk=1", &token).await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let second_header = res
+            .headers()
+            .get("X-Replica-Generation")
+            .and_then(|value| value.to_str().ok())
+            .expect("generation header")
+            .to_string();
+        let page_head = res
+            .headers()
+            .get("X-Replica-Head")
+            .and_then(|value| value.to_str().ok())
+            .expect("head header")
+            .to_string();
+        let body: Value = actix_test::read_body_json(res).await;
+        assert_eq!(body["chunk"], 1);
+        assert_eq!(body["generation"], second_generation);
+        assert_eq!(
+            page_head,
+            head.to_string(),
+            "both pages came from the same head"
+        );
+        assert_ne!(
+            first_header, second_header,
+            "the two pages came from two builds"
+        );
         Ok(())
     }
 
@@ -2256,6 +2390,12 @@ mod tests {
             .and_then(|value| value.to_str().ok())
             .expect("head header")
             .to_string();
+        let generation = res
+            .headers()
+            .get("X-Replica-Generation")
+            .and_then(|value| value.to_str().ok())
+            .expect("generation header")
+            .to_string();
         assert!(
             res.headers().get(ETAG).is_none(),
             "replica read sets no ETag"
@@ -2286,12 +2426,22 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some(head.as_str())
         );
+        assert_eq!(
+            res.headers()
+                .get("X-Replica-Generation")
+                .and_then(|value| value.to_str().ok()),
+            Some(generation.as_str())
+        );
         let body: Value = actix_test::read_body_json(res).await;
         let items = body["items"].as_array().expect("items");
         assert_eq!(items.len(), 1);
         assert_eq!(items[0]["id"], "e1");
         assert_eq!(body["chunk"], 0);
         assert_eq!(body["chunks"], 1);
+        assert_eq!(
+            body["generation"].as_u64().expect("generation").to_string(),
+            generation
+        );
         Ok(())
     }
 
