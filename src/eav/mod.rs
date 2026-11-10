@@ -24,6 +24,12 @@
 //! The runtime is opt-in.
 //! The binary starts it only when `eav.enabled` is true.
 
+/// The maximum value of the `offset` paging field.
+///
+/// A larger offset is invalid.
+/// Use cursor paging with `after` to read a deeper page.
+pub(crate) const MAX_PAGE_OFFSET: usize = 1_000;
+
 /// Entity storage, validation, and indexes.
 pub mod entity;
 
