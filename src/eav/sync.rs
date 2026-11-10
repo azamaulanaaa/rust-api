@@ -33,7 +33,7 @@ use serde::Serialize;
 use crate::eav::entity::Entity;
 use crate::eav::entity_error::EntityError;
 use crate::eav::route::{
-    ENTITIES, ENTITY_ROW, EavApiError, PageQuery, can_read_entity, page_next_offset,
+    ENTITIES, ENTITY_ROW, EavApiError, PageMode, PageQuery, can_read_entity, page_next_offset,
 };
 use crate::eav::runtime::EavRuntime;
 use crate::fs::error::FsError;
@@ -47,7 +47,11 @@ const DEFAULT_LIMIT: usize = 100;
 /// The largest number of events in one page.
 const MAX_LIMIT: usize = 500;
 /// The number of entities that a replica build reads in one page.
+#[cfg(not(test))]
 const REPLICA_PAGE: usize = 500;
+/// A small page in tests, so a build spans more than one page.
+#[cfg(test)]
+const REPLICA_PAGE: usize = 2;
 /// The number of replica builds before a stale head is final.
 const REPLICA_BUILD_ATTEMPTS: u32 = 2;
 
@@ -95,6 +99,11 @@ pub struct SnapshotPage {
     /// A filtered page can then hold fewer items than the limit.
     /// Continue while `next_offset` is `Some`.
     pub next_offset: Option<usize>,
+    /// The id to resume after for the next page.
+    ///
+    /// The value is `Some` only in cursor mode.
+    /// The value is `None` when the scan is exhausted.
+    pub next: Option<String>,
     /// The head of the change log at the time of the call.
     ///
     /// The client passes this value as `since` to the events feed.
@@ -305,6 +314,7 @@ pub(crate) async fn events(
 /// The route reads a raw page and filters each row.
 /// `next_offset` comes from the raw page length.
 /// A filtered page can then hold fewer items than the limit.
+/// A cursor query uses the entity marker family and returns `next`.
 /// A matching `If-None-Match` returns `304` with no body.
 #[utoipa::path(get, path = "/eav/sync/snapshot", tag = "eav", params(PageQuery), responses((status = 200, body = SnapshotPage), (status = 304, description = "not modified"), (status = 400, body = crate::http::error::ErrorBody), (status = 401, body = crate::http::error::ErrorBody), (status = 500, body = crate::http::error::ErrorBody)))]
 #[get("/sync/snapshot")]
@@ -315,7 +325,7 @@ pub(crate) async fn snapshot(
     query: web::Query<PageQuery>,
     req: HttpRequest,
 ) -> Result<HttpResponse, EavApiError> {
-    let (limit, offset) = query.into_inner().resolve()?;
+    let (limit, mode) = query.into_inner().resolve()?;
     let head = runtime.wal().head().await.map_err(internal)?;
     let etag = status_etag(head);
     if let Some(header) = req
@@ -329,22 +339,47 @@ pub(crate) async fn snapshot(
             .finish());
     }
 
-    let raw = runtime.entities().list_page(limit, offset).await?;
-    let raw_len = raw.len();
-    let mut items = Vec::with_capacity(raw_len);
-    for entity in raw {
-        if can_read_entity(&policy, &claims.sub, &entity.id).await? {
-            items.push(entity);
+    match mode {
+        PageMode::Cursor(after) => {
+            let (raw, next) = runtime
+                .entities()
+                .list_after(limit, after.as_deref())
+                .await?;
+            let mut items = Vec::with_capacity(raw.len());
+            for entity in raw {
+                if can_read_entity(&policy, &claims.sub, &entity.id).await? {
+                    items.push(entity);
+                }
+            }
+            Ok(HttpResponse::Ok()
+                .insert_header((ETAG, etag))
+                .json(SnapshotPage {
+                    items,
+                    next_offset: None,
+                    next,
+                    head,
+                }))
+        }
+        PageMode::Offset(offset) => {
+            let raw = runtime.entities().list_page(limit, offset).await?;
+            let raw_len = raw.len();
+            let mut items = Vec::with_capacity(raw_len);
+            for entity in raw {
+                if can_read_entity(&policy, &claims.sub, &entity.id).await? {
+                    items.push(entity);
+                }
+            }
+            let next_offset = page_next_offset(offset, raw_len, limit);
+            Ok(HttpResponse::Ok()
+                .insert_header((ETAG, etag))
+                .json(SnapshotPage {
+                    items,
+                    next_offset,
+                    next: None,
+                    head,
+                }))
         }
     }
-    let next_offset = page_next_offset(offset, raw_len, limit);
-    Ok(HttpResponse::Ok()
-        .insert_header((ETAG, etag))
-        .json(SnapshotPage {
-            items,
-            next_offset,
-            head,
-        }))
 }
 
 /// The source of a missing replica.
@@ -363,8 +398,9 @@ impl std::error::Error for MissingReplica {}
 ///
 /// The caller needs a valid session.
 /// The route reads the current change-log head first.
-/// It then reads every entity in pages of 500.
+/// It then reads every entity in id order with a cursor.
 /// It keeps only the entities that the caller can read.
+/// The stored snapshot is one JSON array.
 /// The build replaces the previous replica for the same subject.
 /// The client applies the events after the returned `head`.
 /// A newer build can commit first.
@@ -382,19 +418,21 @@ pub(crate) async fn build_replica(
         attempt += 1;
         let head = runtime.wal().head().await.map_err(internal)?;
         let mut items = Vec::new();
-        let mut offset = 0;
+        let mut after: Option<String> = None;
         loop {
-            let page = runtime.entities().list_page(REPLICA_PAGE, offset).await?;
-            let len = page.len();
+            let (page, next) = runtime
+                .entities()
+                .list_after(REPLICA_PAGE, after.as_deref())
+                .await?;
             for entity in page {
                 if can_read_entity(&policy, &claims.sub, &entity.id).await? {
                     items.push(entity);
                 }
             }
-            if len < REPLICA_PAGE {
-                break;
+            match next {
+                Some(cursor) => after = Some(cursor),
+                None => break,
             }
-            offset = offset.saturating_add(len);
         }
         let data = serde_json::to_vec(&items).map_err(|e| EavApiError::Internal(Box::new(e)))?;
         let count = items.len();
@@ -967,6 +1005,52 @@ mod tests {
     }
 
     #[actix_web::test]
+    async fn a_snapshot_cursor_pages_through_every_visible_entity_once() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        publish_task_schema(&fx).await?;
+        for id in ["e1", "e2", "e3"] {
+            create_entity(&fx, id).await?;
+        }
+        grant_collection_read(&fx, "alice").await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+
+        let mut ids = Vec::new();
+        let mut after: Option<String> = Some(String::new());
+        let mut first = true;
+        loop {
+            let uri = match &after {
+                Some(cursor) => format!("/eav/sync/snapshot?limit=1&after={cursor}"),
+                None => "/eav/sync/snapshot?limit=1".to_string(),
+            };
+            let res = get_route!(&app, &uri, &token).await;
+            assert_eq!(res.status(), http::StatusCode::OK, "{uri}");
+            let body: Value = actix_test::read_body_json(res).await;
+            assert!(body["next_offset"].is_null(), "{uri}");
+            let page_ids: Vec<&str> = body["items"]
+                .as_array()
+                .expect("items")
+                .iter()
+                .map(|item| item["id"].as_str().expect("id"))
+                .collect();
+            if first {
+                assert_eq!(page_ids, vec!["e1"], "{uri}");
+                assert_eq!(body["next"], "e1", "{uri}");
+                first = false;
+            }
+            ids.extend(page_ids.iter().map(|id| id.to_string()));
+            match body["next"].as_str() {
+                Some(cursor) => after = Some(cursor.to_string()),
+                None => break,
+            }
+        }
+
+        assert_eq!(ids, vec!["e1", "e2", "e3"]);
+        Ok(())
+    }
+
+    #[actix_web::test]
     async fn a_row_grant_user_sees_only_its_snapshot_entity() -> anyhow::Result<()> {
         let fx = fixture().await?;
         publish_task_schema(&fx).await?;
@@ -1095,6 +1179,42 @@ mod tests {
         assert_eq!(items.len(), 2);
         assert_eq!(items[0]["id"], "e1");
         assert_eq!(items[1]["id"], "e2");
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn a_replica_build_reads_every_cursor_page() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        publish_task_schema(&fx).await?;
+        for id in ["e1", "e2", "e3", "e4", "e5"] {
+            create_entity(&fx, id).await?;
+        }
+        grant_collection_read(&fx, "alice").await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::post().uri("/eav/sync/replica"),
+                &token,
+            )
+            .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let body: Value = actix_test::read_body_json(res).await;
+        assert_eq!(body["count"], 5);
+
+        let res = get_route!(&app, "/eav/sync/replica", &token).await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let items: Vec<Value> = actix_test::read_body_json(res).await;
+        let ids: Vec<&str> = items
+            .iter()
+            .map(|item| item["id"].as_str().expect("id"))
+            .collect();
+        assert_eq!(ids, vec!["e1", "e2", "e3", "e4", "e5"]);
         Ok(())
     }
 
