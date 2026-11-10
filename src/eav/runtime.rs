@@ -185,6 +185,9 @@ impl EavRuntime {
     /// The call writes the event and then the marker.
     /// A failed marker write returns the error.
     /// The next pass then emits the same event again.
+    /// A marker write returns false when the value changed after the read.
+    /// The call counts only a written marker.
+    /// The event is already written, and a duplicate event is idempotent.
     /// The rule engine execution marker stops a duplicate action.
     pub async fn fire_due_timers(&self, now: i64, limit: usize) -> anyhow::Result<usize> {
         let mut emitted = 0;
@@ -218,11 +221,14 @@ impl EavRuntime {
                     .emit_timer(&entity, &key, due_at, now)
                     .await
                     .context("emit an EAV timer event")?;
-                self.entities
+                let marked = self
+                    .entities
                     .mark_timer_fired(&entity.id, &key, due_at)
                     .await
                     .context("write the EAV timer marker")?;
-                emitted += 1;
+                // A false result means the value changed after the read.
+                // The event stays idempotent, and the next pass reads the new value.
+                emitted += usize::from(marked);
             }
         }
         self.metrics.record_timer_due(due_count);
