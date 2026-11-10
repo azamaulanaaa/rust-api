@@ -25,6 +25,14 @@
 //! The events route checks one collection grant.
 //! Without the collection grant, it checks a row grant for each event.
 //! A caller sees only the events that it can read.
+//!
+//! The events route reads the feed in fixed windows.
+//! A window holds at most `EVENT_SCAN_BATCH` entries.
+//! The route holds the read guard for one window only.
+//! It releases the guard before it reads the next window.
+//! A slow client therefore does not block appends for its whole backlog.
+//! The route stops at `limit` visible events or at the feed head.
+//! An invisible entry neither fills the page nor stops the scan.
 
 use actix_web::{
     HttpRequest, HttpResponse, get,
@@ -55,6 +63,12 @@ const REPLICA_PAGE: usize = 500;
 /// A small page in tests, so a build spans more than one page.
 #[cfg(test)]
 const REPLICA_PAGE: usize = 2;
+/// The number of change-log entries that the events route reads in one window.
+#[cfg(not(test))]
+const EVENT_SCAN_BATCH: usize = 256;
+/// A small window in tests, so a scan spans more than one window.
+#[cfg(test)]
+const EVENT_SCAN_BATCH: usize = 2;
 /// The number of entities in one stored replica chunk.
 #[cfg(not(test))]
 const REPLICA_CHUNK_ENTITIES: usize = 500;
@@ -81,14 +95,21 @@ pub struct SyncEvent {
 }
 
 /// One page of the entity change feed.
+///
+/// The route scans the feed in windows of `EVENT_SCAN_BATCH` entries.
+/// It releases the change-log read guard between two windows.
+/// An invisible entry neither fills the page nor stops the scan.
 #[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
 pub struct SyncEventsResponse {
     /// The visible entity events in log order.
     pub events: Vec<SyncEvent>,
     /// The cursor for the next call.
     ///
-    /// The value is the sequence of the last event when the page is full.
+    /// The value is the sequence of the last returned event when the page is
+    /// full.
     /// Otherwise it is the current head.
+    /// The next request starts after this sequence, so no event repeats.
+    /// An invisible entry after this sequence stays for a later page.
     pub next: u64,
     /// The head of the change log at the time of the call.
     pub head: u64,
@@ -219,6 +240,16 @@ fn status_etag(head: u64) -> String {
     format!("\"{head}\"")
 }
 
+/// Returns the last sequence of a scan window.
+///
+/// The window starts at `start` and holds at most `batch` entries.
+/// The result never passes `head`.
+/// `batch` must be at least 1.
+fn window_end(start: u64, head: u64, batch: usize) -> u64 {
+    let width = u64::try_from(batch).unwrap_or(u64::MAX);
+    start.saturating_add(width.saturating_sub(1)).min(head)
+}
+
 /// Returns true when `If-None-Match` matches the current tag.
 ///
 /// The check accepts the weak form and a comma-separated list.
@@ -276,6 +307,11 @@ pub(crate) async fn status(
 /// The route checks the collection grant once.
 /// Without that grant, it checks each event row.
 /// The route ignores file and policy entries.
+/// The route reads the feed in windows of `EVENT_SCAN_BATCH` entries.
+/// It holds the read guard for one window only.
+/// It releases the guard before it reads the next window.
+/// The scan stops at `limit` visible events or at the head.
+/// An invisible entry neither fills the page nor stops the scan.
 /// A full page returns the last included sequence as `next`.
 /// A page that is not full returns the head as `next`.
 /// This route does not use `ETag`.
@@ -300,36 +336,40 @@ pub(crate) async fn events(
         }));
     }
 
-    let entries = runtime
-        .wal()
-        .range(since + 1, head)
-        .await
-        .map_err(internal)?;
     let collection = policy
         .authorize(&claims.sub, ENTITIES, Action::Read)
         .await
         .map_err(EavApiError::from)?;
 
-    let mut events = Vec::new();
-    for entry in entries {
-        if events.len() == limit {
+    let mut events = Vec::with_capacity(limit.min(EVENT_SCAN_BATCH));
+    let mut start = since + 1;
+    loop {
+        let end = window_end(start, head, EVENT_SCAN_BATCH);
+        let entries = runtime.wal().range(start, end).await.map_err(internal)?;
+        for entry in entries {
+            let WalEntry { seq, op, .. } = entry;
+            let WalOp::Entity { event } = op else {
+                continue;
+            };
+            let visible = if collection {
+                true
+            } else {
+                policy
+                    .authorize_row(&claims.sub, ENTITY_ROW, &event.entity_id, Action::Read)
+                    .await
+                    .map_err(EavApiError::from)?
+            };
+            if visible {
+                events.push(SyncEvent { seq, event });
+                if events.len() == limit {
+                    break;
+                }
+            }
+        }
+        if events.len() == limit || end == head {
             break;
         }
-        let WalEntry { seq, op, .. } = entry;
-        let WalOp::Entity { event } = op else {
-            continue;
-        };
-        let visible = if collection {
-            true
-        } else {
-            policy
-                .authorize_row(&claims.sub, ENTITY_ROW, &event.entity_id, Action::Read)
-                .await
-                .map_err(EavApiError::from)?
-        };
-        if visible {
-            events.push(SyncEvent { seq, event });
-        }
+        start = end + 1;
     }
 
     let next = match events.last() {
@@ -981,6 +1021,207 @@ mod tests {
         let body: Value = actix_test::read_body_json(res).await;
         assert_eq!(body["events"].as_array().map(Vec::len), Some(0));
         assert_eq!(body["next"], 3);
+        Ok(())
+    }
+
+    #[test]
+    fn a_scan_window_never_passes_the_head() {
+        assert_eq!(window_end(1, 10, 2), 2);
+        assert_eq!(window_end(9, 10, 2), 10);
+        assert_eq!(window_end(10, 10, 2), 10);
+        assert_eq!(window_end(1, 1, 256), 1);
+        assert_eq!(window_end(u64::MAX - 1, u64::MAX, 256), u64::MAX);
+    }
+
+    #[test]
+    fn a_full_scan_window_holds_exactly_the_batch() {
+        let start = 3;
+        let end = window_end(start, 100, 4);
+        assert_eq!(end - start + 1, 4);
+        assert_eq!(window_end(start, 100, 1), start);
+    }
+
+    /// Reads one page of the events feed and returns its body.
+    macro_rules! read_page {
+        ($app:expr, $token:expr, $since:expr, $limit:expr) => {{
+            let uri = format!("/eav/sync/events?limit={}&since={}", $limit, $since);
+            let res = get_route!($app, &uri, $token).await;
+            assert_eq!(res.status(), http::StatusCode::OK, "{uri}");
+            let body: Value = actix_test::read_body_json(res).await;
+            Ok::<Value, anyhow::Error>(body)
+        }};
+    }
+
+    #[actix_web::test]
+    async fn a_limit_pages_every_visible_event_once() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        for id in ["e1", "e2", "e3", "e4", "e5"] {
+            append_entity(&fx, id).await?;
+        }
+        grant_collection_read(&fx, "alice").await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+        let head = fx.runtime.wal().head().await?;
+
+        let first = read_page!(&app, &token, 0, 2)?;
+        let listed = first["events"].as_array().expect("events");
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0]["event"]["entity_id"], "e1");
+        assert_eq!(listed[1]["event"]["entity_id"], "e2");
+        assert_eq!(first["next"], 2);
+        assert_eq!(first["head"], head);
+
+        let mut since = 2;
+        let mut ids = vec!["e1".to_string(), "e2".to_string()];
+        loop {
+            let body = read_page!(&app, &token, since, 2)?;
+            for event in body["events"].as_array().expect("events") {
+                ids.push(
+                    event["event"]["entity_id"]
+                        .as_str()
+                        .expect("id")
+                        .to_string(),
+                );
+            }
+            let next = body["next"].as_u64().expect("next");
+            if next == since {
+                break;
+            }
+            assert!(next > since, "since={since} next={next}");
+            since = next;
+        }
+
+        assert_eq!(ids, ["e1", "e2", "e3", "e4", "e5"]);
+        assert_eq!(since, head);
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn a_feed_longer_than_one_window_pages_to_the_head() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        for id in ["e1", "e2", "e3", "e4", "e5"] {
+            append_entity(&fx, id).await?;
+        }
+        grant_collection_read(&fx, "alice").await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+        let head = fx.runtime.wal().head().await?;
+        assert!(head > EVENT_SCAN_BATCH as u64);
+
+        let mut since = 0;
+        let mut seqs = Vec::new();
+        loop {
+            let body = read_page!(&app, &token, since, 1)?;
+            let listed = body["events"].as_array().expect("events");
+            assert!(listed.len() <= 1);
+            for event in listed {
+                seqs.push(event["seq"].as_u64().expect("seq"));
+            }
+            let next = body["next"].as_u64().expect("next");
+            if next == since {
+                break;
+            }
+            assert!(next > since, "since={since} next={next}");
+            since = next;
+        }
+
+        assert_eq!(seqs, [1, 2, 3, 4, 5]);
+        assert_eq!(since, head);
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn a_row_grant_pages_across_a_window_boundary() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        for id in ["e1", "e2", "e3", "e4", "e5", "e6"] {
+            append_entity(&fx, id).await?;
+        }
+        grant_row_read(&fx, "carol", "e3").await?;
+        grant_row_read(&fx, "carol", "e5").await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("carol")?;
+        let head = fx.runtime.wal().head().await?;
+
+        let first = read_page!(&app, &token, 0, 2)?;
+        let listed = first["events"].as_array().expect("events");
+        let ids: Vec<&str> = listed
+            .iter()
+            .map(|event| event["event"]["entity_id"].as_str().expect("id"))
+            .collect();
+        assert_eq!(ids, ["e3", "e5"]);
+        assert_eq!(first["next"], 5);
+
+        let second = read_page!(&app, &token, 5, 2)?;
+        assert_eq!(second["events"].as_array().map(Vec::len), Some(0));
+        assert_eq!(second["next"], head);
+        assert_eq!(second["head"], head);
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn a_cursor_at_the_head_returns_an_empty_page() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        append_entity(&fx, "e1").await?;
+        append_entity(&fx, "e2").await?;
+        grant_collection_read(&fx, "alice").await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+        let head = fx.runtime.wal().head().await?;
+
+        let body = read_page!(&app, &token, head, 1)?;
+        assert_eq!(body["events"].as_array().map(Vec::len), Some(0));
+        assert_eq!(body["next"], head);
+        assert_eq!(body["head"], head);
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn a_cursor_one_past_the_head_is_409() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        append_entity(&fx, "e1").await?;
+        grant_collection_read(&fx, "alice").await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+        let head = fx.runtime.wal().head().await?;
+
+        let res = get_route!(
+            &app,
+            format!("/eav/sync/events?since={}", head + 1).as_str(),
+            &token
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::CONFLICT);
+        let body: crate::http::error::ErrorBody = actix_test::read_body_json(res).await;
+        assert_eq!(body.code.as_deref(), Some("conflict"));
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn a_repeat_request_at_next_does_not_repeat_an_event() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        for id in ["e1", "e2", "e3"] {
+            append_entity(&fx, id).await?;
+        }
+        grant_collection_read(&fx, "alice").await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+
+        let first = read_page!(&app, &token, 0, 2)?;
+        assert_eq!(first["next"], 2);
+        let again = read_page!(&app, &token, 0, 2)?;
+        assert_eq!(again, first);
+
+        let rest = read_page!(&app, &token, 2, 2)?;
+        let listed = rest["events"].as_array().expect("events");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0]["seq"], 3);
+        assert_eq!(rest["next"], 3);
         Ok(())
     }
 
