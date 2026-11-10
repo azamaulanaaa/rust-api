@@ -5,6 +5,8 @@
 //! The store keeps one head row and one data row for each subject.
 //! The head row points to the data row.
 //! Both rows commit in one transaction.
+//! The head is monotonic: a build with a lower head never replaces a newer
+//! snapshot.
 //!
 //! Keys:
 //!
@@ -25,10 +27,18 @@ use tokio::sync::RwLock;
 
 use crate::eav::entity_error::EntityError;
 
+/// The number of times a get tries to read one consistent pair.
+const GET_ATTEMPTS: u32 = 16;
+
 /// A stored per-user entity replica.
 ///
 /// A build replaces the previous snapshot for the same subject.
-/// A get reads the head first, then the data row that the head names.
+/// A build with a lower head fails with [`EntityError::StaleHead`].
+/// A get reads the head, then the data row that the head names, then the
+/// head again.
+/// It retries when the head changed or the data row is absent.
+/// The head row and the data row commit in one transaction, so a head that
+/// did not change names data from the same snapshot.
 #[derive(Clone)]
 pub struct ReplicaStore {
     /// The shared replica store handle.
@@ -49,6 +59,9 @@ impl ReplicaStore {
     /// The head row points to the data row.
     /// A later build replaces the head and writes a new data row.
     /// The same transaction deletes the old data row.
+    /// A `head` lower than the stored head is stale.
+    /// A stale build returns [`EntityError::StaleHead`] and changes nothing.
+    /// Thus the stored head never goes backwards.
     pub async fn put(&self, sub: &str, head: u64, data: Vec<u8>) -> Result<(), EntityError> {
         let hash = sub_hash(sub);
         let head_bytes =
@@ -56,6 +69,14 @@ impl ReplicaStore {
         let g = self.store.write().await;
         let tx = g.begin_tx().map_err(EntityError::Store)?;
         let old_head = read_head(&tx, &hash).await?;
+        if let Some(stored) = old_head
+            && head < stored
+        {
+            return Err(EntityError::StaleHead {
+                stored,
+                incoming: head,
+            });
+        }
         tx.set_bytes(&data_key(&hash, head), &data)
             .await
             .map_err(EntityError::Store)?;
@@ -75,21 +96,37 @@ impl ReplicaStore {
 
     /// Returns the stored head and JSON bytes for `sub`.
     ///
-    /// The call returns `None` when the head or the data row is absent.
+    /// The call returns `None` only when the subject has no replica.
+    /// A `put` can replace the head while a `get` runs.
+    /// The call reads the head, the data row that the head names, then the
+    /// head again.
+    /// It retries when the head changed or the data row is absent.
+    /// A head that did not change names data from the same committed
+    /// snapshot, so the pair is consistent.
+    /// The loop has a fixed limit.
+    /// The call returns an internal error when every attempt loses the race.
     pub async fn get(&self, sub: &str) -> Result<Option<(u64, Vec<u8>)>, EntityError> {
         let hash = sub_hash(sub);
         let g = self.store.read().await;
-        let Some(head) = read_head(&*g, &hash).await? else {
-            return Ok(None);
-        };
-        let Some(data) = g
-            .get_bytes(&data_key(&hash, head))
-            .await
-            .map_err(EntityError::Store)?
-        else {
-            return Ok(None);
-        };
-        Ok(Some((head, data)))
+        for _ in 0..GET_ATTEMPTS {
+            let Some(head) = read_head(&*g, &hash).await? else {
+                return Ok(None);
+            };
+            let data = g
+                .get_bytes(&data_key(&hash, head))
+                .await
+                .map_err(EntityError::Store)?;
+            if read_head(&*g, &hash).await? != Some(head) {
+                continue;
+            }
+            let Some(data) = data else {
+                continue;
+            };
+            return Ok(Some((head, data)));
+        }
+        Err(EntityError::Internal(
+            "replica read did not settle".to_string(),
+        ))
     }
 
     /// Returns the stored head for `sub`, or `None` when no replica exists.
@@ -185,6 +222,73 @@ mod tests {
         assert_eq!(
             store.get("alice").await.unwrap(),
             Some((9, b"new".to_vec()))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lower_put_head_does_not_replace_a_higher_head() {
+        let store = store().await;
+        store.put("alice", 9, b"new".to_vec()).await.unwrap();
+
+        let error = store.put("alice", 3, b"old".to_vec()).await.unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                EntityError::StaleHead {
+                    stored: 9,
+                    incoming: 3
+                }
+            ),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            store.get("alice").await.unwrap(),
+            Some((9, b"new".to_vec()))
+        );
+        assert_eq!(store.status("alice").await.unwrap(), Some(9));
+
+        let hash = sub_hash("alice");
+        let g = store.store.read().await;
+        assert!(
+            g.get_bytes(&data_key(&hash, 3)).await.unwrap().is_none(),
+            "stale data row was written"
+        );
+        assert_eq!(
+            g.get_bytes(&data_key(&hash, 9)).await.unwrap(),
+            Some(b"new".to_vec())
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_get_during_concurrent_puts_never_returns_none() {
+        let store = store().await;
+        store.put("alice", 0, b"v0".to_vec()).await.unwrap();
+
+        let writer = store.clone();
+        let writer = tokio::spawn(async move {
+            for head in 1..=25u64 {
+                writer
+                    .put("alice", head, format!("v{head}").into_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let reader = store.clone();
+        let reader = tokio::spawn(async move {
+            for _ in 0..200 {
+                let got = reader.get("alice").await.unwrap();
+                let (head, data) = got.expect("get returned None while a replica exists");
+                assert_eq!(data, format!("v{head}").into_bytes());
+            }
+        });
+
+        writer.await.unwrap();
+        reader.await.unwrap();
+        assert_eq!(
+            store.get("alice").await.unwrap(),
+            Some((25, b"v25".to_vec()))
         );
     }
 
