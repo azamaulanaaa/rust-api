@@ -430,7 +430,8 @@ impl From<EntityError> for EavApiError {
             | EntityError::NotIndexed(_) => Kind::Invalid,
             EntityError::UniqueViolation(_)
             | EntityError::VersionConflict
-            | EntityError::AlreadyExists(_) => Kind::Conflict,
+            | EntityError::AlreadyExists(_)
+            | EntityError::StaleHead { .. } => Kind::Conflict,
             EntityError::Store(_) | EntityError::Internal(_) | EntityError::Feed(_) => {
                 Kind::Internal
             }
