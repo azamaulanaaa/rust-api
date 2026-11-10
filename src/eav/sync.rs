@@ -31,6 +31,7 @@ use actix_web::{
 use serde::Serialize;
 
 use crate::eav::entity::Entity;
+use crate::eav::entity_error::EntityError;
 use crate::eav::route::{
     ENTITIES, ENTITY_ROW, EavApiError, PageQuery, can_read_entity, page_next_offset,
 };
@@ -47,6 +48,8 @@ const DEFAULT_LIMIT: usize = 100;
 const MAX_LIMIT: usize = 500;
 /// The number of entities that a replica build reads in one page.
 const REPLICA_PAGE: usize = 500;
+/// The number of replica builds before a stale head is final.
+const REPLICA_BUILD_ATTEMPTS: u32 = 2;
 
 /// The current head of the entity change feed.
 #[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
@@ -364,33 +367,43 @@ impl std::error::Error for MissingReplica {}
 /// It keeps only the entities that the caller can read.
 /// The build replaces the previous replica for the same subject.
 /// The client applies the events after the returned `head`.
-#[utoipa::path(post, path = "/eav/sync/replica", tag = "eav", responses((status = 200, body = ReplicaBuildResponse), (status = 401, body = crate::http::error::ErrorBody), (status = 500, body = crate::http::error::ErrorBody)))]
+/// A newer build can commit first.
+/// The route then reads a fresh feed head and builds one more time.
+/// A second stale result returns `409`.
+#[utoipa::path(post, path = "/eav/sync/replica", tag = "eav", responses((status = 200, body = ReplicaBuildResponse), (status = 401, body = crate::http::error::ErrorBody), (status = 409, body = crate::http::error::ErrorBody), (status = 500, body = crate::http::error::ErrorBody)))]
 #[post("/sync/replica")]
 pub(crate) async fn build_replica(
     runtime: web::Data<EavRuntime>,
     policy: web::Data<Authorizer>,
     claims: Validated<Claims>,
 ) -> Result<HttpResponse, EavApiError> {
-    let head = runtime.wal().head().await.map_err(internal)?;
-    let mut items = Vec::new();
-    let mut offset = 0;
+    let mut attempt = 0;
     loop {
-        let page = runtime.entities().list_page(REPLICA_PAGE, offset).await?;
-        let len = page.len();
-        for entity in page {
-            if can_read_entity(&policy, &claims.sub, &entity.id).await? {
-                items.push(entity);
+        attempt += 1;
+        let head = runtime.wal().head().await.map_err(internal)?;
+        let mut items = Vec::new();
+        let mut offset = 0;
+        loop {
+            let page = runtime.entities().list_page(REPLICA_PAGE, offset).await?;
+            let len = page.len();
+            for entity in page {
+                if can_read_entity(&policy, &claims.sub, &entity.id).await? {
+                    items.push(entity);
+                }
             }
+            if len < REPLICA_PAGE {
+                break;
+            }
+            offset = offset.saturating_add(len);
         }
-        if len < REPLICA_PAGE {
-            break;
+        let data = serde_json::to_vec(&items).map_err(|e| EavApiError::Internal(Box::new(e)))?;
+        let count = items.len();
+        match runtime.replicas().put(&claims.sub, head, data).await {
+            Ok(()) => return Ok(HttpResponse::Ok().json(ReplicaBuildResponse { head, count })),
+            Err(EntityError::StaleHead { .. }) if attempt < REPLICA_BUILD_ATTEMPTS => continue,
+            Err(error) => return Err(EavApiError::from(error)),
         }
-        offset = offset.saturating_add(len);
     }
-    let data = serde_json::to_vec(&items).map_err(|e| EavApiError::Internal(Box::new(e)))?;
-    let count = items.len();
-    runtime.replicas().put(&claims.sub, head, data).await?;
-    Ok(HttpResponse::Ok().json(ReplicaBuildResponse { head, count }))
 }
 
 /// Returns the stored replica of the caller.
@@ -1283,6 +1296,42 @@ mod tests {
         let res = get_route!(&app, "/eav/sync/replica/status", &token).await;
         let body: Value = actix_test::read_body_json(res).await;
         assert_eq!(body["built_head"], second_head);
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn a_stale_replica_build_is_409_and_keeps_the_stored_snapshot() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        publish_task_schema(&fx).await?;
+        create_entity(&fx, "e1").await?;
+        grant_collection_read(&fx, "alice").await?;
+        let head = fx.runtime.wal().head().await?;
+        let future = head + 100;
+        fx.runtime
+            .replicas()
+            .put("alice", future, b"newer".to_vec())
+            .await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::post().uri("/eav/sync/replica"),
+                &token,
+            )
+            .to_request(),
+        )
+        .await;
+
+        assert_eq!(res.status(), http::StatusCode::CONFLICT);
+        let body: crate::http::error::ErrorBody = actix_test::read_body_json(res).await;
+        assert_eq!(body.code.as_deref(), Some("conflict"));
+        assert_eq!(
+            fx.runtime.replicas().get("alice").await?,
+            Some((future, b"newer".to_vec()))
+        );
         Ok(())
     }
 
