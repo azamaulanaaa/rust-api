@@ -19,10 +19,14 @@
 //!   empty result.
 //! - `idx:unique:{key}:{hash}:{entity_id}` is a unique value marker.
 //! - `idx:time:{key}:{encoded_ts}:{entity_id}` is an empty time marker.
+//!   A timer retire removes the row when the timer fires. The index then
+//!   holds only values that have not fired.
 //! - `idx:time-key:{key}` is an empty marker for an attribute key with a
 //!   time row.
 //! - `idx:time-key-meta:backfilled` is an empty backfill marker.
 //! - `timer:fired:{entity_id}:{key}:{encoded_ts}` is a fired timer marker.
+//!   The marker stays after the timer retire removes the time row, so one
+//!   value fires one time only.
 //! - `outbox-meta:pending` holds the pending outbox row count as JSON `u64`.
 //!   The key is not in the `outbox:` family, so an outbox scan does not
 //!   include it.
@@ -1439,6 +1443,8 @@ impl EntityStore {
     /// Lists the entities whose indexed timestamp `key` is due.
     ///
     /// The call scans only the `idx:time:{key}:` family.
+    /// The index holds only values that have not fired.
+    /// A timer retire removes the time row after the timer fires.
     /// The scan stops at the inclusive upper bound for `at_or_before`.
     /// The result is in time order.
     /// An entity appears only when its current value for `key` is a
@@ -1584,6 +1590,46 @@ impl EntityStore {
             .await
             .map(|_| true)
             .map_err(EntityError::Store)
+    }
+
+    /// Writes a timer marker and removes the time index row in one transaction.
+    ///
+    /// The call takes the write lock and then the store write guard.
+    /// It reloads the current entity inside the lock.
+    /// It returns `false` and changes nothing when the entity is absent.
+    /// It returns `false` and changes nothing when the current value for
+    /// `key` is not [`AttributeValue::Timestamp`] with `due_at`.
+    /// The call writes the marker in the same value format as
+    /// [`EntityStore::mark_timer_fired`].
+    /// It deletes the `idx:time:` row for the entity and value.
+    /// The marker write and the row delete commit in one transaction.
+    /// A crash cannot leave one without the other.
+    /// The call returns `true` when the transaction commits.
+    pub async fn retire_timer(
+        &self,
+        entity_id: &str,
+        key: &str,
+        due_at: i64,
+    ) -> Result<bool, EntityError> {
+        let now = chrono::Utc::now().timestamp();
+        let bytes = serde_json::to_vec(&now).map_err(|e| EntityError::Internal(e.to_string()))?;
+        let _write = self.write_lock.lock().await;
+        let g = self.store.write().await;
+        let tx = g.begin_tx().map_err(EntityError::Store)?;
+        let Some(entity) = load_entity(&tx, entity_id).await? else {
+            return Ok(false);
+        };
+        if entity.attributes.get(key) != Some(&AttributeValue::Timestamp(due_at)) {
+            return Ok(false);
+        }
+        tx.set_bytes(&timer_marker_key(entity_id, key, due_at), &bytes)
+            .await
+            .map_err(EntityError::Store)?;
+        tx.delete(&time_index_key(key, due_at, entity_id))
+            .await
+            .map_err(EntityError::Store)?;
+        tx.commit().await.map_err(EntityError::Store)?;
+        Ok(true)
     }
 
     /// Lists every entity, sorted by id.
@@ -5582,6 +5628,65 @@ mod tests {
 
         assert!(!store.mark_timer_fired("e1", "due", 999).await.unwrap());
         assert!(!store.is_timer_fired("e1", "due", 999).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn retire_timer_removes_the_time_row_and_writes_the_marker() {
+        let (store, raw) = timer_store().await;
+        create_task(&store, "e1", 100).await;
+        let keys = all_keys(&raw).await;
+        assert!(keys.contains(&time_index_key("due", 100, "e1")));
+        assert!(!keys.contains(&timer_marker_key("e1", "due", 100)));
+
+        assert!(store.retire_timer("e1", "due", 100).await.unwrap());
+
+        let keys = all_keys(&raw).await;
+        assert!(!keys.contains(&time_index_key("due", 100, "e1")));
+        assert!(keys.contains(&timer_marker_key("e1", "due", 100)));
+        assert!(store.is_timer_fired("e1", "due", 100).await.unwrap());
+        assert!(store.list_due("due", 100, 100).await.unwrap().is_empty());
+        let bytes = raw
+            .get_bytes(&timer_marker_key("e1", "due", 100))
+            .await
+            .unwrap()
+            .unwrap();
+        let fired_at: i64 = serde_json::from_slice(&bytes).unwrap();
+        assert!(fired_at > 0);
+    }
+
+    #[tokio::test]
+    async fn retire_timer_returns_false_after_the_value_changes() {
+        let (store, raw) = timer_store().await;
+        create_task(&store, "e1", 100).await;
+        let first = store.list_due("due", 100, 100).await.unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].id, "e1");
+
+        store
+            .update("e1", 1, patch(vec![("due", Some(t(200)))]), &ctx())
+            .await
+            .unwrap();
+
+        assert!(!store.retire_timer("e1", "due", 100).await.unwrap());
+        assert!(!store.is_timer_fired("e1", "due", 100).await.unwrap());
+
+        let keys = all_keys(&raw).await;
+        assert!(!keys.contains(&time_index_key("due", 100, "e1")));
+        assert!(keys.contains(&time_index_key("due", 200, "e1")));
+
+        let next = store.list_due("due", 200, 100).await.unwrap();
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].attributes.get("due"), Some(&t(200)));
+    }
+
+    #[tokio::test]
+    async fn retire_timer_for_an_absent_entity_writes_nothing() {
+        let (store, raw) = timer_store().await;
+        let before = all_keys(&raw).await;
+
+        assert!(!store.retire_timer("missing", "due", 100).await.unwrap());
+
+        assert_eq!(all_keys(&raw).await, before);
     }
 
     #[tokio::test]
