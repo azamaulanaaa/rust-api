@@ -18,7 +18,7 @@ use actix_web::{HttpResponse, delete, get, patch, post, web};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::eav::entity::{Entity, EntityPatch, WriteContext};
+use crate::eav::entity::{AttributeValue, Entity, EntityPatch, WriteContext};
 use crate::eav::entity_error::EntityError;
 use crate::eav::error::SchemaError;
 use crate::eav::runtime::EavRuntime;
@@ -105,6 +105,7 @@ impl ApiModule for EavApiModule {
             .service(migrate_schema)
             .service(create_entity)
             .service(list_entities)
+            .service(query_entities)
             .service(get_entity)
             .service(patch_entity)
             .service(delete_entity)
@@ -308,6 +309,47 @@ pub struct RulePage {
     pub next_offset: Option<usize>,
 }
 
+/// The body of the entity query route.
+///
+/// The default limit is 50.
+/// The maximum limit is 200.
+/// An empty `after` string starts at the first page.
+#[derive(Debug, Clone, Deserialize, utoipa::ToSchema)]
+pub struct EntityQueryRequest {
+    /// The indexed attribute name.
+    pub attribute: String,
+    /// The exact attribute value.
+    pub value: AttributeValue,
+    /// The page size. The default is 50. The maximum is 200.
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// The entity id to resume after. An empty string starts at the first page.
+    #[serde(default)]
+    pub after: Option<String>,
+}
+
+impl EntityQueryRequest {
+    /// Resolves the page window and checks the limit.
+    fn resolve(&self) -> Result<(usize, Option<String>), EavApiError> {
+        let limit = self.limit.unwrap_or(DEFAULT_PAGE_LIMIT);
+        if limit == 0 || limit > MAX_PAGE_LIMIT {
+            return Err(EavApiError::Invalid(Box::new(InvalidPageLimit)));
+        }
+        let after = self.after.clone().filter(|cursor| !cursor.is_empty());
+        Ok((limit, after))
+    }
+}
+
+/// A page of entities that match an indexed attribute value.
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
+pub struct EntityQueryPage {
+    /// The entities on this page.
+    pub items: Vec<Entity>,
+    /// The entity id to pass as `after` for the next page.
+    /// `None` means that the scan is exhausted.
+    pub next: Option<String>,
+}
+
 /// The source of a page limit outside the allowed range.
 #[derive(Debug)]
 struct InvalidPageLimit;
@@ -407,6 +449,9 @@ pub enum EavApiError {
     /// The request is not valid. HTTP 400.
     #[error("invalid request")]
     Invalid(#[source] Box<dyn std::error::Error + Send + Sync>),
+    /// An attribute is not indexed. HTTP 400.
+    #[error("attribute is not indexed")]
+    NotIndexed,
     /// The request conflicts with the stored state. HTTP 409.
     #[error("conflict")]
     Conflict(#[source] Box<dyn std::error::Error + Send + Sync>),
@@ -441,7 +486,7 @@ impl EavApiError {
         use actix_web::http::StatusCode;
         match self {
             Self::NotFound(_) => StatusCode::NOT_FOUND,
-            Self::Invalid(_) => StatusCode::BAD_REQUEST,
+            Self::Invalid(_) | Self::NotIndexed => StatusCode::BAD_REQUEST,
             Self::Conflict(_) => StatusCode::CONFLICT,
             Self::Forbidden(_) => StatusCode::FORBIDDEN,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -452,7 +497,7 @@ impl EavApiError {
     fn code(&self) -> &'static str {
         match self {
             Self::NotFound(_) => "not_found",
-            Self::Invalid(_) => "invalid_request",
+            Self::Invalid(_) | Self::NotIndexed => "invalid_request",
             Self::Conflict(_) => "conflict",
             Self::Forbidden(_) => "forbidden",
             Self::Internal(_) => "internal_error",
@@ -490,12 +535,12 @@ impl From<EntityError> for EavApiError {
     fn from(error: EntityError) -> Self {
         let kind = match &error {
             EntityError::NotFound(_) | EntityError::UnknownSchema(_) => Kind::NotFound,
+            EntityError::NotIndexed(_) => return Self::NotIndexed,
             EntityError::Invalid(_)
             | EntityError::UnknownAttribute(_)
             | EntityError::SchemaConflict(_)
             | EntityError::MissingRequired(_)
-            | EntityError::TypeMismatch(_)
-            | EntityError::NotIndexed(_) => Kind::Invalid,
+            | EntityError::TypeMismatch(_) => Kind::Invalid,
             EntityError::UniqueViolation(_)
             | EntityError::VersionConflict
             | EntityError::AlreadyExists(_)
@@ -851,6 +896,36 @@ async fn list_entities(
     }
 }
 
+/// Queries one page of entities by an indexed attribute value.
+///
+/// A collection `read` on `eav_entities` exposes every entity.
+/// A row grant exposes only that entity.
+/// The handler filters each result with `can_read_entity`.
+/// The response holds the next cursor when the page is full.
+/// An attribute that no applied schema indexes returns `400`.
+#[utoipa::path(post, path = "/eav/entities/query", tag = "eav", request_body = EntityQueryRequest, responses((status=200, body=EntityQueryPage), (status=400, body=crate::http::error::ErrorBody), (status=401, body=crate::http::error::ErrorBody), (status=403, body=crate::http::error::ErrorBody), (status=500, body=crate::http::error::ErrorBody)))]
+#[post("/entities/query")]
+async fn query_entities(
+    runtime: web::Data<EavRuntime>,
+    policy: web::Data<Authorizer>,
+    claims: Validated<Claims>,
+    body: web::Json<EntityQueryRequest>,
+) -> Result<HttpResponse, EavApiError> {
+    let request = body.into_inner();
+    let (limit, after) = request.resolve()?;
+    let (entities, next) = runtime
+        .entities()
+        .list_by_attribute_after(&request.attribute, &request.value, limit, after.as_deref())
+        .await?;
+    let mut items = Vec::with_capacity(entities.len());
+    for entity in entities {
+        if can_read_entity(&policy, &claims.sub, &entity.id).await? {
+            items.push(entity);
+        }
+    }
+    Ok(HttpResponse::Ok().json(EntityQueryPage { items, next }))
+}
+
 #[utoipa::path(get, path = "/eav/entities/{id}", tag = "eav", params(("id" = String, Path)), responses((status=200, body=crate::eav::entity::Entity), (status=401, body=crate::http::error::ErrorBody), (status=403, body=crate::http::error::ErrorBody), (status=404, body=crate::http::error::ErrorBody), (status=500, body=crate::http::error::ErrorBody)))]
 #[get("/entities/{id}")]
 async fn get_entity(
@@ -1103,6 +1178,7 @@ mod tests {
         "/eav/schemas/{id}/migrate",
         "/eav/schemas/{id}/entities",
         "/eav/entities",
+        "/eav/entities/query",
         "/eav/entities/{id}",
         "/eav/rules",
         "/eav/rules/{id}",
@@ -1281,6 +1357,27 @@ mod tests {
         Ok(())
     }
 
+    async fn publish_indexed_tag_schema(fx: &Fixture) -> anyhow::Result<()> {
+        publish_schema_version(fx, "task", vec![indexed_attr("tag", AttributeType::String)]).await
+    }
+
+    async fn create_tagged_task(fx: &Fixture, id: &str, tag: &str) -> anyhow::Result<()> {
+        fx.runtime
+            .entities()
+            .create(
+                EntityDraft {
+                    id: id.to_string(),
+                    schemas: vec!["task".to_string()],
+                    attributes: [("tag".to_string(), AttributeValue::String(tag.to_string()))]
+                        .into_iter()
+                        .collect(),
+                },
+                &WriteContext::new("alice"),
+            )
+            .await?;
+        Ok(())
+    }
+
     fn attr(name: &str, ty: AttributeType) -> AttributeDef {
         AttributeDef {
             name: name.to_string(),
@@ -1289,6 +1386,13 @@ mod tests {
             indexed: false,
             unique: false,
             default: None,
+        }
+    }
+
+    fn indexed_attr(name: &str, ty: AttributeType) -> AttributeDef {
+        AttributeDef {
+            indexed: true,
+            ..attr(name, ty)
         }
     }
 
@@ -1340,6 +1444,11 @@ mod tests {
             ),
             (
                 EavApiError::from(EntityError::TypeMismatch("x".into())),
+                400,
+                "invalid_request",
+            ),
+            (
+                EavApiError::from(EntityError::NotIndexed("x".into())),
                 400,
                 "invalid_request",
             ),
@@ -1763,6 +1872,112 @@ mod tests {
     }
 
     #[actix_web::test]
+    async fn entity_query_returns_matching_entities() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        assert!(fx.engine.claim_superadmin("alice").await?);
+        publish_indexed_tag_schema(&fx).await?;
+        create_tagged_task(&fx, "e1", "alpha").await?;
+        create_tagged_task(&fx, "e2", "alpha").await?;
+        create_tagged_task(&fx, "e3", "beta").await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::post()
+                    .uri("/eav/entities/query")
+                    .set_json(json!({
+                        "attribute": "tag",
+                        "value": {"type": "string", "value": "alpha"}
+                    })),
+                &fx.token("alice")?,
+            )
+            .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let page: Value = actix_test::read_body_json(res).await;
+        let ids: Vec<&str> = page["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .map(|item| item["id"].as_str().expect("id"))
+            .collect();
+        assert_eq!(ids, vec!["e1", "e2"]);
+        assert!(page["next"].is_null());
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn entity_query_pages_with_the_after_cursor() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        assert!(fx.engine.claim_superadmin("alice").await?);
+        publish_indexed_tag_schema(&fx).await?;
+        for id in ["e1", "e2", "e3"] {
+            create_tagged_task(&fx, id, "alpha").await?;
+        }
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::post()
+                    .uri("/eav/entities/query")
+                    .set_json(json!({
+                        "attribute": "tag",
+                        "value": {"type": "string", "value": "alpha"},
+                        "limit": 2,
+                        "after": ""
+                    })),
+                &token,
+            )
+            .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let page: Value = actix_test::read_body_json(res).await;
+        let ids: Vec<&str> = page["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .map(|item| item["id"].as_str().expect("id"))
+            .collect();
+        assert_eq!(ids, vec!["e1", "e2"]);
+        assert_eq!(page["next"], "e2");
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::post()
+                    .uri("/eav/entities/query")
+                    .set_json(json!({
+                        "attribute": "tag",
+                        "value": {"type": "string", "value": "alpha"},
+                        "limit": 2,
+                        "after": "e2"
+                    })),
+                &token,
+            )
+            .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let page: Value = actix_test::read_body_json(res).await;
+        let ids: Vec<&str> = page["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .map(|item| item["id"].as_str().expect("id"))
+            .collect();
+        assert_eq!(ids, vec!["e3"]);
+        assert!(page["next"].is_null());
+        Ok(())
+    }
+
+    #[actix_web::test]
     async fn the_schema_list_pages_with_an_after_cursor() -> anyhow::Result<()> {
         let fx = fixture().await?;
         assert!(fx.engine.claim_superadmin("alice").await?);
@@ -1819,6 +2034,37 @@ mod tests {
     }
 
     #[actix_web::test]
+    async fn entity_query_rejects_an_attribute_that_is_not_indexed() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        assert!(fx.engine.claim_superadmin("alice").await?);
+        publish_schema_version(&fx, "task", vec![attr("tag", AttributeType::String)]).await?;
+        create_tagged_task(&fx, "e1", "secret").await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::post()
+                    .uri("/eav/entities/query")
+                    .set_json(json!({
+                        "attribute": "tag",
+                        "value": {"type": "string", "value": "secret"}
+                    })),
+                &fx.token("alice")?,
+            )
+            .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::BAD_REQUEST);
+        let body: crate::http::error::ErrorBody = actix_test::read_body_json(res).await;
+        assert_eq!(body.code.as_deref(), Some("invalid_request"));
+        assert_eq!(body.error, "attribute is not indexed");
+        assert!(!body.error.contains("secret"), "{}", body.error);
+        Ok(())
+    }
+
+    #[actix_web::test]
     async fn an_after_cursor_with_a_non_zero_offset_is_400() -> anyhow::Result<()> {
         let fx = fixture().await?;
         assert!(fx.engine.claim_superadmin("alice").await?);
@@ -1840,6 +2086,47 @@ mod tests {
             let body: crate::http::error::ErrorBody = actix_test::read_body_json(res).await;
             assert_eq!(body.code.as_deref(), Some("invalid_request"), "{uri}");
         }
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn entity_query_applies_a_row_grant() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        publish_indexed_tag_schema(&fx).await?;
+        create_tagged_task(&fx, "e1", "alpha").await?;
+        create_tagged_task(&fx, "e2", "alpha").await?;
+        fx.engine
+            .assign_group("carol".into(), "row-readers".into())
+            .await?;
+        fx.engine
+            .add_rule("row-readers".into(), "entity:e1".into(), Action::Read)
+            .await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::post()
+                    .uri("/eav/entities/query")
+                    .set_json(json!({
+                        "attribute": "tag",
+                        "value": {"type": "string", "value": "alpha"}
+                    })),
+                &fx.token("carol")?,
+            )
+            .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let page: Value = actix_test::read_body_json(res).await;
+        let ids: Vec<&str> = page["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .map(|item| item["id"].as_str().expect("id"))
+            .collect();
+        assert_eq!(ids, vec!["e1"]);
         Ok(())
     }
 
