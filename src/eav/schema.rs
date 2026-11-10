@@ -23,6 +23,7 @@ use oxkv::{Direction, GetSet, KeyValue, OxKvStore, Store as _, Transaction as _}
 use serde::{Deserialize, Deserializer, Serialize, de};
 use tokio::sync::{Mutex, RwLock};
 
+use crate::eav::MAX_PAGE_OFFSET;
 use crate::eav::error::SchemaError;
 
 /// Key prefix for the whole schema family.
@@ -311,11 +312,18 @@ impl SchemaRegistry {
     /// The call skips `offset` schemas.
     /// It then loads at most `limit` versions.
     /// A `limit` of 0 returns an empty list.
+    /// An offset above `MAX_PAGE_OFFSET` returns an invalid-input error.
+    /// Use `after` for a deeper page.
     pub async fn list_page(
         &self,
         limit: usize,
         offset: usize,
     ) -> Result<Vec<SchemaDef>, SchemaError> {
+        if offset > MAX_PAGE_OFFSET {
+            return Err(SchemaError::Invalid(format!(
+                "offset must be at most {MAX_PAGE_OFFSET}. Use after to page deeper."
+            )));
+        }
         if limit == 0 {
             return Ok(Vec::new());
         }
@@ -1098,6 +1106,16 @@ mod tests {
         let page = reg.list_page(2, 9).await.unwrap();
 
         assert!(page.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_page_rejects_an_offset_above_the_maximum() {
+        let reg = new_registry().await;
+        reg.publish(draft("a", &[], vec![])).await.unwrap();
+
+        let result = reg.list_page(2, MAX_PAGE_OFFSET + 1).await;
+
+        assert!(matches!(result, Err(SchemaError::Invalid(_))));
     }
 
     #[tokio::test]
