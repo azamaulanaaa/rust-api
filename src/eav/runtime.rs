@@ -114,11 +114,14 @@ impl EavRuntime {
     /// The replica store lives at `{db_prefix}/eav/replica`.
     /// The entity store writes its events to `wal`.
     /// The rule engine uses the given actions.
+    /// The entity store checks that each `EntityRef` target exists when
+    /// `check_entity_refs` is true.
     pub async fn build(
         s3: &S3ClientConfig,
         db_prefix: &str,
         wal: Wal,
         actions: Vec<Arc<dyn RuleAction>>,
+        check_entity_refs: bool,
     ) -> anyhow::Result<Self> {
         let schema_store = build_s3_store(s3, &domain_prefix(db_prefix, "schema"))
             .await
@@ -134,8 +137,9 @@ impl EavRuntime {
             .context("build the EAV replica store")?;
 
         let schemas = SchemaRegistry::new(schema_store);
-        let entities =
-            EntityStore::new(entity_store, schemas.clone()).with_change_sink(Arc::new(wal.clone()));
+        let entities = EntityStore::new(entity_store, schemas.clone())
+            .with_change_sink(Arc::new(wal.clone()))
+            .with_entity_ref_check(check_entity_refs);
         let rules = RuleStore::new(rule_store);
         let replicas = ReplicaStore::new(replica_store);
         let metrics = EavMetrics::global();
@@ -582,7 +586,9 @@ mod tests {
         let s3 = memory_s3();
         let prefix = test_prefix("eav-runtime");
         let wal = Wal::new(build_s3_store(&s3, &format!("{prefix}/wal")).await.unwrap());
-        EavRuntime::build(&s3, &prefix, wal, actions).await.unwrap()
+        EavRuntime::build(&s3, &prefix, wal, actions, true)
+            .await
+            .unwrap()
     }
 
     fn short_config() -> EavRuntimeConfig {
