@@ -263,7 +263,7 @@ Schema evolution has three steps. `GET /eav/schemas/{id}/diff` reports added, re
 
 The entity store writes one change event to an outbox row in the same transaction as the entity data. A background relay flushes the outbox to the shared change feed. Delivery is at least once, so a consumer must be idempotent. Clients read the feed through `/eav/sync/events` and load the initial state through `/eav/sync/snapshot`.
 
-The module also stores one per-user entity replica. `POST /eav/sync/replica` builds a point-in-time snapshot of the entities that the caller can read, in ordered chunks. The client then applies the entity change feed after the stored head. `GET /eav/sync/replica` returns the full snapshot as one JSON array. This full read is for compatibility. `GET /eav/sync/replica?chunk=N` returns one stored chunk. Read chunks from 0 until `next` is null. The build filters with the grants at build time. Each read filters again with the current grants. The snapshot gives no authorization cache, so a policy change takes effect on the next read. The read sets no `ETag` and ignores `If-None-Match`. The response depends on the current grants, so it has no stable validator. This replica differs from the file replica under `/sync`. The `/sync` replica mirrors file records and relations as prefix-scoped store objects. The EAV replica is a chunked JSON snapshot in the EAV replica store. It is not an incremental store.
+The module also stores one per-user entity replica. `POST /eav/sync/replica` builds a head-anchored snapshot of the entities that the caller can read, in ordered chunks. The build reads the feed head first. It then pages the entities. A change that commits after the head can appear in the snapshot. The client applies the feed events after the returned `head`. An apply must be idempotent and version-aware. `GET /eav/sync/replica` returns the full snapshot as one JSON array. This full read is for compatibility. `GET /eav/sync/replica?chunk=N` returns one stored chunk. Read chunks from 0 until `next` is null. The build filters with the grants at build time. Each read filters again with the current grants. The snapshot gives no authorization cache, so a policy change takes effect on the next read. The read sets no `ETag` and ignores `If-None-Match`. The response depends on the current grants, so it has no stable validator. This replica differs from the file replica under `/sync`. The `/sync` replica mirrors file records and relations as prefix-scoped store objects. The EAV replica is a chunked JSON snapshot in the EAV replica store. It is not an incremental store.
 
 ```bash
 curl -s -H "Authorization: Bearer $TOKEN" \
@@ -307,7 +307,7 @@ Metrics cover rule execution (`eav.rules.executed`, `eav.rules.failed`) and webh
 | Method | Path | Description | Auth |
 |---|---|---|---|
 | GET | `/health` | Liveness probe. Always `200`. | none |
-| GET | `/ready` | Readiness probe: policy lock, writer lease, fencing, and dependency probes | none |
+| GET | `/ready` | Readiness probe: policy lock, writer lease, fencing, dependency probes, and the EAV failure latch | none |
 | GET | `/auth/login` | Start OIDC login. Accepts an optional relative `return_to` and redirects to the provider | none |
 | GET | `/auth/callback` | OIDC callback. Returns JSON, or `302` to `return_to` | none |
 | GET | `/auth/me` | Session probe: `sub`, `iss`, `aud`, `exp` | session |
@@ -676,6 +676,9 @@ See modules `lease` and `fencing` in the rustdoc for the protocol.
 - The server lost the writer lease.
 - A primary prefix was fenced.
 - The last background probe of S3 or OIDC failed.
+- An EAV background loop failed, so the failure latch is set.
+
+Each EAV background loop runs under a supervisor. An outbox relay, rule runner, marker cleanup, or timer pass failure sets the failure latch, and the supervisor logs it at `error` level. The supervisor restarts that loop with exponential backoff from 1 second up to 60 seconds. The other loops keep running. `/ready` returns `503` while the latch is set. Restart the process, or read the `EAV background loop failed` log entry.
 
 Wire `/ready` to a Kubernetes readiness probe or a load balancer health check. A route that nothing reads does not remove the instance from rotation. This matters most for fencing, because no client sees that error.
 
@@ -687,8 +690,25 @@ Wire `/ready` to a Kubernetes readiness probe or a load balancer health check. A
 |---|---|---|
 | Policy rules | `{db}/policy` | `rust-api policy import` (see [Policy export and import](#policy-export-and-import)). The import is idempotent. |
 | File metadata and relations | `{db}/fs` | Copy the prefix objects back. Use S3 bucket versioning, or copy prefixes between buckets. |
+| EAV schemas | `{db}/eav/schema` | Copy the prefix objects back. The store holds the versioned schemas. |
+| EAV entities | `{db}/eav/entity` | Copy the prefix objects back. The store holds the entities, attributes, indexes, and outbox. |
+| EAV rules | `{db}/eav/rules` | Copy the prefix objects back. The store holds the rules, the change-feed cursor, and the execution markers. |
+| EAV webhook queue | `{db}/eav-queue` | Copy the prefix objects back. The store holds the durable webhook job queue. |
+| EAV replicas | `{db}/eav/replica` | Copy the prefix objects back. The store holds the per-user chunked snapshots. |
 | Change feed | `{db}/wal` | Nothing. It is a replay log. A fresh prefix replays from zero. |
 | File bytes | User buckets | Your own S3 lifecycle rules. |
+
+Restore the policy, the EAV stores, and the WAL together, from one point in time. When the queue is enabled, include the durable webhook job queue. Restore them in this order:
+
+1. Policy
+2. EAV schemas
+3. EAV entities
+4. EAV rules
+5. EAV webhook queue (when the queue is enabled)
+6. EAV replicas
+7. WAL
+
+The rule store holds the cursor into the WAL. Restore the WAL with the rule store. If you restore the rule store without the WAL, reset the rule cursor and the stored replica heads. A reset feed with an old replica head needs a replica reset or a fresh build.
 
 There is no automated backup job and no restore drill in this repository. Rehearse both.
 
