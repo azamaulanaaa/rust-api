@@ -1265,7 +1265,10 @@ mod tests {
             wal,
             vec![
                 Arc::new(NoopAction),
-                Arc::new(WebhookAction::new(vec![server.address().to_string()])),
+                Arc::new(
+                    WebhookAction::new(vec![server.address().to_string()])
+                        .allow_private_hosts(true),
+                ),
             ],
             true,
         )
