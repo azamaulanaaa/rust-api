@@ -15,6 +15,7 @@
 //! Keys:
 //!
 //! - `replica:{sub_hash}:head` holds a JSON `u64`.
+//! - `replica:{sub_hash}:generation` holds a JSON `u64`.
 //! - `replica:{sub_hash}:meta:{head}` holds JSON `{ "chunks": u64 }`.
 //! - `replica:{sub_hash}:data:{head}:{index:08}` holds one JSON chunk.
 //!
@@ -23,15 +24,19 @@
 //! `sub_hash` is the lowercase SHA-256 hex of the subject.
 //! The hash keeps the subject text out of the key.
 //!
-//! A put writes every chunk, the manifest, and the head in one transaction.
+//! A put writes every chunk, the manifest, the head, and the generation in
+//! one transaction.
 //! The same transaction deletes the old manifest and every old chunk row.
 //! A head equal to the stored head replaces the snapshot.
+//! The put increments the generation on each replacement.
+//! Thus a read detects an equal-head rebuild that changes the snapshot.
 //!
-//! A read sees consistent chunks when the head does not change during the
-//! read.
-//! The read checks the head before and after it reads the manifest and the
-//! chunk rows.
-//! It retries when the head changed or a row is absent.
+//! A read sees consistent chunks when the head and the generation do not
+//! change during the read.
+//! The read checks the head and the generation before and after it reads the
+//! manifest and the chunk rows.
+//! It retries when the head, the generation, or a row changed or is absent.
+//! A missing generation row means a legacy replica at generation 0.
 //!
 //! The store adds no business logic.
 //! It does not filter the data and it does not read the event feed.
@@ -52,6 +57,8 @@ const GET_ATTEMPTS: u32 = 16;
 pub struct ReplicaSnapshot {
     /// The head of the stored replica.
     pub head: u64,
+    /// The build generation of the stored replica.
+    pub generation: u64,
     /// The JSON chunks in index order.
     pub chunks: Vec<Vec<u8>>,
 }
@@ -61,6 +68,8 @@ pub struct ReplicaSnapshot {
 pub struct ReplicaChunk {
     /// The head of the stored replica.
     pub head: u64,
+    /// The build generation of the stored replica.
+    pub generation: u64,
     /// The zero-based index of this chunk.
     pub index: usize,
     /// The number of chunks in the stored replica.
@@ -76,19 +85,36 @@ struct ReplicaMeta {
     chunks: u64,
 }
 
+/// A test hook that runs inside one read attempt.
+#[cfg(test)]
+type ReadHook = std::sync::Arc<
+    dyn for<'a> Fn(
+            &'a OxKvStore,
+            u32,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>
+        + Send
+        + Sync,
+>;
+
 /// A stored per-user entity replica.
 ///
 /// A build replaces the previous snapshot for the same subject.
 /// A build with a lower head fails with [`EntityError::StaleHead`].
-/// A read checks the head before and after it reads the manifest and the
-/// chunk rows.
-/// It retries when the head changed or a row is absent.
-/// All rows commit in one transaction, so a head that did not change names
-/// rows from the same snapshot.
+/// A build increments the generation, including a build with a head equal to
+/// the stored head.
+/// A read checks the head and the generation before and after it reads the
+/// manifest and the chunk rows.
+/// It retries when the head, the generation, or a row changed or is absent.
+/// A missing generation row means a legacy replica at generation 0.
+/// All rows commit in one transaction, so a head and a generation that did not
+/// change name rows from the same snapshot.
 #[derive(Clone)]
 pub struct ReplicaStore {
     /// The shared replica store handle.
     store: Arc<RwLock<OxKvStore>>,
+    /// Runs inside each read attempt before the final check.
+    #[cfg(test)]
+    read_hook: Option<ReadHook>,
 }
 
 impl ReplicaStore {
@@ -96,18 +122,40 @@ impl ReplicaStore {
     pub fn new(store: OxKvStore) -> Self {
         Self {
             store: Arc::new(RwLock::new(store)),
+            #[cfg(test)]
+            read_hook: None,
         }
+    }
+
+    /// Sets a hook that runs inside each read attempt.
+    #[cfg(test)]
+    fn with_read_hook(mut self, hook: ReadHook) -> Self {
+        self.read_hook = Some(hook);
+        self
     }
 
     /// Stores `chunks` for `sub` at `head`.
     ///
-    /// Every chunk, the manifest, and the head commit in one transaction.
+    /// Every chunk, the manifest, the head, and the generation commit in one
+    /// transaction.
     /// The same transaction deletes the old manifest and every old chunk row.
+    /// The call reads the stored generation in the same transaction and writes
+    /// the next value.
+    /// A missing generation row counts as `0`, so the first put writes `1`.
     /// A `head` lower than the stored head is stale.
-    /// A stale build returns [`EntityError::StaleHead`] and changes nothing.
-    /// A `head` equal to the stored head replaces the snapshot.
-    /// Thus the stored head never goes backwards.
-    pub async fn put(&self, sub: &str, head: u64, chunks: Vec<Vec<u8>>) -> Result<(), EntityError> {
+    /// A stale build returns [`EntityError::StaleHead`] and changes nothing,
+    /// including the generation.
+    /// A `head` equal to the stored head replaces the snapshot and increments
+    /// the generation.
+    /// Thus the stored head never goes backwards, and the generation is
+    /// monotonic per subject.
+    /// The call returns the new generation.
+    pub async fn put(
+        &self,
+        sub: &str,
+        head: u64,
+        chunks: Vec<Vec<u8>>,
+    ) -> Result<u64, EntityError> {
         let hash = sub_hash(sub);
         let head_bytes =
             serde_json::to_vec(&head).map_err(|e| EntityError::Internal(e.to_string()))?;
@@ -127,6 +175,12 @@ impl ReplicaStore {
                 incoming: head,
             });
         }
+        let stored_generation = read_generation(&tx, &hash).await?.unwrap_or(0);
+        let generation = stored_generation
+            .checked_add(1)
+            .ok_or_else(|| EntityError::Internal("replica generation is exhausted".to_string()))?;
+        let generation_bytes =
+            serde_json::to_vec(&generation).map_err(|e| EntityError::Internal(e.to_string()))?;
         if let Some(old_head) = old_head {
             let old_chunks = read_meta(&tx, &hash, old_head)
                 .await?
@@ -152,28 +206,35 @@ impl ReplicaStore {
         tx.set_bytes(&head_key(&hash), &head_bytes)
             .await
             .map_err(EntityError::Store)?;
+        tx.set_bytes(&generation_key(&hash), &generation_bytes)
+            .await
+            .map_err(EntityError::Store)?;
         tx.commit().await.map_err(EntityError::Store)?;
-        Ok(())
+        Ok(generation)
     }
 
     /// Returns the stored snapshot for `sub`.
     ///
     /// The call returns `None` only when the subject has no replica.
-    /// A `put` can replace the head while a read runs.
-    /// The call reads the head, the manifest, every chunk, then the head
-    /// again.
-    /// It retries when the head changed or a row is absent.
-    /// A head that did not change names rows from the same committed
-    /// snapshot, so the chunks are consistent.
+    /// A `put` can replace the head or the generation while a read runs.
+    /// The call reads the head, the generation, the manifest, every chunk, then
+    /// the head and the generation again.
+    /// It retries when the head, the generation, or a row changed or is absent.
+    /// A missing generation row means a legacy replica at generation 0.
+    /// A head and a generation that did not change name rows from the same
+    /// committed snapshot, so the chunks are consistent.
+    /// An equal-head rebuild changes the generation, so a read across it
+    /// retries.
     /// The loop has a fixed limit.
     /// The call returns an internal error when every attempt loses the race.
     pub async fn get(&self, sub: &str) -> Result<Option<ReplicaSnapshot>, EntityError> {
         let hash = sub_hash(sub);
         let g = self.store.read().await;
-        for _ in 0..GET_ATTEMPTS {
+        for _attempt in 0..GET_ATTEMPTS {
             let Some(head) = read_head(&*g, &hash).await? else {
                 return Ok(None);
             };
+            let generation = read_generation(&*g, &hash).await?.unwrap_or(0);
             let Some(meta) = read_meta(&*g, &hash, head).await? else {
                 continue;
             };
@@ -193,13 +254,24 @@ impl ReplicaStore {
                     }
                 }
             }
+            #[cfg(test)]
+            if let Some(hook) = &self.read_hook {
+                hook(&g, _attempt).await;
+            }
             if read_head(&*g, &hash).await? != Some(head) {
+                continue;
+            }
+            if read_generation(&*g, &hash).await?.unwrap_or(0) != generation {
                 continue;
             }
             if missing {
                 continue;
             }
-            return Ok(Some(ReplicaSnapshot { head, chunks: data }));
+            return Ok(Some(ReplicaSnapshot {
+                head,
+                generation,
+                chunks: data,
+            }));
         }
         Err(EntityError::Internal(
             "replica read did not settle".to_string(),
@@ -210,8 +282,10 @@ impl ReplicaStore {
     ///
     /// The call returns `None` when the subject has no replica or when `index`
     /// is out of range.
-    /// The call reads the head, the manifest, one chunk, then the head again.
-    /// It retries when the head changed or a row is absent.
+    /// The call reads the head, the generation, the manifest, one chunk, then
+    /// the head and the generation again.
+    /// It retries when the head, the generation, or a row changed or is absent.
+    /// A missing generation row means a legacy replica at generation 0.
     /// The loop has a fixed limit.
     /// The call returns an internal error when every attempt loses the race.
     pub async fn get_chunk(
@@ -221,10 +295,11 @@ impl ReplicaStore {
     ) -> Result<Option<ReplicaChunk>, EntityError> {
         let hash = sub_hash(sub);
         let g = self.store.read().await;
-        for _ in 0..GET_ATTEMPTS {
+        for _attempt in 0..GET_ATTEMPTS {
             let Some(head) = read_head(&*g, &hash).await? else {
                 return Ok(None);
             };
+            let generation = read_generation(&*g, &hash).await?.unwrap_or(0);
             let Some(meta) = read_meta(&*g, &hash, head).await? else {
                 continue;
             };
@@ -233,13 +308,23 @@ impl ReplicaStore {
                 if read_head(&*g, &hash).await? != Some(head) {
                     continue;
                 }
+                if read_generation(&*g, &hash).await?.unwrap_or(0) != generation {
+                    continue;
+                }
                 return Ok(None);
             }
             let data = g
                 .get_bytes(&data_key(&hash, head, index))
                 .await
                 .map_err(EntityError::Store)?;
+            #[cfg(test)]
+            if let Some(hook) = &self.read_hook {
+                hook(&g, _attempt).await;
+            }
             if read_head(&*g, &hash).await? != Some(head) {
+                continue;
+            }
+            if read_generation(&*g, &hash).await?.unwrap_or(0) != generation {
                 continue;
             }
             let Some(data) = data else {
@@ -247,6 +332,7 @@ impl ReplicaStore {
             };
             return Ok(Some(ReplicaChunk {
                 head,
+                generation,
                 index,
                 chunks,
                 data,
@@ -281,6 +367,11 @@ fn sub_hash(sub: &str) -> String {
 /// Returns the head key for one subject hash.
 fn head_key(hash: &str) -> String {
     format!("replica:{hash}:head")
+}
+
+/// Returns the generation key for one subject hash.
+fn generation_key(hash: &str) -> String {
+    format!("replica:{hash}:generation")
 }
 
 /// Returns the manifest key for one subject hash and head.
@@ -327,6 +418,23 @@ where
         .map_err(|e| EntityError::Internal(e.to_string()))
 }
 
+/// Reads and decodes the generation row for one subject hash.
+async fn read_generation<S>(store: &S, hash: &str) -> Result<Option<u64>, EntityError>
+where
+    S: GetSet + ?Sized,
+{
+    let Some(bytes) = store
+        .get_bytes(&generation_key(hash))
+        .await
+        .map_err(EntityError::Store)?
+    else {
+        return Ok(None);
+    };
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|e| EntityError::Internal(e.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -338,6 +446,71 @@ mod tests {
 
     fn chunks(values: &[&[u8]]) -> Vec<Vec<u8>> {
         values.iter().map(|value| value.to_vec()).collect()
+    }
+
+    /// Writes a replica as an older build did: head, manifest, and chunks, with
+    /// no generation row.
+    async fn seed_legacy_replica(store: &ReplicaStore, sub: &str, head: u64, values: &[&[u8]]) {
+        let hash = sub_hash(sub);
+        let g = store.store.write().await;
+        g.set_bytes(&head_key(&hash), head.to_string().as_bytes())
+            .await
+            .unwrap();
+        g.set_bytes(
+            &meta_key(&hash, head),
+            format!("{{\"chunks\":{}}}", values.len()).as_bytes(),
+        )
+        .await
+        .unwrap();
+        for (index, value) in values.iter().enumerate() {
+            g.set_bytes(&data_key(&hash, head, index), value)
+                .await
+                .unwrap();
+        }
+        assert!(
+            g.get_bytes(&generation_key(&hash)).await.unwrap().is_none(),
+            "the legacy replica must have no generation row"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_returns_a_legacy_replica_at_generation_zero() {
+        let store = store().await;
+        seed_legacy_replica(&store, "alice", 7, &[b"one", b"two"]).await;
+
+        let snapshot = store.get("alice").await.unwrap().expect("snapshot");
+
+        assert_eq!(snapshot.head, 7);
+        assert_eq!(snapshot.generation, 0);
+        assert_eq!(snapshot.chunks, chunks(&[b"one", b"two"]));
+    }
+
+    #[tokio::test]
+    async fn get_chunk_returns_a_legacy_chunk_at_generation_zero() {
+        let store = store().await;
+        seed_legacy_replica(&store, "alice", 7, &[b"one", b"two"]).await;
+
+        let chunk = store.get_chunk("alice", 1).await.unwrap().expect("chunk");
+
+        assert_eq!(chunk.head, 7);
+        assert_eq!(chunk.generation, 0);
+        assert_eq!(chunk.index, 1);
+        assert_eq!(chunk.chunks, 2);
+        assert_eq!(chunk.data, b"two".to_vec());
+    }
+
+    #[tokio::test]
+    async fn a_put_after_a_legacy_replica_writes_generation_one() {
+        let store = store().await;
+        seed_legacy_replica(&store, "alice", 7, &[b"old"]).await;
+
+        assert_eq!(store.put("alice", 8, chunks(&[b"new"])).await.unwrap(), 1);
+
+        let snapshot = store.get("alice").await.unwrap().expect("snapshot");
+
+        assert_eq!(snapshot.head, 8);
+        assert_eq!(snapshot.generation, 1);
+        assert_eq!(snapshot.chunks, chunks(&[b"new"]));
     }
 
     #[tokio::test]
@@ -352,6 +525,7 @@ mod tests {
             store.get("alice").await.unwrap(),
             Some(ReplicaSnapshot {
                 head: 7,
+                generation: 1,
                 chunks: chunks(&[b"[{\"id\":\"e1\"}]"]),
             })
         );
@@ -424,6 +598,7 @@ mod tests {
             store.get("alice").await.unwrap(),
             Some(ReplicaSnapshot {
                 head: 9,
+                generation: 2,
                 chunks: chunks(&[b"new", b"data"]),
             })
         );
@@ -490,6 +665,7 @@ mod tests {
             store.get("alice").await.unwrap(),
             Some(ReplicaSnapshot {
                 head: 9,
+                generation: 1,
                 chunks: chunks(&[b"new-0", b"new-1"]),
             })
         );
@@ -525,6 +701,7 @@ mod tests {
             store.get("alice").await.unwrap(),
             Some(ReplicaSnapshot {
                 head: 5,
+                generation: 1,
                 chunks: Vec::new(),
             })
         );
@@ -555,6 +732,7 @@ mod tests {
             store.get("alice").await.unwrap(),
             Some(ReplicaSnapshot {
                 head: 4,
+                generation: 2,
                 chunks: chunks(&[b"new-0"]),
             })
         );
@@ -614,8 +792,156 @@ mod tests {
             store.get("alice").await.unwrap(),
             Some(ReplicaSnapshot {
                 head: 25,
+                generation: 26,
                 chunks: chunks(&[b"v25-0", b"v25-1", b"v25-2"]),
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn the_first_put_writes_generation_one_and_the_next_put_increments_it() {
+        let store = store().await;
+
+        assert_eq!(store.put("alice", 3, chunks(&[b"one"])).await.unwrap(), 1);
+        assert_eq!(store.put("alice", 4, chunks(&[b"two"])).await.unwrap(), 2);
+
+        let hash = sub_hash("alice");
+        let g = store.store.read().await;
+        assert_eq!(
+            g.get_bytes(&generation_key(&hash)).await.unwrap(),
+            Some(b"2".to_vec())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stale_put_does_not_change_the_head_the_generation_or_the_chunks() {
+        let store = store().await;
+        store
+            .put("alice", 9, chunks(&[b"new-0", b"new-1"]))
+            .await
+            .unwrap();
+
+        let error = store
+            .put("alice", 3, chunks(&[b"old-0"]))
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                EntityError::StaleHead {
+                    stored: 9,
+                    incoming: 3
+                }
+            ),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            store.get("alice").await.unwrap(),
+            Some(ReplicaSnapshot {
+                head: 9,
+                generation: 1,
+                chunks: chunks(&[b"new-0", b"new-1"]),
+            })
+        );
+
+        let hash = sub_hash("alice");
+        let g = store.store.read().await;
+        assert_eq!(
+            g.get_bytes(&generation_key(&hash)).await.unwrap(),
+            Some(b"1".to_vec()),
+            "a stale put changed the generation"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_same_head_put_replaces_the_content_and_increments_the_generation() {
+        let store = store().await;
+        store
+            .put("alice", 4, chunks(&[b"old-0", b"old-1"]))
+            .await
+            .unwrap();
+
+        assert_eq!(store.put("alice", 4, chunks(&[b"new-0"])).await.unwrap(), 2);
+
+        let snapshot = store.get("alice").await.unwrap().expect("snapshot");
+
+        assert_eq!(snapshot.head, 4);
+        assert_eq!(snapshot.generation, 2);
+        assert_eq!(snapshot.chunks, chunks(&[b"new-0"]));
+    }
+
+    #[tokio::test]
+    async fn get_returns_the_generation_with_the_snapshot() {
+        let store = store().await;
+        store
+            .put("alice", 7, chunks(&[b"one", b"two"]))
+            .await
+            .unwrap();
+
+        let snapshot = store.get("alice").await.unwrap().expect("snapshot");
+
+        assert_eq!(snapshot.head, 7);
+        assert_eq!(snapshot.generation, 1);
+        assert_eq!(snapshot.chunks, chunks(&[b"one", b"two"]));
+    }
+
+    #[tokio::test]
+    async fn get_chunk_returns_the_generation() {
+        let store = store().await;
+        store.put("alice", 5, chunks(&[b"one"])).await.unwrap();
+        store
+            .put("alice", 6, chunks(&[b"one", b"two"]))
+            .await
+            .unwrap();
+
+        let chunk = store.get_chunk("alice", 1).await.unwrap().expect("chunk");
+
+        assert_eq!(chunk.head, 6);
+        assert_eq!(chunk.generation, 2);
+        assert_eq!(chunk.index, 1);
+        assert_eq!(chunk.chunks, 2);
+        assert_eq!(chunk.data, b"two".to_vec());
+    }
+
+    /// The hook writes a new generation after the chunk read.
+    /// The shared store lock would stop a second writer, so the test uses the
+    /// hook instead of a second store session.
+    #[tokio::test]
+    async fn a_read_retries_when_the_generation_changes_under_it() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let store = store().await;
+        store.put("alice", 5, chunks(&[b"one"])).await.unwrap();
+        let hash = sub_hash("alice");
+        let generation_key = generation_key(&hash);
+        let calls = Arc::new(AtomicU32::new(0));
+        let hook_calls = Arc::clone(&calls);
+        let hook: ReadHook = Arc::new(move |store, _attempt| {
+            let calls = Arc::clone(&hook_calls);
+            let generation_key = generation_key.clone();
+            Box::pin(async move {
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    // Simulate an equal-head rebuild that changes only the
+                    // generation.
+                    store
+                        .set_bytes(&generation_key, b"2")
+                        .await
+                        .expect("hook write");
+                }
+            })
+        });
+        let store = store.with_read_hook(hook);
+
+        let snapshot = store.get("alice").await.unwrap().expect("snapshot");
+
+        assert_eq!(snapshot.head, 5);
+        assert_eq!(snapshot.generation, 2);
+        assert_eq!(snapshot.chunks, chunks(&[b"one"]));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "the read must retry after the generation changes"
         );
     }
 
