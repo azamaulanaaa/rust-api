@@ -21,6 +21,10 @@
 //! The client applies the events after the stored head.
 //! The replica is a head-anchored snapshot, not an incremental store.
 //! The build reads the feed head first, then pages the entities.
+//! A build holds at most `MAX_REPLICA_ENTITIES` visible entities.
+//! The current limit is 100,000.
+//! A build that exceeds the limit stops the entity scan and returns `400`.
+//! The build writes no snapshot, so the stored replica stays unchanged.
 //! A change that commits after the head can appear in the snapshot.
 //! An apply must be idempotent and version-aware.
 //! The full read is for compatibility.
@@ -104,6 +108,12 @@ const REPLICA_CHUNK_ENTITIES: usize = 500;
 const REPLICA_CHUNK_ENTITIES: usize = 2;
 /// The number of replica builds before a stale head is final.
 const REPLICA_BUILD_ATTEMPTS: u32 = 2;
+/// The largest number of visible entities in one replica build.
+#[cfg(not(test))]
+const MAX_REPLICA_ENTITIES: usize = 100_000;
+/// A small entity cap in tests, so a build can exceed it.
+#[cfg(test)]
+const MAX_REPLICA_ENTITIES: usize = 2;
 
 /// The current head of the entity change feed.
 #[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
@@ -539,6 +549,30 @@ impl std::fmt::Display for MissingReplica {
 
 impl std::error::Error for MissingReplica {}
 
+/// The source of a replica build that exceeds the entity limit.
+#[derive(Debug)]
+struct ReplicaBuildTooLarge;
+
+impl std::fmt::Display for ReplicaBuildTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("replica build exceeds the entity limit")
+    }
+}
+
+impl std::error::Error for ReplicaBuildTooLarge {}
+
+/// Returns the entity limit for one replica build.
+fn replica_entity_limit(runtime: &EavRuntime) -> usize {
+    let _ = runtime;
+    #[cfg(test)]
+    {
+        if let Some(limit) = runtime.replica_test().limit() {
+            return limit;
+        }
+    }
+    MAX_REPLICA_ENTITIES
+}
+
 /// Builds a stored replica for the caller.
 ///
 /// The caller needs a valid session.
@@ -548,6 +582,10 @@ impl std::error::Error for MissingReplica {}
 /// It keeps only the entities that the caller can read.
 /// It serializes the entities into ordered JSON chunks.
 /// Each chunk holds at most `REPLICA_CHUNK_ENTITIES` entities.
+/// The build holds at most `MAX_REPLICA_ENTITIES` visible entities.
+/// The current limit is 100,000.
+/// A build that exceeds the limit stops the entity scan and returns `400`.
+/// The build writes no snapshot, so the stored replica stays unchanged.
 /// The build replaces the previous replica and its chunks for the same
 /// subject.
 /// The build increments the replica generation and returns it.
@@ -556,13 +594,16 @@ impl std::error::Error for MissingReplica {}
 /// A newer build can commit first.
 /// The route then reads a fresh feed head and builds one more time.
 /// A second stale result returns `409`.
-#[utoipa::path(post, path = "/eav/sync/replica", tag = "eav", responses((status = 200, body = ReplicaBuildResponse), (status = 401, body = crate::http::error::ErrorBody), (status = 409, body = crate::http::error::ErrorBody), (status = 500, body = crate::http::error::ErrorBody)))]
+#[utoipa::path(post, path = "/eav/sync/replica", tag = "eav", responses((status = 200, body = ReplicaBuildResponse), (status = 400, body = crate::http::error::ErrorBody), (status = 401, body = crate::http::error::ErrorBody), (status = 409, body = crate::http::error::ErrorBody), (status = 500, body = crate::http::error::ErrorBody)))]
 #[post("/sync/replica")]
 pub(crate) async fn build_replica(
     runtime: web::Data<EavRuntime>,
     policy: web::Data<Authorizer>,
     claims: Validated<Claims>,
 ) -> Result<HttpResponse, EavApiError> {
+    #[cfg(test)]
+    runtime.replica_test().reset_read();
+    let entity_limit = replica_entity_limit(&runtime);
     let mut attempt = 0;
     loop {
         attempt += 1;
@@ -577,9 +618,14 @@ pub(crate) async fn build_replica(
                 .list_after(REPLICA_PAGE, after.as_deref())
                 .await?;
             for entity in page {
+                #[cfg(test)]
+                runtime.replica_test().count_read();
                 if can_read_entity(&policy, &claims.sub, &entity.id).await? {
-                    pending.push(entity);
                     count += 1;
+                    if count > entity_limit {
+                        return Err(EavApiError::Invalid(Box::new(ReplicaBuildTooLarge)));
+                    }
+                    pending.push(entity);
                     if pending.len() == REPLICA_CHUNK_ENTITIES {
                         chunks.push(
                             serde_json::to_vec(&pending)
@@ -974,6 +1020,11 @@ mod tests {
         Ok(())
     }
 
+    /// Raises the replica entity limit for a test with many entities.
+    fn raise_replica_limit(fx: &Fixture) {
+        fx.runtime.replica_test().set_limit(100);
+    }
+
     macro_rules! get_route {
         ($app:expr, $uri:expr, $token:expr) => {
             actix_test::call_service(
@@ -988,6 +1039,19 @@ mod tests {
             actix_test::call_service(
                 $app,
                 auth(actix_test::TestRequest::delete().uri($uri), $token).to_request(),
+            )
+        };
+    }
+
+    macro_rules! post_replica {
+        ($app:expr, $token:expr) => {
+            actix_test::call_service(
+                $app,
+                auth(
+                    actix_test::TestRequest::post().uri("/eav/sync/replica"),
+                    $token,
+                )
+                .to_request(),
             )
         };
     }
@@ -1666,6 +1730,158 @@ mod tests {
     }
 
     #[actix_web::test]
+    async fn a_replica_build_over_the_entity_limit_is_400() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        publish_task_schema(&fx).await?;
+        for id in ["e1", "e2", "e3"] {
+            create_entity(&fx, id).await?;
+        }
+        grant_collection_read(&fx, "alice").await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+
+        let res = post_replica!(&app, &token).await;
+        assert_eq!(res.status(), http::StatusCode::BAD_REQUEST);
+        let body: crate::http::error::ErrorBody = actix_test::read_body_json(res).await;
+        assert_eq!(body.code.as_deref(), Some("invalid_request"));
+        assert_eq!(body.error, "invalid request");
+        assert_eq!(
+            ReplicaBuildTooLarge.to_string(),
+            "replica build exceeds the entity limit"
+        );
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn a_rejected_replica_build_keeps_the_old_replica() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        publish_task_schema(&fx).await?;
+        create_entity(&fx, "e1").await?;
+        grant_collection_read(&fx, "alice").await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+
+        let res = post_replica!(&app, &token).await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let built: Value = actix_test::read_body_json(res).await;
+        let old_head = built["head"].as_u64().expect("head");
+        let old_generation = built["generation"].as_u64().expect("generation");
+        let before = fx
+            .runtime
+            .replicas()
+            .get("alice")
+            .await?
+            .expect("stored replica");
+
+        create_entity(&fx, "e2").await?;
+        create_entity(&fx, "e3").await?;
+
+        let res = post_replica!(&app, &token).await;
+        assert_eq!(res.status(), http::StatusCode::BAD_REQUEST);
+        let body: crate::http::error::ErrorBody = actix_test::read_body_json(res).await;
+        assert_eq!(body.code.as_deref(), Some("invalid_request"));
+
+        let after = fx
+            .runtime
+            .replicas()
+            .get("alice")
+            .await?
+            .expect("stored replica");
+        assert_eq!(after, before);
+        assert_eq!(after.head, old_head);
+        assert_eq!(after.generation, old_generation);
+
+        let res = get_route!(&app, "/eav/sync/replica/status", &token).await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let body: Value = actix_test::read_body_json(res).await;
+        assert_eq!(body["built_head"], old_head);
+
+        let res = get_route!(&app, "/eav/sync/replica", &token).await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let items: Vec<Value> = actix_test::read_body_json(res).await;
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["id"], "e1");
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn a_replica_build_at_the_entity_limit_succeeds() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        publish_task_schema(&fx).await?;
+        for id in ["e1", "e2"] {
+            create_entity(&fx, id).await?;
+        }
+        grant_collection_read(&fx, "alice").await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+
+        let res = post_replica!(&app, &token).await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let body: Value = actix_test::read_body_json(res).await;
+        assert_eq!(body["count"], 2);
+        assert_eq!(body["chunks"], 1);
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn a_replica_build_stops_reading_at_the_entity_limit() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        publish_task_schema(&fx).await?;
+        for id in ["e1", "e2", "e3", "e4", "e5"] {
+            create_entity(&fx, id).await?;
+        }
+        grant_collection_read(&fx, "alice").await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+
+        let res = post_replica!(&app, &token).await;
+        assert_eq!(res.status(), http::StatusCode::BAD_REQUEST);
+        assert_eq!(
+            fx.runtime.replica_test().read(),
+            3,
+            "the scan must stop at the entity that passes the limit"
+        );
+        assert!(
+            fx.runtime.replica_test().read() < 5,
+            "the scan read every entity before it stopped"
+        );
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn a_row_grant_keeps_the_replica_build_under_the_entity_limit() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        publish_task_schema(&fx).await?;
+        for id in ["e1", "e2", "e3", "e4", "e5"] {
+            create_entity(&fx, id).await?;
+        }
+        grant_row_read(&fx, "alice", "e1").await?;
+        grant_row_read(&fx, "alice", "e2").await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+
+        let res = post_replica!(&app, &token).await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let body: Value = actix_test::read_body_json(res).await;
+        assert_eq!(body["count"], 2);
+
+        let res = get_route!(&app, "/eav/sync/replica", &token).await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let items: Vec<Value> = actix_test::read_body_json(res).await;
+        let ids: Vec<&str> = items
+            .iter()
+            .map(|item| item["id"].as_str().expect("id"))
+            .collect();
+        assert_eq!(ids, ["e1", "e2"]);
+        Ok(())
+    }
+
+    #[actix_web::test]
     async fn a_replica_build_reads_every_cursor_page() -> anyhow::Result<()> {
         let fx = fixture().await?;
         publish_task_schema(&fx).await?;
@@ -1673,6 +1889,7 @@ mod tests {
             create_entity(&fx, id).await?;
         }
         grant_collection_read(&fx, "alice").await?;
+        raise_replica_limit(&fx);
         let module = fx.module().await?;
         let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
         let token = fx.token("alice")?;
@@ -1770,6 +1987,7 @@ mod tests {
             create_entity(&fx, id).await?;
         }
         grant_collection_read(&fx, "alice").await?;
+        raise_replica_limit(&fx);
         let module = fx.module().await?;
         let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
         let token = fx.token("alice")?;
@@ -1843,6 +2061,7 @@ mod tests {
             create_entity(&fx, id).await?;
         }
         grant_collection_read(&fx, "alice").await?;
+        raise_replica_limit(&fx);
         let module = fx.module().await?;
         let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
         let token = fx.token("alice")?;
@@ -1939,6 +2158,7 @@ mod tests {
             create_entity(&fx, id).await?;
         }
         grant_collection_read(&fx, "alice").await?;
+        raise_replica_limit(&fx);
         let module = fx.module().await?;
         let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
         let token = fx.token("alice")?;
@@ -1972,6 +2192,7 @@ mod tests {
             create_entity(&fx, id).await?;
         }
         grant_collection_read(&fx, "alice").await?;
+        raise_replica_limit(&fx);
         let module = fx.module().await?;
         let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
         let token = fx.token("alice")?;
@@ -2225,6 +2446,7 @@ mod tests {
             create_entity(&fx, id).await?;
         }
         grant_collection_read(&fx, "alice").await?;
+        raise_replica_limit(&fx);
         let module = fx.module().await?;
         let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
         let token = fx.token("alice")?;
@@ -2309,6 +2531,7 @@ mod tests {
             create_entity(&fx, id).await?;
         }
         grant_collection_read(&fx, "alice").await?;
+        raise_replica_limit(&fx);
         let module = fx.module().await?;
         let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
         let token = fx.token("alice")?;
