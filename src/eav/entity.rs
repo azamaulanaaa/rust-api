@@ -27,10 +27,11 @@
 //! The store returns an [`EntityChange`].
 //! A store with a change sink writes one [`EntityEvent`](crate::records::EntityEvent) to an outbox row.
 //! The outbox row commits in the same transaction as the entity rows.
+//! The write succeeds when the entity rows and the outbox row commit.
 //! The store then flushes the outbox to the feed.
-//! A failure after the commit is [`EntityError::Feed`].
-//! The data and the outbox row stay committed in that case.
-//! The caller can call [`EntityStore::flush_outbox`] again.
+//! A feed failure after the commit leaves the outbox row for the relay.
+//! The call still returns success.
+//! [`EntityStore::flush_outbox`] can deliver the row again.
 //! Delivery is at least once.
 //! A consumer must be idempotent.
 //!
@@ -359,6 +360,9 @@ impl EntityStore {
     /// The metadata row, the attribute rows, and all index rows commit in
     /// one transaction.
     /// With a feed, one outbox row commits in the same transaction.
+    /// The write succeeds when the entity rows and the outbox row commit.
+    /// A feed failure after the commit leaves the outbox row for the relay.
+    /// The call still returns success.
     /// The first version is 1.
     pub async fn create(
         &self,
@@ -406,8 +410,11 @@ impl EntityStore {
             tx.commit().await.map_err(EntityError::Store)?;
             outbox.is_some()
         };
-        if pending {
-            self.flush_after_commit().await?;
+        if pending && let Err(error) = self.flush_after_commit().await {
+            tracing::warn!(
+                %error,
+                "entity outbox flush failed after commit; the relay will deliver the event"
+            );
         }
         Ok(EntityChange {
             before: None,
@@ -431,6 +438,9 @@ impl EntityStore {
     /// The call applies the schema defaults after the patch and checks every
     /// attribute.
     /// The version increases by one.
+    /// The write succeeds when the entity rows and the outbox row commit.
+    /// A feed failure after the commit leaves the outbox row for the relay.
+    /// The call still returns success.
     pub async fn update(
         &self,
         id: &str,
@@ -510,8 +520,11 @@ impl EntityStore {
                 outbox.is_some(),
             )
         };
-        if pending {
-            self.flush_after_commit().await?;
+        if pending && let Err(error) = self.flush_after_commit().await {
+            tracing::warn!(
+                %error,
+                "entity outbox flush failed after commit; the relay will deliver the event"
+            );
         }
         Ok(change)
     }
@@ -521,6 +534,9 @@ impl EntityStore {
     /// The expected version must match the stored version.
     /// A mismatch is a version conflict and changes nothing.
     /// The call removes the metadata row and every attribute and index row.
+    /// The write succeeds when the entity rows and the outbox row commit.
+    /// A feed failure after the commit leaves the outbox row for the relay.
+    /// The call still returns success.
     pub async fn delete(
         &self,
         id: &str,
@@ -563,8 +579,11 @@ impl EntityStore {
                 outbox.is_some(),
             )
         };
-        if pending {
-            self.flush_after_commit().await?;
+        if pending && let Err(error) = self.flush_after_commit().await {
+            tracing::warn!(
+                %error,
+                "entity outbox flush failed after commit; the relay will deliver the event"
+            );
         }
         Ok(change)
     }
@@ -617,13 +636,15 @@ impl EntityStore {
 
     /// Flushes the outbox after a commit.
     ///
-    /// A flush failure is a delivery error.
-    /// The data and the outbox row stay committed.
-    async fn flush_after_commit(&self) -> Result<(), EntityError> {
-        self.flush_outbox()
-            .await
-            .map(|_| ())
-            .map_err(|_| EntityError::Feed("entity feed append failed".to_string()))
+    /// The transaction already made the write durable, so this call is best
+    /// effort.
+    /// The call returns the number of delivered rows.
+    /// A feed or store failure returns an error.
+    /// The error does not cancel the write.
+    /// The outbox row stays committed for [`EntityStore::flush_outbox`].
+    /// The relay delivers that row later.
+    async fn flush_after_commit(&self) -> Result<usize, EntityError> {
+        self.flush_outbox().await
     }
 
     /// Builds an outbox row when a feed is configured.
@@ -934,6 +955,7 @@ impl EntityStore {
     /// It builds every after entity and every outbox row in memory.
     /// One transaction writes every row, or it writes no row.
     /// The call flushes the outbox one time after the commit.
+    /// A feed failure after the commit leaves the outbox rows for the relay.
     async fn apply_schema_migration_batch(
         &self,
         entities: &[Entity],
@@ -1035,8 +1057,11 @@ impl EntityStore {
             }
             tx.commit().await.map_err(EntityError::Store)?;
         }
-        if pending {
-            self.flush_after_commit().await?;
+        if pending && let Err(error) = self.flush_after_commit().await {
+            tracing::warn!(
+                %error,
+                "entity outbox flush failed after commit; the relay will deliver the event"
+            );
         }
         Ok(result)
     }
@@ -2329,23 +2354,30 @@ mod tests {
 
     /// A [`ChangeSink`] test double that records every operation.
     ///
-    /// The `failing` switch makes every append fail.
+    /// `fail_next` makes a given number of appends fail.
     struct RecordingFeed {
         ops: std::sync::Mutex<Vec<WalOp>>,
-        failing: std::sync::atomic::AtomicBool,
+        failures: std::sync::atomic::AtomicUsize,
     }
 
     impl RecordingFeed {
         fn new() -> Self {
             Self {
                 ops: std::sync::Mutex::new(Vec::new()),
-                failing: std::sync::atomic::AtomicBool::new(false),
+                failures: std::sync::atomic::AtomicUsize::new(0),
             }
         }
 
         fn set_failing(&self, failing: bool) {
-            self.failing
-                .store(failing, std::sync::atomic::Ordering::SeqCst);
+            self.failures.store(
+                if failing { usize::MAX } else { 0 },
+                std::sync::atomic::Ordering::SeqCst,
+            );
+        }
+
+        fn fail_next(&self, count: usize) {
+            self.failures
+                .store(count, std::sync::atomic::Ordering::SeqCst);
         }
 
         fn ops(&self) -> Vec<WalOp> {
@@ -2366,7 +2398,10 @@ mod tests {
     #[async_trait::async_trait]
     impl ChangeSink for RecordingFeed {
         async fn append(&self, op: WalOp) -> anyhow::Result<()> {
-            if self.failing.load(std::sync::atomic::Ordering::SeqCst) {
+            let remaining = self.failures.load(std::sync::atomic::Ordering::SeqCst);
+            if remaining > 0 {
+                self.failures
+                    .store(remaining - 1, std::sync::atomic::Ordering::SeqCst);
                 return Err(anyhow::anyhow!("feed down"));
             }
             self.ops.lock().unwrap().push(op);
@@ -3679,29 +3714,140 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_failed_append_keeps_the_entity_and_the_outbox_row() {
+    async fn a_create_succeeds_when_the_feed_append_fails() {
         let (store, registry, raw) = new_store().await;
         registry
             .publish(schema("person", &[], vec![]))
             .await
             .unwrap();
         let feed = Arc::new(RecordingFeed::new());
-        feed.set_failing(true);
         let store = store.with_change_sink(feed.clone());
 
-        let result = store.create(draft("e1", &["person"], vec![]), &ctx()).await;
+        feed.fail_next(1);
+        let change = store
+            .create(draft("e1", &["person"], vec![]), &ctx())
+            .await
+            .unwrap();
 
-        assert!(matches!(result, Err(EntityError::Feed(_))));
+        assert!(change.after.is_some());
         assert!(store.get("e1").await.unwrap().is_some());
+        assert_eq!(store.outbox_count().await.unwrap(), 1);
         assert_eq!(outbox_keys(&raw).await.len(), 1);
 
-        feed.set_failing(false);
         assert_eq!(store.flush_outbox().await.unwrap(), 1);
         assert!(store.get("e1").await.unwrap().is_some());
-        assert!(outbox_keys(&raw).await.is_empty());
+        assert_eq!(store.outbox_count().await.unwrap(), 0);
         let events = feed.events();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].entity_id, "e1");
+    }
+
+    #[tokio::test]
+    async fn an_update_succeeds_when_the_feed_append_fails() {
+        let (store, registry, _raw) = new_store().await;
+        registry
+            .publish(schema(
+                "person",
+                &[],
+                vec![attr("age", AttributeType::Integer)],
+            ))
+            .await
+            .unwrap();
+        let feed = Arc::new(RecordingFeed::new());
+        let store = store.with_change_sink(feed.clone());
+        store
+            .create(draft("e1", &["person"], vec![("age", i(30))]), &ctx())
+            .await
+            .unwrap();
+        assert_eq!(store.outbox_count().await.unwrap(), 0);
+
+        feed.fail_next(1);
+        let change = store
+            .update("e1", 1, patch(vec![("age", Some(i(31)))]), &ctx())
+            .await
+            .unwrap();
+
+        assert_eq!(change.after.unwrap().version, 2);
+        assert_eq!(
+            store.get("e1").await.unwrap().unwrap().attributes["age"],
+            i(31)
+        );
+        assert_eq!(store.outbox_count().await.unwrap(), 1);
+
+        assert_eq!(store.flush_outbox().await.unwrap(), 1);
+        assert_eq!(store.outbox_count().await.unwrap(), 0);
+        assert_eq!(feed.events().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_delete_succeeds_when_the_feed_append_fails() {
+        let (store, registry, _raw) = new_store().await;
+        registry
+            .publish(schema("person", &[], vec![]))
+            .await
+            .unwrap();
+        let feed = Arc::new(RecordingFeed::new());
+        let store = store.with_change_sink(feed.clone());
+        store
+            .create(draft("e1", &["person"], vec![]), &ctx())
+            .await
+            .unwrap();
+        assert_eq!(store.outbox_count().await.unwrap(), 0);
+
+        feed.fail_next(1);
+        let change = store.delete("e1", 1, &ctx()).await.unwrap();
+
+        assert_eq!(change.after, None);
+        assert!(store.get("e1").await.unwrap().is_none());
+        assert_eq!(store.outbox_count().await.unwrap(), 1);
+
+        assert_eq!(store.flush_outbox().await.unwrap(), 1);
+        assert_eq!(store.outbox_count().await.unwrap(), 0);
+        assert_eq!(feed.events().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_later_flush_delivers_a_pending_row() {
+        let (store, registry, _raw) = new_store().await;
+        registry
+            .publish(schema("person", &[], vec![]))
+            .await
+            .unwrap();
+        let feed = Arc::new(RecordingFeed::new());
+        let store = store.with_change_sink(feed.clone());
+
+        feed.fail_next(1);
+        store
+            .create(draft("e1", &["person"], vec![]), &ctx())
+            .await
+            .unwrap();
+        assert_eq!(store.outbox_count().await.unwrap(), 1);
+        assert!(feed.events().is_empty());
+
+        assert_eq!(store.flush_outbox().await.unwrap(), 1);
+        assert_eq!(store.outbox_count().await.unwrap(), 0);
+        let events = feed.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].entity_id, "e1");
+    }
+
+    #[tokio::test]
+    async fn a_successful_write_flushes_immediately() {
+        let (store, registry, _raw) = new_store().await;
+        registry
+            .publish(schema("person", &[], vec![]))
+            .await
+            .unwrap();
+        let feed = Arc::new(RecordingFeed::new());
+        let store = store.with_change_sink(feed.clone());
+
+        store
+            .create(draft("e1", &["person"], vec![]), &ctx())
+            .await
+            .unwrap();
+
+        assert_eq!(store.outbox_count().await.unwrap(), 0);
+        assert_eq!(feed.events().len(), 1);
     }
 
     #[tokio::test]
@@ -3733,8 +3879,10 @@ mod tests {
         let store = store.with_change_sink(feed.clone());
 
         for id in ["e1", "e2", "e3"] {
-            let result = store.create(draft(id, &["person"], vec![]), &ctx()).await;
-            assert!(matches!(result, Err(EntityError::Feed(_))));
+            store
+                .create(draft(id, &["person"], vec![]), &ctx())
+                .await
+                .unwrap();
         }
         assert_eq!(store.outbox_count().await.unwrap(), 3);
 
@@ -3755,8 +3903,10 @@ mod tests {
         let store = store.with_change_sink(feed.clone());
 
         for id in ["e1", "e2", "e3"] {
-            let result = store.create(draft(id, &["person"], vec![]), &ctx()).await;
-            assert!(matches!(result, Err(EntityError::Feed(_))));
+            store
+                .create(draft(id, &["person"], vec![]), &ctx())
+                .await
+                .unwrap();
         }
         let mut keys = outbox_keys(&raw).await;
         keys.sort();
