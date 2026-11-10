@@ -326,6 +326,66 @@ impl SchemaRegistry {
         Ok(out)
     }
 
+    /// Lists one page of the latest schema versions in id order.
+    ///
+    /// The scan reads only the `schema:head:` family.
+    /// It starts after the `after` id when the caller gives a cursor.
+    /// The call returns the versions and the cursor for the next page.
+    /// The cursor is the last id of a full page.
+    /// The cursor is `None` when the scan is exhausted.
+    /// A stale or unknown cursor returns the ids after its sort position.
+    /// A `limit` of 0 returns an empty list and no cursor.
+    pub async fn list_after(
+        &self,
+        limit: usize,
+        after: Option<&str>,
+    ) -> Result<(Vec<SchemaDef>, Option<String>), SchemaError> {
+        if limit == 0 {
+            return Ok((Vec::new(), None));
+        }
+        let g = self.store.read().await;
+        let start = match after {
+            Some(cursor) => {
+                validate_name("schema id", cursor)?;
+                format!("{HEAD_PREFIX}{cursor}\0")
+            }
+            None => HEAD_PREFIX.to_string(),
+        };
+        let max = u32::try_from(limit).ok();
+        let cursor = (Some(start), Some(prefix_scan_end(HEAD_PREFIX)));
+        let heads = g
+            .gets_bytes(max, Direction::Next, cursor)
+            .await
+            .map_err(SchemaError::Store)?;
+        let full = heads.len() == limit;
+        let mut rows = Vec::with_capacity(heads.len());
+        for head in heads {
+            let Some(id) = head.key.strip_prefix(HEAD_PREFIX) else {
+                continue;
+            };
+            if id.is_empty() || id.contains(':') {
+                continue;
+            }
+            let version: u64 = serde_json::from_slice(&head.value)
+                .map_err(|e| SchemaError::Internal(e.to_string()))?;
+            rows.push((id.to_string(), version));
+        }
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        let next = if full {
+            rows.last().map(|(id, _)| id.clone())
+        } else {
+            None
+        };
+        let mut out = Vec::with_capacity(rows.len());
+        for (id, version) in rows {
+            let def = load_version(&*g, &id, version).await?.ok_or_else(|| {
+                SchemaError::Internal("schema head points to a missing version".to_string())
+            })?;
+            out.push(def);
+        }
+        Ok((out, next))
+    }
+
     /// Reads one schema version with all inherited attributes flattened.
     ///
     /// The call returns `None` when the version does not exist.
@@ -1033,6 +1093,44 @@ mod tests {
         paged.extend(reg.list_page(2, 4).await.unwrap());
 
         assert_eq!(paged, reg.list().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn list_after_pages_through_every_schema_once() {
+        let reg = new_registry().await;
+        for id in ["a", "b", "c", "d", "e"] {
+            reg.publish(draft(id, &[], vec![])).await.unwrap();
+        }
+
+        let mut ids = Vec::new();
+        let mut after: Option<String> = None;
+        let mut pages = 0;
+        loop {
+            let (page, next) = reg.list_after(2, after.as_deref()).await.unwrap();
+            ids.extend(page.into_iter().map(|def| def.id));
+            pages += 1;
+            match next {
+                Some(cursor) => after = Some(cursor),
+                None => break,
+            }
+        }
+
+        assert_eq!(ids, vec!["a", "b", "c", "d", "e"]);
+        assert_eq!(pages, 3);
+    }
+
+    #[tokio::test]
+    async fn list_after_skips_a_stale_cursor_without_repeating_it() {
+        let reg = new_registry().await;
+        for id in ["a", "c", "d"] {
+            reg.publish(draft(id, &[], vec![])).await.unwrap();
+        }
+
+        let (page, next) = reg.list_after(10, Some("b")).await.unwrap();
+        let ids: Vec<&str> = page.iter().map(|def| def.id.as_str()).collect();
+
+        assert_eq!(ids, vec!["c", "d"]);
+        assert_eq!(next, None);
     }
 
     #[tokio::test]
