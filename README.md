@@ -241,6 +241,8 @@ The schema registry stores immutable schema versions. A schema can extend other 
 
 The entity store keeps validated entities with typed attributes. An entity pins one or more exact schema versions. The store checks every attribute against the merged effective schema. It keeps schema, attribute, and unique indexes.
 
+The attribute index and the unique constraint key on the attribute name only. They do not include a schema id. An attribute index and a unique constraint therefore apply across every schema that uses the name. A unique value blocks a second entity in any schema with that attribute name. Use a distinct name when two schemas must not share the domain.
+
 An `EntityRef` attribute holds the id of another entity. A write validates the target id and requires that the target exists. A self-reference is valid. The check reads one row for each distinct target. Set `check_entity_refs = false` to keep the id validation and skip the existence read. The store keeps a reverse reference index. A delete counts the distinct entities that reference the target. A target with references returns `409` with code `conflict` and changes nothing. Set `force=true` to delete the target and leave the references dangling. A self-reference does not block the delete. An old store gets the reverse markers one time at the first delete. A writer can learn whether an entity id exists.
 
 | Status | Code | Condition |
@@ -250,6 +252,8 @@ An `EntityRef` attribute holds the id of another entity. A write validates the t
 | `409` | `conflict` | Another entity references the target and `force` is false. |
 
 The `/eav` management API covers schemas, entities, and rules. List routes use paging. `limit` defaults to 50 and cannot exceed 200. `offset` defaults to 0 and cannot exceed 1000. A larger offset returns `400`. Use cursor paging with `after` to page deeper. `GET /eav/rules` supports offset paging only, so an `after` cursor on that route returns `400`. `GET /eav/schemas/{id}/entities` returns `404` for an unknown schema id. A known schema returns the normal entity page.
+
+`GET /eav/entities` needs `read` on `eav_entities`. `POST /eav/entities/query` has no collection check. It filters each row with the row grant and returns only the entities that the caller can read. A caller with no grant gets an empty page from query, not `403`.
 
 `POST /eav/entities/query` finds entities by an indexed attribute value. `limit` defaults to 50 and is in the range 1 to 200. An empty `after` starts at the first page. The response returns the next cursor in `next`. An attribute that no applied schema indexes returns `400`.
 
@@ -351,8 +355,8 @@ Metrics cover rule execution (`eav.rules.executed`, `eav.rules.failed`) and webh
 | POST | `/eav/schemas/{id}/revalidate` | Check stored entities against a target version without a write | session |
 | POST | `/eav/schemas/{id}/migrate` | Repin stored entities to a target version. The default is a dry run. A dry run needs read on schemas and entities. A real run needs write on both. | session |
 | POST | `/eav/entities` | Create one validated entity | session |
-| GET | `/eav/entities` | Paged list of entities | session |
-| POST | `/eav/entities/query` | Paged query of entities by an indexed attribute value | session |
+| GET | `/eav/entities` | Paged list of entities. Needs collection read on `eav_entities`. | session |
+| POST | `/eav/entities/query` | Paged query of entities by an indexed attribute value. Filters each row with the row grant. A caller with no grant gets an empty page, not `403`. | session |
 | GET | `/eav/entities/{id}` | Get one entity | session |
 | PATCH | `/eav/entities/{id}` | Update attributes with an expected version | session |
 | DELETE | `/eav/entities/{id}` | Delete one entity with `expected_version`, or a referenced entity with `force=true` | session |
@@ -642,7 +646,7 @@ The `[eav]` section controls the optional EAV runtime and the webhook action. `[
 | `outbox_interval_ms` | `1000` | Pause between entity outbox flushes. |
 | `rule_poll_interval_ms` | `200` | Pause between rule runner polls. |
 | `gc_interval_ms` | `3600000` | Pause between execution marker cleanups. |
-| `execution_retention_secs` | `2592000` | Retention window for execution markers. |
+| `execution_retention_secs` | `2592000` | Retention window for execution markers. A value below `604800` (7 days) logs a warning. |
 | `timer_interval_ms` | `1000` | Pause between due timer passes. |
 | `timer_batch` | `100` | Largest number of due entities read for each time index key. |
 | `max_causation_depth` | `8` | Maximum causation depth for a rule chain, from 1 to 64. The maximum is inclusive. |
@@ -651,6 +655,8 @@ The `[eav]` section controls the optional EAV runtime and the webhook action. `[
 | `webhook_signing_secret` | none | Optional HMAC-SHA256 secret of at least 32 bytes. When set, adds the `X-Signature` header. |
 | `webhook_max_attempts` | `5` | Maximum delivery attempts for one webhook job, from 1 to 20. |
 | `webhook_allow_private_hosts` | `false` | Allows webhook delivery to a non-global address. The action still resolves and pins the address. |
+
+`execution_retention_secs` must stay above zero. The server logs a warning when the value is below 604800 seconds (7 days). A shorter window can delete an execution marker before a rule replay reads it, so the action can run twice. The server does not reject the value. The default is 2592000 seconds (30 days).
 
 The webhook allowlist is empty by default. Every webhook rule is rejected until an operator adds a host. A webhook job that uses all of its attempts is dead-lettered.
 
@@ -934,6 +940,10 @@ cargo bench --bench eav -- --quick
 ## Development
 
 Build, test, lint, documentation, and commit rules are in [CONTRIBUTING.md](CONTRIBUTING.md). This section covers the test suites and releases. See [Performance](#performance) for the benchmark suite.
+
+### Configuration tests
+
+The configuration module is part of the binary target. Run its tests with `cargo test --bin rust-api config`. A `cargo test --lib config` filter runs no configuration test.
 
 ### Integration tests
 

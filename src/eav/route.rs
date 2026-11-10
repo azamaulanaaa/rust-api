@@ -3,7 +3,8 @@
 //! Every handler authorizes itself.
 //! Schema routes check `eav_schemas`.
 //! Rule routes check `eav_rules`.
-//! Entity routes check `eav_entities`.
+//! Entity routes check `eav_entities`, or a row grant on `entity:{id}`.
+//! The query route checks only row grants.
 //! A row grant on `entity:{id}` also allows one entity operation.
 //!
 //! The module adds no actions and no business rules.
@@ -951,9 +952,11 @@ async fn list_entities(
 
 /// Queries one page of entities by an indexed attribute value.
 ///
+/// The route needs no collection `read` on `eav_entities`.
 /// A collection `read` on `eav_entities` exposes every entity.
 /// A row grant exposes only that entity.
 /// The handler filters each result with `can_read_entity`.
+/// A caller with no grant receives an empty page, not `403`.
 /// The response holds the next cursor when the page is full.
 /// An attribute that no applied schema indexes returns `400`.
 #[utoipa::path(post, path = "/eav/entities/query", tag = "eav", request_body = EntityQueryRequest, responses((status=200, body=EntityQueryPage), (status=400, body=crate::http::error::ErrorBody), (status=401, body=crate::http::error::ErrorBody), (status=403, body=crate::http::error::ErrorBody), (status=500, body=crate::http::error::ErrorBody)))]
