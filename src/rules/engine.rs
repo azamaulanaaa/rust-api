@@ -3,11 +3,17 @@
 //! [`RuleEngine::process`] runs the matching rules for one entity event.
 //! [`RuleEngine::run`] tails the durable change feed and calls `process`.
 //! Delivery is at least once.
+//! [`RuleEngine::run`] reads at most `RULE_BATCH_SIZE` entries in one batch.
+//! The batch size is 256 entries in a normal build.
+//! Tests use a batch of two entries.
 //! [`RuleEngine::run`] writes the cursor one time for each batch of 32
 //! successful entries.
 //! A crash can replay the last batch, so at most 32 entries repeat.
 //! An execution marker stops a duplicate action.
 //! An action must still be idempotent because a crash can repeat one event.
+//! A failed run keeps the cursor before the failed entry.
+//! The runtime supervisor restarts a failed run after a backoff delay.
+//! The delay starts at one second and doubles up to 60 seconds.
 //!
 //! The process lock is per event.
 //! Two calls for one event do not run one rule action twice.
@@ -47,6 +53,16 @@ const DEFAULT_MAX_CAUSATION_DEPTH: u32 = 8;
 /// A crash can replay the last batch, so at most this number of entries
 /// repeat.
 const CURSOR_BATCH_SIZE: u64 = 32;
+
+/// The largest number of change-feed entries to read in one rule batch.
+#[cfg(not(test))]
+const RULE_BATCH_SIZE: usize = 256;
+
+/// The largest number of change-feed entries to read in one rule batch.
+///
+/// Tests use a small batch, so a few entries cross the batch boundary.
+#[cfg(test)]
+const RULE_BATCH_SIZE: usize = 2;
 
 /// The result of one rule for one event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -334,8 +350,12 @@ impl RuleEngine {
     /// cancellation.
     ///
     /// The call starts at the persisted cursor.
-    /// It reads the head and asks for the range after the cursor.
-    /// It processes each entry in order.
+    /// It reads the head and asks for at most `RULE_BATCH_SIZE` entries after
+    /// the cursor.
+    /// The range ends at `min(head, cursor + RULE_BATCH_SIZE)`.
+    /// The batch size is 256 entries in a normal build.
+    /// Tests use a batch of two entries.
+    /// It processes each entry in order and then reads the next batch.
     /// It writes the cursor one time after each batch of 32 successful
     /// entries.
     /// It also writes the cursor when the feed is caught up and when the
@@ -345,6 +365,9 @@ impl RuleEngine {
     /// error.
     /// The cursor never moves past a failed entry.
     /// The failed entry and the entries after it replay on the next run.
+    /// The runtime supervisor restarts a failed run after a backoff delay.
+    /// The delay starts at one second and doubles up to 60 seconds.
+    /// The retried batch starts at the entry that failed.
     /// When the cursor is ahead of the head, the call returns an error and
     /// does not rewind.
     /// When the feed is caught up, the call sleeps for `poll_interval` and
@@ -377,7 +400,8 @@ impl RuleEngine {
                 )));
             }
             if cursor < head {
-                let entries = wal.range(cursor + 1, head).await.map_err(map_wal_error)?;
+                let end = head.min(cursor.saturating_add(RULE_BATCH_SIZE as u64));
+                let entries = wal.range(cursor + 1, end).await.map_err(map_wal_error)?;
                 for entry in entries {
                     if let WalOp::Entity { event } = &entry.op
                         && let Err(error) = self.process(event).await
@@ -1382,6 +1406,108 @@ mod tests {
         let expected: Vec<String> = (1..=total).map(|seq| format!("evt-{seq}")).collect();
         assert_eq!(executed, expected);
         assert_eq!(stores.rules.cursor().await.unwrap(), total);
+    }
+
+    /// `run` processes every entry when the feed holds more than one rule
+    /// batch.
+    ///
+    /// The batch size is small in tests, so a few entries cross the
+    /// boundary. Every event runs one time, and the cursor ends at the head.
+    #[tokio::test]
+    async fn run_processes_more_entries_than_one_rule_batch() {
+        let stores = stores().await;
+        let recorder = Arc::new(RecordingAction::new("record"));
+        let engine = engine(&stores, vec![recorder.clone()]);
+        make_entity(&stores.entities).await;
+        stores.rules.upsert(draft("alpha", "record")).await.unwrap();
+        let wal = test_wal().await;
+        let total = (RULE_BATCH_SIZE as u64) + 2;
+        for seq in 1..=total {
+            wal.append(WalOp::Entity {
+                event: event_at(seq),
+            })
+            .await
+            .unwrap();
+        }
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let handle = tokio::spawn({
+            let engine = engine.clone();
+            let wal = wal.clone();
+            let cancel = cancel.clone();
+            async move { engine.run(&wal, cancel, Duration::from_millis(5)).await }
+        });
+        wait_for_cursor(&stores.rules, total).await;
+        cancel.store(true, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        let executed: Vec<String> = recorder
+            .records()
+            .into_iter()
+            .map(|ctx| ctx.event.event_id)
+            .collect();
+        let expected: Vec<String> = (1..=total).map(|seq| format!("evt-{seq}")).collect();
+        assert_eq!(executed, expected);
+        assert_eq!(stores.rules.cursor().await.unwrap(), total);
+    }
+
+    /// A failed entry runs again after a new run and reaches the head.
+    ///
+    /// The action fails one time. The first run returns the action error and
+    /// keeps the cursor before the entry. The second run retries the same
+    /// entry and reaches the head.
+    #[tokio::test]
+    async fn run_retries_a_failed_entry_and_reaches_the_head() {
+        let stores = stores().await;
+        let recorder = Arc::new(RecordingAction::new("record"));
+        let engine = engine(&stores, vec![recorder.clone()]);
+        make_entity(&stores.entities).await;
+        stores.rules.upsert(draft("alpha", "record")).await.unwrap();
+        let wal = test_wal().await;
+        wal.append(WalOp::Entity {
+            event: event(EntityEventKind::Created),
+        })
+        .await
+        .unwrap();
+        recorder.fail_on_call(1);
+
+        let first = tokio::time::timeout(
+            Duration::from_secs(2),
+            engine.run(
+                &wal,
+                Arc::new(AtomicBool::new(false)),
+                Duration::from_millis(5),
+            ),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(first, Err(RuleError::Action(_))));
+        assert_eq!(stores.rules.cursor().await.unwrap(), 0);
+        assert!(!stores.rules.is_executed("alpha", "evt-1").await.unwrap());
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let handle = tokio::spawn({
+            let engine = engine.clone();
+            let wal = wal.clone();
+            let cancel = cancel.clone();
+            async move { engine.run(&wal, cancel, Duration::from_millis(5)).await }
+        });
+        wait_for_cursor(&stores.rules, 1).await;
+        cancel.store(true, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(recorder.records().len(), 2);
+        assert_eq!(stores.rules.cursor().await.unwrap(), 1);
+        assert!(stores.rules.is_executed("alpha", "evt-1").await.unwrap());
     }
 
     /// A failed entry stops the cursor before it.
