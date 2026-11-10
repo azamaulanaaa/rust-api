@@ -841,6 +841,7 @@ Examples:
 - [examples/sample_module.rs](examples/sample_module.rs): a complete module. Build with `cargo build --example sample_module`.
 - [examples/job_queue.rs](examples/job_queue.rs): a memory queue and worker.
 - [examples/reactive_service.rs](examples/reactive_service.rs): a reactive service with an `oxkv` observer.
+- [examples/eav_service.rs](examples/eav_service.rs): schema publish, entity create and update, an indexed query, and cursor paging. Run with `cargo run --example eav_service`.
 
 ### Mount inside your own server
 
