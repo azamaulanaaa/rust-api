@@ -13,11 +13,14 @@
 //! load of an offline client.
 //! The client then reads the events feed for each change.
 //!
-//! `POST /eav/sync/replica` stores a JSON snapshot for the caller.
-//! `GET /eav/sync/replica` returns the stored snapshot.
+//! `POST /eav/sync/replica` stores a chunked JSON snapshot for the caller.
+//! `GET /eav/sync/replica` returns the stored snapshot as one JSON array.
+//! `GET /eav/sync/replica?chunk=N` returns one page of the stored snapshot.
 //! `GET /eav/sync/replica/status` reports the log head and the stored head.
 //! The client applies the events after the stored head.
 //! The replica is a point-in-time snapshot, not an incremental store.
+//! The full read is for compatibility.
+//! Use the chunk read to page a large replica.
 //!
 //! The events route checks one collection grant.
 //! Without the collection grant, it checks a row grant for each event.
@@ -52,6 +55,12 @@ const REPLICA_PAGE: usize = 500;
 /// A small page in tests, so a build spans more than one page.
 #[cfg(test)]
 const REPLICA_PAGE: usize = 2;
+/// The number of entities in one stored replica chunk.
+#[cfg(not(test))]
+const REPLICA_CHUNK_ENTITIES: usize = 500;
+/// A small chunk in tests, so a build stores more than one chunk.
+#[cfg(test)]
+const REPLICA_CHUNK_ENTITIES: usize = 2;
 /// The number of replica builds before a stale head is final.
 const REPLICA_BUILD_ATTEMPTS: u32 = 2;
 
@@ -117,6 +126,31 @@ pub struct ReplicaBuildResponse {
     pub head: u64,
     /// The number of visible entities in the replica.
     pub count: usize,
+    /// The number of stored chunks.
+    pub chunks: usize,
+}
+
+/// The query of the replica read route.
+#[derive(Debug, Clone, Copy, Default, serde::Deserialize, utoipa::IntoParams, utoipa::ToSchema)]
+pub struct ReplicaChunkQuery {
+    /// The zero-based chunk index. Omit it to read the full snapshot.
+    #[serde(default)]
+    pub chunk: Option<usize>,
+}
+
+/// One page of a stored replica.
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
+pub struct ReplicaChunkResponse {
+    /// The head of the stored replica.
+    pub head: u64,
+    /// The zero-based index of this chunk.
+    pub chunk: usize,
+    /// The number of chunks in the stored replica.
+    pub chunks: usize,
+    /// The entities in this chunk.
+    pub items: Vec<Entity>,
+    /// The index of the next chunk, or `None` on the last chunk.
+    pub next: Option<usize>,
 }
 
 /// The current change-log head and the stored replica head.
@@ -400,8 +434,10 @@ impl std::error::Error for MissingReplica {}
 /// The route reads the current change-log head first.
 /// It then reads every entity in id order with a cursor.
 /// It keeps only the entities that the caller can read.
-/// The stored snapshot is one JSON array.
-/// The build replaces the previous replica for the same subject.
+/// It serializes the entities into ordered JSON chunks.
+/// Each chunk holds at most `REPLICA_CHUNK_ENTITIES` entities.
+/// The build replaces the previous replica and its chunks for the same
+/// subject.
 /// The client applies the events after the returned `head`.
 /// A newer build can commit first.
 /// The route then reads a fresh feed head and builds one more time.
@@ -417,7 +453,9 @@ pub(crate) async fn build_replica(
     loop {
         attempt += 1;
         let head = runtime.wal().head().await.map_err(internal)?;
-        let mut items = Vec::new();
+        let mut chunks: Vec<Vec<u8>> = Vec::new();
+        let mut pending: Vec<Entity> = Vec::new();
+        let mut count = 0;
         let mut after: Option<String> = None;
         loop {
             let (page, next) = runtime
@@ -426,7 +464,15 @@ pub(crate) async fn build_replica(
                 .await?;
             for entity in page {
                 if can_read_entity(&policy, &claims.sub, &entity.id).await? {
-                    items.push(entity);
+                    pending.push(entity);
+                    count += 1;
+                    if pending.len() == REPLICA_CHUNK_ENTITIES {
+                        chunks.push(
+                            serde_json::to_vec(&pending)
+                                .map_err(|e| EavApiError::Internal(Box::new(e)))?,
+                        );
+                        pending.clear();
+                    }
                 }
             }
             match next {
@@ -434,34 +480,93 @@ pub(crate) async fn build_replica(
                 None => break,
             }
         }
-        let data = serde_json::to_vec(&items).map_err(|e| EavApiError::Internal(Box::new(e)))?;
-        let count = items.len();
-        match runtime.replicas().put(&claims.sub, head, data).await {
-            Ok(()) => return Ok(HttpResponse::Ok().json(ReplicaBuildResponse { head, count })),
+        if !pending.is_empty() {
+            chunks.push(
+                serde_json::to_vec(&pending).map_err(|e| EavApiError::Internal(Box::new(e)))?,
+            );
+        }
+        let chunk_count = chunks.len();
+        match runtime.replicas().put(&claims.sub, head, chunks).await {
+            Ok(()) => {
+                return Ok(HttpResponse::Ok().json(ReplicaBuildResponse {
+                    head,
+                    count,
+                    chunks: chunk_count,
+                }));
+            }
             Err(EntityError::StaleHead { .. }) if attempt < REPLICA_BUILD_ATTEMPTS => continue,
             Err(error) => return Err(EavApiError::from(error)),
         }
     }
 }
 
+/// The source of a replica chunk index outside the stored range.
+#[derive(Debug)]
+struct ReplicaChunkOutOfRange;
+
+impl std::fmt::Display for ReplicaChunkOutOfRange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("replica chunk is out of range")
+    }
+}
+
+impl std::error::Error for ReplicaChunkOutOfRange {}
+
 /// Returns the stored replica of the caller.
 ///
 /// The caller needs a valid session.
 /// A missing replica returns `404`.
-/// The route sets `ETag` and `X-Replica-Head` to the stored head.
+/// Without a `chunk` parameter, the route returns every entity as one JSON
+/// array and sets `ETag` and `X-Replica-Head` to the stored head.
+/// With `chunk=N`, the route returns one stored chunk and sets
+/// `X-Replica-Head`, `X-Replica-Chunk`, and `X-Replica-Chunks`.
 /// A match on `If-None-Match` returns `304` with no body.
+/// An out-of-range `chunk` returns `400`.
 /// The client applies the events after the stored head.
-#[utoipa::path(get, path = "/eav/sync/replica", tag = "eav", responses((status = 200, body = Vec<Entity>, content_type = "application/json"), (status = 304, description = "not modified"), (status = 401, body = crate::http::error::ErrorBody), (status = 404, body = crate::http::error::ErrorBody), (status = 500, body = crate::http::error::ErrorBody)))]
+#[utoipa::path(get, path = "/eav/sync/replica", tag = "eav", params(ReplicaChunkQuery), responses((status = 200, body = Vec<Entity>, content_type = "application/json"), (status = 304, description = "not modified"), (status = 400, body = crate::http::error::ErrorBody), (status = 401, body = crate::http::error::ErrorBody), (status = 404, body = crate::http::error::ErrorBody), (status = 500, body = crate::http::error::ErrorBody)))]
 #[get("/sync/replica")]
 pub(crate) async fn replica(
     runtime: web::Data<EavRuntime>,
     claims: Validated<Claims>,
     req: HttpRequest,
+    query: web::Query<ReplicaChunkQuery>,
 ) -> Result<HttpResponse, EavApiError> {
-    let Some((head, data)) = runtime.replicas().get(&claims.sub).await? else {
-        return Err(EavApiError::NotFound(Box::new(MissingReplica)));
+    let Some(index) = query.into_inner().chunk else {
+        let Some(stored) = runtime.replicas().get(&claims.sub).await? else {
+            return Err(EavApiError::NotFound(Box::new(MissingReplica)));
+        };
+        let etag = status_etag(stored.head);
+        if let Some(header) = req
+            .headers()
+            .get(IF_NONE_MATCH)
+            .and_then(|value| value.to_str().ok())
+            && etag_matches(header, &etag)
+        {
+            return Ok(HttpResponse::NotModified()
+                .insert_header((ETAG, etag))
+                .finish());
+        }
+        let mut items: Vec<Entity> = Vec::new();
+        for chunk in stored.chunks {
+            let mut page: Vec<Entity> =
+                serde_json::from_slice(&chunk).map_err(|e| EavApiError::Internal(Box::new(e)))?;
+            items.append(&mut page);
+        }
+        let data = serde_json::to_vec(&items).map_err(|e| EavApiError::Internal(Box::new(e)))?;
+        return Ok(HttpResponse::Ok()
+            .insert_header((ETAG, etag))
+            .insert_header(("X-Replica-Head", stored.head.to_string()))
+            .insert_header((CONTENT_TYPE, "application/json"))
+            .body(data));
     };
-    let etag = status_etag(head);
+
+    let Some(chunk) = runtime.replicas().get_chunk(&claims.sub, index).await? else {
+        if runtime.replicas().status(&claims.sub).await?.is_none() {
+            return Err(EavApiError::NotFound(Box::new(MissingReplica)));
+        }
+        return Err(EavApiError::Invalid(Box::new(ReplicaChunkOutOfRange)));
+    };
+    let etag = format!("\"{}-{index}\"", chunk.head);
     if let Some(header) = req
         .headers()
         .get(IF_NONE_MATCH)
@@ -472,11 +577,21 @@ pub(crate) async fn replica(
             .insert_header((ETAG, etag))
             .finish());
     }
+    let items: Vec<Entity> =
+        serde_json::from_slice(&chunk.data).map_err(|e| EavApiError::Internal(Box::new(e)))?;
+    let next = (index + 1 < chunk.chunks).then_some(index + 1);
     Ok(HttpResponse::Ok()
         .insert_header((ETAG, etag))
-        .insert_header(("X-Replica-Head", head.to_string()))
-        .insert_header((CONTENT_TYPE, "application/json"))
-        .body(data))
+        .insert_header(("X-Replica-Head", chunk.head.to_string()))
+        .insert_header(("X-Replica-Chunk", index.to_string()))
+        .insert_header(("X-Replica-Chunks", chunk.chunks.to_string()))
+        .json(ReplicaChunkResponse {
+            head: chunk.head,
+            chunk: index,
+            chunks: chunk.chunks,
+            items,
+            next,
+        }))
 }
 
 /// Returns the change-log head and the stored replica head.
@@ -1429,7 +1544,7 @@ mod tests {
         let future = head + 100;
         fx.runtime
             .replicas()
-            .put("alice", future, b"newer".to_vec())
+            .put("alice", future, vec![b"newer".to_vec()])
             .await?;
         let module = fx.module().await?;
         let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
@@ -1450,8 +1565,153 @@ mod tests {
         assert_eq!(body.code.as_deref(), Some("conflict"));
         assert_eq!(
             fx.runtime.replicas().get("alice").await?,
-            Some((future, b"newer".to_vec()))
+            Some(crate::eav::replica::ReplicaSnapshot {
+                head: future,
+                chunks: vec![b"newer".to_vec()],
+            })
         );
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn a_replica_build_stores_chunks_that_page_every_entity_once() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        publish_task_schema(&fx).await?;
+        for id in ["e1", "e2", "e3", "e4", "e5"] {
+            create_entity(&fx, id).await?;
+        }
+        grant_collection_read(&fx, "alice").await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::post().uri("/eav/sync/replica"),
+                &token,
+            )
+            .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let built: Value = actix_test::read_body_json(res).await;
+        assert_eq!(built["count"], 5);
+        assert_eq!(built["chunks"], 3);
+
+        let res = get_route!(&app, "/eav/sync/replica", &token).await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let items: Vec<Value> = actix_test::read_body_json(res).await;
+        let ids: Vec<&str> = items
+            .iter()
+            .map(|item| item["id"].as_str().expect("id"))
+            .collect();
+        assert_eq!(ids, ["e1", "e2", "e3", "e4", "e5"]);
+
+        let mut seen = Vec::new();
+        let mut chunk = 0;
+        loop {
+            let res = get_route!(
+                &app,
+                format!("/eav/sync/replica?chunk={chunk}").as_str(),
+                &token
+            )
+            .await;
+            assert_eq!(res.status(), http::StatusCode::OK);
+            assert_eq!(
+                res.headers()
+                    .get("X-Replica-Chunk")
+                    .and_then(|value| value.to_str().ok()),
+                Some(chunk.to_string().as_str())
+            );
+            assert_eq!(
+                res.headers()
+                    .get("X-Replica-Chunks")
+                    .and_then(|value| value.to_str().ok()),
+                Some("3")
+            );
+            let body: Value = actix_test::read_body_json(res).await;
+            assert_eq!(body["chunk"], chunk);
+            let items = body["items"].as_array().expect("items");
+            for item in items {
+                seen.push(item["id"].as_str().expect("id").to_string());
+            }
+            match body["next"].as_u64() {
+                Some(next) => chunk = next,
+                None => break,
+            }
+        }
+        assert_eq!(seen, ["e1", "e2", "e3", "e4", "e5"]);
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn a_replica_chunk_read_rejects_an_out_of_range_index() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        publish_task_schema(&fx).await?;
+        create_entity(&fx, "e1").await?;
+        grant_collection_read(&fx, "alice").await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+        actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::post().uri("/eav/sync/replica"),
+                &token,
+            )
+            .to_request(),
+        )
+        .await;
+
+        let res = get_route!(&app, "/eav/sync/replica?chunk=9", &token).await;
+        assert_eq!(res.status(), http::StatusCode::BAD_REQUEST);
+        let body: crate::http::error::ErrorBody = actix_test::read_body_json(res).await;
+        assert_eq!(body.code.as_deref(), Some("invalid_request"));
+
+        let res = get_route!(&app, "/eav/sync/replica?chunk=x", &token).await;
+        assert_eq!(res.status(), http::StatusCode::BAD_REQUEST);
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn a_replica_chunk_read_supports_304() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        publish_task_schema(&fx).await?;
+        create_entity(&fx, "e1").await?;
+        grant_collection_read(&fx, "alice").await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+        actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::post().uri("/eav/sync/replica"),
+                &token,
+            )
+            .to_request(),
+        )
+        .await;
+
+        let res = get_route!(&app, "/eav/sync/replica?chunk=0", &token).await;
+        let etag = res
+            .headers()
+            .get(ETAG)
+            .and_then(|value| value.to_str().ok())
+            .expect("etag")
+            .to_string();
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::get()
+                    .uri("/eav/sync/replica?chunk=0")
+                    .insert_header((IF_NONE_MATCH, etag)),
+                &token,
+            )
+            .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::NOT_MODIFIED);
         Ok(())
     }
 
@@ -1476,6 +1736,8 @@ mod tests {
             "SyncEventsQuery",
             "SnapshotPage",
             "ReplicaBuildResponse",
+            "ReplicaChunkQuery",
+            "ReplicaChunkResponse",
             "ReplicaStatusResponse",
             "EntityEvent",
             "AttributeChange",
