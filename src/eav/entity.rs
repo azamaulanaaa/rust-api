@@ -201,6 +201,9 @@ pub struct RevalidationReport {
     pub compatible: usize,
     /// The entities that fail the target version.
     pub invalid: Vec<InvalidEntity>,
+    /// The id to resume after for the next page.
+    /// `None` means the pass is complete.
+    pub next: Option<String>,
 }
 
 /// The result of one schema migration.
@@ -216,6 +219,9 @@ pub struct MigrationReport {
     pub invalid: Vec<InvalidEntity>,
     /// True when the call wrote no key and no event.
     pub dry_run: bool,
+    /// The id to resume after for the next page.
+    /// `None` means the pass is complete.
+    pub next: Option<String>,
 }
 
 /// The counts from one atomic schema migration batch.
@@ -721,17 +727,76 @@ impl EntityStore {
         Ok(entities)
     }
 
+    /// Lists one page of the entities that pin `schema_id` or an inherited schema.
+    ///
+    /// The result is sorted by entity id.
+    /// The scan starts after the `after` id when the caller gives a cursor.
+    /// The call returns the entities and the cursor for the next page.
+    /// The cursor is the last id of a full page.
+    /// The cursor is `None` when the scan is exhausted.
+    /// A `limit` of 0 returns an empty list and no cursor.
+    pub async fn list_by_schema_after(
+        &self,
+        schema_id: &str,
+        limit: usize,
+        after: Option<&str>,
+    ) -> Result<(Vec<Entity>, Option<String>), EntityError> {
+        validate_name("schema id", schema_id)?;
+        if limit == 0 {
+            return Ok((Vec::new(), None));
+        }
+        let g = self.store.read().await;
+        let prefix = format!("{SCHEMA_INDEX_PREFIX}{schema_id}:");
+        let start = match after {
+            Some(cursor) => {
+                validate_name("entity id", cursor)?;
+                format!("{prefix}{cursor}\0")
+            }
+            None => prefix.clone(),
+        };
+        let max = u32::try_from(limit).ok();
+        let cursor = (Some(start), Some(prefix_scan_end(&prefix)));
+        let markers = g
+            .gets_bytes(max, Direction::Next, cursor)
+            .await
+            .map_err(EntityError::Store)?;
+        let full = markers.len() == limit;
+        let mut ids = Vec::new();
+        let mut seen = BTreeSet::new();
+        for marker in markers {
+            let Some(id) = marker.key.strip_prefix(&prefix) else {
+                continue;
+            };
+            if id.is_empty() || id.contains(':') || !seen.insert(id.to_string()) {
+                continue;
+            }
+            ids.push(id.to_string());
+        }
+        ids.sort();
+        let next = if full { ids.last().cloned() } else { None };
+        let mut entities = Vec::with_capacity(limit.min(ids.len()));
+        for id in &ids {
+            if let Some(entity) = load_entity(&*g, id).await? {
+                entities.push(entity);
+            }
+        }
+        Ok((entities, next))
+    }
+
     /// Checks stored entities against a target schema version.
     ///
     /// The call reads at most `limit` entities that pin `schema_id`.
+    /// The scan starts after the `after` id when the caller gives a cursor.
     /// It changes no key, no entity version, and no pinned schema.
     /// It records one issue for each invalid entity.
+    /// The report holds the cursor for the next page.
     /// A missing target version is [`EntityError::UnknownSchema`].
     pub async fn revalidation_report(
         &self,
         schema_id: &str,
         target_version: u64,
         limit: usize,
+        after: Option<&str>,
     ) -> Result<RevalidationReport, EntityError> {
         validate_name("schema id", schema_id)?;
         if self
@@ -744,11 +809,12 @@ impl EntityStore {
             return Err(EntityError::UnknownSchema(schema_id.to_string()));
         }
 
-        let entities = self.list_by_schema_page(schema_id, limit, 0).await?;
+        let (entities, next) = self.list_by_schema_after(schema_id, limit, after).await?;
         let mut report = RevalidationReport {
             scanned: 0,
             compatible: 0,
             invalid: Vec::new(),
+            next,
         };
         for entity in entities {
             if !entity.schemas.iter().any(|schema| schema.id == schema_id) {
@@ -772,6 +838,7 @@ impl EntityStore {
     /// Applies one target schema version to compatible entities.
     ///
     /// The call reads at most `limit` entities that pin `schema_id`.
+    /// The scan starts after the `after` id when the caller gives a cursor.
     /// It checks each entity with the target version.
     /// An invalid entity stays unchanged and goes into `invalid`.
     /// A valid entity that already pins `target_version` counts as unchanged.
@@ -781,12 +848,14 @@ impl EntityStore {
     /// A stale entity version aborts the batch with no write.
     /// A store error aborts the batch with no write.
     /// A missing target version is [`EntityError::UnknownSchema`].
+    /// The report holds the cursor for the next page.
     /// A `limit` of 0 returns an empty report.
     pub async fn migrate_schema(
         &self,
         schema_id: &str,
         target_version: u64,
         limit: usize,
+        after: Option<&str>,
         dry_run: bool,
         ctx: &WriteContext,
     ) -> Result<MigrationReport, EntityError> {
@@ -807,12 +876,14 @@ impl EntityStore {
             unchanged: 0,
             invalid: Vec::new(),
             dry_run,
+            next: None,
         };
         if limit == 0 {
             return Ok(report);
         }
 
-        let entities = self.list_by_schema_page(schema_id, limit, 0).await?;
+        let (entities, next) = self.list_by_schema_after(schema_id, limit, after).await?;
+        report.next = next;
         if dry_run {
             for entity in entities {
                 if !entity.schemas.iter().any(|schema| schema.id == schema_id) {
@@ -2878,6 +2949,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_by_schema_after_skips_exactly_the_cursor() {
+        let (store, registry, _raw) = new_store().await;
+        registry.publish(schema("task", &[], vec![])).await.unwrap();
+        for id in ["a", "ab", "b"] {
+            store
+                .create(draft(id, &["task"], vec![]), &ctx())
+                .await
+                .unwrap();
+        }
+
+        let (page, next) = store
+            .list_by_schema_after("task", 2, Some("a"))
+            .await
+            .unwrap();
+        let ids: Vec<&str> = page.iter().map(|entity| entity.id.as_str()).collect();
+
+        assert_eq!(ids, vec!["ab", "b"]);
+        assert_eq!(next.as_deref(), Some("b"));
+    }
+
+    #[tokio::test]
+    async fn list_by_schema_after_returns_no_cursor_for_a_partial_page() {
+        let (store, registry, _raw) = new_store().await;
+        registry.publish(schema("task", &[], vec![])).await.unwrap();
+        for id in ["a", "b", "c"] {
+            store
+                .create(draft(id, &["task"], vec![]), &ctx())
+                .await
+                .unwrap();
+        }
+
+        let (page, next) = store.list_by_schema_after("task", 5, None).await.unwrap();
+        let ids: Vec<&str> = page.iter().map(|entity| entity.id.as_str()).collect();
+
+        assert_eq!(ids, vec!["a", "b", "c"]);
+        assert_eq!(next, None);
+    }
+
+    #[tokio::test]
+    async fn list_by_schema_after_with_limit_zero_is_empty() {
+        let (store, registry, _raw) = new_store().await;
+        registry.publish(schema("task", &[], vec![])).await.unwrap();
+        store
+            .create(draft("a", &["task"], vec![]), &ctx())
+            .await
+            .unwrap();
+
+        let (page, next) = store.list_by_schema_after("task", 0, None).await.unwrap();
+
+        assert!(page.is_empty());
+        assert_eq!(next, None);
+    }
+
+    #[tokio::test]
     async fn a_unique_attribute_rejects_a_second_entity_with_the_same_value() {
         let (store, registry, _raw) = new_store().await;
         registry
@@ -4007,7 +4132,10 @@ mod tests {
             .await
             .unwrap();
 
-        let report = store.revalidation_report("task", 2, 100).await.unwrap();
+        let report = store
+            .revalidation_report("task", 2, 100, None)
+            .await
+            .unwrap();
 
         assert_eq!(report.scanned, 1);
         assert_eq!(report.compatible, 1);
@@ -4042,7 +4170,10 @@ mod tests {
             .await
             .unwrap();
 
-        let report = store.revalidation_report("task", 2, 100).await.unwrap();
+        let report = store
+            .revalidation_report("task", 2, 100, None)
+            .await
+            .unwrap();
 
         assert_eq!(report.scanned, 1);
         assert_eq!(report.compatible, 0);
@@ -4078,7 +4209,10 @@ mod tests {
             .await
             .unwrap();
 
-        let report = store.revalidation_report("task", 2, 100).await.unwrap();
+        let report = store
+            .revalidation_report("task", 2, 100, None)
+            .await
+            .unwrap();
 
         assert_eq!(report.compatible, 0);
         assert_eq!(
@@ -4104,7 +4238,10 @@ mod tests {
             .unwrap();
         registry.publish(schema("task", &[], vec![])).await.unwrap();
 
-        let report = store.revalidation_report("task", 2, 100).await.unwrap();
+        let report = store
+            .revalidation_report("task", 2, 100, None)
+            .await
+            .unwrap();
 
         assert_eq!(report.compatible, 0);
         assert_eq!(
@@ -4118,7 +4255,7 @@ mod tests {
         let (store, registry, _raw) = new_store().await;
         registry.publish(schema("task", &[], vec![])).await.unwrap();
 
-        let result = store.revalidation_report("task", 2, 100).await;
+        let result = store.revalidation_report("task", 2, 100, None).await;
 
         assert!(matches!(result, Err(EntityError::UnknownSchema(id)) if id == "task"));
     }
@@ -4153,7 +4290,7 @@ mod tests {
             .unwrap();
 
         let report = store
-            .migrate_schema("task", 2, 100, true, &ctx())
+            .migrate_schema("task", 2, 100, None, true, &ctx())
             .await
             .unwrap();
 
@@ -4198,7 +4335,7 @@ mod tests {
             .with_causation("evt-0", 1);
 
         let report = store
-            .migrate_schema("task", 2, 100, false, &write_ctx)
+            .migrate_schema("task", 2, 100, None, false, &write_ctx)
             .await
             .unwrap();
 
@@ -4266,7 +4403,7 @@ mod tests {
             .unwrap();
 
         let report = store
-            .migrate_schema("task", 2, 100, false, &ctx())
+            .migrate_schema("task", 2, 100, None, false, &ctx())
             .await
             .unwrap();
 
@@ -4298,7 +4435,7 @@ mod tests {
             .unwrap();
 
         let report = store
-            .migrate_schema("task", 1, 100, false, &ctx())
+            .migrate_schema("task", 1, 100, None, false, &ctx())
             .await
             .unwrap();
 
@@ -4328,14 +4465,15 @@ mod tests {
             .unwrap();
 
         let limited = store
-            .migrate_schema("task", 2, 2, true, &ctx())
+            .migrate_schema("task", 2, 2, None, true, &ctx())
             .await
             .unwrap();
         assert_eq!(limited.scanned, 2);
         assert_eq!(limited.migrated, 2);
+        assert_eq!(limited.next.as_deref(), Some("b"));
 
         let empty = store
-            .migrate_schema("task", 2, 0, true, &ctx())
+            .migrate_schema("task", 2, 0, None, true, &ctx())
             .await
             .unwrap();
         assert_eq!(empty.scanned, 0);
@@ -4343,6 +4481,129 @@ mod tests {
         assert_eq!(empty.unchanged, 0);
         assert!(empty.invalid.is_empty());
         assert!(empty.dry_run);
+        assert_eq!(empty.next, None);
+    }
+
+    #[tokio::test]
+    async fn a_migration_pages_through_every_entity_by_cursor() {
+        let (store, registry, _raw) = new_store().await;
+        registry.publish(schema("task", &[], vec![])).await.unwrap();
+        for id in ["a", "b", "c", "d", "e"] {
+            store
+                .create(draft(id, &["task"], vec![]), &ctx())
+                .await
+                .unwrap();
+        }
+        registry
+            .publish(schema(
+                "task",
+                &[],
+                vec![attr("title", AttributeType::String)],
+            ))
+            .await
+            .unwrap();
+
+        let mut after = None;
+        let mut migrated = 0;
+        let mut pages = 0;
+        loop {
+            let report = store
+                .migrate_schema("task", 2, 2, after.as_deref(), false, &ctx())
+                .await
+                .unwrap();
+            migrated += report.migrated;
+            after = report.next;
+            pages += 1;
+            assert!(pages <= 10, "the cursor loop did not terminate");
+            if after.is_none() {
+                break;
+            }
+        }
+
+        assert_eq!(migrated, 5);
+        assert_eq!(pages, 3);
+        for id in ["a", "b", "c", "d", "e"] {
+            let entity = store.get(id).await.unwrap().unwrap();
+            assert_eq!(entity.version, 2);
+            assert_eq!(
+                entity.schemas,
+                vec![SchemaRef {
+                    id: "task".to_string(),
+                    version: 2,
+                }]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_migration_that_reads_a_partial_page_returns_no_cursor() {
+        let (store, registry, _raw) = new_store().await;
+        registry.publish(schema("task", &[], vec![])).await.unwrap();
+        for id in ["a", "b", "c"] {
+            store
+                .create(draft(id, &["task"], vec![]), &ctx())
+                .await
+                .unwrap();
+        }
+        registry
+            .publish(schema(
+                "task",
+                &[],
+                vec![attr("title", AttributeType::String)],
+            ))
+            .await
+            .unwrap();
+
+        let report = store
+            .migrate_schema("task", 2, 5, None, true, &ctx())
+            .await
+            .unwrap();
+
+        assert_eq!(report.scanned, 3);
+        assert_eq!(report.next, None);
+    }
+
+    #[tokio::test]
+    async fn a_revalidation_pages_through_every_entity_by_cursor() {
+        let (store, registry, _raw) = new_store().await;
+        registry.publish(schema("task", &[], vec![])).await.unwrap();
+        for id in ["a", "b", "c", "d", "e"] {
+            store
+                .create(draft(id, &["task"], vec![]), &ctx())
+                .await
+                .unwrap();
+        }
+        registry
+            .publish(schema(
+                "task",
+                &[],
+                vec![attr("title", AttributeType::String)],
+            ))
+            .await
+            .unwrap();
+
+        let mut after = None;
+        let mut scanned = 0;
+        let mut compatible = 0;
+        let mut pages = 0;
+        loop {
+            let report = store
+                .revalidation_report("task", 2, 2, after.as_deref())
+                .await
+                .unwrap();
+            scanned += report.scanned;
+            compatible += report.compatible;
+            after = report.next;
+            pages += 1;
+            assert!(pages <= 10, "the cursor loop did not terminate");
+            if after.is_none() {
+                break;
+            }
+        }
+
+        assert_eq!(scanned, 5);
+        assert_eq!(compatible, 5);
+        assert_eq!(pages, 3);
     }
 
     #[tokio::test]
@@ -4350,7 +4611,9 @@ mod tests {
         let (store, registry, _raw) = new_store().await;
         registry.publish(schema("task", &[], vec![])).await.unwrap();
 
-        let result = store.migrate_schema("task", 2, 100, true, &ctx()).await;
+        let result = store
+            .migrate_schema("task", 2, 100, None, true, &ctx())
+            .await;
 
         assert!(matches!(result, Err(EntityError::UnknownSchema(id)) if id == "task"));
     }
@@ -4430,7 +4693,7 @@ mod tests {
         let store = store.with_change_sink(feed.clone());
 
         let report = store
-            .migrate_schema("task", 2, 100, false, &ctx())
+            .migrate_schema("task", 2, 100, None, false, &ctx())
             .await
             .unwrap();
 
@@ -4517,7 +4780,7 @@ mod tests {
         let store = store.with_change_sink(feed.clone());
 
         let report = store
-            .migrate_schema("task", 2, 100, false, &ctx())
+            .migrate_schema("task", 2, 100, None, false, &ctx())
             .await
             .unwrap();
 
@@ -4574,7 +4837,7 @@ mod tests {
         let store = store.with_change_sink(feed.clone());
 
         let report = store
-            .migrate_schema("task", 2, 100, true, &ctx())
+            .migrate_schema("task", 2, 100, None, true, &ctx())
             .await
             .unwrap();
 
@@ -4692,7 +4955,9 @@ mod tests {
         let store = store.with_change_sink(feed.clone());
         raw.add_validator(RejectMetaKey(meta_key("e2")));
 
-        let result = store.migrate_schema("task", 2, 100, false, &ctx()).await;
+        let result = store
+            .migrate_schema("task", 2, 100, None, false, &ctx())
+            .await;
 
         assert!(matches!(result, Err(EntityError::Store(_))));
         for id in ["e1", "e2"] {
