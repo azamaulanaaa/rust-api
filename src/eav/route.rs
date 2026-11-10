@@ -169,23 +169,26 @@ pub struct SchemaDiffQuery {
 ///
 /// The default limit is 100.
 /// The maximum limit is 500.
-#[derive(Debug, Clone, Copy, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, Deserialize, utoipa::ToSchema)]
 pub struct RevalidateRequest {
     /// The target schema version.
     pub target_version: u64,
     /// The maximum number of entities to check. The default is 100. The maximum is 500.
     #[serde(default)]
     pub limit: Option<usize>,
+    /// The entity id to resume after. Omit it for the first page.
+    #[serde(default)]
+    pub after: Option<String>,
 }
 
 impl RevalidateRequest {
     /// Resolves the limit and checks its range.
-    fn resolve(self) -> Result<(u64, usize), EavApiError> {
+    fn resolve(self) -> Result<(u64, usize, Option<String>), EavApiError> {
         let limit = self.limit.unwrap_or(DEFAULT_REVALIDATE_LIMIT);
         if limit == 0 || limit > MAX_REVALIDATE_LIMIT {
             return Err(EavApiError::Invalid(Box::new(InvalidRevalidateLimit)));
         }
-        Ok((self.target_version, limit))
+        Ok((self.target_version, limit, self.after))
     }
 }
 
@@ -194,7 +197,7 @@ impl RevalidateRequest {
 /// The default limit is 100.
 /// The maximum limit is 500.
 /// The default for `dry_run` is true.
-#[derive(Debug, Clone, Copy, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, Deserialize, utoipa::ToSchema)]
 pub struct MigrateRequest {
     /// The target schema version.
     pub target_version: u64,
@@ -204,6 +207,9 @@ pub struct MigrateRequest {
     /// True to report the changes without a write. The default is true.
     #[serde(default = "default_dry_run")]
     pub dry_run: bool,
+    /// The entity id to resume after. Omit it for the first page.
+    #[serde(default)]
+    pub after: Option<String>,
 }
 
 /// The default value of the migration dry-run flag.
@@ -213,12 +219,12 @@ fn default_dry_run() -> bool {
 
 impl MigrateRequest {
     /// Resolves the limit and checks its range.
-    fn resolve(self) -> Result<(u64, usize, bool), EavApiError> {
+    fn resolve(self) -> Result<(u64, usize, Option<String>, bool), EavApiError> {
         let limit = self.limit.unwrap_or(DEFAULT_MIGRATE_LIMIT);
         if limit == 0 || limit > MAX_MIGRATE_LIMIT {
             return Err(EavApiError::Invalid(Box::new(InvalidMigrateLimit)));
         }
-        Ok((self.target_version, limit, self.dry_run))
+        Ok((self.target_version, limit, self.after, self.dry_run))
     }
 }
 
@@ -653,10 +659,10 @@ async fn revalidate_schema(
     require_management(&policy, &claims.sub, SCHEMAS, Action::Read).await?;
     require_management(&policy, &claims.sub, ENTITIES, Action::Read).await?;
     let id = path.into_inner();
-    let (target_version, limit) = body.into_inner().resolve()?;
+    let (target_version, limit, after) = body.into_inner().resolve()?;
     let report = runtime
         .entities()
-        .revalidation_report(&id, target_version, limit)
+        .revalidation_report(&id, target_version, limit, after.as_deref())
         .await?;
     Ok(HttpResponse::Ok().json(report))
 }
@@ -673,13 +679,14 @@ async fn migrate_schema(
     require_management(&policy, &claims.sub, SCHEMAS, Action::Write).await?;
     require_management(&policy, &claims.sub, ENTITIES, Action::Write).await?;
     let id = path.into_inner();
-    let (target_version, limit, dry_run) = body.into_inner().resolve()?;
+    let (target_version, limit, after, dry_run) = body.into_inner().resolve()?;
     let report = runtime
         .entities()
         .migrate_schema(
             &id,
             target_version,
             limit,
+            after.as_deref(),
             dry_run,
             &WriteContext::new(claims.sub.clone()),
         )
@@ -2149,6 +2156,89 @@ mod tests {
             .runtime
             .entities()
             .get("e1")
+            .await?
+            .expect("entity exists");
+        assert_eq!(entity.version, 2);
+        assert_eq!(entity.schemas[0].version, 2);
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn schema_migration_resumes_after_the_cursor() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        assert!(fx.engine.claim_superadmin("alice").await?);
+        publish_schema_version(&fx, "invoice", vec![attr("total", AttributeType::Integer)]).await?;
+        for id in ["e1", "e2", "e3"] {
+            fx.runtime
+                .entities()
+                .create(
+                    EntityDraft {
+                        id: id.to_string(),
+                        schemas: vec!["invoice".to_string()],
+                        attributes: [("total".to_string(), AttributeValue::Integer(10))]
+                            .into_iter()
+                            .collect(),
+                    },
+                    &WriteContext::new("alice"),
+                )
+                .await?;
+        }
+        publish_schema_version(
+            &fx,
+            "invoice",
+            vec![
+                attr("total", AttributeType::Integer),
+                attr("memo", AttributeType::String),
+            ],
+        )
+        .await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::post()
+                    .uri("/eav/schemas/invoice/migrate")
+                    .set_json(json!({"target_version": 2, "limit": 2, "dry_run": false})),
+                &token,
+            )
+            .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let report: Value = actix_test::read_body_json(res).await;
+        assert_eq!(report["scanned"], 2);
+        assert_eq!(report["migrated"], 2);
+        assert_eq!(report["next"], "e2");
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::post()
+                    .uri("/eav/schemas/invoice/migrate")
+                    .set_json(json!({
+                        "target_version": 2,
+                        "limit": 2,
+                        "dry_run": false,
+                        "after": "e2"
+                    })),
+                &token,
+            )
+            .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let report: Value = actix_test::read_body_json(res).await;
+        assert_eq!(report["scanned"], 1);
+        assert_eq!(report["migrated"], 1);
+        assert_eq!(report["next"], Value::Null);
+
+        let entity = fx
+            .runtime
+            .entities()
+            .get("e3")
             .await?
             .expect("entity exists");
         assert_eq!(entity.version, 2);
