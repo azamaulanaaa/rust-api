@@ -131,6 +131,9 @@ impl ApiModule for EavApiModule {
 pub struct ExpectedVersionQuery {
     /// The version that the caller expects.
     pub expected_version: u64,
+    /// True to delete the entity even when other entities reference it.
+    #[serde(default)]
+    pub force: bool,
 }
 
 /// The paging query of a list route.
@@ -583,6 +586,7 @@ impl From<EntityError> for EavApiError {
             EntityError::UniqueViolation(_)
             | EntityError::VersionConflict
             | EntityError::AlreadyExists(_)
+            | EntityError::Referenced { .. }
             | EntityError::StaleHead { .. } => Kind::Conflict,
             EntityError::Store(_) | EntityError::Internal(_) | EntityError::Feed(_) => {
                 Kind::Internal
@@ -1010,7 +1014,7 @@ async fn patch_entity(
     Ok(HttpResponse::Ok().json(entity))
 }
 
-#[utoipa::path(delete, path = "/eav/entities/{id}", tag = "eav", params(("id" = String, Path), ("expected_version" = u64, Query)), responses((status=204, description="entity deleted"), (status=400, body=crate::http::error::ErrorBody), (status=401, body=crate::http::error::ErrorBody), (status=403, body=crate::http::error::ErrorBody), (status=404, body=crate::http::error::ErrorBody), (status=409, body=crate::http::error::ErrorBody), (status=500, body=crate::http::error::ErrorBody)))]
+#[utoipa::path(delete, path = "/eav/entities/{id}", tag = "eav", params(("id" = String, Path), ("expected_version" = u64, Query), ("force" = Option<bool>, Query, description = "Delete the entity even when other entities reference it")), responses((status=204, description="entity deleted"), (status=400, body=crate::http::error::ErrorBody), (status=401, body=crate::http::error::ErrorBody), (status=403, body=crate::http::error::ErrorBody), (status=404, body=crate::http::error::ErrorBody), (status=409, body=crate::http::error::ErrorBody), (status=500, body=crate::http::error::ErrorBody)))]
 #[delete("/entities/{id}")]
 async fn delete_entity(
     runtime: web::Data<EavRuntime>,
@@ -1026,6 +1030,7 @@ async fn delete_entity(
         .delete(
             &id,
             query.expected_version,
+            query.force,
             &WriteContext::new(claims.sub.clone()),
         )
         .await?;
@@ -1529,6 +1534,14 @@ mod tests {
             ),
             (
                 EavApiError::from(EntityError::AlreadyExists("x".into())),
+                409,
+                "conflict",
+            ),
+            (
+                EavApiError::from(EntityError::Referenced {
+                    id: "x".into(),
+                    count: 1,
+                }),
                 409,
                 "conflict",
             ),
@@ -2735,6 +2748,83 @@ mod tests {
         )
         .await;
         assert_eq!(res.status(), http::StatusCode::NOT_FOUND);
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn delete_entity_reports_a_reference_and_accepts_force() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        assert!(fx.engine.claim_superadmin("alice").await?);
+        publish_schema_version(&fx, "customer", vec![attr("name", AttributeType::String)]).await?;
+        publish_schema_version(
+            &fx,
+            "order",
+            vec![attr("customer", AttributeType::EntityRef)],
+        )
+        .await?;
+        fx.runtime
+            .entities()
+            .create(
+                EntityDraft {
+                    id: "c1".to_string(),
+                    schemas: vec!["customer".to_string()],
+                    attributes: [("name".to_string(), AttributeValue::String("c1".to_string()))]
+                        .into_iter()
+                        .collect(),
+                },
+                &WriteContext::new("alice"),
+            )
+            .await?;
+        fx.runtime
+            .entities()
+            .create(
+                EntityDraft {
+                    id: "o1".to_string(),
+                    schemas: vec!["order".to_string()],
+                    attributes: [(
+                        "customer".to_string(),
+                        AttributeValue::EntityRef("c1".to_string()),
+                    )]
+                    .into_iter()
+                    .collect(),
+                },
+                &WriteContext::new("alice"),
+            )
+            .await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::delete().uri("/eav/entities/c1?expected_version=1"),
+                &token,
+            )
+            .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::CONFLICT);
+        let body: Value = actix_test::read_body_json(res).await;
+        assert_eq!(body["code"], "conflict");
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::delete()
+                    .uri("/eav/entities/c1?expected_version=1&force=true"),
+                &token,
+            )
+            .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::NO_CONTENT);
+        assert!(fx.runtime.entities().get("c1").await?.is_none());
+        let order = fx.runtime.entities().get("o1").await?.expect("order stays");
+        assert_eq!(
+            order.attributes.get("customer"),
+            Some(&AttributeValue::EntityRef("c1".to_string()))
+        );
         Ok(())
     }
 
