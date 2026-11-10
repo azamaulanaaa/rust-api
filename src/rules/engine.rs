@@ -3,7 +3,11 @@
 //! [`RuleEngine::process`] runs the matching rules for one entity event.
 //! [`RuleEngine::run`] tails the durable change feed and calls `process`.
 //! Delivery is at least once.
-//! An action must be idempotent because a crash can repeat one event.
+//! [`RuleEngine::run`] writes the cursor one time for each batch of 32
+//! successful entries.
+//! A crash can replay the last batch, so at most 32 entries repeat.
+//! An execution marker stops a duplicate action.
+//! An action must still be idempotent because a crash can repeat one event.
 //!
 //! An action can write an entity.
 //! That write can create another event, and that event can match a rule
@@ -32,6 +36,12 @@ use crate::sync::wal::Wal;
 ///
 /// A chain deeper than this value is a runaway chain.
 const DEFAULT_MAX_CAUSATION_DEPTH: u32 = 8;
+
+/// The number of successful entries between cursor writes.
+///
+/// A crash can replay the last batch, so at most this number of entries
+/// repeat.
+const CURSOR_BATCH_SIZE: u64 = 32;
 
 /// The result of one rule for one event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -261,19 +271,25 @@ impl RuleEngine {
     ///
     /// The call starts at the persisted cursor.
     /// It reads the head and asks for the range after the cursor.
-    /// It processes each entry in order and persists the cursor after each
-    /// success.
+    /// It processes each entry in order.
+    /// It writes the cursor one time after each batch of 32 successful
+    /// entries.
+    /// It also writes the cursor when the feed is caught up and when the
+    /// loop exits.
     /// A non-entity entry does no rule work, but it still moves the cursor.
-    /// A process failure returns the error, and the cursor stays on the
-    /// failed entry.
+    /// A process failure writes the last successful sequence and returns the
+    /// error.
+    /// The cursor never moves past a failed entry.
+    /// The failed entry and the entries after it replay on the next run.
     /// When the cursor is ahead of the head, the call returns an error and
     /// does not rewind.
     /// When the feed is caught up, the call sleeps for `poll_interval` and
     /// checks cancellation again.
     ///
     /// Delivery is at least once.
-    /// A crash can repeat one event.
-    /// An action must be idempotent.
+    /// A crash can replay the last batch, so at most 32 entries repeat.
+    /// An execution marker stops a duplicate action.
+    /// An action must still be idempotent.
     pub async fn run<C: CancelToken>(
         &self,
         wal: &Wal,
@@ -281,8 +297,13 @@ impl RuleEngine {
         poll_interval: Duration,
     ) -> Result<(), RuleError> {
         let mut cursor = self.rules.cursor().await?;
+        // The number of successful entries since the last cursor write.
+        let mut pending: u64 = 0;
         loop {
             if cancel.is_cancelled() {
+                if pending > 0 {
+                    self.rules.set_cursor(cursor).await?;
+                }
                 return Ok(());
             }
             let head = wal.head().await.map_err(map_wal_error)?;
@@ -294,13 +315,31 @@ impl RuleEngine {
             if cursor < head {
                 let entries = wal.range(cursor + 1, head).await.map_err(map_wal_error)?;
                 for entry in entries {
-                    if let WalOp::Entity { event } = &entry.op {
-                        self.process(event).await?;
+                    if let WalOp::Entity { event } = &entry.op
+                        && let Err(error) = self.process(event).await
+                    {
+                        // Do not move the cursor past the failed entry. Write
+                        // the last successful sequence, so the next run starts
+                        // at the failed entry.
+                        if pending > 0 {
+                            self.rules.set_cursor(cursor).await?;
+                        }
+                        return Err(error);
                     }
-                    self.rules.set_cursor(entry.seq).await?;
                     cursor = entry.seq;
+                    pending += 1;
+                    if pending >= CURSOR_BATCH_SIZE {
+                        self.rules.set_cursor(cursor).await?;
+                        pending = 0;
+                    }
                 }
                 continue;
+            }
+            // The feed is caught up. Write the last successful sequence before
+            // the call waits for new entries.
+            if pending > 0 {
+                self.rules.set_cursor(cursor).await?;
+                pending = 0;
             }
             tokio::time::sleep(poll_interval).await;
         }
@@ -337,11 +376,13 @@ mod tests {
     /// A [`RuleAction`] test double that records each context.
     ///
     /// The `failing` switch makes `execute` return an error.
+    /// `fail_at_call` makes one numbered call return an error.
     /// The optional notify signals one test when the action ran.
     struct RecordingAction {
         kind: String,
         records: std::sync::Mutex<Vec<ActionContext>>,
         failing: AtomicBool,
+        fail_at_call: AtomicUsize,
         notify: Option<Arc<Notify>>,
     }
 
@@ -351,6 +392,7 @@ mod tests {
                 kind: kind.to_string(),
                 records: std::sync::Mutex::new(Vec::new()),
                 failing: AtomicBool::new(false),
+                fail_at_call: AtomicUsize::new(0),
                 notify: None,
             }
         }
@@ -362,6 +404,11 @@ mod tests {
 
         fn set_failing(&self, failing: bool) {
             self.failing.store(failing, Ordering::SeqCst);
+        }
+
+        /// Makes call number `call` return an error. A value of 0 disables it.
+        fn fail_on_call(&self, call: usize) {
+            self.fail_at_call.store(call, Ordering::SeqCst);
         }
 
         fn records(&self) -> Vec<ActionContext> {
@@ -376,11 +423,16 @@ mod tests {
         }
 
         async fn execute(&self, ctx: ActionContext) -> Result<(), anyhow::Error> {
-            self.records.lock().unwrap().push(ctx);
+            let call = {
+                let mut records = self.records.lock().unwrap();
+                records.push(ctx);
+                records.len()
+            };
             if let Some(notify) = &self.notify {
                 notify.notify_one();
             }
-            if self.failing.load(Ordering::SeqCst) {
+            let fail_at = self.fail_at_call.load(Ordering::SeqCst);
+            if self.failing.load(Ordering::SeqCst) || (fail_at != 0 && call == fail_at) {
                 return Err(anyhow::anyhow!("recording action failed"));
             }
             Ok(())
@@ -528,6 +580,13 @@ mod tests {
             snapshot: None,
             occurred_at: 1,
         }
+    }
+
+    /// Returns one created event with a unique event id for `seq`.
+    fn event_at(seq: u64) -> EntityEvent {
+        let mut item = event(EntityEventKind::Created);
+        item.event_id = format!("evt-{seq}");
+        item
     }
 
     async fn test_wal() -> Wal {
@@ -1018,6 +1077,179 @@ mod tests {
         assert!(matches!(result, Err(RuleError::Action(_))));
         assert_eq!(stores.rules.cursor().await.unwrap(), 0);
         assert!(!stores.rules.is_executed("alpha", "evt-1").await.unwrap());
+    }
+
+    /// `run` processes more entries than one cursor batch.
+    ///
+    /// Every event runs one time, and the cursor ends at the head.
+    #[tokio::test]
+    async fn run_processes_more_entries_than_one_batch_and_reaches_the_head() {
+        let stores = stores().await;
+        let recorder = Arc::new(RecordingAction::new("record"));
+        let engine = engine(&stores, vec![recorder.clone()]);
+        make_entity(&stores.entities).await;
+        stores.rules.upsert(draft("alpha", "record")).await.unwrap();
+        let wal = test_wal().await;
+        let total = CURSOR_BATCH_SIZE + 8;
+        for seq in 1..=total {
+            wal.append(WalOp::Entity {
+                event: event_at(seq),
+            })
+            .await
+            .unwrap();
+        }
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let handle = tokio::spawn({
+            let engine = engine.clone();
+            let wal = wal.clone();
+            let cancel = cancel.clone();
+            async move { engine.run(&wal, cancel, Duration::from_millis(5)).await }
+        });
+        wait_for_cursor(&stores.rules, total).await;
+        cancel.store(true, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        let executed: Vec<String> = recorder
+            .records()
+            .into_iter()
+            .map(|ctx| ctx.event.event_id)
+            .collect();
+        let expected: Vec<String> = (1..=total).map(|seq| format!("evt-{seq}")).collect();
+        assert_eq!(executed, expected);
+        assert_eq!(stores.rules.cursor().await.unwrap(), total);
+    }
+
+    /// A failed entry stops the cursor before it.
+    ///
+    /// The failed entry and the later entries replay on the next run.
+    #[tokio::test]
+    async fn a_failure_leaves_the_cursor_before_the_entry_and_replays_it() {
+        let stores = stores().await;
+        let recorder = Arc::new(RecordingAction::new("record"));
+        let engine = engine(&stores, vec![recorder.clone()]);
+        make_entity(&stores.entities).await;
+        stores.rules.upsert(draft("alpha", "record")).await.unwrap();
+        let wal = test_wal().await;
+        for seq in 1..=5 {
+            wal.append(WalOp::Entity {
+                event: event_at(seq),
+            })
+            .await
+            .unwrap();
+        }
+        recorder.fail_on_call(3);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            engine.run(
+                &wal,
+                Arc::new(AtomicBool::new(false)),
+                Duration::from_millis(5),
+            ),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(result, Err(RuleError::Action(_))));
+        assert_eq!(stores.rules.cursor().await.unwrap(), 2);
+        assert!(!stores.rules.is_executed("alpha", "evt-3").await.unwrap());
+        assert!(!stores.rules.is_executed("alpha", "evt-4").await.unwrap());
+        assert!(!stores.rules.is_executed("alpha", "evt-5").await.unwrap());
+
+        recorder.fail_on_call(0);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let handle = tokio::spawn({
+            let engine = engine.clone();
+            let wal = wal.clone();
+            let cancel = cancel.clone();
+            async move { engine.run(&wal, cancel, Duration::from_millis(5)).await }
+        });
+        wait_for_cursor(&stores.rules, 5).await;
+        cancel.store(true, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(stores.rules.cursor().await.unwrap(), 5);
+        assert!(stores.rules.is_executed("alpha", "evt-3").await.unwrap());
+        assert!(stores.rules.is_executed("alpha", "evt-4").await.unwrap());
+        assert!(stores.rules.is_executed("alpha", "evt-5").await.unwrap());
+        let executed: Vec<String> = recorder
+            .records()
+            .into_iter()
+            .map(|ctx| ctx.event.event_id)
+            .collect();
+        assert_eq!(
+            executed,
+            vec!["evt-1", "evt-2", "evt-3", "evt-3", "evt-4", "evt-5"]
+        );
+    }
+
+    /// A restart that replays one entry does not run its action again.
+    ///
+    /// The execution marker stops the duplicate action.
+    #[tokio::test]
+    async fn a_restart_with_a_replayed_cursor_does_not_rerun_an_executed_event() {
+        let stores = stores().await;
+        let first = Arc::new(RecordingAction::new("record"));
+        let subject = engine(&stores, vec![first.clone()]);
+        make_entity(&stores.entities).await;
+        stores.rules.upsert(draft("alpha", "record")).await.unwrap();
+        let wal = test_wal().await;
+        for seq in 1..=2 {
+            wal.append(WalOp::Entity {
+                event: event_at(seq),
+            })
+            .await
+            .unwrap();
+        }
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let handle = tokio::spawn({
+            let engine = subject.clone();
+            let wal = wal.clone();
+            let cancel = cancel.clone();
+            async move { engine.run(&wal, cancel, Duration::from_millis(5)).await }
+        });
+        wait_for_cursor(&stores.rules, 2).await;
+        cancel.store(true, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.records().len(), 2);
+
+        // A crash before the last cursor write replays one entry. Move the
+        // stored cursor back one entry to model that replay window.
+        stores.rules.set_cursor(1).await.unwrap();
+
+        let second = Arc::new(RecordingAction::new("record"));
+        let restarted = engine(&stores, vec![second.clone()]);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let handle = tokio::spawn({
+            let engine = restarted.clone();
+            let wal = wal.clone();
+            let cancel = cancel.clone();
+            async move { engine.run(&wal, cancel, Duration::from_millis(5)).await }
+        });
+        wait_for_cursor(&stores.rules, 2).await;
+        cancel.store(true, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        assert!(second.records().is_empty());
+        assert_eq!(stores.rules.cursor().await.unwrap(), 2);
     }
 
     #[tokio::test]
