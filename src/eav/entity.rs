@@ -11,6 +11,7 @@
 //! - `entity:{id}:meta` holds the entity metadata as JSON.
 //! - `entity:{id}:attr:{key}` holds one tagged JSON [`AttributeValue`].
 //! - `idx:entity:{entity_id}` is an empty entity marker.
+//! - `idx:entity-meta:backfilled` is an empty backfill marker.
 //! - `idx:schema:{schema_id}:{entity_id}` is an empty schema marker.
 //! - `idx:attr:{key}:{hash}:{entity_id}` is an empty attribute marker.
 //! - `idx:attr-key:{key}` is an empty marker that records that the attribute
@@ -31,9 +32,11 @@
 //! The entity list scans this marker family in id order.
 //! All scans stop at the `prefix:` to `prefix;` bound.
 //!
-//! An existing store needs one reindex pass to gain the entity markers.
-//! This build has no migration command for that pass.
-//! A store without the markers returns an empty cursor page.
+//! An existing store can lack the entity markers.
+//! [`EntityStore::list_after`] then backfills them one time.
+//! The `idx:entity-meta:backfilled` marker records that pass.
+//! The pass holds the write lock, so a create or a delete cannot race it.
+//! A store without the markers still returns entity pages after the pass.
 //!
 //! # Entity events
 //!
@@ -78,6 +81,12 @@ const ATTR_INFIX: &str = ":attr:";
 
 /// Key prefix for entity markers.
 const ENTITY_INDEX_PREFIX: &str = "idx:entity:";
+
+/// Key prefix for entity marker metadata.
+const ENTITY_META_PREFIX: &str = "idx:entity-meta:";
+
+/// Key suffix for the one-time entity marker backfill.
+const ENTITY_BACKFILL_SUFFIX: &str = "backfilled";
 
 /// Key prefix for schema index markers.
 const SCHEMA_INDEX_PREFIX: &str = "idx:schema:";
@@ -1449,6 +1458,59 @@ impl EntityStore {
         Ok(entities)
     }
 
+    /// Backfills the entity index markers one time.
+    ///
+    /// The call returns early when the backfill marker exists.
+    /// It takes the write lock and then the store write guard.
+    /// It re-checks the marker inside the lock.
+    /// It scans every `entity:{id}:meta` row and writes each missing marker.
+    /// It writes the backfill marker last.
+    /// A crash before the last write retries on the next call.
+    /// Every write is idempotent.
+    async fn backfill_entity_index(&self) -> Result<(), EntityError> {
+        let marker = entity_backfill_marker();
+        {
+            let g = self.store.read().await;
+            if g.get_bytes(&marker)
+                .await
+                .map_err(EntityError::Store)?
+                .is_some()
+            {
+                return Ok(());
+            }
+        }
+
+        let _write = self.write_lock.lock().await;
+        let g = self.store.write().await;
+        if g.get_bytes(&marker)
+            .await
+            .map_err(EntityError::Store)?
+            .is_some()
+        {
+            return Ok(());
+        }
+        let rows = scan_prefix(&*g, ENTITY_PREFIX).await?;
+        let mut seen = BTreeSet::new();
+        for row in rows {
+            let Some(rest) = row.key.strip_prefix(ENTITY_PREFIX) else {
+                continue;
+            };
+            let Some(id) = rest.strip_suffix(META_SUFFIX) else {
+                continue;
+            };
+            if id.is_empty() || id.contains(':') || !seen.insert(id.to_string()) {
+                continue;
+            }
+            g.set_bytes(&entity_index_key(id), b"")
+                .await
+                .map_err(EntityError::Store)?;
+        }
+        g.set_bytes(&marker, b"")
+            .await
+            .map_err(EntityError::Store)?;
+        Ok(())
+    }
+
     /// Lists one page of every entity.
     ///
     /// The result is sorted by id.
@@ -1469,7 +1531,16 @@ impl EntityStore {
 
     /// Lists one page of every entity in id order.
     ///
-    /// The scan reads only the `idx:entity:` family.
+    /// An old store can lack the entity markers.
+    /// The call then backfills every missing marker one time.
+    /// The `idx:entity-meta:backfilled` marker records the pass.
+    /// The pass takes the write lock and the store write guard.
+    /// It re-checks the marker inside the lock.
+    /// It scans the `entity:` family and writes one marker for each meta row.
+    /// It writes the backfill marker last.
+    /// A crash before that write retries on the next call.
+    /// Every write is idempotent.
+    /// The call then scans only the `idx:entity:` family.
     /// It starts after the `after` id when the caller gives a cursor.
     /// The call returns the entities and the cursor for the next page.
     /// The cursor is the last id of a full page.
@@ -1484,6 +1555,7 @@ impl EntityStore {
         if limit == 0 {
             return Ok((Vec::new(), None));
         }
+        self.backfill_entity_index().await?;
         let g = self.store.read().await;
         let start = match after {
             Some(cursor) => {
@@ -2305,6 +2377,11 @@ fn meta_key(id: &str) -> String {
 /// The marker key for one entity.
 fn entity_index_key(id: &str) -> String {
     format!("{ENTITY_INDEX_PREFIX}{id}")
+}
+
+/// The marker key for the one-time entity marker backfill.
+fn entity_backfill_marker() -> String {
+    format!("{ENTITY_META_PREFIX}{ENTITY_BACKFILL_SUFFIX}")
 }
 
 /// The key that holds one attribute of an entity.
@@ -3418,6 +3495,177 @@ mod tests {
 
         assert_eq!(ids, vec!["c", "d"]);
         assert_eq!(next, None);
+    }
+
+    /// An old store without the entity markers gets them on the first page.
+    #[tokio::test]
+    async fn list_after_backfills_the_markers_for_an_old_store() {
+        let (store, registry, raw) = new_store().await;
+        registry.publish(schema("task", &[], vec![])).await.unwrap();
+        for id in ["a", "b", "c"] {
+            store
+                .create(draft(id, &["task"], vec![]), &ctx())
+                .await
+                .unwrap();
+        }
+        for id in ["a", "b", "c"] {
+            raw.delete(&entity_index_key(id)).await.unwrap();
+        }
+        raw.delete(&entity_backfill_marker()).await.unwrap();
+        assert!(
+            all_keys(&raw)
+                .await
+                .iter()
+                .all(|key| !key.starts_with(ENTITY_INDEX_PREFIX))
+        );
+
+        let (page, next) = store.list_after(10, None).await.unwrap();
+        let ids: Vec<&str> = page.iter().map(|entity| entity.id.as_str()).collect();
+
+        assert_eq!(ids, vec!["a", "b", "c"]);
+        assert_eq!(next, None);
+        for id in ["a", "b", "c"] {
+            assert!(
+                raw.get_bytes(&entity_index_key(id))
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        assert!(
+            raw.get_bytes(&entity_backfill_marker())
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// A fresh store keeps the same page and gains the backfill marker.
+    #[tokio::test]
+    async fn list_after_keeps_a_fresh_store_page_and_sets_the_marker() {
+        let (store, registry, raw) = new_store().await;
+        registry.publish(schema("task", &[], vec![])).await.unwrap();
+        for id in ["a", "b", "c"] {
+            store
+                .create(draft(id, &["task"], vec![]), &ctx())
+                .await
+                .unwrap();
+        }
+
+        let (page, next) = store.list_after(10, None).await.unwrap();
+
+        assert_eq!(page, store.list().await.unwrap());
+        assert_eq!(next, None);
+        assert!(
+            raw.get_bytes(&entity_backfill_marker())
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// A set backfill marker writes no duplicate entity marker.
+    #[tokio::test]
+    async fn list_after_with_the_backfill_marker_does_not_duplicate_entities() {
+        let (store, registry, raw) = new_store().await;
+        registry.publish(schema("task", &[], vec![])).await.unwrap();
+        for id in ["a", "b", "c"] {
+            store
+                .create(draft(id, &["task"], vec![]), &ctx())
+                .await
+                .unwrap();
+        }
+        raw.set_bytes(&entity_backfill_marker(), b"").await.unwrap();
+
+        let (first, first_next) = store.list_after(2, None).await.unwrap();
+        let first_ids: Vec<&str> = first.iter().map(|entity| entity.id.as_str()).collect();
+        assert_eq!(first_ids, vec!["a", "b"]);
+        assert_eq!(first_next.as_deref(), Some("b"));
+
+        let (second, second_next) = store.list_after(2, first_next.as_deref()).await.unwrap();
+        let second_ids: Vec<&str> = second.iter().map(|entity| entity.id.as_str()).collect();
+        assert_eq!(second_ids, vec!["c"]);
+        assert_eq!(second_next, None);
+
+        let mut all: Vec<String> = first.into_iter().map(|entity| entity.id).collect();
+        all.extend(second.into_iter().map(|entity| entity.id));
+        assert_eq!(all, vec!["a", "b", "c"]);
+        let markers = all_keys(&raw)
+            .await
+            .into_iter()
+            .filter(|key| key.starts_with(ENTITY_INDEX_PREFIX))
+            .count();
+        assert_eq!(markers, 3);
+    }
+
+    /// The offset page path works through the backfill.
+    #[tokio::test]
+    async fn list_page_pages_an_old_store_after_the_backfill() {
+        let (store, registry, raw) = new_store().await;
+        registry.publish(schema("task", &[], vec![])).await.unwrap();
+        for id in ["a", "b", "c", "d", "e"] {
+            store
+                .create(draft(id, &["task"], vec![]), &ctx())
+                .await
+                .unwrap();
+        }
+        for id in ["a", "b", "c", "d", "e"] {
+            raw.delete(&entity_index_key(id)).await.unwrap();
+        }
+
+        let mut paged = store.list_page(2, 0).await.unwrap();
+        paged.extend(store.list_page(2, 2).await.unwrap());
+        paged.extend(store.list_page(2, 4).await.unwrap());
+
+        assert_eq!(paged, store.list().await.unwrap());
+        assert!(
+            raw.get_bytes(&entity_backfill_marker())
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// A deleted entity stays out of the pages after a later backfill.
+    #[tokio::test]
+    async fn list_after_does_not_restore_a_deleted_entity() {
+        let (store, registry, raw) = new_store().await;
+        registry.publish(schema("task", &[], vec![])).await.unwrap();
+        for id in ["a", "b"] {
+            store
+                .create(draft(id, &["task"], vec![]), &ctx())
+                .await
+                .unwrap();
+        }
+        store.delete("b", 1, &ctx()).await.unwrap();
+        for id in ["a", "b"] {
+            raw.delete(&entity_index_key(id)).await.unwrap();
+        }
+        raw.delete(&entity_backfill_marker()).await.unwrap();
+
+        let (page, next) = store.list_after(10, None).await.unwrap();
+        let ids: Vec<&str> = page.iter().map(|entity| entity.id.as_str()).collect();
+
+        assert_eq!(ids, vec!["a"]);
+        assert_eq!(next, None);
+        assert!(
+            raw.get_bytes(&entity_index_key("a"))
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            raw.get_bytes(&entity_index_key("b"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            raw.get_bytes(&entity_backfill_marker())
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[tokio::test]
