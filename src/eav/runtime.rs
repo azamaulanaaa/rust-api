@@ -13,8 +13,15 @@
 //!
 //! The runtime has no HTTP routes and no concrete actions.
 //! It adds no business rules.
+//!
+//! The runtime has one shared failure latch.
+//! [`EavRuntime::spawn`] sets the latch when [`EavRuntime::run`] returns an
+//! error.
+//! The readiness probe reads the latch.
+//! A normal cancellation stops the loops and leaves the latch clear.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -90,6 +97,11 @@ pub struct EavRuntime {
     wal: Wal,
     /// The OpenTelemetry instruments for the runtime.
     metrics: EavMetrics,
+    /// Set when a background loop returns an error.
+    ///
+    /// The latch starts as `false`.
+    /// A normal cancellation does not set it.
+    failed: Arc<AtomicBool>,
 }
 
 impl EavRuntime {
@@ -139,6 +151,7 @@ impl EavRuntime {
             engine,
             wal,
             metrics,
+            failed: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -175,6 +188,24 @@ impl EavRuntime {
     /// Returns the runtime metrics.
     pub fn metrics(&self) -> &EavMetrics {
         &self.metrics
+    }
+
+    /// Returns the shared failure latch.
+    ///
+    /// The latch starts as `false`.
+    /// [`EavRuntime::spawn`] sets it to `true` when [`EavRuntime::run`]
+    /// returns an error.
+    /// A normal cancellation leaves it `false`.
+    ///
+    /// The call is cheap and does not block.
+    /// The readiness probe reads the flag with [`Ordering::Relaxed`].
+    pub fn failure_latch(&self) -> Arc<AtomicBool> {
+        self.failed.clone()
+    }
+
+    /// Sets the failure latch.
+    fn mark_failed(&self) {
+        self.failed.store(true, Ordering::Relaxed);
     }
 
     /// Emits a timer event for each due timestamp value and returns the count.
@@ -275,7 +306,9 @@ impl EavRuntime {
 
     /// Starts [`EavRuntime::run`] on a Tokio task.
     ///
-    /// The call logs a runtime error and returns it.
+    /// The call logs a runtime error, sets the failure latch, and returns
+    /// the error.
+    /// The call does not set the latch on a normal cancellation.
     /// A caller can await the handle during shutdown.
     pub fn spawn<C: CancelToken + Send + 'static>(
         &self,
@@ -287,6 +320,7 @@ impl EavRuntime {
             match runtime.run(cancel, config).await {
                 Ok(()) => Ok(()),
                 Err(error) => {
+                    runtime.mark_failed();
                     tracing::error!(?error, "EAV runtime failed");
                     Err(error)
                 }
@@ -427,7 +461,7 @@ mod tests {
     use crate::eav::entity::{AttributeValue, EntityDraft, WriteContext};
     use crate::eav::schema::{AttributeDef, AttributeType, SchemaDraft};
     use crate::fs::s3::S3Backend;
-    use crate::records::EntityEventKind;
+    use crate::records::{ChangeSink, EntityEventKind, WalOp};
     use crate::rules::action::ActionContext;
     use crate::rules::rule::{ActionRef, Condition, RuleDraft, RuleTrigger};
 
@@ -560,6 +594,80 @@ mod tests {
             timer_interval: Duration::from_millis(2),
             timer_batch: 100,
         }
+    }
+
+    /// A [`ChangeSink`] that refuses every append.
+    struct FailingFeed;
+
+    #[async_trait::async_trait]
+    impl ChangeSink for FailingFeed {
+        async fn append(&self, _op: WalOp) -> anyhow::Result<()> {
+            Err(anyhow::anyhow!("the test feed is down"))
+        }
+    }
+
+    /// Builds a runtime whose outbox relay fails on its first flush.
+    ///
+    /// The entity store uses a feed that refuses every append.
+    /// The create commits the outbox row and then reports the delivery
+    /// error, so the row stays for the relay to find.
+    async fn runtime_with_a_failing_outbox() -> EavRuntime {
+        let mut runtime = build_runtime(Vec::new()).await;
+        let s3 = memory_s3();
+        let prefix = test_prefix("eav-runtime-failing");
+        let store = build_s3_store(&s3, &format!("{prefix}/entity"))
+            .await
+            .unwrap();
+        let schemas = SchemaRegistry::new(
+            build_s3_store(&s3, &format!("{prefix}/schema"))
+                .await
+                .unwrap(),
+        );
+        let entities =
+            EntityStore::new(store, schemas.clone()).with_change_sink(Arc::new(FailingFeed));
+        schemas.publish(schema()).await.unwrap();
+        runtime.entities = entities;
+        runtime
+    }
+
+    #[tokio::test]
+    async fn a_new_runtime_starts_with_a_clear_failure_latch() {
+        let runtime = build_runtime(Vec::new()).await;
+        assert!(!runtime.failure_latch().load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn a_set_failure_latch_reads_true() {
+        let runtime = build_runtime(Vec::new()).await;
+        let latch = runtime.failure_latch();
+        assert!(!latch.load(Ordering::Relaxed));
+        runtime.mark_failed();
+        assert!(latch.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn spawn_sets_the_failure_latch_when_the_outbox_relay_fails() {
+        let runtime = runtime_with_a_failing_outbox().await;
+        let latch = runtime.failure_latch();
+        assert!(!latch.load(Ordering::Relaxed));
+
+        let created = runtime
+            .entities()
+            .create(entity(), &WriteContext::new("tester"))
+            .await;
+        assert!(created.is_err(), "the test feed must refuse the create");
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let handle = runtime.spawn(cancel, short_config());
+        let result = tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("the runtime stops after the outbox failure")
+            .expect("the task does not panic");
+        assert!(result.is_err(), "the outbox failure must reach the handle");
+        assert!(
+            latch.load(Ordering::Relaxed),
+            "a dead runtime must set the failure latch"
+        );
     }
 
     #[tokio::test]
