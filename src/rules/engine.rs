@@ -1244,7 +1244,7 @@ mod tests {
         let created = make_entity(&stores.entities).await;
         stores
             .entities
-            .delete("e1", created.version, &WriteContext::new("tester"))
+            .delete("e1", created.version, false, &WriteContext::new("tester"))
             .await
             .unwrap();
         let mut rule = draft("alpha", "record");
