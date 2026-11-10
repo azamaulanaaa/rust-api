@@ -55,6 +55,12 @@ pub enum EntityError {
         /// The head of the rejected build.
         incoming: u64,
     },
+    /// An `EntityRef` attribute names an entity that does not exist.
+    ///
+    /// The first field is the attribute name.
+    /// The second field is the target entity id.
+    #[error("attribute {0} references an entity that does not exist: {1}")]
+    DanglingRef(String, String),
     /// Data could not be encoded or decoded.
     #[error("entity serialization failed")]
     Internal(String),

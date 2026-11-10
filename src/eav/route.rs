@@ -540,7 +540,8 @@ impl From<EntityError> for EavApiError {
             | EntityError::UnknownAttribute(_)
             | EntityError::SchemaConflict(_)
             | EntityError::MissingRequired(_)
-            | EntityError::TypeMismatch(_) => Kind::Invalid,
+            | EntityError::TypeMismatch(_)
+            | EntityError::DanglingRef(_, _) => Kind::Invalid,
             EntityError::UniqueViolation(_)
             | EntityError::VersionConflict
             | EntityError::AlreadyExists(_)
@@ -1266,6 +1267,7 @@ mod tests {
                 Arc::new(NoopAction),
                 Arc::new(WebhookAction::new(vec![server.address().to_string()])),
             ],
+            true,
         )
         .await?;
         let engine =

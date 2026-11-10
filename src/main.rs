@@ -410,6 +410,7 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
             &db_prefix,
             wal.clone(),
             vec![Arc::new(NoopAction), Arc::new(LogAction), Arc::new(webhook)],
+            config.eav.check_entity_refs,
         )
         .await
         .context("build the EAV runtime")?;
