@@ -135,24 +135,64 @@ pub struct ExpectedVersionQuery {
 ///
 /// The default limit is 50.
 /// The maximum limit is 200.
-#[derive(Debug, Clone, Copy, Deserialize, utoipa::IntoParams)]
+/// A present `after` field selects cursor mode.
+#[derive(Debug, Clone, Deserialize, utoipa::IntoParams)]
 pub struct PageQuery {
     /// The page size. The default is 50. The maximum is 200.
     #[serde(default)]
     pub limit: Option<usize>,
     /// The number of items to skip. The default is 0.
+    ///
+    /// This field applies only to offset mode.
     #[serde(default)]
     pub offset: Option<usize>,
+    /// The id to resume after. The default is `None`.
+    ///
+    /// A present value selects cursor mode.
+    /// An empty value starts at the first item.
+    /// A non-empty value starts after that id.
+    /// Omit the field to use offset paging.
+    /// Do not combine it with a non-zero `offset`.
+    #[serde(default)]
+    pub after: Option<String>,
+}
+
+/// The paging mode of a list route.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PageMode {
+    /// Skip `offset` items and use `next_offset`.
+    Offset(usize),
+    /// Resume after an id and use `next`.
+    ///
+    /// `None` starts at the first item.
+    Cursor(Option<String>),
 }
 
 impl PageQuery {
-    /// Resolves the page window and checks the limit.
-    pub(crate) fn resolve(self) -> Result<(usize, usize), EavApiError> {
+    /// Resolves the page size and the paging mode.
+    ///
+    /// A cursor with a non-zero offset is invalid.
+    /// An empty cursor starts at the first item.
+    pub(crate) fn resolve(self) -> Result<(usize, PageMode), EavApiError> {
         let limit = self.limit.unwrap_or(DEFAULT_PAGE_LIMIT);
         if limit == 0 || limit > MAX_PAGE_LIMIT {
             return Err(EavApiError::Invalid(Box::new(InvalidPageLimit)));
         }
-        Ok((limit, self.offset.unwrap_or(0)))
+        let offset = self.offset.unwrap_or(0);
+        let mode = match self.after {
+            Some(after) => {
+                if offset != 0 {
+                    return Err(EavApiError::Invalid(Box::new(InvalidPageCursor)));
+                }
+                if after.is_empty() {
+                    PageMode::Cursor(None)
+                } else {
+                    PageMode::Cursor(Some(after))
+                }
+            }
+            None => PageMode::Offset(offset),
+        };
+        Ok((limit, mode))
     }
 }
 
@@ -236,6 +276,11 @@ pub struct SchemaPage {
     /// `Some` means the page was full and a following page may exist.
     /// Fetch it and stop when the page is empty.
     pub next_offset: Option<usize>,
+    /// The id to resume after for the next page.
+    ///
+    /// The value is `Some` only in cursor mode.
+    /// The value is `None` when the scan is exhausted.
+    pub next: Option<String>,
 }
 
 /// A page of entities.
@@ -246,6 +291,11 @@ pub struct EntityPage {
     /// `Some` means the page was full and a following page may exist.
     /// Fetch it and stop when the page is empty.
     pub next_offset: Option<usize>,
+    /// The id to resume after for the next page.
+    ///
+    /// The value is `Some` only in cursor mode.
+    /// The value is `None` when the scan is exhausted.
+    pub next: Option<String>,
 }
 
 /// A page of rules.
@@ -269,6 +319,18 @@ impl fmt::Display for InvalidPageLimit {
 }
 
 impl std::error::Error for InvalidPageLimit {}
+
+/// The source of a cursor that comes with a non-zero offset.
+#[derive(Debug)]
+struct InvalidPageCursor;
+
+impl fmt::Display for InvalidPageCursor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("after and offset cannot be combined")
+    }
+}
+
+impl std::error::Error for InvalidPageCursor {}
 
 /// The source of a revalidation limit outside the allowed range.
 #[derive(Debug)]
@@ -553,10 +615,29 @@ async fn list_schemas(
     query: web::Query<PageQuery>,
 ) -> Result<HttpResponse, EavApiError> {
     require_management(&policy, &claims.sub, SCHEMAS, Action::Read).await?;
-    let (limit, offset) = query.into_inner().resolve()?;
-    let items = runtime.schemas().list_page(limit, offset).await?;
-    let next_offset = page_next_offset(offset, items.len(), limit);
-    Ok(HttpResponse::Ok().json(SchemaPage { items, next_offset }))
+    let (limit, mode) = query.into_inner().resolve()?;
+    match mode {
+        PageMode::Cursor(after) => {
+            let (items, next) = runtime
+                .schemas()
+                .list_after(limit, after.as_deref())
+                .await?;
+            Ok(HttpResponse::Ok().json(SchemaPage {
+                items,
+                next_offset: None,
+                next,
+            }))
+        }
+        PageMode::Offset(offset) => {
+            let items = runtime.schemas().list_page(limit, offset).await?;
+            let next_offset = page_next_offset(offset, items.len(), limit);
+            Ok(HttpResponse::Ok().json(SchemaPage {
+                items,
+                next_offset,
+                next: None,
+            }))
+        }
+    }
 }
 
 #[utoipa::path(get, path = "/eav/schemas/{id}", tag = "eav", params(("id" = String, Path)), responses((status=200, body=crate::eav::schema::SchemaDef), (status=401, body=crate::http::error::ErrorBody), (status=403, body=crate::http::error::ErrorBody), (status=404, body=crate::http::error::ErrorBody), (status=500, body=crate::http::error::ErrorBody)))]
@@ -722,6 +803,7 @@ async fn create_entity(
 /// It loads a raw page, filters the rows, and returns the visible items.
 /// `next_offset` comes from the number of raw rows that the page consumed.
 /// The next page can then contain fewer items than the limit.
+/// A cursor query uses the entity marker family and returns `next`.
 #[utoipa::path(get, path = "/eav/entities", tag = "eav", params(PageQuery), responses((status=200, body=EntityPage), (status=400, body=crate::http::error::ErrorBody), (status=401, body=crate::http::error::ErrorBody), (status=403, body=crate::http::error::ErrorBody), (status=500, body=crate::http::error::ErrorBody)))]
 #[get("/entities")]
 async fn list_entities(
@@ -731,17 +813,42 @@ async fn list_entities(
     query: web::Query<PageQuery>,
 ) -> Result<HttpResponse, EavApiError> {
     require_management(&policy, &claims.sub, ENTITIES, Action::Read).await?;
-    let (limit, offset) = query.into_inner().resolve()?;
-    let raw = runtime.entities().list_page(limit, offset).await?;
-    let raw_len = raw.len();
-    let mut items = Vec::with_capacity(raw_len);
-    for entity in raw {
-        if can_read_entity(&policy, &claims.sub, &entity.id).await? {
-            items.push(entity);
+    let (limit, mode) = query.into_inner().resolve()?;
+    match mode {
+        PageMode::Cursor(after) => {
+            let (raw, next) = runtime
+                .entities()
+                .list_after(limit, after.as_deref())
+                .await?;
+            let mut items = Vec::with_capacity(raw.len());
+            for entity in raw {
+                if can_read_entity(&policy, &claims.sub, &entity.id).await? {
+                    items.push(entity);
+                }
+            }
+            Ok(HttpResponse::Ok().json(EntityPage {
+                items,
+                next_offset: None,
+                next,
+            }))
+        }
+        PageMode::Offset(offset) => {
+            let raw = runtime.entities().list_page(limit, offset).await?;
+            let raw_len = raw.len();
+            let mut items = Vec::with_capacity(raw_len);
+            for entity in raw {
+                if can_read_entity(&policy, &claims.sub, &entity.id).await? {
+                    items.push(entity);
+                }
+            }
+            let next_offset = page_next_offset(offset, raw_len, limit);
+            Ok(HttpResponse::Ok().json(EntityPage {
+                items,
+                next_offset,
+                next: None,
+            }))
         }
     }
-    let next_offset = page_next_offset(offset, raw_len, limit);
-    Ok(HttpResponse::Ok().json(EntityPage { items, next_offset }))
 }
 
 #[utoipa::path(get, path = "/eav/entities/{id}", tag = "eav", params(("id" = String, Path)), responses((status=200, body=crate::eav::entity::Entity), (status=401, body=crate::http::error::ErrorBody), (status=403, body=crate::http::error::ErrorBody), (status=404, body=crate::http::error::ErrorBody), (status=500, body=crate::http::error::ErrorBody)))]
@@ -822,20 +929,45 @@ async fn list_schema_entities(
 ) -> Result<HttpResponse, EavApiError> {
     require_management(&policy, &claims.sub, ENTITIES, Action::Read).await?;
     let id = path.into_inner();
-    let (limit, offset) = query.into_inner().resolve()?;
-    let raw = runtime
-        .entities()
-        .list_by_schema_page(&id, limit, offset)
-        .await?;
-    let raw_len = raw.len();
-    let mut items = Vec::with_capacity(raw_len);
-    for entity in raw {
-        if can_read_entity(&policy, &claims.sub, &entity.id).await? {
-            items.push(entity);
+    let (limit, mode) = query.into_inner().resolve()?;
+    match mode {
+        PageMode::Cursor(after) => {
+            let (raw, next) = runtime
+                .entities()
+                .list_by_schema_after(&id, limit, after.as_deref())
+                .await?;
+            let mut items = Vec::with_capacity(raw.len());
+            for entity in raw {
+                if can_read_entity(&policy, &claims.sub, &entity.id).await? {
+                    items.push(entity);
+                }
+            }
+            Ok(HttpResponse::Ok().json(EntityPage {
+                items,
+                next_offset: None,
+                next,
+            }))
+        }
+        PageMode::Offset(offset) => {
+            let raw = runtime
+                .entities()
+                .list_by_schema_page(&id, limit, offset)
+                .await?;
+            let raw_len = raw.len();
+            let mut items = Vec::with_capacity(raw_len);
+            for entity in raw {
+                if can_read_entity(&policy, &claims.sub, &entity.id).await? {
+                    items.push(entity);
+                }
+            }
+            let next_offset = page_next_offset(offset, raw_len, limit);
+            Ok(HttpResponse::Ok().json(EntityPage {
+                items,
+                next_offset,
+                next: None,
+            }))
         }
     }
-    let next_offset = page_next_offset(offset, raw_len, limit);
-    Ok(HttpResponse::Ok().json(EntityPage { items, next_offset }))
 }
 
 #[utoipa::path(post, path = "/eav/rules", tag = "eav", request_body = RuleDraft, responses((status=201, body=crate::rules::rule::Rule), (status=400, body=crate::http::error::ErrorBody), (status=401, body=crate::http::error::ErrorBody), (status=403, body=crate::http::error::ErrorBody), (status=500, body=crate::http::error::ErrorBody)))]
@@ -864,7 +996,11 @@ async fn list_rules(
     query: web::Query<PageQuery>,
 ) -> Result<HttpResponse, EavApiError> {
     require_management(&policy, &claims.sub, RULES, Action::Read).await?;
-    let (limit, offset) = query.into_inner().resolve()?;
+    let (limit, mode) = query.into_inner().resolve()?;
+    let offset = match mode {
+        PageMode::Offset(offset) => offset,
+        PageMode::Cursor(_) => 0,
+    };
     let items = runtime.rules().list_page(limit, offset).await?;
     let next_offset = page_next_offset(offset, items.len(), limit);
     Ok(HttpResponse::Ok().json(RulePage { items, next_offset }))
@@ -944,7 +1080,7 @@ mod tests {
     use crate::db::{build_s3_store, build_test_store, test_prefix};
     use crate::docs::ApiDoc;
     use crate::eav::entity::{AttributeValue, EntityDraft};
-    use crate::eav::schema::{AttributeDef, AttributeType};
+    use crate::eav::schema::{AttributeDef, AttributeType, SchemaDraft};
     use crate::fs::s3::{S3Backend, S3ClientConfig};
     use crate::http::middleware::jwks::test_support::{rsa_key, sign_rs256, spawn_jwks};
     use crate::policy::PolicyEngine;
@@ -1573,6 +1709,137 @@ mod tests {
         let page: Value = actix_test::read_body_json(res).await;
         assert_eq!(page["items"].as_array().map(Vec::len), Some(0));
         assert!(page["next_offset"].is_null());
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn the_entity_list_pages_with_an_after_cursor() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        assert!(fx.engine.claim_superadmin("alice").await?);
+        publish_task_schema(&fx).await?;
+        for id in ["e1", "e2", "e3"] {
+            create_task(&fx, id).await?;
+        }
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+
+        let mut ids = Vec::new();
+        let mut after = Some(String::new());
+        let mut first = true;
+        loop {
+            let uri = match &after {
+                Some(cursor) => format!("/eav/entities?limit=2&after={cursor}"),
+                None => "/eav/entities?limit=2".to_string(),
+            };
+            let res = actix_test::call_service(
+                &app,
+                auth(actix_test::TestRequest::get().uri(&uri), &token).to_request(),
+            )
+            .await;
+            assert_eq!(res.status(), http::StatusCode::OK, "{uri}");
+            let page: Value = actix_test::read_body_json(res).await;
+            assert!(page["next_offset"].is_null(), "{uri}");
+            let page_ids: Vec<&str> = page["items"]
+                .as_array()
+                .expect("items")
+                .iter()
+                .map(|item| item["id"].as_str().expect("id"))
+                .collect();
+            if first {
+                assert_eq!(page_ids, vec!["e1", "e2"], "{uri}");
+                assert_eq!(page["next"], "e2", "{uri}");
+                first = false;
+            }
+            ids.extend(page_ids.iter().map(|id| id.to_string()));
+            match page["next"].as_str() {
+                Some(cursor) => after = Some(cursor.to_string()),
+                None => break,
+            }
+        }
+
+        assert_eq!(ids, vec!["e1", "e2", "e3"]);
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn the_schema_list_pages_with_an_after_cursor() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        assert!(fx.engine.claim_superadmin("alice").await?);
+        for id in ["alpha", "beta", "gamma"] {
+            fx.runtime
+                .schemas()
+                .publish(SchemaDraft {
+                    id: id.to_string(),
+                    extends: Vec::new(),
+                    attributes: Default::default(),
+                })
+                .await?;
+        }
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+
+        let mut ids = Vec::new();
+        let mut after = Some(String::new());
+        let mut first = true;
+        loop {
+            let uri = match &after {
+                Some(cursor) => format!("/eav/schemas?limit=1&after={cursor}"),
+                None => "/eav/schemas?limit=1".to_string(),
+            };
+            let res = actix_test::call_service(
+                &app,
+                auth(actix_test::TestRequest::get().uri(&uri), &token).to_request(),
+            )
+            .await;
+            assert_eq!(res.status(), http::StatusCode::OK, "{uri}");
+            let page: Value = actix_test::read_body_json(res).await;
+            assert!(page["next_offset"].is_null(), "{uri}");
+            let page_ids: Vec<&str> = page["items"]
+                .as_array()
+                .expect("items")
+                .iter()
+                .map(|item| item["id"].as_str().expect("id"))
+                .collect();
+            if first {
+                assert_eq!(page_ids, vec!["alpha"], "{uri}");
+                assert_eq!(page["next"], "alpha", "{uri}");
+                first = false;
+            }
+            ids.extend(page_ids.iter().map(|id| id.to_string()));
+            match page["next"].as_str() {
+                Some(cursor) => after = Some(cursor.to_string()),
+                None => break,
+            }
+        }
+
+        assert_eq!(ids, vec!["alpha", "beta", "gamma"]);
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn an_after_cursor_with_a_non_zero_offset_is_400() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        assert!(fx.engine.claim_superadmin("alice").await?);
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+
+        for uri in [
+            "/eav/entities?after=e1&offset=1",
+            "/eav/schemas?after=alpha&offset=1",
+            "/eav/sync/snapshot?after=e1&offset=1",
+        ] {
+            let res = actix_test::call_service(
+                &app,
+                auth(actix_test::TestRequest::get().uri(uri), &token).to_request(),
+            )
+            .await;
+            assert_eq!(res.status(), http::StatusCode::BAD_REQUEST, "{uri}");
+            let body: crate::http::error::ErrorBody = actix_test::read_body_json(res).await;
+            assert_eq!(body.code.as_deref(), Some("invalid_request"), "{uri}");
+        }
         Ok(())
     }
 

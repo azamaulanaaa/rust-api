@@ -10,6 +10,7 @@
 //!
 //! - `entity:{id}:meta` holds the entity metadata as JSON.
 //! - `entity:{id}:attr:{key}` holds one tagged JSON [`AttributeValue`].
+//! - `idx:entity:{entity_id}` is an empty entity marker.
 //! - `idx:schema:{schema_id}:{entity_id}` is an empty schema marker.
 //! - `idx:attr:{key}:{hash}:{entity_id}` is an empty attribute marker.
 //! - `idx:unique:{key}:{hash}:{entity_id}` is a unique value marker.
@@ -20,7 +21,13 @@
 //! The `encoded_ts` is the timestamp XORed with the sign bit, as 16 hex digits.
 //! Lexicographic key order then equals numeric time order.
 //! A schema marker exists for the pinned schema and for each inherited schema.
+//! An entity marker exists for each entity.
+//! The entity list scans this marker family in id order.
 //! All scans stop at the `prefix:` to `prefix;` bound.
+//!
+//! An existing store needs one reindex pass to gain the entity markers.
+//! This build has no migration command for that pass.
+//! A store without the markers returns an empty cursor page.
 //!
 //! # Entity events
 //!
@@ -62,6 +69,9 @@ const META_SUFFIX: &str = ":meta";
 
 /// Infix before an attribute key.
 const ATTR_INFIX: &str = ":attr:";
+
+/// Key prefix for entity markers.
+const ENTITY_INDEX_PREFIX: &str = "idx:entity:";
 
 /// Key prefix for schema index markers.
 const SCHEMA_INDEX_PREFIX: &str = "idx:schema:";
@@ -566,6 +576,9 @@ impl EntityStore {
                     .await
                     .map_err(EntityError::Store)?;
             }
+            tx.delete(&entity_index_key(id))
+                .await
+                .map_err(EntityError::Store)?;
             tx.delete(&meta_key(id)).await.map_err(EntityError::Store)?;
             if let Some((key, bytes)) = &outbox {
                 tx.set_bytes(key, bytes).await.map_err(EntityError::Store)?;
@@ -1337,35 +1350,71 @@ impl EntityStore {
     /// The result is sorted by id.
     /// The call skips `offset` ids.
     /// It then loads at most `limit` entities.
+    /// The call scans at most `offset + limit` entity markers.
     /// A `limit` of 0 returns an empty list.
     pub async fn list_page(&self, limit: usize, offset: usize) -> Result<Vec<Entity>, EntityError> {
         if limit == 0 {
             return Ok(Vec::new());
         }
+        let max = offset.saturating_add(limit);
+        let (mut entities, _) = self.list_after(max, None).await?;
+        let skip = offset.min(entities.len());
+        entities.drain(..skip);
+        Ok(entities)
+    }
+
+    /// Lists one page of every entity in id order.
+    ///
+    /// The scan reads only the `idx:entity:` family.
+    /// It starts after the `after` id when the caller gives a cursor.
+    /// The call returns the entities and the cursor for the next page.
+    /// The cursor is the last id of a full page.
+    /// The cursor is `None` when the scan is exhausted.
+    /// A stale or unknown cursor returns the ids after its sort position.
+    /// A `limit` of 0 returns an empty list and no cursor.
+    pub async fn list_after(
+        &self,
+        limit: usize,
+        after: Option<&str>,
+    ) -> Result<(Vec<Entity>, Option<String>), EntityError> {
+        if limit == 0 {
+            return Ok((Vec::new(), None));
+        }
         let g = self.store.read().await;
-        let rows = scan_prefix(&*g, ENTITY_PREFIX).await?;
-        let mut ids = Vec::new();
-        for row in rows {
-            let Some(rest) = row.key.strip_prefix(ENTITY_PREFIX) else {
+        let start = match after {
+            Some(cursor) => {
+                validate_name("entity id", cursor)?;
+                format!("{ENTITY_INDEX_PREFIX}{cursor}\0")
+            }
+            None => ENTITY_INDEX_PREFIX.to_string(),
+        };
+        let max = u32::try_from(limit).ok();
+        let cursor = (Some(start), Some(prefix_scan_end(ENTITY_INDEX_PREFIX)));
+        let markers = g
+            .gets_bytes(max, Direction::Next, cursor)
+            .await
+            .map_err(EntityError::Store)?;
+        let full = markers.len() == limit;
+        let mut ids = Vec::with_capacity(markers.len());
+        let mut seen = BTreeSet::new();
+        for marker in markers {
+            let Some(id) = marker.key.strip_prefix(ENTITY_INDEX_PREFIX) else {
                 continue;
             };
-            let Some(id) = rest.strip_suffix(META_SUFFIX) else {
-                continue;
-            };
-            if id.is_empty() || id.contains(':') {
+            if id.is_empty() || id.contains(':') || !seen.insert(id.to_string()) {
                 continue;
             }
             ids.push(id.to_string());
         }
         ids.sort();
-        ids.dedup();
-        let mut entities = Vec::with_capacity(limit.min(ids.len()));
-        for id in ids.iter().skip(offset).take(limit) {
+        let next = if full { ids.last().cloned() } else { None };
+        let mut entities = Vec::with_capacity(ids.len());
+        for id in &ids {
             if let Some(entity) = load_entity(&*g, id).await? {
                 entities.push(entity);
             }
         }
-        Ok(entities)
+        Ok((entities, next))
     }
 
     /// Resolves schema ids to their latest versions and flattens them.
@@ -1885,6 +1934,10 @@ where
         .set_bytes(&meta_key(&entity.id), &meta_bytes)
         .await
         .map_err(EntityError::Store)?;
+    store
+        .set_bytes(&entity_index_key(&entity.id), b"")
+        .await
+        .map_err(EntityError::Store)?;
 
     for (key, value) in &entity.attributes {
         let def = merged
@@ -2135,6 +2188,11 @@ fn prefix_scan_end(prefix: &str) -> String {
 /// The key that holds the metadata of an entity.
 fn meta_key(id: &str) -> String {
     format!("{ENTITY_PREFIX}{id}{META_SUFFIX}")
+}
+
+/// The marker key for one entity.
+fn entity_index_key(id: &str) -> String {
+    format!("{ENTITY_INDEX_PREFIX}{id}")
 }
 
 /// The key that holds one attribute of an entity.
@@ -2972,6 +3030,94 @@ mod tests {
         paged.extend(store.list_page(2, 4).await.unwrap());
 
         assert_eq!(paged, store.list().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn the_entity_index_marker_survives_update_and_is_removed_on_delete() {
+        let (store, registry, raw) = new_store().await;
+        registry
+            .publish(schema(
+                "task",
+                &[],
+                vec![attr("title", AttributeType::String)],
+            ))
+            .await
+            .unwrap();
+        store
+            .create(draft("e1", &["task"], vec![("title", s("a"))]), &ctx())
+            .await
+            .unwrap();
+        assert!(
+            raw.get_bytes(&entity_index_key("e1"))
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        store
+            .update("e1", 1, patch(vec![("title", Some(s("b")))]), &ctx())
+            .await
+            .unwrap();
+        assert!(
+            raw.get_bytes(&entity_index_key("e1"))
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        store.delete("e1", 2, &ctx()).await.unwrap();
+        assert!(
+            raw.get_bytes(&entity_index_key("e1"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn list_after_pages_through_every_entity_once() {
+        let (store, registry, _raw) = new_store().await;
+        registry.publish(schema("task", &[], vec![])).await.unwrap();
+        for id in ["a", "b", "c", "d", "e"] {
+            store
+                .create(draft(id, &["task"], vec![]), &ctx())
+                .await
+                .unwrap();
+        }
+
+        let mut ids = Vec::new();
+        let mut after: Option<String> = None;
+        let mut pages = 0;
+        loop {
+            let (page, next) = store.list_after(2, after.as_deref()).await.unwrap();
+            ids.extend(page.into_iter().map(|entity| entity.id));
+            pages += 1;
+            match next {
+                Some(cursor) => after = Some(cursor),
+                None => break,
+            }
+        }
+
+        assert_eq!(ids, vec!["a", "b", "c", "d", "e"]);
+        assert_eq!(pages, 3);
+    }
+
+    #[tokio::test]
+    async fn list_after_skips_a_stale_cursor_without_repeating_it() {
+        let (store, registry, _raw) = new_store().await;
+        registry.publish(schema("task", &[], vec![])).await.unwrap();
+        for id in ["a", "c", "d"] {
+            store
+                .create(draft(id, &["task"], vec![]), &ctx())
+                .await
+                .unwrap();
+        }
+
+        let (page, next) = store.list_after(10, Some("b")).await.unwrap();
+        let ids: Vec<&str> = page.iter().map(|entity| entity.id.as_str()).collect();
+
+        assert_eq!(ids, vec!["c", "d"]);
+        assert_eq!(next, None);
     }
 
     #[tokio::test]
