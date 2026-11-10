@@ -241,6 +241,8 @@ The schema registry stores immutable schema versions. A schema can extend other 
 
 The entity store keeps validated entities with typed attributes. An entity pins one or more exact schema versions. The store checks every attribute against the merged effective schema. It keeps schema, attribute, and unique indexes.
 
+An `EntityRef` attribute holds the id of another entity. A write validates the target id and requires that the target exists. A self-reference is valid. The check reads one row for each distinct target. Set `check_entity_refs = false` to keep the id validation and skip the existence read. A delete does not check reverse references, so a delete can leave a dangling reference. A writer can learn whether an entity id exists.
+
 The `/eav` management API covers schemas, entities, and rules. List routes use paging. `limit` defaults to 50 and cannot exceed 200. `offset` defaults to 0.
 
 `POST /eav/entities/query` finds entities by an indexed attribute value. `limit` defaults to 50 and is in the range 1 to 200. An empty `after` starts at the first page. The response returns the next cursor in `next`. An attribute that no applied schema indexes returns `400`.
@@ -261,7 +263,16 @@ Schema evolution has three steps. `GET /eav/schemas/{id}/diff` reports added, re
 
 The entity store writes one change event to an outbox row in the same transaction as the entity data. A background relay flushes the outbox to the shared change feed. Delivery is at least once, so a consumer must be idempotent. Clients read the feed through `/eav/sync/events` and load the initial state through `/eav/sync/snapshot`.
 
-The module also stores one per-user entity replica. `POST /eav/sync/replica` builds a point-in-time JSON snapshot of the entities that the caller can read. The client then applies the entity change feed after the stored head. This replica differs from the file replica under `/sync`. The `/sync` replica mirrors file records and relations as prefix-scoped store objects. The EAV replica is one JSON snapshot in the EAV replica store. It is not an incremental store.
+The module also stores one per-user entity replica. `POST /eav/sync/replica` builds a point-in-time snapshot of the entities that the caller can read, in ordered chunks. The client then applies the entity change feed after the stored head. `GET /eav/sync/replica` returns the full snapshot as one JSON array. This full read is for compatibility. `GET /eav/sync/replica?chunk=N` returns one stored chunk. Read chunks from 0 until `next` is null. This replica differs from the file replica under `/sync`. The `/sync` replica mirrors file records and relations as prefix-scoped store objects. The EAV replica is a chunked JSON snapshot in the EAV replica store. It is not an incremental store.
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" \
+  "http://localhost:8080/eav/sync/replica?chunk=0"
+```
+
+```json
+{ "head": 42, "chunk": 0, "chunks": 3, "items": [], "next": 1 }
+```
 
 ### Rules and automation
 
@@ -349,7 +360,7 @@ Metrics cover rule execution (`eav.rules.executed`, `eav.rules.failed`) and webh
 | GET | `/eav/sync/events` | Entity events after a `since` cursor | session |
 | GET | `/eav/sync/snapshot` | One page of entity state for an offline client | session |
 | POST | `/eav/sync/replica` | Build and store the caller's entity replica | session |
-| GET | `/eav/sync/replica` | Read the caller's stored entity replica | session |
+| GET | `/eav/sync/replica` | Read the stored replica, or one chunk with `?chunk=N` | session |
 | GET | `/eav/sync/replica/status` | Change feed head and stored replica head | session |
 | GET | `/openapi.json` | OpenAPI 3.1 document | none |
 | GET | `/swagger-ui/` | Swagger UI for the document | none |
@@ -627,6 +638,7 @@ The `[eav]` section controls the optional EAV runtime and the webhook action. `[
 | `execution_retention_secs` | `2592000` | Retention window for execution markers. |
 | `timer_interval_ms` | `1000` | Pause between due timer passes. |
 | `timer_batch` | `100` | Largest number of due entities read for each time index key. |
+| `check_entity_refs` | `true` | Checks that each `EntityRef` target exists on a write. With `false`, a write still validates the target form. |
 | `webhook_allowed_hosts` | empty | Hosts that a webhook rule can call. Each entry is a host or a `host:port` pair. |
 | `webhook_signing_secret` | none | Optional HMAC-SHA256 secret of at least 32 bytes. When set, adds the `X-Signature` header. |
 | `webhook_max_attempts` | `5` | Maximum delivery attempts for one webhook job, from 1 to 20. |
@@ -841,6 +853,7 @@ Examples:
 - [examples/sample_module.rs](examples/sample_module.rs): a complete module. Build with `cargo build --example sample_module`.
 - [examples/job_queue.rs](examples/job_queue.rs): a memory queue and worker.
 - [examples/reactive_service.rs](examples/reactive_service.rs): a reactive service with an `oxkv` observer.
+- [examples/eav_service.rs](examples/eav_service.rs): schema publish, entity create and update, an indexed query, and cursor paging. Run with `cargo run --example eav_service`.
 
 ### Mount inside your own server
 

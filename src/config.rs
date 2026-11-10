@@ -577,6 +577,13 @@ pub struct EavConfig {
     /// Largest number of due entities to read for each time index key.
     #[serde(default = "default_eav_timer_batch")]
     pub timer_batch: usize,
+    /// Checks that each `EntityRef` target exists on a write.
+    ///
+    /// The default is `true`.
+    /// With `false`, a write still validates the target form.
+    /// It skips only the existence read.
+    #[serde(default = "default_true")]
+    pub check_entity_refs: bool,
     /// The hosts that a webhook rule can call.
     ///
     /// Each entry is a host or a `host:port` pair.
@@ -614,6 +621,7 @@ impl Default for EavConfig {
     /// The marker cleanup runs every hour.
     /// Execution markers stay for 30 days.
     /// The timer pass runs every second and reads 100 entities for each key.
+    /// A write checks that each `EntityRef` target exists.
     /// The webhook allowlist is empty.
     /// Webhook signing is off.
     /// One webhook job has up to 5 attempts.
@@ -627,6 +635,7 @@ impl Default for EavConfig {
             execution_retention_secs: default_eav_execution_retention_secs(),
             timer_interval_ms: default_eav_timer_interval_ms(),
             timer_batch: default_eav_timer_batch(),
+            check_entity_refs: default_true(),
             webhook_allowed_hosts: Vec::new(),
             webhook_signing_secret: None,
             webhook_max_attempts: default_eav_webhook_max_attempts(),
@@ -649,6 +658,10 @@ impl EavConfig {
             timer_batch: self.timer_batch,
         }
     }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_eav_outbox_interval_ms() -> u64 {
@@ -849,6 +862,7 @@ mod tests {
         assert_eq!(cfg.listen_port, 8080);
         assert_eq!(cfg.s3.bucket, "my-bucket");
         assert_eq!(cfg.s3.region, "us-east-1");
+        assert!(cfg.eav.check_entity_refs);
         assert!(!cfg.eav.webhook_allow_private_hosts);
     }
 
@@ -1363,6 +1377,7 @@ mod tests {
         assert_eq!(cfg.eav.execution_retention_secs, 2_592_000);
         assert_eq!(cfg.eav.timer_interval_ms, 1000);
         assert_eq!(cfg.eav.timer_batch, 100);
+        assert!(cfg.eav.check_entity_refs);
         assert!(cfg.eav.webhook_allowed_hosts.is_empty());
         assert!(cfg.eav.webhook_signing_secret.is_none());
         assert_eq!(cfg.eav.webhook_max_attempts, 5);
@@ -1378,6 +1393,7 @@ mod tests {
              outbox_interval_ms = 2500\nrule_poll_interval_ms = 50\n\
              gc_interval_ms = 9000\nexecution_retention_secs = 120\n\
              timer_interval_ms = 750\ntimer_batch = 25\n\
+             check_entity_refs = false\n\
              webhook_allowed_hosts = [\"example.com\", \"example.com:8443\"]\n\
              webhook_signing_secret = \"0123456789abcdef0123456789abcdef\"\n\
              webhook_max_attempts = 7\nwebhook_allow_private_hosts = true",
@@ -1391,6 +1407,7 @@ mod tests {
         assert_eq!(cfg.eav.execution_retention_secs, 120);
         assert_eq!(cfg.eav.timer_interval_ms, 750);
         assert_eq!(cfg.eav.timer_batch, 25);
+        assert!(!cfg.eav.check_entity_refs);
         assert_eq!(
             cfg.eav.webhook_allowed_hosts,
             vec!["example.com".to_string(), "example.com:8443".to_string()]
