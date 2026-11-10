@@ -260,6 +260,9 @@ pub struct MigrateRequest {
     #[serde(default)]
     pub limit: Option<usize>,
     /// True to report the changes without a write. The default is true.
+    ///
+    /// A true value requires `read` on `eav_schemas` and `eav_entities`.
+    /// A false value requires `write` on both objects.
     #[serde(default = "default_dry_run")]
     pub dry_run: bool,
     /// The entity id to resume after. Omit it for the first page.
@@ -837,6 +840,12 @@ async fn revalidate_schema(
     Ok(HttpResponse::Ok().json(report))
 }
 
+/// Repins stored entities to a target schema version.
+///
+/// A dry run requires `read` on `eav_schemas` and `eav_entities`.
+/// A real run requires `write` on both objects.
+/// A real run writes the entities, so it also needs the write grant.
+/// The default `dry_run` value is true.
 #[utoipa::path(post, path = "/eav/schemas/{id}/migrate", tag = "eav", params(("id" = String, Path)), request_body = MigrateRequest, responses((status=200, body=crate::eav::entity::MigrationReport), (status=400, body=crate::http::error::ErrorBody), (status=401, body=crate::http::error::ErrorBody), (status=403, body=crate::http::error::ErrorBody), (status=404, body=crate::http::error::ErrorBody), (status=500, body=crate::http::error::ErrorBody)))]
 #[post("/schemas/{id}/migrate")]
 async fn migrate_schema(
@@ -846,10 +855,11 @@ async fn migrate_schema(
     path: web::Path<String>,
     body: web::Json<MigrateRequest>,
 ) -> Result<HttpResponse, EavApiError> {
-    require_management(&policy, &claims.sub, SCHEMAS, Action::Write).await?;
-    require_management(&policy, &claims.sub, ENTITIES, Action::Write).await?;
     let id = path.into_inner();
     let (target_version, limit, after, dry_run) = body.into_inner().resolve()?;
+    let action = if dry_run { Action::Read } else { Action::Write };
+    require_management(&policy, &claims.sub, SCHEMAS, action).await?;
+    require_management(&policy, &claims.sub, ENTITIES, action).await?;
     let report = runtime
         .entities()
         .migrate_schema(
@@ -1037,7 +1047,12 @@ async fn delete_entity(
     Ok(HttpResponse::NoContent().finish())
 }
 
-#[utoipa::path(get, path = "/eav/schemas/{id}/entities", tag = "eav", params(("id" = String, Path), PageQuery), responses((status=200, body=EntityPage), (status=400, body=crate::http::error::ErrorBody), (status=401, body=crate::http::error::ErrorBody), (status=403, body=crate::http::error::ErrorBody), (status=500, body=crate::http::error::ErrorBody)))]
+/// Lists one page of the entities that pin a schema.
+///
+/// The caller needs `read` on `eav_entities`.
+/// An unknown schema id returns `404` before the list call.
+/// A known schema keeps the offset or cursor page behavior.
+#[utoipa::path(get, path = "/eav/schemas/{id}/entities", tag = "eav", params(("id" = String, Path), PageQuery), responses((status=200, body=EntityPage), (status=400, body=crate::http::error::ErrorBody), (status=401, body=crate::http::error::ErrorBody), (status=403, body=crate::http::error::ErrorBody), (status=404, body=crate::http::error::ErrorBody), (status=500, body=crate::http::error::ErrorBody)))]
 #[get("/schemas/{id}/entities")]
 async fn list_schema_entities(
     runtime: web::Data<EavRuntime>,
@@ -1048,6 +1063,9 @@ async fn list_schema_entities(
 ) -> Result<HttpResponse, EavApiError> {
     require_management(&policy, &claims.sub, ENTITIES, Action::Read).await?;
     let id = path.into_inner();
+    if !runtime.schemas().exists(&id).await? {
+        return Err(EavApiError::not_found());
+    }
     let (limit, mode) = query.into_inner().resolve()?;
     match mode {
         PageMode::Cursor(after) => {
@@ -3330,7 +3348,7 @@ mod tests {
                 auth(
                     actix_test::TestRequest::post()
                         .uri("/eav/schemas/invoice/migrate")
-                        .set_json(json!({"target_version": 2})),
+                        .set_json(json!({"target_version": 2, "dry_run": false})),
                     &fx.token(sub)?,
                 )
                 .to_request(),
@@ -3344,13 +3362,143 @@ mod tests {
             auth(
                 actix_test::TestRequest::post()
                     .uri("/eav/schemas/invoice/migrate")
-                    .set_json(json!({"target_version": 2})),
+                    .set_json(json!({"target_version": 2, "dry_run": false})),
                 &fx.token("erin")?,
             )
             .to_request(),
         )
         .await;
         assert_eq!(res.status(), http::StatusCode::OK);
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn schema_migration_dry_run_requires_read_only() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        publish_schema_version(&fx, "invoice", vec![attr("total", AttributeType::Integer)]).await?;
+        fx.runtime
+            .entities()
+            .create(
+                EntityDraft {
+                    id: "e1".to_string(),
+                    schemas: vec!["invoice".to_string()],
+                    attributes: [("total".to_string(), AttributeValue::Integer(10))]
+                        .into_iter()
+                        .collect(),
+                },
+                &WriteContext::new("alice"),
+            )
+            .await?;
+        publish_schema_version(
+            &fx,
+            "invoice",
+            vec![
+                attr("total", AttributeType::Integer),
+                attr("memo", AttributeType::String),
+            ],
+        )
+        .await?;
+
+        fx.engine
+            .assign_group("frank".into(), "migration-readers".into())
+            .await?;
+        fx.engine
+            .add_rule(
+                "migration-readers".into(),
+                "eav_schemas".into(),
+                Action::Read,
+            )
+            .await?;
+        fx.engine
+            .add_rule(
+                "migration-readers".into(),
+                "eav_entities".into(),
+                Action::Read,
+            )
+            .await?;
+
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("frank")?;
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::post()
+                    .uri("/eav/schemas/invoice/migrate")
+                    .set_json(json!({"target_version": 2})),
+                &token,
+            )
+            .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let report: Value = actix_test::read_body_json(res).await;
+        assert_eq!(report["dry_run"], true);
+        assert_eq!(report["migrated"], 1);
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::post()
+                    .uri("/eav/schemas/invoice/migrate")
+                    .set_json(json!({"target_version": 2, "dry_run": false})),
+                &token,
+            )
+            .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::FORBIDDEN);
+
+        let entity = fx
+            .runtime
+            .entities()
+            .get("e1")
+            .await?
+            .expect("entity exists");
+        assert_eq!(entity.version, 1);
+        assert_eq!(entity.schemas[0].version, 1);
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn schema_entity_list_is_404_for_an_unknown_schema() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        assert!(fx.engine.claim_superadmin("alice").await?);
+        publish_task_schema(&fx).await?;
+        create_task(&fx, "e1").await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::get().uri("/eav/schemas/absent/entities"),
+                &token,
+            )
+            .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::NOT_FOUND);
+        let body: crate::http::error::ErrorBody = actix_test::read_body_json(res).await;
+        assert_eq!(body.code.as_deref(), Some("not_found"));
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::get().uri("/eav/schemas/task/entities?limit=2&offset=0"),
+                &token,
+            )
+            .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let page: Value = actix_test::read_body_json(res).await;
+        let items = page["items"].as_array().expect("items");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["id"], "e1");
+        assert_eq!(page["next_offset"], Value::Null);
         Ok(())
     }
 }

@@ -174,7 +174,10 @@ pub struct ReplicaBuildResponse {
 /// The query of the replica read route.
 #[derive(Debug, Clone, Copy, Default, serde::Deserialize, utoipa::IntoParams, utoipa::ToSchema)]
 pub struct ReplicaChunkQuery {
-    /// The zero-based chunk index. Omit it to read the full snapshot.
+    /// The zero-based chunk index.
+    ///
+    /// Omit it to read the full snapshot as a JSON array of entities.
+    /// Set it to read one `ReplicaChunkResponse`.
     #[serde(default)]
     pub chunk: Option<usize>,
 }
@@ -194,6 +197,20 @@ pub struct ReplicaChunkResponse {
     pub items: Vec<Entity>,
     /// The index of the next chunk, or `None` on the last chunk.
     pub next: Option<usize>,
+}
+
+/// The response body of the replica read route.
+///
+/// The route returns one of two shapes.
+/// Without `chunk`, it returns every permitted entity as a JSON array.
+/// With `chunk=N`, it returns one [`ReplicaChunkResponse`].
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
+#[serde(untagged)]
+pub enum ReplicaReadResponse {
+    /// Every permitted entity in the full replica.
+    Full(Vec<Entity>),
+    /// One stored chunk.
+    Chunk(ReplicaChunkResponse),
 }
 
 /// The current change-log head and the stored replica head.
@@ -622,7 +639,7 @@ impl std::error::Error for ReplicaChunkOutOfRange {}
 /// The response depends on the current grants, so it has no stable validator.
 /// An out-of-range `chunk` returns `400`.
 /// The client applies the events after the stored head.
-#[utoipa::path(get, path = "/eav/sync/replica", tag = "eav", params(ReplicaChunkQuery), responses((status = 200, body = Vec<Entity>, content_type = "application/json"), (status = 400, body = crate::http::error::ErrorBody), (status = 401, body = crate::http::error::ErrorBody), (status = 404, body = crate::http::error::ErrorBody), (status = 500, body = crate::http::error::ErrorBody)))]
+#[utoipa::path(get, path = "/eav/sync/replica", tag = "eav", params(ReplicaChunkQuery), responses((status = 200, body = ReplicaReadResponse), (status = 400, body = crate::http::error::ErrorBody), (status = 401, body = crate::http::error::ErrorBody), (status = 404, body = crate::http::error::ErrorBody), (status = 500, body = crate::http::error::ErrorBody)))]
 #[get("/sync/replica")]
 pub(crate) async fn replica(
     runtime: web::Data<EavRuntime>,

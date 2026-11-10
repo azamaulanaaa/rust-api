@@ -249,7 +249,7 @@ An `EntityRef` attribute holds the id of another entity. A write validates the t
 | `409` | `conflict` | `expected_version` does not match the stored version. |
 | `409` | `conflict` | Another entity references the target and `force` is false. |
 
-The `/eav` management API covers schemas, entities, and rules. List routes use paging. `limit` defaults to 50 and cannot exceed 200. `offset` defaults to 0 and cannot exceed 1000. A larger offset returns `400`. Use cursor paging with `after` to page deeper. `GET /eav/rules` supports offset paging only, so an `after` cursor on that route returns `400`.
+The `/eav` management API covers schemas, entities, and rules. List routes use paging. `limit` defaults to 50 and cannot exceed 200. `offset` defaults to 0 and cannot exceed 1000. A larger offset returns `400`. Use cursor paging with `after` to page deeper. `GET /eav/rules` supports offset paging only, so an `after` cursor on that route returns `400`. `GET /eav/schemas/{id}/entities` returns `404` for an unknown schema id. A known schema returns the normal entity page.
 
 `POST /eav/entities/query` finds entities by an indexed attribute value. `limit` defaults to 50 and is in the range 1 to 200. An empty `after` starts at the first page. The response returns the next cursor in `next`. An attribute that no applied schema indexes returns `400`.
 
@@ -265,7 +265,7 @@ curl -sS -X POST http://localhost:8080/eav/entities/query \
   }'
 ```
 
-Schema evolution has three steps. `GET /eav/schemas/{id}/diff` reports added, removed, and changed attributes and marks breaking changes. `POST /eav/schemas/{id}/revalidate` checks stored entities against a target version without a write. `POST /eav/schemas/{id}/migrate` repins stored entities to a target version. A migration is a dry run unless `dry_run` is false.
+Schema evolution has three steps. `GET /eav/schemas/{id}/diff` reports added, removed, and changed attributes and marks breaking changes. `POST /eav/schemas/{id}/revalidate` checks stored entities against a target version without a write. `POST /eav/schemas/{id}/migrate` repins stored entities to a target version. A migration is a dry run unless `dry_run` is false. A dry run needs `read` on `eav_schemas` and `eav_entities`. A real run needs `write` on both objects.
 
 The entity store writes one change event to an outbox row in the same transaction as the entity data. A background relay flushes the outbox to the shared change feed. Delivery is at least once, so a consumer must be idempotent. Clients read the feed through `/eav/sync/events` and load the initial state through `/eav/sync/snapshot`.
 
@@ -349,14 +349,14 @@ Metrics cover rule execution (`eav.rules.executed`, `eav.rules.failed`) and webh
 | GET | `/eav/schemas/{id}/children` | List the schemas whose latest version extends this schema | session |
 | GET | `/eav/schemas/{id}/diff` | Compare two effective schema versions with `from` and `to` | session |
 | POST | `/eav/schemas/{id}/revalidate` | Check stored entities against a target version without a write | session |
-| POST | `/eav/schemas/{id}/migrate` | Repin stored entities to a target version. The default is a dry run. | session |
+| POST | `/eav/schemas/{id}/migrate` | Repin stored entities to a target version. The default is a dry run. A dry run needs read on schemas and entities. A real run needs write on both. | session |
 | POST | `/eav/entities` | Create one validated entity | session |
 | GET | `/eav/entities` | Paged list of entities | session |
 | POST | `/eav/entities/query` | Paged query of entities by an indexed attribute value | session |
 | GET | `/eav/entities/{id}` | Get one entity | session |
 | PATCH | `/eav/entities/{id}` | Update attributes with an expected version | session |
 | DELETE | `/eav/entities/{id}` | Delete one entity with `expected_version`, or a referenced entity with `force=true` | session |
-| GET | `/eav/schemas/{id}/entities` | Paged list of the entities that pin a schema | session |
+| GET | `/eav/schemas/{id}/entities` | Paged list of the entities that pin a schema. An unknown schema returns `404`. | session |
 | POST | `/eav/rules` | Create or replace one rule | session |
 | GET | `/eav/rules` | Paged list of rules | session |
 | GET | `/eav/rules/{id}` | Get one rule | session |
@@ -366,7 +366,7 @@ Metrics cover rule execution (`eav.rules.executed`, `eav.rules.failed`) and webh
 | GET | `/eav/sync/events` | Entity events after a `since` cursor | session |
 | GET | `/eav/sync/snapshot` | One page of entity state for an offline client | session |
 | POST | `/eav/sync/replica` | Build and store the caller's entity replica | session |
-| GET | `/eav/sync/replica` | Read the stored replica with the current grants, or one chunk with `?chunk=N` | session |
+| GET | `/eav/sync/replica` | Read the stored replica as a JSON array with the current grants, or one chunk object with `?chunk=N` | session |
 | GET | `/eav/sync/replica/status` | Change feed head and stored replica head | session |
 | GET | `/openapi.json` | OpenAPI 3.1 document | none |
 | GET | `/swagger-ui/` | Swagger UI for the document | none |
