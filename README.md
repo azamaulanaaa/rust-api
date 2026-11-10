@@ -241,7 +241,13 @@ The schema registry stores immutable schema versions. A schema can extend other 
 
 The entity store keeps validated entities with typed attributes. An entity pins one or more exact schema versions. The store checks every attribute against the merged effective schema. It keeps schema, attribute, and unique indexes.
 
-An `EntityRef` attribute holds the id of another entity. A write validates the target id and requires that the target exists. A self-reference is valid. The check reads one row for each distinct target. Set `check_entity_refs = false` to keep the id validation and skip the existence read. A delete does not check reverse references, so a delete can leave a dangling reference. A writer can learn whether an entity id exists.
+An `EntityRef` attribute holds the id of another entity. A write validates the target id and requires that the target exists. A self-reference is valid. The check reads one row for each distinct target. Set `check_entity_refs = false` to keep the id validation and skip the existence read. The store keeps a reverse reference index. A delete counts the distinct entities that reference the target. A target with references returns `409` with code `conflict` and changes nothing. Set `force=true` to delete the target and leave the references dangling. A self-reference does not block the delete. An old store gets the reverse markers one time at the first delete. A writer can learn whether an entity id exists.
+
+| Status | Code | Condition |
+|---|---|---|
+| `404` | `not_found` | The entity does not exist. |
+| `409` | `conflict` | `expected_version` does not match the stored version. |
+| `409` | `conflict` | Another entity references the target and `force` is false. |
 
 The `/eav` management API covers schemas, entities, and rules. List routes use paging. `limit` defaults to 50 and cannot exceed 200. `offset` defaults to 0 and cannot exceed 1000. A larger offset returns `400`. Use cursor paging with `after` to page deeper. `GET /eav/rules` supports offset paging only, so an `after` cursor on that route returns `400`.
 
@@ -349,7 +355,7 @@ Metrics cover rule execution (`eav.rules.executed`, `eav.rules.failed`) and webh
 | POST | `/eav/entities/query` | Paged query of entities by an indexed attribute value | session |
 | GET | `/eav/entities/{id}` | Get one entity | session |
 | PATCH | `/eav/entities/{id}` | Update attributes with an expected version | session |
-| DELETE | `/eav/entities/{id}` | Delete one entity with `expected_version` | session |
+| DELETE | `/eav/entities/{id}` | Delete one entity with `expected_version`, or a referenced entity with `force=true` | session |
 | GET | `/eav/schemas/{id}/entities` | Paged list of the entities that pin a schema | session |
 | POST | `/eav/rules` | Create or replace one rule | session |
 | GET | `/eav/rules` | Paged list of rules | session |
