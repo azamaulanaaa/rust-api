@@ -596,6 +596,13 @@ pub struct EavConfig {
     /// The default is 5.
     #[serde(default = "default_eav_webhook_max_attempts")]
     pub webhook_max_attempts: u32,
+    /// Allows webhook delivery to a private address.
+    ///
+    /// The default is `false`.
+    /// The webhook action still resolves the host and pins the address.
+    /// Set the value to `true` only for an intentional internal webhook.
+    #[serde(default)]
+    pub webhook_allow_private_hosts: bool,
 }
 
 impl Default for EavConfig {
@@ -610,6 +617,7 @@ impl Default for EavConfig {
     /// The webhook allowlist is empty.
     /// Webhook signing is off.
     /// One webhook job has up to 5 attempts.
+    /// A webhook cannot call a private address.
     fn default() -> Self {
         Self {
             enabled: false,
@@ -622,6 +630,7 @@ impl Default for EavConfig {
             webhook_allowed_hosts: Vec::new(),
             webhook_signing_secret: None,
             webhook_max_attempts: default_eav_webhook_max_attempts(),
+            webhook_allow_private_hosts: false,
         }
     }
 }
@@ -840,6 +849,7 @@ mod tests {
         assert_eq!(cfg.listen_port, 8080);
         assert_eq!(cfg.s3.bucket, "my-bucket");
         assert_eq!(cfg.s3.region, "us-east-1");
+        assert!(!cfg.eav.webhook_allow_private_hosts);
     }
 
     #[test]
@@ -1356,6 +1366,7 @@ mod tests {
         assert!(cfg.eav.webhook_allowed_hosts.is_empty());
         assert!(cfg.eav.webhook_signing_secret.is_none());
         assert_eq!(cfg.eav.webhook_max_attempts, 5);
+        assert!(!cfg.eav.webhook_allow_private_hosts);
         assert_eq!(cfg.eav, EavConfig::default());
     }
 
@@ -1369,7 +1380,7 @@ mod tests {
              timer_interval_ms = 750\ntimer_batch = 25\n\
              webhook_allowed_hosts = [\"example.com\", \"example.com:8443\"]\n\
              webhook_signing_secret = \"0123456789abcdef0123456789abcdef\"\n\
-             webhook_max_attempts = 7",
+             webhook_max_attempts = 7\nwebhook_allow_private_hosts = true",
         );
         let cfg = parse(&toml).expect("explicit EAV values must parse");
 
@@ -1389,6 +1400,7 @@ mod tests {
             Some("0123456789abcdef0123456789abcdef")
         );
         assert_eq!(cfg.eav.webhook_max_attempts, 7);
+        assert!(cfg.eav.webhook_allow_private_hosts);
         let runtime = cfg.eav.runtime_config();
         assert_eq!(runtime.outbox_interval, Duration::from_millis(2500));
         assert_eq!(runtime.rule_poll_interval, Duration::from_millis(50));
