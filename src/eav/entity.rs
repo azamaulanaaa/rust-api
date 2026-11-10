@@ -62,6 +62,16 @@
 //! The delete holds the write lock for the scan and the write, so a
 //! reference write cannot appear after the scan.
 //!
+//! # Attribute and unique index scope
+//!
+//! The attribute index and the unique constraint key on the attribute name.
+//! The key includes no schema id.
+//! An attribute index and a unique constraint therefore apply across every
+//! schema that uses the name.
+//! A unique value blocks a second entity in any schema with that attribute
+//! name.
+//! Use a distinct name when two schemas must not share the domain.
+//!
 //! # Entity events
 //!
 //! The store returns an [`EntityChange`].
