@@ -149,6 +149,11 @@ sample_ratio = 1.0
 # Must be above 0. Default: 100.
 # timer_batch = 100
 
+# Checks that each EntityRef target exists on a write. With false, a write
+# still validates the target form and skips only the existence read.
+# Default: true.
+# check_entity_refs = true
+
 # Hosts that a webhook rule can call. Each value is a host or a host:port pair.
 # An empty list rejects every webhook rule. Default: empty.
 # webhook_allowed_hosts = ["example.com", "example.com:8443"]
