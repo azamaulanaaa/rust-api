@@ -655,7 +655,12 @@ mod tests {
             .entities()
             .create(entity(), &WriteContext::new("tester"))
             .await;
-        assert!(created.is_err(), "the test feed must refuse the create");
+        assert!(created.is_ok(), "the entity and the outbox row must commit");
+        assert_eq!(
+            runtime.entities().outbox_count().await.unwrap(),
+            1,
+            "a failed inline flush must leave the outbox row"
+        );
 
         let cancel = Arc::new(AtomicBool::new(false));
         let handle = runtime.spawn(cancel, short_config());
