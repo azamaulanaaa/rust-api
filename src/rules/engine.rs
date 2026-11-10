@@ -9,6 +9,11 @@
 //! An execution marker stops a duplicate action.
 //! An action must still be idempotent because a crash can repeat one event.
 //!
+//! The process lock is per event.
+//! Two calls for one event do not run one rule action twice.
+//! Two calls for different events run at the same time.
+//! The engine removes a lock entry when no caller holds or waits for it.
+//!
 //! An action can write an entity.
 //! That write can create another event, and that event can match a rule
 //! again.
@@ -23,12 +28,12 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 
 use crate::CancelToken;
-use crate::eav::entity::EntityStore;
+use crate::eav::entity::{Entity, EntityStore};
 use crate::eav::entity_error::EntityError;
 use crate::records::{EntityEvent, WalOp};
 use crate::rules::action::{ActionContext, RuleAction};
 use crate::rules::error::RuleError;
-use crate::rules::rule::validate_identifier;
+use crate::rules::rule::{Rule, validate_identifier};
 use crate::rules::store::RuleStore;
 use crate::sync::wal::Wal;
 
@@ -82,8 +87,10 @@ pub trait RuleObserver: Send + Sync {
 /// The generic rule runner.
 ///
 /// The engine holds one action for each registered kind.
-/// One process mutex stops two calls from running one rule and one event
-/// twice.
+/// The engine holds one process lock for each event id.
+/// Two calls for one rule and one event run the action one time.
+/// Calls for different events do not serialize.
+/// The engine removes a lock entry when no caller holds or waits for it.
 #[derive(Clone)]
 pub struct RuleEngine {
     /// The durable rule store.
@@ -99,8 +106,10 @@ pub struct RuleEngine {
     max_causation_depth: u32,
     /// The optional observer for rule results.
     observer: Option<Arc<dyn RuleObserver>>,
-    /// Serializes processing, so one rule and one event run one time.
-    process_lock: Arc<Mutex<()>>,
+    /// The process locks, keyed by event id.
+    ///
+    /// One lock stops two calls from running one rule and one event twice.
+    process_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
 }
 
 impl RuleEngine {
@@ -130,7 +139,7 @@ impl RuleEngine {
             actions: by_kind,
             max_causation_depth: DEFAULT_MAX_CAUSATION_DEPTH,
             observer: None,
-            process_lock: Arc::new(Mutex::new(())),
+            process_locks: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -186,6 +195,38 @@ impl RuleEngine {
         }
     }
 
+    /// Returns the process lock for one event id.
+    ///
+    /// The call adds a new entry when the map has no entry for the id.
+    async fn event_process_lock(&self, event_id: &str) -> Arc<Mutex<()>> {
+        let mut locks = self.process_locks.lock().await;
+        locks
+            .entry(event_id.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    /// Removes the process lock for one event id when no caller needs it.
+    ///
+    /// The map holds one strong reference to the lock.
+    /// This call holds one more strong reference in `lock`.
+    /// A count of two therefore shows that no other caller holds or waits.
+    async fn release_process_lock(&self, event_id: &str, lock: &Arc<Mutex<()>>) {
+        let mut locks = self.process_locks.lock().await;
+        let removable = locks
+            .get(event_id)
+            .is_some_and(|entry| Arc::ptr_eq(entry, lock) && Arc::strong_count(entry) == 2);
+        if removable {
+            locks.remove(event_id);
+        }
+    }
+
+    /// Returns the number of live process lock entries.
+    #[cfg(test)]
+    async fn live_process_locks(&self) -> usize {
+        self.process_locks.lock().await.len()
+    }
+
     /// Runs the matching rules for one entity event.
     ///
     /// The call loads the current entity first.
@@ -194,12 +235,15 @@ impl RuleEngine {
     /// If the event depth is above the maximum, it returns one
     /// [`ExecutionOutcome::CausationLimit`] for each matching rule.
     /// It then runs no action and writes no marker.
-    /// Otherwise, for each rule it checks the execution marker, evaluates the
-    /// condition, finds the action, and calls the action.
+    /// Otherwise, it locks the entry for the event id.
+    /// The lock covers the marker read, the condition check, the action call,
+    /// and the marker write.
+    /// Two calls for the same event run each rule action one time.
+    /// Calls for different events do not serialize.
     /// A successful action writes the marker for this rule and event.
     /// A failed action writes no marker, so a later retry can run it again.
+    /// The call removes the lock entry when the last caller releases it.
     pub async fn process(&self, event: &EntityEvent) -> Result<Vec<RuleExecution>, RuleError> {
-        let _process = self.process_lock.lock().await;
         let entity = self
             .entities
             .get(&event.entity_id)
@@ -219,6 +263,26 @@ impl RuleEngine {
                 })
                 .collect());
         }
+
+        let lock = self.event_process_lock(&event.event_id).await;
+        let guard = lock.lock().await;
+        let result = self.run_rules(event, entity, rules).await;
+        drop(guard);
+        self.release_process_lock(&event.event_id, &lock).await;
+        result
+    }
+
+    /// Runs the loaded rules for one event under the event lock.
+    ///
+    /// The caller holds the lock for `event.event_id`.
+    /// A successful action writes the marker for this rule and event.
+    /// A failed action writes no marker.
+    async fn run_rules(
+        &self,
+        event: &EntityEvent,
+        entity: Option<Entity>,
+        rules: Vec<Rule>,
+    ) -> Result<Vec<RuleExecution>, RuleError> {
         let mut executions = Vec::with_capacity(rules.len());
 
         for rule in rules {
@@ -436,6 +500,77 @@ mod tests {
                 return Err(anyhow::anyhow!("recording action failed"));
             }
             Ok(())
+        }
+    }
+
+    /// A [`RuleAction`] test double that coordinates two events.
+    ///
+    /// The action for `waited_event_id` signals `waiting` and then waits on
+    /// `gate`.
+    /// The action for any other event signals `gate`.
+    /// The pair finishes only when two event locks allow both actions to run.
+    struct GatedAction {
+        kind: String,
+        waited_event_id: String,
+        gate: Arc<Notify>,
+        waiting: Arc<Notify>,
+        calls: AtomicUsize,
+    }
+
+    impl GatedAction {
+        fn new(kind: &str, waited_event_id: &str, gate: Arc<Notify>) -> Self {
+            Self {
+                kind: kind.to_string(),
+                waited_event_id: waited_event_id.to_string(),
+                gate,
+                waiting: Arc::new(Notify::new()),
+                calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RuleAction for GatedAction {
+        fn kind(&self) -> &str {
+            &self.kind
+        }
+
+        async fn execute(&self, ctx: ActionContext) -> Result<(), anyhow::Error> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if ctx.event.event_id == self.waited_event_id {
+                self.waiting.notify_one();
+                self.gate.notified().await;
+            } else {
+                self.gate.notify_one();
+            }
+            Ok(())
+        }
+    }
+
+    /// Waits for two task results and fails the test on a timeout.
+    async fn join_two<T>(
+        first: &mut tokio::task::JoinHandle<T>,
+        second: &mut tokio::task::JoinHandle<T>,
+        timeout_message: &str,
+    ) -> (T, T) {
+        match tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(&mut *first, &mut *second)
+        })
+        .await
+        {
+            Ok((first_result, second_result)) => (
+                first_result.expect("the first task must not panic"),
+                second_result.expect("the second task must not panic"),
+            ),
+            Err(_) => {
+                first.abort();
+                second.abort();
+                panic!("{timeout_message}");
+            }
         }
     }
 
@@ -709,6 +844,131 @@ mod tests {
 
         assert_eq!(second[0].outcome, ExecutionOutcome::AlreadyExecuted);
         assert_eq!(recorder.records().len(), 1);
+    }
+
+    /// Two calls for one event run the action one time.
+    ///
+    /// The barrier makes both calls start before either can finish.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_calls_for_one_event_run_the_action_one_time() {
+        let stores = stores().await;
+        let recorder = Arc::new(RecordingAction::new("record"));
+        let engine = engine(&stores, vec![recorder.clone()]);
+        make_entity(&stores.entities).await;
+        stores.rules.upsert(draft("alpha", "record")).await.unwrap();
+        let subject = event(EntityEventKind::Created);
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+
+        let mut first = tokio::spawn({
+            let engine = engine.clone();
+            let subject = subject.clone();
+            let barrier = barrier.clone();
+            async move {
+                barrier.wait().await;
+                engine.process(&subject).await
+            }
+        });
+        let mut second = tokio::spawn({
+            let engine = engine.clone();
+            let subject = subject.clone();
+            let barrier = barrier.clone();
+            async move {
+                barrier.wait().await;
+                engine.process(&subject).await
+            }
+        });
+
+        let (first_result, second_result) = join_two(
+            &mut first,
+            &mut second,
+            "two calls for one event did not finish: the event lock must not deadlock",
+        )
+        .await;
+        let first_result = first_result.unwrap();
+        let second_result = second_result.unwrap();
+
+        let outcomes: Vec<ExecutionOutcome> = first_result
+            .into_iter()
+            .chain(second_result)
+            .map(|item| item.outcome)
+            .collect();
+        assert_eq!(recorder.records().len(), 1);
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| **outcome == ExecutionOutcome::Executed)
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| **outcome == ExecutionOutcome::AlreadyExecuted)
+                .count(),
+            1
+        );
+        assert_eq!(engine.live_process_locks().await, 0);
+    }
+
+    /// Two calls for different events do not serialize.
+    ///
+    /// The action for `evt-a` waits for the action for `evt-b`.
+    /// A global lock would block the pair until the timeout.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_calls_for_different_events_do_not_serialize() {
+        let stores = stores().await;
+        let gate = Arc::new(Notify::new());
+        let action = Arc::new(GatedAction::new("record", "evt-a", gate.clone()));
+        let engine = engine(&stores, vec![action.clone()]);
+        make_entity(&stores.entities).await;
+        stores.rules.upsert(draft("alpha", "record")).await.unwrap();
+        let mut first_event = event_at(1);
+        first_event.event_id = "evt-a".to_string();
+        let second_event = event_at(2);
+
+        let mut first = tokio::spawn({
+            let engine = engine.clone();
+            async move { engine.process(&first_event).await }
+        });
+        tokio::time::timeout(Duration::from_secs(5), action.waiting.notified())
+            .await
+            .expect("the first action must start and wait before the second call");
+        assert_eq!(action.calls(), 1);
+
+        let mut second = tokio::spawn({
+            let engine = engine.clone();
+            async move { engine.process(&second_event).await }
+        });
+
+        let (first_result, second_result) = join_two(
+            &mut first,
+            &mut second,
+            "two different events serialized: the first call blocked the second call",
+        )
+        .await;
+        let first_result = first_result.unwrap();
+        let second_result = second_result.unwrap();
+
+        assert_eq!(first_result[0].outcome, ExecutionOutcome::Executed);
+        assert_eq!(second_result[0].outcome, ExecutionOutcome::Executed);
+        assert_eq!(action.calls(), 2);
+        assert_eq!(engine.live_process_locks().await, 0);
+    }
+
+    /// The engine removes each event lock after the call.
+    #[tokio::test]
+    async fn the_process_lock_map_is_empty_after_process_returns() {
+        let stores = stores().await;
+        let recorder = Arc::new(RecordingAction::new("record"));
+        let engine = engine(&stores, vec![recorder.clone()]);
+        make_entity(&stores.entities).await;
+        stores.rules.upsert(draft("alpha", "record")).await.unwrap();
+
+        for seq in 1..=3 {
+            engine.process(&event_at(seq)).await.unwrap();
+        }
+
+        assert_eq!(engine.live_process_locks().await, 0);
     }
 
     #[tokio::test]
