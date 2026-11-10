@@ -102,6 +102,54 @@ impl Default for EavRuntimeConfig {
     }
 }
 
+/// Test-only controls for a replica build.
+///
+/// The `limit` value is zero when the test did not set a limit.
+/// The `read` value is the number of entities that the last build examined.
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(crate) struct ReplicaTestHooks {
+    /// The entity limit for a build. Zero means the default limit.
+    limit: Arc<std::sync::atomic::AtomicUsize>,
+    /// The number of entities that the last build examined.
+    read: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(test)]
+impl ReplicaTestHooks {
+    /// Sets the entity limit for a replica build.
+    ///
+    /// A value of zero restores the default limit.
+    pub(crate) fn set_limit(&self, limit: usize) {
+        self.limit.store(limit, Ordering::Relaxed);
+    }
+
+    /// Returns the entity limit for a replica build.
+    ///
+    /// The result is `None` when the test did not set a limit.
+    pub(crate) fn limit(&self) -> Option<usize> {
+        match self.limit.load(Ordering::Relaxed) {
+            0 => None,
+            limit => Some(limit),
+        }
+    }
+
+    /// Resets the entity read counter.
+    pub(crate) fn reset_read(&self) {
+        self.read.store(0, Ordering::Relaxed);
+    }
+
+    /// Adds one to the entity read counter.
+    pub(crate) fn count_read(&self) {
+        self.read.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Returns the entity read counter.
+    pub(crate) fn read(&self) -> usize {
+        self.read.load(Ordering::Relaxed)
+    }
+}
+
 /// The EAV stores and their background loops.
 ///
 /// The runtime holds one shared WAL.
@@ -128,6 +176,9 @@ pub struct EavRuntime {
     /// The latch starts as `false`.
     /// A normal cancellation does not set it.
     failed: Arc<AtomicBool>,
+    /// Test-only controls for a replica build.
+    #[cfg(test)]
+    replica_test: ReplicaTestHooks,
 }
 
 impl EavRuntime {
@@ -186,6 +237,8 @@ impl EavRuntime {
             wal,
             metrics,
             failed: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            replica_test: ReplicaTestHooks::default(),
         })
     }
 
@@ -207,6 +260,12 @@ impl EavRuntime {
     /// Returns the stored per-user entity replicas.
     pub fn replicas(&self) -> &ReplicaStore {
         &self.replicas
+    }
+
+    /// Returns the test-only controls for a replica build.
+    #[cfg(test)]
+    pub(crate) fn replica_test(&self) -> &ReplicaTestHooks {
+        &self.replica_test
     }
 
     /// Returns the rule engine.
