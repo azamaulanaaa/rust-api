@@ -14,10 +14,18 @@
 //! The runtime has no HTTP routes and no concrete actions.
 //! It adds no business rules.
 //!
-//! The runtime has one shared failure latch.
-//! [`EavRuntime::spawn`] sets the latch when [`EavRuntime::run`] returns an
-//! error.
+//! Each loop runs under its own supervisor.
+//! A supervisor restarts its loop after an error.
+//! It first sets the shared failure latch, logs the error, and sleeps for a
+//! backoff delay.
+//! The delay starts at one second and doubles up to 60 seconds.
+//! The backoff wait stops when the cancel token fires.
+//! Tests use a 10 millisecond base.
 //! The readiness probe reads the latch.
+//! The latch stays set after the first failure.
+//! It is a signal for the operator, not a stop switch.
+//! The loops keep running after a latch is set.
+//! [`EavRuntime::run`] returns only when the cancel token fires.
 //! A normal cancellation stops the loops and leaves the latch clear.
 
 use std::sync::Arc;
@@ -38,6 +46,24 @@ use crate::rules::action::RuleAction;
 use crate::rules::engine::RuleEngine;
 use crate::rules::store::RuleStore;
 use crate::sync::wal::Wal;
+
+/// The first backoff delay after a background loop fails.
+#[cfg(not(test))]
+const LOOP_BACKOFF_BASE: Duration = Duration::from_secs(1);
+
+/// The first backoff delay after a background loop fails.
+///
+/// Tests use a short delay, so a retry does not make the test slow.
+#[cfg(test)]
+const LOOP_BACKOFF_BASE: Duration = Duration::from_millis(10);
+
+/// The largest backoff delay after a background loop fails.
+const LOOP_BACKOFF_MAX: Duration = Duration::from_secs(60);
+
+/// The longest single sleep in a backoff wait.
+///
+/// A shorter slice lets a cancelled runtime stop before the full delay ends.
+const BACKOFF_SLICE: Duration = Duration::from_millis(25);
 
 /// Settings for the EAV background runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -197,8 +223,11 @@ impl EavRuntime {
     /// Returns the shared failure latch.
     ///
     /// The latch starts as `false`.
-    /// [`EavRuntime::spawn`] sets it to `true` when [`EavRuntime::run`]
-    /// returns an error.
+    /// A supervisor sets it to `true` when its background loop returns an
+    /// error.
+    /// The latch stays set after the first failure.
+    /// It is a signal for the operator, not a stop switch.
+    /// The loops keep running after a latch is set.
     /// A normal cancellation leaves it `false`.
     ///
     /// The call is cheap and does not block.
@@ -282,35 +311,75 @@ impl EavRuntime {
     }
 
     /// Runs the outbox relay, the rule runner, the marker cleanup, and the
-    /// timer pass until `cancel` fires.
+    /// timer pass under supervision until `cancel` fires.
     ///
     /// The call runs all four loops at the same time.
-    /// The first failure of the outbox relay or the rule runner stops the
-    /// runtime and returns the error.
-    /// The marker cleanup and the timer pass are best effort.
-    /// They log a warning and continue.
+    /// Each loop has its own supervisor.
+    /// When a loop returns an error, its supervisor does three things.
+    /// It sets the failure latch.
+    /// It logs the error with the loop name at `error` level.
+    /// It sleeps and then calls the loop again.
+    /// The wait stops when cancellation fires.
+    /// The delay starts at one second and doubles up to 60 seconds.
+    /// Tests use a 10 millisecond base.
+    /// An error in one loop does not stop the other loops or the remaining
+    /// work of that loop.
+    /// The latch stays set after the first failure.
+    /// It is a signal for the operator, not a stop switch.
+    /// The call returns `Ok(())` only when `cancel` is cancelled.
+    /// A normal cancellation does not set the latch.
+    ///
     /// The outbox relay flushes the pending entity events.
     /// The rule runner tails the shared change feed.
+    /// The marker cleanup deletes old execution markers.
     /// The timer pass emits the due timer events.
-    /// Each loop stops when `cancel` is cancelled.
     pub async fn run<C: CancelToken>(
         &self,
         cancel: C,
         config: EavRuntimeConfig,
     ) -> anyhow::Result<()> {
-        let relay = self.run_outbox(cancel.clone(), config.outbox_interval);
-        let runner = async {
-            self.engine
-                .run(&self.wal, cancel.clone(), config.rule_poll_interval)
-                .await
-                .map_err(|error| anyhow::anyhow!("EAV rule runner failed: {error}"))
-        };
-        let cleanup = self.run_execution_gc(
-            cancel.clone(),
-            config.gc_interval,
-            config.execution_retention,
-        );
-        let timers = self.run_timers(cancel.clone(), config.timer_interval, config.timer_batch);
+        let relay = self.supervise("outbox relay", cancel.clone(), {
+            let runtime = self.clone();
+            move |token| {
+                let runtime = runtime.clone();
+                async move { runtime.run_outbox(token, config.outbox_interval).await }
+            }
+        });
+        let runner = self.supervise("rule runner", cancel.clone(), {
+            let runtime = self.clone();
+            move |token| {
+                let runtime = runtime.clone();
+                async move {
+                    runtime
+                        .engine
+                        .run(&runtime.wal, token, config.rule_poll_interval)
+                        .await
+                        .map_err(|error| anyhow::anyhow!("EAV rule runner failed: {error}"))
+                }
+            }
+        });
+        let cleanup = self.supervise("marker cleanup", cancel.clone(), {
+            let runtime = self.clone();
+            move |token| {
+                let runtime = runtime.clone();
+                async move {
+                    runtime
+                        .run_execution_gc(token, config.gc_interval, config.execution_retention)
+                        .await
+                }
+            }
+        });
+        let timers = self.supervise("timer pass", cancel.clone(), {
+            let runtime = self.clone();
+            move |token| {
+                let runtime = runtime.clone();
+                async move {
+                    runtime
+                        .run_timers(token, config.timer_interval, config.timer_batch)
+                        .await
+                }
+            }
+        });
         tokio::select! {
             result = relay => result,
             result = runner => result,
@@ -319,11 +388,57 @@ impl EavRuntime {
         }
     }
 
+    /// Runs one background loop under supervision until `cancel` fires.
+    ///
+    /// The call runs `work`.
+    /// When `work` returns an error, the call sets the failure latch, logs
+    /// the error with `name`, sleeps for the backoff delay, and runs `work`
+    /// again.
+    /// The delay starts at [`LOOP_BACKOFF_BASE`] and doubles up to
+    /// [`LOOP_BACKOFF_MAX`].
+    /// The backoff wait stops when the cancel token fires, and the call then
+    /// returns `Ok(())`.
+    /// The latch is a signal for the operator, not a stop switch.
+    /// The call keeps running after it sets the latch.
+    /// A normal cancellation returns `Ok(())` and does not set the latch.
+    async fn supervise<C, F, Fut>(
+        &self,
+        name: &'static str,
+        cancel: C,
+        mut work: F,
+    ) -> anyhow::Result<()>
+    where
+        C: CancelToken,
+        F: FnMut(C) -> Fut,
+        Fut: std::future::Future<Output = anyhow::Result<()>>,
+    {
+        let mut delay = LOOP_BACKOFF_BASE;
+        loop {
+            match work(cancel.clone()).await {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    if cancel.is_cancelled() {
+                        return Ok(());
+                    }
+                    self.mark_failed();
+                    tracing::error!(loop_name = name, ?error, "EAV background loop failed");
+                    if sleep_unless_cancelled(&cancel, delay).await {
+                        return Ok(());
+                    }
+                    delay = delay.saturating_mul(2).min(LOOP_BACKOFF_MAX);
+                }
+            }
+        }
+    }
+
     /// Starts [`EavRuntime::run`] on a Tokio task.
     ///
-    /// The call logs a runtime error, sets the failure latch, and returns
-    /// the error.
-    /// The call does not set the latch on a normal cancellation.
+    /// [`EavRuntime::run`] returns only when the cancel token fires, so a
+    /// normal handle result is `Ok(())` after cancellation.
+    /// Each loop supervisor sets the failure latch when its loop returns an
+    /// error.
+    /// The call also sets the latch if [`EavRuntime::run`] itself returns an
+    /// error.
     /// A caller can await the handle during shutdown.
     pub fn spawn<C: CancelToken + Send + 'static>(
         &self,
@@ -332,14 +447,12 @@ impl EavRuntime {
     ) -> JoinHandle<anyhow::Result<()>> {
         let runtime = self.clone();
         tokio::spawn(async move {
-            match runtime.run(cancel, config).await {
-                Ok(()) => Ok(()),
-                Err(error) => {
-                    runtime.mark_failed();
-                    tracing::error!(?error, "EAV runtime failed");
-                    Err(error)
-                }
+            let result = runtime.run(cancel, config).await;
+            if let Err(error) = &result {
+                runtime.mark_failed();
+                tracing::error!(?error, "EAV runtime failed");
             }
+            result
         })
     }
 
@@ -382,7 +495,8 @@ impl EavRuntime {
     ///
     /// The call sleeps for `interval` between passes.
     /// It deletes the markers older than `retention`.
-    /// A failed cleanup logs a warning and continues.
+    /// A failed cleanup returns the error to the supervisor, which sets the
+    /// failure latch and restarts the loop after a backoff delay.
     /// A zero interval becomes one second. A zero retention becomes one second.
     async fn run_execution_gc<C: CancelToken>(
         &self,
@@ -402,16 +516,18 @@ impl EavRuntime {
                 return Ok(());
             }
             let older_than = chrono::Utc::now().timestamp().saturating_sub(retention);
-            if let Err(error) = self.rules.gc_executions(older_than).await {
-                tracing::warn!(?error, "EAV execution marker cleanup failed");
-            }
+            self.rules
+                .gc_executions(older_than)
+                .await
+                .context("delete the old EAV execution markers")?;
         }
     }
 
     /// Fires the due timers until `cancel` fires.
     ///
     /// The call sleeps for `interval` between passes.
-    /// A failed pass logs a warning and continues.
+    /// A failed pass returns the error to the supervisor, which sets the
+    /// failure latch and restarts the loop after a backoff delay.
     /// A zero interval becomes one second.
     /// A zero batch becomes 1.
     async fn run_timers<C: CancelToken>(
@@ -438,11 +554,29 @@ impl EavRuntime {
                     .record_timer_fired(fired as u64, started.elapsed()),
                 Err(error) => {
                     self.metrics.record_timer_failure();
-                    tracing::warn!(?error, "EAV due timer pass failed");
+                    return Err(error).context("fire the due EAV timers");
                 }
             }
         }
     }
+}
+
+/// Waits for `delay` in short slices and stops when `cancel` fires.
+///
+/// The call checks `cancel` before each slice and after the last slice.
+/// It returns `true` when the token is cancelled.
+/// A zero delay does not sleep and checks the token one time.
+async fn sleep_unless_cancelled<C: CancelToken>(cancel: &C, delay: Duration) -> bool {
+    let mut remaining = delay;
+    while !remaining.is_zero() {
+        if cancel.is_cancelled() {
+            return true;
+        }
+        let slice = remaining.min(BACKOFF_SLICE);
+        tokio::time::sleep(slice).await;
+        remaining = remaining.saturating_sub(slice);
+    }
+    cancel.is_cancelled()
 }
 
 /// Returns `duration`, or one second when it is zero.
@@ -470,6 +604,8 @@ fn domain_prefix(db_prefix: &str, domain: &str) -> String {
 mod tests {
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    use tokio_util::sync::CancellationToken;
 
     use super::*;
     use crate::db::{build_s3_store, test_prefix};
@@ -623,6 +759,26 @@ mod tests {
         }
     }
 
+    /// A [`ChangeSink`] that accepts timer events and refuses other events.
+    ///
+    /// The outbox relay fails on the created entity event.
+    /// The timer pass can still append its event to the shared feed.
+    struct TimerOnlyFeed {
+        wal: Wal,
+    }
+
+    #[async_trait::async_trait]
+    impl ChangeSink for TimerOnlyFeed {
+        async fn append(&self, op: WalOp) -> anyhow::Result<()> {
+            match &op {
+                WalOp::Entity { event } if event.kind == EntityEventKind::Timer => {
+                    self.wal.append(op).await
+                }
+                _ => Err(anyhow::anyhow!("the test feed refuses a non-timer event")),
+            }
+        }
+    }
+
     /// Builds a runtime whose outbox relay fails on its first flush.
     ///
     /// The entity store uses a feed that refuses every append.
@@ -643,6 +799,34 @@ mod tests {
         let entities =
             EntityStore::new(store, schemas.clone()).with_change_sink(Arc::new(FailingFeed));
         schemas.publish(schema()).await.unwrap();
+        runtime.entities = entities;
+        runtime
+    }
+
+    /// Builds a runtime whose outbox relay fails and whose timer pass works.
+    ///
+    /// The entity store uses a feed that accepts timer events and refuses
+    /// other events.
+    /// The created entity leaves an outbox row, so the relay fails.
+    /// The timer pass can still append its event to the runtime WAL.
+    async fn runtime_with_a_timer_only_feed() -> EavRuntime {
+        let mut runtime = build_runtime(Vec::new()).await;
+        let s3 = memory_s3();
+        let prefix = test_prefix("eav-runtime-timer-feed");
+        let store = build_s3_store(&s3, &format!("{prefix}/entity"))
+            .await
+            .unwrap();
+        let schemas = SchemaRegistry::new(
+            build_s3_store(&s3, &format!("{prefix}/schema"))
+                .await
+                .unwrap(),
+        );
+        let feed = Arc::new(TimerOnlyFeed {
+            wal: runtime.wal().clone(),
+        });
+        let entities = EntityStore::new(store, schemas.clone()).with_change_sink(feed);
+        schemas.publish(schema()).await.unwrap();
+        schemas.publish(timer_schema()).await.unwrap();
         runtime.entities = entities;
         runtime
     }
@@ -680,16 +864,78 @@ mod tests {
         );
 
         let cancel = Arc::new(AtomicBool::new(false));
-        let handle = runtime.spawn(cancel, short_config());
+        let mut handle = runtime.spawn(cancel.clone(), short_config());
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !latch.load(Ordering::Relaxed) {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("the outbox failure must set the failure latch");
+
+        // The latch is a signal, not a stop switch. The runtime keeps
+        // running, so the handle stays pending.
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), &mut handle)
+                .await
+                .is_err(),
+            "the runtime must keep running after the latch is set"
+        );
+
+        cancel.store(true, Ordering::SeqCst);
         let result = tokio::time::timeout(Duration::from_secs(2), handle)
             .await
-            .expect("the runtime stops after the outbox failure")
+            .expect("a cancelled runtime must stop")
             .expect("the task does not panic");
-        assert!(result.is_err(), "the outbox failure must reach the handle");
-        assert!(
-            latch.load(Ordering::Relaxed),
-            "a dead runtime must set the failure latch"
-        );
+        assert!(result.is_ok(), "a normal cancellation must return Ok");
+    }
+
+    #[tokio::test]
+    async fn a_failed_outbox_loop_does_not_stop_the_timer_loop() {
+        let runtime = runtime_with_a_timer_only_feed().await;
+        let latch = runtime.failure_latch();
+        assert!(!latch.load(Ordering::Relaxed));
+
+        // The created invoice event makes the outbox relay fail.
+        runtime
+            .entities()
+            .create(entity(), &WriteContext::new("tester"))
+            .await
+            .unwrap();
+        // The due timer entity makes the timer pass emit one event.
+        let now = chrono::Utc::now().timestamp();
+        runtime
+            .entities()
+            .create(timer_entity("t1", now - 10), &WriteContext::new("tester"))
+            .await
+            .unwrap();
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let handle = runtime.spawn(cancel.clone(), short_config());
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !latch.load(Ordering::Relaxed) {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("the outbox failure must set the failure latch");
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while runtime.wal().head().await.unwrap() == 0 {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("the timer loop must still emit after the outbox failure");
+
+        cancel.store(true, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("a cancelled runtime must stop")
+            .expect("the task does not panic")
+            .expect("a normal cancellation must return Ok");
     }
 
     #[tokio::test]
@@ -1001,6 +1247,42 @@ mod tests {
             nonzero_duration(Duration::from_millis(5)),
             Duration::from_millis(5)
         );
+    }
+
+    #[tokio::test]
+    async fn sleep_unless_cancelled_returns_true_soon_after_cancellation() {
+        let cancel = CancellationToken::new();
+        let token = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            token.cancel();
+        });
+        let started = Instant::now();
+
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(100),
+            sleep_unless_cancelled(&cancel, Duration::from_millis(200)),
+        )
+        .await
+        .expect("the wait must stop soon after cancellation");
+
+        assert!(cancelled);
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "a cancelled wait must not sleep for the full delay"
+        );
+    }
+
+    #[tokio::test]
+    async fn sleep_unless_cancelled_returns_false_after_a_full_short_delay() {
+        let cancel = CancellationToken::new();
+        let started = Instant::now();
+
+        let cancelled = sleep_unless_cancelled(&cancel, Duration::from_millis(20)).await;
+
+        assert!(!cancelled);
+        assert!(started.elapsed() >= Duration::from_millis(20));
+        assert!(!sleep_unless_cancelled(&cancel, Duration::ZERO).await);
     }
 
     #[tokio::test]
