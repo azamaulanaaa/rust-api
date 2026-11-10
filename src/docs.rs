@@ -62,6 +62,7 @@ use utoipa::OpenApi;
         crate::eav::sync::snapshot,
         crate::eav::sync::build_replica,
         crate::eav::sync::replica,
+        crate::eav::sync::reset_replica,
         crate::eav::sync::replica_status,
     ),
     components(schemas(

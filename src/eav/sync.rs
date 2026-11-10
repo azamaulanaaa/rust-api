@@ -17,6 +17,7 @@
 //! `GET /eav/sync/replica` returns the stored snapshot as one JSON array.
 //! `GET /eav/sync/replica?chunk=N` returns one page of the stored snapshot.
 //! `GET /eav/sync/replica/status` reports the log head and the stored head.
+//! `DELETE /eav/sync/replica` removes the stored replica of the caller.
 //! The client applies the events after the stored head.
 //! The replica is a head-anchored snapshot, not an incremental store.
 //! The build reads the feed head first, then pages the entities.
@@ -24,6 +25,14 @@
 //! An apply must be idempotent and version-aware.
 //! The full read is for compatibility.
 //! Use the chunk read to page a large replica.
+//!
+//! A reset removes the snapshot, the chunks, the manifest, the generation, and
+//! the head.
+//! The caller needs a valid session and no management grant.
+//! A caller owns its replica.
+//! A reset returns `204` when a replica existed.
+//! A reset returns `404` when the caller has no replica.
+//! After a WAL reset, call the reset route, then build a new replica.
 //!
 //! Each build increments the stored generation, including an equal-head build.
 //! The full read sets `X-Replica-Generation`.
@@ -53,7 +62,7 @@
 //! An invisible entry neither fills the page nor stops the scan.
 
 use actix_web::{
-    HttpRequest, HttpResponse, get,
+    HttpRequest, HttpResponse, delete, get,
     http::header::{CONTENT_TYPE, ETAG, IF_NONE_MATCH},
     post, web,
 };
@@ -606,6 +615,29 @@ pub(crate) async fn build_replica(
     }
 }
 
+/// Removes the stored replica of the caller.
+///
+/// The caller needs a valid session.
+/// The route needs no management grant, because a caller owns its replica.
+/// The route removes only the replica of the caller.
+/// A reset removes the snapshot, the chunks, the manifest, the generation, and
+/// the head in one transaction.
+/// A reset returns `204` when a replica existed and was removed.
+/// A reset returns `404` when the caller has no replica.
+/// After a WAL reset, call the reset route, then build a new replica.
+/// The next build starts at generation 1.
+#[utoipa::path(delete, path = "/eav/sync/replica", tag = "eav", responses((status = 204, description = "replica removed"), (status = 401, body = crate::http::error::ErrorBody), (status = 404, body = crate::http::error::ErrorBody), (status = 500, body = crate::http::error::ErrorBody)))]
+#[delete("/sync/replica")]
+pub(crate) async fn reset_replica(
+    runtime: web::Data<EavRuntime>,
+    claims: Validated<Claims>,
+) -> Result<HttpResponse, EavApiError> {
+    if runtime.replicas().clear(&claims.sub).await? {
+        return Ok(HttpResponse::NoContent().finish());
+    }
+    Err(EavApiError::NotFound(Box::new(MissingReplica)))
+}
+
 /// The source of a replica chunk index outside the stored range.
 #[derive(Debug)]
 struct ReplicaChunkOutOfRange;
@@ -947,6 +979,15 @@ mod tests {
             actix_test::call_service(
                 $app,
                 auth(actix_test::TestRequest::get().uri($uri), $token).to_request(),
+            )
+        };
+    }
+
+    macro_rules! delete_route {
+        ($app:expr, $uri:expr, $token:expr) => {
+            actix_test::call_service(
+                $app,
+                auth(actix_test::TestRequest::delete().uri($uri), $token).to_request(),
             )
         };
     }
@@ -2462,6 +2503,154 @@ mod tests {
         Ok(())
     }
 
+    #[actix_web::test]
+    async fn a_replica_reset_allows_a_build_after_a_stored_higher_head() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        publish_task_schema(&fx).await?;
+        create_entity(&fx, "e1").await?;
+        grant_collection_read(&fx, "alice").await?;
+        let head = fx.runtime.wal().head().await?;
+        let stored = serde_json::to_vec(&Vec::<Entity>::new())?;
+        fx.runtime
+            .replicas()
+            .put("alice", head + 5, vec![stored])
+            .await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::post().uri("/eav/sync/replica"),
+                &token,
+            )
+            .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::CONFLICT);
+        let body: Value = actix_test::read_body_json(res).await;
+        assert_eq!(body["code"], "conflict");
+
+        let res = delete_route!(&app, "/eav/sync/replica", &token).await;
+        assert_eq!(res.status(), http::StatusCode::NO_CONTENT);
+        let body = actix_test::read_body(res).await;
+        assert!(body.is_empty(), "a reset returns no body");
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::post().uri("/eav/sync/replica"),
+                &token,
+            )
+            .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let body: Value = actix_test::read_body_json(res).await;
+        assert_eq!(body["head"], head);
+        assert_eq!(body["generation"], 1);
+        assert_eq!(body["count"], 1);
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn delete_without_a_replica_returns_404() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+
+        let res = delete_route!(&app, "/eav/sync/replica", &token).await;
+        assert_eq!(res.status(), http::StatusCode::NOT_FOUND);
+        let body: crate::http::error::ErrorBody = actix_test::read_body_json(res).await;
+        assert_eq!(body.error, "not found");
+        assert_eq!(body.code.as_deref(), Some("not_found"));
+        assert_eq!(fx.runtime.replicas().status("alice").await?, None);
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn a_replica_reset_affects_only_the_caller() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        publish_task_schema(&fx).await?;
+        create_entity(&fx, "e1").await?;
+        grant_collection_read(&fx, "alice").await?;
+        grant_collection_read(&fx, "bob").await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let alice = fx.token("alice")?;
+        let bob = fx.token("bob")?;
+
+        for token in [&alice, &bob] {
+            let res = actix_test::call_service(
+                &app,
+                auth(
+                    actix_test::TestRequest::post().uri("/eav/sync/replica"),
+                    token,
+                )
+                .to_request(),
+            )
+            .await;
+            assert_eq!(res.status(), http::StatusCode::OK);
+        }
+
+        let res = delete_route!(&app, "/eav/sync/replica", &alice).await;
+        assert_eq!(res.status(), http::StatusCode::NO_CONTENT);
+
+        let res = get_route!(&app, "/eav/sync/replica/status", &alice).await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let body: Value = actix_test::read_body_json(res).await;
+        assert!(body["built_head"].is_null(), "the reset left a head");
+
+        let res = get_route!(&app, "/eav/sync/replica/status", &bob).await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let body: Value = actix_test::read_body_json(res).await;
+        assert_eq!(body["built_head"], body["head"]);
+
+        let res = get_route!(&app, "/eav/sync/replica", &bob).await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let items: Vec<Value> = actix_test::read_body_json(res).await;
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["id"], "e1");
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn the_read_and_chunk_routes_return_404_after_a_reset() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        publish_task_schema(&fx).await?;
+        for id in ["e1", "e2"] {
+            create_entity(&fx, id).await?;
+        }
+        grant_collection_read(&fx, "alice").await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::post().uri("/eav/sync/replica"),
+                &token,
+            )
+            .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+
+        let res = delete_route!(&app, "/eav/sync/replica", &token).await;
+        assert_eq!(res.status(), http::StatusCode::NO_CONTENT);
+
+        for uri in ["/eav/sync/replica", "/eav/sync/replica?chunk=0"] {
+            let res = get_route!(&app, uri, &token).await;
+            assert_eq!(res.status(), http::StatusCode::NOT_FOUND, "{uri}");
+            let body: crate::http::error::ErrorBody = actix_test::read_body_json(res).await;
+            assert_eq!(body.code.as_deref(), Some("not_found"), "{uri}");
+        }
+        Ok(())
+    }
+
     #[test]
     fn openapi_includes_sync_paths_and_schemas() {
         let spec: Value =
@@ -2472,6 +2661,10 @@ mod tests {
         assert!(paths.contains_key("/eav/sync/events"));
         assert!(paths.contains_key("/eav/sync/snapshot"));
         assert!(paths.contains_key("/eav/sync/replica"));
+        assert!(
+            paths["/eav/sync/replica"]["delete"].is_object(),
+            "spec missing DELETE /eav/sync/replica"
+        );
         assert!(paths.contains_key("/eav/sync/replica/status"));
         let schemas = spec["components"]["schemas"]
             .as_object()

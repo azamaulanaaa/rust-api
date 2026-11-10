@@ -31,6 +31,11 @@
 //! The put increments the generation on each replacement.
 //! Thus a read detects an equal-head rebuild that changes the snapshot.
 //!
+//! A reset removes the snapshot, the chunks, the manifest, the generation, and
+//! the head.
+//! A reset commits in one transaction under the store write guard.
+//! Thus a concurrent put and reset cannot leave a partial replica.
+//!
 //! A read sees consistent chunks when the head and the generation do not
 //! change during the read.
 //! The read checks the head and the generation before and after it reads the
@@ -211,6 +216,56 @@ impl ReplicaStore {
             .map_err(EntityError::Store)?;
         tx.commit().await.map_err(EntityError::Store)?;
         Ok(generation)
+    }
+
+    /// Removes the stored replica for `sub`.
+    ///
+    /// The call reads the stored head and generation, then deletes the head
+    /// row, the generation row, the manifest row for that head, and every
+    /// chunk row for that head.
+    /// All reads and deletes commit in one transaction.
+    /// The call takes the store write guard for the whole operation, so a
+    /// concurrent [`ReplicaStore::put`] and clear cannot leave a partial
+    /// replica.
+    /// The call returns `true` when a replica existed and was removed.
+    /// It returns `false` when no head row existed, and it writes nothing.
+    ///
+    /// The removed keys are:
+    ///
+    /// - `replica:{sub_hash}:head`
+    /// - `replica:{sub_hash}:generation`
+    /// - `replica:{sub_hash}:meta:{head}`
+    /// - `replica:{sub_hash}:data:{head}:{index:08}` for every chunk index
+    ///
+    /// A later build starts at generation 1.
+    pub async fn clear(&self, sub: &str) -> Result<bool, EntityError> {
+        let hash = sub_hash(sub);
+        let g = self.store.write().await;
+        let tx = g.begin_tx().map_err(EntityError::Store)?;
+        let Some(head) = read_head(&tx, &hash).await? else {
+            return Ok(false);
+        };
+        let _generation = read_generation(&tx, &hash).await?;
+        let chunks = read_meta(&tx, &hash, head)
+            .await?
+            .map(|meta| meta.chunks)
+            .unwrap_or(0);
+        for index in 0..chunks {
+            tx.delete(&data_key(&hash, head, index as usize))
+                .await
+                .map_err(EntityError::Store)?;
+        }
+        tx.delete(&meta_key(&hash, head))
+            .await
+            .map_err(EntityError::Store)?;
+        tx.delete(&generation_key(&hash))
+            .await
+            .map_err(EntityError::Store)?;
+        tx.delete(&head_key(&hash))
+            .await
+            .map_err(EntityError::Store)?;
+        tx.commit().await.map_err(EntityError::Store)?;
+        Ok(true)
     }
 
     /// Returns the stored snapshot for `sub`.
@@ -636,6 +691,76 @@ mod tests {
             g.get_bytes(&meta_key(&hash, 9)).await.unwrap(),
             Some(br#"{"chunks":1}"#.to_vec())
         );
+    }
+
+    #[tokio::test]
+    async fn clear_removes_the_head_the_generation_the_manifest_and_every_chunk() {
+        let store = store().await;
+        store
+            .put("alice", 7, chunks(&[b"one", b"two"]))
+            .await
+            .unwrap();
+
+        assert!(store.clear("alice").await.unwrap());
+
+        let hash = sub_hash("alice");
+        let g = store.store.read().await;
+        assert!(g.get_bytes(&head_key(&hash)).await.unwrap().is_none());
+        assert!(g.get_bytes(&generation_key(&hash)).await.unwrap().is_none());
+        assert!(g.get_bytes(&meta_key(&hash, 7)).await.unwrap().is_none());
+        for index in 0..2 {
+            assert!(
+                g.get_bytes(&data_key(&hash, 7, index))
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "chunk row {index} remains"
+            );
+        }
+        drop(g);
+        assert_eq!(store.get("alice").await.unwrap(), None);
+        assert_eq!(store.get_chunk("alice", 0).await.unwrap(), None);
+        assert_eq!(store.status("alice").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn clear_after_a_multi_chunk_put_removes_every_chunk() {
+        let store = store().await;
+        store
+            .put("alice", 12, chunks(&[b"one", b"two", b"three", b"four"]))
+            .await
+            .unwrap();
+
+        assert!(store.clear("alice").await.unwrap());
+
+        let hash = sub_hash("alice");
+        let g = store.store.read().await;
+        for index in 0..4 {
+            assert!(
+                g.get_bytes(&data_key(&hash, 12, index))
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "chunk row {index} remains"
+            );
+        }
+        assert_eq!(store.status("alice").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn clear_on_a_missing_replica_returns_false_and_writes_nothing() {
+        let store = store().await;
+
+        assert!(!store.clear("alice").await.unwrap());
+
+        let hash = sub_hash("alice");
+        let g = store.store.read().await;
+        assert!(g.get_bytes(&head_key(&hash)).await.unwrap().is_none());
+        assert!(g.get_bytes(&generation_key(&hash)).await.unwrap().is_none());
+        assert!(g.get_bytes(&meta_key(&hash, 0)).await.unwrap().is_none());
+        assert!(g.get_bytes(&data_key(&hash, 0, 0)).await.unwrap().is_none());
+        drop(g);
+        assert_eq!(store.status("alice").await.unwrap(), None);
     }
 
     #[tokio::test]
