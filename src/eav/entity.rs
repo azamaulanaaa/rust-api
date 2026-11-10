@@ -1183,6 +1183,12 @@ impl EntityStore {
 
     /// Writes a timer marker for one entity, key, and due value.
     ///
+    /// The call takes the write lock and then the store write guard.
+    /// It reloads the entity inside the lock.
+    /// It writes the marker only when the entity exists and its current value
+    /// for `key` is [`AttributeValue::Timestamp`] with `due_at`.
+    /// The call returns `true` when it writes the marker.
+    /// It returns `false` when the entity is absent or the value differs.
     /// The value is the current Unix time as JSON.
     /// The call is idempotent.
     pub async fn mark_timer_fired(
@@ -1190,13 +1196,20 @@ impl EntityStore {
         entity_id: &str,
         key: &str,
         due_at: i64,
-    ) -> Result<(), EntityError> {
+    ) -> Result<bool, EntityError> {
         let now = chrono::Utc::now().timestamp();
         let bytes = serde_json::to_vec(&now).map_err(|e| EntityError::Internal(e.to_string()))?;
+        let _write = self.write_lock.lock().await;
         let g = self.store.write().await;
+        let Some(entity) = load_entity(&*g, entity_id).await? else {
+            return Ok(false);
+        };
+        if entity.attributes.get(key) != Some(&AttributeValue::Timestamp(due_at)) {
+            return Ok(false);
+        }
         g.set_bytes(&timer_marker_key(entity_id, key, due_at), &bytes)
             .await
-            .map(|_| ())
+            .map(|_| true)
             .map_err(EntityError::Store)
     }
 
@@ -2232,6 +2245,32 @@ mod tests {
 
     fn ctx() -> WriteContext {
         WriteContext::new("tester")
+    }
+
+    /// Builds a store with one `task` schema that has a timestamp `due`
+    /// and a string `title`.
+    async fn timer_store() -> (EntityStore, OxKvStore) {
+        let (store, registry, raw) = new_store().await;
+        registry
+            .publish(schema(
+                "task",
+                &[],
+                vec![
+                    full_attr("due", AttributeType::Timestamp, false, true, false, None),
+                    attr("title", AttributeType::String),
+                ],
+            ))
+            .await
+            .unwrap();
+        (store, raw)
+    }
+
+    /// Creates one `task` entity with a `due` value.
+    async fn create_task(store: &EntityStore, id: &str, due: i64) {
+        store
+            .create(draft(id, &["task"], vec![("due", t(due))]), &ctx())
+            .await
+            .unwrap();
     }
 
     async fn all_keys(store: &OxKvStore) -> Vec<String> {
@@ -3917,12 +3956,13 @@ mod tests {
 
     #[tokio::test]
     async fn a_timer_marker_is_idempotent() {
-        let (store, _registry, raw) = new_store().await;
+        let (store, raw) = timer_store().await;
+        create_task(&store, "e1", 100).await;
 
         assert!(!store.is_timer_fired("e1", "due", 100).await.unwrap());
-        store.mark_timer_fired("e1", "due", 100).await.unwrap();
+        assert!(store.mark_timer_fired("e1", "due", 100).await.unwrap());
         assert!(store.is_timer_fired("e1", "due", 100).await.unwrap());
-        store.mark_timer_fired("e1", "due", 100).await.unwrap();
+        assert!(store.mark_timer_fired("e1", "due", 100).await.unwrap());
         assert!(store.is_timer_fired("e1", "due", 100).await.unwrap());
 
         let bytes = raw
@@ -3932,6 +3972,68 @@ mod tests {
             .unwrap();
         let fired_at: i64 = serde_json::from_slice(&bytes).unwrap();
         assert!(fired_at > 0);
+    }
+
+    #[tokio::test]
+    async fn a_timer_marker_is_written_for_the_current_value() {
+        let (store, _raw) = timer_store().await;
+        create_task(&store, "e1", 100).await;
+
+        assert!(store.mark_timer_fired("e1", "due", 100).await.unwrap());
+        assert!(store.is_timer_fired("e1", "due", 100).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_timer_marker_for_an_old_value_is_not_written() {
+        let (store, _raw) = timer_store().await;
+        create_task(&store, "e1", 100).await;
+        assert!(store.mark_timer_fired("e1", "due", 100).await.unwrap());
+
+        store
+            .update("e1", 1, patch(vec![("due", Some(t(200)))]), &ctx())
+            .await
+            .unwrap();
+
+        assert!(!store.mark_timer_fired("e1", "due", 100).await.unwrap());
+        assert!(!store.is_timer_fired("e1", "due", 100).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_timer_fires_again_after_the_value_returns() {
+        let (store, _raw) = timer_store().await;
+        create_task(&store, "e1", 100).await;
+        assert!(store.mark_timer_fired("e1", "due", 100).await.unwrap());
+        store
+            .update("e1", 1, patch(vec![("due", Some(t(200)))]), &ctx())
+            .await
+            .unwrap();
+        assert!(!store.mark_timer_fired("e1", "due", 100).await.unwrap());
+        store
+            .update("e1", 2, patch(vec![("due", Some(t(100)))]), &ctx())
+            .await
+            .unwrap();
+
+        assert!(!store.is_timer_fired("e1", "due", 100).await.unwrap());
+        assert!(store.mark_timer_fired("e1", "due", 100).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_timer_marker_for_a_deleted_entity_is_not_written() {
+        let (store, _raw) = timer_store().await;
+        create_task(&store, "e1", 100).await;
+        store.delete("e1", 1, &ctx()).await.unwrap();
+
+        assert!(!store.mark_timer_fired("e1", "due", 100).await.unwrap());
+        assert!(!store.is_timer_fired("e1", "due", 100).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_timer_marker_for_a_value_the_entity_never_had_is_not_written() {
+        let (store, _raw) = timer_store().await;
+        create_task(&store, "e1", 100).await;
+
+        assert!(!store.mark_timer_fired("e1", "due", 999).await.unwrap());
+        assert!(!store.is_timer_fired("e1", "due", 999).await.unwrap());
     }
 
     #[tokio::test]
