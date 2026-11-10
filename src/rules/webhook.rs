@@ -10,11 +10,19 @@
 //!
 //! A strict host allowlist limits the destinations.
 //! The client follows no redirects.
+//! The action resolves the URL host before each request.
+//! It rejects a host when any address is not public.
+//! An operator can permit a private address with
+//! `[eav].webhook_allow_private_hosts`.
+//! The action pins the resolved address to the HTTP client.
+//! A second DNS answer cannot change the target.
+//! The client keeps the original host name for TLS certificate validation.
 //! The allowlist and the disabled redirects limit the destinations.
 //! A compromised allowlisted host remains trusted.
 //! The action cannot stop that host from reading the payload.
 
 use std::collections::BTreeMap;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -56,20 +64,21 @@ fn record_delivery(succeeded: bool, elapsed: Duration) {
 
 /// An action that posts one event to an allowlisted host.
 ///
-/// The action builds one client with a 10 second timeout.
+/// The action builds one client for each request with a 10 second timeout.
 /// The client follows no redirects.
+/// The client uses only the address that the action resolved.
 #[derive(Clone)]
 pub struct WebhookAction {
     /// The parsed allowlist entries.
     allowed_hosts: Vec<AllowedHost>,
-    /// The shared HTTP client.
-    client: reqwest::Client,
     /// The optional queue for durable delivery.
     queue: Option<Arc<dyn JobQueue>>,
     /// The optional HMAC-SHA256 signing secret.
     signing_secret: Option<Vec<u8>>,
     /// The maximum number of delivery attempts.
     max_attempts: u32,
+    /// Allows delivery to a private address when true.
+    allow_private_hosts: bool,
 }
 
 impl std::fmt::Debug for WebhookAction {
@@ -79,6 +88,7 @@ impl std::fmt::Debug for WebhookAction {
             .field("has_queue", &self.queue.is_some())
             .field("has_signing_secret", &self.signing_secret.is_some())
             .field("max_attempts", &self.max_attempts)
+            .field("allow_private_hosts", &self.allow_private_hosts)
             .finish()
     }
 }
@@ -89,6 +99,7 @@ impl WebhookAction {
     /// Each entry is a host or a `host:port` pair.
     /// An empty list rejects every webhook rule.
     /// The direct mode uses no queue and no signing secret.
+    /// The action rejects a private address by default.
     pub fn new(allowed_hosts: Vec<String>) -> Self {
         let allowed_hosts = allowed_hosts
             .iter()
@@ -96,11 +107,20 @@ impl WebhookAction {
             .collect();
         Self {
             allowed_hosts,
-            client: build_client(),
             queue: None,
             signing_secret: None,
             max_attempts: DEFAULT_MAX_ATTEMPTS,
+            allow_private_hosts: false,
         }
+    }
+
+    /// Sets whether a private address is allowed.
+    ///
+    /// The action resolves and pins the address in both modes.
+    /// The value `true` preserves an intentional internal webhook.
+    pub fn allow_private_hosts(mut self, allow: bool) -> Self {
+        self.allow_private_hosts = allow;
+        self
     }
 
     /// Uses the shared queue for delivery.
@@ -121,10 +141,10 @@ impl WebhookAction {
 
     /// Builds the job handler for the queue path.
     ///
-    /// The handler holds the allowlist, the HTTP client, and the signing
-    /// secret.
+    /// The handler holds the allowlist, the private-address flag, and the
+    /// signing secret.
     pub fn job_handler(&self) -> WebhookJobHandler {
-        WebhookJobHandler::new(self.client.clone(), self.signing_secret.clone())
+        WebhookJobHandler::new(self.signing_secret.clone(), self.allow_private_hosts)
             .with_allowed_hosts(self.allowed_hosts.clone())
     }
 }
@@ -167,12 +187,12 @@ impl RuleAction for WebhookAction {
                 .map_err(|_| anyhow::anyhow!("webhook payload is not valid"))?;
             let started = Instant::now();
             let result = send_webhook(
-                &self.client,
                 url,
                 &body,
                 ctx.event.event_id.as_str(),
                 ctx.rule.id.as_str(),
                 self.signing_secret.as_deref(),
+                self.allow_private_hosts,
             )
             .await;
             record_delivery(result.is_ok(), started.elapsed());
@@ -208,27 +228,28 @@ impl RuleAction for WebhookAction {
 
 /// A job handler that delivers one queued webhook.
 ///
-/// The handler holds the allowlist, the HTTP client, and the signing secret.
+/// The handler holds the allowlist, the private-address flag, and the signing
+/// secret.
 #[derive(Clone)]
 pub struct WebhookJobHandler {
     /// The parsed allowlist entries.
     allowed_hosts: Vec<AllowedHost>,
-    /// The shared HTTP client.
-    client: reqwest::Client,
     /// The optional HMAC-SHA256 signing secret.
     signing_secret: Option<Vec<u8>>,
+    /// Allows delivery to a private address when true.
+    allow_private_hosts: bool,
 }
 
 impl WebhookJobHandler {
-    /// Creates a handler from the HTTP client and the signing secret.
+    /// Creates a handler from the signing secret and the private-address flag.
     ///
     /// The handler starts with an empty allowlist.
     /// Use [`WebhookAction::job_handler`](crate::rules::webhook::WebhookAction::job_handler) to add allowlist entries.
-    pub fn new(client: reqwest::Client, signing_secret: Option<Vec<u8>>) -> Self {
+    pub fn new(signing_secret: Option<Vec<u8>>, allow_private_hosts: bool) -> Self {
         Self {
             allowed_hosts: Vec::new(),
-            client,
             signing_secret,
+            allow_private_hosts,
         }
     }
 
@@ -292,12 +313,12 @@ impl WebhookJobHandler {
         let body = serde_json::to_vec(&envelope.body)
             .map_err(|_| anyhow::anyhow!("webhook job body is not valid"))?;
         send_webhook(
-            &self.client,
             url,
             &body,
             event_id,
             rule_id,
             self.signing_secret.as_deref(),
+            self.allow_private_hosts,
         )
         .await?;
         Ok(None)
@@ -353,16 +374,21 @@ struct AllowedHost {
 
 /// Sends one webhook request.
 ///
-/// The call signs the exact body bytes when a secret exists.
+/// The call resolves the URL host and pins the resolved address to a new
+/// client.
+/// It rejects the request when any address is not public, unless the caller
+/// allows a private host.
+/// It signs the exact body bytes when a secret exists.
 /// It returns an error for any status that is not 2xx.
 async fn send_webhook(
-    client: &reqwest::Client,
     url: Url,
     body: &[u8],
     event_id: &str,
     rule_id: &str,
     signing_secret: Option<&[u8]>,
+    allow_private_hosts: bool,
 ) -> Result<(), anyhow::Error> {
+    let client = build_pinned_client(&url, allow_private_hosts).await?;
     let mut request = client
         .post(url)
         .header(reqwest::header::CONTENT_TYPE, "application/json")
@@ -507,18 +533,97 @@ fn url_from_params(params: &serde_json::Value) -> Result<Url, anyhow::Error> {
     Url::parse(raw).map_err(|_| anyhow::anyhow!("webhook URL is not valid"))
 }
 
-/// Builds the shared HTTP client with a timeout and no redirects.
+/// Builds a client that sends every request to one resolved address.
+///
+/// The call resolves the URL host with the URL port.
+/// It rejects a non-public address unless `allow_private_hosts` is true.
+/// It pins every resolved address to the host name in the client.
+/// The URL keeps the original host name, so TLS certificate validation still
+/// uses that name.
+async fn build_pinned_client(
+    url: &Url,
+    allow_private_hosts: bool,
+) -> Result<reqwest::Client, anyhow::Error> {
+    let (host, addresses) = resolve_webhook_target(url, allow_private_hosts).await?;
+    Ok(build_client(&host, &addresses))
+}
+
+/// Resolves one webhook URL to a host and socket addresses.
+///
+/// The lookup includes the URL port.
+/// The call rejects the URL when any address is not public, unless
+/// `allow_private_hosts` is true.
+async fn resolve_webhook_target(
+    url: &Url,
+    allow_private_hosts: bool,
+) -> Result<(String, Vec<SocketAddr>), anyhow::Error> {
+    let Some(raw_host) = url.host_str() else {
+        bail!("webhook URL has no host");
+    };
+    let host = normalize_host(raw_host);
+    let Some(port) = url.port_or_known_default() else {
+        bail!("webhook URL has no port");
+    };
+    let addresses: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), port))
+        .await
+        .map_err(|_| anyhow::anyhow!("webhook host does not resolve"))?
+        .collect();
+    if addresses.is_empty() {
+        bail!("webhook host does not resolve");
+    }
+    if !allow_private_hosts && addresses.iter().any(|address| !is_public_ip(address.ip())) {
+        bail!("webhook host resolves to a private address");
+    }
+    Ok((host, addresses))
+}
+
+/// Builds one HTTP client with a timeout, no redirects, and pinned addresses.
 #[allow(clippy::expect_used)]
-fn build_client() -> reqwest::Client {
+fn build_client(host: &str, addresses: &[SocketAddr]) -> reqwest::Client {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(TIMEOUT_SECS))
         .redirect(reqwest::redirect::Policy::none())
+        .resolve_to_addrs(host, addresses)
         .build()
         .expect("webhook HTTP client must build")
 }
 
+/// Returns true when one address is public.
+///
+/// The call rejects an IPv4 loopback, private, link-local, unspecified,
+/// broadcast, or multicast address.
+/// It rejects an IPv6 loopback, unspecified, multicast, link-local, or
+/// unique-local address.
+/// It checks an IPv4-mapped IPv6 address as an IPv4 address.
+fn is_public_ip(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => is_public_ipv4(address),
+        IpAddr::V6(address) => {
+            if let Some(mapped) = address.to_ipv4_mapped() {
+                return is_public_ipv4(mapped);
+            }
+            !(address.is_loopback()
+                || address.is_unspecified()
+                || address.is_multicast()
+                || address.is_unicast_link_local()
+                || address.is_unique_local())
+        }
+    }
+}
+
+/// Returns true when one IPv4 address is public.
+fn is_public_ipv4(address: Ipv4Addr) -> bool {
+    !(address.is_loopback()
+        || address.is_private()
+        || address.is_link_local()
+        || address.is_unspecified()
+        || address.is_broadcast()
+        || address.is_multicast())
+}
+
 #[cfg(test)]
 mod tests {
+    use std::net::Ipv6Addr;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -670,6 +775,132 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_address_classifier_rejects_non_public_addresses() {
+        let rejected_ipv4 = [
+            "127.0.0.1",
+            "10.0.0.1",
+            "172.16.0.1",
+            "192.168.1.1",
+            "169.254.1.1",
+            "0.0.0.0",
+            "255.255.255.255",
+            "224.0.0.1",
+        ];
+        for raw in rejected_ipv4 {
+            let address: Ipv4Addr = raw.parse().unwrap();
+            assert!(!is_public_ip(address.into()), "{raw}");
+        }
+
+        let rejected_ipv6 = ["::1", "::", "fc00::1", "fe80::1", "ff02::1"];
+        for raw in rejected_ipv6 {
+            let address: Ipv6Addr = raw.parse().unwrap();
+            assert!(!is_public_ip(address.into()), "{raw}");
+        }
+    }
+
+    #[test]
+    fn the_address_classifier_accepts_public_addresses() {
+        let address: Ipv4Addr = "8.8.8.8".parse().unwrap();
+        assert!(is_public_ip(address.into()));
+
+        let address: Ipv6Addr = "2001:4860:4860::8888".parse().unwrap();
+        assert!(is_public_ip(address.into()));
+    }
+
+    #[test]
+    fn an_ipv4_mapped_private_address_is_rejected() {
+        let address: Ipv6Addr = "::ffff:192.168.1.1".parse().unwrap();
+        assert!(!is_public_ip(address.into()));
+
+        let address: Ipv6Addr = "::ffff:127.0.0.1".parse().unwrap();
+        assert!(!is_public_ip(address.into()));
+
+        let address: Ipv6Addr = "::ffff:8.8.8.8".parse().unwrap();
+        assert!(is_public_ip(address.into()));
+    }
+
+    #[tokio::test]
+    async fn the_resolver_keeps_the_url_host_and_port() {
+        let url = Url::parse("http://127.0.0.1:8080/hook").unwrap();
+
+        let (host, addresses) = resolve_webhook_target(&url, true).await.unwrap();
+
+        assert_eq!(host, "127.0.0.1");
+        assert!(addresses.contains(&"127.0.0.1:8080".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn the_resolver_rejects_a_private_address_by_default() {
+        let url = Url::parse("http://127.0.0.1:8080/hook").unwrap();
+
+        let error = resolve_webhook_target(&url, false).await.unwrap_err();
+
+        assert!(error.to_string().contains("private address"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn execute_rejects_a_private_address_by_default() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/hook"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let action = WebhookAction::new(vec![server.address().to_string()]);
+        let params = json!({"url": format!("{}/hook", server.uri())});
+
+        let error = action.execute(context(params, "evt-1")).await.unwrap_err();
+
+        assert!(error.to_string().contains("private address"), "{error}");
+        assert_eq!(server.received_requests().await.unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn execute_accepts_a_private_address_when_allowed() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/hook"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let action =
+            WebhookAction::new(vec![server.address().to_string()]).allow_private_hosts(true);
+        let params = json!({"url": format!("{}/hook", server.uri())});
+
+        action.execute(context(params, "evt-1")).await.unwrap();
+
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_handler_rejects_a_private_address_by_default() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/hook"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let queue = Arc::new(MemoryQueue::new());
+        let action = WebhookAction::new(vec![server.address().to_string()]).with_queue(
+            queue.clone(),
+            None,
+            5,
+        );
+        let params = json!({"url": format!("{}/hook", server.uri())});
+        action.execute(context(params, "evt-1")).await.unwrap();
+        let handler = action.job_handler();
+        let leased = queue
+            .reserve("test", 10, Duration::from_secs(30))
+            .await
+            .unwrap();
+
+        let error = handler.handle(&leased[0].job).await.unwrap_err();
+
+        assert!(error.to_string().contains("private address"), "{error}");
+        assert_eq!(server.received_requests().await.unwrap().len(), 0);
+    }
+
     #[tokio::test]
     async fn execute_posts_the_safe_payload_and_headers() {
         let server = MockServer::start().await;
@@ -678,7 +909,8 @@ mod tests {
             .respond_with(ResponseTemplate::new(204))
             .mount(&server)
             .await;
-        let action = WebhookAction::new(vec![server.address().to_string()]);
+        let action =
+            WebhookAction::new(vec![server.address().to_string()]).allow_private_hosts(true);
         let params = json!({"url": format!("{}/hook", server.uri())});
 
         action.execute(context(params, "evt-1")).await.unwrap();
@@ -736,7 +968,8 @@ mod tests {
             .respond_with(ResponseTemplate::new(500))
             .mount(&server)
             .await;
-        let action = WebhookAction::new(vec![server.address().to_string()]);
+        let action =
+            WebhookAction::new(vec![server.address().to_string()]).allow_private_hosts(true);
         let params = json!({"url": format!("{}/hook", server.uri())});
 
         assert!(action.execute(context(params, "evt-1")).await.is_err());
@@ -755,7 +988,8 @@ mod tests {
             .respond_with(ResponseTemplate::new(204))
             .mount(&server)
             .await;
-        let action = WebhookAction::new(vec![server.address().to_string()]);
+        let action =
+            WebhookAction::new(vec![server.address().to_string()]).allow_private_hosts(true);
         let params = json!({"url": format!("{}/hook", server.uri())});
 
         assert!(action.execute(context(params, "evt-1")).await.is_err());
@@ -839,11 +1073,9 @@ mod tests {
             .mount(&server)
             .await;
         let queue = Arc::new(MemoryQueue::new());
-        let action = WebhookAction::new(vec![server.address().to_string()]).with_queue(
-            queue.clone(),
-            Some(secret()),
-            5,
-        );
+        let action = WebhookAction::new(vec![server.address().to_string()])
+            .allow_private_hosts(true)
+            .with_queue(queue.clone(), Some(secret()), 5);
         let params = json!({"url": format!("{}/hook", server.uri())});
         action.execute(context(params, "evt-1")).await.unwrap();
         let handler = action.job_handler();
@@ -903,11 +1135,9 @@ mod tests {
             .mount(&server)
             .await;
         let queue = Arc::new(MemoryQueue::new());
-        let action = WebhookAction::new(vec![server.address().to_string()]).with_queue(
-            queue.clone(),
-            None,
-            5,
-        );
+        let action = WebhookAction::new(vec![server.address().to_string()])
+            .allow_private_hosts(true)
+            .with_queue(queue.clone(), None, 5);
         let params = json!({"url": format!("{}/hook", server.uri())});
         action.execute(context(params, "evt-1")).await.unwrap();
         let handler = action.job_handler();

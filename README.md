@@ -262,7 +262,7 @@ The durable rule store lives on OxKV and keeps an index for each trigger event a
 | `log` | Writes one log line with the rule and event identifiers. |
 | `webhook` | Posts one JSON event to an allowlisted host. |
 
-The webhook action uses a strict host allowlist. Each entry is a host or a `host:port` pair. The client follows no redirects. It accepts `http` only for a loopback host. When a signing secret is set, the action sends `X-Signature: sha256=<hex>` over the exact body bytes. The action can send directly or enqueue a durable `webhook.deliver` job. The queue retries a failed job up to `webhook_max_attempts` and then dead-letters it. The job idempotency key deduplicates one rule and one event. The receiver must deduplicate on the `X-Event-Id` header.
+The webhook action uses a strict host allowlist. Each entry is a host or a `host:port` pair. The client follows no redirects. It accepts `http` only for a loopback host. Before each request, the action resolves the host and rejects a non-public address unless `webhook_allow_private_hosts` is `true`. The action pins the resolved address to the HTTP client, and the URL keeps the host name for TLS certificate validation. When a signing secret is set, the action sends `X-Signature: sha256=<hex>` over the exact body bytes. The action can send directly or enqueue a durable `webhook.deliver` job. The queue retries a failed job up to `webhook_max_attempts` and then dead-letters it. The job idempotency key deduplicates one rule and one event. The receiver must deduplicate on the `X-Event-Id` header.
 
 The runtime also processes timers. A timestamp attribute with an index forms a time index. Each pass emits one timer event for each due timestamp value. A fired marker stops a duplicate event for the same entity, key, and value. A new timestamp value allows a new timer event.
 
@@ -614,8 +614,11 @@ The `[eav]` section controls the optional EAV runtime and the webhook action. `[
 | `webhook_allowed_hosts` | empty | Hosts that a webhook rule can call. Each entry is a host or a `host:port` pair. |
 | `webhook_signing_secret` | none | Optional HMAC-SHA256 secret of at least 32 bytes. When set, adds the `X-Signature` header. |
 | `webhook_max_attempts` | `5` | Maximum delivery attempts for one webhook job, from 1 to 20. |
+| `webhook_allow_private_hosts` | `false` | Allows webhook delivery to a private, loopback, or link-local address. The action still resolves and pins the address. |
 
 The webhook allowlist is empty by default. Every webhook rule is rejected until an operator adds a host. A webhook job that uses all of its attempts is dead-lettered.
+
+The webhook action resolves the host before each request. It rejects the request when any resolved address is not public. The action pins the resolved address to the HTTP client, so a second DNS answer cannot change the target. The URL keeps the host name, so TLS certificate validation stays in effect. Set `webhook_allow_private_hosts = true` only for an intentional internal webhook.
 
 ## Operations
 
