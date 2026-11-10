@@ -79,8 +79,13 @@
 //! rows.
 //! A write increments the counter in the transaction that writes the outbox
 //! row.
-//! A flush decrements the counter in the same write guard as the row delete.
+//! A flush deletes one row and decrements the counter in one transaction.
+//! The transaction commits both changes or neither change.
 //! The counter is always equal to the number of `outbox:` rows.
+//! One flush reads at most 100 rows at one time.
+//! A test build reads at most 2 rows at one time.
+//! A failed feed append stops the flush and changes no row and no counter.
+//! A failed transaction stops the flush and changes no row and no counter.
 //! When the counter key is absent, [`EntityStore::outbox_count`] scans the
 //! `outbox:` family one time and writes the exact count.
 //! The backfill runs at most once.
@@ -114,6 +119,14 @@ const OUTBOX_PREFIX: &str = "outbox:";
 /// The key does not start with [`OUTBOX_PREFIX`], so an outbox scan does not
 /// count it as a row.
 const OUTBOX_PENDING_KEY: &str = "outbox-meta:pending";
+
+/// Maximum number of outbox rows to read in one flush batch.
+#[cfg(not(test))]
+const OUTBOX_FLUSH_BATCH: usize = 100;
+
+/// Maximum number of outbox rows to read in one flush batch.
+#[cfg(test)]
+const OUTBOX_FLUSH_BATCH: usize = 2;
 
 /// Suffix for the metadata row of an entity.
 const META_SUFFIX: &str = ":meta";
@@ -425,6 +438,12 @@ pub struct EntityStore {
     /// The check is on by default.
     /// A host can turn it off for a store that holds legacy references.
     check_entity_refs: bool,
+    /// The number of outbox row deletes to fail in a test.
+    #[cfg(test)]
+    outbox_delete_failures: Arc<std::sync::atomic::AtomicUsize>,
+    /// The largest outbox batch that a flush read in a test.
+    #[cfg(test)]
+    outbox_batch_peak: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl EntityStore {
@@ -437,6 +456,10 @@ impl EntityStore {
             flush_lock: Arc::new(Mutex::new(())),
             feed: None,
             check_entity_refs: true,
+            #[cfg(test)]
+            outbox_delete_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            outbox_batch_peak: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -780,23 +803,29 @@ impl EntityStore {
         Ok(change)
     }
 
-    /// Delivers every pending outbox row to the change feed.
+    /// Delivers pending outbox rows to the change feed in batches.
     ///
     /// The call returns `Ok(0)` when no feed is configured.
     /// Before it reads the rows, the call ensures that the
     /// `outbox-meta:pending` counter exists.
     /// An old store without the counter gets the one-time backfill.
-    /// It reads the rows in key order.
-    /// For each row, it appends the event and then deletes the row.
-    /// It decrements the counter in the same write guard as the delete.
+    /// One batch reads at most 100 rows in key order.
+    /// A test build reads at most 2 rows.
+    /// For each row, the call appends the event to the feed.
+    /// The call then deletes the row and decrements the counter in one
+    /// transaction.
+    /// The transaction commits both changes or neither change.
     /// The counter never goes below zero.
-    /// It stops at the first append failure.
-    /// That row and every later row stay in the outbox.
+    /// The call stops when a batch returns zero rows.
+    /// A failed append stops the loop and returns the error.
+    /// The row and the counter stay unchanged.
+    /// A failed transaction stops the loop and returns the error.
+    /// The row and the counter stay unchanged.
     /// The call does not hold the store write guard during the append.
     ///
     /// The counter is equal to the number of `outbox:` rows.
     /// Delivery is at least once.
-    /// A crash after an append and before a delete can deliver one event
+    /// A crash after an append and before a commit can deliver one event
     /// again.
     /// A consumer must be idempotent.
     pub async fn flush_outbox(&self) -> Result<usize, EntityError> {
@@ -805,22 +834,51 @@ impl EntityStore {
         };
         let _flush = self.flush_lock.lock().await;
         self.ensure_outbox_pending().await?;
-        let rows = {
-            let g = self.store.read().await;
-            scan_prefix(&*g, OUTBOX_PREFIX).await?
-        };
         let mut delivered = 0;
-        for row in rows {
-            let event: EntityEvent = serde_json::from_slice(&row.value)
-                .map_err(|e| EntityError::Internal(format!("outbox event is invalid: {e}")))?;
-            feed.append(WalOp::Entity { event })
-                .await
-                .map_err(|_| EntityError::Feed("entity feed append failed".to_string()))?;
-            let g = self.store.write().await;
-            g.delete(&row.key).await.map_err(EntityError::Store)?;
-            decrement_outbox_pending(&*g, 1).await?;
-            drop(g);
-            delivered += 1;
+        loop {
+            let rows = {
+                let g = self.store.read().await;
+                scan_prefix_bounded(&*g, OUTBOX_PREFIX, OUTBOX_FLUSH_BATCH).await?
+            };
+            if rows.is_empty() {
+                break;
+            }
+            #[cfg(test)]
+            {
+                let peak = self
+                    .outbox_batch_peak
+                    .load(std::sync::atomic::Ordering::SeqCst);
+                if rows.len() > peak {
+                    self.outbox_batch_peak
+                        .store(rows.len(), std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+            for row in rows {
+                let event: EntityEvent = serde_json::from_slice(&row.value)
+                    .map_err(|e| EntityError::Internal(format!("outbox event is invalid: {e}")))?;
+                feed.append(WalOp::Entity { event })
+                    .await
+                    .map_err(|_| EntityError::Feed("entity feed append failed".to_string()))?;
+                let g = self.store.write().await;
+                let tx = g.begin_tx().map_err(EntityError::Store)?;
+                decrement_outbox_pending(&tx, 1).await?;
+                #[cfg(test)]
+                if self
+                    .outbox_delete_failures
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    > 0
+                {
+                    self.outbox_delete_failures
+                        .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    return Err(EntityError::Store(oxkv::StoreError::Other(
+                        "injected outbox delete failure".to_string(),
+                    )));
+                }
+                tx.delete(&row.key).await.map_err(EntityError::Store)?;
+                tx.commit().await.map_err(EntityError::Store)?;
+                drop(g);
+                delivered += 1;
+            }
         }
         Ok(delivered)
     }
@@ -3205,6 +3263,8 @@ mod tests {
     struct RecordingFeed {
         ops: std::sync::Mutex<Vec<WalOp>>,
         failures: std::sync::atomic::AtomicUsize,
+        attempts: std::sync::atomic::AtomicUsize,
+        fail_at: std::sync::atomic::AtomicUsize,
     }
 
     impl RecordingFeed {
@@ -3212,7 +3272,20 @@ mod tests {
             Self {
                 ops: std::sync::Mutex::new(Vec::new()),
                 failures: std::sync::atomic::AtomicUsize::new(0),
+                attempts: std::sync::atomic::AtomicUsize::new(0),
+                fail_at: std::sync::atomic::AtomicUsize::new(0),
             }
+        }
+
+        /// Makes the append that follows `successes` appends fail.
+        fn fail_after(&self, successes: usize) {
+            let next = self
+                .attempts
+                .load(std::sync::atomic::Ordering::SeqCst)
+                .saturating_add(successes)
+                .saturating_add(1);
+            self.fail_at
+                .store(next, std::sync::atomic::Ordering::SeqCst);
         }
 
         fn set_failing(&self, failing: bool) {
@@ -3245,6 +3318,13 @@ mod tests {
     #[async_trait::async_trait]
     impl ChangeSink for RecordingFeed {
         async fn append(&self, op: WalOp) -> anyhow::Result<()> {
+            let attempt = self
+                .attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                .saturating_add(1);
+            if self.fail_at.load(std::sync::atomic::Ordering::SeqCst) == attempt {
+                return Err(anyhow::anyhow!("feed down"));
+            }
             let remaining = self.failures.load(std::sync::atomic::Ordering::SeqCst);
             if remaining > 0 {
                 self.failures
@@ -5268,6 +5348,151 @@ mod tests {
         assert_eq!(store.flush_outbox().await.unwrap(), 3);
         assert_eq!(store.outbox_count().await.unwrap(), 0);
         assert_eq!(pending_counter(&raw).await, Some(0));
+    }
+
+    /// Builds a store with one pending outbox row for each id.
+    async fn outbox_store(ids: &[&str]) -> (EntityStore, Arc<RecordingFeed>, OxKvStore) {
+        let (store, registry, raw) = new_store().await;
+        registry
+            .publish(schema("person", &[], vec![]))
+            .await
+            .unwrap();
+        let feed = Arc::new(RecordingFeed::new());
+        feed.set_failing(true);
+        let store = store.with_change_sink(feed.clone());
+        for id in ids {
+            store
+                .create(draft(id, &["person"], vec![]), &ctx())
+                .await
+                .unwrap();
+        }
+        (store, feed, raw)
+    }
+
+    #[tokio::test]
+    async fn flush_outbox_delivers_five_rows_in_key_order_in_batches_of_two() {
+        let ids = ["e1", "e2", "e3", "e4", "e5"];
+        let (store, feed, raw) = outbox_store(&ids).await;
+        let keys = outbox_keys(&raw).await;
+        assert_eq!(keys.len(), 5);
+
+        feed.set_failing(false);
+        assert_eq!(store.flush_outbox().await.unwrap(), 5);
+
+        let events = feed.events();
+        let delivered: Vec<String> = events
+            .iter()
+            .map(|event| outbox_key(&event.event_id))
+            .collect();
+        assert_eq!(delivered, keys);
+        assert!(outbox_keys(&raw).await.is_empty());
+        assert_eq!(pending_counter(&raw).await, Some(0));
+    }
+
+    #[tokio::test]
+    async fn flush_outbox_delivers_every_row_across_more_than_one_batch() {
+        let ids = ["e1", "e2", "e3", "e4", "e5", "e6", "e7"];
+        let (store, feed, raw) = outbox_store(&ids).await;
+        let keys = outbox_keys(&raw).await;
+        assert_eq!(keys.len(), 7);
+
+        feed.set_failing(false);
+        assert_eq!(store.flush_outbox().await.unwrap(), 7);
+
+        let events = feed.events();
+        let delivered: Vec<String> = events
+            .iter()
+            .map(|event| outbox_key(&event.event_id))
+            .collect();
+        assert_eq!(delivered, keys);
+        assert!(outbox_keys(&raw).await.is_empty());
+        assert_eq!(pending_counter(&raw).await, Some(0));
+    }
+
+    #[tokio::test]
+    async fn a_feed_failure_on_the_second_row_keeps_later_rows() {
+        let ids = ["e1", "e2", "e3", "e4", "e5"];
+        let (store, feed, raw) = outbox_store(&ids).await;
+        let keys = outbox_keys(&raw).await;
+
+        feed.set_failing(false);
+        feed.fail_after(1);
+        let result = store.flush_outbox().await;
+
+        assert!(matches!(result, Err(EntityError::Feed(_))));
+        assert_eq!(feed.events().len(), 1);
+        assert_eq!(outbox_keys(&raw).await, keys[1..]);
+        assert_eq!(pending_counter(&raw).await, Some(4));
+    }
+
+    #[tokio::test]
+    async fn a_counter_write_failure_keeps_the_row_and_the_counter() {
+        use oxkv::Hooks as _;
+
+        struct RejectCounterKey;
+
+        #[async_trait::async_trait]
+        impl oxkv::Validator for RejectCounterKey {
+            async fn validate(
+                &self,
+                _ctx: &dyn oxkv::StoreView,
+                key: &str,
+                _value: &[u8],
+            ) -> Result<(), oxkv::StoreError> {
+                if key == OUTBOX_PENDING_KEY {
+                    return Err(oxkv::StoreError::Other("write rejected".to_string()));
+                }
+                Ok(())
+            }
+        }
+
+        let ids = ["e1", "e2"];
+        let (store, feed, raw) = outbox_store(&ids).await;
+        let keys = outbox_keys(&raw).await;
+
+        feed.set_failing(false);
+        raw.add_validator(RejectCounterKey);
+        let result = store.flush_outbox().await;
+
+        assert!(matches!(result, Err(EntityError::Store(_))));
+        assert_eq!(feed.events().len(), 1);
+        assert_eq!(outbox_keys(&raw).await, keys);
+        assert_eq!(pending_counter(&raw).await, Some(2));
+    }
+
+    #[tokio::test]
+    async fn a_delete_failure_keeps_the_row_and_the_counter() {
+        let ids = ["e1", "e2"];
+        let (store, feed, raw) = outbox_store(&ids).await;
+        let keys = outbox_keys(&raw).await;
+
+        feed.set_failing(false);
+        store
+            .outbox_delete_failures
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        let result = store.flush_outbox().await;
+
+        assert!(matches!(result, Err(EntityError::Store(_))));
+        assert_eq!(feed.events().len(), 1);
+        assert_eq!(outbox_keys(&raw).await, keys);
+        assert_eq!(pending_counter(&raw).await, Some(2));
+    }
+
+    #[tokio::test]
+    async fn flush_outbox_reads_at_most_two_rows_at_one_time() {
+        let ids = ["e1", "e2", "e3", "e4", "e5"];
+        let (store, feed, _raw) = outbox_store(&ids).await;
+
+        feed.set_failing(false);
+        assert_eq!(store.flush_outbox().await.unwrap(), 5);
+
+        assert_eq!(OUTBOX_FLUSH_BATCH, 2);
+        assert_eq!(
+            store
+                .outbox_batch_peak
+                .load(std::sync::atomic::Ordering::SeqCst),
+            OUTBOX_FLUSH_BATCH
+        );
     }
 
     #[tokio::test]
