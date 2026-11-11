@@ -1,9 +1,52 @@
-//! Sandboxed Rhai condition scripts.
+//! Sandboxed Rhai scripts.
 //!
-//! A script is a pure boolean expression.
+//! A condition script is a pure boolean expression.
 //! It reads the event, the optional entity, and the current time.
 //! It cannot read the store, write, call the network, read the clock, use
 //! random values, load files, or evaluate more code.
+//!
+//! An action script runs when a rule action has kind `script`.
+//! The action parameters hold the source: `{ "source": "<rhai>" }`.
+//! An action script also gets a `host` value.
+//! The host reads entities and stages create, update, and delete effects.
+//! Nothing commits during the script.
+//! The rule engine applies the staged effects and the execution marker in one
+//! transaction after the script returns.
+//!
+//! # Host methods
+//!
+//! - `host.get_entity(id)` returns a map or `()`.
+//! - `host.find(schema, key, value, limit)` returns an array of ids.
+//! - `host.find_by_schema(schema, limit)` returns an array of ids.
+//! - `host.create_entity(id, schemas, attributes)` stages a create.
+//! - `host.update_entity(id, expected_version, patch)` stages an update.
+//! - `host.delete_entity(id, expected_version)` stages a delete.
+//!
+//! A `()` value in an update patch removes the attribute.
+//! Any other patch value sets the attribute.
+//!
+//! One evaluation makes at most 50 host read calls and stages at most 100
+//! effects.
+//! The existing operation, call-depth, string, array, map, and source limits
+//! still apply.
+//!
+//! Reads see committed state only.
+//! A write that the script stages does not appear in a later read.
+//!
+//! The read capability set controls `get_entity` and both find methods.
+//! A denied `get_entity` returns `()`.
+//! A denied find returns the stable error `rule script read access denied`.
+//! The write capability set controls every staged write.
+//! A write outside the set returns the stable error
+//! `rule script write access denied`.
+//!
+//! The host has no function for HTTP, files, the clock, random values, or
+//! processes.
+//! A script that calls an unknown function fails at evaluation.
+//!
+//! A condition script has no `host` value.
+//! A condition that calls `host.get_entity` fails with an unknown-variable
+//! error.
 //!
 //! [`ScriptEngine`] holds one Rhai engine and a bounded compiled-AST cache.
 //! The cache is a speed aid, not a correctness requirement.
@@ -21,8 +64,8 @@
 //! stdout or the log.
 
 use std::cell::Cell;
-use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -32,14 +75,41 @@ use rhai::packages::{
     BasicMathPackage, BasicStringPackage, BitFieldPackage, LogicPackage, MoreStringPackage,
     Package,
 };
-use rhai::{AST, Dynamic, Engine, EvalAltResult, Map, Scope};
+use rhai::{AST, Array, Dynamic, Engine, EvalAltResult, Map, Position, Scope};
 use thiserror::Error;
+use tokio::runtime::Handle;
 
-use crate::eav::entity::Entity;
+use crate::eav::entity::{AttributeValue, Entity, EntityStore};
 use crate::records::{EntityEvent, EntityEventKind};
+use crate::rules::effect::{EntityEffect, MAX_EFFECTS};
+use crate::rules::script_host::{ScriptCapabilities, ScriptHostError, ScriptReadHost};
+
+/// The action kind of a script action.
+pub(crate) const SCRIPT_ACTION_KIND: &str = "script";
 
 /// The largest accepted script source, in bytes.
 pub(crate) const MAX_SOURCE_BYTES: usize = 8 * 1024;
+
+/// The largest number of host read calls in one action evaluation.
+pub(crate) const MAX_READ_CALLS: usize = 50;
+
+/// The stable message for a read limit failure.
+const READ_LIMIT_MESSAGE: &str = "rule script exceeded its read limit";
+
+/// The stable message for an effect limit failure.
+const EFFECT_LIMIT_MESSAGE: &str = "rule script exceeded its effect limit";
+
+/// The stable message for a denied find call.
+const READ_DENIED_MESSAGE: &str = "rule script read access denied";
+
+/// The stable message for a denied write call.
+const WRITE_DENIED_MESSAGE: &str = "rule script write access denied";
+
+/// The stable message for an invalid host argument.
+const INVALID_ARGUMENT_MESSAGE: &str = "rule script argument is not valid";
+
+/// The stable message for a failed store operation.
+const STORE_MESSAGE: &str = "rule script store operation failed";
 
 /// The largest number of compiled scripts in the cache.
 const CACHE_CAPACITY: usize = 256;
@@ -88,12 +158,38 @@ pub enum ScriptError {
     /// The script returned a value that is not a boolean.
     #[error("rule script did not return a boolean")]
     ReturnType,
-    /// The server disables condition scripts.
+    /// The server disables scripts.
     #[error("rule scripts are disabled")]
     Disabled,
     /// The script source is larger than 8 KiB.
     #[error("rule script source is larger than 8 KiB")]
     SourceTooLarge,
+    /// The script made more than 50 host read calls.
+    #[error("rule script exceeded its read limit")]
+    ReadLimit,
+    /// The script staged more than 100 effects.
+    #[error("rule script exceeded its effect limit")]
+    EffectLimit,
+    /// The script read a schema that its read capability does not allow.
+    #[error("rule script read access denied")]
+    ReadDenied,
+    /// The script wrote a schema that its write capability does not allow.
+    #[error("rule script write access denied")]
+    WriteDenied,
+}
+
+/// The owned inputs of one script action evaluation.
+///
+/// `event` is always present.
+/// `entity` is `None` for a deleted entity.
+/// `now` is a Unix timestamp in seconds.
+pub struct ScriptActionContext {
+    /// The event that started the rule.
+    pub event: EntityEvent,
+    /// The current entity, or `None` when the entity is absent.
+    pub entity: Option<Entity>,
+    /// The current Unix time in seconds.
+    pub now: i64,
 }
 
 /// The inputs of one script evaluation.
@@ -108,6 +204,271 @@ pub struct ScriptContext<'a> {
     pub entity: Option<&'a Entity>,
     /// The current Unix time in seconds.
     pub now: i64,
+}
+
+/// The mutable state of one script host.
+#[derive(Default)]
+struct HostState {
+    /// The number of read calls that the script made.
+    reads: usize,
+    /// The effects that the script staged.
+    effects: Vec<EntityEffect>,
+}
+
+/// The data API for one script action.
+///
+/// The host reads entities through [`ScriptReadHost`] and stages effects.
+/// It commits nothing.
+/// The rule engine applies the staged effects after the script returns.
+///
+/// One host belongs to one rule and one event.
+/// The host is `Clone`, `Send`, and `Sync`, because the Rhai engine uses the
+/// `sync` feature.
+#[derive(Clone)]
+pub struct ScriptHost {
+    /// The read-only host that enforces the read capability set.
+    read_host: ScriptReadHost,
+    /// The store that supplies the entity data.
+    entities: EntityStore,
+    /// The schema ids that the script may write.
+    write: BTreeSet<String>,
+    /// The staged effects and the read count.
+    state: Arc<Mutex<HostState>>,
+    /// The runtime handle for one blocking store call.
+    runtime: Handle,
+    /// The rule id for audit messages.
+    rule_id: String,
+    /// The event id for audit messages.
+    event_id: String,
+}
+
+impl ScriptHost {
+    /// Creates a host for one rule and one event.
+    ///
+    /// `read` holds the read capability set.
+    /// `write` holds the write capability set.
+    /// `runtime` is the handle of the async runtime.
+    /// The host calls `block_on` on that handle from a blocking thread.
+    pub fn new(
+        entities: EntityStore,
+        read: ScriptCapabilities,
+        write: Vec<String>,
+        rule_id: String,
+        event_id: String,
+        runtime: Handle,
+    ) -> Self {
+        Self {
+            read_host: ScriptReadHost::new(entities.clone(), read),
+            entities,
+            write: write.into_iter().collect(),
+            state: Arc::new(Mutex::new(HostState::default())),
+            runtime,
+            rule_id,
+            event_id,
+        }
+    }
+
+    /// Returns the effects that the script staged.
+    pub(crate) fn take_effects(&self) -> Vec<EntityEffect> {
+        std::mem::take(&mut self.lock_state().effects)
+    }
+
+    /// Returns one entity as a Rhai map or `()`.
+    ///
+    /// A denied read returns `()`, as
+    /// [`ScriptReadHost::get_entity`](crate::rules::script_host::ScriptReadHost::get_entity)
+    /// does.
+    /// A missing entity also returns `()`.
+    pub fn get_entity(&mut self, id: &str) -> Result<Dynamic, Box<EvalAltResult>> {
+        self.count_read()?;
+        match self.runtime.block_on(self.read_host.get_entity(id)) {
+            Ok(Some(entity)) => Ok(json_to_dynamic(&entity)),
+            Ok(None) => Ok(Dynamic::UNIT),
+            Err(error) => Err(self.map_read_error(error)),
+        }
+    }
+
+    /// Returns the ids that match one schema and one indexed attribute.
+    ///
+    /// A denied read returns the stable error
+    /// `rule script read access denied`.
+    pub fn find(
+        &mut self,
+        schema: &str,
+        key: &str,
+        value: Dynamic,
+        limit: i64,
+    ) -> Result<Dynamic, Box<EvalAltResult>> {
+        self.count_read()?;
+        let value = dynamic_to_json(&value).ok_or_else(|| host_error(INVALID_ARGUMENT_MESSAGE))?;
+        let limit = usize::try_from(limit).unwrap_or(0);
+        match self
+            .runtime
+            .block_on(self.read_host.find(schema, Some(key), Some(&value), limit))
+        {
+            Ok(ids) => Ok(ids_to_dynamic(ids)),
+            Err(error) => Err(self.map_read_error(error)),
+        }
+    }
+
+    /// Returns the ids of the entities that pin one schema.
+    ///
+    /// A denied read returns the stable error
+    /// `rule script read access denied`.
+    pub fn find_by_schema(
+        &mut self,
+        schema: &str,
+        limit: i64,
+    ) -> Result<Dynamic, Box<EvalAltResult>> {
+        self.count_read()?;
+        let limit = usize::try_from(limit).unwrap_or(0);
+        match self
+            .runtime
+            .block_on(self.read_host.find_by_schema(schema, limit))
+        {
+            Ok(ids) => Ok(ids_to_dynamic(ids)),
+            Err(error) => Err(self.map_read_error(error)),
+        }
+    }
+
+    /// Stages one create.
+    ///
+    /// Every schema id must be in the write capability set.
+    /// The call reads no entity and commits nothing.
+    pub fn create_entity(
+        &mut self,
+        id: &str,
+        schemas: Array,
+        attributes: Map,
+    ) -> Result<(), Box<EvalAltResult>> {
+        let schemas =
+            strings_from_array(&schemas).ok_or_else(|| host_error(INVALID_ARGUMENT_MESSAGE))?;
+        if schemas.is_empty() {
+            return Err(host_error(INVALID_ARGUMENT_MESSAGE));
+        }
+        if schemas.iter().any(|schema| !self.write.contains(schema)) {
+            return Err(host_error(WRITE_DENIED_MESSAGE));
+        }
+        let attributes = attributes_from_map(&attributes)?;
+        self.stage(EntityEffect::Create {
+            id: id.to_string(),
+            schemas,
+            attributes,
+        })
+    }
+
+    /// Stages one update.
+    ///
+    /// The call reads the entity to check that at least one pinned schema is in
+    /// the write capability set.
+    /// The call commits nothing.
+    pub fn update_entity(
+        &mut self,
+        id: &str,
+        expected_version: i64,
+        patch: Map,
+    ) -> Result<(), Box<EvalAltResult>> {
+        let expected_version =
+            u64::try_from(expected_version).map_err(|_| host_error(INVALID_ARGUMENT_MESSAGE))?;
+        self.require_write(id)?;
+        let attributes = patch_from_map(&patch)?;
+        self.stage(EntityEffect::Update {
+            id: id.to_string(),
+            expected_version,
+            attributes,
+        })
+    }
+
+    /// Stages one delete.
+    ///
+    /// The call reads the entity to check that at least one pinned schema is in
+    /// the write capability set.
+    /// The call commits nothing.
+    pub fn delete_entity(
+        &mut self,
+        id: &str,
+        expected_version: i64,
+    ) -> Result<(), Box<EvalAltResult>> {
+        let expected_version =
+            u64::try_from(expected_version).map_err(|_| host_error(INVALID_ARGUMENT_MESSAGE))?;
+        self.require_write(id)?;
+        self.stage(EntityEffect::Delete {
+            id: id.to_string(),
+            expected_version,
+            force: false,
+        })
+    }
+
+    /// Counts one read call and rejects a call above the read limit.
+    fn count_read(&self) -> Result<(), Box<EvalAltResult>> {
+        let mut state = self.lock_state();
+        if state.reads >= MAX_READ_CALLS {
+            return Err(host_error(READ_LIMIT_MESSAGE));
+        }
+        state.reads += 1;
+        Ok(())
+    }
+
+    /// Stages one effect and rejects an effect above the effect limit.
+    fn stage(&self, effect: EntityEffect) -> Result<(), Box<EvalAltResult>> {
+        let mut state = self.lock_state();
+        if state.effects.len() >= MAX_EFFECTS {
+            return Err(host_error(EFFECT_LIMIT_MESSAGE));
+        }
+        state.effects.push(effect);
+        Ok(())
+    }
+
+    /// Checks that the entity pins at least one schema in the write set.
+    ///
+    /// The call reads committed state only.
+    /// A missing entity is a denied write, because no pinned schema can allow
+    /// it.
+    fn require_write(&self, id: &str) -> Result<(), Box<EvalAltResult>> {
+        let entity = match self.runtime.block_on(self.entities.get(id)) {
+            Ok(Some(entity)) => entity,
+            Ok(None) => return Err(host_error(WRITE_DENIED_MESSAGE)),
+            Err(error) => {
+                tracing::warn!(
+                    rule_id = %self.rule_id,
+                    event_id = %self.event_id,
+                    error = %error,
+                    "script host store read failed"
+                );
+                return Err(host_error(STORE_MESSAGE));
+            }
+        };
+        if entity
+            .schemas
+            .iter()
+            .any(|schema| self.write.contains(&schema.id))
+        {
+            Ok(())
+        } else {
+            Err(host_error(WRITE_DENIED_MESSAGE))
+        }
+    }
+
+    /// Maps one read host error to a stable Rhai error.
+    fn map_read_error(&self, error: ScriptHostError) -> Box<EvalAltResult> {
+        match error {
+            ScriptHostError::Denied => host_error(READ_DENIED_MESSAGE),
+            ScriptHostError::Invalid(message) => host_error(&message),
+            ScriptHostError::Store(_) => {
+                tracing::warn!(
+                    rule_id = %self.rule_id,
+                    event_id = %self.event_id,
+                    "script host store read failed"
+                );
+                host_error(STORE_MESSAGE)
+            }
+        }
+    }
+
+    /// Locks the host state and recovers from a poisoned lock.
+    fn lock_state(&self) -> MutexGuard<'_, HostState> {
+        self.state.lock().unwrap_or_else(|error| error.into_inner())
+    }
 }
 
 /// A cached compiled script.
@@ -176,6 +537,16 @@ impl ScriptEngine {
             });
             expired.then(|| Dynamic::from("rule script exceeded its execution budget"))
         });
+        // Register the action host one time.
+        // A condition script has no `host` value, so these methods are
+        // unreachable from a condition.
+        engine.register_type_with_name::<ScriptHost>("Host");
+        engine.register_fn("get_entity", ScriptHost::get_entity);
+        engine.register_fn("find", ScriptHost::find);
+        engine.register_fn("find_by_schema", ScriptHost::find_by_schema);
+        engine.register_fn("create_entity", ScriptHost::create_entity);
+        engine.register_fn("update_entity", ScriptHost::update_entity);
+        engine.register_fn("delete_entity", ScriptHost::delete_entity);
         Self {
             engine: Arc::new(engine),
             cache: Arc::new(Mutex::new(HashMap::new())),
@@ -216,6 +587,43 @@ impl ScriptEngine {
 
         match result {
             Ok(value) => value.as_bool().map_err(|_| ScriptError::ReturnType),
+            Err(error) => Err(classify(&error)),
+        }
+    }
+
+    /// Evaluates one action script and returns its staged effects.
+    ///
+    /// The call compiles the script on a cache miss.
+    /// It pushes the event, the optional entity, the time, and the `host`.
+    /// A condition script never gets the `host`.
+    /// Any script failure returns a sanitized [`ScriptError`].
+    /// The call commits nothing.
+    /// The caller applies the effects and the execution marker in one
+    /// transaction.
+    ///
+    /// The caller must run this call on a blocking thread.
+    /// A host method calls `block_on` on the runtime handle, so a call on an
+    /// async worker thread would block the reactor.
+    pub fn eval_action(
+        &self,
+        source: &str,
+        ctx: &ScriptActionContext,
+        host: ScriptHost,
+    ) -> Result<Vec<EntityEffect>, ScriptError> {
+        let ast = self.ast_for(source)?;
+        let staged = host.clone();
+        let mut scope = Scope::new();
+        scope.push_constant("event", event_map(&ctx.event));
+        scope.push_constant("entity", entity_value(ctx.entity.as_ref()));
+        scope.push_constant("now", ctx.now);
+        scope.push("host", host);
+
+        EVAL_DEADLINE.with(|deadline| deadline.set(Some(Instant::now() + WALL_TIME_GUARD)));
+        let result = self.engine.eval_ast_with_scope::<Dynamic>(&mut scope, &ast);
+        EVAL_DEADLINE.with(|deadline| deadline.set(None));
+
+        match result {
+            Ok(_) => Ok(staged.take_effects()),
             Err(error) => Err(classify(&error)),
         }
     }
@@ -292,8 +700,122 @@ fn classify(error: &EvalAltResult) -> ScriptError {
         | EvalAltResult::ErrorTerminated(_, _) => ScriptError::Budget,
         EvalAltResult::ErrorInFunctionCall(_, _, inner, _)
         | EvalAltResult::ErrorInModule(_, inner, _) => classify(inner),
+        EvalAltResult::ErrorRuntime(value, _) => match value.clone().into_string() {
+            Ok(message) if message == READ_LIMIT_MESSAGE => ScriptError::ReadLimit,
+            Ok(message) if message == EFFECT_LIMIT_MESSAGE => ScriptError::EffectLimit,
+            Ok(message) if message == READ_DENIED_MESSAGE => ScriptError::ReadDenied,
+            Ok(message) if message == WRITE_DENIED_MESSAGE => ScriptError::WriteDenied,
+            _ => ScriptError::Runtime,
+        },
         _ => ScriptError::Runtime,
     }
+}
+
+/// Returns one stable Rhai runtime error.
+fn host_error(message: &str) -> Box<EvalAltResult> {
+    EvalAltResult::ErrorRuntime(Dynamic::from(message.to_string()), Position::NONE).into()
+}
+
+/// Converts one Rhai array of strings into a string list.
+fn strings_from_array(array: &Array) -> Option<Vec<String>> {
+    array
+        .iter()
+        .map(|item| item.clone().into_string().ok())
+        .collect()
+}
+
+/// Converts one Rhai map into entity attributes.
+///
+/// A plain string becomes a string attribute.
+/// A boolean becomes a boolean attribute.
+/// An integer becomes an integer attribute.
+/// A float becomes a float attribute.
+/// An array, an object, or `()` becomes a JSON attribute.
+fn attributes_from_map(map: &Map) -> Result<BTreeMap<String, AttributeValue>, Box<EvalAltResult>> {
+    let mut attributes = BTreeMap::new();
+    for (key, value) in map {
+        let json = dynamic_to_json(value).ok_or_else(|| host_error(INVALID_ARGUMENT_MESSAGE))?;
+        attributes.insert(key.to_string(), json_to_attribute(json));
+    }
+    Ok(attributes)
+}
+
+/// Converts one Rhai map into an update patch.
+///
+/// A `()` value removes the attribute.
+/// Any other value sets the attribute.
+fn patch_from_map(
+    map: &Map,
+) -> Result<BTreeMap<String, Option<AttributeValue>>, Box<EvalAltResult>> {
+    let mut attributes = BTreeMap::new();
+    for (key, value) in map {
+        let value = if value.is_unit() {
+            None
+        } else {
+            let json =
+                dynamic_to_json(value).ok_or_else(|| host_error(INVALID_ARGUMENT_MESSAGE))?;
+            Some(json_to_attribute(json))
+        };
+        attributes.insert(key.to_string(), value);
+    }
+    Ok(attributes)
+}
+
+/// Converts one Rhai value into a plain JSON value.
+fn dynamic_to_json(value: &Dynamic) -> Option<serde_json::Value> {
+    if value.is_unit() {
+        return Some(serde_json::Value::Null);
+    }
+    if let Ok(value) = value.as_bool() {
+        return Some(serde_json::Value::Bool(value));
+    }
+    if let Ok(value) = value.as_int() {
+        return Some(serde_json::Value::Number(value.into()));
+    }
+    if let Ok(value) = value.as_float() {
+        return serde_json::Number::from_f64(value).map(serde_json::Value::Number);
+    }
+    if let Ok(value) = value.clone().into_string() {
+        return Some(serde_json::Value::String(value));
+    }
+    if let Some(array) = value.clone().try_cast::<Array>() {
+        let mut values = Vec::with_capacity(array.len());
+        for item in &array {
+            values.push(dynamic_to_json(item)?);
+        }
+        return Some(serde_json::Value::Array(values));
+    }
+    if let Some(map) = value.clone().try_cast::<Map>() {
+        let mut object = serde_json::Map::new();
+        for (key, item) in &map {
+            object.insert(key.to_string(), dynamic_to_json(item)?);
+        }
+        return Some(serde_json::Value::Object(object));
+    }
+    None
+}
+
+/// Converts one plain JSON value into an attribute value.
+fn json_to_attribute(value: serde_json::Value) -> AttributeValue {
+    match value {
+        serde_json::Value::String(value) => AttributeValue::String(value),
+        serde_json::Value::Bool(value) => AttributeValue::Boolean(value),
+        serde_json::Value::Number(number) => {
+            if let Some(value) = number.as_i64() {
+                AttributeValue::Integer(value)
+            } else if let Some(value) = number.as_f64() {
+                AttributeValue::Float(value)
+            } else {
+                AttributeValue::Json(serde_json::Value::Number(number))
+            }
+        }
+        other => AttributeValue::Json(other),
+    }
+}
+
+/// Converts one id list into a Rhai array.
+fn ids_to_dynamic(ids: Vec<String>) -> Dynamic {
+    Dynamic::from_array(ids.into_iter().map(Dynamic::from).collect())
 }
 
 /// Returns the Rhai map for one event.
@@ -424,13 +946,109 @@ fn json_to_dynamic(value: &serde_json::Value) -> Dynamic {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::eav::entity::AttributeValue;
-    use crate::eav::schema::SchemaRef;
+    use crate::db::{build_test_store, test_prefix};
+    use crate::eav::entity::{AttributeValue, EntityDraft, WriteContext};
+    use crate::eav::schema::{AttributeDef, AttributeType, SchemaDraft, SchemaRef, SchemaRegistry};
     use crate::records::AttributeChange;
     use std::collections::BTreeMap;
 
     fn engine() -> ScriptEngine {
         ScriptEngine::new(true)
+    }
+
+    fn attr(name: &str, ty: AttributeType, indexed: bool) -> AttributeDef {
+        AttributeDef {
+            name: name.to_string(),
+            ty,
+            required: false,
+            indexed,
+            unique: false,
+            default: None,
+        }
+    }
+
+    fn schema(id: &str, attrs: Vec<AttributeDef>) -> SchemaDraft {
+        SchemaDraft {
+            id: id.to_string(),
+            extends: Vec::new(),
+            attributes: attrs.into_iter().map(|a| (a.name.clone(), a)).collect(),
+        }
+    }
+
+    /// Builds one action host and its store.
+    ///
+    /// The store has a `task` schema and a `secret` schema.
+    async fn action_host(read: &[&str], write: &[&str]) -> (ScriptHost, EntityStore) {
+        let registry =
+            SchemaRegistry::new(build_test_store(&test_prefix("script-action-schema")).await);
+        let raw = build_test_store(&test_prefix("script-action")).await;
+        let store = EntityStore::new(raw, registry.clone());
+        registry
+            .publish(schema(
+                "task",
+                vec![
+                    attr("status", AttributeType::String, true),
+                    attr("total", AttributeType::Integer, true),
+                ],
+            ))
+            .await
+            .unwrap();
+        registry
+            .publish(schema(
+                "secret",
+                vec![attr("code", AttributeType::String, true)],
+            ))
+            .await
+            .unwrap();
+        let host = ScriptHost::new(
+            store.clone(),
+            ScriptCapabilities::new(read.iter().copied()).unwrap(),
+            write.iter().map(|schema| (*schema).to_string()).collect(),
+            "rule-1".to_string(),
+            "evt-1".to_string(),
+            Handle::current(),
+        );
+        (host, store)
+    }
+
+    async fn create_task(store: &EntityStore, id: &str, status: &str, total: i64) {
+        store
+            .create(
+                EntityDraft {
+                    id: id.to_string(),
+                    schemas: vec!["task".to_string()],
+                    attributes: BTreeMap::from([
+                        (
+                            "status".to_string(),
+                            AttributeValue::String(status.to_string()),
+                        ),
+                        ("total".to_string(), AttributeValue::Integer(total)),
+                    ]),
+                },
+                &WriteContext::new("tester"),
+            )
+            .await
+            .unwrap();
+    }
+
+    /// Runs one action script on a blocking thread, as the engine does.
+    async fn eval_action(
+        subject: &ScriptEngine,
+        host: ScriptHost,
+        source: &str,
+        event: &EntityEvent,
+        entity: Option<&Entity>,
+    ) -> Result<Vec<EntityEffect>, ScriptError> {
+        let subject = subject.clone();
+        let source = source.to_string();
+        let ctx = ScriptActionContext {
+            event: event.clone(),
+            entity: entity.cloned(),
+            now: 1_700_000_100,
+        };
+        tokio::task::spawn_blocking(move || subject.eval_action(&source, &ctx, host))
+            .await
+            .expect("the blocking evaluation must finish")
     }
 
     fn entity(attributes: Vec<(&str, AttributeValue)>) -> Entity {
@@ -706,5 +1324,217 @@ mod tests {
         let subject = engine();
         let source = " ".repeat(MAX_SOURCE_BYTES + 1);
         assert_eq!(subject.compile(&source), Err(ScriptError::SourceTooLarge));
+    }
+
+    #[tokio::test]
+    async fn an_action_script_reads_an_allowed_entity() {
+        let subject = engine();
+        let (host, store) = action_host(&["task"], &[]).await;
+        create_task(&store, "e1", "open", 10).await;
+        let ev = event(EntityEventKind::Created, Vec::new());
+
+        let effects = eval_action(
+            &subject,
+            host,
+            r#"let t = host.get_entity("e1"); if t == () { throw "missing"; } t.attributes.total == 10"#,
+            &ev,
+            None,
+        )
+        .await;
+
+        assert_eq!(effects, Ok(Vec::new()));
+    }
+
+    #[tokio::test]
+    async fn the_find_methods_return_ids_in_order() {
+        let subject = engine();
+        let (host, store) = action_host(&["task"], &[]).await;
+        create_task(&store, "a", "open", 1).await;
+        create_task(&store, "b", "open", 2).await;
+        let ev = event(EntityEventKind::Created, Vec::new());
+
+        let effects = eval_action(
+            &subject,
+            host,
+            r#"let all = host.find_by_schema("task", 10); if all.len() != 2 || all[0] != "a" || all[1] != "b" { throw "bad schema find"; } let open = host.find("task", "status", "open", 10); if open.len() != 2 || open[0] != "a" || open[1] != "b" { throw "bad attribute find"; }"#,
+            &ev,
+            None,
+        )
+        .await;
+
+        assert_eq!(effects, Ok(Vec::new()));
+    }
+
+    #[tokio::test]
+    async fn a_denied_get_entity_returns_unit() {
+        let subject = engine();
+        let (host, store) = action_host(&["secret"], &[]).await;
+        create_task(&store, "e1", "open", 10).await;
+        let ev = event(EntityEventKind::Created, Vec::new());
+
+        let effects = eval_action(
+            &subject,
+            host,
+            r#"if host.get_entity("e1") != () { throw "denied read did not return unit"; }"#,
+            &ev,
+            None,
+        )
+        .await;
+
+        assert_eq!(effects, Ok(Vec::new()));
+    }
+
+    #[tokio::test]
+    async fn a_denied_find_returns_the_read_denied_error() {
+        let subject = engine();
+        let (host, store) = action_host(&["secret"], &[]).await;
+        create_task(&store, "e1", "open", 10).await;
+        let ev = event(EntityEventKind::Created, Vec::new());
+
+        let result = eval_action(
+            &subject,
+            host,
+            r#"host.find("task", "status", "open", 10)"#,
+            &ev,
+            None,
+        )
+        .await;
+
+        assert_eq!(result, Err(ScriptError::ReadDenied));
+    }
+
+    #[tokio::test]
+    async fn a_create_outside_the_write_set_is_denied() {
+        let subject = engine();
+        let (host, _store) = action_host(&["task"], &["secret"]).await;
+        let ev = event(EntityEventKind::Created, Vec::new());
+
+        let result = eval_action(
+            &subject,
+            host,
+            r#"host.create_entity("new", ["task"], #{ status: "open", total: 1 })"#,
+            &ev,
+            None,
+        )
+        .await;
+
+        assert_eq!(result, Err(ScriptError::WriteDenied));
+    }
+
+    #[tokio::test]
+    async fn an_update_outside_the_write_set_is_denied() {
+        let subject = engine();
+        let (host, store) = action_host(&["task"], &["secret"]).await;
+        create_task(&store, "e1", "open", 10).await;
+        let ev = event(EntityEventKind::Created, Vec::new());
+
+        let result = eval_action(
+            &subject,
+            host,
+            r#"host.update_entity("e1", 1, #{ status: "done" })"#,
+            &ev,
+            None,
+        )
+        .await;
+
+        assert_eq!(result, Err(ScriptError::WriteDenied));
+    }
+
+    #[tokio::test]
+    async fn a_delete_outside_the_write_set_is_denied() {
+        let subject = engine();
+        let (host, store) = action_host(&["task"], &["secret"]).await;
+        create_task(&store, "e1", "open", 10).await;
+        let ev = event(EntityEventKind::Created, Vec::new());
+
+        let result = eval_action(&subject, host, r#"host.delete_entity("e1", 1)"#, &ev, None).await;
+
+        assert_eq!(result, Err(ScriptError::WriteDenied));
+    }
+
+    #[tokio::test]
+    async fn staged_writes_are_not_visible_to_a_later_read() {
+        let subject = engine();
+        let (host, _store) = action_host(&["task"], &["task"]).await;
+        let ev = event(EntityEventKind::Created, Vec::new());
+
+        let effects = eval_action(
+            &subject,
+            host,
+            r#"host.create_entity("new", ["task"], #{ status: "open", total: 1 }); if host.get_entity("new") != () { throw "staged write is visible"; }"#,
+            &ev,
+            None,
+        )
+        .await
+        .expect("the script must finish");
+
+        assert_eq!(effects.len(), 1);
+        assert!(matches!(effects[0], EntityEffect::Create { .. }));
+    }
+
+    #[tokio::test]
+    async fn the_read_limit_stops_the_fifty_first_call() {
+        let subject = engine();
+        let (host, store) = action_host(&["task"], &[]).await;
+        create_task(&store, "e1", "open", 10).await;
+        let ev = event(EntityEventKind::Created, Vec::new());
+
+        let result = eval_action(
+            &subject,
+            host,
+            r#"let i = 0; while i < 51 { host.get_entity("e1"); i += 1; }"#,
+            &ev,
+            None,
+        )
+        .await;
+
+        assert_eq!(result, Err(ScriptError::ReadLimit));
+    }
+
+    #[tokio::test]
+    async fn the_effect_limit_stops_the_hundred_and_first_effect() {
+        let subject = engine();
+        let (host, _store) = action_host(&[], &["task"]).await;
+        let ev = event(EntityEventKind::Created, Vec::new());
+
+        let result = eval_action(
+            &subject,
+            host,
+            r#"let i = 0; while i < 101 { host.create_entity("x", ["task"], #{ status: "open", total: 1 }); i += 1; }"#,
+            &ev,
+            None,
+        )
+        .await;
+
+        assert_eq!(result, Err(ScriptError::EffectLimit));
+    }
+
+    #[test]
+    fn a_condition_script_cannot_reach_the_host() {
+        let subject = engine();
+        let ev = event(EntityEventKind::Created, Vec::new());
+        let ctx = context(&ev, None);
+
+        let result = subject.eval_bool(r#"host.get_entity("e1") == ()"#, &ctx);
+
+        assert_eq!(result, Err(ScriptError::Runtime));
+    }
+
+    #[tokio::test]
+    async fn an_http_function_name_is_unknown() {
+        let subject = engine();
+        let (host, _store) = action_host(&[], &[]).await;
+        let ev = event(EntityEventKind::Created, Vec::new());
+
+        let result = eval_action(
+            &subject,
+            host,
+            r#"http_get("https://example.test")"#,
+            &ev,
+            None,
+        )
+        .await;
+
+        assert_eq!(result, Err(ScriptError::Runtime));
     }
 }

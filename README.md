@@ -318,13 +318,52 @@ event.kind == "updated" && entity.attributes.status == "urgent"
 
 The engine limits the source to 8 KiB. One evaluation has at most 10,000 operations, 16 call levels, a 64 KiB string, a 1,000 element array, and a 1,000 entry map. A 50 ms wall-time guard is a last-resort safety net. The operation limit is the deterministic budget.
 
-A script cannot read the store, write, call the network, read the clock, use random values, load files, or evaluate more code. The engine disables `eval` and `import`. It replaces `print` and `debug` with no-ops, so a script cannot flood stdout or the log. The compiled-script cache holds at most 256 entries. It is a speed aid only.
+A condition script cannot read the store, write, call the network, read the clock, use random values, load files, or evaluate more code. The engine disables `eval` and `import`. It replaces `print` and `debug` with no-ops, so a script cannot flood stdout or the log. The compiled-script cache holds at most 256 entries. It is a speed aid only.
+
+#### Script actions
+
+An action of kind `script` runs a sandboxed Rhai script against the entity store. The action parameters hold the source:
+
+```json
+{ "kind": "script", "params": { "source": "<rhai>" } }
+```
+
+The source must be a non-empty string of at most 8 KiB. It must compile. An unknown parameter key is invalid. The error never repeats the source.
+
+The script gets the same `event`, `entity`, and `now` values as a condition script, plus a `host` value. The host reads entities and stages create, update, and delete effects. Nothing commits during the script.
+
+```rhai
+let t = host.get_entity("task-1");
+if t != () {
+    host.update_entity("task-1", t.version, #{ status: "done" });
+}
+```
+
+The host methods are:
+
+- `host.get_entity(id)` returns a map or `()`.
+- `host.find(schema, key, value, limit)` returns an array of ids.
+- `host.find_by_schema(schema, limit)` returns an array of ids.
+- `host.create_entity(id, schemas, attributes)` stages a create.
+- `host.update_entity(id, expected_version, patch)` stages an update.
+- `host.delete_entity(id, expected_version)` stages a delete.
+
+A `()` value in an update patch removes the attribute. Any other patch value sets the attribute.
+
+One evaluation makes at most 50 host read calls and stages at most 100 effects. The operation, call-depth, string, array, map, and source limits still apply. Reads see committed state only. A write that the script stages does not appear in a later read.
+
+The `read` capability list controls the read methods. A denied `get_entity` returns `()`. A denied find returns the stable error `rule script read access denied`. The `write` capability list controls every staged write. A create needs every schema in the write set. An update or a delete needs at least one pinned schema in the write set. A write outside the set returns the stable error `rule script write access denied`.
+
+After the script returns, the engine applies the staged effects and the execution marker in one transaction. A script error or an effect error writes no marker and no effect. A successful script with no effects still writes the marker. The script path does not call `mark_executed` a second time.
+
+The host has no function for HTTP, files, the clock, random values, or processes. A script that calls an unknown function fails at evaluation. A condition script has no `host` value.
 
 | Action | Effect |
 |---|---|
 | `noop` | Changes no state. Use it in tests and dry runs. |
 | `log` | Writes one log line with the rule and event identifiers. |
 | `webhook` | Posts one JSON event to an allowlisted host. |
+| `script` | Runs a sandboxed Rhai script against the entity store. |
 
 The webhook action uses a strict host allowlist. Each entry is a host or a `host:port` pair. The client follows no redirects. It accepts `http` only for a loopback host. Rule validation rejects a URL that the delivery path would reject for a static reason. It rejects a non-public literal address unless `webhook_allow_private_hosts` is `true`. It rejects `http` for a non-loopback host. Validation does not do a DNS lookup. Before each request, the action resolves the host and rejects an address that is not global unless `webhook_allow_private_hosts` is `true`. The rejected IPv4 ranges are loopback, private, link-local, carrier-grade NAT, IETF assignment, 6to4 relay, benchmarking, documentation, and reserved. The rejected IPv6 ranges are loopback, link-local, unique-local, 6to4, Teredo, NAT64, documentation, discard-only, and ORCHID. The action pins the resolved address to the HTTP client, and the URL keeps the host name for TLS certificate validation. When a signing secret is set, the action sends `X-Signature: sha256=<hex>` over the exact body bytes. The action can send directly or enqueue a durable `webhook.deliver` job. The queue retries a failed job up to `webhook_max_attempts` and then dead-letters it. The job idempotency key deduplicates one rule and one event. The receiver must deduplicate on the `X-Event-Id` header.
 
