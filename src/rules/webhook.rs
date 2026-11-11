@@ -11,9 +11,17 @@
 //! A strict host allowlist limits the destinations.
 //! The client follows no redirects.
 //! The action resolves the URL host before each request.
-//! It rejects a host when any address is not public.
+//! It rejects a host when any address is not global.
+//! The rejected IPv4 ranges are loopback, private, link-local, carrier-grade
+//! NAT, IETF assignment, 6to4 relay, benchmarking, documentation, and
+//! reserved.
+//! The rejected IPv6 ranges are loopback, link-local, unique-local, 6to4,
+//! Teredo, NAT64, documentation, discard-only, and ORCHID.
 //! An operator can permit a private address with
 //! `[eav].webhook_allow_private_hosts`.
+//! Rule validation also rejects a URL that the delivery path would reject
+//! for a static reason.
+//! It checks a literal address and the scheme without a DNS lookup.
 //! The action pins the resolved address to the HTTP client.
 //! A second DNS answer cannot change the target.
 //! The client keeps the original host name for TLS certificate validation.
@@ -22,7 +30,7 @@
 //! The action cannot stop that host from reading the payload.
 
 use std::collections::BTreeMap;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -160,15 +168,18 @@ impl RuleAction for WebhookAction {
     /// The call accepts `http` and `https`.
     /// It accepts `http` only for a loopback host in the allowlist.
     /// It rejects user information, a missing host, a fragment, a long URL,
-    /// and a host that is not in the allowlist.
+    /// a non-public literal address, and a host that is not in the allowlist.
+    /// It does not resolve the host.
     fn validate(&self, params: &serde_json::Value) -> Result<(), anyhow::Error> {
         let url = url_from_params(params)?;
-        validate_url(&url, &self.allowed_hosts)
+        validate_url(&url, &self.allowed_hosts, self.allow_private_hosts)
     }
 
     async fn execute(&self, ctx: ActionContext) -> Result<(), anyhow::Error> {
-        self.validate(&ctx.params)?;
         let url = url_from_params(&ctx.params)?;
+        // The delivery path applies the address policy.
+        // This early check keeps the scheme and the allowlist rules.
+        validate_url(&url, &self.allowed_hosts, true)?;
         let payload = WebhookPayload {
             rule_id: &ctx.rule.id,
             event_id: &ctx.event.event_id,
@@ -299,7 +310,7 @@ impl WebhookJobHandler {
             .map_err(|_| anyhow::anyhow!("webhook job payload is not valid"))?;
         let url = Url::parse(&envelope.url)
             .map_err(|_| anyhow::anyhow!("webhook job URL is not valid"))?;
-        validate_url(&url, &self.allowed_hosts)?;
+        validate_url(&url, &self.allowed_hosts, self.allow_private_hosts)?;
         let event_id = envelope
             .body
             .get("event_id")
@@ -434,8 +445,13 @@ fn signature_header(secret: &[u8], body: &[u8]) -> Result<String, anyhow::Error>
 /// The call accepts `http` and `https`.
 /// It accepts `http` only for a loopback host in the allowlist.
 /// It rejects user information, a missing host, a fragment, a long URL,
-/// and a host that is not in the allowlist.
-fn validate_url(url: &Url, allowed_hosts: &[AllowedHost]) -> Result<(), anyhow::Error> {
+/// a non-public literal address, and a host that is not in the allowlist.
+/// The call does not resolve the host. It stays offline and synchronous.
+fn validate_url(
+    url: &Url,
+    allowed_hosts: &[AllowedHost],
+    allow_private_hosts: bool,
+) -> Result<(), anyhow::Error> {
     if url.scheme() != "http" && url.scheme() != "https" {
         bail!("webhook URL must use http or https");
     }
@@ -449,6 +465,12 @@ fn validate_url(url: &Url, allowed_hosts: &[AllowedHost]) -> Result<(), anyhow::
         bail!("webhook URL must not contain a fragment");
     }
     let host = normalize_host(host);
+    if let Ok(address) = host.parse::<IpAddr>()
+        && !allow_private_hosts
+        && !is_public_ip(address)
+    {
+        bail!("webhook URL must not target a private address or another non-public address");
+    }
     if url.scheme() == "http" && !is_loopback(&host) {
         bail!("webhook URL must use https for this host");
     }
@@ -588,13 +610,10 @@ fn build_client(host: &str, addresses: &[SocketAddr]) -> reqwest::Client {
         .expect("webhook HTTP client must build")
 }
 
-/// Returns true when one address is public.
+/// Returns true when one address is global.
 ///
-/// The call rejects an IPv4 loopback, private, link-local, unspecified,
-/// broadcast, or multicast address.
-/// It rejects an IPv6 loopback, unspecified, multicast, link-local, or
-/// unique-local address.
-/// It checks an IPv4-mapped IPv6 address as an IPv4 address.
+/// The call checks an IPv4-mapped IPv6 address as an IPv4 address.
+/// The call rejects every non-global range in the two functions below.
 fn is_public_ip(address: IpAddr) -> bool {
     match address {
         IpAddr::V4(address) => is_public_ipv4(address),
@@ -602,23 +621,77 @@ fn is_public_ip(address: IpAddr) -> bool {
             if let Some(mapped) = address.to_ipv4_mapped() {
                 return is_public_ipv4(mapped);
             }
-            !(address.is_loopback()
-                || address.is_unspecified()
-                || address.is_multicast()
-                || address.is_unicast_link_local()
-                || address.is_unique_local())
+            is_public_ipv6(address)
         }
     }
 }
 
-/// Returns true when one IPv4 address is public.
+/// Returns true when one IPv4 address is global.
+///
+/// The call rejects loopback, private, link-local, unspecified, broadcast,
+/// and multicast addresses.
+/// It also rejects the ranges below.
 fn is_public_ipv4(address: Ipv4Addr) -> bool {
+    let octets = address.octets();
+    let first = octets[0];
+    let second = octets[1];
+    let third = octets[2];
     !(address.is_loopback()
         || address.is_private()
         || address.is_link_local()
         || address.is_unspecified()
         || address.is_broadcast()
-        || address.is_multicast())
+        || address.is_multicast()
+        // 100.64.0.0/10 is carrier-grade NAT.
+        || (first == 100 && (64..=127).contains(&second))
+        // 192.0.0.0/24 is an IETF assignment.
+        || (first == 192 && second == 0 && third == 0)
+        // 192.88.99.0/24 is the 6to4 relay anycast range.
+        || (first == 192 && second == 88 && third == 99)
+        // 198.18.0.0/15 is the benchmarking range.
+        || (first == 198 && (18..=19).contains(&second))
+        // 192.0.2.0/24 is TEST-NET-1 documentation.
+        || (first == 192 && second == 0 && third == 2)
+        // 198.51.100.0/24 is TEST-NET-2 documentation.
+        || (first == 198 && second == 51 && third == 100)
+        // 203.0.113.0/24 is TEST-NET-3 documentation.
+        || (first == 203 && second == 0 && third == 113)
+        // 240.0.0.0/4 is reserved.
+        || first >= 240)
+}
+
+/// Returns true when one IPv6 address is global.
+///
+/// The call rejects loopback, unspecified, multicast, link-local, and
+/// unique-local addresses.
+/// It also rejects the ranges below.
+fn is_public_ipv6(address: Ipv6Addr) -> bool {
+    let segments = address.segments();
+    !(address.is_loopback()
+        || address.is_unspecified()
+        || address.is_multicast()
+        || address.is_unicast_link_local()
+        || address.is_unique_local()
+        // 2002::/16 is the 6to4 range.
+        || segments[0] == 0x2002
+        // 2001::/32 is the Teredo range.
+        || (segments[0] == 0x2001 && segments[1] == 0)
+        // 64:ff9b::/96 is the NAT64 range.
+        || (segments[0] == 0x0064
+            && segments[1] == 0xff9b
+            && segments[2] == 0
+            && segments[3] == 0
+            && segments[4] == 0
+            && segments[5] == 0)
+        // 2001:db8::/32 is the documentation range.
+        || (segments[0] == 0x2001 && segments[1] == 0x0db8)
+        // 100::/64 is the discard-only range.
+        || (segments[0] == 0x0100
+            && segments[1] == 0
+            && segments[2] == 0
+            && segments[3] == 0)
+        // 2001:10::/28 and 2001:20::/28 are the ORCHID ranges.
+        || (segments[0] == 0x2001 && (segments[1] >> 4 == 0x001 || segments[1] >> 4 == 0x002)))
 }
 
 #[cfg(test)]
@@ -729,7 +802,8 @@ mod tests {
             "example.com".to_string(),
             "api.example.com:8443".to_string(),
             "127.0.0.1".to_string(),
-        ]);
+        ])
+        .allow_private_hosts(true);
         for params in [
             json!({"url": "https://example.com/hook"}),
             json!({"url": "https://example.com:9443/hook"}),
@@ -767,10 +841,65 @@ mod tests {
                 .is_err()
         );
 
-        let default_http = WebhookAction::new(vec!["127.0.0.1:80".to_string()]);
+        let default_http =
+            WebhookAction::new(vec!["127.0.0.1:80".to_string()]).allow_private_hosts(true);
         assert!(
             default_http
                 .validate(&json!({"url": "http://127.0.0.1/hook"}))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn validate_rejects_a_loopback_url_when_private_hosts_are_disallowed() {
+        let denied = WebhookAction::new(vec!["127.0.0.1".to_string()]);
+        let error = denied
+            .validate(&json!({"url": "http://127.0.0.1/hook"}))
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "webhook URL must not target a private address or another non-public address"
+        );
+
+        let allowed = WebhookAction::new(vec!["127.0.0.1".to_string()]).allow_private_hosts(true);
+        assert!(
+            allowed
+                .validate(&json!({"url": "http://127.0.0.1/hook"}))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn validate_requires_https_for_a_non_loopback_host() {
+        let action = WebhookAction::new(vec!["example.com".to_string()]);
+
+        assert!(
+            action
+                .validate(&json!({"url": "http://example.com/hook"}))
+                .is_err()
+        );
+        assert!(
+            action
+                .validate(&json!({"url": "https://example.com/hook"}))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn validate_rejects_a_private_literal_when_private_hosts_are_disallowed() {
+        let denied = WebhookAction::new(vec!["10.0.0.1".to_string()]);
+        let error = denied
+            .validate(&json!({"url": "https://10.0.0.1/hook"}))
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "webhook URL must not target a private address or another non-public address"
+        );
+
+        let allowed = WebhookAction::new(vec!["10.0.0.1".to_string()]).allow_private_hosts(true);
+        assert!(
+            allowed
+                .validate(&json!({"url": "https://10.0.0.1/hook"}))
                 .is_ok()
         );
     }
@@ -800,12 +929,51 @@ mod tests {
     }
 
     #[test]
-    fn the_address_classifier_accepts_public_addresses() {
-        let address: Ipv4Addr = "8.8.8.8".parse().unwrap();
-        assert!(is_public_ip(address.into()));
+    fn the_address_classifier_rejects_new_non_global_ipv4_ranges() {
+        let rejected_ipv4 = [
+            "100.64.0.1",   // Carrier-grade NAT.
+            "192.0.0.1",    // IETF assignment.
+            "192.88.99.1",  // 6to4 relay.
+            "198.18.0.1",   // Benchmarking.
+            "192.0.2.1",    // Documentation.
+            "198.51.100.1", // Documentation.
+            "203.0.113.1",  // Documentation.
+            "240.0.0.1",    // Reserved.
+        ];
+        for raw in rejected_ipv4 {
+            let address: Ipv4Addr = raw.parse().unwrap();
+            assert!(!is_public_ip(address.into()), "{raw}");
+        }
+    }
 
-        let address: Ipv6Addr = "2001:4860:4860::8888".parse().unwrap();
-        assert!(is_public_ip(address.into()));
+    #[test]
+    fn the_address_classifier_rejects_new_non_global_ipv6_ranges() {
+        let rejected_ipv6 = [
+            "2002::1",     // 6to4.
+            "2001::1",     // Teredo.
+            "64:ff9b::1",  // NAT64.
+            "2001:db8::1", // Documentation.
+            "100::1",      // Discard-only.
+            "2001:10::1",  // ORCHIDv1.
+            "2001:20::1",  // ORCHIDv2.
+        ];
+        for raw in rejected_ipv6 {
+            let address: Ipv6Addr = raw.parse().unwrap();
+            assert!(!is_public_ip(address.into()), "{raw}");
+        }
+    }
+
+    #[test]
+    fn the_address_classifier_accepts_public_addresses() {
+        for raw in ["8.8.8.8", "1.1.1.1"] {
+            let address: Ipv4Addr = raw.parse().unwrap();
+            assert!(is_public_ip(address.into()), "{raw}");
+        }
+
+        for raw in ["2001:4860:4860::8888", "2606:4700:4700::1111"] {
+            let address: Ipv6Addr = raw.parse().unwrap();
+            assert!(is_public_ip(address.into()), "{raw}");
+        }
     }
 
     #[test]

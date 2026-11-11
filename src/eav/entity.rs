@@ -12,6 +12,11 @@
 //! - `entity:{id}:attr:{key}` holds one tagged JSON [`AttributeValue`].
 //! - `idx:entity:{entity_id}` is an empty entity marker.
 //! - `idx:entity-meta:backfilled` is an empty backfill marker.
+//! - `idx:ref:{target_id}:{source_id}:{attribute}` is an empty reverse
+//!   reference marker. The marker records that `source_id` holds an
+//!   `EntityRef` value for `attribute` that names `target_id`.
+//!   A self-reference has `source_id == target_id`.
+//! - `idx:ref-meta:backfilled` is an empty backfill marker.
 //! - `idx:schema:{schema_id}:{entity_id}` is an empty schema marker.
 //! - `idx:attr:{key}:{hash}:{entity_id}` is an empty attribute marker.
 //! - `idx:attr-key:{key}` is an empty marker that records that the attribute
@@ -19,10 +24,14 @@
 //!   empty result.
 //! - `idx:unique:{key}:{hash}:{entity_id}` is a unique value marker.
 //! - `idx:time:{key}:{encoded_ts}:{entity_id}` is an empty time marker.
+//!   A timer retire removes the row when the timer fires. The index then
+//!   holds only values that have not fired.
 //! - `idx:time-key:{key}` is an empty marker for an attribute key with a
 //!   time row.
 //! - `idx:time-key-meta:backfilled` is an empty backfill marker.
 //! - `timer:fired:{entity_id}:{key}:{encoded_ts}` is a fired timer marker.
+//!   The marker stays after the timer retire removes the time row, so one
+//!   value fires one time only.
 //! - `outbox-meta:pending` holds the pending outbox row count as JSON `u64`.
 //!   The key is not in the `outbox:` family, so an outbox scan does not
 //!   include it.
@@ -38,8 +47,58 @@
 //! An existing store can lack the entity markers.
 //! [`EntityStore::list_after`] then backfills them one time.
 //! The `idx:entity-meta:backfilled` marker records that pass.
-//! The pass holds the write lock, so a create or a delete cannot race it.
+//! The pass reads 200 `entity:` rows in one page.
+//! A test build reads 2 rows in one page.
+//! Each page holds the write lock and the store write guard.
+//! The pass writes the page markers, commits, and releases both guards.
+//! It re-checks each metadata row inside the page lock.
+//! The cursor is the last key plus a NUL byte, so a deleted key does not
+//! reset progress.
+//! The memory bound is one page of rows.
+//! A concurrent create or delete writes its own markers on the normal path.
 //! A store without the markers still returns entity pages after the pass.
+//!
+//! An existing store can also lack the reverse reference markers.
+//! [`EntityStore::delete`] then backfills them one time.
+//! The `idx:ref-meta:backfilled` marker records that pass.
+//! The pass reads 200 entity markers in one page.
+//! A test build reads 2 entity markers in one page.
+//! Each page holds the write lock and the store write guard.
+//! The pass writes the page markers, commits, and releases both guards.
+//! It re-checks that the entity marker and the entity row exist inside the
+//! page lock.
+//! The cursor is the last key plus a NUL byte.
+//! The memory bound is one page of entity ids and the attributes of one
+//! entity.
+//!
+//! An existing store can also lack the time key markers.
+//! [`EntityStore::time_keys`] then backfills them one time.
+//! The `idx:time-key-meta:backfilled` marker records that pass.
+//! The pass reads 200 `idx:time:` rows in one page.
+//! A test build reads 2 rows in one page.
+//! Each page holds the write lock and the store write guard.
+//! The pass writes the page markers, commits, and releases both guards.
+//! It re-checks that a time row still exists for each key inside the page
+//! lock.
+//! The cursor is the last key plus a NUL byte.
+//! The memory bound is one page of keys.
+//!
+//! A delete scans the `idx:ref:{id}:` family before it writes.
+//! A distinct source other than `id` blocks the delete with
+//! [`EntityError::Referenced`] unless the caller sets `force`.
+//! A self-reference does not block the delete.
+//! The delete holds the write lock for the scan and the write, so a
+//! reference write cannot appear after the scan.
+//!
+//! # Attribute and unique index scope
+//!
+//! The attribute index and the unique constraint key on the attribute name.
+//! The key includes no schema id.
+//! An attribute index and a unique constraint therefore apply across every
+//! schema that uses the name.
+//! A unique value blocks a second entity in any schema with that attribute
+//! name.
+//! Use a distinct name when two schemas must not share the domain.
 //!
 //! # Entity events
 //!
@@ -58,8 +117,13 @@
 //! rows.
 //! A write increments the counter in the transaction that writes the outbox
 //! row.
-//! A flush decrements the counter in the same write guard as the row delete.
+//! A flush deletes one row and decrements the counter in one transaction.
+//! The transaction commits both changes or neither change.
 //! The counter is always equal to the number of `outbox:` rows.
+//! One flush reads at most 100 rows at one time.
+//! A test build reads at most 2 rows at one time.
+//! A failed feed append stops the flush and changes no row and no counter.
+//! A failed transaction stops the flush and changes no row and no counter.
 //! When the counter key is absent, [`EntityStore::outbox_count`] scans the
 //! `outbox:` family one time and writes the exact count.
 //! The backfill runs at most once.
@@ -76,6 +140,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, RwLock};
 
+use crate::eav::MAX_PAGE_OFFSET;
 use crate::eav::entity_error::EntityError;
 use crate::eav::error::SchemaError;
 use crate::eav::schema::{AttributeDef, AttributeType, EffectiveSchema, SchemaRef, SchemaRegistry};
@@ -92,6 +157,14 @@ const OUTBOX_PREFIX: &str = "outbox:";
 /// The key does not start with [`OUTBOX_PREFIX`], so an outbox scan does not
 /// count it as a row.
 const OUTBOX_PENDING_KEY: &str = "outbox-meta:pending";
+
+/// Maximum number of outbox rows to read in one flush batch.
+#[cfg(not(test))]
+const OUTBOX_FLUSH_BATCH: usize = 100;
+
+/// Maximum number of outbox rows to read in one flush batch.
+#[cfg(test)]
+const OUTBOX_FLUSH_BATCH: usize = 2;
 
 /// Suffix for the metadata row of an entity.
 const META_SUFFIX: &str = ":meta";
@@ -110,6 +183,28 @@ const ENTITY_BACKFILL_SUFFIX: &str = "backfilled";
 
 /// Key prefix for schema index markers.
 const SCHEMA_INDEX_PREFIX: &str = "idx:schema:";
+
+/// Key prefix for reverse reference markers.
+const REF_INDEX_PREFIX: &str = "idx:ref:";
+
+/// Key prefix for reverse reference metadata.
+const REF_META_PREFIX: &str = "idx:ref-meta:";
+
+/// Key suffix for the one-time reverse reference backfill marker.
+const REF_BACKFILL_SUFFIX: &str = "backfilled";
+
+/// Maximum number of rows that one lazy backfill page reads.
+#[cfg(not(test))]
+const BACKFILL_PAGE: usize = 200;
+
+/// Maximum number of rows that one lazy backfill page reads.
+#[cfg(test)]
+const BACKFILL_PAGE: usize = 2;
+
+/// A test hook that runs after a lazy backfill page releases its locks.
+#[cfg(test)]
+type BackfillPageHook =
+    Arc<dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync>;
 
 /// Key prefix for attribute index markers.
 const ATTR_INDEX_PREFIX: &str = "idx:attr:";
@@ -391,6 +486,19 @@ pub struct EntityStore {
     /// The check is on by default.
     /// A host can turn it off for a store that holds legacy references.
     check_entity_refs: bool,
+    /// The number of outbox row deletes to fail in a test.
+    #[cfg(test)]
+    outbox_delete_failures: Arc<std::sync::atomic::AtomicUsize>,
+    /// The largest outbox batch that a flush read in a test.
+    #[cfg(test)]
+    outbox_batch_peak: Arc<std::sync::atomic::AtomicUsize>,
+    /// The number of lazy backfill pages that committed in a test.
+    #[cfg(test)]
+    backfill_page_commits: Arc<std::sync::atomic::AtomicUsize>,
+    /// A hook that runs after a lazy backfill page releases its locks in a
+    /// test.
+    #[cfg(test)]
+    backfill_page_hook: Arc<std::sync::Mutex<Option<BackfillPageHook>>>,
 }
 
 impl EntityStore {
@@ -403,7 +511,52 @@ impl EntityStore {
             flush_lock: Arc::new(Mutex::new(())),
             feed: None,
             check_entity_refs: true,
+            #[cfg(test)]
+            outbox_delete_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            outbox_batch_peak: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            backfill_page_commits: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            backfill_page_hook: Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    /// Records one committed lazy backfill page in a test.
+    #[cfg(test)]
+    fn note_backfill_page(&self) {
+        self.backfill_page_commits
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Records one committed lazy backfill page.
+    #[cfg(not(test))]
+    fn note_backfill_page(&self) {}
+
+    /// Runs the test hook that stands in for a write between two pages.
+    #[cfg(test)]
+    async fn run_backfill_page_hook(&self) {
+        let hook = self
+            .backfill_page_hook
+            .lock()
+            .expect("backfill page hook lock")
+            .clone();
+        if let Some(hook) = hook {
+            hook().await;
+        }
+    }
+
+    /// Runs the hook that stands in for a write between two pages.
+    #[cfg(not(test))]
+    async fn run_backfill_page_hook(&self) {}
+
+    /// Sets the test hook that runs after a lazy backfill page.
+    #[cfg(test)]
+    fn set_backfill_page_hook(&self, hook: Option<BackfillPageHook>) {
+        *self
+            .backfill_page_hook
+            .lock()
+            .expect("backfill page hook lock") = hook;
     }
 
     /// Sets whether a write checks that every `EntityRef` target exists.
@@ -635,6 +788,7 @@ impl EntityStore {
             check_unique_values(&tx, &after, &merged.attributes).await?;
             delete_changed_timer_markers(&tx, &before, &after, &merged).await?;
             delete_mutable_rows(&tx, &before, &merged).await?;
+            delete_ref_rows(&tx, &before, &merged).await?;
             put_entity_rows(&tx, &after, &merged).await?;
             if outbox.is_some() {
                 increment_outbox_pending(&tx, 1).await?;
@@ -664,6 +818,16 @@ impl EntityStore {
     ///
     /// The expected version must match the stored version.
     /// A mismatch is a version conflict and changes nothing.
+    /// The call backfills the reverse reference markers for an old store.
+    /// It then scans the markers for this entity.
+    /// A distinct source entity blocks the delete with
+    /// [`EntityError::Referenced`] unless `force` is true.
+    /// The count excludes a self-reference.
+    /// The call takes the write lock before the scan, so a reference write
+    /// cannot appear after the scan.
+    /// With `force`, the call leaves each incoming reference in place.
+    /// Those references are dangling by request.
+    /// The call does not edit the referring entities.
     /// The call removes the metadata row and every attribute and index row.
     /// The write succeeds when the entity rows and the outbox row commit.
     /// A feed failure after the commit leaves the outbox row for the relay.
@@ -672,9 +836,11 @@ impl EntityStore {
         &self,
         id: &str,
         expected_version: u64,
+        force: bool,
         ctx: &WriteContext,
     ) -> Result<EntityChange, EntityError> {
         validate_name("entity id", id)?;
+        self.backfill_ref_index().await?;
         let (change, pending) = {
             let _write = self.write_lock.lock().await;
             let g = self.store.write().await;
@@ -685,12 +851,20 @@ impl EntityStore {
             if before.version != expected_version {
                 return Err(EntityError::VersionConflict);
             }
+            let count = count_incoming_refs(&tx, id).await?;
+            if count > 0 && !force {
+                return Err(EntityError::Referenced {
+                    id: id.to_string(),
+                    count,
+                });
+            }
 
             let effective = self.resolve_refs(&before.schemas).await?;
             let merged = merge_schemas(&effective)?;
             let outbox =
                 self.prepare_outbox(Some(&before), None, event_schema_ids(&effective), ctx)?;
             delete_mutable_rows(&tx, &before, &merged).await?;
+            delete_ref_rows(&tx, &before, &merged).await?;
             delete_all_timer_markers(&tx, &before, &merged).await?;
             for schema_id in &merged.schema_ids {
                 tx.delete(&schema_index_key(schema_id, id))
@@ -725,23 +899,29 @@ impl EntityStore {
         Ok(change)
     }
 
-    /// Delivers every pending outbox row to the change feed.
+    /// Delivers pending outbox rows to the change feed in batches.
     ///
     /// The call returns `Ok(0)` when no feed is configured.
     /// Before it reads the rows, the call ensures that the
     /// `outbox-meta:pending` counter exists.
     /// An old store without the counter gets the one-time backfill.
-    /// It reads the rows in key order.
-    /// For each row, it appends the event and then deletes the row.
-    /// It decrements the counter in the same write guard as the delete.
+    /// One batch reads at most 100 rows in key order.
+    /// A test build reads at most 2 rows.
+    /// For each row, the call appends the event to the feed.
+    /// The call then deletes the row and decrements the counter in one
+    /// transaction.
+    /// The transaction commits both changes or neither change.
     /// The counter never goes below zero.
-    /// It stops at the first append failure.
-    /// That row and every later row stay in the outbox.
+    /// The call stops when a batch returns zero rows.
+    /// A failed append stops the loop and returns the error.
+    /// The row and the counter stay unchanged.
+    /// A failed transaction stops the loop and returns the error.
+    /// The row and the counter stay unchanged.
     /// The call does not hold the store write guard during the append.
     ///
     /// The counter is equal to the number of `outbox:` rows.
     /// Delivery is at least once.
-    /// A crash after an append and before a delete can deliver one event
+    /// A crash after an append and before a commit can deliver one event
     /// again.
     /// A consumer must be idempotent.
     pub async fn flush_outbox(&self) -> Result<usize, EntityError> {
@@ -750,22 +930,51 @@ impl EntityStore {
         };
         let _flush = self.flush_lock.lock().await;
         self.ensure_outbox_pending().await?;
-        let rows = {
-            let g = self.store.read().await;
-            scan_prefix(&*g, OUTBOX_PREFIX).await?
-        };
         let mut delivered = 0;
-        for row in rows {
-            let event: EntityEvent = serde_json::from_slice(&row.value)
-                .map_err(|e| EntityError::Internal(format!("outbox event is invalid: {e}")))?;
-            feed.append(WalOp::Entity { event })
-                .await
-                .map_err(|_| EntityError::Feed("entity feed append failed".to_string()))?;
-            let g = self.store.write().await;
-            g.delete(&row.key).await.map_err(EntityError::Store)?;
-            decrement_outbox_pending(&*g, 1).await?;
-            drop(g);
-            delivered += 1;
+        loop {
+            let rows = {
+                let g = self.store.read().await;
+                scan_prefix_bounded(&*g, OUTBOX_PREFIX, OUTBOX_FLUSH_BATCH).await?
+            };
+            if rows.is_empty() {
+                break;
+            }
+            #[cfg(test)]
+            {
+                let peak = self
+                    .outbox_batch_peak
+                    .load(std::sync::atomic::Ordering::SeqCst);
+                if rows.len() > peak {
+                    self.outbox_batch_peak
+                        .store(rows.len(), std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+            for row in rows {
+                let event: EntityEvent = serde_json::from_slice(&row.value)
+                    .map_err(|e| EntityError::Internal(format!("outbox event is invalid: {e}")))?;
+                feed.append(WalOp::Entity { event })
+                    .await
+                    .map_err(|_| EntityError::Feed("entity feed append failed".to_string()))?;
+                let g = self.store.write().await;
+                let tx = g.begin_tx().map_err(EntityError::Store)?;
+                decrement_outbox_pending(&tx, 1).await?;
+                #[cfg(test)]
+                if self
+                    .outbox_delete_failures
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    > 0
+                {
+                    self.outbox_delete_failures
+                        .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    return Err(EntityError::Store(oxkv::StoreError::Other(
+                        "injected outbox delete failure".to_string(),
+                    )));
+                }
+                tx.delete(&row.key).await.map_err(EntityError::Store)?;
+                tx.commit().await.map_err(EntityError::Store)?;
+                drop(g);
+                delivered += 1;
+            }
         }
         Ok(delivered)
     }
@@ -931,7 +1140,8 @@ impl EntityStore {
     /// The result is sorted by entity id.
     /// The scan starts after the `after` id when the caller gives a cursor.
     /// The call returns the entities and the cursor for the next page.
-    /// The cursor is the last id of a full page.
+    /// The scan reads one extra id as a look-ahead.
+    /// The cursor is the last id of the page when the extra id exists.
     /// The cursor is `None` when the scan is exhausted.
     /// A `limit` of 0 returns an empty list and no cursor.
     pub async fn list_by_schema_after(
@@ -953,13 +1163,12 @@ impl EntityStore {
             }
             None => prefix.clone(),
         };
-        let max = u32::try_from(limit).ok();
+        let max = u32::try_from(limit.saturating_add(1)).ok();
         let cursor = (Some(start), Some(prefix_scan_end(&prefix)));
         let markers = g
             .gets_bytes(max, Direction::Next, cursor)
             .await
             .map_err(EntityError::Store)?;
-        let full = markers.len() == limit;
         let mut ids = Vec::new();
         let mut seen = BTreeSet::new();
         for marker in markers {
@@ -972,8 +1181,10 @@ impl EntityStore {
             ids.push(id.to_string());
         }
         ids.sort();
-        let next = if full { ids.last().cloned() } else { None };
-        let mut entities = Vec::with_capacity(limit.min(ids.len()));
+        let has_more = ids.len() > limit;
+        ids.truncate(limit);
+        let next = if has_more { ids.last().cloned() } else { None };
+        let mut entities = Vec::with_capacity(ids.len());
         for id in &ids {
             if let Some(entity) = load_entity(&*g, id).await? {
                 entities.push(entity);
@@ -1315,7 +1526,9 @@ impl EntityStore {
     /// The scan starts after the `after` id when the caller gives a cursor.
     /// The scan verifies each hash match against the exact value.
     /// The result is in entity id order.
-    /// The call returns the cursor for the next page when the page is full.
+    /// The scan reads one extra matching entity as a look-ahead.
+    /// The call returns the cursor for the next page only when the extra
+    /// entity exists.
     /// The cursor is `None` when the scan is exhausted.
     /// A `limit` of 0 returns an empty list and no cursor.
     /// The call returns [`EntityError::NotIndexed`] when no applied schema
@@ -1351,7 +1564,8 @@ impl EntityStore {
             }
             None => prefix.clone(),
         };
-        let max = u32::try_from(limit).ok();
+        let target = limit.saturating_add(1);
+        let max = u32::try_from(target).ok();
         let mut entities = Vec::new();
         let mut seen = BTreeSet::new();
         loop {
@@ -1363,7 +1577,7 @@ impl EntityStore {
                 )
                 .await
                 .map_err(EntityError::Store)?;
-            let full = rows.len() == limit;
+            let full = rows.len() == target;
             for row in &rows {
                 start = format!("{}\0", row.key);
                 let Some(id) = row.key.strip_prefix(&prefix) else {
@@ -1376,14 +1590,19 @@ impl EntityStore {
                     && entity.attributes.get(key) == Some(value)
                 {
                     entities.push(entity);
+                    if entities.len() >= target {
+                        break;
+                    }
                 }
             }
-            if entities.len() >= limit || !full {
+            if entities.len() >= target || !full {
                 break;
             }
         }
         entities.sort_by(|a, b| a.id.cmp(&b.id));
-        let next = if entities.len() >= limit {
+        let has_more = entities.len() > limit;
+        entities.truncate(limit);
+        let next = if has_more {
             entities.last().map(|entity| entity.id.clone())
         } else {
             None
@@ -1393,52 +1612,125 @@ impl EntityStore {
 
     /// Returns the attribute keys that have a time index row.
     ///
-    /// The call scans only the `idx:time-key:` family.
+    /// The call scans only the `idx:time-key:` family after the backfill.
     /// The result is sorted and has no duplicates.
     /// An attribute key contains no colon.
     /// A delete keeps the key marker. A stale marker costs one empty scan.
     /// The `idx:time-key-meta:backfilled` marker records the one-time
-    /// backfill. When it is absent, the call scans the `idx:time:` family one
-    /// time. It writes every missing key marker and the backfill marker. It
-    /// returns the union of the marker keys and the scanned keys.
+    /// backfill. When it is absent, the call scans the `idx:time:` family in
+    /// pages. It writes every missing key marker and the backfill marker. It
+    /// returns the marker keys.
     /// The backfill runs at most one time per store.
+    /// Each page holds the write lock and the store write guard.
+    /// The call reads 200 `idx:time:` rows in one page. A test build reads 2.
+    /// It re-checks that a time row still exists for each key inside the page
+    /// lock, writes the page markers, commits, and releases both guards.
+    /// The cursor is the last key plus a NUL byte, so a deleted key does not
+    /// reset progress.
+    /// It writes the backfill marker last, under the write lock.
+    /// The memory bound is one page of keys.
     pub async fn time_keys(&self) -> Result<Vec<String>, EntityError> {
         let backfill_marker = time_key_backfill_marker();
-        let g = self.store.read().await;
-        let markers: BTreeSet<String> =
-            time_key_marker_keys(scan_prefix(&*g, TIME_KEY_INDEX_PREFIX).await?)
-                .into_iter()
-                .collect();
-        let backfilled = g
-            .get_bytes(&backfill_marker)
-            .await
-            .map_err(EntityError::Store)?
-            .is_some();
-        if backfilled {
-            return Ok(markers.into_iter().collect());
+        {
+            let g = self.store.read().await;
+            if g.get_bytes(&backfill_marker)
+                .await
+                .map_err(EntityError::Store)?
+                .is_some()
+            {
+                return Ok(time_key_marker_keys(
+                    scan_prefix(&*g, TIME_KEY_INDEX_PREFIX).await?,
+                ));
+            }
         }
-        let keys = time_row_keys(scan_prefix(&*g, TIME_INDEX_PREFIX).await?);
-        drop(g);
 
-        let mut all = markers.clone();
-        all.extend(keys);
-        let g = self.store.write().await;
-        for key in &all {
-            if !markers.contains(key) {
-                g.set_bytes(&time_key_index_key(key), b"")
+        let end = prefix_scan_end(TIME_INDEX_PREFIX);
+        let max = u32::try_from(BACKFILL_PAGE).ok();
+        let mut cursor = TIME_INDEX_PREFIX.to_string();
+        loop {
+            let page = {
+                let _write = self.write_lock.lock().await;
+                let g = self.store.write().await;
+                if g.get_bytes(&backfill_marker)
+                    .await
+                    .map_err(EntityError::Store)?
+                    .is_some()
+                {
+                    None
+                } else {
+                    let rows = g
+                        .gets_bytes(
+                            max,
+                            Direction::Next,
+                            (Some(cursor.clone()), Some(end.clone())),
+                        )
+                        .await
+                        .map_err(EntityError::Store)?;
+                    if rows.is_empty() {
+                        None
+                    } else {
+                        let full = rows.len() == BACKFILL_PAGE;
+                        let last = rows.last().map(|row| row.key.clone()).unwrap_or_default();
+                        let keys = time_row_keys(rows);
+                        let tx = g.begin_tx().map_err(EntityError::Store)?;
+                        for key in &keys {
+                            let prefix = format!("{TIME_INDEX_PREFIX}{key}:");
+                            // Re-check the source row inside the page lock.
+                            if scan_prefix_bounded(&tx, &prefix, 1).await?.is_empty() {
+                                continue;
+                            }
+                            let marker_key = time_key_index_key(key);
+                            if tx
+                                .get_bytes(&marker_key)
+                                .await
+                                .map_err(EntityError::Store)?
+                                .is_none()
+                            {
+                                tx.set_bytes(&marker_key, b"")
+                                    .await
+                                    .map_err(EntityError::Store)?;
+                            }
+                        }
+                        tx.commit().await.map_err(EntityError::Store)?;
+                        self.note_backfill_page();
+                        Some((last, full))
+                    }
+                }
+            };
+            let Some((last, full)) = page else {
+                break;
+            };
+            self.run_backfill_page_hook().await;
+            if !full {
+                break;
+            }
+            cursor = format!("{last}\0");
+        }
+
+        {
+            let _write = self.write_lock.lock().await;
+            let g = self.store.write().await;
+            if g.get_bytes(&backfill_marker)
+                .await
+                .map_err(EntityError::Store)?
+                .is_none()
+            {
+                g.set_bytes(&backfill_marker, b"")
                     .await
                     .map_err(EntityError::Store)?;
             }
         }
-        g.set_bytes(&backfill_marker, b"")
-            .await
-            .map_err(EntityError::Store)?;
-        Ok(all.into_iter().collect())
+        let g = self.store.read().await;
+        Ok(time_key_marker_keys(
+            scan_prefix(&*g, TIME_KEY_INDEX_PREFIX).await?,
+        ))
     }
 
     /// Lists the entities whose indexed timestamp `key` is due.
     ///
     /// The call scans only the `idx:time:{key}:` family.
+    /// The index holds only values that have not fired.
+    /// A timer retire removes the time row after the timer fires.
     /// The scan stops at the inclusive upper bound for `at_or_before`.
     /// The result is in time order.
     /// An entity appears only when its current value for `key` is a
@@ -1586,6 +1878,46 @@ impl EntityStore {
             .map_err(EntityError::Store)
     }
 
+    /// Writes a timer marker and removes the time index row in one transaction.
+    ///
+    /// The call takes the write lock and then the store write guard.
+    /// It reloads the current entity inside the lock.
+    /// It returns `false` and changes nothing when the entity is absent.
+    /// It returns `false` and changes nothing when the current value for
+    /// `key` is not [`AttributeValue::Timestamp`] with `due_at`.
+    /// The call writes the marker in the same value format as
+    /// [`EntityStore::mark_timer_fired`].
+    /// It deletes the `idx:time:` row for the entity and value.
+    /// The marker write and the row delete commit in one transaction.
+    /// A crash cannot leave one without the other.
+    /// The call returns `true` when the transaction commits.
+    pub async fn retire_timer(
+        &self,
+        entity_id: &str,
+        key: &str,
+        due_at: i64,
+    ) -> Result<bool, EntityError> {
+        let now = chrono::Utc::now().timestamp();
+        let bytes = serde_json::to_vec(&now).map_err(|e| EntityError::Internal(e.to_string()))?;
+        let _write = self.write_lock.lock().await;
+        let g = self.store.write().await;
+        let tx = g.begin_tx().map_err(EntityError::Store)?;
+        let Some(entity) = load_entity(&tx, entity_id).await? else {
+            return Ok(false);
+        };
+        if entity.attributes.get(key) != Some(&AttributeValue::Timestamp(due_at)) {
+            return Ok(false);
+        }
+        tx.set_bytes(&timer_marker_key(entity_id, key, due_at), &bytes)
+            .await
+            .map_err(EntityError::Store)?;
+        tx.delete(&time_index_key(key, due_at, entity_id))
+            .await
+            .map_err(EntityError::Store)?;
+        tx.commit().await.map_err(EntityError::Store)?;
+        Ok(true)
+    }
+
     /// Lists every entity, sorted by id.
     pub async fn list(&self) -> Result<Vec<Entity>, EntityError> {
         let g = self.store.read().await;
@@ -1612,12 +1944,17 @@ impl EntityStore {
     /// Backfills the entity index markers one time.
     ///
     /// The call returns early when the backfill marker exists.
-    /// It takes the write lock and then the store write guard.
-    /// It re-checks the marker inside the lock.
-    /// It scans every `entity:{id}:meta` row and writes each missing marker.
-    /// It writes the backfill marker last.
+    /// It scans the `entity:` family in pages.
+    /// Each page holds the write lock and the store write guard.
+    /// The call reads 200 `entity:` rows in one page. A test build reads 2.
+    /// It re-checks each metadata row inside the page lock.
+    /// It writes the page markers, commits, and releases both guards.
+    /// The cursor is the last key plus a NUL byte, so a deleted key does not
+    /// reset progress.
+    /// It writes the backfill marker last, under the write lock.
     /// A crash before the last write retries on the next call.
     /// Every write is idempotent.
+    /// The memory bound is one page of rows.
     async fn backfill_entity_index(&self) -> Result<(), EntityError> {
         let marker = entity_backfill_marker();
         {
@@ -1631,34 +1968,197 @@ impl EntityStore {
             }
         }
 
+        let end = prefix_scan_end(ENTITY_PREFIX);
+        let max = u32::try_from(BACKFILL_PAGE).ok();
+        let mut cursor = ENTITY_PREFIX.to_string();
+        loop {
+            let page = {
+                let _write = self.write_lock.lock().await;
+                let g = self.store.write().await;
+                if g.get_bytes(&marker)
+                    .await
+                    .map_err(EntityError::Store)?
+                    .is_some()
+                {
+                    None
+                } else {
+                    let rows = g
+                        .gets_bytes(
+                            max,
+                            Direction::Next,
+                            (Some(cursor.clone()), Some(end.clone())),
+                        )
+                        .await
+                        .map_err(EntityError::Store)?;
+                    if rows.is_empty() {
+                        None
+                    } else {
+                        let full = rows.len() == BACKFILL_PAGE;
+                        let last = rows.last().map(|row| row.key.clone()).unwrap_or_default();
+                        let tx = g.begin_tx().map_err(EntityError::Store)?;
+                        for row in &rows {
+                            let Some(rest) = row.key.strip_prefix(ENTITY_PREFIX) else {
+                                continue;
+                            };
+                            let Some(id) = rest.strip_suffix(META_SUFFIX) else {
+                                continue;
+                            };
+                            if id.is_empty() || id.contains(':') {
+                                continue;
+                            }
+                            // Re-check the source row inside the page lock.
+                            if tx
+                                .get_bytes(&meta_key(id))
+                                .await
+                                .map_err(EntityError::Store)?
+                                .is_none()
+                            {
+                                continue;
+                            }
+                            tx.set_bytes(&entity_index_key(id), b"")
+                                .await
+                                .map_err(EntityError::Store)?;
+                        }
+                        tx.commit().await.map_err(EntityError::Store)?;
+                        self.note_backfill_page();
+                        Some((last, full))
+                    }
+                }
+            };
+            let Some((last, full)) = page else {
+                break;
+            };
+            self.run_backfill_page_hook().await;
+            if !full {
+                break;
+            }
+            cursor = format!("{last}\0");
+        }
+
         let _write = self.write_lock.lock().await;
         let g = self.store.write().await;
         if g.get_bytes(&marker)
             .await
             .map_err(EntityError::Store)?
-            .is_some()
+            .is_none()
         {
-            return Ok(());
-        }
-        let rows = scan_prefix(&*g, ENTITY_PREFIX).await?;
-        let mut seen = BTreeSet::new();
-        for row in rows {
-            let Some(rest) = row.key.strip_prefix(ENTITY_PREFIX) else {
-                continue;
-            };
-            let Some(id) = rest.strip_suffix(META_SUFFIX) else {
-                continue;
-            };
-            if id.is_empty() || id.contains(':') || !seen.insert(id.to_string()) {
-                continue;
-            }
-            g.set_bytes(&entity_index_key(id), b"")
+            g.set_bytes(&marker, b"")
                 .await
                 .map_err(EntityError::Store)?;
         }
-        g.set_bytes(&marker, b"")
+        Ok(())
+    }
+
+    /// Backfills the reverse reference markers one time.
+    ///
+    /// The call returns early when the `idx:ref-meta:backfilled` marker
+    /// exists.
+    /// It first ensures that the entity index markers exist.
+    /// It pages every entity marker in id order.
+    /// Each page holds the write lock and the store write guard.
+    /// The call reads 200 entity markers in one page. A test build reads 2.
+    /// For each entity, the call resolves the pinned schemas and merges them.
+    /// It re-checks the entity marker and the entity row inside the page lock.
+    /// It then writes one marker for each `EntityRef` attribute, commits, and
+    /// releases both guards.
+    /// The cursor is the last key plus a NUL byte.
+    /// It writes the backfill marker last, under the write lock.
+    /// A crash before that write retries on the next call.
+    /// Every marker write is idempotent.
+    /// The memory bound is one page of entity ids and the attributes of one
+    /// entity.
+    async fn backfill_ref_index(&self) -> Result<(), EntityError> {
+        let marker = ref_backfill_marker();
+        {
+            let g = self.store.read().await;
+            if g.get_bytes(&marker)
+                .await
+                .map_err(EntityError::Store)?
+                .is_some()
+            {
+                return Ok(());
+            }
+        }
+
+        self.backfill_entity_index().await?;
+        let end = prefix_scan_end(ENTITY_INDEX_PREFIX);
+        let max = u32::try_from(BACKFILL_PAGE).ok();
+        let mut cursor = ENTITY_INDEX_PREFIX.to_string();
+        loop {
+            let page = {
+                let _write = self.write_lock.lock().await;
+                let g = self.store.write().await;
+                if g.get_bytes(&marker)
+                    .await
+                    .map_err(EntityError::Store)?
+                    .is_some()
+                {
+                    None
+                } else {
+                    let rows = g
+                        .gets_bytes(
+                            max,
+                            Direction::Next,
+                            (Some(cursor.clone()), Some(end.clone())),
+                        )
+                        .await
+                        .map_err(EntityError::Store)?;
+                    if rows.is_empty() {
+                        None
+                    } else {
+                        let full = rows.len() == BACKFILL_PAGE;
+                        let last = rows.last().map(|row| row.key.clone()).unwrap_or_default();
+                        let tx = g.begin_tx().map_err(EntityError::Store)?;
+                        for row in &rows {
+                            let Some(id) = row.key.strip_prefix(ENTITY_INDEX_PREFIX) else {
+                                continue;
+                            };
+                            if id.is_empty() || id.contains(':') {
+                                continue;
+                            }
+                            // Re-check the source entity inside the page lock.
+                            if tx
+                                .get_bytes(&entity_index_key(id))
+                                .await
+                                .map_err(EntityError::Store)?
+                                .is_none()
+                            {
+                                continue;
+                            }
+                            let Some(entity) = load_entity(&tx, id).await? else {
+                                continue;
+                            };
+                            let effective = self.resolve_refs(&entity.schemas).await?;
+                            let merged = merge_schemas(&effective)?;
+                            put_ref_rows(&tx, &entity, &merged).await?;
+                        }
+                        tx.commit().await.map_err(EntityError::Store)?;
+                        self.note_backfill_page();
+                        Some((last, full))
+                    }
+                }
+            };
+            let Some((last, full)) = page else {
+                break;
+            };
+            self.run_backfill_page_hook().await;
+            if !full {
+                break;
+            }
+            cursor = format!("{last}\0");
+        }
+
+        let _write = self.write_lock.lock().await;
+        let g = self.store.write().await;
+        if g.get_bytes(&marker)
             .await
-            .map_err(EntityError::Store)?;
+            .map_err(EntityError::Store)?
+            .is_none()
+        {
+            g.set_bytes(&marker, b"")
+                .await
+                .map_err(EntityError::Store)?;
+        }
         Ok(())
     }
 
@@ -1669,7 +2169,14 @@ impl EntityStore {
     /// It then loads at most `limit` entities.
     /// The call scans at most `offset + limit` entity markers.
     /// A `limit` of 0 returns an empty list.
+    /// An offset above `MAX_PAGE_OFFSET` returns an invalid-input error.
+    /// Use `after` for a deeper page.
     pub async fn list_page(&self, limit: usize, offset: usize) -> Result<Vec<Entity>, EntityError> {
+        if offset > MAX_PAGE_OFFSET {
+            return Err(EntityError::Invalid(format!(
+                "offset must be at most {MAX_PAGE_OFFSET}. Use after to page deeper."
+            )));
+        }
         if limit == 0 {
             return Ok(Vec::new());
         }
@@ -1685,16 +2192,20 @@ impl EntityStore {
     /// An old store can lack the entity markers.
     /// The call then backfills every missing marker one time.
     /// The `idx:entity-meta:backfilled` marker records the pass.
-    /// The pass takes the write lock and the store write guard.
-    /// It re-checks the marker inside the lock.
-    /// It scans the `entity:` family and writes one marker for each meta row.
-    /// It writes the backfill marker last.
+    /// The pass reads 200 `entity:` rows in one page.
+    /// A test build reads 2 rows in one page.
+    /// Each page holds the write lock and the store write guard.
+    /// The pass writes the page markers, commits, and releases both guards.
+    /// It re-checks each metadata row inside the page lock.
+    /// The cursor is the last key plus a NUL byte.
+    /// It writes the backfill marker last, under the write lock.
     /// A crash before that write retries on the next call.
     /// Every write is idempotent.
     /// The call then scans only the `idx:entity:` family.
     /// It starts after the `after` id when the caller gives a cursor.
     /// The call returns the entities and the cursor for the next page.
-    /// The cursor is the last id of a full page.
+    /// The scan reads one extra id as a look-ahead.
+    /// The cursor is the last id of the page when the extra id exists.
     /// The cursor is `None` when the scan is exhausted.
     /// A stale or unknown cursor returns the ids after its sort position.
     /// A `limit` of 0 returns an empty list and no cursor.
@@ -1715,13 +2226,12 @@ impl EntityStore {
             }
             None => ENTITY_INDEX_PREFIX.to_string(),
         };
-        let max = u32::try_from(limit).ok();
+        let max = u32::try_from(limit.saturating_add(1)).ok();
         let cursor = (Some(start), Some(prefix_scan_end(ENTITY_INDEX_PREFIX)));
         let markers = g
             .gets_bytes(max, Direction::Next, cursor)
             .await
             .map_err(EntityError::Store)?;
-        let full = markers.len() == limit;
         let mut ids = Vec::with_capacity(markers.len());
         let mut seen = BTreeSet::new();
         for marker in markers {
@@ -1734,7 +2244,9 @@ impl EntityStore {
             ids.push(id.to_string());
         }
         ids.sort();
-        let next = if full { ids.last().cloned() } else { None };
+        let has_more = ids.len() > limit;
+        ids.truncate(limit);
+        let next = if has_more { ids.last().cloned() } else { None };
         let mut entities = Vec::with_capacity(ids.len());
         for id in &ids {
             if let Some(entity) = load_entity(&*g, id).await? {
@@ -2382,6 +2894,37 @@ where
             .await
             .map_err(EntityError::Store)?;
     }
+    put_ref_rows(store, entity, merged).await?;
+    Ok(())
+}
+
+/// Writes one reverse reference marker for each `EntityRef` attribute.
+///
+/// The marker key is `idx:ref:{target_id}:{source_id}:{attribute}`.
+/// A self-reference writes a marker where the source and target are equal.
+async fn put_ref_rows<S>(
+    store: &S,
+    entity: &Entity,
+    merged: &MergedSchema,
+) -> Result<(), EntityError>
+where
+    S: GetSet + ?Sized,
+{
+    for (key, value) in &entity.attributes {
+        let Some(def) = merged.attributes.get(key) else {
+            continue;
+        };
+        if def.ty != AttributeType::EntityRef {
+            continue;
+        }
+        let AttributeValue::EntityRef(target) = value else {
+            continue;
+        };
+        store
+            .set_bytes(&ref_index_key(target, &entity.id, key), b"")
+            .await
+            .map_err(EntityError::Store)?;
+    }
     Ok(())
 }
 
@@ -2424,6 +2967,62 @@ where
         }
     }
     Ok(())
+}
+
+/// Deletes every outgoing reverse reference marker of one entity.
+///
+/// The call reads the stored attributes and the merged definitions.
+/// It builds the exact key for each `EntityRef` value.
+/// It does not scan the `idx:ref:` family.
+async fn delete_ref_rows<S>(
+    store: &S,
+    entity: &Entity,
+    merged: &MergedSchema,
+) -> Result<(), EntityError>
+where
+    S: GetSet + ?Sized,
+{
+    for (key, value) in &entity.attributes {
+        let Some(def) = merged.attributes.get(key) else {
+            continue;
+        };
+        if def.ty != AttributeType::EntityRef {
+            continue;
+        }
+        let AttributeValue::EntityRef(target) = value else {
+            continue;
+        };
+        store
+            .delete(&ref_index_key(target, &entity.id, key))
+            .await
+            .map_err(EntityError::Store)?;
+    }
+    Ok(())
+}
+
+/// Counts the distinct entities that reference `target_id` from another entity.
+///
+/// The call scans the `idx:ref:{target_id}:` family only.
+/// A marker from `target_id` itself does not count.
+async fn count_incoming_refs<S>(store: &S, target_id: &str) -> Result<usize, EntityError>
+where
+    S: GetSet + ?Sized,
+{
+    let prefix = ref_target_prefix(target_id);
+    let mut sources = BTreeSet::new();
+    for row in scan_prefix(store, &prefix).await? {
+        let Some(rest) = row.key.strip_prefix(&prefix) else {
+            continue;
+        };
+        let Some((source, attribute)) = rest.split_once(':') else {
+            continue;
+        };
+        if source.is_empty() || attribute.is_empty() || source == target_id {
+            continue;
+        }
+        sources.insert(source.to_string());
+    }
+    Ok(sources.len())
 }
 
 /// Deletes the timer markers of timestamp values that changed.
@@ -2602,6 +3201,21 @@ fn entity_backfill_marker() -> String {
     format!("{ENTITY_META_PREFIX}{ENTITY_BACKFILL_SUFFIX}")
 }
 
+/// The marker key for one reverse reference.
+fn ref_index_key(target_id: &str, source_id: &str, attribute: &str) -> String {
+    format!("{REF_INDEX_PREFIX}{target_id}:{source_id}:{attribute}")
+}
+
+/// The scan prefix for every reverse reference to one target entity.
+fn ref_target_prefix(target_id: &str) -> String {
+    format!("{REF_INDEX_PREFIX}{target_id}:")
+}
+
+/// The marker key for the one-time reverse reference backfill.
+fn ref_backfill_marker() -> String {
+    format!("{REF_META_PREFIX}{REF_BACKFILL_SUFFIX}")
+}
+
 /// The key that holds one attribute of an entity.
 fn attr_key(id: &str, key: &str) -> String {
     format!("{ENTITY_PREFIX}{id}{ATTR_INFIX}{key}")
@@ -2772,6 +3386,7 @@ mod tests {
     use super::*;
     use crate::db::{build_test_store, test_prefix};
     use crate::eav::schema::SchemaDraft;
+    use std::sync::atomic::Ordering;
 
     async fn new_store() -> (EntityStore, SchemaRegistry, OxKvStore) {
         let registry =
@@ -2916,6 +3531,8 @@ mod tests {
     struct RecordingFeed {
         ops: std::sync::Mutex<Vec<WalOp>>,
         failures: std::sync::atomic::AtomicUsize,
+        attempts: std::sync::atomic::AtomicUsize,
+        fail_at: std::sync::atomic::AtomicUsize,
     }
 
     impl RecordingFeed {
@@ -2923,7 +3540,20 @@ mod tests {
             Self {
                 ops: std::sync::Mutex::new(Vec::new()),
                 failures: std::sync::atomic::AtomicUsize::new(0),
+                attempts: std::sync::atomic::AtomicUsize::new(0),
+                fail_at: std::sync::atomic::AtomicUsize::new(0),
             }
+        }
+
+        /// Makes the append that follows `successes` appends fail.
+        fn fail_after(&self, successes: usize) {
+            let next = self
+                .attempts
+                .load(std::sync::atomic::Ordering::SeqCst)
+                .saturating_add(successes)
+                .saturating_add(1);
+            self.fail_at
+                .store(next, std::sync::atomic::Ordering::SeqCst);
         }
 
         fn set_failing(&self, failing: bool) {
@@ -2956,6 +3586,13 @@ mod tests {
     #[async_trait::async_trait]
     impl ChangeSink for RecordingFeed {
         async fn append(&self, op: WalOp) -> anyhow::Result<()> {
+            let attempt = self
+                .attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                .saturating_add(1);
+            if self.fail_at.load(std::sync::atomic::Ordering::SeqCst) == attempt {
+                return Err(anyhow::anyhow!("feed down"));
+            }
             let remaining = self.failures.load(std::sync::atomic::Ordering::SeqCst);
             if remaining > 0 {
                 self.failures
@@ -2999,7 +3636,7 @@ mod tests {
         assert_eq!(created.version, 1);
         assert_eq!(store.get("e1").await.unwrap(), Some(created.clone()));
 
-        let deleted = store.delete("e1", 1, &ctx()).await.unwrap();
+        let deleted = store.delete("e1", 1, false, &ctx()).await.unwrap();
         assert_eq!(deleted.before, Some(created));
         assert_eq!(deleted.after, None);
         assert_eq!(store.get("e1").await.unwrap(), None);
@@ -3256,9 +3893,16 @@ mod tests {
             .unwrap();
         assert!(!all_keys(&raw).await.is_empty());
 
-        store.delete("e1", 1, &ctx()).await.unwrap();
+        store.delete("e1", 1, false, &ctx()).await.unwrap();
 
-        assert_eq!(all_keys(&raw).await, vec![attr_key_index_key("tag")]);
+        assert_eq!(
+            all_keys(&raw).await,
+            vec![
+                attr_key_index_key("tag"),
+                entity_backfill_marker(),
+                ref_backfill_marker(),
+            ]
+        );
         let found = store.list_by_attribute("tag", &s("alpha")).await.unwrap();
         assert!(found.is_empty());
     }
@@ -3497,6 +4141,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_by_attribute_after_full_final_page_returns_no_cursor() {
+        let (store, registry, _raw) = new_store().await;
+        registry
+            .publish(schema(
+                "task",
+                &[],
+                vec![full_attr(
+                    "tag",
+                    AttributeType::String,
+                    false,
+                    true,
+                    false,
+                    None,
+                )],
+            ))
+            .await
+            .unwrap();
+        for id in ["e1", "e2", "e3", "e4"] {
+            store
+                .create(draft(id, &["task"], vec![("tag", s("alpha"))]), &ctx())
+                .await
+                .unwrap();
+        }
+
+        let (first, next) = store
+            .list_by_attribute_after("tag", &s("alpha"), 2, None)
+            .await
+            .unwrap();
+        let first_ids: Vec<&str> = first.iter().map(|entity| entity.id.as_str()).collect();
+        assert_eq!(first_ids, vec!["e1", "e2"]);
+        assert_eq!(next.as_deref(), Some("e2"));
+
+        let (second, next) = store
+            .list_by_attribute_after("tag", &s("alpha"), 2, next.as_deref())
+            .await
+            .unwrap();
+        let second_ids: Vec<&str> = second.iter().map(|entity| entity.id.as_str()).collect();
+        assert_eq!(second_ids, vec!["e3", "e4"]);
+        assert_eq!(next, None);
+
+        let mut all: Vec<String> = first.into_iter().map(|entity| entity.id).collect();
+        all.extend(second.into_iter().map(|entity| entity.id));
+        assert_eq!(all, vec!["e1", "e2", "e3", "e4"]);
+    }
+
+    #[tokio::test]
     async fn list_by_attribute_after_ignores_a_hash_collision_with_a_different_value() {
         let (store, registry, raw) = new_store().await;
         registry
@@ -3604,6 +4294,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_page_rejects_an_offset_above_the_maximum() {
+        let (store, registry, _raw) = new_store().await;
+        registry.publish(schema("task", &[], vec![])).await.unwrap();
+        store
+            .create(draft("a", &["task"], vec![]), &ctx())
+            .await
+            .unwrap();
+
+        let result = store.list_page(2, MAX_PAGE_OFFSET + 1).await;
+
+        assert!(matches!(result, Err(EntityError::Invalid(_))));
+    }
+
+    #[tokio::test]
     async fn list_page_with_limit_zero_is_empty() {
         let (store, registry, _raw) = new_store().await;
         registry.publish(schema("task", &[], vec![])).await.unwrap();
@@ -3668,7 +4372,7 @@ mod tests {
                 .is_some()
         );
 
-        store.delete("e1", 2, &ctx()).await.unwrap();
+        store.delete("e1", 2, false, &ctx()).await.unwrap();
         assert!(
             raw.get_bytes(&entity_index_key("e1"))
                 .await
@@ -3703,6 +4407,101 @@ mod tests {
 
         assert_eq!(ids, vec!["a", "b", "c", "d", "e"]);
         assert_eq!(pages, 3);
+    }
+
+    #[tokio::test]
+    async fn list_after_full_final_page_returns_no_cursor() {
+        let (store, registry, _raw) = new_store().await;
+        registry.publish(schema("task", &[], vec![])).await.unwrap();
+        for id in ["a", "b", "c", "d"] {
+            store
+                .create(draft(id, &["task"], vec![]), &ctx())
+                .await
+                .unwrap();
+        }
+
+        let (first, next) = store.list_after(2, None).await.unwrap();
+        let first_ids: Vec<&str> = first.iter().map(|entity| entity.id.as_str()).collect();
+        assert_eq!(first_ids, vec!["a", "b"]);
+        assert_eq!(next.as_deref(), Some("b"));
+
+        let (second, next) = store.list_after(2, next.as_deref()).await.unwrap();
+        let second_ids: Vec<&str> = second.iter().map(|entity| entity.id.as_str()).collect();
+        assert_eq!(second_ids, vec!["c", "d"]);
+        assert_eq!(next, None);
+
+        let mut all: Vec<String> = first.into_iter().map(|entity| entity.id).collect();
+        all.extend(second.into_iter().map(|entity| entity.id));
+        assert_eq!(all, vec!["a", "b", "c", "d"]);
+    }
+
+    #[tokio::test]
+    async fn list_after_pages_five_entities_with_a_short_final_page() {
+        let (store, registry, _raw) = new_store().await;
+        registry.publish(schema("task", &[], vec![])).await.unwrap();
+        for id in ["a", "b", "c", "d", "e"] {
+            store
+                .create(draft(id, &["task"], vec![]), &ctx())
+                .await
+                .unwrap();
+        }
+
+        let (first, next) = store.list_after(2, None).await.unwrap();
+        let first_ids: Vec<&str> = first.iter().map(|entity| entity.id.as_str()).collect();
+        assert_eq!(first_ids, vec!["a", "b"]);
+        assert_eq!(next.as_deref(), Some("b"));
+
+        let (second, next) = store.list_after(2, next.as_deref()).await.unwrap();
+        let second_ids: Vec<&str> = second.iter().map(|entity| entity.id.as_str()).collect();
+        assert_eq!(second_ids, vec!["c", "d"]);
+        assert_eq!(next.as_deref(), Some("d"));
+
+        let (third, next) = store.list_after(2, next.as_deref()).await.unwrap();
+        let third_ids: Vec<&str> = third.iter().map(|entity| entity.id.as_str()).collect();
+        assert_eq!(third_ids, vec!["e"]);
+        assert_eq!(next, None);
+
+        let mut all: Vec<String> = first.into_iter().map(|entity| entity.id).collect();
+        all.extend(second.into_iter().map(|entity| entity.id));
+        all.extend(third.into_iter().map(|entity| entity.id));
+        assert_eq!(all, vec!["a", "b", "c", "d", "e"]);
+    }
+
+    #[tokio::test]
+    async fn list_after_pages_three_entities_with_a_short_final_page() {
+        let (store, registry, _raw) = new_store().await;
+        registry.publish(schema("task", &[], vec![])).await.unwrap();
+        for id in ["a", "b", "c"] {
+            store
+                .create(draft(id, &["task"], vec![]), &ctx())
+                .await
+                .unwrap();
+        }
+
+        let (first, next) = store.list_after(2, None).await.unwrap();
+        let first_ids: Vec<&str> = first.iter().map(|entity| entity.id.as_str()).collect();
+        assert_eq!(first_ids, vec!["a", "b"]);
+        assert_eq!(next.as_deref(), Some("b"));
+
+        let (second, next) = store.list_after(2, next.as_deref()).await.unwrap();
+        let second_ids: Vec<&str> = second.iter().map(|entity| entity.id.as_str()).collect();
+        assert_eq!(second_ids, vec!["c"]);
+        assert_eq!(next, None);
+
+        let mut all: Vec<String> = first.into_iter().map(|entity| entity.id).collect();
+        all.extend(second.into_iter().map(|entity| entity.id));
+        assert_eq!(all, vec!["a", "b", "c"]);
+    }
+
+    #[tokio::test]
+    async fn list_after_empty_store_returns_no_cursor() {
+        let (store, registry, _raw) = new_store().await;
+        registry.publish(schema("task", &[], vec![])).await.unwrap();
+
+        let (page, next) = store.list_after(2, None).await.unwrap();
+
+        assert!(page.is_empty());
+        assert_eq!(next, None);
     }
 
     #[tokio::test]
@@ -3758,6 +4557,102 @@ mod tests {
                     .is_some()
             );
         }
+        assert!(
+            raw.get_bytes(&entity_backfill_marker())
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// The entity index backfill covers several pages and lists every entity.
+    ///
+    /// The page counter shows that more than one page committed.
+    /// It does not observe the lock state directly. The lock release is a
+    /// structural property of the page loop.
+    #[tokio::test]
+    async fn list_after_backfills_more_entities_than_one_page() {
+        let (store, registry, raw) = new_store().await;
+        registry.publish(schema("task", &[], vec![])).await.unwrap();
+        let ids = ["a", "b", "c", "d", "e", "f"];
+        for id in ids {
+            store
+                .create(draft(id, &["task"], vec![]), &ctx())
+                .await
+                .unwrap();
+        }
+        for id in ids {
+            raw.delete(&entity_index_key(id)).await.unwrap();
+        }
+        raw.delete(&entity_backfill_marker()).await.unwrap();
+        store.backfill_page_commits.store(0, Ordering::SeqCst);
+
+        let (page, next) = store.list_after(10, None).await.unwrap();
+        let listed: Vec<&str> = page.iter().map(|entity| entity.id.as_str()).collect();
+
+        assert_eq!(listed, ids.to_vec());
+        assert_eq!(next, None);
+        assert!(store.backfill_page_commits.load(Ordering::SeqCst) > 1);
+
+        // A second call keeps the marker and commits no page.
+        store.backfill_page_commits.store(0, Ordering::SeqCst);
+        let (page, next) = store.list_after(10, None).await.unwrap();
+        let listed: Vec<&str> = page.iter().map(|entity| entity.id.as_str()).collect();
+        assert_eq!(listed, ids.to_vec());
+        assert_eq!(next, None);
+        assert_eq!(store.backfill_page_commits.load(Ordering::SeqCst), 0);
+        assert!(
+            raw.get_bytes(&entity_backfill_marker())
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// A marker is not written for an entity that is deleted between pages.
+    #[tokio::test]
+    async fn the_entity_index_backfill_skips_an_entity_deleted_between_pages() {
+        let (store, registry, raw) = new_store().await;
+        registry.publish(schema("task", &[], vec![])).await.unwrap();
+        let ids = ["a", "b", "c", "d", "e", "f"];
+        for id in ids {
+            store
+                .create(draft(id, &["task"], vec![]), &ctx())
+                .await
+                .unwrap();
+        }
+        for id in ids {
+            raw.delete(&entity_index_key(id)).await.unwrap();
+        }
+        raw.delete(&entity_backfill_marker()).await.unwrap();
+
+        let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hook_store = store.clone();
+        let hook_fired = fired.clone();
+        store.set_backfill_page_hook(Some(Arc::new(move || {
+            let hook_store = hook_store.clone();
+            let hook_fired = hook_fired.clone();
+            Box::pin(async move {
+                if !hook_fired.swap(true, Ordering::SeqCst) {
+                    hook_store.delete("e", 1, false, &ctx()).await.unwrap();
+                }
+            })
+        })));
+
+        let (page, next) = store.list_after(10, None).await.unwrap();
+        store.set_backfill_page_hook(None);
+
+        let listed: Vec<&str> = page.iter().map(|entity| entity.id.as_str()).collect();
+
+        assert!(fired.load(Ordering::SeqCst));
+        assert_eq!(listed, vec!["a", "b", "c", "d", "f"]);
+        assert_eq!(next, None);
+        assert!(
+            raw.get_bytes(&entity_index_key("e"))
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert!(
             raw.get_bytes(&entity_backfill_marker())
                 .await
@@ -3863,7 +4758,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        store.delete("b", 1, &ctx()).await.unwrap();
+        store.delete("b", 1, false, &ctx()).await.unwrap();
         for id in ["a", "b"] {
             raw.delete(&entity_index_key(id)).await.unwrap();
         }
@@ -3943,7 +4838,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_by_schema_after_skips_exactly_the_cursor() {
+    async fn list_by_schema_after_skips_exactly_the_cursor_and_returns_no_cursor() {
         let (store, registry, _raw) = new_store().await;
         registry.publish(schema("task", &[], vec![])).await.unwrap();
         for id in ["a", "ab", "b"] {
@@ -3960,7 +4855,47 @@ mod tests {
         let ids: Vec<&str> = page.iter().map(|entity| entity.id.as_str()).collect();
 
         assert_eq!(ids, vec!["ab", "b"]);
+        assert_eq!(next, None);
+    }
+
+    #[tokio::test]
+    async fn list_by_schema_after_full_final_page_returns_no_cursor() {
+        let (store, registry, _raw) = new_store().await;
+        registry.publish(schema("task", &[], vec![])).await.unwrap();
+        for id in ["a", "b", "c", "d"] {
+            store
+                .create(draft(id, &["task"], vec![]), &ctx())
+                .await
+                .unwrap();
+        }
+
+        let (first, next) = store.list_by_schema_after("task", 2, None).await.unwrap();
+        let first_ids: Vec<&str> = first.iter().map(|entity| entity.id.as_str()).collect();
+        assert_eq!(first_ids, vec!["a", "b"]);
         assert_eq!(next.as_deref(), Some("b"));
+
+        let (second, next) = store
+            .list_by_schema_after("task", 2, next.as_deref())
+            .await
+            .unwrap();
+        let second_ids: Vec<&str> = second.iter().map(|entity| entity.id.as_str()).collect();
+        assert_eq!(second_ids, vec!["c", "d"]);
+        assert_eq!(next, None);
+
+        let mut all: Vec<String> = first.into_iter().map(|entity| entity.id).collect();
+        all.extend(second.into_iter().map(|entity| entity.id));
+        assert_eq!(all, vec!["a", "b", "c", "d"]);
+    }
+
+    #[tokio::test]
+    async fn list_by_schema_after_empty_store_returns_no_cursor() {
+        let (store, registry, _raw) = new_store().await;
+        registry.publish(schema("task", &[], vec![])).await.unwrap();
+
+        let (page, next) = store.list_by_schema_after("task", 2, None).await.unwrap();
+
+        assert!(page.is_empty());
+        assert_eq!(next, None);
     }
 
     #[tokio::test]
@@ -4500,7 +5435,7 @@ mod tests {
         assert_eq!(name.new, Some(tagged(&s("Bob"))));
 
         let delete_ctx = WriteContext::new("carol");
-        store.delete("e1", 2, &delete_ctx).await.unwrap();
+        store.delete("e1", 2, false, &delete_ctx).await.unwrap();
 
         let events = feed.events();
         assert_eq!(events.len(), 3);
@@ -4639,7 +5574,7 @@ mod tests {
             .await
             .unwrap();
 
-        store.delete("e1", 1, &ctx()).await.unwrap();
+        store.delete("e1", 1, false, &ctx()).await.unwrap();
 
         let events = feed.events();
         assert_eq!(events.len(), 2);
@@ -4754,7 +5689,7 @@ mod tests {
         assert_eq!(store.outbox_count().await.unwrap(), 0);
 
         feed.fail_next(1);
-        let change = store.delete("e1", 1, &ctx()).await.unwrap();
+        let change = store.delete("e1", 1, false, &ctx()).await.unwrap();
 
         assert_eq!(change.after, None);
         assert!(store.get("e1").await.unwrap().is_none());
@@ -4877,7 +5812,7 @@ mod tests {
             .unwrap();
         assert_eq!(store.outbox_count().await.unwrap(), 2);
 
-        store.delete("e1", 2, &ctx()).await.unwrap();
+        store.delete("e1", 2, false, &ctx()).await.unwrap();
         assert_eq!(store.outbox_count().await.unwrap(), 3);
 
         assert_eq!(outbox_keys(&raw).await.len(), 3);
@@ -4958,6 +5893,151 @@ mod tests {
         assert_eq!(store.flush_outbox().await.unwrap(), 3);
         assert_eq!(store.outbox_count().await.unwrap(), 0);
         assert_eq!(pending_counter(&raw).await, Some(0));
+    }
+
+    /// Builds a store with one pending outbox row for each id.
+    async fn outbox_store(ids: &[&str]) -> (EntityStore, Arc<RecordingFeed>, OxKvStore) {
+        let (store, registry, raw) = new_store().await;
+        registry
+            .publish(schema("person", &[], vec![]))
+            .await
+            .unwrap();
+        let feed = Arc::new(RecordingFeed::new());
+        feed.set_failing(true);
+        let store = store.with_change_sink(feed.clone());
+        for id in ids {
+            store
+                .create(draft(id, &["person"], vec![]), &ctx())
+                .await
+                .unwrap();
+        }
+        (store, feed, raw)
+    }
+
+    #[tokio::test]
+    async fn flush_outbox_delivers_five_rows_in_key_order_in_batches_of_two() {
+        let ids = ["e1", "e2", "e3", "e4", "e5"];
+        let (store, feed, raw) = outbox_store(&ids).await;
+        let keys = outbox_keys(&raw).await;
+        assert_eq!(keys.len(), 5);
+
+        feed.set_failing(false);
+        assert_eq!(store.flush_outbox().await.unwrap(), 5);
+
+        let events = feed.events();
+        let delivered: Vec<String> = events
+            .iter()
+            .map(|event| outbox_key(&event.event_id))
+            .collect();
+        assert_eq!(delivered, keys);
+        assert!(outbox_keys(&raw).await.is_empty());
+        assert_eq!(pending_counter(&raw).await, Some(0));
+    }
+
+    #[tokio::test]
+    async fn flush_outbox_delivers_every_row_across_more_than_one_batch() {
+        let ids = ["e1", "e2", "e3", "e4", "e5", "e6", "e7"];
+        let (store, feed, raw) = outbox_store(&ids).await;
+        let keys = outbox_keys(&raw).await;
+        assert_eq!(keys.len(), 7);
+
+        feed.set_failing(false);
+        assert_eq!(store.flush_outbox().await.unwrap(), 7);
+
+        let events = feed.events();
+        let delivered: Vec<String> = events
+            .iter()
+            .map(|event| outbox_key(&event.event_id))
+            .collect();
+        assert_eq!(delivered, keys);
+        assert!(outbox_keys(&raw).await.is_empty());
+        assert_eq!(pending_counter(&raw).await, Some(0));
+    }
+
+    #[tokio::test]
+    async fn a_feed_failure_on_the_second_row_keeps_later_rows() {
+        let ids = ["e1", "e2", "e3", "e4", "e5"];
+        let (store, feed, raw) = outbox_store(&ids).await;
+        let keys = outbox_keys(&raw).await;
+
+        feed.set_failing(false);
+        feed.fail_after(1);
+        let result = store.flush_outbox().await;
+
+        assert!(matches!(result, Err(EntityError::Feed(_))));
+        assert_eq!(feed.events().len(), 1);
+        assert_eq!(outbox_keys(&raw).await, keys[1..]);
+        assert_eq!(pending_counter(&raw).await, Some(4));
+    }
+
+    #[tokio::test]
+    async fn a_counter_write_failure_keeps_the_row_and_the_counter() {
+        use oxkv::Hooks as _;
+
+        struct RejectCounterKey;
+
+        #[async_trait::async_trait]
+        impl oxkv::Validator for RejectCounterKey {
+            async fn validate(
+                &self,
+                _ctx: &dyn oxkv::StoreView,
+                key: &str,
+                _value: &[u8],
+            ) -> Result<(), oxkv::StoreError> {
+                if key == OUTBOX_PENDING_KEY {
+                    return Err(oxkv::StoreError::Other("write rejected".to_string()));
+                }
+                Ok(())
+            }
+        }
+
+        let ids = ["e1", "e2"];
+        let (store, feed, raw) = outbox_store(&ids).await;
+        let keys = outbox_keys(&raw).await;
+
+        feed.set_failing(false);
+        raw.add_validator(RejectCounterKey);
+        let result = store.flush_outbox().await;
+
+        assert!(matches!(result, Err(EntityError::Store(_))));
+        assert_eq!(feed.events().len(), 1);
+        assert_eq!(outbox_keys(&raw).await, keys);
+        assert_eq!(pending_counter(&raw).await, Some(2));
+    }
+
+    #[tokio::test]
+    async fn a_delete_failure_keeps_the_row_and_the_counter() {
+        let ids = ["e1", "e2"];
+        let (store, feed, raw) = outbox_store(&ids).await;
+        let keys = outbox_keys(&raw).await;
+
+        feed.set_failing(false);
+        store
+            .outbox_delete_failures
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        let result = store.flush_outbox().await;
+
+        assert!(matches!(result, Err(EntityError::Store(_))));
+        assert_eq!(feed.events().len(), 1);
+        assert_eq!(outbox_keys(&raw).await, keys);
+        assert_eq!(pending_counter(&raw).await, Some(2));
+    }
+
+    #[tokio::test]
+    async fn flush_outbox_reads_at_most_two_rows_at_one_time() {
+        let ids = ["e1", "e2", "e3", "e4", "e5"];
+        let (store, feed, _raw) = outbox_store(&ids).await;
+
+        feed.set_failing(false);
+        assert_eq!(store.flush_outbox().await.unwrap(), 5);
+
+        assert_eq!(OUTBOX_FLUSH_BATCH, 2);
+        assert_eq!(
+            store
+                .outbox_batch_peak
+                .load(std::sync::atomic::Ordering::SeqCst),
+            OUTBOX_FLUSH_BATCH
+        );
     }
 
     #[tokio::test]
@@ -5248,8 +6328,8 @@ mod tests {
         create_task(&store, "e1", 100).await;
         create_task(&store, "e2", 200).await;
 
-        store.delete("e1", 1, &ctx()).await.unwrap();
-        store.delete("e2", 1, &ctx()).await.unwrap();
+        store.delete("e1", 1, false, &ctx()).await.unwrap();
+        store.delete("e2", 1, false, &ctx()).await.unwrap();
 
         let keys = store.time_keys().await.unwrap();
         assert_eq!(keys, vec!["due".to_string()]);
@@ -5334,6 +6414,55 @@ mod tests {
         );
     }
 
+    /// The time key backfill writes every distinct key across several pages.
+    ///
+    /// The page counter shows that more than one page committed.
+    /// It does not observe the lock state directly. The lock release is a
+    /// structural property of the page loop.
+    #[tokio::test]
+    async fn time_keys_backfills_more_keys_than_one_page() {
+        let (store, registry, raw) = new_store().await;
+        registry.publish(schema("task", &[], vec![])).await.unwrap();
+        let keys = ["alpha", "beta", "delta", "epsilon", "gamma"];
+        for (offset, key) in keys.iter().enumerate() {
+            raw.set_bytes(&time_index_key(key, offset as i64, "e1"), b"")
+                .await
+                .unwrap();
+        }
+        assert!(
+            !all_keys(&raw)
+                .await
+                .iter()
+                .any(|key| key.starts_with(TIME_KEY_INDEX_PREFIX))
+        );
+        store.backfill_page_commits.store(0, Ordering::SeqCst);
+
+        let found = store.time_keys().await.unwrap();
+
+        assert_eq!(found, keys.map(str::to_string).to_vec());
+        assert!(store.backfill_page_commits.load(Ordering::SeqCst) > 1);
+        let markers: Vec<String> = all_keys(&raw)
+            .await
+            .into_iter()
+            .filter(|key| key.starts_with(TIME_KEY_INDEX_PREFIX))
+            .collect();
+        assert_eq!(markers.len(), keys.len());
+
+        // A second call keeps the marker and commits no page.
+        store.backfill_page_commits.store(0, Ordering::SeqCst);
+        assert_eq!(
+            store.time_keys().await.unwrap(),
+            keys.map(str::to_string).to_vec()
+        );
+        assert_eq!(store.backfill_page_commits.load(Ordering::SeqCst), 0);
+        assert!(
+            raw.get_bytes(&time_key_backfill_marker())
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
     #[tokio::test]
     async fn list_due_returns_due_entities_in_time_order_with_a_limit() {
         let (store, registry, raw) = new_store().await;
@@ -5409,7 +6538,7 @@ mod tests {
         assert!(!keys.contains(&time_index_key("due", 100, "e1")));
         assert!(keys.contains(&time_index_key("due", 200, "e1")));
 
-        store.delete("e1", 2, &ctx()).await.unwrap();
+        store.delete("e1", 2, false, &ctx()).await.unwrap();
         let keys = all_keys(&raw).await;
         assert!(
             keys.iter().all(|key| !key.starts_with(TIME_INDEX_PREFIX)),
@@ -5569,7 +6698,7 @@ mod tests {
     async fn a_timer_marker_for_a_deleted_entity_is_not_written() {
         let (store, _raw) = timer_store().await;
         create_task(&store, "e1", 100).await;
-        store.delete("e1", 1, &ctx()).await.unwrap();
+        store.delete("e1", 1, false, &ctx()).await.unwrap();
 
         assert!(!store.mark_timer_fired("e1", "due", 100).await.unwrap());
         assert!(!store.is_timer_fired("e1", "due", 100).await.unwrap());
@@ -5582,6 +6711,65 @@ mod tests {
 
         assert!(!store.mark_timer_fired("e1", "due", 999).await.unwrap());
         assert!(!store.is_timer_fired("e1", "due", 999).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn retire_timer_removes_the_time_row_and_writes_the_marker() {
+        let (store, raw) = timer_store().await;
+        create_task(&store, "e1", 100).await;
+        let keys = all_keys(&raw).await;
+        assert!(keys.contains(&time_index_key("due", 100, "e1")));
+        assert!(!keys.contains(&timer_marker_key("e1", "due", 100)));
+
+        assert!(store.retire_timer("e1", "due", 100).await.unwrap());
+
+        let keys = all_keys(&raw).await;
+        assert!(!keys.contains(&time_index_key("due", 100, "e1")));
+        assert!(keys.contains(&timer_marker_key("e1", "due", 100)));
+        assert!(store.is_timer_fired("e1", "due", 100).await.unwrap());
+        assert!(store.list_due("due", 100, 100).await.unwrap().is_empty());
+        let bytes = raw
+            .get_bytes(&timer_marker_key("e1", "due", 100))
+            .await
+            .unwrap()
+            .unwrap();
+        let fired_at: i64 = serde_json::from_slice(&bytes).unwrap();
+        assert!(fired_at > 0);
+    }
+
+    #[tokio::test]
+    async fn retire_timer_returns_false_after_the_value_changes() {
+        let (store, raw) = timer_store().await;
+        create_task(&store, "e1", 100).await;
+        let first = store.list_due("due", 100, 100).await.unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].id, "e1");
+
+        store
+            .update("e1", 1, patch(vec![("due", Some(t(200)))]), &ctx())
+            .await
+            .unwrap();
+
+        assert!(!store.retire_timer("e1", "due", 100).await.unwrap());
+        assert!(!store.is_timer_fired("e1", "due", 100).await.unwrap());
+
+        let keys = all_keys(&raw).await;
+        assert!(!keys.contains(&time_index_key("due", 100, "e1")));
+        assert!(keys.contains(&time_index_key("due", 200, "e1")));
+
+        let next = store.list_due("due", 200, 100).await.unwrap();
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].attributes.get("due"), Some(&t(200)));
+    }
+
+    #[tokio::test]
+    async fn retire_timer_for_an_absent_entity_writes_nothing() {
+        let (store, raw) = timer_store().await;
+        let before = all_keys(&raw).await;
+
+        assert!(!store.retire_timer("missing", "due", 100).await.unwrap());
+
+        assert_eq!(all_keys(&raw).await, before);
     }
 
     #[tokio::test]
@@ -5624,7 +6812,7 @@ mod tests {
         assert!(store.is_timer_fired("e1", "due", 200).await.unwrap());
 
         // A delete removes every marker of the entity.
-        store.delete("e1", 3, &ctx()).await.unwrap();
+        store.delete("e1", 3, false, &ctx()).await.unwrap();
         assert!(!store.is_timer_fired("e1", "due", 200).await.unwrap());
     }
 
@@ -6494,10 +7682,10 @@ mod tests {
         assert!(outbox_keys(&raw).await.is_empty());
     }
 
-    async fn reference_store(check: bool) -> (EntityStore, SchemaRegistry) {
+    async fn reference_store(check: bool) -> (EntityStore, SchemaRegistry, OxKvStore) {
         let registry = SchemaRegistry::new(build_test_store(&test_prefix("eav-ref-schema")).await);
         let raw = build_test_store(&test_prefix("eav-ref")).await;
-        let store = EntityStore::new(raw, registry.clone()).with_entity_ref_check(check);
+        let store = EntityStore::new(raw.clone(), registry.clone()).with_entity_ref_check(check);
         registry
             .publish(schema(
                 "customer",
@@ -6514,7 +7702,15 @@ mod tests {
             ))
             .await
             .unwrap();
-        (store, registry)
+        (store, registry, raw)
+    }
+
+    async fn ref_markers(raw: &OxKvStore) -> Vec<String> {
+        all_keys(raw)
+            .await
+            .into_iter()
+            .filter(|key| key.starts_with(REF_INDEX_PREFIX))
+            .collect()
     }
 
     fn customer(id: &str) -> EntityDraft {
@@ -6531,7 +7727,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_dangling_reference_is_rejected_on_create() {
-        let (store, _) = reference_store(true).await;
+        let (store, _, _) = reference_store(true).await;
 
         let error = store
             .create(order("o1", "missing"), &ctx())
@@ -6551,7 +7747,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_reference_to_an_existing_entity_and_a_self_reference_are_accepted() {
-        let (store, registry) = reference_store(true).await;
+        let (store, registry, _) = reference_store(true).await;
         store.create(customer("c1"), &ctx()).await.unwrap();
 
         store.create(order("o1", "c1"), &ctx()).await.unwrap();
@@ -6584,7 +7780,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_update_to_a_missing_reference_keeps_the_old_row() {
-        let (store, _) = reference_store(true).await;
+        let (store, _, _) = reference_store(true).await;
         store.create(customer("c1"), &ctx()).await.unwrap();
         store.create(order("o1", "c1"), &ctx()).await.unwrap();
         let patch = EntityPatch {
@@ -6609,7 +7805,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_check_can_be_turned_off_but_the_target_form_is_still_checked() {
-        let (store, _) = reference_store(false).await;
+        let (store, _, _) = reference_store(false).await;
 
         store.create(order("o1", "missing"), &ctx()).await.unwrap();
         let error = store
@@ -6623,7 +7819,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_default_reference_to_a_missing_entity_is_rejected() {
-        let (store, registry) = reference_store(true).await;
+        let (store, registry, _) = reference_store(true).await;
         registry
             .publish(schema(
                 "ticket",
@@ -6651,11 +7847,11 @@ mod tests {
 
     #[tokio::test]
     async fn a_delete_does_not_remove_a_reference() {
-        let (store, _) = reference_store(true).await;
+        let (store, _, _) = reference_store(true).await;
         store.create(customer("c1"), &ctx()).await.unwrap();
         store.create(order("o1", "c1"), &ctx()).await.unwrap();
 
-        store.delete("c1", 1, &ctx()).await.unwrap();
+        store.delete("c1", 1, true, &ctx()).await.unwrap();
 
         let stored = store.get("o1").await.unwrap().unwrap();
         assert_eq!(
@@ -6668,10 +7864,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_migration_that_introduces_a_dangling_reference_writes_no_row() {
-        let (store, registry) = reference_store(true).await;
+        let (store, registry, _) = reference_store(true).await;
         store.create(customer("c1"), &ctx()).await.unwrap();
         store.create(order("o1", "c1"), &ctx()).await.unwrap();
-        store.delete("c1", 1, &ctx()).await.unwrap();
+        store.delete("c1", 1, true, &ctx()).await.unwrap();
         registry
             .publish(schema(
                 "order",
@@ -6692,5 +7888,266 @@ mod tests {
         let stored = store.get("o1").await.unwrap().unwrap();
         assert_eq!(stored.version, 1);
         assert_eq!(stored.schemas[0].version, 1);
+    }
+
+    #[tokio::test]
+    async fn a_referenced_entity_delete_is_blocked_and_changes_nothing() {
+        let (store, _, _) = reference_store(true).await;
+        let customer_before = store
+            .create(customer("c1"), &ctx())
+            .await
+            .unwrap()
+            .after
+            .unwrap();
+        let order_before = store
+            .create(order("o1", "c1"), &ctx())
+            .await
+            .unwrap()
+            .after
+            .unwrap();
+
+        let error = store.delete("c1", 1, false, &ctx()).await.unwrap_err();
+
+        match &error {
+            EntityError::Referenced { id, count } => {
+                assert_eq!(id, "c1");
+                assert_eq!(*count, 1);
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+        assert_eq!(store.get("c1").await.unwrap(), Some(customer_before));
+        assert_eq!(store.get("o1").await.unwrap(), Some(order_before));
+    }
+
+    #[tokio::test]
+    async fn a_forced_delete_removes_the_entity_and_keeps_the_source_reference() {
+        let (store, _, raw) = reference_store(true).await;
+        store.create(customer("c1"), &ctx()).await.unwrap();
+        store.create(order("o1", "c1"), &ctx()).await.unwrap();
+
+        let change = store.delete("c1", 1, true, &ctx()).await.unwrap();
+
+        assert_eq!(
+            change.before.map(|entity| entity.id),
+            Some("c1".to_string())
+        );
+        assert!(change.after.is_none());
+        assert!(store.get("c1").await.unwrap().is_none());
+        let stored = store.get("o1").await.unwrap().unwrap();
+        assert_eq!(
+            stored.attributes.get("customer"),
+            Some(&AttributeValue::EntityRef("c1".to_string()))
+        );
+        assert!(
+            ref_markers(&raw)
+                .await
+                .contains(&"idx:ref:c1:o1:customer".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_self_reference_does_not_block_its_own_delete() {
+        let (store, registry, _) = reference_store(true).await;
+        registry
+            .publish(schema(
+                "node",
+                &[],
+                vec![attr("parent", AttributeType::EntityRef)],
+            ))
+            .await
+            .unwrap();
+        store
+            .create(
+                draft(
+                    "n1",
+                    &["node"],
+                    vec![("parent", AttributeValue::EntityRef("n1".to_string()))],
+                ),
+                &ctx(),
+            )
+            .await
+            .unwrap();
+
+        store.delete("n1", 1, false, &ctx()).await.unwrap();
+
+        assert!(store.get("n1").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn an_update_that_removes_a_reference_removes_the_marker() {
+        let (store, _, raw) = reference_store(true).await;
+        store.create(customer("c1"), &ctx()).await.unwrap();
+        store.create(order("o1", "c1"), &ctx()).await.unwrap();
+
+        store
+            .update("o1", 1, patch(vec![("customer", None)]), &ctx())
+            .await
+            .unwrap();
+
+        assert!(ref_markers(&raw).await.is_empty());
+        store.delete("c1", 1, false, &ctx()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_update_that_points_to_a_new_target_moves_the_marker() {
+        let (store, _, raw) = reference_store(true).await;
+        store.create(customer("c1"), &ctx()).await.unwrap();
+        store.create(customer("c2"), &ctx()).await.unwrap();
+        store.create(order("o1", "c1"), &ctx()).await.unwrap();
+
+        store
+            .update(
+                "o1",
+                1,
+                patch(vec![(
+                    "customer",
+                    Some(AttributeValue::EntityRef("c2".to_string())),
+                )]),
+                &ctx(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            ref_markers(&raw).await,
+            vec!["idx:ref:c2:o1:customer".to_string()]
+        );
+        store.delete("c1", 1, false, &ctx()).await.unwrap();
+        let error = store.delete("c2", 1, false, &ctx()).await.unwrap_err();
+        assert!(matches!(error, EntityError::Referenced { count: 1, .. }));
+    }
+
+    #[tokio::test]
+    async fn deleting_the_source_removes_its_outgoing_marker() {
+        let (store, _, raw) = reference_store(true).await;
+        store.create(customer("c1"), &ctx()).await.unwrap();
+        store.create(order("o1", "c1"), &ctx()).await.unwrap();
+
+        store.delete("o1", 1, false, &ctx()).await.unwrap();
+
+        assert!(ref_markers(&raw).await.is_empty());
+        store.delete("c1", 1, false, &ctx()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn two_referrers_give_a_count_and_the_message_names_no_referrer() {
+        let (store, _, _) = reference_store(true).await;
+        store.create(customer("c1"), &ctx()).await.unwrap();
+        store.create(order("o1", "c1"), &ctx()).await.unwrap();
+        store.create(order("o2", "c1"), &ctx()).await.unwrap();
+
+        let error = store.delete("c1", 1, false, &ctx()).await.unwrap_err();
+
+        assert!(matches!(error, EntityError::Referenced { count: 2, .. }));
+        let message = error.to_string();
+        assert!(message.contains("c1"), "{message}");
+        assert!(message.contains('2'), "{message}");
+        assert!(!message.contains("o1"), "{message}");
+        assert!(!message.contains("o2"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn the_first_delete_backfills_the_markers_for_an_old_store() {
+        let (store, _, raw) = reference_store(true).await;
+        store.create(customer("c1"), &ctx()).await.unwrap();
+        store.create(order("o1", "c1"), &ctx()).await.unwrap();
+        for key in all_keys(&raw).await {
+            if key.starts_with(REF_INDEX_PREFIX) {
+                raw.delete(&key).await.unwrap();
+            }
+        }
+        raw.delete(&ref_backfill_marker()).await.unwrap();
+        assert!(ref_markers(&raw).await.is_empty());
+
+        let error = store.delete("c1", 1, false, &ctx()).await.unwrap_err();
+
+        assert!(matches!(error, EntityError::Referenced { count: 1, .. }));
+        assert!(
+            raw.get_bytes(&ref_backfill_marker())
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            ref_markers(&raw)
+                .await
+                .contains(&"idx:ref:c1:o1:customer".to_string())
+        );
+    }
+
+    /// The ref backfill writes every marker across several pages.
+    ///
+    /// The page counter shows that more than one page committed.
+    /// It does not observe the lock state directly. The lock release is a
+    /// structural property of the page loop.
+    #[tokio::test]
+    async fn the_first_delete_backfills_more_entities_than_one_page() {
+        let (store, _, raw) = reference_store(true).await;
+        let targets = ["c1", "c2", "c3", "c4", "c5"];
+        for target in targets {
+            store.create(customer(target), &ctx()).await.unwrap();
+        }
+        for (index, target) in targets.iter().enumerate() {
+            let order_id = format!("o{}", index + 1);
+            store
+                .create(order(&order_id, target), &ctx())
+                .await
+                .unwrap();
+        }
+        for key in all_keys(&raw).await {
+            if key.starts_with(REF_INDEX_PREFIX) {
+                raw.delete(&key).await.unwrap();
+            }
+        }
+        raw.delete(&ref_backfill_marker()).await.unwrap();
+        assert!(ref_markers(&raw).await.is_empty());
+        store.backfill_page_commits.store(0, Ordering::SeqCst);
+
+        let error = store.delete("c1", 1, false, &ctx()).await.unwrap_err();
+
+        assert!(matches!(error, EntityError::Referenced { count: 1, .. }));
+        assert!(store.backfill_page_commits.load(Ordering::SeqCst) > 1);
+        for (index, target) in targets.iter().enumerate() {
+            let expected = format!("idx:ref:{target}:o{}:customer", index + 1);
+            assert!(ref_markers(&raw).await.contains(&expected));
+        }
+
+        // A present marker keeps its value and commits no page.
+        store.create(customer("c9"), &ctx()).await.unwrap();
+        store.backfill_page_commits.store(0, Ordering::SeqCst);
+        store.delete("c9", 1, false, &ctx()).await.unwrap();
+        assert_eq!(store.backfill_page_commits.load(Ordering::SeqCst), 0);
+        assert!(
+            raw.get_bytes(&ref_backfill_marker())
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_non_reference_attribute_writes_no_marker() {
+        let (store, _, raw) = reference_store(true).await;
+
+        store.create(customer("c1"), &ctx()).await.unwrap();
+
+        assert!(ref_markers(&raw).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_forced_delete_of_an_unreferenced_entity_matches_a_normal_delete() {
+        let (store, _, _) = reference_store(true).await;
+        let created = store
+            .create(customer("c1"), &ctx())
+            .await
+            .unwrap()
+            .after
+            .unwrap();
+
+        let change = store.delete("c1", 1, true, &ctx()).await.unwrap();
+
+        assert_eq!(change.before, Some(created));
+        assert!(change.after.is_none());
+        assert!(store.get("c1").await.unwrap().is_none());
     }
 }

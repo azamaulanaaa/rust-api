@@ -3,7 +3,8 @@
 //! Secrets may also arrive through environment variables, because secret
 //! managers inject them there. A variable that is present and not empty wins
 //! over the value in the file. See [`ENV_CLIENT_SECRET`],
-//! [`ENV_S3_ACCESS_KEY_ID`], and [`ENV_S3_SECRET_ACCESS_KEY`].
+//! [`ENV_S3_ACCESS_KEY_ID`], [`ENV_S3_SECRET_ACCESS_KEY`], and
+//! [`ENV_EAV_WEBHOOK_SIGNING_SECRET`].
 
 use std::{fs, path::Path, time::Duration};
 
@@ -78,6 +79,12 @@ pub const ENV_CAPABILITY_SECRET: &str = "RUST_API_CAPABILITY_SECRET";
 /// A value that is present and not empty wins over
 /// `capability.previous_secret`.
 pub const ENV_CAPABILITY_SECRET_PREV: &str = "RUST_API_CAPABILITY_SECRET_PREV";
+
+/// Environment variable that overrides the webhook signing secret.
+///
+/// A value that is present and not empty wins over
+/// `eav.webhook_signing_secret`.
+pub const ENV_EAV_WEBHOOK_SIGNING_SECRET: &str = "RUST_API_EAV_WEBHOOK_SIGNING_SECRET";
 
 /// Environment variable that overrides the browser origins allowed by CORS.
 ///
@@ -196,6 +203,10 @@ fn apply_overrides_from(config: &mut Config, var: impl Fn(&str) -> Option<String
     config.capability.previous_secret = prefer_env_opt(
         var(ENV_CAPABILITY_SECRET_PREV),
         config.capability.previous_secret.take(),
+    );
+    config.eav.webhook_signing_secret = prefer_env_opt(
+        var(ENV_EAV_WEBHOOK_SIGNING_SECRET),
+        config.eav.webhook_signing_secret.take(),
     );
     if let Some(raw) = var(ENV_ALLOWED_ORIGINS)
         && !raw.trim().is_empty()
@@ -342,11 +353,27 @@ impl Config {
         if self.eav.execution_retention_secs == 0 {
             anyhow::bail!("eav.execution_retention_secs must be greater than 0");
         }
+        if self.eav.retention_below_safe_floor() {
+            tracing::warn!(
+                field = "eav.execution_retention_secs",
+                value = self.eav.execution_retention_secs,
+                recommended = MIN_SAFE_RETENTION_SECS,
+                "eav.execution_retention_secs is below the safe floor. Set it to at least \
+                 {MIN_SAFE_RETENTION_SECS} seconds (7 days). A shorter window can delete a \
+                 marker before a replay reads it, so the action can run twice."
+            );
+        }
         if self.eav.timer_interval_ms == 0 {
             anyhow::bail!("eav.timer_interval_ms must be greater than 0");
         }
         if self.eav.timer_batch == 0 {
             anyhow::bail!("eav.timer_batch must be greater than 0");
+        }
+        if !(1..=64).contains(&self.eav.max_causation_depth) {
+            anyhow::bail!(
+                "eav.max_causation_depth must be within 1..=64 (got {})",
+                self.eav.max_causation_depth
+            );
         }
         for host in &self.eav.webhook_allowed_hosts {
             validate_webhook_allowed_host(host)?;
@@ -550,6 +577,15 @@ impl LimitsConfig {
     }
 }
 
+/// Minimum safe retention for execution markers, in seconds.
+///
+/// The value is 7 days.
+/// A shorter window can delete a marker before a rule replay reads it.
+/// The replay then runs the action a second time.
+/// The config validation warns when the value is below this floor.
+/// It does not reject the value.
+pub const MIN_SAFE_RETENTION_SECS: u64 = 604_800;
+
 /// Settings for the optional EAV background runtime.
 ///
 /// The runtime is off by default.
@@ -577,6 +613,14 @@ pub struct EavConfig {
     /// Largest number of due entities to read for each time index key.
     #[serde(default = "default_eav_timer_batch")]
     pub timer_batch: usize,
+    /// Maximum causation depth that can run a rule action.
+    ///
+    /// The maximum is inclusive.
+    /// An event with a greater depth runs no action.
+    /// The value must be within `1..=64`.
+    /// The default is 8.
+    #[serde(default = "default_eav_max_causation_depth")]
+    pub max_causation_depth: u32,
     /// Checks that each `EntityRef` target exists on a write.
     ///
     /// The default is `true`.
@@ -621,6 +665,7 @@ impl Default for EavConfig {
     /// The marker cleanup runs every hour.
     /// Execution markers stay for 30 days.
     /// The timer pass runs every second and reads 100 entities for each key.
+    /// The maximum causation depth is 8.
     /// A write checks that each `EntityRef` target exists.
     /// The webhook allowlist is empty.
     /// Webhook signing is off.
@@ -635,6 +680,7 @@ impl Default for EavConfig {
             execution_retention_secs: default_eav_execution_retention_secs(),
             timer_interval_ms: default_eav_timer_interval_ms(),
             timer_batch: default_eav_timer_batch(),
+            max_causation_depth: default_eav_max_causation_depth(),
             check_entity_refs: default_true(),
             webhook_allowed_hosts: Vec::new(),
             webhook_signing_secret: None,
@@ -645,6 +691,15 @@ impl Default for EavConfig {
 }
 
 impl EavConfig {
+    /// Returns true when the marker retention is below
+    /// [`MIN_SAFE_RETENTION_SECS`].
+    ///
+    /// The rule uses this helper.
+    /// A test can then check the rule without a log capture.
+    pub fn retention_below_safe_floor(&self) -> bool {
+        self.execution_retention_secs < MIN_SAFE_RETENTION_SECS
+    }
+
     /// Converts the settings into an [`EavRuntimeConfig`].
     ///
     /// [`EavRuntimeConfig`]: rust_api::eav::runtime::EavRuntimeConfig
@@ -686,6 +741,10 @@ fn default_eav_timer_interval_ms() -> u64 {
 
 fn default_eav_timer_batch() -> usize {
     100
+}
+
+fn default_eav_max_causation_depth() -> u32 {
+    8
 }
 
 fn default_eav_webhook_max_attempts() -> u32 {
@@ -788,8 +847,8 @@ mod tests {
     /// [`Config::try_from`]. The reason is that `try_from` reads
     /// `RUST_API_CLIENT_SECRET`, `RUST_API_S3_ACCESS_KEY_ID`,
     /// `RUST_API_CAPABILITY_SECRET`, `RUST_API_CAPABILITY_SECRET_PREV`,
-    /// `RUST_API_S3_SECRET_ACCESS_KEY`, and `RUST_API_ALLOWED_ORIGINS` out of
-    /// the process environment.
+    /// `RUST_API_S3_SECRET_ACCESS_KEY`, `RUST_API_EAV_WEBHOOK_SIGNING_SECRET`,
+    /// and `RUST_API_ALLOWED_ORIGINS` out of the process environment.
     ///
     /// That is a real hazard, not a theoretical one. `cargo test` inherits
     /// the developer's shell, and the run instructions in the README export
@@ -864,6 +923,7 @@ mod tests {
         assert_eq!(cfg.s3.region, "us-east-1");
         assert!(cfg.eav.check_entity_refs);
         assert!(!cfg.eav.webhook_allow_private_hosts);
+        assert_eq!(cfg.eav.max_causation_depth, 8);
     }
 
     #[test]
@@ -1244,6 +1304,7 @@ mod tests {
             ENV_S3_SECRET_ACCESS_KEY => Some("env-sk".into()),
             ENV_CAPABILITY_SECRET => Some(secret.clone()),
             ENV_CAPABILITY_SECRET_PREV => Some(secret.clone()),
+            ENV_EAV_WEBHOOK_SIGNING_SECRET => Some(secret.clone()),
             ENV_ALLOWED_ORIGINS => Some("https://env.example.com, https://env2.example.com".into()),
             #[cfg(feature = "queue-rabbitmq")]
             ENV_RABBITMQ_URL => Some("amqp://env".into()),
@@ -1258,6 +1319,10 @@ mod tests {
             Some(secret.as_str())
         );
         assert_eq!(
+            overlaid.eav.webhook_signing_secret.as_deref(),
+            Some(secret.as_str())
+        );
+        assert_eq!(
             overlaid.http.allowed_origins,
             vec!["https://env.example.com", "https://env2.example.com"]
         );
@@ -1269,6 +1334,7 @@ mod tests {
         assert_eq!(plain.s3.secret_access_key.as_deref(), Some("sk"));
         assert!(plain.capability.secret.is_none());
         assert!(plain.capability.previous_secret.is_none());
+        assert!(plain.eav.webhook_signing_secret.is_none());
         assert_eq!(plain.http.allowed_origins, vec!["https://file.example.com"]);
     }
 
@@ -1377,12 +1443,58 @@ mod tests {
         assert_eq!(cfg.eav.execution_retention_secs, 2_592_000);
         assert_eq!(cfg.eav.timer_interval_ms, 1000);
         assert_eq!(cfg.eav.timer_batch, 100);
+        assert_eq!(cfg.eav.max_causation_depth, 8);
         assert!(cfg.eav.check_entity_refs);
         assert!(cfg.eav.webhook_allowed_hosts.is_empty());
         assert!(cfg.eav.webhook_signing_secret.is_none());
         assert_eq!(cfg.eav.webhook_max_attempts, 5);
         assert!(!cfg.eav.webhook_allow_private_hosts);
         assert_eq!(cfg.eav, EavConfig::default());
+    }
+
+    #[test]
+    fn retention_below_the_safe_floor_is_detected() {
+        let mut cfg = EavConfig::default();
+
+        for value in [1, MIN_SAFE_RETENTION_SECS - 1] {
+            cfg.execution_retention_secs = value;
+            assert!(
+                cfg.retention_below_safe_floor(),
+                "value {value} must be below the safe floor"
+            );
+        }
+
+        for value in [MIN_SAFE_RETENTION_SECS, MIN_SAFE_RETENTION_SECS + 1] {
+            cfg.execution_retention_secs = value;
+            assert!(
+                !cfg.retention_below_safe_floor(),
+                "value {value} must be at or above the safe floor"
+            );
+        }
+    }
+
+    #[test]
+    fn a_retention_below_the_safe_floor_warns_but_does_not_fail() {
+        let short = MIN_SAFE_RETENTION_SECS - 1;
+        let toml = minimal_toml().replace(
+            "region = \"us-east-1\"",
+            &format!("region = \"us-east-1\"\n[eav]\nexecution_retention_secs = {short}"),
+        );
+        let cfg = parse(&toml).expect("a short retention must not fail validation");
+
+        assert_eq!(cfg.eav.execution_retention_secs, short);
+        assert!(cfg.eav.retention_below_safe_floor());
+
+        let at_floor = minimal_toml().replace(
+            "region = \"us-east-1\"",
+            &format!(
+                "region = \"us-east-1\"\n[eav]\nexecution_retention_secs = \
+                 {MIN_SAFE_RETENTION_SECS}"
+            ),
+        );
+        let cfg = parse(&at_floor).expect("the safe floor must pass validation");
+
+        assert!(!cfg.eav.retention_below_safe_floor());
     }
 
     #[test]
@@ -1393,6 +1505,7 @@ mod tests {
              outbox_interval_ms = 2500\nrule_poll_interval_ms = 50\n\
              gc_interval_ms = 9000\nexecution_retention_secs = 120\n\
              timer_interval_ms = 750\ntimer_batch = 25\n\
+             max_causation_depth = 16\n\
              check_entity_refs = false\n\
              webhook_allowed_hosts = [\"example.com\", \"example.com:8443\"]\n\
              webhook_signing_secret = \"0123456789abcdef0123456789abcdef\"\n\
@@ -1407,6 +1520,7 @@ mod tests {
         assert_eq!(cfg.eav.execution_retention_secs, 120);
         assert_eq!(cfg.eav.timer_interval_ms, 750);
         assert_eq!(cfg.eav.timer_batch, 25);
+        assert_eq!(cfg.eav.max_causation_depth, 16);
         assert!(!cfg.eav.check_entity_refs);
         assert_eq!(
             cfg.eav.webhook_allowed_hosts,
@@ -1469,6 +1583,50 @@ mod tests {
              webhook_signing_secret = \"0123456789abcdef0123456789abcdef\"",
         );
         assert!(parse(&ok).is_ok(), "a 32 byte secret must pass");
+    }
+
+    /// The webhook signing secret must work like the other secrets. An
+    /// operator can inject it from a secret manager and leave the file
+    /// without it.
+    #[test]
+    fn the_webhook_secret_environment_override_wins() {
+        let file_secret = "file-secret-0123456789abcdef01234567";
+        let env_secret = "env-secret-0123456789abcdef012345678";
+        let toml = minimal_toml().replace(
+            "region = \"us-east-1\"",
+            &format!("region = \"us-east-1\"\n[eav]\nwebhook_signing_secret = {file_secret:?}"),
+        );
+        let path = tmp_toml(&toml);
+
+        let cfg = Config::try_from_with(path.as_path(), |name| {
+            (name == ENV_EAV_WEBHOOK_SIGNING_SECRET).then(|| env_secret.to_string())
+        })
+        .expect("a valid environment secret must pass validation");
+        assert_eq!(
+            cfg.eav.webhook_signing_secret.as_deref(),
+            Some(env_secret),
+            "the environment value must win over the value in the file"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The override must not bypass the length check. A short environment
+    /// secret is a weak HMAC key, and the server must refuse to start.
+    #[test]
+    fn a_short_webhook_secret_from_the_environment_fails() {
+        let path = tmp_toml(&minimal_toml());
+
+        let err = Config::try_from_with(path.as_path(), |name| {
+            (name == ENV_EAV_WEBHOOK_SIGNING_SECRET).then(|| "short".to_string())
+        })
+        .expect_err("a short environment secret must not survive validation");
+        assert!(
+            format!("{err:?}").contains("eav.webhook_signing_secret"),
+            "the error names the offending field, got: {err:?}"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -1560,6 +1718,42 @@ mod tests {
         assert!(
             err.contains("eav.timer_batch"),
             "a zero timer batch must name its field, got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_max_causation_depth_outside_the_range_fails() {
+        for value in ["0", "65"] {
+            let toml = minimal_toml().replace(
+                "region = \"us-east-1\"",
+                &format!("region = \"us-east-1\"\n[eav]\nmax_causation_depth = {value}"),
+            );
+            let err = validation_error(&toml);
+            assert!(
+                err.contains("eav.max_causation_depth"),
+                "value {value} must name its field, got: {err}"
+            );
+        }
+
+        for value in ["1", "64"] {
+            let toml = minimal_toml().replace(
+                "region = \"us-east-1\"",
+                &format!("region = \"us-east-1\"\n[eav]\nmax_causation_depth = {value}"),
+            );
+            assert!(parse(&toml).is_ok(), "value {value} must pass");
+        }
+    }
+
+    /// The example config is the documented starting point. Its value must
+    /// agree with the default that [`EavConfig::default`] returns.
+    #[test]
+    fn the_example_config_carries_the_default_max_causation_depth() {
+        let cfg = parse(include_str!("../config.example.toml"))
+            .expect("config.example.toml must parse and validate");
+        assert_eq!(cfg.eav.max_causation_depth, 8);
+        assert_eq!(
+            cfg.eav.max_causation_depth,
+            default_eav_max_causation_depth()
         );
     }
 
