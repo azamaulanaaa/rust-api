@@ -145,6 +145,7 @@ use crate::eav::entity_error::EntityError;
 use crate::eav::error::SchemaError;
 use crate::eav::schema::{AttributeDef, AttributeType, EffectiveSchema, SchemaRef, SchemaRegistry};
 use crate::records::{AttributeChange, ChangeSink, EntityEvent, EntityEventKind, WalOp};
+use crate::rules::effect::{EffectPlan, EntityEffect};
 
 /// Key prefix for entity rows.
 const ENTITY_PREFIX: &str = "entity:";
@@ -501,6 +502,38 @@ pub struct EntityStore {
     backfill_page_hook: Arc<std::sync::Mutex<Option<BackfillPageHook>>>,
 }
 
+/// One create after validation.
+struct PreparedCreate {
+    /// The entity with version 1 and the schema defaults applied.
+    entity: Entity,
+    /// The effective schemas that the entity pins.
+    effective: Vec<EffectiveSchema>,
+    /// The merged attribute definitions.
+    merged: MergedSchema,
+}
+
+/// One update after validation.
+struct PreparedUpdate {
+    /// The entity before the update.
+    before: Entity,
+    /// The entity after the update.
+    after: Entity,
+    /// The effective schemas that the entity pins.
+    effective: Vec<EffectiveSchema>,
+    /// The merged attribute definitions.
+    merged: MergedSchema,
+}
+
+/// One delete after validation.
+struct PreparedDelete {
+    /// The entity before the delete.
+    before: Entity,
+    /// The effective schemas that the entity pins.
+    effective: Vec<EffectiveSchema>,
+    /// The merged attribute definitions.
+    merged: MergedSchema,
+}
+
 impl EntityStore {
     /// Creates an entity store over `store` with `schemas`.
     pub fn new(store: OxKvStore, schemas: SchemaRegistry) -> Self {
@@ -627,22 +660,12 @@ impl EntityStore {
         self
     }
 
-    /// Creates an entity and returns the change.
+    /// Validates one create and builds the entity.
     ///
     /// The call resolves each schema id to its latest version.
     /// It applies the schema defaults and checks every attribute.
-    /// The metadata row, the attribute rows, and all index rows commit in
-    /// one transaction.
-    /// With a feed, one outbox row commits in the same transaction.
-    /// The write succeeds when the entity rows and the outbox row commit.
-    /// A feed failure after the commit leaves the outbox row for the relay.
-    /// The call still returns success.
-    /// The first version is 1.
-    pub async fn create(
-        &self,
-        draft: EntityDraft,
-        ctx: &WriteContext,
-    ) -> Result<EntityChange, EntityError> {
+    /// The call writes no row.
+    async fn prepare_create(&self, draft: EntityDraft) -> Result<PreparedCreate, EntityError> {
         validate_name("entity id", &draft.id)?;
         let effective = self.resolve_schemas(&draft.schemas).await?;
         let merged = merge_schemas(&effective)?;
@@ -662,24 +685,260 @@ impl EntityStore {
             created_at: now,
             updated_at: now,
         };
+        Ok(PreparedCreate {
+            entity,
+            effective,
+            merged,
+        })
+    }
+
+    /// Checks one create against the store and writes its rows.
+    ///
+    /// The call rejects an existing entity.
+    /// It checks every entity reference and every unique value.
+    /// It writes the metadata, attribute, and index rows.
+    /// The call returns the outbox row when a feed is configured.
+    async fn stage_create<S>(
+        &self,
+        store: &S,
+        prepared: &PreparedCreate,
+        ctx: &WriteContext,
+    ) -> Result<Option<(String, Vec<u8>)>, EntityError>
+    where
+        S: GetSet + ?Sized,
+    {
+        let entity = &prepared.entity;
+        if store
+            .get_bytes(&meta_key(&entity.id))
+            .await
+            .map_err(EntityError::Store)?
+            .is_some()
+        {
+            return Err(EntityError::AlreadyExists(entity.id.clone()));
+        }
+        self.check_entity_refs(
+            store,
+            &entity.id,
+            &entity.attributes,
+            &prepared.merged.attributes,
+        )
+        .await?;
+        let outbox = self.prepare_outbox(
+            None,
+            Some(entity),
+            event_schema_ids(&prepared.effective),
+            ctx,
+        )?;
+        check_unique_values(store, entity, &prepared.merged.attributes).await?;
+        put_entity_rows(store, entity, &prepared.merged).await?;
+        Ok(outbox)
+    }
+
+    /// Validates one update and builds the after state.
+    ///
+    /// The call loads the entity and checks the expected version.
+    /// It applies the patch and the schema defaults.
+    /// It checks every attribute.
+    /// The call writes no row.
+    async fn prepare_update<S>(
+        &self,
+        store: &S,
+        id: &str,
+        expected_version: u64,
+        patch: &EntityPatch,
+    ) -> Result<PreparedUpdate, EntityError>
+    where
+        S: GetSet + ?Sized,
+    {
+        validate_update_input(id, patch)?;
+        let Some(before) = load_entity(store, id).await? else {
+            return Err(EntityError::NotFound(id.to_string()));
+        };
+        if before.version != expected_version {
+            return Err(EntityError::VersionConflict);
+        }
+
+        let effective = self.resolve_refs(&before.schemas).await?;
+        let merged = merge_schemas(&effective)?;
+        validate_defaults(&merged.attributes)?;
+        let mut attributes = before.attributes.clone();
+        for (key, value) in &patch.attributes {
+            if !merged.attributes.contains_key(key) {
+                return Err(EntityError::UnknownAttribute(key.clone()));
+            }
+            match value {
+                Some(value) => {
+                    attributes.insert(key.clone(), value.clone());
+                }
+                None => {
+                    attributes.remove(key);
+                }
+            }
+        }
+        apply_defaults(&mut attributes, &merged.attributes)?;
+        check_types(&attributes, &merged.attributes)?;
+        check_required(&attributes, &merged.attributes)?;
+
+        let version = before
+            .version
+            .checked_add(1)
+            .ok_or_else(|| EntityError::Internal("entity version overflow".to_string()))?;
+        let after = Entity {
+            id: id.to_string(),
+            version,
+            schemas: before.schemas.clone(),
+            attributes,
+            created_at: before.created_at,
+            updated_at: chrono::Utc::now().timestamp(),
+        };
+        Ok(PreparedUpdate {
+            before,
+            after,
+            effective,
+            merged,
+        })
+    }
+
+    /// Checks one update against the store and writes its rows.
+    ///
+    /// The call checks every entity reference and every unique value.
+    /// It removes the rows of the before state and writes the rows of the
+    /// after state.
+    /// The call returns the outbox row when a feed is configured.
+    async fn stage_update<S>(
+        &self,
+        store: &S,
+        prepared: &PreparedUpdate,
+        ctx: &WriteContext,
+    ) -> Result<Option<(String, Vec<u8>)>, EntityError>
+    where
+        S: GetSet + ?Sized,
+    {
+        let before = &prepared.before;
+        let after = &prepared.after;
+        self.check_entity_refs(
+            store,
+            &after.id,
+            &after.attributes,
+            &prepared.merged.attributes,
+        )
+        .await?;
+        let outbox = self.prepare_outbox(
+            Some(before),
+            Some(after),
+            event_schema_ids(&prepared.effective),
+            ctx,
+        )?;
+        check_unique_values(store, after, &prepared.merged.attributes).await?;
+        delete_changed_timer_markers(store, before, after, &prepared.merged).await?;
+        delete_mutable_rows(store, before, &prepared.merged).await?;
+        delete_ref_rows(store, before, &prepared.merged).await?;
+        put_entity_rows(store, after, &prepared.merged).await?;
+        Ok(outbox)
+    }
+
+    /// Validates one delete.
+    ///
+    /// The call loads the entity and checks the expected version.
+    /// It counts the incoming references and rejects them unless `force` is
+    /// true.
+    /// The call writes no row.
+    async fn prepare_delete<S>(
+        &self,
+        store: &S,
+        id: &str,
+        expected_version: u64,
+        force: bool,
+    ) -> Result<PreparedDelete, EntityError>
+    where
+        S: GetSet + ?Sized,
+    {
+        validate_name("entity id", id)?;
+        let Some(before) = load_entity(store, id).await? else {
+            return Err(EntityError::NotFound(id.to_string()));
+        };
+        if before.version != expected_version {
+            return Err(EntityError::VersionConflict);
+        }
+        let count = count_incoming_refs(store, id).await?;
+        if count > 0 && !force {
+            return Err(EntityError::Referenced {
+                id: id.to_string(),
+                count,
+            });
+        }
+
+        let effective = self.resolve_refs(&before.schemas).await?;
+        let merged = merge_schemas(&effective)?;
+        Ok(PreparedDelete {
+            before,
+            effective,
+            merged,
+        })
+    }
+
+    /// Writes the delete rows of one prepared delete.
+    ///
+    /// The call removes the metadata, attribute, and index rows.
+    /// It returns the outbox row when a feed is configured.
+    async fn stage_delete<S>(
+        &self,
+        store: &S,
+        prepared: &PreparedDelete,
+        ctx: &WriteContext,
+    ) -> Result<Option<(String, Vec<u8>)>, EntityError>
+    where
+        S: GetSet + ?Sized,
+    {
+        let before = &prepared.before;
+        let outbox = self.prepare_outbox(
+            Some(before),
+            None,
+            event_schema_ids(&prepared.effective),
+            ctx,
+        )?;
+        delete_mutable_rows(store, before, &prepared.merged).await?;
+        delete_ref_rows(store, before, &prepared.merged).await?;
+        delete_all_timer_markers(store, before, &prepared.merged).await?;
+        for schema_id in &prepared.merged.schema_ids {
+            store
+                .delete(&schema_index_key(schema_id, &before.id))
+                .await
+                .map_err(EntityError::Store)?;
+        }
+        store
+            .delete(&entity_index_key(&before.id))
+            .await
+            .map_err(EntityError::Store)?;
+        store
+            .delete(&meta_key(&before.id))
+            .await
+            .map_err(EntityError::Store)?;
+        Ok(outbox)
+    }
+
+    /// Creates an entity and returns the change.
+    ///
+    /// The call resolves each schema id to its latest version.
+    /// It applies the schema defaults and checks every attribute.
+    /// The metadata row, the attribute rows, and all index rows commit in
+    /// one transaction.
+    /// With a feed, one outbox row commits in the same transaction.
+    /// The write succeeds when the entity rows and the outbox row commit.
+    /// A feed failure after the commit leaves the outbox row for the relay.
+    /// The call still returns success.
+    /// The first version is 1.
+    pub async fn create(
+        &self,
+        draft: EntityDraft,
+        ctx: &WriteContext,
+    ) -> Result<EntityChange, EntityError> {
+        let prepared = self.prepare_create(draft).await?;
         let pending = {
             let _write = self.write_lock.lock().await;
             let g = self.store.write().await;
             let tx = g.begin_tx().map_err(EntityError::Store)?;
-            if tx
-                .get_bytes(&meta_key(&entity.id))
-                .await
-                .map_err(EntityError::Store)?
-                .is_some()
-            {
-                return Err(EntityError::AlreadyExists(entity.id));
-            }
-            self.check_entity_refs(&tx, &entity.id, &entity.attributes, &merged.attributes)
-                .await?;
-            let outbox =
-                self.prepare_outbox(None, Some(&entity), event_schema_ids(&effective), ctx)?;
-            check_unique_values(&tx, &entity, &merged.attributes).await?;
-            put_entity_rows(&tx, &entity, &merged).await?;
+            let outbox = self.stage_create(&tx, &prepared, ctx).await?;
             if outbox.is_some() {
                 increment_outbox_pending(&tx, 1).await?;
             }
@@ -697,7 +956,7 @@ impl EntityStore {
         }
         Ok(EntityChange {
             before: None,
-            after: Some(entity),
+            after: Some(prepared.entity),
         })
     }
 
@@ -727,69 +986,16 @@ impl EntityStore {
         patch: EntityPatch,
         ctx: &WriteContext,
     ) -> Result<EntityChange, EntityError> {
-        validate_name("entity id", id)?;
-        if patch.attributes.is_empty() {
-            return Err(EntityError::Invalid("patch is empty".to_string()));
-        }
+        validate_update_input(id, &patch)?;
 
         let (change, pending) = {
             let _write = self.write_lock.lock().await;
             let g = self.store.write().await;
             let tx = g.begin_tx().map_err(EntityError::Store)?;
-            let Some(before) = load_entity(&tx, id).await? else {
-                return Err(EntityError::NotFound(id.to_string()));
-            };
-            if before.version != expected_version {
-                return Err(EntityError::VersionConflict);
-            }
-
-            let effective = self.resolve_refs(&before.schemas).await?;
-            let merged = merge_schemas(&effective)?;
-            validate_defaults(&merged.attributes)?;
-            let mut attributes = before.attributes.clone();
-            for (key, value) in &patch.attributes {
-                if !merged.attributes.contains_key(key) {
-                    return Err(EntityError::UnknownAttribute(key.clone()));
-                }
-                match value {
-                    Some(value) => {
-                        attributes.insert(key.clone(), value.clone());
-                    }
-                    None => {
-                        attributes.remove(key);
-                    }
-                }
-            }
-            apply_defaults(&mut attributes, &merged.attributes)?;
-            check_types(&attributes, &merged.attributes)?;
-            check_required(&attributes, &merged.attributes)?;
-
-            let version = before
-                .version
-                .checked_add(1)
-                .ok_or_else(|| EntityError::Internal("entity version overflow".to_string()))?;
-            let after = Entity {
-                id: id.to_string(),
-                version,
-                schemas: before.schemas.clone(),
-                attributes,
-                created_at: before.created_at,
-                updated_at: chrono::Utc::now().timestamp(),
-            };
-            self.check_entity_refs(&tx, &after.id, &after.attributes, &merged.attributes)
+            let prepared = self
+                .prepare_update(&tx, id, expected_version, &patch)
                 .await?;
-            let outbox = self.prepare_outbox(
-                Some(&before),
-                Some(&after),
-                event_schema_ids(&effective),
-                ctx,
-            )?;
-
-            check_unique_values(&tx, &after, &merged.attributes).await?;
-            delete_changed_timer_markers(&tx, &before, &after, &merged).await?;
-            delete_mutable_rows(&tx, &before, &merged).await?;
-            delete_ref_rows(&tx, &before, &merged).await?;
-            put_entity_rows(&tx, &after, &merged).await?;
+            let outbox = self.stage_update(&tx, &prepared, ctx).await?;
             if outbox.is_some() {
                 increment_outbox_pending(&tx, 1).await?;
             }
@@ -799,8 +1005,8 @@ impl EntityStore {
             tx.commit().await.map_err(EntityError::Store)?;
             (
                 EntityChange {
-                    before: Some(before),
-                    after: Some(after),
+                    before: Some(prepared.before),
+                    after: Some(prepared.after),
                 },
                 outbox.is_some(),
             )
@@ -845,36 +1051,10 @@ impl EntityStore {
             let _write = self.write_lock.lock().await;
             let g = self.store.write().await;
             let tx = g.begin_tx().map_err(EntityError::Store)?;
-            let Some(before) = load_entity(&tx, id).await? else {
-                return Err(EntityError::NotFound(id.to_string()));
-            };
-            if before.version != expected_version {
-                return Err(EntityError::VersionConflict);
-            }
-            let count = count_incoming_refs(&tx, id).await?;
-            if count > 0 && !force {
-                return Err(EntityError::Referenced {
-                    id: id.to_string(),
-                    count,
-                });
-            }
-
-            let effective = self.resolve_refs(&before.schemas).await?;
-            let merged = merge_schemas(&effective)?;
-            let outbox =
-                self.prepare_outbox(Some(&before), None, event_schema_ids(&effective), ctx)?;
-            delete_mutable_rows(&tx, &before, &merged).await?;
-            delete_ref_rows(&tx, &before, &merged).await?;
-            delete_all_timer_markers(&tx, &before, &merged).await?;
-            for schema_id in &merged.schema_ids {
-                tx.delete(&schema_index_key(schema_id, id))
-                    .await
-                    .map_err(EntityError::Store)?;
-            }
-            tx.delete(&entity_index_key(id))
-                .await
-                .map_err(EntityError::Store)?;
-            tx.delete(&meta_key(id)).await.map_err(EntityError::Store)?;
+            let prepared = self
+                .prepare_delete(&tx, id, expected_version, force)
+                .await?;
+            let outbox = self.stage_delete(&tx, &prepared, ctx).await?;
             if outbox.is_some() {
                 increment_outbox_pending(&tx, 1).await?;
             }
@@ -884,7 +1064,7 @@ impl EntityStore {
             tx.commit().await.map_err(EntityError::Store)?;
             (
                 EntityChange {
-                    before: Some(before),
+                    before: Some(prepared.before),
                     after: None,
                 },
                 outbox.is_some(),
@@ -897,6 +1077,150 @@ impl EntityStore {
             );
         }
         Ok(change)
+    }
+
+    /// Applies an effect plan as one atomic write.
+    ///
+    /// The call validates the plan before it takes a lock.
+    /// It rejects more than 100 effects.
+    /// An empty plan returns an empty result and changes nothing.
+    ///
+    /// The call holds the write lock and the store write guard for the whole
+    /// plan.
+    /// It opens one transaction and applies the effects in plan order.
+    /// A plan with a delete runs the one-time reverse-reference backfill
+    /// before the plan transaction, as the single delete call does.
+    ///
+    /// The OxKV transaction reads its own uncommitted writes.
+    /// A later effect therefore sees every earlier create, update, and delete.
+    /// The plan needs no separate overlay.
+    /// A reference to an entity that an earlier effect created is valid.
+    /// A self-reference is valid.
+    ///
+    /// Each effect uses the same validation and row helpers as the single
+    /// effect methods.
+    /// The call checks schemas, defaults, types, required fields, unique
+    /// values, entity references, and expected versions.
+    ///
+    /// With a feed, the call writes one outbox event for each effect in plan
+    /// order.
+    /// It increments `outbox-meta:pending` by the number of outbox rows in
+    /// the same transaction.
+    ///
+    /// One commit writes every entity row, index row, outbox row, and the
+    /// counter.
+    /// An error in any effect rolls back the whole plan.
+    /// No row that an effect writes commits.
+    ///
+    /// The call flushes the outbox after the commit.
+    /// A flush failure leaves the rows for the relay.
+    /// The call returns the changes in plan order.
+    pub async fn apply_effects(
+        &self,
+        plan: &EffectPlan,
+        ctx: &WriteContext,
+    ) -> Result<Vec<EntityChange>, EntityError> {
+        plan.validate_allow_empty()?;
+        if plan.is_empty() {
+            return Ok(Vec::new());
+        }
+        if plan
+            .effects()
+            .iter()
+            .any(|effect| matches!(effect, EntityEffect::Delete { .. }))
+        {
+            self.backfill_ref_index().await?;
+        }
+
+        let (changes, pending) = {
+            let _write = self.write_lock.lock().await;
+            let g = self.store.write().await;
+            let tx = g.begin_tx().map_err(EntityError::Store)?;
+            let mut changes = Vec::with_capacity(plan.len());
+            let mut outbox_rows = Vec::new();
+            for effect in plan.effects() {
+                let (change, outbox) = match effect {
+                    EntityEffect::Create {
+                        id,
+                        schemas,
+                        attributes,
+                    } => {
+                        let prepared = self
+                            .prepare_create(EntityDraft {
+                                id: id.clone(),
+                                schemas: schemas.clone(),
+                                attributes: attributes.clone(),
+                            })
+                            .await?;
+                        let outbox = self.stage_create(&tx, &prepared, ctx).await?;
+                        (
+                            EntityChange {
+                                before: None,
+                                after: Some(prepared.entity),
+                            },
+                            outbox,
+                        )
+                    }
+                    EntityEffect::Update {
+                        id,
+                        expected_version,
+                        attributes,
+                    } => {
+                        let patch = EntityPatch {
+                            attributes: attributes.clone(),
+                        };
+                        let prepared = self
+                            .prepare_update(&tx, id, *expected_version, &patch)
+                            .await?;
+                        let outbox = self.stage_update(&tx, &prepared, ctx).await?;
+                        (
+                            EntityChange {
+                                before: Some(prepared.before),
+                                after: Some(prepared.after),
+                            },
+                            outbox,
+                        )
+                    }
+                    EntityEffect::Delete {
+                        id,
+                        expected_version,
+                        force,
+                    } => {
+                        let prepared = self
+                            .prepare_delete(&tx, id, *expected_version, *force)
+                            .await?;
+                        let outbox = self.stage_delete(&tx, &prepared, ctx).await?;
+                        (
+                            EntityChange {
+                                before: Some(prepared.before),
+                                after: None,
+                            },
+                            outbox,
+                        )
+                    }
+                };
+                changes.push(change);
+                if let Some(row) = outbox {
+                    outbox_rows.push(row);
+                }
+            }
+            if !outbox_rows.is_empty() {
+                let count = u64::try_from(outbox_rows.len()).unwrap_or(u64::MAX);
+                increment_outbox_pending(&tx, count).await?;
+                for (key, bytes) in &outbox_rows {
+                    tx.set_bytes(key, bytes).await.map_err(EntityError::Store)?;
+                }
+            }
+            tx.commit().await.map_err(EntityError::Store)?;
+            (changes, !outbox_rows.is_empty())
+        };
+        if pending && let Err(error) = self.flush_after_commit().await {
+            tracing::warn!(
+                %error,
+                "entity outbox flush failed after commit; the relay will deliver the event"
+            );
+        }
+        Ok(changes)
     }
 
     /// Delivers pending outbox rows to the change feed in batches.
@@ -3356,12 +3680,23 @@ fn map_schema_error(error: SchemaError) -> EntityError {
     }
 }
 
+/// Checks the id and the patch of one update.
+///
+/// The call rejects an invalid id and an empty patch.
+fn validate_update_input(id: &str, patch: &EntityPatch) -> Result<(), EntityError> {
+    validate_name("entity id", id)?;
+    if patch.attributes.is_empty() {
+        return Err(EntityError::Invalid("patch is empty".to_string()));
+    }
+    Ok(())
+}
+
 /// Checks an id or a name against the storage key rules.
 ///
 /// The value must be 1 to 128 bytes.
 /// It may contain only lowercase ASCII letters, digits, `_`, and `-`.
 /// These rules reject `:` and `/`, so a value cannot inject a key.
-fn validate_name(kind: &str, value: &str) -> Result<(), EntityError> {
+pub(crate) fn validate_name(kind: &str, value: &str) -> Result<(), EntityError> {
     if value.is_empty() {
         return Err(EntityError::Invalid(format!("{kind} is empty")));
     }
@@ -8149,5 +8484,437 @@ mod tests {
         assert_eq!(change.before, Some(created));
         assert!(change.after.is_none());
         assert!(store.get("c1").await.unwrap().is_none());
+    }
+
+    fn effect_create(
+        id: &str,
+        schemas: &[&str],
+        attrs: Vec<(&str, AttributeValue)>,
+    ) -> EntityEffect {
+        EntityEffect::Create {
+            id: id.to_string(),
+            schemas: schemas.iter().map(|value| value.to_string()).collect(),
+            attributes: attrs
+                .into_iter()
+                .map(|(key, value)| (key.to_string(), value))
+                .collect(),
+        }
+    }
+
+    fn effect_update(
+        id: &str,
+        expected_version: u64,
+        attrs: Vec<(&str, Option<AttributeValue>)>,
+    ) -> EntityEffect {
+        EntityEffect::Update {
+            id: id.to_string(),
+            expected_version,
+            attributes: attrs
+                .into_iter()
+                .map(|(key, value)| (key.to_string(), value))
+                .collect(),
+        }
+    }
+
+    fn effect_delete(id: &str, expected_version: u64, force: bool) -> EntityEffect {
+        EntityEffect::Delete {
+            id: id.to_string(),
+            expected_version,
+            force,
+        }
+    }
+
+    async fn person_store() -> (EntityStore, SchemaRegistry, OxKvStore) {
+        let (store, registry, raw) = new_store().await;
+        registry
+            .publish(schema(
+                "person",
+                &[],
+                vec![attr("name", AttributeType::String)],
+            ))
+            .await
+            .unwrap();
+        (store, registry, raw)
+    }
+
+    #[tokio::test]
+    async fn three_creates_commit_together_and_return_changes_in_plan_order() {
+        let (store, _, _) = person_store().await;
+        let plan = EffectPlan::new(vec![
+            effect_create("e1", &["person"], vec![("name", s("Alice"))]),
+            effect_create("e2", &["person"], vec![("name", s("Bob"))]),
+            effect_create("e3", &["person"], vec![("name", s("Carol"))]),
+        ]);
+
+        let changes = store.apply_effects(&plan, &ctx()).await.unwrap();
+
+        assert_eq!(changes.len(), 3);
+        let ids: Vec<&str> = changes
+            .iter()
+            .map(|change| change.after.as_ref().unwrap().id.as_str())
+            .collect();
+        assert_eq!(ids, ["e1", "e2", "e3"]);
+        for change in &changes {
+            assert!(change.before.is_none());
+            assert_eq!(change.after.as_ref().unwrap().version, 1);
+        }
+        for id in ["e1", "e2", "e3"] {
+            assert!(store.get(id).await.unwrap().is_some());
+        }
+    }
+
+    /// The second effect reads the uncommitted create of the first effect.
+    ///
+    /// The OxKV transaction supplies read-your-writes, so the plan needs no
+    /// separate overlay.
+    #[tokio::test]
+    async fn a_create_then_an_update_of_one_entity_commits_the_final_state() {
+        let (store, _, _) = person_store().await;
+        let plan = EffectPlan::new(vec![
+            effect_create("e1", &["person"], vec![("name", s("Alice"))]),
+            effect_update("e1", 1, vec![("name", Some(s("Bob")))]),
+        ]);
+
+        let changes = store.apply_effects(&plan, &ctx()).await.unwrap();
+
+        assert_eq!(changes.len(), 2);
+        assert_eq!(changes[0].after.as_ref().unwrap().version, 1);
+        assert_eq!(changes[1].before.as_ref().unwrap().version, 1);
+        let after = changes[1].after.as_ref().unwrap();
+        assert_eq!(after.version, 2);
+        assert_eq!(after.attributes.get("name"), Some(&s("Bob")));
+        let stored = store.get("e1").await.unwrap().unwrap();
+        assert_eq!(stored.version, 2);
+        assert_eq!(stored.attributes.get("name"), Some(&s("Bob")));
+    }
+
+    #[tokio::test]
+    async fn a_create_then_a_delete_of_one_entity_leaves_no_entity() {
+        let (store, _, _) = person_store().await;
+        let plan = EffectPlan::new(vec![
+            effect_create("e1", &["person"], vec![("name", s("Alice"))]),
+            effect_delete("e1", 1, false),
+        ]);
+
+        let changes = store.apply_effects(&plan, &ctx()).await.unwrap();
+
+        assert_eq!(changes.len(), 2);
+        assert!(changes[0].after.is_some());
+        assert!(changes[1].after.is_none());
+        assert_eq!(changes[1].before.as_ref().unwrap().id, "e1");
+        assert!(store.get("e1").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn an_update_then_a_delete_of_one_entity_commits_both_changes() {
+        let (store, _, _) = person_store().await;
+        store
+            .create(draft("e1", &["person"], vec![("name", s("Alice"))]), &ctx())
+            .await
+            .unwrap();
+        let plan = EffectPlan::new(vec![
+            effect_update("e1", 1, vec![("name", Some(s("Bob")))]),
+            effect_delete("e1", 2, false),
+        ]);
+
+        let changes = store.apply_effects(&plan, &ctx()).await.unwrap();
+
+        assert_eq!(changes.len(), 2);
+        assert_eq!(changes[0].after.as_ref().unwrap().version, 2);
+        assert_eq!(changes[1].before.as_ref().unwrap().version, 2);
+        assert!(changes[1].after.is_none());
+        assert!(store.get("e1").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_failure_in_the_last_effect_rolls_back_the_whole_plan() {
+        let (store, _, raw) = person_store().await;
+        let feed = Arc::new(RecordingFeed::new());
+        let store = store.with_change_sink(feed.clone());
+        let before = all_keys(&raw).await;
+        let plan = EffectPlan::new(vec![
+            effect_create("e1", &["person"], vec![("name", s("Alice"))]),
+            effect_create("e2", &["person"], vec![("name", s("Bob"))]),
+            effect_create("e1", &["person"], vec![("name", s("Carol"))]),
+        ]);
+
+        let error = store.apply_effects(&plan, &ctx()).await.unwrap_err();
+
+        assert!(
+            matches!(&error, EntityError::AlreadyExists(id) if id == "e1"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(all_keys(&raw).await, before);
+        assert!(store.get("e1").await.unwrap().is_none());
+        assert!(store.get("e2").await.unwrap().is_none());
+        assert!(outbox_keys(&raw).await.is_empty());
+        assert_eq!(pending_counter(&raw).await, None);
+        assert!(feed.events().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_version_conflict_in_the_middle_rolls_back_the_whole_plan() {
+        let (store, _, raw) = person_store().await;
+        store
+            .create(draft("e1", &["person"], vec![("name", s("Alice"))]), &ctx())
+            .await
+            .unwrap();
+        let before = all_keys(&raw).await;
+        let plan = EffectPlan::new(vec![
+            effect_create("e2", &["person"], vec![("name", s("Bob"))]),
+            effect_update("e1", 99, vec![("name", Some(s("Bob")))]),
+            effect_create("e3", &["person"], vec![("name", s("Carol"))]),
+        ]);
+
+        let error = store.apply_effects(&plan, &ctx()).await.unwrap_err();
+
+        assert!(matches!(error, EntityError::VersionConflict));
+        assert_eq!(all_keys(&raw).await, before);
+        assert!(store.get("e2").await.unwrap().is_none());
+        assert!(store.get("e3").await.unwrap().is_none());
+        let stored = store.get("e1").await.unwrap().unwrap();
+        assert_eq!(stored.version, 1);
+        assert_eq!(stored.attributes.get("name"), Some(&s("Alice")));
+    }
+
+    #[tokio::test]
+    async fn a_unique_conflict_in_the_middle_rolls_back_the_whole_plan() {
+        let (store, registry, raw) = new_store().await;
+        registry
+            .publish(schema(
+                "person",
+                &[],
+                vec![full_attr(
+                    "email",
+                    AttributeType::String,
+                    false,
+                    false,
+                    true,
+                    None,
+                )],
+            ))
+            .await
+            .unwrap();
+        store
+            .create(
+                draft("owner", &["person"], vec![("email", s("a@example.com"))]),
+                &ctx(),
+            )
+            .await
+            .unwrap();
+        let before = all_keys(&raw).await;
+        let plan = EffectPlan::new(vec![
+            effect_create("e2", &["person"], vec![("email", s("b@example.com"))]),
+            effect_create("e3", &["person"], vec![("email", s("a@example.com"))]),
+            effect_create("e4", &["person"], vec![("email", s("c@example.com"))]),
+        ]);
+
+        let error = store.apply_effects(&plan, &ctx()).await.unwrap_err();
+
+        assert!(
+            matches!(&error, EntityError::UniqueViolation(key) if key == "email"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(all_keys(&raw).await, before);
+        for id in ["e2", "e3", "e4"] {
+            assert!(store.get(id).await.unwrap().is_none());
+        }
+        let owner = store.get("owner").await.unwrap().unwrap();
+        assert_eq!(owner.attributes.get("email"), Some(&s("a@example.com")));
+        store
+            .create(
+                draft("e5", &["person"], vec![("email", s("b@example.com"))]),
+                &ctx(),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_dangling_reference_in_the_middle_rolls_back_the_whole_plan() {
+        let (store, _, raw) = reference_store(true).await;
+        store.create(customer("c1"), &ctx()).await.unwrap();
+        let before = all_keys(&raw).await;
+        let plan = EffectPlan::new(vec![
+            effect_create(
+                "o1",
+                &["order"],
+                vec![("customer", AttributeValue::EntityRef("c1".to_string()))],
+            ),
+            effect_create(
+                "o2",
+                &["order"],
+                vec![("customer", AttributeValue::EntityRef("missing".to_string()))],
+            ),
+            effect_create(
+                "o3",
+                &["order"],
+                vec![("customer", AttributeValue::EntityRef("c1".to_string()))],
+            ),
+        ]);
+
+        let error = store.apply_effects(&plan, &ctx()).await.unwrap_err();
+
+        assert!(
+            matches!(&error, EntityError::DanglingRef(name, target) if name == "customer" && target == "missing"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(all_keys(&raw).await, before);
+        for id in ["o1", "o2", "o3"] {
+            assert!(store.get(id).await.unwrap().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_reference_to_an_entity_created_earlier_in_the_plan_succeeds() {
+        let (store, _, raw) = reference_store(true).await;
+        let plan = EffectPlan::new(vec![
+            effect_create("c1", &["customer"], vec![("name", s("c1"))]),
+            effect_create(
+                "o1",
+                &["order"],
+                vec![("customer", AttributeValue::EntityRef("c1".to_string()))],
+            ),
+        ]);
+
+        let changes = store.apply_effects(&plan, &ctx()).await.unwrap();
+
+        assert_eq!(changes.len(), 2);
+        assert!(store.get("c1").await.unwrap().is_some());
+        let order = store.get("o1").await.unwrap().unwrap();
+        assert_eq!(
+            order.attributes.get("customer"),
+            Some(&AttributeValue::EntityRef("c1".to_string()))
+        );
+        assert!(
+            ref_markers(&raw)
+                .await
+                .contains(&"idx:ref:c1:o1:customer".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_self_reference_to_an_entity_created_in_the_plan_succeeds() {
+        let (store, registry, _) = reference_store(true).await;
+        registry
+            .publish(schema(
+                "node",
+                &[],
+                vec![attr("parent", AttributeType::EntityRef)],
+            ))
+            .await
+            .unwrap();
+        let plan = EffectPlan::new(vec![effect_create(
+            "n1",
+            &["node"],
+            vec![("parent", AttributeValue::EntityRef("n1".to_string()))],
+        )]);
+
+        let changes = store.apply_effects(&plan, &ctx()).await.unwrap();
+
+        assert_eq!(changes.len(), 1);
+        let node = store.get("n1").await.unwrap().unwrap();
+        assert_eq!(
+            node.attributes.get("parent"),
+            Some(&AttributeValue::EntityRef("n1".to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_plan_of_one_hundred_effects_is_applied() {
+        let (store, _, _) = person_store().await;
+        let effects = (0..100)
+            .map(|index| effect_create(&format!("e{index}"), &["person"], vec![]))
+            .collect();
+        let plan = EffectPlan::new(effects);
+
+        let changes = store.apply_effects(&plan, &ctx()).await.unwrap();
+
+        assert_eq!(changes.len(), 100);
+        assert!(store.get("e0").await.unwrap().is_some());
+        assert!(store.get("e99").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn a_plan_of_one_hundred_and_one_effects_is_rejected() {
+        let (store, _, raw) = person_store().await;
+        let before = all_keys(&raw).await;
+        let effects = (0..=100)
+            .map(|index| effect_create(&format!("e{index}"), &["person"], vec![]))
+            .collect();
+        let plan = EffectPlan::new(effects);
+
+        let error = store.apply_effects(&plan, &ctx()).await.unwrap_err();
+
+        assert!(
+            matches!(&error, EntityError::Invalid(message) if message.contains("more than 100")),
+            "unexpected error: {error}"
+        );
+        assert_eq!(all_keys(&raw).await, before);
+    }
+
+    #[tokio::test]
+    async fn an_empty_plan_returns_an_empty_result_and_changes_nothing() {
+        let (store, _, raw) = person_store().await;
+        let before = all_keys(&raw).await;
+
+        let changes = store
+            .apply_effects(&EffectPlan::default(), &ctx())
+            .await
+            .unwrap();
+
+        assert!(changes.is_empty());
+        assert_eq!(all_keys(&raw).await, before);
+    }
+
+    #[tokio::test]
+    async fn the_outbox_has_one_row_for_each_effect_in_plan_order() {
+        let (store, _, raw) = person_store().await;
+        let feed = Arc::new(RecordingFeed::new());
+        let store = store.with_change_sink(feed.clone());
+        feed.set_failing(true);
+        let plan = EffectPlan::new(vec![
+            effect_create("e1", &["person"], vec![("name", s("Alice"))]),
+            effect_update("e1", 1, vec![("name", Some(s("Bob")))]),
+            effect_create("e2", &["person"], vec![("name", s("Carol"))]),
+        ]);
+
+        let changes = store.apply_effects(&plan, &ctx()).await.unwrap();
+
+        assert_eq!(changes.len(), 3);
+        assert!(feed.events().is_empty());
+        let keys = outbox_keys(&raw).await;
+        assert_eq!(keys.len(), 3);
+        assert_eq!(pending_counter(&raw).await, Some(3));
+        let mut events = Vec::new();
+        for key in &keys {
+            let bytes = raw.get_bytes(key).await.unwrap().unwrap();
+            events.push(serde_json::from_slice::<EntityEvent>(&bytes).unwrap());
+        }
+        let ids: Vec<&str> = events
+            .iter()
+            .map(|event| event.entity_id.as_str())
+            .collect();
+        assert_eq!(ids, ["e1", "e1", "e2"]);
+        let kinds: Vec<EntityEventKind> = events.iter().map(|event| event.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                EntityEventKind::Created,
+                EntityEventKind::Updated,
+                EntityEventKind::Created
+            ]
+        );
+
+        feed.set_failing(false);
+        assert_eq!(store.flush_outbox().await.unwrap(), 3);
+        assert_eq!(pending_counter(&raw).await, Some(0));
+        assert!(outbox_keys(&raw).await.is_empty());
+        let delivered = feed.events();
+        let ids: Vec<&str> = delivered
+            .iter()
+            .map(|event| event.entity_id.as_str())
+            .collect();
+        assert_eq!(ids, ["e1", "e1", "e2"]);
     }
 }
