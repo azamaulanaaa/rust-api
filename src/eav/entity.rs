@@ -1081,9 +1081,33 @@ impl EntityStore {
 
     /// Applies an effect plan as one atomic write.
     ///
+    /// The call delegates to [`EntityStore::apply_effects_with_marker`] with
+    /// no marker.
+    /// An empty plan returns an empty result and changes nothing.
+    pub async fn apply_effects(
+        &self,
+        plan: &EffectPlan,
+        ctx: &WriteContext,
+    ) -> Result<Vec<EntityChange>, EntityError> {
+        self.apply_effects_with_marker(plan, ctx, None).await
+    }
+
+    /// Applies an effect plan and an optional execution marker as one atomic
+    /// write.
+    ///
     /// The call validates the plan before it takes a lock.
     /// It rejects more than 100 effects.
-    /// An empty plan returns an empty result and changes nothing.
+    ///
+    /// The marker is one key and one value.
+    /// With a marker, the call writes the marker in the plan transaction.
+    /// The marker and every effect commit together or not at all.
+    /// A marker write failure rolls back every entity row, index row, outbox
+    /// row, and the pending counter.
+    /// An effect failure also rolls back the marker.
+    ///
+    /// An empty plan with a marker writes the marker only.
+    /// An empty plan without a marker returns an empty result and changes
+    /// nothing.
     ///
     /// The call holds the write lock and the store write guard for the whole
     /// plan.
@@ -1107,21 +1131,22 @@ impl EntityStore {
     /// It increments `outbox-meta:pending` by the number of outbox rows in
     /// the same transaction.
     ///
-    /// One commit writes every entity row, index row, outbox row, and the
-    /// counter.
-    /// An error in any effect rolls back the whole plan.
-    /// No row that an effect writes commits.
+    /// One commit writes every entity row, index row, outbox row, the
+    /// counter, and the marker.
+    /// An error in any effect rolls back the whole plan and the marker.
+    /// No row that an effect or the marker writes commits.
     ///
     /// The call flushes the outbox after the commit.
     /// A flush failure leaves the rows for the relay.
     /// The call returns the changes in plan order.
-    pub async fn apply_effects(
+    pub async fn apply_effects_with_marker(
         &self,
         plan: &EffectPlan,
         ctx: &WriteContext,
+        marker: Option<(&str, &[u8])>,
     ) -> Result<Vec<EntityChange>, EntityError> {
         plan.validate_allow_empty()?;
-        if plan.is_empty() {
+        if plan.is_empty() && marker.is_none() {
             return Ok(Vec::new());
         }
         if plan
@@ -1210,6 +1235,9 @@ impl EntityStore {
                 for (key, bytes) in &outbox_rows {
                     tx.set_bytes(key, bytes).await.map_err(EntityError::Store)?;
                 }
+            }
+            if let Some((key, bytes)) = marker {
+                tx.set_bytes(key, bytes).await.map_err(EntityError::Store)?;
             }
             tx.commit().await.map_err(EntityError::Store)?;
             (changes, !outbox_rows.is_empty())
@@ -8916,5 +8944,217 @@ mod tests {
             .map(|event| event.entity_id.as_str())
             .collect();
         assert_eq!(ids, ["e1", "e1", "e2"]);
+    }
+
+    #[tokio::test]
+    async fn effects_and_a_marker_commit_together() {
+        let (store, _, raw) = person_store().await;
+        let feed = Arc::new(RecordingFeed::new());
+        let store = store.with_change_sink(feed.clone());
+        feed.set_failing(true);
+        let marker_key = "rule:exec:greet:ev1";
+        let marker_value = b"1700000000";
+        let plan = EffectPlan::new(vec![
+            effect_create("e1", &["person"], vec![("name", s("Alice"))]),
+            effect_update("e1", 1, vec![("name", Some(s("Bob")))]),
+        ]);
+
+        let changes = store
+            .apply_effects_with_marker(&plan, &ctx(), Some((marker_key, marker_value)))
+            .await
+            .unwrap();
+
+        assert_eq!(changes.len(), 2);
+        assert_eq!(
+            raw.get_bytes(marker_key).await.unwrap().as_deref(),
+            Some(&marker_value[..])
+        );
+        let stored = store.get("e1").await.unwrap().unwrap();
+        assert_eq!(stored.version, 2);
+        assert_eq!(stored.attributes.get("name"), Some(&s("Bob")));
+        assert_eq!(outbox_keys(&raw).await.len(), 2);
+        assert_eq!(pending_counter(&raw).await, Some(2));
+        assert!(feed.events().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_marker_write_failure_rolls_back_the_whole_plan() {
+        use oxkv::Hooks as _;
+
+        struct RejectMarkerKey(&'static str);
+
+        #[async_trait::async_trait]
+        impl oxkv::Validator for RejectMarkerKey {
+            async fn validate(
+                &self,
+                _ctx: &dyn oxkv::StoreView,
+                key: &str,
+                _value: &[u8],
+            ) -> Result<(), oxkv::StoreError> {
+                if key == self.0 {
+                    return Err(oxkv::StoreError::Other("write rejected".to_string()));
+                }
+                Ok(())
+            }
+        }
+
+        let (store, registry, raw) = new_store().await;
+        registry
+            .publish(schema(
+                "person",
+                &[],
+                vec![
+                    attr("name", AttributeType::String),
+                    full_attr("tag", AttributeType::String, false, true, false, None),
+                ],
+            ))
+            .await
+            .unwrap();
+        let feed = Arc::new(RecordingFeed::new());
+        let store = store.with_change_sink(feed.clone());
+        feed.set_failing(true);
+        let before = all_keys(&raw).await;
+        let marker_key = "rule:exec:greet:ev1";
+        let plan = EffectPlan::new(vec![
+            effect_create(
+                "e1",
+                &["person"],
+                vec![("name", s("Alice")), ("tag", s("alpha"))],
+            ),
+            effect_create("e2", &["person"], vec![("name", s("Bob"))]),
+        ]);
+        raw.add_validator(RejectMarkerKey(marker_key));
+
+        let error = store
+            .apply_effects_with_marker(&plan, &ctx(), Some((marker_key, b"1")))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, EntityError::Store(_)));
+        assert_eq!(all_keys(&raw).await, before);
+        for id in ["e1", "e2"] {
+            assert!(store.get(id).await.unwrap().is_none());
+        }
+        let keys = all_keys(&raw).await;
+        assert!(keys.iter().all(|key| !key.starts_with(ENTITY_INDEX_PREFIX)));
+        assert!(keys.iter().all(|key| !key.starts_with(ATTR_INDEX_PREFIX)));
+        assert!(keys.iter().all(|key| !key.starts_with(SCHEMA_INDEX_PREFIX)));
+        assert!(outbox_keys(&raw).await.is_empty());
+        assert_eq!(pending_counter(&raw).await, None);
+        assert!(raw.get_bytes(marker_key).await.unwrap().is_none());
+        assert!(feed.events().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_effect_failure_rolls_back_the_marker() {
+        let (store, _, raw) = person_store().await;
+        let before = all_keys(&raw).await;
+        let marker_key = "rule:exec:greet:ev1";
+        let plan = EffectPlan::new(vec![
+            effect_create("e1", &["person"], vec![("name", s("Alice"))]),
+            effect_create("e1", &["person"], vec![("name", s("Bob"))]),
+        ]);
+
+        let error = store
+            .apply_effects_with_marker(&plan, &ctx(), Some((marker_key, b"1")))
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(&error, EntityError::AlreadyExists(id) if id == "e1"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(all_keys(&raw).await, before);
+        assert!(store.get("e1").await.unwrap().is_none());
+        assert!(outbox_keys(&raw).await.is_empty());
+        assert_eq!(pending_counter(&raw).await, None);
+        assert!(raw.get_bytes(marker_key).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn an_empty_plan_with_a_marker_writes_only_the_marker() {
+        let (store, _, raw) = person_store().await;
+        let before = all_keys(&raw).await;
+        let marker_key = "rule:exec:greet:ev1";
+        let marker_value = b"1700000000";
+
+        let changes = store
+            .apply_effects_with_marker(
+                &EffectPlan::default(),
+                &ctx(),
+                Some((marker_key, marker_value)),
+            )
+            .await
+            .unwrap();
+
+        assert!(changes.is_empty());
+        let mut expected = before.clone();
+        expected.push(marker_key.to_string());
+        expected.sort();
+        assert_eq!(all_keys(&raw).await, expected);
+        assert_eq!(
+            raw.get_bytes(marker_key).await.unwrap().as_deref(),
+            Some(&marker_value[..])
+        );
+        assert!(outbox_keys(&raw).await.is_empty());
+        assert_eq!(pending_counter(&raw).await, None);
+    }
+
+    #[tokio::test]
+    async fn an_empty_plan_without_a_marker_changes_nothing() {
+        let (store, _, raw) = person_store().await;
+        let before = all_keys(&raw).await;
+
+        let changes = store
+            .apply_effects_with_marker(&EffectPlan::default(), &ctx(), None)
+            .await
+            .unwrap();
+
+        assert!(changes.is_empty());
+        assert_eq!(all_keys(&raw).await, before);
+    }
+
+    #[tokio::test]
+    async fn an_existing_marker_key_is_overwritten() {
+        let (store, _, raw) = person_store().await;
+        let marker_key = "rule:exec:greet:ev1";
+        raw.set_bytes(marker_key, b"old").await.unwrap();
+
+        let changes = store
+            .apply_effects_with_marker(&EffectPlan::default(), &ctx(), Some((marker_key, b"new")))
+            .await
+            .unwrap();
+
+        assert!(changes.is_empty());
+        assert_eq!(
+            raw.get_bytes(marker_key).await.unwrap().as_deref(),
+            Some(&b"new"[..])
+        );
+        let keys = all_keys(&raw).await;
+        assert_eq!(
+            keys.iter().filter(|key| key.as_str() == marker_key).count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_effects_writes_no_marker_row() {
+        let (store, _, raw) = person_store().await;
+        let plan = EffectPlan::new(vec![effect_create(
+            "e1",
+            &["person"],
+            vec![("name", s("Alice"))],
+        )]);
+
+        let changes = store.apply_effects(&plan, &ctx()).await.unwrap();
+
+        assert_eq!(changes.len(), 1);
+        assert!(store.get("e1").await.unwrap().is_some());
+        assert!(
+            all_keys(&raw)
+                .await
+                .iter()
+                .all(|key| !key.starts_with("rule:exec:"))
+        );
     }
 }
