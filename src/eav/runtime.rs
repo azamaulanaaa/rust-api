@@ -760,6 +760,7 @@ mod tests {
                 kind: "record".to_string(),
                 params: serde_json::json!({}),
             },
+            capabilities: crate::rules::rule::RuleCapabilities::default(),
         }
     }
 
