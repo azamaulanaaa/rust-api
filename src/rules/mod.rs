@@ -31,6 +31,9 @@ pub mod error;
 /// Rule definitions, triggers, and condition evaluation.
 pub mod rule;
 
+/// The read-only data API for the future script engine.
+pub mod script_host;
+
 /// Durable rule storage and index lookup.
 pub mod store;
 
@@ -42,5 +45,6 @@ pub use builtin::{LogAction, NoopAction};
 pub use engine::{ExecutionOutcome, RuleEngine, RuleExecution, RuleObserver};
 pub use error::RuleError;
 pub use rule::{ActionRef, CompareOp, Condition, Rule, RuleDraft, RuleId, RuleTrigger};
+pub use script_host::{MAX_FIND_RESULTS, ScriptCapabilities, ScriptHostError, ScriptReadHost};
 pub use store::RuleStore;
 pub use webhook::WebhookAction;
