@@ -413,6 +413,7 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
             vec![Arc::new(NoopAction), Arc::new(LogAction), Arc::new(webhook)],
             config.eav.check_entity_refs,
             eav_max_causation_depth,
+            config.eav.script_enabled,
         )
         .await
         .context("build the EAV runtime")?;

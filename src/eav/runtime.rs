@@ -195,6 +195,8 @@ impl EavRuntime {
     /// `check_entity_refs` is true.
     /// The rule engine runs an action only when the event depth is at most
     /// `max_causation_depth`.
+    /// The rule engine accepts a condition script only when `script_enabled`
+    /// is true.
     pub async fn build(
         s3: &S3ClientConfig,
         db_prefix: &str,
@@ -202,6 +204,7 @@ impl EavRuntime {
         actions: Vec<Arc<dyn RuleAction>>,
         check_entity_refs: bool,
         max_causation_depth: u32,
+        script_enabled: bool,
     ) -> anyhow::Result<Self> {
         let schema_store = build_s3_store(s3, &domain_prefix(db_prefix, "schema"))
             .await
@@ -226,6 +229,7 @@ impl EavRuntime {
         let engine = RuleEngine::new(rules.clone(), entities.clone(), actions)
             .context("build the EAV rule engine")?
             .with_max_causation_depth(max_causation_depth)
+            .with_script_enabled(script_enabled)
             .with_observer(Arc::new(metrics.clone()));
 
         Ok(Self {
@@ -804,7 +808,16 @@ mod tests {
         let s3 = memory_s3();
         let prefix = test_prefix("eav-runtime");
         let wal = Wal::new(build_s3_store(&s3, &format!("{prefix}/wal")).await.unwrap());
-        EavRuntime::build(&s3, &prefix, wal, actions, true, max_causation_depth)
+        EavRuntime::build(&s3, &prefix, wal, actions, true, max_causation_depth, false)
+            .await
+            .unwrap()
+    }
+
+    async fn build_runtime_with_scripts(actions: Vec<Arc<dyn RuleAction>>) -> EavRuntime {
+        let s3 = memory_s3();
+        let prefix = test_prefix("eav-runtime-script");
+        let wal = Wal::new(build_s3_store(&s3, &format!("{prefix}/wal")).await.unwrap());
+        EavRuntime::build(&s3, &prefix, wal, actions, true, 8, true)
             .await
             .unwrap()
     }
@@ -1044,6 +1057,43 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].rule.id, "alpha");
         assert_eq!(records[0].event.entity_id, "e1");
+    }
+
+    #[tokio::test]
+    async fn a_script_rule_runs_when_the_runtime_enables_scripts() {
+        let recorder = Arc::new(RecordingAction::new("record"));
+        let runtime = build_runtime_with_scripts(vec![recorder.clone()]).await;
+        runtime.schemas().publish(schema()).await.unwrap();
+        let mut scripted = rule();
+        scripted.condition = Condition::Script {
+            source: r#"event.kind == "created" && entity.attributes.total == 10"#.to_string(),
+        };
+        runtime.rules().upsert(scripted).await.unwrap();
+        runtime
+            .entities()
+            .create(entity(), &WriteContext::new("tester"))
+            .await
+            .unwrap();
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let handle = runtime.spawn(cancel.clone(), short_config());
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while recorder.records().is_empty() {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        cancel.store(true, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(recorder.records().len(), 1);
     }
 
     /// The configured value must reach the rule engine through the runtime
