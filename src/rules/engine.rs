@@ -26,6 +26,11 @@
 //! A causation-depth guard stops such a chain.
 //! The maximum depth is inclusive.
 //! A depth above the maximum is a runaway chain.
+//!
+//! A [`Condition::Script`] runs through
+//! [the script engine](crate::rules::script::ScriptEngine).
+//! A script error is a rule error.
+//! A stored script fails when the server disables scripts.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -39,7 +44,8 @@ use crate::eav::entity_error::EntityError;
 use crate::records::{EntityEvent, WalOp};
 use crate::rules::action::{ActionContext, RuleAction};
 use crate::rules::error::RuleError;
-use crate::rules::rule::{Rule, validate_identifier};
+use crate::rules::rule::{Condition, Rule, validate_identifier};
+use crate::rules::script::{ScriptContext, ScriptEngine};
 use crate::rules::store::RuleStore;
 use crate::sync::wal::Wal;
 
@@ -122,6 +128,8 @@ pub struct RuleEngine {
     max_causation_depth: u32,
     /// The optional observer for rule results.
     observer: Option<Arc<dyn RuleObserver>>,
+    /// The sandboxed condition script engine.
+    script: ScriptEngine,
     /// The process locks, keyed by event id.
     ///
     /// One lock stops two calls from running one rule and one event twice.
@@ -155,6 +163,7 @@ impl RuleEngine {
             actions: by_kind,
             max_causation_depth: DEFAULT_MAX_CAUSATION_DEPTH,
             observer: None,
+            script: ScriptEngine::new(false),
             process_locks: Arc::new(Mutex::new(HashMap::new())),
         })
     }
@@ -180,6 +189,38 @@ impl RuleEngine {
         action
             .validate(params)
             .map_err(|_| RuleError::Invalid("rule action parameters are not valid".to_string()))
+    }
+
+    /// Sets the condition-script feature flag.
+    ///
+    /// The default is `false`.
+    /// A disabled engine rejects every script at save time and at run time.
+    pub fn with_script_enabled(mut self, enabled: bool) -> Self {
+        self.script = ScriptEngine::new(enabled);
+        self
+    }
+
+    /// Checks one condition before the store writes the rule.
+    ///
+    /// A script condition must compile.
+    /// A disabled script feature returns an invalid error.
+    /// A compile failure returns an invalid error with a stable message.
+    /// The error never repeats the script source.
+    pub fn validate_condition(&self, condition: &Condition) -> Result<(), RuleError> {
+        match condition {
+            Condition::Script { source } => self
+                .script
+                .compile(source)
+                .map_err(|error| RuleError::Invalid(error.to_string())),
+            Condition::Not(child) => self.validate_condition(child),
+            Condition::All(children) | Condition::Any(children) => {
+                for child in children {
+                    self.validate_condition(child)?;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
     }
 
     /// Sets the maximum causation depth.
@@ -311,7 +352,18 @@ impl RuleEngine {
                 });
                 continue;
             }
-            if !rule.condition.eval(entity.as_ref(), event) {
+            let passed = match &rule.condition {
+                Condition::Script { source } => {
+                    let ctx = ScriptContext {
+                        event,
+                        entity: entity.as_ref(),
+                        now: chrono::Utc::now().timestamp(),
+                    };
+                    self.script.eval_bool(source, &ctx)?
+                }
+                other => other.eval(entity.as_ref(), event),
+            };
+            if !passed {
                 let outcome = ExecutionOutcome::ConditionFalse;
                 self.observe(outcome);
                 executions.push(RuleExecution {
@@ -460,6 +512,7 @@ mod tests {
     use crate::eav::schema::{AttributeDef, AttributeType, SchemaDraft, SchemaRegistry};
     use crate::records::{ChangeSink, EntityEventKind};
     use crate::rules::rule::{ActionRef, CompareOp, Condition, RuleDraft, RuleTrigger};
+    use crate::rules::script::ScriptError;
 
     /// A [`RuleAction`] test double that records each context.
     ///
@@ -1771,6 +1824,95 @@ mod tests {
             }
             other => panic!("expected a generic invalid error, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn a_script_condition_runs_next_to_a_json_condition() {
+        let stores = stores().await;
+        let recorder = Arc::new(RecordingAction::new("record"));
+        let subject = engine(&stores, vec![recorder.clone()]).with_script_enabled(true);
+        make_entity(&stores.entities).await;
+
+        let mut scripted = draft("scripted", "record");
+        scripted.condition = Condition::Script {
+            source: r#"event.kind == "created" && entity.attributes.total == 10"#.to_string(),
+        };
+        let mut json = draft("json", "record");
+        json.condition = Condition::Compare {
+            key: "total".to_string(),
+            op: CompareOp::Eq,
+            value: serde_json::json!(10),
+        };
+        stores.rules.upsert(json).await.unwrap();
+        stores.rules.upsert(scripted).await.unwrap();
+
+        let executions = subject
+            .process(&event(EntityEventKind::Created))
+            .await
+            .unwrap();
+
+        assert_eq!(executions.len(), 2);
+        assert!(
+            executions
+                .iter()
+                .all(|item| item.outcome == ExecutionOutcome::Executed)
+        );
+        assert_eq!(recorder.records().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_stored_script_fails_when_the_feature_is_disabled() {
+        let stores = stores().await;
+        let recorder = Arc::new(RecordingAction::new("record"));
+        let subject = engine(&stores, vec![recorder.clone()]);
+        make_entity(&stores.entities).await;
+        let mut rule = draft("alpha", "record");
+        rule.condition = Condition::Script {
+            source: "true".to_string(),
+        };
+        stores.rules.upsert(rule).await.unwrap();
+
+        let result = subject.process(&event(EntityEventKind::Created)).await;
+
+        assert!(matches!(
+            result,
+            Err(RuleError::Script(ScriptError::Disabled))
+        ));
+        assert!(recorder.records().is_empty());
+    }
+
+    #[tokio::test]
+    async fn validate_condition_rejects_a_bad_script_without_the_source() {
+        let stores = stores().await;
+        let subject = engine(&stores, Vec::new()).with_script_enabled(true);
+        let source = "let x = ;";
+
+        let result = subject.validate_condition(&Condition::Script {
+            source: source.to_string(),
+        });
+
+        match result {
+            Err(RuleError::Invalid(message)) => {
+                assert_eq!(message, "rule script failed to compile");
+                assert!(!message.contains(source));
+            }
+            other => panic!("expected an invalid script error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn validate_condition_rejects_a_script_when_disabled() {
+        let stores = stores().await;
+        let subject = engine(&stores, Vec::new());
+
+        let result = subject.validate_condition(&Condition::Script {
+            source: "true".to_string(),
+        });
+
+        assert!(matches!(
+            result,
+            Err(RuleError::Invalid(message)) if message == "rule scripts are disabled"
+        ));
     }
 
     #[tokio::test]

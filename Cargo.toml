@@ -65,6 +65,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono = "0.4"
 uuid = { version = "1.18", features = ["v7", "serde"] }
 rand = "0.8"
+# The `sync` feature makes the engine and the cached AST values `Send` and
+# `Sync`, so the rule engine can share them across Tokio tasks.
+rhai = { version = "1", features = ["sync"] }
 
 utoipa = { version = "6", features = ["actix_extras"] }
 utoipa-swagger-ui = { version = "10", features = ["actix-web"] }
@@ -101,3 +104,9 @@ path = "src/main.rs"
 
 [package.metadata.dist]
 dist = true
+
+# Casbin enables Rhai features that remove the limits, the function calls,
+# and the 64-bit integers that the condition script engine needs. The local
+# copy keeps the casbin source and changes only the Rhai features.
+[patch.crates-io]
+casbin = { path = "vendor/casbin" }

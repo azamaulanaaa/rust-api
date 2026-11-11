@@ -612,7 +612,8 @@ impl From<RuleError> for EavApiError {
             | RuleError::Serialization(_)
             | RuleError::Action(_)
             | RuleError::Wal(_)
-            | RuleError::DuplicateAction(_) => Kind::Internal,
+            | RuleError::DuplicateAction(_)
+            | RuleError::Script(_) => Kind::Internal,
         };
         Self::wrap(kind, error)
     }
@@ -1124,6 +1125,7 @@ async fn upsert_rule(
     runtime
         .engine()
         .validate_action(&draft.action.kind, &draft.action.params)?;
+    runtime.engine().validate_condition(&draft.condition)?;
     let rule = runtime.rules().upsert(draft).await?;
     Ok(HttpResponse::Created().json(rule))
 }
@@ -1359,6 +1361,7 @@ mod tests {
             ],
             true,
             8,
+            true,
         )
         .await?;
         let engine =
@@ -1900,6 +1903,35 @@ mod tests {
         )
         .await;
         assert_eq!(res.status(), http::StatusCode::NO_CONTENT);
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn an_invalid_script_rule_returns_400_and_stores_nothing() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        assert!(fx.engine.claim_superadmin("alice").await?);
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+        let mut body = rule_body();
+        body["condition"] = json!({
+            "Script": { "source": "let x = ;" }
+        });
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::post()
+                    .uri("/eav/rules")
+                    .set_json(body),
+                &token,
+            )
+            .to_request(),
+        )
+        .await;
+
+        assert_eq!(res.status(), http::StatusCode::BAD_REQUEST);
+        assert!(fx.runtime.rules().list_page(50, 0).await?.is_empty());
         Ok(())
     }
 
