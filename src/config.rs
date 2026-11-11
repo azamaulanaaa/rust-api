@@ -42,7 +42,7 @@ pub struct Config {
     /// Cost limits. Each limit is off by default. See [`LimitsConfig`].
     #[serde(default)]
     pub limits: LimitsConfig,
-    /// EAV background runtime settings. The runtime is off by default.
+    /// EAV background runtime settings. The runtime is always on.
     #[serde(default)]
     pub eav: EavConfig,
 
@@ -586,15 +586,12 @@ impl LimitsConfig {
 /// It does not reject the value.
 pub const MIN_SAFE_RETENTION_SECS: u64 = 604_800;
 
-/// Settings for the optional EAV background runtime.
+/// Settings for the EAV background runtime.
 ///
-/// The runtime is off by default.
-/// When it is on, it relays the entity outbox and runs matching rules.
+/// The runtime is always on.
+/// It relays the entity outbox and runs matching rules.
 #[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct EavConfig {
-    /// Starts the EAV runtime when true.
-    #[serde(default)]
-    pub enabled: bool,
     /// Pause in milliseconds between outbox flushes.
     #[serde(default = "default_eav_outbox_interval_ms")]
     pub outbox_interval_ms: u64,
@@ -668,7 +665,6 @@ pub struct EavConfig {
 impl Default for EavConfig {
     /// Returns the default settings.
     ///
-    /// The runtime is off.
     /// The outbox relay runs every second.
     /// The rule runner polls every 200 milliseconds.
     /// The marker cleanup runs every hour.
@@ -683,7 +679,6 @@ impl Default for EavConfig {
     /// A webhook cannot call a private address.
     fn default() -> Self {
         Self {
-            enabled: false,
             outbox_interval_ms: default_eav_outbox_interval_ms(),
             rule_poll_interval_ms: default_eav_rule_poll_interval_ms(),
             gc_interval_ms: default_eav_gc_interval_ms(),
@@ -1440,14 +1435,13 @@ mod tests {
         // A config without an [eav] section parses.
         let cfg = parse(&minimal_toml()).expect("the EAV section is optional");
 
-        assert!(!cfg.eav.enabled);
+        assert_eq!(cfg.eav, EavConfig::default());
     }
 
     #[test]
     fn eav_defaults_apply() {
         let cfg = parse(&minimal_toml()).expect("should parse");
 
-        assert!(!cfg.eav.enabled);
         assert_eq!(cfg.eav.outbox_interval_ms, 1000);
         assert_eq!(cfg.eav.rule_poll_interval_ms, 200);
         assert_eq!(cfg.eav.gc_interval_ms, 3_600_000);
@@ -1531,7 +1525,7 @@ mod tests {
     fn explicit_eav_values_parse() {
         let toml = minimal_toml().replace(
             "region = \"us-east-1\"",
-            "region = \"us-east-1\"\n[eav]\nenabled = true\n\
+            "region = \"us-east-1\"\n[eav]\n\
              outbox_interval_ms = 2500\nrule_poll_interval_ms = 50\n\
              gc_interval_ms = 9000\nexecution_retention_secs = 120\n\
              timer_interval_ms = 750\ntimer_batch = 25\n\
@@ -1543,7 +1537,6 @@ mod tests {
         );
         let cfg = parse(&toml).expect("explicit EAV values must parse");
 
-        assert!(cfg.eav.enabled);
         assert_eq!(cfg.eav.outbox_interval_ms, 2500);
         assert_eq!(cfg.eav.rule_poll_interval_ms, 50);
         assert_eq!(cfg.eav.gc_interval_ms, 9000);

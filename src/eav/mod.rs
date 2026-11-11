@@ -21,8 +21,8 @@
 //!
 //! [`runtime::EavRuntime`](crate::eav::runtime::EavRuntime) builds the stores from one S3 config and prefix.
 //! It then starts the outbox relay and the rule runner.
-//! The runtime is opt-in.
-//! The binary starts it only when `eav.enabled` is true.
+//! The runtime is always on.
+//! A host that does not want EAV removes its wiring in the binary and rebuilds.
 
 /// The maximum value of the `offset` paging field.
 ///

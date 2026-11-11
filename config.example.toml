@@ -121,10 +121,6 @@ sample_ratio = 1.0
 # max_concurrent_downloads = 0
 
 [eav]
-# Start the EAV background runtime. It relays the entity outbox and runs
-# matching rules. Default: false.
-# enabled = false
-
 # Pause in milliseconds between outbox flushes. Must be above 0.
 # Default: 1000.
 # outbox_interval_ms = 1000

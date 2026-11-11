@@ -706,11 +706,10 @@ The rate limiter keys on the peer address, not the subject. Clients behind one N
 
 ### EAV and rules
 
-The `[eav]` section controls the optional EAV runtime and the webhook action. `[eav].enabled` gates the runtime. The default is `false`, so the server starts no EAV background loops and mounts no `/eav` module.
+The `[eav]` section controls the EAV runtime and the webhook action. The EAV module is always on. To omit it, remove its wiring in `src/main.rs` and rebuild.
 
 | Key | Default | Effect |
 |---|---|---|
-| `enabled` | `false` | Starts the EAV runtime and the `/eav` module. |
 | `outbox_interval_ms` | `1000` | Pause between entity outbox flushes. |
 | `rule_poll_interval_ms` | `200` | Pause between rule runner polls. |
 | `gc_interval_ms` | `3600000` | Pause between execution marker cleanups. |
