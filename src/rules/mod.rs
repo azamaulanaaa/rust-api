@@ -22,6 +22,9 @@ pub mod action;
 /// Built-in actions for tests and dry runs.
 pub mod builtin;
 
+/// Atomic entity effect plans.
+pub mod effect;
+
 /// The generic rule runner.
 pub mod engine;
 
@@ -39,6 +42,7 @@ pub mod webhook;
 
 pub use action::{ActionContext, RuleAction};
 pub use builtin::{LogAction, NoopAction};
+pub use effect::{EffectPlan, EntityEffect, MAX_EFFECTS};
 pub use engine::{ExecutionOutcome, RuleEngine, RuleExecution, RuleObserver};
 pub use error::RuleError;
 pub use rule::{ActionRef, CompareOp, Condition, Rule, RuleDraft, RuleId, RuleTrigger};
