@@ -1112,6 +1112,17 @@ async fn list_schema_entities(
     }
 }
 
+/// Creates or replaces one rule.
+///
+/// The caller needs `write` on `eav_rules`.
+/// A non-empty `read` list also needs `read` on `eav_entities`.
+/// A non-empty `write` list also needs `write` on `eav_entities`.
+/// The author needs the collection grant, and the rule narrows that grant to
+/// the listed schemas.
+/// The capability ids do not need a schema that exists. A rule can be saved
+/// before its schema.
+/// The enable route does not change the capability lists, so it does not
+/// repeat these checks.
 #[utoipa::path(post, path = "/eav/rules", tag = "eav", request_body = RuleDraft, responses((status=201, body=crate::rules::rule::Rule), (status=400, body=crate::http::error::ErrorBody), (status=401, body=crate::http::error::ErrorBody), (status=403, body=crate::http::error::ErrorBody), (status=500, body=crate::http::error::ErrorBody)))]
 #[post("/rules")]
 async fn upsert_rule(
@@ -1122,6 +1133,12 @@ async fn upsert_rule(
 ) -> Result<HttpResponse, EavApiError> {
     require_management(&policy, &claims.sub, RULES, Action::Write).await?;
     let draft = body.into_inner();
+    if !draft.capabilities.read.is_empty() {
+        require_management(&policy, &claims.sub, ENTITIES, Action::Read).await?;
+    }
+    if !draft.capabilities.write.is_empty() {
+        require_management(&policy, &claims.sub, ENTITIES, Action::Write).await?;
+    }
     runtime
         .engine()
         .validate_action(&draft.action.kind, &draft.action.params)?;
@@ -1932,6 +1949,193 @@ mod tests {
 
         assert_eq!(res.status(), http::StatusCode::BAD_REQUEST);
         assert!(fx.runtime.rules().list_page(50, 0).await?.is_empty());
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn a_read_capability_without_entity_read_is_403_and_stores_nothing() -> anyhow::Result<()>
+    {
+        let fx = fixture().await?;
+        fx.engine
+            .add_rule("bob".into(), "eav_rules".into(), Action::Write)
+            .await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let mut body = rule_body();
+        body["capabilities"] = json!({"read": ["task"], "write": []});
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::post()
+                    .uri("/eav/rules")
+                    .set_json(body),
+                &fx.token("bob")?,
+            )
+            .to_request(),
+        )
+        .await;
+
+        assert_eq!(res.status(), http::StatusCode::FORBIDDEN);
+        assert!(fx.runtime.rules().list_page(50, 0).await?.is_empty());
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn a_write_capability_without_entity_write_is_403_and_stores_nothing()
+    -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        fx.engine
+            .add_rule("bob".into(), "eav_rules".into(), Action::Write)
+            .await?;
+        fx.engine
+            .add_rule("bob".into(), "eav_entities".into(), Action::Read)
+            .await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let mut body = rule_body();
+        body["capabilities"] = json!({"read": [], "write": ["task"]});
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::post()
+                    .uri("/eav/rules")
+                    .set_json(body),
+                &fx.token("bob")?,
+            )
+            .to_request(),
+        )
+        .await;
+
+        assert_eq!(res.status(), http::StatusCode::FORBIDDEN);
+        assert!(fx.runtime.rules().list_page(50, 0).await?.is_empty());
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn a_rule_with_entity_grants_stores_both_capability_lists() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        fx.engine
+            .add_rule("bob".into(), "eav_rules".into(), Action::Write)
+            .await?;
+        fx.engine
+            .add_rule("bob".into(), "eav_entities".into(), Action::Read)
+            .await?;
+        fx.engine
+            .add_rule("bob".into(), "eav_entities".into(), Action::Write)
+            .await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let mut body = rule_body();
+        body["capabilities"] = json!({"read": ["task"], "write": ["task"]});
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::post()
+                    .uri("/eav/rules")
+                    .set_json(body),
+                &fx.token("bob")?,
+            )
+            .to_request(),
+        )
+        .await;
+
+        assert_eq!(res.status(), http::StatusCode::CREATED);
+        let rule: Value = actix_test::read_body_json(res).await;
+        assert_eq!(rule["capabilities"]["read"], json!(["task"]));
+        assert_eq!(rule["capabilities"]["write"], json!(["task"]));
+
+        let stored = fx.runtime.rules().get("alpha").await?.expect("rule exists");
+        assert_eq!(stored.capabilities.read, vec!["task".to_string()]);
+        assert_eq!(stored.capabilities.write, vec!["task".to_string()]);
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn a_read_only_rule_needs_only_the_entity_read_grant() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        fx.engine
+            .add_rule("bob".into(), "eav_rules".into(), Action::Write)
+            .await?;
+        fx.engine
+            .add_rule("bob".into(), "eav_entities".into(), Action::Read)
+            .await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let mut body = rule_body();
+        body["capabilities"] = json!({"read": ["task"], "write": []});
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::post()
+                    .uri("/eav/rules")
+                    .set_json(body),
+                &fx.token("bob")?,
+            )
+            .to_request(),
+        )
+        .await;
+
+        assert_eq!(res.status(), http::StatusCode::CREATED);
+        let rule: Value = actix_test::read_body_json(res).await;
+        assert_eq!(rule["capabilities"]["read"], json!(["task"]));
+        assert_eq!(rule["capabilities"]["write"], json!([]));
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn a_second_create_replaces_the_capability_lists() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        fx.engine
+            .add_rule("bob".into(), "eav_rules".into(), Action::Write)
+            .await?;
+        fx.engine
+            .add_rule("bob".into(), "eav_entities".into(), Action::Read)
+            .await?;
+        fx.engine
+            .add_rule("bob".into(), "eav_entities".into(), Action::Write)
+            .await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("bob")?;
+
+        let mut first = rule_body();
+        first["capabilities"] = json!({"read": ["task"], "write": ["task"]});
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::post()
+                    .uri("/eav/rules")
+                    .set_json(first),
+                &token,
+            )
+            .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::CREATED);
+
+        let mut second = rule_body();
+        second["capabilities"] = json!({"read": ["invoice"], "write": []});
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::post()
+                    .uri("/eav/rules")
+                    .set_json(second),
+                &token,
+            )
+            .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::CREATED);
+
+        let stored = fx.runtime.rules().get("alpha").await?.expect("rule exists");
+        assert_eq!(stored.version, 2);
+        assert_eq!(stored.capabilities.read, vec!["invoice".to_string()]);
+        assert!(stored.capabilities.write.is_empty());
         Ok(())
     }
 

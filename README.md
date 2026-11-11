@@ -290,6 +290,16 @@ The `rules` module runs actions for entity events. It adds no business rules.
 
 A rule has a trigger, a condition, and an action reference. The trigger selects event kinds and schemas. The condition tests entity state and the changed attributes. A condition tree is limited to 16 levels. The action reference names one registered action and holds its parameters.
 
+A rule also declares the schema ids that its script may read and write:
+
+```json
+"capabilities": { "read": ["task"], "write": ["task"] }
+```
+
+An empty list grants no access. Each list holds at most 32 ids. A list cannot contain a duplicate. An id does not need a schema that exists, so you can create a rule before its schema.
+
+Authorization has two levels. The author needs `read` on `eav_entities` for a non-empty `read` list. The author needs `write` on `eav_entities` for a non-empty `write` list. The rule then narrows that collection grant to the listed schemas. The create and replace route checks these grants. The enable route does not change the lists, so it does not repeat the check. There are no per-schema grants, so the collection grant is the author-level boundary.
+
 The durable rule store lives on OxKV and keeps an index for each trigger event and schema pair. The runner tails the shared change feed and runs the matching enabled rules in priority order.
 
 #### Condition scripts

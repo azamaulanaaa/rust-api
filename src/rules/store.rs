@@ -199,6 +199,7 @@ impl RuleStore {
             trigger: draft.trigger,
             condition: draft.condition,
             action: draft.action,
+            capabilities: draft.capabilities,
             created_at: previous.as_ref().map_or(now, |rule| rule.created_at),
             updated_at: now,
         };
@@ -810,7 +811,7 @@ mod tests {
     use crate::eav::entity::{AttributeValue, Entity};
     use crate::eav::schema::SchemaRef;
     use crate::records::AttributeChange;
-    use crate::rules::rule::{ActionRef, CompareOp, Condition};
+    use crate::rules::rule::{ActionRef, CompareOp, Condition, RuleCapabilities};
     use std::collections::BTreeMap;
 
     async fn new_store() -> RuleStore {
@@ -837,6 +838,7 @@ mod tests {
                 kind: "log".to_string(),
                 params: serde_json::json!({}),
             },
+            capabilities: RuleCapabilities::default(),
         }
     }
 
@@ -886,6 +888,29 @@ mod tests {
         assert_eq!(store.get("alpha").await.unwrap(), None);
         assert!(store.list().await.unwrap().is_empty());
         assert!(!store.delete("alpha").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn capabilities_round_trip_through_the_store() {
+        let store = new_store().await;
+        let mut rule = draft("alpha");
+        rule.capabilities.read = vec!["task".to_string()];
+        rule.capabilities.write = vec!["task".to_string(), "note".to_string()];
+
+        let saved = store.upsert(rule).await.unwrap();
+        assert_eq!(saved.capabilities.read, vec!["task".to_string()]);
+        assert_eq!(
+            saved.capabilities.write,
+            vec!["task".to_string(), "note".to_string()]
+        );
+        assert_eq!(store.get("alpha").await.unwrap(), Some(saved.clone()));
+
+        let mut replacement = draft("alpha");
+        replacement.capabilities.read = vec!["invoice".to_string()];
+        let replaced = store.upsert(replacement).await.unwrap();
+        assert_eq!(replaced.version, 2);
+        assert_eq!(replaced.capabilities.read, vec!["invoice".to_string()]);
+        assert!(replaced.capabilities.write.is_empty());
     }
 
     #[tokio::test]

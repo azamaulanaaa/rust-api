@@ -59,7 +59,9 @@ pub use builtin::{LogAction, NoopAction};
 pub use effect::{EffectPlan, EntityEffect, MAX_EFFECTS};
 pub use engine::{ExecutionOutcome, RuleEngine, RuleExecution, RuleObserver};
 pub use error::RuleError;
-pub use rule::{ActionRef, CompareOp, Condition, Rule, RuleDraft, RuleId, RuleTrigger};
+pub use rule::{
+    ActionRef, CompareOp, Condition, Rule, RuleCapabilities, RuleDraft, RuleId, RuleTrigger,
+};
 pub use script::{ScriptContext, ScriptEngine, ScriptError};
 pub use script_host::{MAX_FIND_RESULTS, ScriptCapabilities, ScriptHostError, ScriptReadHost};
 pub use store::{RuleDeadLetter, RuleStore};
