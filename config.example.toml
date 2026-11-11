@@ -138,7 +138,10 @@ sample_ratio = 1.0
 # gc_interval_ms = 3600000
 
 # Retention window in seconds for execution markers. Must be above 0.
-# Keep it longer than any replay window for WAL events. Default: 2592000.
+# Values below 604800 (7 days) log a warning. A shorter window can delete a
+# marker before a replay reads it, so the action can run twice. The server
+# does not reject the value. Keep it longer than any replay window for WAL
+# events. Default: 2592000.
 # execution_retention_secs = 2592000
 
 # Pause in milliseconds between due timer passes. Must be above 0.
@@ -148,6 +151,10 @@ sample_ratio = 1.0
 # Largest number of due entities to read for each time index key.
 # Must be above 0. Default: 100.
 # timer_batch = 100
+
+# Maximum causation depth for a rule chain. The maximum is inclusive. The
+# value must be within 1..=64. Default: 8.
+# max_causation_depth = 8
 
 # Checks that each EntityRef target exists on a write. With false, a write
 # still validates the target form and skips only the existence read.
@@ -159,7 +166,8 @@ sample_ratio = 1.0
 # webhook_allowed_hosts = ["example.com", "example.com:8443"]
 
 # Optional HMAC-SHA256 secret for webhook signing. It must have at least
-# 32 bytes. Default: none, which sends no signature header.
+# 32 bytes. Default: none, which sends no signature header. Set
+# RUST_API_EAV_WEBHOOK_SIGNING_SECRET to inject it from the environment.
 # webhook_signing_secret = "change-me-32-bytes-or-longer"
 
 # Maximum delivery attempts for one webhook job. It must be within 1..=20.

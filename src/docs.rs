@@ -62,6 +62,7 @@ use utoipa::OpenApi;
         crate::eav::sync::snapshot,
         crate::eav::sync::build_replica,
         crate::eav::sync::replica,
+        crate::eav::sync::reset_replica,
         crate::eav::sync::replica_status,
     ),
     components(schemas(
@@ -98,6 +99,7 @@ use utoipa::OpenApi;
         crate::eav::sync::ReplicaBuildResponse,
         crate::eav::sync::ReplicaChunkQuery,
         crate::eav::sync::ReplicaChunkResponse,
+        crate::eav::sync::ReplicaReadResponse,
         crate::eav::sync::ReplicaStatusResponse,
         crate::rules::rule::RuleDraft,
         crate::rules::rule::Rule,
@@ -217,6 +219,35 @@ mod tests {
         ] {
             assert!(schemas.contains_key(name), "spec missing {name}");
         }
+    }
+
+    /// The replica read route documents both response shapes.
+    ///
+    /// Without `chunk`, the route returns a JSON array of entities.
+    /// With `chunk=N`, it returns one `ReplicaChunkResponse`.
+    #[test]
+    fn replica_read_documents_the_chunk_response() {
+        let spec: Value =
+            serde_json::from_str(&ApiDoc::openapi().to_json().expect("spec serializes"))
+                .expect("spec is JSON");
+        let schemas = spec["components"]["schemas"]
+            .as_object()
+            .expect("component schemas");
+        assert!(schemas.contains_key("ReplicaChunkResponse"));
+        let one_of = schemas["ReplicaReadResponse"]["oneOf"]
+            .as_array()
+            .expect("ReplicaReadResponse oneOf");
+        assert_eq!(one_of.len(), 2);
+        let shapes = serde_json::to_string(one_of).expect("oneOf serializes");
+        assert!(shapes.contains("ReplicaChunkResponse"), "{shapes}");
+        assert!(shapes.contains("Entity"), "{shapes}");
+
+        let schema = &spec["paths"]["/eav/sync/replica"]["get"]["responses"]["200"]["content"]["application/json"]
+            ["schema"];
+        assert_eq!(
+            schema["$ref"], "#/components/schemas/ReplicaReadResponse",
+            "replica read schema is {schema}"
+        );
     }
 
     /// Guards the PWA contract. Every served route that the SPA code generator

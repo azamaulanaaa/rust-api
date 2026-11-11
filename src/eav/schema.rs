@@ -15,6 +15,15 @@
 //! and a clone of the registry shares that cache.
 //! Schema versions are immutable, so a cache entry never changes and no code
 //! invalidates it. A new schema version gets a new cache key.
+//!
+//! The cache has a fixed cap of 1024 entries in a normal build.
+//! A test build uses a cap of 2 entries, so a test can cross the boundary
+//! quickly.
+//! A cache miss at or above the cap removes arbitrary entries until one slot is
+//! free.
+//! A `HashMap` has no order, so the eviction order is not defined.
+//! Eviction costs one reload and never changes the result, because a schema
+//! version is immutable.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -23,6 +32,7 @@ use oxkv::{Direction, GetSet, KeyValue, OxKvStore, Store as _, Transaction as _}
 use serde::{Deserialize, Deserializer, Serialize, de};
 use tokio::sync::{Mutex, RwLock};
 
+use crate::eav::MAX_PAGE_OFFSET;
 use crate::eav::error::SchemaError;
 
 /// Key prefix for the whole schema family.
@@ -42,6 +52,14 @@ const MAX_NAME_BYTES: usize = 128;
 
 /// Maximum number of schemas on one inheritance path.
 const MAX_DEPTH: usize = 16;
+
+/// Maximum number of cached effective schemas in a normal build.
+#[cfg(not(test))]
+const MAX_EFFECTIVE_CACHE: usize = 1024;
+
+/// Maximum number of cached effective schemas in a test build.
+#[cfg(test)]
+const MAX_EFFECTIVE_CACHE: usize = 2;
 
 /// The storage type of one attribute.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
@@ -168,6 +186,7 @@ pub struct SchemaRegistry {
     /// Effective schemas keyed by exact schema id and version.
     ///
     /// An entry is immutable, because a schema version is immutable.
+    /// The map holds at most 1024 entries in a normal build.
     cache: Arc<RwLock<HashMap<(String, u64), EffectiveSchema>>>,
 }
 
@@ -179,6 +198,12 @@ impl SchemaRegistry {
             publish_lock: Arc::new(Mutex::new(())),
             cache: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    /// Returns the number of cached effective schemas.
+    #[cfg(test)]
+    async fn cache_len(&self) -> usize {
+        self.cache.read().await.len()
     }
 
     /// Publishes a schema draft and returns the stored definition.
@@ -275,6 +300,17 @@ impl SchemaRegistry {
         load_version(&*g, id, version).await
     }
 
+    /// Reports whether a schema exists.
+    ///
+    /// The call reads only the head key.
+    /// It does not load the schema version.
+    /// Use this call when a route needs the existence status and no schema data.
+    pub async fn exists(&self, id: &str) -> Result<bool, SchemaError> {
+        validate_name("schema id", id)?;
+        let g = self.store.read().await;
+        Ok(read_head(&*g, id).await?.is_some())
+    }
+
     /// Reads the latest schema version.
     ///
     /// The call returns `None` when the schema does not exist.
@@ -311,11 +347,18 @@ impl SchemaRegistry {
     /// The call skips `offset` schemas.
     /// It then loads at most `limit` versions.
     /// A `limit` of 0 returns an empty list.
+    /// An offset above `MAX_PAGE_OFFSET` returns an invalid-input error.
+    /// Use `after` for a deeper page.
     pub async fn list_page(
         &self,
         limit: usize,
         offset: usize,
     ) -> Result<Vec<SchemaDef>, SchemaError> {
+        if offset > MAX_PAGE_OFFSET {
+            return Err(SchemaError::Invalid(format!(
+                "offset must be at most {MAX_PAGE_OFFSET}. Use after to page deeper."
+            )));
+        }
         if limit == 0 {
             return Ok(Vec::new());
         }
@@ -344,7 +387,8 @@ impl SchemaRegistry {
     /// The scan reads only the `schema:head:` family.
     /// It starts after the `after` id when the caller gives a cursor.
     /// The call returns the versions and the cursor for the next page.
-    /// The cursor is the last id of a full page.
+    /// The scan reads one extra id as a look-ahead.
+    /// The cursor is the last id of the page when the extra id exists.
     /// The cursor is `None` when the scan is exhausted.
     /// A stale or unknown cursor returns the ids after its sort position.
     /// A `limit` of 0 returns an empty list and no cursor.
@@ -364,13 +408,12 @@ impl SchemaRegistry {
             }
             None => HEAD_PREFIX.to_string(),
         };
-        let max = u32::try_from(limit).ok();
+        let max = u32::try_from(limit.saturating_add(1)).ok();
         let cursor = (Some(start), Some(prefix_scan_end(HEAD_PREFIX)));
         let heads = g
             .gets_bytes(max, Direction::Next, cursor)
             .await
             .map_err(SchemaError::Store)?;
-        let full = heads.len() == limit;
         let mut rows = Vec::with_capacity(heads.len());
         for head in heads {
             let Some(id) = head.key.strip_prefix(HEAD_PREFIX) else {
@@ -384,7 +427,9 @@ impl SchemaRegistry {
             rows.push((id.to_string(), version));
         }
         rows.sort_by(|a, b| a.0.cmp(&b.0));
-        let next = if full {
+        let has_more = rows.len() > limit;
+        rows.truncate(limit);
+        let next = if has_more {
             rows.last().map(|(id, _)| id.clone())
         } else {
             None
@@ -410,6 +455,10 @@ impl SchemaRegistry {
     /// A cache entry is immutable, because a schema version is immutable.
     /// The cache belongs to this registry instance, and a clone of the
     /// registry shares the same cache.
+    /// The cache holds at most 1024 entries in a normal build.
+    /// A miss at or above the cap removes arbitrary entries before it inserts
+    /// the new entry.
+    /// Eviction costs one store reload and never changes the result.
     pub async fn effective(
         &self,
         id: &str,
@@ -429,7 +478,11 @@ impl SchemaRegistry {
         let effective = flatten(&*g, &root).await?;
         drop(g);
 
-        self.cache.write().await.insert(key, effective.clone());
+        let mut cache = self.cache.write().await;
+        if cache.len() >= MAX_EFFECTIVE_CACHE {
+            evict_for_one_slot(&mut cache);
+        }
+        cache.insert(key, effective.clone());
         Ok(Some(effective))
     }
 
@@ -529,6 +582,19 @@ impl SchemaRegistry {
         out.sort();
         out.dedup();
         Ok(out)
+    }
+}
+
+/// Removes arbitrary entries until the cache has one free slot.
+///
+/// A `HashMap` has no order, so the removal order is not defined.
+/// Eviction costs one reload on the next `effective` call for each removed key.
+fn evict_for_one_slot(cache: &mut HashMap<(String, u64), EffectiveSchema>) {
+    while cache.len() >= MAX_EFFECTIVE_CACHE {
+        let Some(key) = cache.keys().next().cloned() else {
+            break;
+        };
+        cache.remove(&key);
     }
 }
 
@@ -1101,6 +1167,16 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_page_rejects_an_offset_above_the_maximum() {
+        let reg = new_registry().await;
+        reg.publish(draft("a", &[], vec![])).await.unwrap();
+
+        let result = reg.list_page(2, MAX_PAGE_OFFSET + 1).await;
+
+        assert!(matches!(result, Err(SchemaError::Invalid(_))));
+    }
+
+    #[tokio::test]
     async fn list_page_with_limit_zero_is_empty() {
         let reg = new_registry().await;
         reg.publish(draft("a", &[], vec![])).await.unwrap();
@@ -1146,6 +1222,88 @@ mod tests {
 
         assert_eq!(ids, vec!["a", "b", "c", "d", "e"]);
         assert_eq!(pages, 3);
+    }
+
+    #[tokio::test]
+    async fn list_after_full_final_page_returns_no_cursor() {
+        let reg = new_registry().await;
+        for id in ["a", "b", "c", "d"] {
+            reg.publish(draft(id, &[], vec![])).await.unwrap();
+        }
+
+        let (first, next) = reg.list_after(2, None).await.unwrap();
+        let first_ids: Vec<&str> = first.iter().map(|def| def.id.as_str()).collect();
+        assert_eq!(first_ids, vec!["a", "b"]);
+        assert_eq!(next.as_deref(), Some("b"));
+
+        let (second, next) = reg.list_after(2, next.as_deref()).await.unwrap();
+        let second_ids: Vec<&str> = second.iter().map(|def| def.id.as_str()).collect();
+        assert_eq!(second_ids, vec!["c", "d"]);
+        assert_eq!(next, None);
+
+        let mut all: Vec<String> = first.into_iter().map(|def| def.id).collect();
+        all.extend(second.into_iter().map(|def| def.id));
+        assert_eq!(all, vec!["a", "b", "c", "d"]);
+    }
+
+    #[tokio::test]
+    async fn list_after_pages_five_schemas_with_a_short_final_page() {
+        let reg = new_registry().await;
+        for id in ["a", "b", "c", "d", "e"] {
+            reg.publish(draft(id, &[], vec![])).await.unwrap();
+        }
+
+        let (first, next) = reg.list_after(2, None).await.unwrap();
+        let first_ids: Vec<&str> = first.iter().map(|def| def.id.as_str()).collect();
+        assert_eq!(first_ids, vec!["a", "b"]);
+        assert_eq!(next.as_deref(), Some("b"));
+
+        let (second, next) = reg.list_after(2, next.as_deref()).await.unwrap();
+        let second_ids: Vec<&str> = second.iter().map(|def| def.id.as_str()).collect();
+        assert_eq!(second_ids, vec!["c", "d"]);
+        assert_eq!(next.as_deref(), Some("d"));
+
+        let (third, next) = reg.list_after(2, next.as_deref()).await.unwrap();
+        let third_ids: Vec<&str> = third.iter().map(|def| def.id.as_str()).collect();
+        assert_eq!(third_ids, vec!["e"]);
+        assert_eq!(next, None);
+
+        let mut all: Vec<String> = first.into_iter().map(|def| def.id).collect();
+        all.extend(second.into_iter().map(|def| def.id));
+        all.extend(third.into_iter().map(|def| def.id));
+        assert_eq!(all, vec!["a", "b", "c", "d", "e"]);
+    }
+
+    #[tokio::test]
+    async fn list_after_pages_three_schemas_with_a_short_final_page() {
+        let reg = new_registry().await;
+        for id in ["a", "b", "c"] {
+            reg.publish(draft(id, &[], vec![])).await.unwrap();
+        }
+
+        let (first, next) = reg.list_after(2, None).await.unwrap();
+        let first_ids: Vec<&str> = first.iter().map(|def| def.id.as_str()).collect();
+        assert_eq!(first_ids, vec!["a", "b"]);
+        assert_eq!(next.as_deref(), Some("b"));
+
+        let (second, next) = reg.list_after(2, next.as_deref()).await.unwrap();
+        let second_ids: Vec<&str> = second.iter().map(|def| def.id.as_str()).collect();
+        assert_eq!(second_ids, vec!["c"]);
+        assert_eq!(next, None);
+
+        let mut all: Vec<String> = first.into_iter().map(|def| def.id).collect();
+        all.extend(second.into_iter().map(|def| def.id));
+        assert_eq!(all, vec!["a", "b", "c"]);
+    }
+
+    #[tokio::test]
+    async fn list_after_empty_registry_returns_no_cursor() {
+        let reg = new_registry().await;
+
+        let (page, next) = reg.list_after(2, None).await.unwrap();
+
+        assert!(page.is_empty());
+        assert_eq!(next, None);
     }
 
     #[tokio::test]
@@ -1635,5 +1793,175 @@ mod tests {
         assert_eq!(reg.cache.read().await.len(), 1);
         assert_eq!(reg.effective("user", 1).await.unwrap(), Some(from_clone));
         assert_eq!(reg.cache.read().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn effective_returns_the_correct_schema_after_more_versions_than_the_cap() {
+        let reg = new_registry().await;
+        let versions = MAX_EFFECTIVE_CACHE + 4;
+        for i in 0..versions {
+            reg.publish(draft(
+                "user",
+                &[],
+                vec![attr(&format!("field{i}"), AttributeType::String)],
+            ))
+            .await
+            .unwrap();
+        }
+
+        for i in 0..versions {
+            let version = (i + 1) as u64;
+            let effective = reg.effective("user", version).await.unwrap().unwrap();
+            assert_eq!(effective.version, version);
+            assert_eq!(effective.attributes.len(), 1);
+            assert!(
+                effective.attributes.contains_key(&format!("field{i}")),
+                "version {version} must keep its own attribute"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_cache_stays_at_or_below_the_cap() {
+        let reg = new_registry().await;
+        for i in 0..(MAX_EFFECTIVE_CACHE + 4) {
+            reg.publish(draft(
+                "user",
+                &[],
+                vec![attr(&format!("field{i}"), AttributeType::String)],
+            ))
+            .await
+            .unwrap();
+            reg.effective("user", (i + 1) as u64).await.unwrap();
+        }
+
+        let len = reg.cache_len().await;
+        assert!(len > 0, "a cache miss must insert one entry");
+        assert!(
+            len <= MAX_EFFECTIVE_CACHE,
+            "cache length {len} must not exceed the cap {MAX_EFFECTIVE_CACHE}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cached_entry_that_survives_eviction_is_still_a_hit() {
+        let reg = new_registry().await;
+        reg.publish(draft(
+            "user",
+            &[],
+            vec![attr("email", AttributeType::String)],
+        ))
+        .await
+        .unwrap();
+
+        let sentinels: Vec<(String, EffectiveSchema)> = (0..MAX_EFFECTIVE_CACHE)
+            .map(|i| {
+                let id = format!("ghost{i}");
+                let value = EffectiveSchema {
+                    id: id.clone(),
+                    version: 1,
+                    ancestors: Vec::new(),
+                    attributes: BTreeMap::new(),
+                };
+                (id, value)
+            })
+            .collect();
+        {
+            let mut cache = reg.cache.write().await;
+            for (id, value) in &sentinels {
+                cache.insert((id.clone(), 1), value.clone());
+            }
+        }
+        assert_eq!(reg.cache_len().await, MAX_EFFECTIVE_CACHE);
+
+        // This miss crosses the cap, so the insert removes one arbitrary entry.
+        reg.effective("user", 1).await.unwrap().unwrap();
+        assert_eq!(reg.cache_len().await, MAX_EFFECTIVE_CACHE);
+
+        // A hit returns the sentinel value without a store read. An evicted
+        // sentinel reads the store and returns `None`, because it has no row.
+        let mut hits = 0;
+        for (id, value) in &sentinels {
+            if reg.effective(id, 1).await.unwrap().as_ref() == Some(value) {
+                hits += 1;
+            }
+        }
+        assert_eq!(
+            hits,
+            MAX_EFFECTIVE_CACHE - 1,
+            "every sentinel except the evicted one must be a cache hit"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_version_returns_none_and_does_not_insert_an_entry() {
+        let reg = new_registry().await;
+        for i in 0..MAX_EFFECTIVE_CACHE {
+            reg.publish(draft(
+                "user",
+                &[],
+                vec![attr(&format!("field{i}"), AttributeType::String)],
+            ))
+            .await
+            .unwrap();
+            reg.effective("user", (i + 1) as u64).await.unwrap();
+        }
+        let before = reg.cache_len().await;
+        assert_eq!(before, MAX_EFFECTIVE_CACHE);
+
+        let missing = reg
+            .effective("user", (MAX_EFFECTIVE_CACHE + 1) as u64)
+            .await
+            .unwrap();
+
+        assert!(missing.is_none());
+        assert_eq!(reg.cache_len().await, before);
+    }
+
+    #[tokio::test]
+    async fn parent_and_child_versions_stay_isolated_after_many_resolutions() {
+        let reg = new_registry().await;
+        reg.publish(draft(
+            "base",
+            &[],
+            vec![attr("base_only", AttributeType::String)],
+        ))
+        .await
+        .unwrap();
+        reg.publish(draft(
+            "child",
+            &["base"],
+            vec![attr("child_only", AttributeType::String)],
+        ))
+        .await
+        .unwrap();
+
+        for i in 0..(MAX_EFFECTIVE_CACHE + 2) {
+            reg.publish(draft(
+                "base",
+                &[],
+                vec![attr(&format!("base{i}"), AttributeType::String)],
+            ))
+            .await
+            .unwrap();
+            reg.publish(draft(
+                "child",
+                &["base"],
+                vec![attr(&format!("child{i}"), AttributeType::String)],
+            ))
+            .await
+            .unwrap();
+            reg.effective("base", (i + 2) as u64).await.unwrap();
+            reg.effective("child", (i + 2) as u64).await.unwrap();
+        }
+
+        let parent = reg.effective("base", 1).await.unwrap().unwrap();
+        let child = reg.effective("child", 1).await.unwrap().unwrap();
+
+        assert!(parent.attributes.contains_key("base_only"));
+        assert!(!parent.attributes.contains_key("child_only"));
+        assert!(child.attributes.contains_key("base_only"));
+        assert!(child.attributes.contains_key("child_only"));
+        assert!(reg.cache_len().await <= MAX_EFFECTIVE_CACHE);
     }
 }

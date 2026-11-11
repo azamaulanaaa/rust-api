@@ -61,6 +61,20 @@ pub enum EntityError {
     /// The second field is the target entity id.
     #[error("attribute {0} references an entity that does not exist: {1}")]
     DanglingRef(String, String),
+    /// Other entities still reference the entity.
+    ///
+    /// The fields are the entity id and the number of distinct referring
+    /// entities.
+    /// The message does not list the referring ids.
+    #[error(
+        "entity {id} has {count} references from other entities. Delete with force to override"
+    )]
+    Referenced {
+        /// The entity id.
+        id: String,
+        /// The number of distinct referring entities.
+        count: usize,
+    },
     /// Data could not be encoded or decoded.
     #[error("entity serialization failed")]
     Internal(String),

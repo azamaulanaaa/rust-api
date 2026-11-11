@@ -27,6 +27,20 @@
 //! A marker stops a second run of one rule and one event.
 //! [`RuleStore::gc_executions`] deletes old markers.
 //!
+//! # Execution marker cleanup
+//!
+//! [`RuleStore::gc_executions`] walks the `rule:exec:` key family in pages.
+//! One page holds at most `GC_BATCH` rows.
+//! The batch size is 200 in a normal build and 2 in a test build.
+//! The call reads one page, deletes the expired markers of that page, and
+//! reads again.
+//! The scan moves its cursor forward only when a page holds no expired
+//! marker.
+//! Therefore a delete cannot skip a live marker.
+//! Memory use is proportional to `GC_BATCH` and not to the marker count.
+//! [`RuleStore::execution_count`] walks the family in the same pages.
+//! The marker of a deleted rule waits for the retention window.
+//!
 //! # Cleanup safety
 //!
 //! A delete of a marker can permit a duplicate action.
@@ -40,6 +54,7 @@ use std::sync::Arc;
 use oxkv::{Direction, GetSet, KeyValue, OxKvStore, Store as _, Transaction as _};
 use tokio::sync::{Mutex, RwLock};
 
+use crate::eav::MAX_PAGE_OFFSET;
 use crate::records::{EntityEvent, EntityEventKind};
 use crate::rules::error::RuleError;
 use crate::rules::rule::{Rule, RuleDraft, RuleTrigger, validate_identifier};
@@ -59,6 +74,21 @@ const CURSOR_KEY: &str = "rule:cursor";
 /// Key prefix for execution markers.
 const EXEC_PREFIX: &str = "rule:exec:";
 
+/// Maximum number of execution markers that one cleanup page reads.
+///
+/// The cleanup walks the `rule:exec:` family in pages of this size.
+/// Test builds use a small page, so that a test can cross a page boundary
+/// with a small marker set.
+#[cfg(not(test))]
+const GC_BATCH: usize = 200;
+
+/// Maximum number of execution markers that one cleanup page reads.
+///
+/// Test builds use a small page, so that a test can cross a page boundary
+/// with a small marker set.
+#[cfg(test)]
+const GC_BATCH: usize = 2;
+
 /// A store of rules on one OxKV store.
 ///
 /// The store keeps one shared handle.
@@ -69,6 +99,11 @@ pub struct RuleStore {
     store: Arc<RwLock<OxKvStore>>,
     /// Serializes writes, so two callers cannot claim one version.
     publish_lock: Arc<Mutex<()>>,
+    /// Largest execution-marker page that a cleanup read.
+    ///
+    /// The field exists only in a test build.
+    #[cfg(test)]
+    gc_page_high_water: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl RuleStore {
@@ -77,6 +112,8 @@ impl RuleStore {
         Self {
             store: Arc::new(RwLock::new(store)),
             publish_lock: Arc::new(Mutex::new(())),
+            #[cfg(test)]
+            gc_page_high_water: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -165,7 +202,14 @@ impl RuleStore {
     /// The call skips `offset` rules.
     /// It then returns at most `limit` rules.
     /// A `limit` of 0 returns an empty list.
+    /// An offset above `MAX_PAGE_OFFSET` returns an invalid-input error.
+    /// Rules support offset paging only.
     pub async fn list_page(&self, limit: usize, offset: usize) -> Result<Vec<Rule>, RuleError> {
+        if offset > MAX_PAGE_OFFSET {
+            return Err(RuleError::Invalid(format!(
+                "offset must be at most {MAX_PAGE_OFFSET}. Rules support offset paging only."
+            )));
+        }
         if limit == 0 {
             return Ok(Vec::new());
         }
@@ -319,6 +363,17 @@ impl RuleStore {
     /// The call logs a warning for that marker and continues the pass.
     /// The return value is the number of deleted markers.
     ///
+    /// # Paging
+    ///
+    /// The call reads the family in pages of `GC_BATCH` rows.
+    /// It deletes the expired markers of one page, then reads again.
+    /// It stops when a page holds zero rows.
+    /// It moves its cursor forward only when a page holds no expired marker.
+    /// Thus a delete cannot skip a live marker.
+    /// Memory use is proportional to `GC_BATCH` and not to the marker count.
+    ///
+    /// A marker of a deleted rule stays until the retention window ends.
+    ///
     /// # Duplicate actions
     ///
     /// A delete can permit a duplicate action.
@@ -326,13 +381,24 @@ impl RuleStore {
     /// the cursor is reset.
     /// The retention window must be longer than any replay window.
     pub async fn gc_executions(&self, older_than: i64) -> Result<usize, RuleError> {
-        let expired = {
-            let g = self.store.read().await;
-            let rows = scan_prefix(&*g, EXEC_PREFIX).await?;
-            let mut keys = Vec::new();
+        let mut deleted = 0usize;
+        // None starts at the first marker. A set value resumes at that key.
+        let mut cursor: Option<String> = None;
+        loop {
+            let rows = {
+                let g = self.store.read().await;
+                exec_page(&g, cursor.as_deref()).await?
+            };
+            if rows.is_empty() {
+                break;
+            }
+            self.record_gc_page(rows.len());
+
+            let last_key = rows.last().map(|row| row.key.clone());
+            let mut expired = Vec::new();
             for row in rows {
                 match serde_json::from_slice::<i64>(&row.value) {
-                    Ok(timestamp) if timestamp < older_than => keys.push(row.key),
+                    Ok(timestamp) if timestamp < older_than => expired.push(row.key),
                     Ok(_) => {}
                     Err(_) => {
                         tracing::warn!(
@@ -342,29 +408,73 @@ impl RuleStore {
                     }
                 }
             }
-            keys
-        };
 
-        if expired.is_empty() {
-            return Ok(0);
-        }
+            let Some(last_key) = last_key else {
+                break;
+            };
+            if expired.is_empty() {
+                // No delete in this page. The next page starts at the last key.
+                cursor = Some(last_key);
+                continue;
+            }
 
-        let _publish = self.publish_lock.lock().await;
-        let g = self.store.write().await;
-        let tx = g.begin_tx().map_err(RuleError::Store)?;
-        for key in &expired {
-            tx.delete(key).await.map_err(RuleError::Store)?;
+            let count = expired.len();
+            {
+                let _publish = self.publish_lock.lock().await;
+                let g = self.store.write().await;
+                let tx = g.begin_tx().map_err(RuleError::Store)?;
+                for key in &expired {
+                    tx.delete(key).await.map_err(RuleError::Store)?;
+                }
+                tx.commit().await.map_err(RuleError::Store)?;
+            }
+            deleted += count;
+            // Do not move the cursor. The next page starts at the same key,
+            // because a delete can otherwise skip a live marker.
         }
-        tx.commit().await.map_err(RuleError::Store)?;
-        Ok(expired.len())
+        Ok(deleted)
     }
 
     /// Returns the number of execution markers.
     ///
     /// The call counts the rows in the `rule:exec:` key family.
+    /// It reads the family in pages of `GC_BATCH` rows.
+    /// Memory use is proportional to `GC_BATCH` and not to the marker count.
     pub async fn execution_count(&self) -> Result<usize, RuleError> {
-        let g = self.store.read().await;
-        Ok(scan_prefix(&*g, EXEC_PREFIX).await?.len())
+        let mut total = 0usize;
+        let mut cursor: Option<String> = None;
+        loop {
+            let rows = {
+                let g = self.store.read().await;
+                exec_page(&g, cursor.as_deref()).await?
+            };
+            let Some(last) = rows.last() else {
+                break;
+            };
+            total += rows.len();
+            cursor = Some(last.key.clone());
+        }
+        Ok(total)
+    }
+
+    /// Records the size of one cleanup page.
+    ///
+    /// The counter exists only in a test build.
+    fn record_gc_page(&self, len: usize) {
+        #[cfg(test)]
+        self.gc_page_high_water
+            .fetch_max(len, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(not(test))]
+        let _ = len;
+    }
+
+    /// Returns the largest cleanup page that this store read.
+    ///
+    /// The call exists only in a test build.
+    #[cfg(test)]
+    fn gc_page_high_water(&self) -> usize {
+        self.gc_page_high_water
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -421,6 +531,28 @@ where
     serde_json::from_slice(&bytes)
         .map(Some)
         .map_err(|error| RuleError::Serialization(error.to_string()))
+}
+
+/// Reads one bounded page of the `rule:exec:` key family.
+///
+/// The call reads at most `GC_BATCH` rows.
+/// The cursor is inclusive.
+/// When `after` is set, the call drops the resume key itself, so that the
+/// caller does not read one key twice.
+async fn exec_page(store: &OxKvStore, after: Option<&str>) -> Result<Vec<KeyValue>, RuleError> {
+    let start = after.map_or_else(|| EXEC_PREFIX.to_string(), ToString::to_string);
+    let cursor = (Some(start), Some(prefix_scan_end(EXEC_PREFIX)));
+    let limit = u32::try_from(GC_BATCH).unwrap_or(u32::MAX);
+    let mut rows = store
+        .gets_bytes(Some(limit), Direction::Next, cursor)
+        .await
+        .map_err(RuleError::Store)?;
+    if let Some(resume) = after
+        && rows.first().is_some_and(|row| row.key == resume)
+    {
+        rows.remove(0);
+    }
+    Ok(rows)
 }
 
 /// Scans a key range that ends at the `prefix:` family bound.
@@ -616,6 +748,16 @@ mod tests {
         let page = store.list_page(2, 9).await.unwrap();
 
         assert!(page.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_page_rejects_an_offset_above_the_maximum() {
+        let store = new_store().await;
+        store.upsert(draft("a")).await.unwrap();
+
+        let result = store.list_page(2, MAX_PAGE_OFFSET + 1).await;
+
+        assert!(matches!(result, Err(RuleError::Invalid(_))));
     }
 
     #[tokio::test]
@@ -864,6 +1006,83 @@ mod tests {
         put_execution_marker(&raw, "beta", "evt-2", 300).await;
 
         assert_eq!(store.execution_count().await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn gc_executions_deletes_old_markers_across_pages() {
+        let (store, raw) = store_with_raw().await;
+        for index in 1..=7 {
+            put_execution_marker(&raw, "alpha", &format!("evt-{index}"), 100).await;
+        }
+
+        let deleted = store.gc_executions(200).await.unwrap();
+
+        assert_eq!(deleted, 7);
+        assert_eq!(store.execution_count().await.unwrap(), 0);
+        for index in 1..=7 {
+            assert!(
+                !store
+                    .is_executed("alpha", &format!("evt-{index}"))
+                    .await
+                    .unwrap()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn gc_executions_keeps_live_markers_across_pages() {
+        let (store, raw) = store_with_raw().await;
+        for index in 1..=5 {
+            let at = if index % 2 == 0 { 300 } else { 100 };
+            put_execution_marker(&raw, "alpha", &format!("evt-{index}"), at).await;
+        }
+
+        let deleted = store.gc_executions(200).await.unwrap();
+
+        assert_eq!(deleted, 3);
+        assert!(!store.is_executed("alpha", "evt-1").await.unwrap());
+        assert!(store.is_executed("alpha", "evt-2").await.unwrap());
+        assert!(!store.is_executed("alpha", "evt-3").await.unwrap());
+        assert!(store.is_executed("alpha", "evt-4").await.unwrap());
+        assert!(!store.is_executed("alpha", "evt-5").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn gc_executions_second_pass_finds_nothing() {
+        let (store, raw) = store_with_raw().await;
+        for index in 1..=5 {
+            put_execution_marker(&raw, "alpha", &format!("evt-{index}"), 100).await;
+        }
+
+        assert_eq!(store.gc_executions(200).await.unwrap(), 5);
+        assert_eq!(store.gc_executions(200).await.unwrap(), 0);
+        assert_eq!(store.execution_count().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn gc_executions_reads_at_most_one_batch() {
+        let (store, raw) = store_with_raw().await;
+        for index in 1..=7 {
+            put_execution_marker(&raw, "alpha", &format!("evt-{index}"), 100).await;
+        }
+
+        assert_eq!(store.gc_executions(200).await.unwrap(), 7);
+
+        let largest = store.gc_page_high_water();
+        assert_eq!(
+            largest, GC_BATCH,
+            "the cleanup must read one full page and no more"
+        );
+    }
+
+    #[tokio::test]
+    async fn execution_count_pages_the_family() {
+        let (store, raw) = store_with_raw().await;
+        for index in 1..=7 {
+            put_execution_marker(&raw, "alpha", &format!("evt-{index}"), 100).await;
+        }
+
+        assert_eq!(store.execution_count().await.unwrap(), 7);
     }
 
     #[tokio::test]
