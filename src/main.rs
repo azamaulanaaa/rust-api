@@ -266,20 +266,15 @@ async fn import_policy(
 ///
 /// The policy lock, the lease, the fencing state, and the dependency health
 /// keep their existing behaviour.
-/// `eav_failed` is `None` when the EAV runtime is disabled.
-/// A `Some(true)` value means that the EAV runtime stopped after an error.
+/// `eav_failed` is `true` when the EAV runtime stopped after an error.
 fn readiness_state(
     policy_unlocked: bool,
     lease_lost: bool,
     primary_loss: bool,
     dependencies_healthy: bool,
-    eav_failed: Option<bool>,
+    eav_failed: bool,
 ) -> bool {
-    policy_unlocked
-        && !lease_lost
-        && !primary_loss
-        && dependencies_healthy
-        && !eav_failed.unwrap_or(false)
+    policy_unlocked && !lease_lost && !primary_loss && dependencies_healthy && !eav_failed
 }
 
 /// Runs the HTTP listener until stopped.
@@ -293,7 +288,6 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
     let mirror_master = config.database.mirror_master;
     let lease_ttl = config.database.writer_lease_ttl_secs;
     // Read the EAV settings before the code moves other config fields.
-    let eav_enabled = config.eav.enabled;
     let eav_config = config.eav.runtime_config();
     let eav_max_causation_depth = config.eav.max_causation_depth;
     let webhook_signing_secret = config.eav.webhook_signing_secret.clone();
@@ -378,61 +372,50 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
     // of being dropped mid-flight.
     let cancel = tokio_util::sync::CancellationToken::new();
 
-    // Start the optional EAV runtime and API module. The binary registers the
-    // built-in `noop` and `log` actions. A host application adds its own
-    // actions through `EavRuntime::build`. The module and the background loops
-    // share one runtime handle.
-    let (eav_api_module, eav_handle, webhook_worker, eav_failure_latch) = if eav_enabled {
-        // The webhook worker uses one durable queue under `{prefix}/eav-queue`.
-        let queue_store = rust_api::db::build_s3_store(
-            &s3_client_config,
-            &domain_prefix(&db_prefix, "eav-queue"),
-        )
-        .await
-        .map_err(|e| anyhow::anyhow!("build EAV queue OxKvStore: {e}"))?;
-        let queue: Arc<dyn rust_api::queue::JobQueue> = Arc::new(DurableQueue::new(Arc::new(
-            tokio::sync::RwLock::new(queue_store),
-        )));
-        let signing_secret = webhook_signing_secret
-            .as_ref()
-            .map(|secret| secret.as_bytes().to_vec());
-        let webhook = WebhookAction::new(config.eav.webhook_allowed_hosts.clone())
-            .allow_private_hosts(webhook_allow_private_hosts)
-            .with_queue(queue.clone(), signing_secret, webhook_max_attempts);
-        let worker = QueueWorker::new(
-            queue,
-            vec![Arc::new(webhook.job_handler())],
-            "eav-webhook".to_string(),
-        );
-        let worker_cancel = cancel.clone();
-        let worker_handle = tokio::spawn(async move { worker.run(worker_cancel).await });
-        let runtime = rust_api::eav::runtime::EavRuntime::build(
-            &s3_client_config,
-            &db_prefix,
-            wal.clone(),
-            vec![Arc::new(NoopAction), Arc::new(LogAction), Arc::new(webhook)],
-            config.eav.check_entity_refs,
-            eav_max_causation_depth,
-            config.eav.script_enabled,
-        )
-        .await
-        .context("build the EAV runtime")?;
-        let module = EavApiModule::new(
-            runtime.clone(),
-            policy_engine.authorizer(),
-            oidc_api_module.middleware(),
-        );
-        let handle = runtime.spawn(cancel.clone(), eav_config);
-        let failure_latch = runtime.failure_latch();
-        (
-            Some(module),
-            Some(handle),
-            Some(worker_handle),
-            Some(failure_latch),
-        )
-    } else {
-        (None, None, None, None)
-    };
+    // Start the EAV runtime and API module. The runtime is always on. A host
+    // that does not want EAV removes this wiring in code and rebuilds. The
+    // binary registers the built-in `noop` and `log` actions. A host
+    // application adds its own actions through `EavRuntime::build`. The module
+    // and the background loops share one runtime handle.
+    // The webhook worker uses one durable queue under `{prefix}/eav-queue`.
+    let queue_store =
+        rust_api::db::build_s3_store(&s3_client_config, &domain_prefix(&db_prefix, "eav-queue"))
+            .await
+            .map_err(|e| anyhow::anyhow!("build EAV queue OxKvStore: {e}"))?;
+    let queue: Arc<dyn rust_api::queue::JobQueue> = Arc::new(DurableQueue::new(Arc::new(
+        tokio::sync::RwLock::new(queue_store),
+    )));
+    let signing_secret = webhook_signing_secret
+        .as_ref()
+        .map(|secret| secret.as_bytes().to_vec());
+    let webhook = WebhookAction::new(config.eav.webhook_allowed_hosts.clone())
+        .allow_private_hosts(webhook_allow_private_hosts)
+        .with_queue(queue.clone(), signing_secret, webhook_max_attempts);
+    let worker = QueueWorker::new(
+        queue,
+        vec![Arc::new(webhook.job_handler())],
+        "eav-webhook".to_string(),
+    );
+    let worker_cancel = cancel.clone();
+    let webhook_worker = tokio::spawn(async move { worker.run(worker_cancel).await });
+    let runtime = rust_api::eav::runtime::EavRuntime::build(
+        &s3_client_config,
+        &db_prefix,
+        wal.clone(),
+        vec![Arc::new(NoopAction), Arc::new(LogAction), Arc::new(webhook)],
+        config.eav.check_entity_refs,
+        eav_max_causation_depth,
+        config.eav.script_enabled,
+    )
+    .await
+    .context("build the EAV runtime")?;
+    let eav_api_module = EavApiModule::new(
+        runtime.clone(),
+        policy_engine.authorizer(),
+        oidc_api_module.middleware(),
+    );
+    let eav_handle = runtime.spawn(cancel.clone(), eav_config);
+    let eav_failure_latch = runtime.failure_latch();
 
     // Applications append their own reactive services here. The starter kit
     // ships none, so the list stays empty. Each entry implements
@@ -525,8 +508,8 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
     // happens when a writer still holds it. It also fails when the
     // single-writer lease is lost. A lost lease means that a successor now
     // owns the prefix. This process must stop taking traffic. The startup of
-    // the server already checks S3, OIDC, JWKS, and the lease. When the EAV
-    // runtime is enabled, the check also fails when its failure latch is set.
+    // the server already checks S3, OIDC, JWKS, and the lease. The check also
+    // fails when the EAV failure latch is set.
     let readiness: rust_api::http::health::ReadyCheck = Arc::new({
         let policy_engine = policy_engine.clone();
         let dependency_health = dependency_health.clone();
@@ -548,15 +531,13 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
             // - An external dependency (S3 or OIDC) failed its last
             //   background probe.
             // - The EAV runtime stopped after an error, so entity events no
-            //   longer flow. A disabled EAV runtime leaves this check out.
+            //   longer flow.
             readiness_state(
                 policy_engine.is_unlocked(),
                 lease_lost.load(std::sync::atomic::Ordering::Relaxed),
                 rust_api::fencing::primary_loss(),
                 dependency_health.is_healthy(),
-                eav_failure_latch
-                    .as_ref()
-                    .map(|latch| latch.load(std::sync::atomic::Ordering::Relaxed)),
+                eav_failure_latch.load(std::sync::atomic::Ordering::Relaxed),
             )
         }
     });
@@ -565,7 +546,7 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
     // the lease is claimed and before the server listens takes the path of
     // the early error. On that path, the best-effort release of the `Drop`
     // of the guard is all that there is.
-    let mut service = ApiService::new()
+    let service = ApiService::new()
         .with_cors_origins(config.http.allowed_origins.clone())
         .with_rate_limit(rust_api::limits::TokenBucket::new(
             config.limits.burst_or_rate(),
@@ -576,10 +557,8 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
         .register_module(Box::new(setup_api_module))
         .register_module(Box::new(policy_api_module))
         .register_module(Box::new(fs_api_module))
-        .register_module(Box::new(sync_api_module));
-    if let Some(module) = eav_api_module {
-        service = service.register_module(Box::new(module));
-    }
+        .register_module(Box::new(sync_api_module))
+        .register_module(Box::new(eav_api_module));
     let served = service.start(listen_addr.into()).await;
 
     // This is the orderly release, and the code awaits it. `start` returns
@@ -604,21 +583,17 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
         }
     }
 
-    // Stop the optional EAV runtime with the other background tasks.
-    if let Some(handle) = eav_handle {
-        match handle.await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => tracing::error!(?error, "EAV runtime failed"),
-            Err(error) => tracing::error!(?error, "EAV runtime task failed"),
-        }
+    // Stop the EAV runtime with the other background tasks.
+    match eav_handle.await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::error!(?error, "EAV runtime failed"),
+        Err(error) => tracing::error!(?error, "EAV runtime task failed"),
     }
 
     // The worker observes the shared token and exits after one poll.
-    if let Some(handle) = webhook_worker {
-        match handle.await {
-            Ok(()) => {}
-            Err(error) => tracing::error!(?error, "webhook worker task failed"),
-        }
+    match webhook_worker.await {
+        Ok(()) => {}
+        Err(error) => tracing::error!(?error, "webhook worker task failed"),
     }
 
     // This runs before the flush of the telemetry, so that the log lines of
@@ -782,27 +757,23 @@ force_path_style = true
     /// A dead EAV runtime takes the instance out of the rotation.
     ///
     /// The test reads a shared latch, so it covers the same path that the
-    /// readiness closure uses. A disabled EAV runtime supplies `None` and
-    /// leaves the other checks unchanged.
+    /// readiness closure uses. The latch is always part of the check.
     #[test]
     fn a_dead_eav_runtime_makes_the_instance_not_ready() {
         use std::sync::atomic::{AtomicBool, Ordering};
 
         let latch = Arc::new(AtomicBool::new(false));
-        let read = |latch: &Arc<AtomicBool>| Some(latch.load(Ordering::Relaxed));
+        let read = |latch: &Arc<AtomicBool>| latch.load(Ordering::Relaxed);
 
         assert!(readiness_state(true, false, false, true, read(&latch)));
         latch.store(true, Ordering::Relaxed);
         assert!(!readiness_state(true, false, false, true, read(&latch)));
 
-        // A disabled EAV runtime supplies `None`.
-        assert!(readiness_state(true, false, false, true, None));
-
-        // The new latch does not change the other reasons.
-        assert!(!readiness_state(false, false, false, true, None));
-        assert!(!readiness_state(true, true, false, true, None));
-        assert!(!readiness_state(true, false, true, true, None));
-        assert!(!readiness_state(true, false, false, false, None));
+        // A healthy EAV runtime does not change the other reasons.
+        assert!(!readiness_state(false, false, false, true, false));
+        assert!(!readiness_state(true, true, false, true, false));
+        assert!(!readiness_state(true, false, true, true, false));
+        assert!(!readiness_state(true, false, false, false, false));
     }
 
     /// The `[s3]` section of the config file becomes the type that the engine
