@@ -473,8 +473,6 @@ dependencies = [
 [[package]]
 name = "casbin"
 version = "2.20.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c53f7476c2d0d9cd7ccc88c16ffc5c7889a0497b3462b10b12b5329adde69665"
 dependencies = [
  "async-trait",
  "fixedbitset",
@@ -3124,6 +3122,7 @@ dependencies = [
  "oxkv",
  "rand 0.8.8",
  "reqwest",
+ "rhai",
  "rsa",
  "serde",
  "serde_json",

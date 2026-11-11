@@ -14,6 +14,14 @@
 //! The engine also tails the durable change feed.
 //! Delivery is at least once, so an action must be idempotent.
 //!
+//! [A script condition](crate::rules::rule::Condition::Script) holds a
+//! sandboxed Rhai expression.
+//! [The script engine](crate::rules::script::ScriptEngine) compiles and
+//! evaluates it.
+//! A script is pure: it cannot read the store, write, call the network, read
+//! the clock, use random values, load files, or evaluate more code.
+//! The server enables scripts with `[eav].script_enabled`.
+//!
 //! The module has no HTTP routes and no business rules.
 
 /// Rule actions and the action context.
@@ -31,6 +39,9 @@ pub mod error;
 /// Rule definitions, triggers, and condition evaluation.
 pub mod rule;
 
+/// Sandboxed Rhai condition scripts.
+pub mod script;
+
 /// The read-only data API for the future script engine.
 pub mod script_host;
 
@@ -45,6 +56,7 @@ pub use builtin::{LogAction, NoopAction};
 pub use engine::{ExecutionOutcome, RuleEngine, RuleExecution, RuleObserver};
 pub use error::RuleError;
 pub use rule::{ActionRef, CompareOp, Condition, Rule, RuleDraft, RuleId, RuleTrigger};
+pub use script::{ScriptContext, ScriptEngine, ScriptError};
 pub use script_host::{MAX_FIND_RESULTS, ScriptCapabilities, ScriptHostError, ScriptReadHost};
 pub use store::{RuleDeadLetter, RuleStore};
 pub use webhook::WebhookAction;
