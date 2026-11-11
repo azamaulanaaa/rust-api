@@ -2,7 +2,7 @@
 //!
 //! # Key layout
 //!
-//! All keys live in one bounded key family:
+//! Rule rows and markers live in one bounded key family:
 //!
 //! - `rule:meta:{id}` holds one [`Rule`] as JSON.
 //! - `rule:idx:{event_kind}:{schema_id}:{rule_id}` is an empty marker.
@@ -11,6 +11,11 @@
 //! The keys are `created`, `updated`, `deleted`, `schema_applied`,
 //! `schema_removed`, and `timer`.
 //! All scans stop at the `prefix:` to `prefix;` bound.
+//!
+//! The engine keeps two more key families:
+//!
+//! - `rule-attempt:{seq}:{event_id}` holds a JSON `u32` attempt count.
+//! - `rule-dead:{seq}:{event_id}` holds one [`RuleDeadLetter`] as JSON.
 //!
 //! # Writes
 //!
@@ -27,6 +32,15 @@
 //! A marker stops a second run of one rule and one event.
 //! [`RuleStore::gc_executions`] deletes old markers.
 //!
+//! # Attempt and dead-letter rows
+//!
+//! The engine increments the attempt row when `process` fails for one entry.
+//! The row is durable, so a runtime restart continues the count.
+//! The engine deletes the attempt row after a success.
+//! At the attempt limit, the engine writes one dead-letter row and deletes
+//! the attempt row.
+//! [`RuleStore::dead_letters`] lists the dead-letter rows, newest first.
+//!
 //! # Execution marker cleanup
 //!
 //! [`RuleStore::gc_executions`] walks the `rule:exec:` key family in pages.
@@ -40,6 +54,11 @@
 //! Memory use is proportional to `GC_BATCH` and not to the marker count.
 //! [`RuleStore::execution_count`] walks the family in the same pages.
 //! The marker of a deleted rule waits for the retention window.
+//!
+//! The same pass deletes the `rule-dead:` rows older than
+//! `DEAD_LETTER_RETENTION_SECS`.
+//! That retention is 7 days.
+//! The pass does not touch the cursor.
 //!
 //! # Cleanup safety
 //!
@@ -74,6 +93,19 @@ const CURSOR_KEY: &str = "rule:cursor";
 /// Key prefix for execution markers.
 const EXEC_PREFIX: &str = "rule:exec:";
 
+/// Key prefix for failed-attempt rows.
+const ATTEMPT_PREFIX: &str = "rule-attempt:";
+
+/// Key prefix for dead-letter rows.
+const DEAD_PREFIX: &str = "rule-dead:";
+
+/// The number of seconds that a dead-letter row stays before cleanup.
+///
+/// The existing execution-marker cleanup pass deletes a dead letter when its
+/// `at` time is older than this value.
+/// The value is 7 days.
+const DEAD_LETTER_RETENTION_SECS: i64 = 7 * 24 * 60 * 60;
+
 /// Maximum number of execution markers that one cleanup page reads.
 ///
 /// The cleanup walks the `rule:exec:` family in pages of this size.
@@ -88,6 +120,25 @@ const GC_BATCH: usize = 200;
 /// with a small marker set.
 #[cfg(test)]
 const GC_BATCH: usize = 2;
+
+/// One entry that the engine failed by policy.
+///
+/// The engine writes this row after `MAX_ENTRY_ATTEMPTS` failed attempts.
+/// The row holds the feed sequence, the event id, the attempt count, the
+/// sanitized error text, and the Unix time of the write.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RuleDeadLetter {
+    /// The feed sequence of the failed entry.
+    pub seq: u64,
+    /// The id of the failed event.
+    pub event_id: String,
+    /// The number of failed attempts.
+    pub attempts: u32,
+    /// The sanitized error text.
+    pub error: String,
+    /// The Unix time of the dead-letter write, in seconds.
+    pub at: i64,
+}
 
 /// A store of rules on one OxKV store.
 ///
@@ -354,23 +405,127 @@ impl RuleStore {
             .map_err(RuleError::Store)
     }
 
-    /// Deletes execution markers older than `older_than`.
+    /// Returns the number of failed attempts for one feed entry.
     ///
-    /// The call scans only the `rule:exec:` key family.
+    /// A missing row is 0.
+    /// The key is `rule-attempt:{seq}:{event_id}`.
+    /// The call exists only in a test build.
+    #[cfg(test)]
+    pub(crate) async fn entry_attempts(&self, seq: u64, event_id: &str) -> Result<u32, RuleError> {
+        let g = self.store.read().await;
+        let Some(bytes) = g
+            .get_bytes(&attempt_key(seq, event_id))
+            .await
+            .map_err(RuleError::Store)?
+        else {
+            return Ok(0);
+        };
+        serde_json::from_slice(&bytes).map_err(|error| RuleError::Serialization(error.to_string()))
+    }
+
+    /// Records one failed attempt and returns the new count.
+    ///
+    /// The row is durable, so a runtime restart continues the count.
+    /// The key is `rule-attempt:{seq}:{event_id}`.
+    /// The value is a JSON `u32`.
+    pub(crate) async fn increment_entry_attempts(
+        &self,
+        seq: u64,
+        event_id: &str,
+    ) -> Result<u32, RuleError> {
+        let key = attempt_key(seq, event_id);
+        let g = self.store.write().await;
+        let attempts = match g.get_bytes(&key).await.map_err(RuleError::Store)? {
+            Some(bytes) => serde_json::from_slice::<u32>(&bytes)
+                .map_err(|error| RuleError::Serialization(error.to_string()))?
+                .saturating_add(1),
+            None => 1,
+        };
+        let bytes = serde_json::to_vec(&attempts)
+            .map_err(|error| RuleError::Serialization(error.to_string()))?;
+        g.set_bytes(&key, &bytes)
+            .await
+            .map(|_| ())
+            .map_err(RuleError::Store)?;
+        Ok(attempts)
+    }
+
+    /// Deletes the attempt row for one feed entry.
+    ///
+    /// A missing row is not an error.
+    pub(crate) async fn clear_entry_attempts(
+        &self,
+        seq: u64,
+        event_id: &str,
+    ) -> Result<(), RuleError> {
+        let g = self.store.write().await;
+        g.delete(&attempt_key(seq, event_id))
+            .await
+            .map(|_| ())
+            .map_err(RuleError::Store)
+    }
+
+    /// Writes one dead-letter row.
+    ///
+    /// The key is `rule-dead:{seq}:{event_id}`.
+    /// The value holds a [`RuleDeadLetter`] as JSON.
+    pub(crate) async fn write_dead_letter(&self, dead: &RuleDeadLetter) -> Result<(), RuleError> {
+        let bytes = serde_json::to_vec(dead)
+            .map_err(|error| RuleError::Serialization(error.to_string()))?;
+        let g = self.store.write().await;
+        g.set_bytes(&dead_key(dead.seq, &dead.event_id), &bytes)
+            .await
+            .map(|_| ())
+            .map_err(RuleError::Store)
+    }
+
+    /// Lists every dead-letter row, newest first.
+    ///
+    /// The result is sorted by `at` in descending order.
+    /// Two rows with the same `at` are sorted by `seq` in descending order.
+    /// The call is for tests and for a future operator surface.
+    pub async fn dead_letters(&self) -> Result<Vec<RuleDeadLetter>, RuleError> {
+        let g = self.store.read().await;
+        let rows = scan_family(&*g, DEAD_PREFIX).await?;
+        let mut dead = Vec::with_capacity(rows.len());
+        for row in rows {
+            let entry: RuleDeadLetter = serde_json::from_slice(&row.value)
+                .map_err(|error| RuleError::Serialization(error.to_string()))?;
+            dead.push(entry);
+        }
+        dead.sort_by(|left, right| {
+            right
+                .at
+                .cmp(&left.at)
+                .then_with(|| right.seq.cmp(&left.seq))
+        });
+        Ok(dead)
+    }
+
+    /// Deletes expired cleanup rows.
+    ///
+    /// The call scans the `rule:exec:` key family.
     /// Each marker holds a JSON Unix timestamp in seconds.
     /// The call deletes a marker when its timestamp is less than `older_than`.
     /// A marker that does not decode stays in place.
-    /// The call logs a warning for that marker and continues the pass.
-    /// The return value is the number of deleted markers.
+    /// The call logs a warning for that row and continues the pass.
+    ///
+    /// The same pass scans the `rule-dead:` key family.
+    /// It deletes a dead letter when its `at` time is older than
+    /// `DEAD_LETTER_RETENTION_SECS`.
+    /// The dead-letter retention is 7 days.
+    /// The pass does not touch the cursor.
+    ///
+    /// The return value is the number of deleted rows.
     ///
     /// # Paging
     ///
-    /// The call reads the family in pages of `GC_BATCH` rows.
-    /// It deletes the expired markers of one page, then reads again.
+    /// The call reads one family in pages of `GC_BATCH` rows.
+    /// It deletes the expired rows of one page, then reads again.
     /// It stops when a page holds zero rows.
-    /// It moves its cursor forward only when a page holds no expired marker.
-    /// Thus a delete cannot skip a live marker.
-    /// Memory use is proportional to `GC_BATCH` and not to the marker count.
+    /// It moves its cursor forward only when a page holds no expired row.
+    /// Thus a delete cannot skip a live row.
+    /// Memory use is proportional to `GC_BATCH` and not to the row count.
     ///
     /// A marker of a deleted rule stays until the retention window ends.
     ///
@@ -381,13 +536,41 @@ impl RuleStore {
     /// the cursor is reset.
     /// The retention window must be longer than any replay window.
     pub async fn gc_executions(&self, older_than: i64) -> Result<usize, RuleError> {
+        let markers = self
+            .gc_family(EXEC_PREFIX, older_than, |row| {
+                serde_json::from_slice::<i64>(&row.value).ok()
+            })
+            .await?;
+        let dead_before = chrono::Utc::now()
+            .timestamp()
+            .saturating_sub(DEAD_LETTER_RETENTION_SECS);
+        let dead = self
+            .gc_family(DEAD_PREFIX, dead_before, |row| {
+                serde_json::from_slice::<RuleDeadLetter>(&row.value)
+                    .ok()
+                    .map(|entry| entry.at)
+            })
+            .await?;
+        Ok(markers + dead)
+    }
+
+    /// Deletes the rows of one family whose timestamp is below `older_than`.
+    async fn gc_family<F>(
+        &self,
+        prefix: &str,
+        older_than: i64,
+        timestamp: F,
+    ) -> Result<usize, RuleError>
+    where
+        F: Fn(&KeyValue) -> Option<i64>,
+    {
         let mut deleted = 0usize;
-        // None starts at the first marker. A set value resumes at that key.
+        // None starts at the first row. A set value resumes at that key.
         let mut cursor: Option<String> = None;
         loop {
             let rows = {
                 let g = self.store.read().await;
-                exec_page(&g, cursor.as_deref()).await?
+                family_page(&g, prefix, cursor.as_deref()).await?
             };
             if rows.is_empty() {
                 break;
@@ -397,13 +580,13 @@ impl RuleStore {
             let last_key = rows.last().map(|row| row.key.clone());
             let mut expired = Vec::new();
             for row in rows {
-                match serde_json::from_slice::<i64>(&row.value) {
-                    Ok(timestamp) if timestamp < older_than => expired.push(row.key),
-                    Ok(_) => {}
-                    Err(_) => {
+                match timestamp(&row) {
+                    Some(at) if at < older_than => expired.push(row.key),
+                    Some(_) => {}
+                    None => {
                         tracing::warn!(
                             key = %row.key,
-                            "rule execution marker does not decode; keep it"
+                            "rule cleanup row does not decode; keep it"
                         );
                     }
                 }
@@ -430,7 +613,7 @@ impl RuleStore {
             }
             deleted += count;
             // Do not move the cursor. The next page starts at the same key,
-            // because a delete can otherwise skip a live marker.
+            // because a delete can otherwise skip a live row.
         }
         Ok(deleted)
     }
@@ -446,7 +629,7 @@ impl RuleStore {
         loop {
             let rows = {
                 let g = self.store.read().await;
-                exec_page(&g, cursor.as_deref()).await?
+                family_page(&g, EXEC_PREFIX, cursor.as_deref()).await?
             };
             let Some(last) = rows.last() else {
                 break;
@@ -533,15 +716,19 @@ where
         .map_err(|error| RuleError::Serialization(error.to_string()))
 }
 
-/// Reads one bounded page of the `rule:exec:` key family.
+/// Reads one bounded page of one key family.
 ///
 /// The call reads at most `GC_BATCH` rows.
 /// The cursor is inclusive.
 /// When `after` is set, the call drops the resume key itself, so that the
 /// caller does not read one key twice.
-async fn exec_page(store: &OxKvStore, after: Option<&str>) -> Result<Vec<KeyValue>, RuleError> {
-    let start = after.map_or_else(|| EXEC_PREFIX.to_string(), ToString::to_string);
-    let cursor = (Some(start), Some(prefix_scan_end(EXEC_PREFIX)));
+async fn family_page(
+    store: &OxKvStore,
+    prefix: &str,
+    after: Option<&str>,
+) -> Result<Vec<KeyValue>, RuleError> {
+    let start = after.map_or_else(|| prefix.to_string(), ToString::to_string);
+    let cursor = (Some(start), Some(prefix_scan_end(prefix)));
     let limit = u32::try_from(GC_BATCH).unwrap_or(u32::MAX);
     let mut rows = store
         .gets_bytes(Some(limit), Direction::Next, cursor)
@@ -561,6 +748,14 @@ where
     S: GetSet + ?Sized,
 {
     debug_assert!(prefix.starts_with(RULE_PREFIX));
+    scan_family(store, prefix).await
+}
+
+/// Scans one key family that ends at the `prefix:` family bound.
+async fn scan_family<S>(store: &S, prefix: &str) -> Result<Vec<KeyValue>, RuleError>
+where
+    S: GetSet + ?Sized,
+{
     debug_assert!(prefix.ends_with(':'));
     let cursor = (Some(prefix.to_string()), Some(prefix_scan_end(prefix)));
     store
@@ -586,6 +781,16 @@ fn meta_key(id: &str) -> String {
 /// The key that holds one execution marker.
 fn exec_key(rule_id: &str, event_id: &str) -> String {
     format!("{EXEC_PREFIX}{rule_id}:{event_id}")
+}
+
+/// The key that holds the failed-attempt count of one feed entry.
+fn attempt_key(seq: u64, event_id: &str) -> String {
+    format!("{ATTEMPT_PREFIX}{seq}:{event_id}")
+}
+
+/// The key that holds one dead-letter row.
+fn dead_key(seq: u64, event_id: &str) -> String {
+    format!("{DEAD_PREFIX}{seq}:{event_id}")
 }
 
 /// Sorts rules by priority in descending order and then by id.
@@ -962,6 +1167,16 @@ mod tests {
             .unwrap();
     }
 
+    fn dead_letter(seq: u64, event_id: &str, at: i64) -> RuleDeadLetter {
+        RuleDeadLetter {
+            seq,
+            event_id: event_id.to_string(),
+            attempts: 5,
+            error: "rule action failed: record".to_string(),
+            at,
+        }
+    }
+
     #[tokio::test]
     async fn gc_executions_deletes_old_markers() {
         let (store, raw) = store_with_raw().await;
@@ -1006,6 +1221,86 @@ mod tests {
         put_execution_marker(&raw, "beta", "evt-2", 300).await;
 
         assert_eq!(store.execution_count().await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn entry_attempts_increment_and_clear() {
+        let (store, raw) = store_with_raw().await;
+
+        assert_eq!(store.entry_attempts(1, "evt-1").await.unwrap(), 0);
+        assert_eq!(store.increment_entry_attempts(1, "evt-1").await.unwrap(), 1);
+        assert_eq!(store.increment_entry_attempts(1, "evt-1").await.unwrap(), 2);
+        assert_eq!(store.entry_attempts(1, "evt-1").await.unwrap(), 2);
+
+        let bytes = raw
+            .get_bytes(&attempt_key(1, "evt-1"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(serde_json::from_slice::<u32>(&bytes).unwrap(), 2);
+
+        store.clear_entry_attempts(1, "evt-1").await.unwrap();
+        assert_eq!(store.entry_attempts(1, "evt-1").await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn dead_letters_returns_newest_first() {
+        let (store, _raw) = store_with_raw().await;
+        store
+            .write_dead_letter(&dead_letter(1, "evt-1", 100))
+            .await
+            .unwrap();
+        store
+            .write_dead_letter(&dead_letter(3, "evt-3", 300))
+            .await
+            .unwrap();
+        store
+            .write_dead_letter(&dead_letter(2, "evt-2", 200))
+            .await
+            .unwrap();
+
+        let dead = store.dead_letters().await.unwrap();
+        let seqs: Vec<u64> = dead.into_iter().map(|entry| entry.seq).collect();
+
+        assert_eq!(seqs, vec![3, 2, 1]);
+    }
+
+    #[tokio::test]
+    async fn gc_executions_deletes_old_dead_letters_and_keeps_new_ones() {
+        let (store, _raw) = store_with_raw().await;
+        let now = chrono::Utc::now().timestamp();
+        let old = dead_letter(1, "evt-old", now - DEAD_LETTER_RETENTION_SECS - 60);
+        let new = dead_letter(2, "evt-new", now);
+        store.write_dead_letter(&old).await.unwrap();
+        store.write_dead_letter(&new).await.unwrap();
+
+        let deleted = store.gc_executions(200).await.unwrap();
+
+        assert_eq!(deleted, 1);
+        assert_eq!(store.dead_letters().await.unwrap(), vec![new]);
+    }
+
+    #[tokio::test]
+    async fn dead_letter_cleanup_keeps_execution_markers_and_the_cursor() {
+        let (store, raw) = store_with_raw().await;
+        let now = chrono::Utc::now().timestamp();
+        put_execution_marker(&raw, "alpha", "evt-live", now).await;
+        store.set_cursor(9).await.unwrap();
+        store
+            .write_dead_letter(&dead_letter(
+                1,
+                "evt-old",
+                now - DEAD_LETTER_RETENTION_SECS - 60,
+            ))
+            .await
+            .unwrap();
+
+        let deleted = store.gc_executions(200).await.unwrap();
+
+        assert_eq!(deleted, 1);
+        assert!(store.is_executed("alpha", "evt-live").await.unwrap());
+        assert_eq!(store.cursor().await.unwrap(), 9);
+        assert!(store.dead_letters().await.unwrap().is_empty());
     }
 
     #[tokio::test]
