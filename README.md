@@ -316,7 +316,41 @@ A script reads three values:
 event.kind == "updated" && entity.attributes.status == "urgent"
 ```
 
-The engine limits the source to 8 KiB. One evaluation has at most 10,000 operations, 16 call levels, a 64 KiB string, a 1,000 element array, and a 1,000 entry map. A 50 ms wall-time guard is a last-resort safety net. The operation limit is the deterministic budget.
+The engine limits the source to 64 KiB. One evaluation has at most 250,000 operations, 64 call levels, a 256 KiB string, a 10,000 element array, and a 10,000 entry map. A 200 ms wall-time guard is a last-resort safety net. The operation limit is the deterministic budget.
+
+The math functions include `sin`, `cos`, `tan`, `sqrt`, `pow` via `**`, `floor`, `round`, `min`, and `max`.
+
+Use integer minor units for money. Rhai has `f64` and no decimal type, so a float cannot hold an exact amount. Add the rounding step to the integer calculation:
+
+```rhai
+fn tax_cents(income) {
+    let first = min(income, 1_100_000);
+    let second = min(max(income - 1_100_000, 0), 3_400_000);
+    let third = max(income - 4_500_000, 0);
+    (first * 10 + second * 22 + third * 37 + 50) / 100
+}
+
+tax_cents(5_000_000) == 1_043_000
+```
+
+A script is deterministic. It cannot read the clock or use random values. The server injects `now` in seconds.
+
+A rule script blocks the rule runner for its duration. Keep a script short. Use a durable job for a heavy simulation.
+
+```rhai
+fn height(v0, angle, g, h0, steps) {
+    let vy = v0 * sin(angle);
+    let flight = (vy + sqrt(vy * vy + 2.0 * g * h0)) / g;
+    let dt = flight / steps;
+    let t = 0.0;
+    for i in 0..steps {
+        t += dt;
+    }
+    h0 + vy * t - 0.5 * g * t * t
+}
+
+abs(height(20.0, 0.7, 9.81, 1.5, 100)) < 0.000000001
+```
 
 A condition script cannot read the store, write, call the network, read the clock, use random values, load files, or evaluate more code. The engine disables `eval` and `import`. It replaces `print` and `debug` with no-ops, so a script cannot flood stdout or the log. The compiled-script cache holds at most 256 entries. It is a speed aid only.
 
@@ -328,7 +362,7 @@ An action of kind `script` runs a sandboxed Rhai script against the entity store
 { "kind": "script", "params": { "source": "<rhai>" } }
 ```
 
-The source must be a non-empty string of at most 8 KiB. It must compile. An unknown parameter key is invalid. The error never repeats the source.
+The source must be a non-empty string of at most 64 KiB. It must compile. An unknown parameter key is invalid. The error never repeats the source.
 
 The script gets the same `event`, `entity`, and `now` values as a condition script, plus a `host` value. The host reads entities and stages create, update, and delete effects. Nothing commits during the script.
 
@@ -350,7 +384,7 @@ The host methods are:
 
 A `()` value in an update patch removes the attribute. Any other patch value sets the attribute.
 
-One evaluation makes at most 50 host read calls and stages at most 100 effects. The operation, call-depth, string, array, map, and source limits still apply. Reads see committed state only. A write that the script stages does not appear in a later read.
+One evaluation makes at most 200 host read calls and stages at most 100 effects. The operation, call-depth, string, array, map, and source limits still apply. Reads see committed state only. A write that the script stages does not appear in a later read.
 
 The `read` capability list controls the read methods. A denied `get_entity` returns `()`. A denied find returns the stable error `rule script read access denied`. The `write` capability list controls every staged write. A create needs every schema in the write set. An update or a delete needs at least one pinned schema in the write set. A write outside the set returns the stable error `rule script write access denied`.
 
