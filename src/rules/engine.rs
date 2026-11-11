@@ -859,6 +859,7 @@ mod tests {
                 kind: kind.to_string(),
                 params: serde_json::json!({ "note": "hello" }),
             },
+            capabilities: crate::rules::rule::RuleCapabilities::default(),
         }
     }
 

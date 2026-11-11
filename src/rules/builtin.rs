@@ -66,7 +66,9 @@ mod tests {
     use crate::eav::schema::SchemaRegistry;
     use crate::records::{EntityEvent, EntityEventKind};
     use crate::rules::engine::RuleEngine;
-    use crate::rules::rule::{ActionRef, Condition, Rule, RuleDraft, RuleTrigger};
+    use crate::rules::rule::{
+        ActionRef, Condition, Rule, RuleCapabilities, RuleDraft, RuleTrigger,
+    };
     use crate::rules::store::RuleStore;
 
     /// Builds one action context for the tests.
@@ -87,6 +89,7 @@ mod tests {
                     kind: kind.to_string(),
                     params: json!({ "note": "hello" }),
                 },
+                capabilities: RuleCapabilities::default(),
                 created_at: 0,
                 updated_at: 0,
             },
@@ -159,6 +162,7 @@ mod tests {
                 kind: "log".to_string(),
                 params: json!({}),
             },
+            capabilities: RuleCapabilities::default(),
         };
         assert!(engine.has_action(&draft.action.kind));
     }
