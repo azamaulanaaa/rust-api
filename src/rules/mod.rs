@@ -32,7 +32,7 @@
 //! { "kind": "script", "params": { "source": "<rhai>" } }
 //! ```
 //!
-//! The source must be a non-empty string of at most 8 KiB.
+//! The source must be a non-empty string of at most 64 KiB.
 //! It must compile.
 //! An unknown parameter key is invalid.
 //! The error never repeats the source.
@@ -61,7 +61,7 @@
 //! A `()` value in an update patch removes the attribute.
 //! Any other patch value sets the attribute.
 //!
-//! One evaluation makes at most 50 host read calls and stages at most 100
+//! One evaluation makes at most 200 host read calls and stages at most 100
 //! effects.
 //! The operation, call-depth, string, array, map, and source limits still
 //! apply.

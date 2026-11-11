@@ -212,7 +212,7 @@ impl RuleEngine {
     /// The message never repeats the parameter or the URL.
     ///
     /// A `script` action requires one non-empty `source` string of at most
-    /// 8 KiB.
+    /// 64 KiB.
     /// The source must compile.
     /// An unknown parameter key is invalid.
     /// A disabled script feature is invalid.
@@ -652,7 +652,7 @@ impl RuleEngine {
 ///
 /// The parameters must be an object with exactly one `source` string.
 /// The source must not be empty.
-/// The source must not be larger than 8 KiB.
+/// The source must not be larger than 64 KiB.
 /// Each failure returns a stable error that never repeats the source.
 fn script_source(params: &serde_json::Value) -> Result<&str, RuleError> {
     let invalid = || RuleError::Invalid("rule script action parameters are not valid".to_string());
