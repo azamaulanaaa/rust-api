@@ -18,9 +18,75 @@
 //! sandboxed Rhai expression.
 //! [The script engine](crate::rules::script::ScriptEngine) compiles and
 //! evaluates it.
-//! A script is pure: it cannot read the store, write, call the network, read
-//! the clock, use random values, load files, or evaluate more code.
+//! A condition script is pure: it cannot read the store, write, call the
+//! network, read the clock, use random values, load files, or evaluate more
+//! code.
 //! The server enables scripts with `[eav].script_enabled`.
+//!
+//! # Script actions
+//!
+//! An action of kind `script` runs one sandboxed Rhai script.
+//! The action parameters hold the source:
+//!
+//! ```json
+//! { "kind": "script", "params": { "source": "<rhai>" } }
+//! ```
+//!
+//! The source must be a non-empty string of at most 8 KiB.
+//! It must compile.
+//! An unknown parameter key is invalid.
+//! The error never repeats the source.
+//!
+//! The script gets the same `event`, `entity`, and `now` values as a
+//! condition script, plus a `host` value.
+//! The host reads entities and stages create, update, and delete effects.
+//! Nothing commits during the script.
+//!
+//! ```rhai
+//! let t = host.get_entity("task-1");
+//! if t != () {
+//!     host.update_entity("task-1", t.version, #{ status: "done" });
+//! }
+//! ```
+//!
+//! The host methods are:
+//!
+//! - `host.get_entity(id)` returns a map or `()`.
+//! - `host.find(schema, key, value, limit)` returns an array of ids.
+//! - `host.find_by_schema(schema, limit)` returns an array of ids.
+//! - `host.create_entity(id, schemas, attributes)` stages a create.
+//! - `host.update_entity(id, expected_version, patch)` stages an update.
+//! - `host.delete_entity(id, expected_version)` stages a delete.
+//!
+//! A `()` value in an update patch removes the attribute.
+//! Any other patch value sets the attribute.
+//!
+//! One evaluation makes at most 50 host read calls and stages at most 100
+//! effects.
+//! The operation, call-depth, string, array, map, and source limits still
+//! apply.
+//! Reads see committed state only.
+//! A write that the script stages does not appear in a later read.
+//!
+//! The `read` capability list controls the read methods.
+//! A denied `get_entity` returns `()`.
+//! A denied find returns the stable error
+//! `rule script read access denied`.
+//! The `write` capability list controls every staged write.
+//! A create needs every schema in the write set.
+//! An update or a delete needs at least one pinned schema in the write set.
+//! A write outside the set returns the stable error
+//! `rule script write access denied`.
+//!
+//! After the script returns, the engine applies the staged effects and the
+//! execution marker in one transaction.
+//! A script error or an effect error writes no marker and no effect.
+//! A successful script with no effects still writes the marker.
+//!
+//! The host has no function for HTTP, files, the clock, random values, or
+//! processes.
+//! A script that calls an unknown function fails at evaluation.
+//! A condition script has no `host` value.
 //!
 //! The module has no HTTP routes and no business rules.
 
@@ -62,7 +128,7 @@ pub use error::RuleError;
 pub use rule::{
     ActionRef, CompareOp, Condition, Rule, RuleCapabilities, RuleDraft, RuleId, RuleTrigger,
 };
-pub use script::{ScriptContext, ScriptEngine, ScriptError};
+pub use script::{ScriptActionContext, ScriptContext, ScriptEngine, ScriptError, ScriptHost};
 pub use script_host::{MAX_FIND_RESULTS, ScriptCapabilities, ScriptHostError, ScriptReadHost};
 pub use store::{RuleDeadLetter, RuleStore};
 pub use webhook::WebhookAction;
