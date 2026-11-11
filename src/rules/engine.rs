@@ -53,13 +53,17 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 
 use crate::CancelToken;
-use crate::eav::entity::{Entity, EntityStore};
+use crate::eav::entity::{Entity, EntityStore, WriteContext};
 use crate::eav::entity_error::EntityError;
 use crate::records::{EntityEvent, WalOp};
 use crate::rules::action::{ActionContext, RuleAction};
+use crate::rules::effect::EffectPlan;
 use crate::rules::error::RuleError;
 use crate::rules::rule::{Condition, Rule, validate_identifier};
-use crate::rules::script::{ScriptContext, ScriptEngine};
+use crate::rules::script::{
+    MAX_SOURCE_BYTES, SCRIPT_ACTION_KIND, ScriptActionContext, ScriptContext, ScriptEngine,
+    ScriptError, ScriptHost,
+};
 use crate::rules::store::{RuleDeadLetter, RuleStore};
 use crate::sync::wal::Wal;
 
@@ -195,8 +199,9 @@ impl RuleEngine {
     /// Returns true when the engine has a registered action of `kind`.
     ///
     /// A rule can name only a registered kind.
+    /// The built-in `script` kind is always present.
     pub fn has_action(&self, kind: &str) -> bool {
-        self.actions.contains_key(kind)
+        kind == SCRIPT_ACTION_KIND || self.actions.contains_key(kind)
     }
 
     /// Checks the parameters for one registered action kind.
@@ -205,7 +210,21 @@ impl RuleEngine {
     /// An unknown kind returns [`RuleError::UnknownAction`].
     /// A failed check returns [`RuleError::Invalid`] with a generic message.
     /// The message never repeats the parameter or the URL.
+    ///
+    /// A `script` action requires one non-empty `source` string of at most
+    /// 8 KiB.
+    /// The source must compile.
+    /// An unknown parameter key is invalid.
+    /// A disabled script feature is invalid.
+    /// The error never repeats the source.
     pub fn validate_action(&self, kind: &str, params: &serde_json::Value) -> Result<(), RuleError> {
+        if kind == SCRIPT_ACTION_KIND {
+            let source = script_source(params)?;
+            return self
+                .script
+                .compile(source)
+                .map_err(|error| RuleError::Invalid(error.to_string()));
+        }
         let action = self
             .actions
             .get(kind)
@@ -396,22 +415,28 @@ impl RuleEngine {
                 });
                 continue;
             }
-            let Some(action) = self.actions.get(&rule.action.kind) else {
-                self.observe_action_failure();
-                return Err(RuleError::UnknownAction(rule.action.kind.clone()));
-            };
-            let kind = rule.action.kind.clone();
-            let ctx = ActionContext {
-                rule: rule.clone(),
-                event: event.clone(),
-                entity: entity.clone(),
-                params: rule.action.params.clone(),
-            };
-            action.execute(ctx).await.map_err(|_| {
-                self.observe_action_failure();
-                RuleError::Action(kind)
-            })?;
-            self.rules.mark_executed(&rule.id, &event.event_id).await?;
+            if rule.action.kind == SCRIPT_ACTION_KIND {
+                self.run_script_action(&rule, event, entity.as_ref())
+                    .await
+                    .inspect_err(|_| self.observe_action_failure())?;
+            } else {
+                let Some(action) = self.actions.get(&rule.action.kind) else {
+                    self.observe_action_failure();
+                    return Err(RuleError::UnknownAction(rule.action.kind.clone()));
+                };
+                let kind = rule.action.kind.clone();
+                let ctx = ActionContext {
+                    rule: rule.clone(),
+                    event: event.clone(),
+                    entity: entity.clone(),
+                    params: rule.action.params.clone(),
+                };
+                action.execute(ctx).await.map_err(|_| {
+                    self.observe_action_failure();
+                    RuleError::Action(kind)
+                })?;
+                self.rules.mark_executed(&rule.id, &event.event_id).await?;
+            }
             let outcome = ExecutionOutcome::Executed;
             self.observe(outcome);
             executions.push(RuleExecution {
@@ -420,6 +445,58 @@ impl RuleEngine {
             });
         }
         Ok(executions)
+    }
+
+    /// Runs one script action and commits its effects with the marker.
+    ///
+    /// The call builds a host with the read and write capability sets.
+    /// It evaluates the script on a blocking thread.
+    /// The host captures the runtime handle, so a host method can call
+    /// `block_on` without blocking the async reactor.
+    /// The call validates the effect plan and accepts an empty plan.
+    /// It builds the execution marker with the rule id and the event id.
+    /// One transaction commits the effects and the marker.
+    /// A script error or an effect error writes no marker and no effect.
+    async fn run_script_action(
+        &self,
+        rule: &Rule,
+        event: &EntityEvent,
+        entity: Option<&Entity>,
+    ) -> Result<(), RuleError> {
+        let source = script_source(&rule.action.params)?.to_string();
+        let host = ScriptHost::new(
+            self.entities.clone(),
+            rule.capabilities.to_script_capabilities()?,
+            rule.capabilities.write.clone(),
+            rule.id.clone(),
+            event.event_id.clone(),
+            tokio::runtime::Handle::current(),
+        );
+        let ctx = ScriptActionContext {
+            event: event.clone(),
+            entity: entity.cloned(),
+            now: chrono::Utc::now().timestamp(),
+        };
+        let script = self.script.clone();
+        let effects = tokio::task::spawn_blocking(move || script.eval_action(&source, &ctx, host))
+            .await
+            .map_err(|_| RuleError::Script(ScriptError::Runtime))??;
+
+        let plan = EffectPlan::new(effects);
+        plan.validate_allow_empty().map_err(map_entity_error)?;
+        let key = RuleStore::execution_key(&rule.id, &event.event_id);
+        let value = RuleStore::execution_marker_value(chrono::Utc::now().timestamp())?;
+        let ctx = WriteContext::new(format!("rule:{}", rule.id))
+            .with_correlation_id(event.correlation_id.clone())
+            .with_causation(
+                event.event_id.clone(),
+                event.causation_depth.saturating_add(1),
+            );
+        self.entities
+            .apply_effects_with_marker(&plan, &ctx, Some((&key, &value)))
+            .await
+            .map_err(map_entity_error)?;
+        Ok(())
     }
 
     /// Tails the change feed and processes each entity event until
@@ -571,6 +648,31 @@ impl RuleEngine {
     }
 }
 
+/// Returns the source of one script action.
+///
+/// The parameters must be an object with exactly one `source` string.
+/// The source must not be empty.
+/// The source must not be larger than 8 KiB.
+/// Each failure returns a stable error that never repeats the source.
+fn script_source(params: &serde_json::Value) -> Result<&str, RuleError> {
+    let invalid = || RuleError::Invalid("rule script action parameters are not valid".to_string());
+    let object = params.as_object().ok_or_else(invalid)?;
+    if object.keys().any(|key| key != "source") {
+        return Err(invalid());
+    }
+    let source = object
+        .get("source")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(invalid)?;
+    if source.is_empty() {
+        return Err(invalid());
+    }
+    if source.len() > MAX_SOURCE_BYTES {
+        return Err(RuleError::Invalid(ScriptError::SourceTooLarge.to_string()));
+    }
+    Ok(source)
+}
+
 /// Maps an entity store error into a rule error.
 fn map_entity_error(error: EntityError) -> RuleError {
     match error {
@@ -597,7 +699,8 @@ mod tests {
     use crate::eav::schema::{AttributeDef, AttributeType, SchemaDraft, SchemaRegistry};
     use crate::records::{ChangeSink, EntityEventKind};
     use crate::rules::rule::{ActionRef, CompareOp, Condition, RuleDraft, RuleTrigger};
-    use crate::rules::script::ScriptError;
+    use crate::rules::script::{MAX_SOURCE_BYTES, ScriptError};
+    use oxkv::Hooks as _;
 
     /// A [`RuleAction`] test double that records each context.
     ///
@@ -790,6 +893,7 @@ mod tests {
     struct TestStores {
         rules: RuleStore,
         entities: EntityStore,
+        raw: oxkv::OxKvStore,
     }
 
     fn schema() -> SchemaDraft {
@@ -817,7 +921,8 @@ mod tests {
         let raw = build_test_store(&test_prefix("rules-engine")).await;
         TestStores {
             rules: RuleStore::new(raw.clone()),
-            entities: EntityStore::new(raw, registry),
+            entities: EntityStore::new(raw.clone(), registry),
+            raw,
         }
     }
 
@@ -826,14 +931,18 @@ mod tests {
     }
 
     async fn make_entity(entities: &EntityStore) -> Entity {
+        make_invoice(entities, "e1", 10).await
+    }
+
+    async fn make_invoice(entities: &EntityStore, id: &str, total: i64) -> Entity {
         entities
             .create(
                 EntityDraft {
-                    id: "e1".to_string(),
+                    id: id.to_string(),
                     schemas: vec!["invoice".to_string()],
                     attributes: BTreeMap::from([(
                         "total".to_string(),
-                        AttributeValue::Integer(10),
+                        AttributeValue::Integer(total),
                     )]),
                 },
                 &WriteContext::new("tester"),
@@ -861,6 +970,14 @@ mod tests {
             },
             capabilities: crate::rules::rule::RuleCapabilities::default(),
         }
+    }
+
+    fn script_rule(id: &str, source: &str, read: &[&str], write: &[&str]) -> RuleDraft {
+        let mut rule = draft(id, "script");
+        rule.action.params = serde_json::json!({ "source": source });
+        rule.capabilities.read = read.iter().map(|schema| (*schema).to_string()).collect();
+        rule.capabilities.write = write.iter().map(|schema| (*schema).to_string()).collect();
+        rule
     }
 
     fn event(kind: EntityEventKind) -> EntityEvent {
@@ -2213,5 +2330,418 @@ mod tests {
         let result = RuleEngine::new(stores.rules.clone(), stores.entities.clone(), vec![empty]);
 
         assert!(matches!(result, Err(RuleError::Invalid(_))));
+    }
+
+    #[tokio::test]
+    async fn has_action_reports_the_script_kind() {
+        let stores = stores().await;
+        let engine = engine(&stores, Vec::new());
+
+        assert!(engine.has_action("script"));
+        assert!(!engine.has_action("ghost"));
+    }
+
+    #[tokio::test]
+    async fn a_script_action_reads_an_allowed_entity_and_writes_the_marker() {
+        let stores = stores().await;
+        let engine = engine(&stores, Vec::new()).with_script_enabled(true);
+        make_entity(&stores.entities).await;
+        stores
+            .rules
+            .upsert(script_rule(
+                "alpha",
+                r#"let t = host.get_entity("e1"); if t == () { throw "missing"; } t.attributes.total == 10"#,
+                &["invoice"],
+                &[],
+            ))
+            .await
+            .unwrap();
+
+        let executions = engine
+            .process(&event(EntityEventKind::Created))
+            .await
+            .unwrap();
+
+        assert_eq!(executions[0].outcome, ExecutionOutcome::Executed);
+        assert!(stores.rules.is_executed("alpha", "evt-1").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_script_action_creates_updates_and_deletes_entities() {
+        let stores = stores().await;
+        let engine = engine(&stores, Vec::new()).with_script_enabled(true);
+        make_entity(&stores.entities).await;
+        make_invoice(&stores.entities, "e2", 20).await;
+        stores
+            .rules
+            .upsert(script_rule(
+                "alpha",
+                r#"let t = host.get_entity("e1"); host.create_entity("e3", ["invoice"], #{ total: 5 }); host.update_entity("e1", t.version, #{ total: 20 }); host.delete_entity("e2", 1);"#,
+                &["invoice"],
+                &["invoice"],
+            ))
+            .await
+            .unwrap();
+
+        let executions = engine
+            .process(&event(EntityEventKind::Created))
+            .await
+            .unwrap();
+
+        assert_eq!(executions[0].outcome, ExecutionOutcome::Executed);
+        let e1 = stores.entities.get("e1").await.unwrap().unwrap();
+        assert_eq!(e1.version, 2);
+        assert_eq!(
+            e1.attributes.get("total"),
+            Some(&AttributeValue::Integer(20))
+        );
+        assert!(stores.entities.get("e2").await.unwrap().is_none());
+        let e3 = stores.entities.get("e3").await.unwrap().unwrap();
+        assert_eq!(e3.version, 1);
+        assert_eq!(
+            e3.attributes.get("total"),
+            Some(&AttributeValue::Integer(5))
+        );
+        assert!(stores.rules.is_executed("alpha", "evt-1").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_create_outside_the_write_set_writes_no_effect_and_no_marker() {
+        let stores = stores().await;
+        let engine = engine(&stores, Vec::new()).with_script_enabled(true);
+        make_entity(&stores.entities).await;
+        stores
+            .rules
+            .upsert(script_rule(
+                "alpha",
+                r#"host.create_entity("e3", ["invoice"], #{ total: 5 });"#,
+                &["invoice"],
+                &["other"],
+            ))
+            .await
+            .unwrap();
+
+        let result = engine.process(&event(EntityEventKind::Created)).await;
+
+        assert!(matches!(
+            result,
+            Err(RuleError::Script(ScriptError::WriteDenied))
+        ));
+        assert!(stores.entities.get("e3").await.unwrap().is_none());
+        assert!(!stores.rules.is_executed("alpha", "evt-1").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn an_update_outside_the_write_set_writes_no_effect_and_no_marker() {
+        let stores = stores().await;
+        let engine = engine(&stores, Vec::new()).with_script_enabled(true);
+        make_entity(&stores.entities).await;
+        stores
+            .rules
+            .upsert(script_rule(
+                "alpha",
+                r#"host.update_entity("e1", 1, #{ total: 99 });"#,
+                &["invoice"],
+                &["other"],
+            ))
+            .await
+            .unwrap();
+
+        let result = engine.process(&event(EntityEventKind::Created)).await;
+
+        assert!(matches!(
+            result,
+            Err(RuleError::Script(ScriptError::WriteDenied))
+        ));
+        let e1 = stores.entities.get("e1").await.unwrap().unwrap();
+        assert_eq!(
+            e1.attributes.get("total"),
+            Some(&AttributeValue::Integer(10))
+        );
+        assert!(!stores.rules.is_executed("alpha", "evt-1").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_marker_write_failure_rolls_back_every_effect() {
+        struct RejectMarkerKey(String);
+
+        #[async_trait::async_trait]
+        impl oxkv::Validator for RejectMarkerKey {
+            async fn validate(
+                &self,
+                _ctx: &dyn oxkv::StoreView,
+                key: &str,
+                _value: &[u8],
+            ) -> Result<(), oxkv::StoreError> {
+                if key == self.0 {
+                    return Err(oxkv::StoreError::Other("write rejected".to_string()));
+                }
+                Ok(())
+            }
+        }
+
+        let stores = stores().await;
+        let engine = engine(&stores, Vec::new()).with_script_enabled(true);
+        make_entity(&stores.entities).await;
+        stores
+            .rules
+            .upsert(script_rule(
+                "alpha",
+                r#"host.create_entity("e3", ["invoice"], #{ total: 5 }); host.update_entity("e1", 1, #{ total: 99 });"#,
+                &["invoice"],
+                &["invoice"],
+            ))
+            .await
+            .unwrap();
+        stores
+            .raw
+            .add_validator(RejectMarkerKey("rule:exec:alpha:evt-1".to_string()));
+
+        let result = engine.process(&event(EntityEventKind::Created)).await;
+
+        assert!(matches!(result, Err(RuleError::Store(_))));
+        let e1 = stores.entities.get("e1").await.unwrap().unwrap();
+        assert_eq!(e1.version, 1);
+        assert_eq!(
+            e1.attributes.get("total"),
+            Some(&AttributeValue::Integer(10))
+        );
+        assert!(stores.entities.get("e3").await.unwrap().is_none());
+        assert!(!stores.rules.is_executed("alpha", "evt-1").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn an_effect_error_writes_no_effect_and_no_marker() {
+        let stores = stores().await;
+        let engine = engine(&stores, Vec::new()).with_script_enabled(true);
+        make_entity(&stores.entities).await;
+        stores
+            .rules
+            .upsert(script_rule(
+                "alpha",
+                r#"host.create_entity("e1", ["invoice"], #{ total: 5 });"#,
+                &["invoice"],
+                &["invoice"],
+            ))
+            .await
+            .unwrap();
+
+        let result = engine.process(&event(EntityEventKind::Created)).await;
+
+        assert!(matches!(result, Err(RuleError::Invalid(_))));
+        let e1 = stores.entities.get("e1").await.unwrap().unwrap();
+        assert_eq!(e1.version, 1);
+        assert_eq!(
+            e1.attributes.get("total"),
+            Some(&AttributeValue::Integer(10))
+        );
+        assert!(!stores.rules.is_executed("alpha", "evt-1").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_script_error_discards_every_staged_effect() {
+        let stores = stores().await;
+        let engine = engine(&stores, Vec::new()).with_script_enabled(true);
+        make_entity(&stores.entities).await;
+        stores
+            .rules
+            .upsert(script_rule(
+                "alpha",
+                r#"host.create_entity("e3", ["invoice"], #{ total: 5 }); host.create_entity("e4", ["secret"], #{ total: 6 });"#,
+                &["invoice"],
+                &["invoice"],
+            ))
+            .await
+            .unwrap();
+
+        let result = engine.process(&event(EntityEventKind::Created)).await;
+
+        assert!(matches!(
+            result,
+            Err(RuleError::Script(ScriptError::WriteDenied))
+        ));
+        assert!(stores.entities.get("e3").await.unwrap().is_none());
+        assert!(stores.entities.get("e4").await.unwrap().is_none());
+        assert!(!stores.rules.is_executed("alpha", "evt-1").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_script_action_with_no_effects_writes_the_marker_and_does_not_rerun() {
+        let stores = stores().await;
+        let engine = engine(&stores, Vec::new()).with_script_enabled(true);
+        make_entity(&stores.entities).await;
+        stores
+            .rules
+            .upsert(script_rule(
+                "alpha",
+                r#"let t = host.get_entity("e1");"#,
+                &["invoice"],
+                &[],
+            ))
+            .await
+            .unwrap();
+        let subject = event(EntityEventKind::Created);
+
+        let first = engine.process(&subject).await.unwrap();
+        let second = engine.process(&subject).await.unwrap();
+
+        assert_eq!(first[0].outcome, ExecutionOutcome::Executed);
+        assert_eq!(second[0].outcome, ExecutionOutcome::AlreadyExecuted);
+        assert!(stores.rules.is_executed("alpha", "evt-1").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_replay_returns_already_executed_and_does_not_run_the_script() {
+        let stores = stores().await;
+        let engine = engine(&stores, Vec::new()).with_script_enabled(true);
+        make_entity(&stores.entities).await;
+        stores
+            .rules
+            .upsert(script_rule(
+                "alpha",
+                r#"host.create_entity("e3", ["invoice"], #{ total: 5 });"#,
+                &["invoice"],
+                &["invoice"],
+            ))
+            .await
+            .unwrap();
+        let subject = event(EntityEventKind::Created);
+
+        engine.process(&subject).await.unwrap();
+        let second = engine.process(&subject).await.unwrap();
+
+        assert_eq!(second[0].outcome, ExecutionOutcome::AlreadyExecuted);
+        let e3 = stores.entities.get("e3").await.unwrap().unwrap();
+        assert_eq!(e3.version, 1);
+    }
+
+    #[tokio::test]
+    async fn a_condition_script_cannot_reach_the_host() {
+        let stores = stores().await;
+        let recorder = Arc::new(RecordingAction::new("record"));
+        let engine = engine(&stores, vec![recorder.clone()]).with_script_enabled(true);
+        make_entity(&stores.entities).await;
+        let mut rule = draft("alpha", "record");
+        rule.condition = Condition::Script {
+            source: r#"host.get_entity("e1") == ()"#.to_string(),
+        };
+        stores.rules.upsert(rule).await.unwrap();
+
+        let result = engine.process(&event(EntityEventKind::Created)).await;
+
+        assert!(matches!(result, Err(RuleError::Script(_))));
+        assert!(recorder.records().is_empty());
+        assert!(!stores.rules.is_executed("alpha", "evt-1").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn an_http_function_name_fails_evaluation() {
+        let stores = stores().await;
+        let engine = engine(&stores, Vec::new()).with_script_enabled(true);
+        make_entity(&stores.entities).await;
+        stores
+            .rules
+            .upsert(script_rule(
+                "alpha",
+                r#"http_get("https://example.test")"#,
+                &[],
+                &[],
+            ))
+            .await
+            .unwrap();
+
+        let result = engine.process(&event(EntityEventKind::Created)).await;
+
+        assert!(matches!(
+            result,
+            Err(RuleError::Script(ScriptError::Runtime))
+        ));
+        assert!(!stores.rules.is_executed("alpha", "evt-1").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_script_action_is_rejected_at_save_and_fails_at_run_when_disabled() {
+        let stores = stores().await;
+        let engine = engine(&stores, Vec::new());
+        let params = serde_json::json!({ "source": "let value = 1;" });
+
+        let validation = engine.validate_action("script", &params);
+
+        assert!(matches!(
+            validation,
+            Err(RuleError::Invalid(message)) if message == "rule scripts are disabled"
+        ));
+
+        make_entity(&stores.entities).await;
+        stores
+            .rules
+            .upsert(script_rule("alpha", "let value = 1;", &[], &[]))
+            .await
+            .unwrap();
+        let result = engine.process(&event(EntityEventKind::Created)).await;
+
+        assert!(matches!(
+            result,
+            Err(RuleError::Script(ScriptError::Disabled))
+        ));
+        assert!(!stores.rules.is_executed("alpha", "evt-1").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn validate_action_rejects_bad_script_parameters() {
+        let stores = stores().await;
+        let engine = engine(&stores, Vec::new()).with_script_enabled(true);
+        let oversized = " ".repeat(MAX_SOURCE_BYTES + 1);
+        let cases = [
+            serde_json::json!({}),
+            serde_json::json!({ "source": 5 }),
+            serde_json::json!({ "source": "" }),
+            serde_json::json!({ "source": "let value = ;" }),
+            serde_json::json!({ "source": "let value = 1;", "extra": true }),
+            serde_json::json!({ "source": oversized }),
+        ];
+
+        for params in cases {
+            let result = engine.validate_action("script", &params);
+            assert!(
+                matches!(result, Err(RuleError::Invalid(_))),
+                "parameters must fail validation: {params}"
+            );
+        }
+    }
+
+    /// The blocking bridge reads and writes on a multi-thread runtime.
+    ///
+    /// A host method calls `block_on` on the captured handle.
+    /// The test fails on a deadlock with the timeout.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_blocking_bridge_reads_and_writes_without_deadlock() {
+        let stores = stores().await;
+        let engine = engine(&stores, Vec::new()).with_script_enabled(true);
+        make_entity(&stores.entities).await;
+        stores
+            .rules
+            .upsert(script_rule(
+                "alpha",
+                r#"let t = host.get_entity("e1"); host.update_entity("e1", t.version, #{ total: 11 });"#,
+                &["invoice"],
+                &["invoice"],
+            ))
+            .await
+            .unwrap();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            engine.process(&event(EntityEventKind::Created)),
+        )
+        .await
+        .expect("the blocking bridge must not deadlock");
+
+        assert_eq!(result.unwrap()[0].outcome, ExecutionOutcome::Executed);
+        let e1 = stores.entities.get("e1").await.unwrap().unwrap();
+        assert_eq!(
+            e1.attributes.get("total"),
+            Some(&AttributeValue::Integer(11))
+        );
     }
 }
