@@ -11,9 +11,23 @@
 //! A crash can replay the last batch, so at most 32 entries repeat.
 //! An execution marker stops a duplicate action.
 //! An action must still be idempotent because a crash can repeat one event.
-//! A failed run keeps the cursor before the failed entry.
+//!
+//! A failed entry can block the feed forever.
+//! The engine counts failed attempts for one entry in
+//! `rule-attempt:{seq}:{event_id}`.
+//! The count is durable, so a restart continues it.
+//! The limit is `MAX_ENTRY_ATTEMPTS`: 5 in a normal build and 2 in a test
+//! build.
+//! Below the limit, the run keeps the cursor before the failed entry.
 //! The runtime supervisor restarts a failed run after a backoff delay.
 //! The delay starts at one second and doubles up to 60 seconds.
+//! At the limit, the engine writes a dead-letter row in
+//! `rule-dead:{seq}:{event_id}`.
+//! It deletes the attempt row, writes the cursor at the failed sequence, and
+//! continues with the next entry.
+//! A dead-letter row holds the sequence, the event id, the attempt count,
+//! the sanitized error text, and the write time.
+//! The execution-marker cleanup deletes a dead letter older than 7 days.
 //!
 //! The process lock is per event.
 //! Two calls for one event do not run one rule action twice.
@@ -40,7 +54,7 @@ use crate::records::{EntityEvent, WalOp};
 use crate::rules::action::{ActionContext, RuleAction};
 use crate::rules::error::RuleError;
 use crate::rules::rule::{Rule, validate_identifier};
-use crate::rules::store::RuleStore;
+use crate::rules::store::{RuleDeadLetter, RuleStore};
 use crate::sync::wal::Wal;
 
 /// The default maximum causation depth.
@@ -63,6 +77,16 @@ const RULE_BATCH_SIZE: usize = 256;
 /// Tests use a small batch, so a few entries cross the batch boundary.
 #[cfg(test)]
 const RULE_BATCH_SIZE: usize = 2;
+
+/// The number of failed attempts before the engine dead-letters one entry.
+#[cfg(not(test))]
+const MAX_ENTRY_ATTEMPTS: u32 = 5;
+
+/// The number of failed attempts before the engine dead-letters one entry.
+///
+/// Tests use a small limit, so a test reaches the limit with few runs.
+#[cfg(test)]
+const MAX_ENTRY_ATTEMPTS: u32 = 2;
 
 /// The result of one rule for one event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -361,22 +385,46 @@ impl RuleEngine {
     /// It also writes the cursor when the feed is caught up and when the
     /// loop exits.
     /// A non-entity entry does no rule work, but it still moves the cursor.
-    /// A process failure writes the last successful sequence and returns the
-    /// error.
-    /// The cursor never moves past a failed entry.
+    ///
+    /// # Failure policy
+    ///
+    /// A process failure increments the attempt row
+    /// `rule-attempt:{seq}:{event_id}`.
+    /// The row holds a JSON `u32` and is durable, so a restart continues the
+    /// count.
+    /// The limit is `MAX_ENTRY_ATTEMPTS`: 5 in a normal build and 2 in a test
+    /// build.
+    /// Below the limit, the call writes the last successful sequence and
+    /// returns the error.
+    /// The cursor stays before the failed entry.
     /// The failed entry and the entries after it replay on the next run.
     /// The runtime supervisor restarts a failed run after a backoff delay.
     /// The delay starts at one second and doubles up to 60 seconds.
     /// The retried batch starts at the entry that failed.
+    ///
+    /// At the limit, the call writes one dead-letter row
+    /// `rule-dead:{seq}:{event_id}`.
+    /// The row holds the sequence, the event id, the attempt count, the
+    /// sanitized error text, and the Unix time.
+    /// The call then deletes the attempt row, writes the cursor at the failed
+    /// sequence, resets the pending count, and continues with the next entry.
+    /// A later entry can therefore make progress.
+    /// The execution-marker cleanup deletes a dead letter older than 7 days.
+    ///
+    /// A successful entry deletes its attempt row.
+    /// An entry never skips before the limit.
+    ///
     /// When the cursor is ahead of the head, the call returns an error and
     /// does not rewind.
     /// When the feed is caught up, the call sleeps for `poll_interval` and
     /// checks cancellation again.
     ///
-    /// Delivery is at least once.
+    /// Delivery is at least once for an entry below the limit.
     /// A crash can replay the last batch, so at most 32 entries repeat.
     /// An execution marker stops a duplicate action.
     /// An action must still be idempotent.
+    /// A dead-lettered entry is failed by policy and stays visible in the
+    /// dead-letter rows.
     pub async fn run<C: CancelToken>(
         &self,
         wal: &Wal,
@@ -403,16 +451,53 @@ impl RuleEngine {
                 let end = head.min(cursor.saturating_add(RULE_BATCH_SIZE as u64));
                 let entries = wal.range(cursor + 1, end).await.map_err(map_wal_error)?;
                 for entry in entries {
-                    if let WalOp::Entity { event } = &entry.op
-                        && let Err(error) = self.process(event).await
-                    {
-                        // Do not move the cursor past the failed entry. Write
-                        // the last successful sequence, so the next run starts
-                        // at the failed entry.
-                        if pending > 0 {
-                            self.rules.set_cursor(cursor).await?;
+                    if let WalOp::Entity { event } = &entry.op {
+                        match self.process(event).await {
+                            Ok(_) => {
+                                self.rules
+                                    .clear_entry_attempts(entry.seq, &event.event_id)
+                                    .await?;
+                            }
+                            Err(error) => {
+                                let attempts = self
+                                    .rules
+                                    .increment_entry_attempts(entry.seq, &event.event_id)
+                                    .await?;
+                                if attempts < MAX_ENTRY_ATTEMPTS {
+                                    // Do not move the cursor past the failed
+                                    // entry. Write the last successful
+                                    // sequence, so the next run starts at the
+                                    // failed entry.
+                                    if pending > 0 {
+                                        self.rules.set_cursor(cursor).await?;
+                                    }
+                                    return Err(error);
+                                }
+                                let dead = RuleDeadLetter {
+                                    seq: entry.seq,
+                                    event_id: event.event_id.clone(),
+                                    attempts,
+                                    error: error.to_string(),
+                                    at: chrono::Utc::now().timestamp(),
+                                };
+                                self.rules.write_dead_letter(&dead).await?;
+                                self.rules
+                                    .clear_entry_attempts(entry.seq, &event.event_id)
+                                    .await?;
+                                // The entry is failed by policy. Move the
+                                // cursor past it, so later entries can run.
+                                self.rules.set_cursor(entry.seq).await?;
+                                tracing::warn!(
+                                    seq = entry.seq,
+                                    event_id = %event.event_id,
+                                    attempts,
+                                    "rule entry dead-lettered after the attempt limit"
+                                );
+                                cursor = entry.seq;
+                                pending = 0;
+                                continue;
+                            }
                         }
-                        return Err(error);
                     }
                     cursor = entry.seq;
                     pending += 1;
@@ -763,6 +848,41 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    /// Runs the engine one time and returns its result.
+    ///
+    /// The call expects a failure below the attempt limit, so the run returns
+    /// before the timeout.
+    async fn run_once(engine: &RuleEngine, wal: &Wal) -> Result<(), RuleError> {
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            engine.run(
+                wal,
+                Arc::new(AtomicBool::new(false)),
+                Duration::from_millis(5),
+            ),
+        )
+        .await
+        .expect("the run must return before the timeout")
+    }
+
+    /// Runs the engine until the cursor reaches `target`, then cancels it.
+    async fn run_to_cursor(engine: &RuleEngine, wal: &Wal, rules: &RuleStore, target: u64) {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let handle = tokio::spawn({
+            let engine = engine.clone();
+            let wal = wal.clone();
+            let cancel = cancel.clone();
+            async move { engine.run(&wal, cancel, Duration::from_millis(5)).await }
+        });
+        wait_for_cursor(rules, target).await;
+        cancel.store(true, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("the run must stop after cancellation")
+            .expect("the run task must not panic")
+            .expect("the run must return no error");
     }
 
     #[tokio::test]
@@ -1384,6 +1504,162 @@ mod tests {
         assert!(matches!(result, Err(RuleError::Action(_))));
         assert_eq!(stores.rules.cursor().await.unwrap(), 0);
         assert!(!stores.rules.is_executed("alpha", "evt-1").await.unwrap());
+    }
+
+    /// A poison entry dead-letters at the limit and a later event runs.
+    #[tokio::test]
+    async fn a_poison_entry_dead_letters_after_the_limit_and_a_later_event_runs() {
+        let stores = stores().await;
+        let recorder = Arc::new(RecordingAction::new("record"));
+        let engine = engine(&stores, vec![recorder.clone()]);
+        make_entity(&stores.entities).await;
+        stores.rules.upsert(draft("alpha", "record")).await.unwrap();
+        let wal = test_wal().await;
+        wal.append(WalOp::Entity { event: event_at(1) })
+            .await
+            .unwrap();
+        recorder.set_failing(true);
+
+        for expected in 1..MAX_ENTRY_ATTEMPTS {
+            let result = run_once(&engine, &wal).await;
+            assert!(matches!(result, Err(RuleError::Action(_))));
+            assert_eq!(
+                stores.rules.entry_attempts(1, "evt-1").await.unwrap(),
+                expected
+            );
+            assert_eq!(stores.rules.cursor().await.unwrap(), 0);
+            assert!(stores.rules.dead_letters().await.unwrap().is_empty());
+        }
+
+        run_to_cursor(&engine, &wal, &stores.rules, 1).await;
+
+        assert_eq!(stores.rules.cursor().await.unwrap(), 1);
+        assert_eq!(stores.rules.entry_attempts(1, "evt-1").await.unwrap(), 0);
+        let dead = stores.rules.dead_letters().await.unwrap();
+        assert_eq!(dead.len(), 1);
+        assert_eq!(dead[0].seq, 1);
+        assert_eq!(dead[0].event_id, "evt-1");
+        assert_eq!(dead[0].attempts, MAX_ENTRY_ATTEMPTS);
+
+        recorder.set_failing(false);
+        wal.append(WalOp::Entity { event: event_at(2) })
+            .await
+            .unwrap();
+        run_to_cursor(&engine, &wal, &stores.rules, 2).await;
+
+        assert_eq!(stores.rules.cursor().await.unwrap(), 2);
+        assert!(stores.rules.is_executed("alpha", "evt-2").await.unwrap());
+        assert_eq!(recorder.records().last().unwrap().event.event_id, "evt-2");
+    }
+
+    /// Below the limit, the cursor stays before the failed entry.
+    #[tokio::test]
+    async fn a_failed_entry_below_the_limit_keeps_the_cursor_and_counts_the_attempt() {
+        let stores = stores().await;
+        let recorder = Arc::new(RecordingAction::new("record"));
+        let engine = engine(&stores, vec![recorder.clone()]);
+        make_entity(&stores.entities).await;
+        stores.rules.upsert(draft("alpha", "record")).await.unwrap();
+        let wal = test_wal().await;
+        wal.append(WalOp::Entity { event: event_at(1) })
+            .await
+            .unwrap();
+        recorder.set_failing(true);
+
+        let result = run_once(&engine, &wal).await;
+
+        assert!(matches!(result, Err(RuleError::Action(_))));
+        assert_eq!(stores.rules.cursor().await.unwrap(), 0);
+        assert_eq!(stores.rules.entry_attempts(1, "evt-1").await.unwrap(), 1);
+        assert!(stores.rules.dead_letters().await.unwrap().is_empty());
+        assert!(!stores.rules.is_executed("alpha", "evt-1").await.unwrap());
+    }
+
+    /// A transient failure retries and reaches the head without a dead letter.
+    #[tokio::test]
+    async fn a_transient_failure_retries_and_reaches_the_head_without_a_dead_letter() {
+        let stores = stores().await;
+        let recorder = Arc::new(RecordingAction::new("record"));
+        let engine = engine(&stores, vec![recorder.clone()]);
+        make_entity(&stores.entities).await;
+        stores.rules.upsert(draft("alpha", "record")).await.unwrap();
+        let wal = test_wal().await;
+        wal.append(WalOp::Entity { event: event_at(1) })
+            .await
+            .unwrap();
+        recorder.fail_on_call(1);
+
+        let first = run_once(&engine, &wal).await;
+
+        assert!(matches!(first, Err(RuleError::Action(_))));
+        assert_eq!(stores.rules.cursor().await.unwrap(), 0);
+        assert_eq!(stores.rules.entry_attempts(1, "evt-1").await.unwrap(), 1);
+
+        run_to_cursor(&engine, &wal, &stores.rules, 1).await;
+
+        assert_eq!(stores.rules.cursor().await.unwrap(), 1);
+        assert_eq!(stores.rules.entry_attempts(1, "evt-1").await.unwrap(), 0);
+        assert!(stores.rules.dead_letters().await.unwrap().is_empty());
+        assert!(stores.rules.is_executed("alpha", "evt-1").await.unwrap());
+        assert_eq!(recorder.records().len(), 2);
+    }
+
+    /// A dead-letter row holds the sequence, event id, attempts, error, and
+    /// time.
+    #[tokio::test]
+    async fn a_dead_letter_holds_the_sequence_event_attempts_error_and_time() {
+        let stores = stores().await;
+        let recorder = Arc::new(RecordingAction::new("record"));
+        let engine = engine(&stores, vec![recorder.clone()]);
+        make_entity(&stores.entities).await;
+        stores.rules.upsert(draft("alpha", "record")).await.unwrap();
+        let wal = test_wal().await;
+        wal.append(WalOp::Entity { event: event_at(1) })
+            .await
+            .unwrap();
+        recorder.set_failing(true);
+
+        for _ in 1..MAX_ENTRY_ATTEMPTS {
+            assert!(run_once(&engine, &wal).await.is_err());
+        }
+        run_to_cursor(&engine, &wal, &stores.rules, 1).await;
+
+        let dead = stores.rules.dead_letters().await.unwrap();
+        assert_eq!(dead.len(), 1);
+        let entry = &dead[0];
+        assert_eq!(entry.seq, 1);
+        assert_eq!(entry.event_id, "evt-1");
+        assert_eq!(entry.attempts, MAX_ENTRY_ATTEMPTS);
+        assert_eq!(entry.error, "rule action failed: record");
+        assert!(entry.at > 0);
+    }
+
+    /// A restart after a failure continues the durable attempt count.
+    #[tokio::test]
+    async fn a_restart_after_a_failure_continues_the_attempt_count() {
+        let stores = stores().await;
+        let recorder = Arc::new(RecordingAction::new("record"));
+        let first = engine(&stores, vec![recorder.clone()]);
+        make_entity(&stores.entities).await;
+        stores.rules.upsert(draft("alpha", "record")).await.unwrap();
+        let wal = test_wal().await;
+        wal.append(WalOp::Entity { event: event_at(1) })
+            .await
+            .unwrap();
+        recorder.set_failing(true);
+
+        let result = run_once(&first, &wal).await;
+
+        assert!(matches!(result, Err(RuleError::Action(_))));
+        assert_eq!(stores.rules.entry_attempts(1, "evt-1").await.unwrap(), 1);
+
+        let restarted = engine(&stores, vec![recorder.clone()]);
+        run_to_cursor(&restarted, &wal, &stores.rules, 1).await;
+
+        assert_eq!(stores.rules.cursor().await.unwrap(), 1);
+        let dead = stores.rules.dead_letters().await.unwrap();
+        assert_eq!(dead.len(), 1);
+        assert_eq!(dead[0].attempts, MAX_ENTRY_ATTEMPTS);
     }
 
     /// `run` processes more entries than one cursor batch.
