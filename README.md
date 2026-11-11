@@ -292,6 +292,24 @@ A rule has a trigger, a condition, and an action reference. The trigger selects 
 
 The durable rule store lives on OxKV and keeps an index for each trigger event and schema pair. The runner tails the shared change feed and runs the matching enabled rules in priority order.
 
+#### Condition scripts
+
+A `Script` condition is a sandboxed Rhai expression that returns a boolean. The server enables scripts with `[eav].script_enabled`. The default is `false`. When the value is `false`, the server rejects a script at save time and a stored script fails at run time.
+
+A script reads three values:
+
+- `event`: a map with `event_id`, `entity_id`, `kind`, `schemas`, `changed`, `correlation_id`, and `causation_id`. `kind` is one of `created`, `updated`, `deleted`, `schema_applied`, `schema_removed`, or `timer`. `changed` holds `{key, before, after}` maps.
+- `entity`: `()` when the entity is absent, or a map with `id`, `version`, `schemas`, and `attributes`. The attribute values are plain JSON.
+- `now`: the current Unix time in seconds.
+
+```rhai
+event.kind == "updated" && entity.attributes.status == "urgent"
+```
+
+The engine limits the source to 8 KiB. One evaluation has at most 10,000 operations, 16 call levels, a 64 KiB string, a 1,000 element array, and a 1,000 entry map. A 50 ms wall-time guard is a last-resort safety net. The operation limit is the deterministic budget.
+
+A script cannot read the store, write, call the network, read the clock, use random values, load files, or evaluate more code. The engine disables `eval` and `import`. It replaces `print` and `debug` with no-ops, so a script cannot flood stdout or the log. The compiled-script cache holds at most 256 entries. It is a speed aid only.
+
 | Action | Effect |
 |---|---|
 | `noop` | Changes no state. Use it in tests and dry runs. |
@@ -651,6 +669,7 @@ The `[eav]` section controls the optional EAV runtime and the webhook action. `[
 | `timer_interval_ms` | `1000` | Pause between due timer passes. |
 | `timer_batch` | `100` | Largest number of due entities read for each time index key. |
 | `max_causation_depth` | `8` | Maximum causation depth for a rule chain, from 1 to 64. The maximum is inclusive. |
+| `script_enabled` | `false` | Enables sandboxed Rhai condition scripts. A disabled server rejects a script at save time. |
 | `check_entity_refs` | `true` | Checks that each `EntityRef` target exists on a write. With `false`, a write still validates the target form. |
 | `webhook_allowed_hosts` | empty | Hosts that a webhook rule can call. Each entry is a host or a `host:port` pair. |
 | `webhook_signing_secret` | none | Optional HMAC-SHA256 secret of at least 32 bytes. When set, adds the `X-Signature` header. |
@@ -941,6 +960,10 @@ cargo bench --bench eav -- --quick
 ## Development
 
 Build, test, lint, documentation, and commit rules are in [CONTRIBUTING.md](CONTRIBUTING.md). This section covers the test suites and releases. See [Performance](#performance) for the benchmark suite.
+
+### Vendored dependencies
+
+Casbin is vendored at `vendor/casbin` with one Rhai feature change. Casbin enables Rhai features that remove the operation limits, function calls, and 64-bit integers that the condition script engine needs. See [vendor/casbin/PATCH.md](vendor/casbin/PATCH.md) for the exact change and the update procedure.
 
 ### Configuration tests
 
