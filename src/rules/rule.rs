@@ -256,7 +256,7 @@ pub enum Condition {
     /// clock, use random values, load files, or evaluate more code.
     /// The server enables scripts with `[eav].script_enabled`.
     Script {
-        /// The Rhai source. The value is at most 8 KiB.
+        /// The Rhai source. The value is at most 64 KiB.
         source: String,
     },
 }
@@ -319,7 +319,7 @@ impl Condition {
     fn validate_source_size(&self) -> Result<(), RuleError> {
         match self {
             Self::Script { source } if source.len() > MAX_SOURCE_BYTES => Err(RuleError::Invalid(
-                "rule script source is larger than 8 KiB".to_string(),
+                "rule script source is larger than 64 KiB".to_string(),
             )),
             Self::Not(child) => child.validate_source_size(),
             Self::All(children) | Self::Any(children) => {
@@ -773,7 +773,7 @@ mod tests {
 
         assert!(matches!(
             draft.validate(),
-            Err(RuleError::Invalid(message)) if message.contains("8 KiB")
+            Err(RuleError::Invalid(message)) if message.contains("64 KiB")
         ));
     }
 

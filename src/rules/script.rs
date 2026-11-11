@@ -25,7 +25,7 @@
 //! A `()` value in an update patch removes the attribute.
 //! Any other patch value sets the attribute.
 //!
-//! One evaluation makes at most 50 host read calls and stages at most 100
+//! One evaluation makes at most 200 host read calls and stages at most 100
 //! effects.
 //! The existing operation, call-depth, string, array, map, and source limits
 //! still apply.
@@ -88,10 +88,10 @@ use crate::rules::script_host::{ScriptCapabilities, ScriptHostError, ScriptReadH
 pub(crate) const SCRIPT_ACTION_KIND: &str = "script";
 
 /// The largest accepted script source, in bytes.
-pub(crate) const MAX_SOURCE_BYTES: usize = 8 * 1024;
+pub(crate) const MAX_SOURCE_BYTES: usize = 64 * 1024;
 
 /// The largest number of host read calls in one action evaluation.
-pub(crate) const MAX_READ_CALLS: usize = 50;
+pub(crate) const MAX_READ_CALLS: usize = 200;
 
 /// The stable message for a read limit failure.
 const READ_LIMIT_MESSAGE: &str = "rule script exceeded its read limit";
@@ -115,22 +115,22 @@ const STORE_MESSAGE: &str = "rule script store operation failed";
 const CACHE_CAPACITY: usize = 256;
 
 /// The maximum number of Rhai operations for one evaluation.
-const MAX_OPERATIONS: u64 = 10_000;
+const MAX_OPERATIONS: u64 = 250_000;
 
 /// The maximum number of Rhai call levels for one evaluation.
-const MAX_CALL_LEVELS: usize = 16;
+const MAX_CALL_LEVELS: usize = 64;
 
 /// The maximum Rhai string size, in bytes.
-const MAX_STRING_SIZE: usize = 64 * 1024;
+const MAX_STRING_SIZE: usize = 256 * 1024;
 
 /// The maximum Rhai array size.
-const MAX_ARRAY_SIZE: usize = 1_000;
+const MAX_ARRAY_SIZE: usize = 10_000;
 
 /// The maximum Rhai map size.
-const MAX_MAP_SIZE: usize = 1_000;
+const MAX_MAP_SIZE: usize = 10_000;
 
 /// The wall-time guard for one evaluation.
-const WALL_TIME_GUARD: Duration = Duration::from_millis(50);
+const WALL_TIME_GUARD: Duration = Duration::from_millis(200);
 
 thread_local! {
     /// The deadline for the evaluation on this thread.
@@ -161,10 +161,10 @@ pub enum ScriptError {
     /// The server disables scripts.
     #[error("rule scripts are disabled")]
     Disabled,
-    /// The script source is larger than 8 KiB.
-    #[error("rule script source is larger than 8 KiB")]
+    /// The script source is larger than 64 KiB.
+    #[error("rule script source is larger than 64 KiB")]
     SourceTooLarge,
-    /// The script made more than 50 host read calls.
+    /// The script made more than 200 host read calls.
     #[error("rule script exceeded its read limit")]
     ReadLimit,
     /// The script staged more than 100 effects.
@@ -561,7 +561,7 @@ impl ScriptEngine {
 
     /// Compiles a script and caches the AST.
     ///
-    /// The call rejects a disabled engine, a source larger than 8 KiB, and a
+    /// The call rejects a disabled engine, a source larger than 64 KiB, and a
     /// syntax error.
     /// It returns no detail from the Rhai parser, so the caller cannot echo
     /// the source.
@@ -1217,7 +1217,7 @@ mod tests {
 
         assert_eq!(
             subject.eval_bool(
-                r#"let s = "x"; while s.len() < 70000 { s += s; } true"#,
+                r#"let s = "x"; while s.len() < 270000 { s += s; } true"#,
                 &ctx
             ),
             Err(ScriptError::Budget)
@@ -1234,6 +1234,138 @@ mod tests {
             subject.eval_bool("let a = []; while true { a.push(1); } true", &ctx),
             Err(ScriptError::Budget)
         );
+    }
+
+    #[test]
+    fn a_user_function_returns_the_same_result_on_each_call() {
+        let subject = engine();
+        let ev = event(EntityEventKind::Created, Vec::new());
+        let ctx = context(&ev, None);
+
+        assert_eq!(
+            subject.eval_bool(
+                "fn area(width, height) { width * height } area(6, 7) == 42 && area(3, 5) == 15",
+                &ctx
+            ),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn trigonometry_roots_and_power_return_the_expected_values() {
+        let subject = engine();
+        let ev = event(EntityEventKind::Created, Vec::new());
+        let ctx = context(&ev, None);
+
+        assert_eq!(
+            subject.eval_bool(
+                r#"let s = sin(0.5);
+let c = cos(0.5);
+let r = sqrt(2.0);
+let p = 2.0 ** 10.0;
+abs(s - 0.479425538604203) < 0.000000001
+    && abs(c - 0.8775825618903728) < 0.000000001
+    && abs(r - 1.4142135623730951) < 0.000000001
+    && abs(p - 1024.0) < 0.000000001"#,
+                &ctx
+            ),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn a_tax_function_uses_integer_cents_and_rounds() {
+        let subject = engine();
+        let ev = event(EntityEventKind::Created, Vec::new());
+        let ctx = context(&ev, None);
+
+        assert_eq!(
+            subject.eval_bool(
+                r#"fn tax_cents(income_cents) {
+    let brackets = [
+        #{ cap: 1_100_000, rate: 10 },
+        #{ cap: 4_500_000, rate: 22 },
+        #{ cap: 0, rate: 37 }
+    ];
+    let total = 0;
+    let lower = 0;
+    for b in brackets {
+        if income_cents <= lower { break; }
+        let upper = if b.cap == 0 { income_cents } else { b.cap };
+        let slice = (if income_cents < upper { income_cents } else { upper }) - lower;
+        if slice > 0 {
+            total += (slice * b.rate + 50) / 100;
+        }
+        lower = upper;
+        if b.cap == 0 { break; }
+    }
+    total
+}
+tax_cents(3_000_000) == 528_000 && tax_cents(5_000_000) == 1_043_000"#,
+                &ctx
+            ),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn a_projectile_loop_returns_the_expected_height() {
+        let subject = engine();
+        let ev = event(EntityEventKind::Created, Vec::new());
+        let ctx = context(&ev, None);
+
+        assert_eq!(
+            subject.eval_bool(
+                r#"fn height(v0, angle, g, h0, steps) {
+    let vy = v0 * sin(angle);
+    let flight = (vy + sqrt(vy * vy + 2.0 * g * h0)) / g;
+    let dt = flight / steps;
+    let t = 0.0;
+    for i in 0..steps {
+        t += dt;
+    }
+    h0 + vy * t - 0.5 * g * t * t
+}
+abs(height(20.0, 0.7, 9.81, 1.5, 100)) < 0.000000001"#,
+                &ctx
+            ),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn a_script_builds_and_sums_a_large_array() {
+        let subject = engine();
+        let ev = event(EntityEventKind::Created, Vec::new());
+        let ctx = context(&ev, None);
+
+        assert_eq!(
+            subject.eval_bool(
+                "let a = []; let total = 0; for i in 0..5000 { a.push(i); total += i; } a.len() == 5000 && total == 12497500",
+                &ctx
+            ),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn a_loop_above_the_operation_budget_fails() {
+        let subject = engine();
+        let ev = event(EntityEventKind::Created, Vec::new());
+        let ctx = context(&ev, None);
+
+        assert_eq!(
+            subject.eval_bool("let i = 0; while i < 300000 { i += 1; } true", &ctx),
+            Err(ScriptError::Budget)
+        );
+    }
+
+    #[test]
+    fn a_source_above_sixty_four_kib_fails_with_the_source_size_error() {
+        let subject = engine();
+        let source = " ".repeat(64 * 1024 + 1);
+
+        assert_eq!(subject.compile(&source), Err(ScriptError::SourceTooLarge));
     }
 
     #[test]
@@ -1473,7 +1605,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_read_limit_stops_the_fifty_first_call() {
+    async fn the_read_limit_stops_the_two_hundred_and_first_call() {
         let subject = engine();
         let (host, store) = action_host(&["task"], &[]).await;
         create_task(&store, "e1", "open", 10).await;
@@ -1482,7 +1614,7 @@ mod tests {
         let result = eval_action(
             &subject,
             host,
-            r#"let i = 0; while i < 51 { host.get_entity("e1"); i += 1; }"#,
+            r#"let i = 0; while i < 201 { host.get_entity("e1"); i += 1; }"#,
             &ev,
             None,
         )
