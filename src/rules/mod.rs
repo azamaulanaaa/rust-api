@@ -42,5 +42,5 @@ pub use builtin::{LogAction, NoopAction};
 pub use engine::{ExecutionOutcome, RuleEngine, RuleExecution, RuleObserver};
 pub use error::RuleError;
 pub use rule::{ActionRef, CompareOp, Condition, Rule, RuleDraft, RuleId, RuleTrigger};
-pub use store::RuleStore;
+pub use store::{RuleDeadLetter, RuleStore};
 pub use webhook::WebhookAction;
