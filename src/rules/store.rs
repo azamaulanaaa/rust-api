@@ -375,6 +375,21 @@ impl RuleStore {
             .map_err(RuleError::Store)
     }
 
+    /// Returns the key of one execution marker.
+    ///
+    /// The key is `rule:exec:{rule_id}:{event_id}`.
+    pub(crate) fn execution_key(rule_id: &str, event_id: &str) -> String {
+        exec_key(rule_id, event_id)
+    }
+
+    /// Returns the value of one execution marker.
+    ///
+    /// The value is the JSON encoding of the Unix time in seconds.
+    /// [`RuleStore::mark_executed`] and a script action use the same format.
+    pub(crate) fn execution_marker_value(now: i64) -> Result<Vec<u8>, RuleError> {
+        serde_json::to_vec(&now).map_err(|error| RuleError::Serialization(error.to_string()))
+    }
+
     /// True when an execution marker exists for one rule and one event.
     pub(crate) async fn is_executed(
         &self,
@@ -383,7 +398,7 @@ impl RuleStore {
     ) -> Result<bool, RuleError> {
         validate_identifier("rule id", rule_id)?;
         let g = self.store.read().await;
-        Ok(g.get_bytes(&exec_key(rule_id, event_id))
+        Ok(g.get_bytes(&Self::execution_key(rule_id, event_id))
             .await
             .map_err(RuleError::Store)?
             .is_some())
@@ -397,10 +412,9 @@ impl RuleStore {
     ) -> Result<(), RuleError> {
         validate_identifier("rule id", rule_id)?;
         let now = chrono::Utc::now().timestamp();
-        let bytes = serde_json::to_vec(&now)
-            .map_err(|error| RuleError::Serialization(error.to_string()))?;
+        let bytes = Self::execution_marker_value(now)?;
         let g = self.store.write().await;
-        g.set_bytes(&exec_key(rule_id, event_id), &bytes)
+        g.set_bytes(&Self::execution_key(rule_id, event_id), &bytes)
             .await
             .map(|_| ())
             .map_err(RuleError::Store)

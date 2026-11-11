@@ -1953,6 +1953,74 @@ mod tests {
     }
 
     #[actix_web::test]
+    async fn a_script_action_rule_is_accepted_and_stored() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        assert!(fx.engine.claim_superadmin("alice").await?);
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let body = rule_body_with_params("script", json!({ "source": "let value = 1;" }));
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::post()
+                    .uri("/eav/rules")
+                    .set_json(body),
+                &fx.token("alice")?,
+            )
+            .to_request(),
+        )
+        .await;
+
+        assert_eq!(res.status(), http::StatusCode::CREATED);
+        let rule: Value = actix_test::read_body_json(res).await;
+        assert_eq!(rule["action"]["kind"], "script");
+        assert_eq!(rule["action"]["params"]["source"], "let value = 1;");
+        let stored = fx.runtime.rules().get("alpha").await?.expect("rule exists");
+        assert_eq!(stored.action.kind, "script");
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn invalid_script_action_parameters_return_400_and_store_nothing() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        assert!(fx.engine.claim_superadmin("alice").await?);
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+        let cases = [
+            json!({}),
+            json!({ "source": 5 }),
+            json!({ "source": "" }),
+            json!({ "source": "let value = ;" }),
+            json!({ "source": "let value = 1;", "extra": true }),
+        ];
+
+        for params in cases {
+            let body = rule_body_with_params("script", params.clone());
+            let res = actix_test::call_service(
+                &app,
+                auth(
+                    actix_test::TestRequest::post()
+                        .uri("/eav/rules")
+                        .set_json(body),
+                    &token,
+                )
+                .to_request(),
+            )
+            .await;
+
+            assert_eq!(
+                res.status(),
+                http::StatusCode::BAD_REQUEST,
+                "parameters must fail: {params}"
+            );
+            assert!(fx.runtime.rules().list_page(50, 0).await?.is_empty());
+        }
+        Ok(())
+    }
+
+    #[actix_web::test]
     async fn a_read_capability_without_entity_read_is_403_and_stores_nothing() -> anyhow::Result<()>
     {
         let fx = fixture().await?;
