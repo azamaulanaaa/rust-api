@@ -1,0 +1,136 @@
+# This is a local copy of casbin 2.20.0 with one change: the rhai dependency
+# does not enable `unchecked`, `only_i32`, `no_function`, or `no_float`.
+# Those features remove the Rhai limits, the function calls, and the 64-bit
+# integers that the rule script engine needs. Casbin compiles without them.
+[package]
+edition = "2021"
+name = "casbin"
+version = "2.20.0"
+authors = [
+    "Joey <joey.xf@gmail.com>",
+    "Cheng JIANG <jiang.cheng@vip.163.com>",
+]
+build = false
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "An authorization library that supports access control models like ACL, RBAC, ABAC."
+homepage = "https://casbin.org/"
+readme = "README.md"
+keywords = [
+    "auth",
+    "authorization",
+    "rbac",
+    "acl",
+    "abac",
+]
+license = "Apache-2.0"
+repository = "https://github.com/casbin/casbin-rs"
+
+[features]
+cached = ["mini-moka"]
+default = [
+    "runtime-tokio",
+    "incremental",
+]
+explain = []
+glob = ["globset"]
+incremental = []
+ip = ["ip_network"]
+logging = [
+    "slog",
+    "slog-term",
+    "slog-async",
+]
+runtime-async-std = ["async-std"]
+runtime-tokio = [
+    "tokio/fs",
+    "tokio/io-util",
+]
+watcher = []
+
+[lib]
+name = "casbin"
+path = "src/lib.rs"
+bench = false
+
+[dependencies.async-std]
+version = "1.10.0"
+optional = true
+
+[dependencies.async-trait]
+version = "0.1.52"
+
+[dependencies.fixedbitset]
+version = "0.4"
+
+[dependencies.globset]
+version = "0.4.8"
+optional = true
+
+[dependencies.hashlink]
+version = "0.9.0"
+
+[dependencies.ip_network]
+version = "0.4.1"
+optional = true
+
+[dependencies.mini-moka]
+version = "0.10"
+optional = true
+
+[dependencies.once_cell]
+version = "1.9.0"
+
+[dependencies.parking_lot]
+version = "0.12.0"
+
+[dependencies.petgraph]
+version = "0.6"
+
+[dependencies.regex]
+version = "1.5.4"
+
+[dependencies.rhai]
+version = "1.5.0"
+features = ["sync", "no_optimize", "no_module", "serde"]
+
+[dependencies.serde]
+version = "1.0.136"
+
+[dependencies.serde_json]
+version = "1.0.127"
+
+[dependencies.slog]
+version = "2.7.0"
+optional = true
+
+[dependencies.slog-async]
+version = "2.7.0"
+optional = true
+
+[dependencies.slog-term]
+version = "2.9.0"
+optional = true
+
+[dependencies.thiserror]
+version = "1.0.30"
+
+[dependencies.tokio]
+version = "1.17.0"
+optional = true
+default-features = false
+
+[dependencies.tokio-stream]
+version = "0.1.8"
+optional = true
+default-features = false
+
+[target.'cfg(target_arch = "wasm32")'.dependencies.getrandom]
+version = "0.3"
+features = ["wasm_js"]
+
+[target.'cfg(target_arch = "wasm32")'.dependencies.wasm-bindgen-test]
+version = "0.3.49"

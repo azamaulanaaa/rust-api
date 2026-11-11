@@ -156,6 +156,11 @@ sample_ratio = 1.0
 # value must be within 1..=64. Default: 8.
 # max_causation_depth = 8
 
+# Enables sandboxed Rhai condition scripts. With false, the server rejects a
+# script condition at save time. A stored script condition then fails at run
+# time. Default: false.
+# script_enabled = false
+
 # Checks that each EntityRef target exists on a write. With false, a write
 # still validates the target form and skips only the existence read.
 # Default: true.

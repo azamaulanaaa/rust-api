@@ -621,6 +621,15 @@ pub struct EavConfig {
     /// The default is 8.
     #[serde(default = "default_eav_max_causation_depth")]
     pub max_causation_depth: u32,
+    /// Enables sandboxed Rhai condition scripts.
+    ///
+    /// The default is `false`.
+    /// When the value is `false`, the server rejects a script condition at
+    /// save time.
+    /// A stored script condition then fails at run time with the disabled
+    /// error.
+    #[serde(default)]
+    pub script_enabled: bool,
     /// Checks that each `EntityRef` target exists on a write.
     ///
     /// The default is `true`.
@@ -666,6 +675,7 @@ impl Default for EavConfig {
     /// Execution markers stay for 30 days.
     /// The timer pass runs every second and reads 100 entities for each key.
     /// The maximum causation depth is 8.
+    /// Condition scripts are off.
     /// A write checks that each `EntityRef` target exists.
     /// The webhook allowlist is empty.
     /// Webhook signing is off.
@@ -681,6 +691,7 @@ impl Default for EavConfig {
             timer_interval_ms: default_eav_timer_interval_ms(),
             timer_batch: default_eav_timer_batch(),
             max_causation_depth: default_eav_max_causation_depth(),
+            script_enabled: false,
             check_entity_refs: default_true(),
             webhook_allowed_hosts: Vec::new(),
             webhook_signing_secret: None,
@@ -1444,12 +1455,31 @@ mod tests {
         assert_eq!(cfg.eav.timer_interval_ms, 1000);
         assert_eq!(cfg.eav.timer_batch, 100);
         assert_eq!(cfg.eav.max_causation_depth, 8);
+        assert!(!cfg.eav.script_enabled);
         assert!(cfg.eav.check_entity_refs);
         assert!(cfg.eav.webhook_allowed_hosts.is_empty());
         assert!(cfg.eav.webhook_signing_secret.is_none());
         assert_eq!(cfg.eav.webhook_max_attempts, 5);
         assert!(!cfg.eav.webhook_allow_private_hosts);
         assert_eq!(cfg.eav, EavConfig::default());
+    }
+
+    #[test]
+    fn script_conditions_are_disabled_by_default() {
+        let cfg = parse(&minimal_toml()).expect("should parse");
+
+        assert!(!cfg.eav.script_enabled);
+    }
+
+    #[test]
+    fn script_conditions_parse_when_enabled() {
+        let toml = minimal_toml().replace(
+            "region = \"us-east-1\"",
+            "region = \"us-east-1\"\n[eav]\nscript_enabled = true",
+        );
+        let cfg = parse(&toml).expect("an explicit script flag must parse");
+
+        assert!(cfg.eav.script_enabled);
     }
 
     #[test]

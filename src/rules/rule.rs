@@ -9,6 +9,10 @@
 //! [`Condition`] is a small tree.
 //! [`Condition::eval`] returns `bool` for one entity state and one event.
 //! A deleted entity passes `None` as the entity state.
+//! [`Condition::Script`] is a sandboxed Rhai expression.
+//! The rule engine resolves a script through
+//! [the script engine](crate::rules::script::ScriptEngine), not through
+//! [`Condition::eval`].
 
 use std::cmp::Ordering;
 
@@ -17,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use crate::eav::entity::Entity;
 use crate::records::{EntityEvent, EntityEventKind};
 use crate::rules::error::RuleError;
+use crate::rules::script::MAX_SOURCE_BYTES;
 
 /// Maximum size of a rule id, a schema id, or an action kind, in bytes.
 const MAX_NAME_BYTES: usize = 128;
@@ -78,6 +83,7 @@ impl RuleDraft {
         if self.condition.depth() > MAX_DEPTH {
             return Err(RuleError::ConditionDepth);
         }
+        self.condition.validate_source_size()?;
         Ok(())
     }
 }
@@ -133,6 +139,9 @@ impl RuleTrigger {
 }
 
 /// A condition on an entity or an event.
+///
+/// A [`Condition::Script`] is a sandboxed Rhai expression.
+/// The server must enable scripts with `[eav].script_enabled`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub enum Condition {
     /// Always true.
@@ -165,6 +174,17 @@ pub enum Condition {
         /// The attribute name.
         key: String,
     },
+    /// A sandboxed Rhai expression that returns a boolean.
+    ///
+    /// The rule engine compiles the source at save time and evaluates it at
+    /// run time.
+    /// The script cannot read the store, write, call the network, read the
+    /// clock, use random values, load files, or evaluate more code.
+    /// The server enables scripts with `[eav].script_enabled`.
+    Script {
+        /// The Rhai source. The value is at most 8 KiB.
+        source: String,
+    },
 }
 
 impl Condition {
@@ -178,6 +198,11 @@ impl Condition {
     /// In that case only [`Condition::Always`], [`Condition::Changed`], and
     /// logical combinations can be true, unless the snapshot supplies the
     /// attribute.
+    ///
+    /// This method does not evaluate [`Condition::Script`].
+    /// A script always returns `false` here.
+    /// The rule engine must resolve a script through
+    /// [eval_bool](crate::rules::script::ScriptEngine::eval_bool).
     pub fn eval(&self, entity: Option<&Entity>, event: &EntityEvent) -> bool {
         match self {
             Self::Always => true,
@@ -197,17 +222,39 @@ impl Condition {
                 None => entity.is_some_and(|entity| entity.attributes.contains_key(key)),
             },
             Self::Changed { key } => event.changed.iter().any(|change| change.key == *key),
+            Self::Script { .. } => false,
         }
     }
 
     /// Returns the depth of this tree. The root counts as depth 1.
     fn depth(&self) -> usize {
         match self {
-            Self::Always | Self::Compare { .. } | Self::Exists { .. } | Self::Changed { .. } => 1,
+            Self::Always
+            | Self::Compare { .. }
+            | Self::Exists { .. }
+            | Self::Changed { .. }
+            | Self::Script { .. } => 1,
             Self::Not(child) => 1 + child.depth(),
             Self::All(children) | Self::Any(children) => {
                 1 + children.iter().map(Self::depth).max().unwrap_or(0)
             }
+        }
+    }
+
+    /// Rejects a script source that is larger than [`MAX_SOURCE_BYTES`].
+    fn validate_source_size(&self) -> Result<(), RuleError> {
+        match self {
+            Self::Script { source } if source.len() > MAX_SOURCE_BYTES => Err(RuleError::Invalid(
+                "rule script source is larger than 8 KiB".to_string(),
+            )),
+            Self::Not(child) => child.validate_source_size(),
+            Self::All(children) | Self::Any(children) => {
+                for child in children {
+                    child.validate_source_size()?;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
         }
     }
 }
@@ -614,5 +661,44 @@ mod tests {
             }
             .eval(None, &ev)
         );
+    }
+
+    /// A script counts as one level, and `eval` never resolves it.
+    #[test]
+    fn a_script_condition_has_depth_one_and_eval_is_false() {
+        let script = Condition::Script {
+            source: "true".to_string(),
+        };
+
+        assert_eq!(script.depth(), 1);
+        assert!(!script.eval(None, &event(vec![])));
+        assert_eq!(Condition::Not(Box::new(script)).depth(), 2);
+    }
+
+    /// The draft rejects a script source above the size limit.
+    #[test]
+    fn a_rule_draft_rejects_an_oversized_script() {
+        let draft = RuleDraft {
+            id: "alpha".to_string(),
+            name: "alpha".to_string(),
+            enabled: true,
+            priority: 0,
+            trigger: RuleTrigger {
+                events: vec![EntityEventKind::Created],
+                schemas: vec!["invoice".to_string()],
+            },
+            condition: Condition::Script {
+                source: " ".repeat(MAX_SOURCE_BYTES + 1),
+            },
+            action: ActionRef {
+                kind: "record".to_string(),
+                params: serde_json::json!({}),
+            },
+        };
+
+        assert!(matches!(
+            draft.validate(),
+            Err(RuleError::Invalid(message)) if message.contains("8 KiB")
+        ));
     }
 }

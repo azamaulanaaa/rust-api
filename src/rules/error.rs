@@ -6,6 +6,8 @@
 
 use thiserror::Error;
 
+use crate::rules::script::ScriptError;
+
 /// An error from the rule store.
 #[derive(Debug, Error)]
 pub enum RuleError {
@@ -39,4 +41,10 @@ pub enum RuleError {
     /// Two registered actions have the same kind.
     #[error("duplicate action kind: {0}")]
     DuplicateAction(String),
+    /// A condition script failed at run time.
+    ///
+    /// The inner message is stable and sanitized.
+    /// It never holds the script source.
+    #[error("rule script failed: {0}")]
+    Script(#[from] ScriptError),
 }
