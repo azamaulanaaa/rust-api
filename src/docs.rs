@@ -103,6 +103,7 @@ use utoipa::OpenApi;
         crate::eav::sync::ReplicaStatusResponse,
         crate::rules::rule::RuleDraft,
         crate::rules::rule::Rule,
+        crate::rules::rule::RuleCapabilities,
         crate::rules::rule::RuleTrigger,
         crate::rules::rule::Condition,
         crate::rules::rule::CompareOp,

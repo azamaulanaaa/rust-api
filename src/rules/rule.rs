@@ -22,12 +22,16 @@ use crate::eav::entity::Entity;
 use crate::records::{EntityEvent, EntityEventKind};
 use crate::rules::error::RuleError;
 use crate::rules::script::MAX_SOURCE_BYTES;
+use crate::rules::script_host::ScriptCapabilities;
 
 /// Maximum size of a rule id, a schema id, or an action kind, in bytes.
 const MAX_NAME_BYTES: usize = 128;
 
 /// Maximum depth of a condition tree. The root counts as depth 1.
 const MAX_DEPTH: usize = 16;
+
+/// Maximum count of ids in one capability list.
+const MAX_CAPABILITY_IDS: usize = 32;
 
 /// The identifier of a rule.
 pub type RuleId = String;
@@ -49,13 +53,17 @@ pub struct RuleDraft {
     pub condition: Condition,
     /// The action to run. The store does not run it.
     pub action: ActionRef,
+    /// The schema ids that the rule script may read and write.
+    #[serde(default)]
+    pub capabilities: RuleCapabilities,
 }
 
 impl RuleDraft {
     /// Checks the draft before the store writes it.
     ///
     /// The call rejects an empty trigger, a duplicate trigger entry, an
-    /// invalid identifier, or a condition tree deeper than 16 levels.
+    /// invalid identifier, a condition tree deeper than 16 levels, or an
+    /// invalid capability list.
     pub fn validate(&self) -> Result<(), RuleError> {
         validate_identifier("rule id", &self.id)?;
         validate_identifier("action kind", &self.action.kind)?;
@@ -80,12 +88,75 @@ impl RuleDraft {
                 ));
             }
         }
+        self.capabilities.validate()?;
         if self.condition.depth() > MAX_DEPTH {
             return Err(RuleError::ConditionDepth);
         }
         self.condition.validate_source_size()?;
         Ok(())
     }
+}
+
+/// The schema ids that a rule script may read and write.
+///
+/// An old stored rule without this field gets two empty lists.
+/// An empty list grants no access.
+/// The ids do not need a schema that exists. A rule can be saved before its
+/// schema.
+/// The host enforces the stored lists at run time.
+/// The author needs the collection grant on `eav_entities`, and the rule
+/// narrows that grant to the listed schemas.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct RuleCapabilities {
+    /// The schema ids that the script may read.
+    #[serde(default)]
+    pub read: Vec<String>,
+    /// The schema ids that the script may write.
+    #[serde(default)]
+    pub write: Vec<String>,
+}
+
+impl RuleCapabilities {
+    /// Checks the two capability lists.
+    ///
+    /// The call rejects an invalid id, a duplicate id in one list, or a list
+    /// with more than 32 ids.
+    pub fn validate(&self) -> Result<(), RuleError> {
+        validate_capability_list("read", &self.read)?;
+        validate_capability_list("write", &self.write)?;
+        Ok(())
+    }
+
+    /// Builds the read-side capability set for the script host.
+    ///
+    /// The call uses only the `read` list.
+    /// It returns an invalid-input error for an invalid schema id.
+    /// The write side stays in the rule until the host supports it.
+    pub fn to_script_capabilities(&self) -> Result<ScriptCapabilities, RuleError> {
+        ScriptCapabilities::new(self.read.iter().cloned())
+            .map_err(|error| RuleError::Invalid(error.to_string()))
+    }
+}
+
+/// Checks one capability list.
+///
+/// The call rejects a list with more than 32 ids, an invalid id, or a
+/// duplicate id.
+fn validate_capability_list(kind: &str, ids: &[String]) -> Result<(), RuleError> {
+    if ids.len() > MAX_CAPABILITY_IDS {
+        return Err(RuleError::Invalid(format!(
+            "capability {kind} list has more than 32 ids"
+        )));
+    }
+    for (index, id) in ids.iter().enumerate() {
+        validate_identifier("capability schema id", id)?;
+        if ids[..index].contains(id) {
+            return Err(RuleError::Invalid(format!(
+                "capability {kind} list contains a duplicate"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// A stored rule.
@@ -107,6 +178,9 @@ pub struct Rule {
     pub condition: Condition,
     /// The action to run. The store does not run it.
     pub action: ActionRef,
+    /// The schema ids that the rule script may read and write.
+    #[serde(default)]
+    pub capabilities: RuleCapabilities,
     /// The creation time as a Unix timestamp in seconds.
     pub created_at: i64,
     /// The last update time as a Unix timestamp in seconds.
@@ -694,11 +768,108 @@ mod tests {
                 kind: "record".to_string(),
                 params: serde_json::json!({}),
             },
+            capabilities: RuleCapabilities::default(),
         };
 
         assert!(matches!(
             draft.validate(),
             Err(RuleError::Invalid(message)) if message.contains("8 KiB")
         ));
+    }
+
+    /// Builds a valid draft with the default capability lists.
+    fn draft() -> RuleDraft {
+        RuleDraft {
+            id: "alpha".to_string(),
+            name: "alpha".to_string(),
+            enabled: true,
+            priority: 0,
+            trigger: RuleTrigger {
+                events: vec![EntityEventKind::Created],
+                schemas: vec!["invoice".to_string()],
+            },
+            condition: Condition::Always,
+            action: ActionRef {
+                kind: "record".to_string(),
+                params: serde_json::json!({}),
+            },
+            capabilities: RuleCapabilities::default(),
+        }
+    }
+
+    /// An old stored rule has no capability field, so it gets two empty lists.
+    #[test]
+    fn an_old_rule_without_capabilities_gets_two_empty_lists() {
+        let stored = serde_json::json!({
+            "id": "alpha",
+            "version": 1,
+            "name": "alpha",
+            "enabled": true,
+            "priority": 0,
+            "trigger": {
+                "events": ["Created"],
+                "schemas": ["invoice"]
+            },
+            "condition": "Always",
+            "action": {"kind": "record", "params": {}},
+            "created_at": 1,
+            "updated_at": 1
+        });
+        let rule: Rule = serde_json::from_value(stored).expect("old rule parses");
+
+        assert!(rule.capabilities.read.is_empty());
+        assert!(rule.capabilities.write.is_empty());
+    }
+
+    /// A duplicate id in one list is invalid.
+    #[test]
+    fn a_duplicate_capability_id_is_rejected() {
+        let mut rule = draft();
+        rule.capabilities.read = vec!["task".to_string(), "task".to_string()];
+
+        assert!(matches!(
+            rule.validate(),
+            Err(RuleError::Invalid(message)) if message.contains("duplicate")
+        ));
+    }
+
+    /// An id that breaks the identifier rule is invalid.
+    #[test]
+    fn an_invalid_capability_id_is_rejected() {
+        let mut rule = draft();
+        rule.capabilities.write = vec!["Task/one".to_string()];
+
+        assert!(matches!(
+            rule.validate(),
+            Err(RuleError::Invalid(message)) if message.contains("invalid")
+        ));
+    }
+
+    /// A list with 33 ids is invalid.
+    #[test]
+    fn a_capability_list_above_32_ids_is_rejected() {
+        let mut rule = draft();
+        rule.capabilities.read = (0..33).map(|index| format!("s{index}")).collect();
+
+        assert!(matches!(
+            rule.validate(),
+            Err(RuleError::Invalid(message)) if message.contains("more than 32")
+        ));
+    }
+
+    /// The read list becomes the read-side script capability set.
+    #[test]
+    fn capabilities_build_the_read_side_script_set() {
+        let mut rule = draft();
+        rule.capabilities.read = vec!["task".to_string()];
+        rule.capabilities.write = vec!["other".to_string()];
+
+        let script = rule
+            .capabilities
+            .to_script_capabilities()
+            .expect("read list is valid");
+
+        assert!(script.allows("task"));
+        assert!(!script.allows("other"));
     }
 }

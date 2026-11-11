@@ -711,7 +711,7 @@ mod tests {
     use crate::queue::{JobQueue, MemoryQueue};
     use crate::records::{AttributeChange, EntityEvent};
     use crate::rules::engine::RuleEngine;
-    use crate::rules::rule::{ActionRef, Condition, Rule, RuleTrigger};
+    use crate::rules::rule::{ActionRef, Condition, Rule, RuleCapabilities, RuleTrigger};
     use crate::rules::store::RuleStore;
 
     /// Builds one action context for the tests.
@@ -732,6 +732,7 @@ mod tests {
                     kind: "webhook".to_string(),
                     params: params.clone(),
                 },
+                capabilities: RuleCapabilities::default(),
                 created_at: 0,
                 updated_at: 0,
             },
