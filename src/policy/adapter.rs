@@ -301,7 +301,7 @@ where
 
         let tx = self.store.begin_tx().map_err(store_err)?;
         for (key, value) in &encoded {
-            if tx.has(key).await.map_err(store_err)? {
+            if oxkv::GetSet::has(&tx, key).await.map_err(store_err)? {
                 tx.rollback().await.map_err(store_err)?;
                 return Ok(false);
             }
@@ -330,7 +330,7 @@ where
 
         let tx = self.store.begin_tx().map_err(store_err)?;
         for key in &keys {
-            if tx.has(key).await.map_err(store_err)? {
+            if oxkv::GetSet::has(&tx, key).await.map_err(store_err)? {
                 tx.delete(key).await.map_err(store_err)?;
             } else {
                 tx.rollback().await.map_err(store_err)?;
@@ -416,7 +416,7 @@ mod tests {
         }
         async fn gets_bytes(
             &self,
-            limit: Option<u32>,
+            limit: Option<usize>,
             direction: oxkv::Direction,
             cursor: (Option<String>, Option<String>),
         ) -> Result<Vec<oxkv::KeyValue>, oxkv::StoreError> {
@@ -485,7 +485,7 @@ mod tests {
         }
         async fn gets_bytes(
             &self,
-            _limit: Option<u32>,
+            _limit: Option<usize>,
             _direction: oxkv::Direction,
             _cursor: (Option<String>, Option<String>),
         ) -> Result<Vec<oxkv::KeyValue>, oxkv::StoreError> {

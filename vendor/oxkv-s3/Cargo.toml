@@ -1,0 +1,18 @@
+[package]
+name = "oxkv-s3"
+version = "0.12.1"
+edition = "2024"
+description = "object_store adapter for the oxkv key-value store."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/azamaulanaaa/oxkv"
+keywords = ["s3", "gcs", "azure", "keyvalue"]
+categories = ["database"]
+
+[dependencies]
+oxkv = { version = "0.12.1", default-features = false }
+async-trait = "0.1"
+futures = { version = "0.3", default-features = false, features = ["std"] }
+object_store = { version = "0.12", features = ["aws"] }
+
+[dev-dependencies]
+tokio = { version = "1.53.1", features = ["test-util", "macros", "rt"] }

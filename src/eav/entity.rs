@@ -1515,7 +1515,7 @@ impl EntityStore {
             }
             None => prefix.clone(),
         };
-        let max = u32::try_from(limit.saturating_add(1)).ok();
+        let max = Some(limit.saturating_add(1));
         let cursor = (Some(start), Some(prefix_scan_end(&prefix)));
         let markers = g
             .gets_bytes(max, Direction::Next, cursor)
@@ -1917,7 +1917,7 @@ impl EntityStore {
             None => prefix.clone(),
         };
         let target = limit.saturating_add(1);
-        let max = u32::try_from(target).ok();
+        let max = Some(target);
         let mut entities = Vec::new();
         let mut seen = BTreeSet::new();
         loop {
@@ -1997,7 +1997,7 @@ impl EntityStore {
         }
 
         let end = prefix_scan_end(TIME_INDEX_PREFIX);
-        let max = u32::try_from(BACKFILL_PAGE).ok();
+        let max = Some(BACKFILL_PAGE);
         let mut cursor = TIME_INDEX_PREFIX.to_string();
         loop {
             let page = {
@@ -2321,7 +2321,7 @@ impl EntityStore {
         }
 
         let end = prefix_scan_end(ENTITY_PREFIX);
-        let max = u32::try_from(BACKFILL_PAGE).ok();
+        let max = Some(BACKFILL_PAGE);
         let mut cursor = ENTITY_PREFIX.to_string();
         loop {
             let page = {
@@ -2434,7 +2434,7 @@ impl EntityStore {
 
         self.backfill_entity_index().await?;
         let end = prefix_scan_end(ENTITY_INDEX_PREFIX);
-        let max = u32::try_from(BACKFILL_PAGE).ok();
+        let max = Some(BACKFILL_PAGE);
         let mut cursor = ENTITY_INDEX_PREFIX.to_string();
         loop {
             let page = {
@@ -2578,7 +2578,7 @@ impl EntityStore {
             }
             None => ENTITY_INDEX_PREFIX.to_string(),
         };
-        let max = u32::try_from(limit.saturating_add(1)).ok();
+        let max = Some(limit.saturating_add(1));
         let cursor = (Some(start), Some(prefix_scan_end(ENTITY_INDEX_PREFIX)));
         let markers = g
             .gets_bytes(max, Direction::Next, cursor)
@@ -3521,7 +3521,7 @@ where
     S: GetSet + ?Sized,
 {
     debug_assert!(prefix.ends_with(':'));
-    let max = u32::try_from(limit).ok();
+    let max = Some(limit);
     let cursor = (Some(prefix.to_string()), Some(prefix_scan_end(prefix)));
     store
         .gets_bytes(max, Direction::Next, cursor)

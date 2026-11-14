@@ -52,7 +52,7 @@ pub async fn build_s3_store(cfg: &S3ClientConfig, prefix: &str) -> Result<OxKvSt
     let inner = build_object_store(cfg).map_err(|e| StoreError::Other(e.to_string()))?;
     let object_prefix = ObjectPath::from(prefix.trim_matches('/'));
     let mut builder = OxKvStore::builder()
-        .with_object_store(inner)
+        .with_store(Arc::new(oxkv_s3::ObjectStoreStorage::new(inner)))
         .with_prefix(object_prefix);
     if cfg.backend == S3Backend::Memory {
         builder = builder.skip_probe(true);
@@ -103,7 +103,7 @@ pub fn test_prefix(name: &str) -> String {
 pub async fn build_test_store(prefix: &str) -> OxKvStore {
     let inner = Arc::new(object_store::memory::InMemory::new()) as Arc<dyn ObjectStore>;
     OxKvStore::builder()
-        .with_object_store(inner)
+        .with_store(Arc::new(oxkv_s3::ObjectStoreStorage::new(inner)))
         .with_prefix(ObjectPath::from(prefix))
         .skip_probe(true)
         .build()
@@ -122,7 +122,7 @@ pub async fn build_test_store(prefix: &str) -> OxKvStore {
 #[allow(clippy::expect_used)]
 pub async fn build_test_store_new_session(inner: Arc<dyn ObjectStore>, prefix: &str) -> OxKvStore {
     OxKvStore::builder()
-        .with_object_store(inner)
+        .with_store(Arc::new(oxkv_s3::ObjectStoreStorage::new(inner)))
         .with_prefix(ObjectPath::from(prefix))
         .skip_probe(true)
         .build()
@@ -143,7 +143,7 @@ pub async fn build_test_store_new_session(inner: Arc<dyn ObjectStore>, prefix: &
 pub async fn build_scratch_store(prefix: &str) -> OxKvStore {
     let inner = Arc::new(object_store::memory::InMemory::new()) as Arc<dyn ObjectStore>;
     OxKvStore::builder()
-        .with_object_store(inner)
+        .with_store(Arc::new(oxkv_s3::ObjectStoreStorage::new(inner)))
         .with_prefix(ObjectPath::from(prefix))
         .skip_probe(true)
         .build()

@@ -6,9 +6,8 @@
 
 use std::sync::Arc;
 
-use oxkv::{
-    CachedOxKvStore, Direction, GetSet, KeyValue, OxKvStore, Store as _, Transaction as _, WarmMode,
-};
+use oxkv::{Direction, GetSet, KeyValue, OxKvStore, Store as _, Transaction as _};
+use oxkv_cached::{CachedOxKvStore, WarmMode};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
@@ -818,7 +817,7 @@ impl FsStore {
 /// receives a page that holds only the duplicate key.
 /// The value is small enough that a full scan of a large replica is not
 /// one large allocation.
-const SCAN_PAGE: u32 = 512;
+const SCAN_PAGE: usize = 512;
 
 /// A key-ordered walk over an oxkv store. The walk holds one page at a
 /// time.
@@ -987,7 +986,7 @@ mod tests {
             FsStore::new(build_test_store(&crate::db::test_prefix("latch-replica")).await);
 
         let fenced = FsError::from(oxkv::StoreError::Fenced("epoch 2".into()));
-        let other = FsError::from(oxkv::StoreError::Storage("bucket gone".into()));
+        let other = FsError::from(oxkv::StoreError::storage("bucket gone"));
 
         assert!(master.latches(&fenced), "a fenced master write is terminal");
         assert!(!replica.latches(&fenced), "a replica build race is not");
@@ -1196,7 +1195,7 @@ mod tests {
     async fn paged_walk_visits_every_key_exactly_once() {
         /// The test uses more keys than `SCAN_PAGE`, so at least one page
         /// boundary falls strictly inside the keyspace.
-        const KEYS: usize = SCAN_PAGE as usize * 3 + 7;
+        const KEYS: usize = SCAN_PAGE * 3 + 7;
 
         let store = test_store().await;
         let expected: Vec<String> = (0..KEYS).map(|i| format!("k:{i:06}")).collect();
@@ -1237,11 +1236,7 @@ mod tests {
     /// hidden.
     #[tokio::test]
     async fn paged_walk_handles_exact_page_multiples() {
-        for size in [
-            SCAN_PAGE as usize,
-            SCAN_PAGE as usize + 1,
-            SCAN_PAGE as usize * 2,
-        ] {
+        for size in [SCAN_PAGE, SCAN_PAGE + 1, SCAN_PAGE * 2] {
             let store = test_store().await;
             let expected: Vec<String> = (0..size).map(|i| format!("k:{i:06}")).collect();
             for key in &expected {

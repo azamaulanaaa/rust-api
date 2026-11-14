@@ -239,8 +239,12 @@ mod tests {
     fn oxkv_fencing_is_classified_and_others_are_not() {
         assert!(FsError::from(oxkv::StoreError::Fenced("epoch 2".into())).is_fencing_loss());
         for other in [
-            oxkv::StoreError::Storage("disk".into()),
+            oxkv::StoreError::storage("disk"),
             oxkv::StoreError::CasConflict("race".into()),
+            oxkv::StoreError::TxConflict {
+                key: "k".into(),
+                current: None,
+            },
             oxkv::StoreError::NotModified,
             oxkv::StoreError::Rejected {
                 key: "k".into(),

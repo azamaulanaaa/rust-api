@@ -726,7 +726,7 @@ mod tests {
         );
         // A generic store failure is not a fencing loss and must not be
         // treated as one.
-        assert!(!FsError::from(oxkv::StoreError::Storage("disk".into())).is_fencing_loss());
+        assert!(!FsError::from(oxkv::StoreError::storage("disk")).is_fencing_loss());
         assert!(!FsError::Internal("fenced: looks like it".into()).is_fencing_loss());
     }
 

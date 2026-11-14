@@ -1,0 +1,20 @@
+[package]
+name = "oxkv-cached"
+version = "0.12.1"
+edition = "2024"
+description = "Write-through RAM mirror for the oxkv key-value store."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/azamaulanaaa/oxkv"
+keywords = ["cache", "mirror", "keyvalue", "database"]
+categories = ["database"]
+
+[dependencies]
+oxkv = { version = "0.12.1", features = ["btree", "oxkv"] }
+async-lock = "3"
+async-trait = "0.1"
+futures = { version = "0.3", default-features = false, features = ["std"] }
+web-time = "1"
+
+[dev-dependencies]
+serde_json = "1"
+tokio = { version = "1.53.1", features = ["test-util", "macros", "rt"] }

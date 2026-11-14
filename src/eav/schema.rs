@@ -408,7 +408,7 @@ impl SchemaRegistry {
             }
             None => HEAD_PREFIX.to_string(),
         };
-        let max = u32::try_from(limit.saturating_add(1)).ok();
+        let max = Some(limit.saturating_add(1));
         let cursor = (Some(start), Some(prefix_scan_end(HEAD_PREFIX)));
         let heads = g
             .gets_bytes(max, Direction::Next, cursor)
@@ -802,7 +802,7 @@ where
     S: GetSet + ?Sized,
 {
     debug_assert!(prefix.starts_with(SCHEMA_PREFIX));
-    let max = u32::try_from(limit).ok();
+    let max = Some(limit);
     let cursor = (Some(prefix.to_string()), Some(prefix_scan_end(prefix)));
     store
         .gets_bytes(max, Direction::Next, cursor)
