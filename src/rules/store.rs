@@ -744,9 +744,8 @@ async fn family_page(
 ) -> Result<Vec<KeyValue>, RuleError> {
     let start = after.map_or_else(|| prefix.to_string(), ToString::to_string);
     let cursor = (Some(start), Some(prefix_scan_end(prefix)));
-    let limit = u32::try_from(GC_BATCH).unwrap_or(u32::MAX);
     let mut rows = store
-        .gets_bytes(Some(limit), Direction::Next, cursor)
+        .gets_bytes(Some(GC_BATCH), Direction::Next, cursor)
         .await
         .map_err(RuleError::Store)?;
     if let Some(resume) = after

@@ -669,7 +669,7 @@ A client that reads a replica must follow these rules. The client owns them. The
 - Three top-level names change under one name: `manifest.json`, `ownership.json`, and `probe/canary`. Revalidate each with `If-None-Match`. Each response carries `Cache-Control: no-cache`.
 - The `e{epoch}/sst/*`, `e{epoch}/wal/*`, and `e{epoch}/blob/*` classes are immutable. Cache them with `public, max-age=31536000, immutable`.
 - Only these exact names are mutable. A key that merely ends in `manifest.json` is not.
-- `oxkv` 0.10 removed the reader pin. Re-open the reader or re-read the manifest when a client needs a view consistent with a moment in time, or snapshot the keys itself.
+- `oxkv` 0.12 has no reader pin. Re-open the reader or re-read the manifest when a client needs a view that matches a moment in time. A client can also snapshot the keys itself.
 - `/sync/db/{object}` streams with `Content-Length`. A large SST segment does not need to fit in the server heap.
 
 ## Configuration
@@ -954,7 +954,7 @@ The new binary ignores a leftover `[database].path` key and uses `[database].pre
 
 ### Security advisories
 
-`mise run advisories` passes because `deny.toml` contains documented suppressions for seven advisories. An advisory outside that list fails the check. `lib::tests::every_ignore_is_justified` fails an entry without a substantive reason. Re-examine the list when `oxkv`, `actix-web`, or `casbin` moves.
+`mise run advisories` passes because `deny.toml` contains documented suppressions for six advisories. An advisory outside that list fails the check. `lib::tests::every_ignore_is_justified` fails an entry without a substantive reason. Re-examine the list when `oxkv`, `actix-web`, or `casbin` moves.
 
 One suppression is reachable: `h2` 0.3 is compiled in because actix-web enables HTTP/2, and no actix-web release can take the fix yet. Terminate HTTP/2 in front of this process, or bound memory. The others are low exposure, unmaintained, or have no patched version.
 

@@ -778,7 +778,7 @@ mod tests {
         assert!(fenced.to_string().contains("epoch 7 superseded"));
 
         for other in [
-            oxkv::StoreError::Storage("bucket gone".into()),
+            oxkv::StoreError::storage("bucket gone"),
             oxkv::StoreError::CasConflict("two writers".into()),
             oxkv::StoreError::Other("fenced-ish wording that must not count".into()),
         ] {

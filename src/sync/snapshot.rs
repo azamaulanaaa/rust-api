@@ -39,10 +39,10 @@
 //! the ownership record, and the storage probe are the exceptions, because
 //! `oxkv` rewrites each of them under one name.
 //!
-//! # A reader in `oxkv` 0.10 holds no pin
+//! # A reader in `oxkv` 0.12 holds no pin
 //!
-//! `oxkv` 0.10 removed `register_reader`, `unregister_reader`, and
-//! `min_reader_version`. No caller can now ask a writer to keep a segment
+//! `oxkv` 0.12 has no `register_reader`, `unregister_reader`, or
+//! `min_reader_version`. No caller can ask a writer to keep a segment
 //! alive. The writer instead collects a `WAL` file only after a flush put
 //! every record of that file into an `SST`. A read that loses a segment to a
 //! compaction then runs again against a fresh manifest.
@@ -57,6 +57,7 @@ use crate::policy::row::RowAuthorizer;
 use crate::policy::{Action, Authorizer};
 use crate::records::WalOp;
 use oxkv::{GetSet as _, OxKvReader, Store as _, Transaction as _};
+use oxkv_s3::ObjectStoreStorage;
 
 use super::wal::Wal;
 
@@ -625,7 +626,7 @@ impl SnapshotManager {
     ///
     /// An error from the follower open is now an error here. `oxkv` 0.7
     /// opened a follower with an empty manifest when the read of
-    /// `manifest.json` failed. The method then answered `None`. `oxkv` 0.10
+    /// `manifest.json` failed. The method then answered `None`. `oxkv` 0.12
     /// reports that failure instead. A temporary `S3` error then reaches the
     /// caller as an error. It no longer looks like a prefix that was never
     /// built.
@@ -854,7 +855,9 @@ impl SnapshotManager {
     /// `policy export` CLI does.
     async fn open_writer(&self, sub: &str) -> Result<oxkv::OxKvStore, FsError> {
         oxkv::OxKvStore::builder()
-            .with_object_store(self.object_store.clone())
+            .with_store(std::sync::Arc::new(ObjectStoreStorage::new(
+                self.object_store.clone(),
+            )))
             .with_prefix(oxkv::ObjectPath::from(self.user_prefix(sub).as_str()))
             .skip_probe(self.skip_probe)
             .build_with_cache(self.sst_cache.clone())
@@ -869,7 +872,7 @@ impl SnapshotManager {
     /// writer. The shared SST cache keeps repeated opens from downloading the
     /// hot segments again.
     ///
-    /// `oxkv` 0.10 offers no reader pin. The writer collects a `WAL` file only
+    /// `oxkv` 0.12 offers no reader pin. The writer collects a `WAL` file only
     /// after a flush put every record of that file into an `SST`. A read that
     /// loses a segment to a compaction then runs again against a fresh
     /// manifest. The follower therefore sees the live state of the prefix.
@@ -877,11 +880,10 @@ impl SnapshotManager {
     ///
     /// Every caller in this module opens the follower for one short read. So
     /// one fix per read is enough for the call. A caller that must read a
-    /// stable snapshot needs another mechanism, because `oxkv` 0.10 does not
+    /// stable snapshot needs another mechanism, because `oxkv` 0.12 does not
     /// provide one.
     async fn open_reader(&self, sub: &str) -> Result<OxKvReader, FsError> {
-        let base: std::sync::Arc<dyn object_store::ObjectStore> = self.object_store.clone();
-        let storage: std::sync::Arc<dyn oxkv::Storage> = std::sync::Arc::new(base);
+        let storage = std::sync::Arc::new(ObjectStoreStorage::new(self.object_store.clone()));
         oxkv::OxKvStore::builder()
             .with_store(storage)
             .with_prefix(oxkv::ObjectPath::from(self.user_prefix(sub).as_str()))
@@ -1481,8 +1483,7 @@ mod tests {
     }
 
     async fn open_reader(mem: &std::sync::Arc<InMemory>, prefix: &str) -> OxKvReader {
-        let base: std::sync::Arc<dyn object_store::ObjectStore> = mem.clone();
-        let storage: std::sync::Arc<dyn oxkv::Storage> = std::sync::Arc::new(base);
+        let storage = std::sync::Arc::new(ObjectStoreStorage::new(mem.clone()));
         OxKvReader::open(storage, oxkv::ObjectPath::from(prefix))
             .await
             .unwrap()

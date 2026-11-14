@@ -47,13 +47,13 @@ jsonwebtoken = { version = "10.2", features = ["rust_crypto"] }
 openidconnect = { version = "4.0", default-features = false, features = ["reqwest", "rustls-tls"] }
 
 object_store = { version = "0.12", default-features = false, features = ["aws"] }
-# `btree` is named explicitly because oxkv 0.10 re-exports `CachedOxKvStore`,
-# `CachedTx` and `WarmMode` only under
-# `all(feature = "oxkv", feature = "btree")`, and `src/fs/store.rs` builds a
-# `CachedOxKvStore` with `WarmMode::Lazy`. The item resolves today only
-# because the oxkv default feature happens to include `btree`. Naming it here
-# keeps the build correct if that default ever changes.
-oxkv = { version = "0.10", features = ["btree", "oxkv", "oxkv-s3", "otel"] }
+# `btree` is named explicitly because oxkv 0.12 gates its `BTreeStore` on that
+# feature, and the policy adapter tests use `BTreeStore`. The `oxkv` feature is
+# the default and stays implicit. The S3 adapter and the cache adapter are
+# local copies, because crates.io does not publish them before 1.0.
+oxkv = { version = "0.12", features = ["btree"] }
+oxkv-s3 = { version = "0.12.1", path = "vendor/oxkv-s3" }
+oxkv-cached = { version = "0.12.1", path = "vendor/oxkv-cached" }
 
 opentelemetry = "0.32"
 opentelemetry-otlp = { version = "0.32", optional = true, default-features = false }
