@@ -716,9 +716,12 @@ impl EntityStore {
         ctx: &WriteContext,
     ) -> Result<Option<(String, Vec<u8>)>, EntityError>
     where
-        S: GetSet + ?Sized,
+        S: TxCas + ?Sized + Sync,
     {
         let entity = &prepared.entity;
+        // A duplicate create in one transaction must fail before commit.
+        // The transaction reads its own staged writes, so this check sees an
+        // earlier create in the same plan.
         if store
             .get_bytes(&meta_key(&entity.id))
             .await
@@ -741,7 +744,11 @@ impl EntityStore {
             ctx,
         )?;
         check_unique_values(store, entity, &prepared.merged.attributes).await?;
-        put_entity_rows(store, entity, &prepared.merged).await?;
+        store
+            .set_if_absent(&meta_key(&entity.id), &meta_bytes(entity)?)
+            .await
+            .map_err(EntityError::Store)?;
+        put_entity_rows_except_meta(store, entity, &prepared.merged).await?;
         Ok(outbox)
     }
 
@@ -956,7 +963,13 @@ impl EntityStore {
             if let Some((key, bytes)) = &outbox {
                 tx.set_bytes(key, bytes).await.map_err(EntityError::Store)?;
             }
-            tx.commit().await.map_err(EntityError::Store)?;
+            match tx.commit().await {
+                Ok(()) => {}
+                Err(StoreError::TxConflict { key, .. }) if key == meta_key(&prepared.entity.id) => {
+                    return Err(EntityError::AlreadyExists(prepared.entity.id.clone()));
+                }
+                Err(error) => return Err(EntityError::Store(error)),
+            }
             outbox.is_some()
         };
         if pending && let Err(error) = self.flush_after_commit().await {
@@ -3171,13 +3184,8 @@ where
     Ok(())
 }
 
-/// Writes the metadata row of one entity.
-///
-/// The call changes no attribute row and no index row.
-async fn put_meta_row<S>(store: &S, entity: &Entity) -> Result<(), EntityError>
-where
-    S: GetSet + ?Sized,
-{
+/// Returns the JSON bytes of the metadata row of one entity.
+fn meta_bytes(entity: &Entity) -> Result<Vec<u8>, EntityError> {
     let meta = EntityMeta {
         id: entity.id.clone(),
         version: entity.version,
@@ -3185,7 +3193,17 @@ where
         created_at: entity.created_at,
         updated_at: entity.updated_at,
     };
-    let meta_bytes = serde_json::to_vec(&meta).map_err(|e| EntityError::Internal(e.to_string()))?;
+    serde_json::to_vec(&meta).map_err(|e| EntityError::Internal(e.to_string()))
+}
+
+/// Writes the metadata row of one entity.
+///
+/// The call changes no attribute row and no index row.
+async fn put_meta_row<S>(store: &S, entity: &Entity) -> Result<(), EntityError>
+where
+    S: GetSet + ?Sized,
+{
+    let meta_bytes = meta_bytes(entity)?;
     store
         .set_bytes(&meta_key(&entity.id), &meta_bytes)
         .await
@@ -3202,18 +3220,25 @@ async fn put_entity_rows<S>(
 where
     S: GetSet + ?Sized,
 {
-    let meta = EntityMeta {
-        id: entity.id.clone(),
-        version: entity.version,
-        schemas: entity.schemas.clone(),
-        created_at: entity.created_at,
-        updated_at: entity.updated_at,
-    };
-    let meta_bytes = serde_json::to_vec(&meta).map_err(|e| EntityError::Internal(e.to_string()))?;
+    let meta_bytes = meta_bytes(entity)?;
     store
         .set_bytes(&meta_key(&entity.id), &meta_bytes)
         .await
         .map_err(EntityError::Store)?;
+    put_entity_rows_except_meta(store, entity, merged).await
+}
+
+/// Writes the attribute and index rows of one entity.
+///
+/// The caller writes the metadata row.
+async fn put_entity_rows_except_meta<S>(
+    store: &S,
+    entity: &Entity,
+    merged: &MergedSchema,
+) -> Result<(), EntityError>
+where
+    S: GetSet + ?Sized,
+{
     store
         .set_bytes(&entity_index_key(&entity.id), b"")
         .await
@@ -4151,6 +4176,45 @@ mod tests {
         let result = store.create(draft("e1", &["person"], vec![]), &ctx()).await;
 
         assert!(matches!(result, Err(EntityError::AlreadyExists(id)) if id == "e1"));
+    }
+
+    #[tokio::test]
+    async fn a_duplicate_create_writes_no_attribute_row() {
+        let (store, registry, raw) = new_store().await;
+        registry
+            .publish(schema(
+                "person",
+                &[],
+                vec![attr("name", AttributeType::String)],
+            ))
+            .await
+            .unwrap();
+        store
+            .create(draft("e1", &["person"], vec![("name", s("Alice"))]), &ctx())
+            .await
+            .unwrap();
+
+        let result = store
+            .create(draft("e1", &["person"], vec![("name", s("Bob"))]), &ctx())
+            .await;
+
+        assert!(matches!(result, Err(EntityError::AlreadyExists(id)) if id == "e1"));
+        let stored = raw
+            .get_bytes(&attr_key("e1", "name"))
+            .await
+            .unwrap()
+            .expect("the first attribute row must stay");
+        assert_eq!(
+            serde_json::from_slice::<AttributeValue>(&stored).unwrap(),
+            s("Alice")
+        );
+        let mut keys: Vec<String> = all_keys(&raw)
+            .await
+            .into_iter()
+            .filter(|key| key.starts_with(&attr_prefix("e1")))
+            .collect();
+        keys.sort();
+        assert_eq!(keys, vec![attr_key("e1", "name")]);
     }
 
     #[tokio::test]
