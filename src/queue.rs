@@ -48,14 +48,15 @@ pub struct Job {
 /// Proof that a worker holds a lease on a job.
 ///
 /// A queue operation that changes a leased job must carry the token that
-/// [`JobQueue::reserve`] returned. The backend rejects the call when the
-/// token does not match the current lease.
+/// [`JobQueue::reserve`] or [`JobQueue::extend_lease`] returned. The backend
+/// rejects the call when the token does not match the current lease.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LeaseToken {
     /// Worker that holds the lease.
     pub worker: String,
-    /// Lease expiry time, in unix seconds.
-    pub expires_at: i64,
+    /// Lease generation. The backend increments the value on each reserve
+    /// and each extension. An old token has a lower value.
+    pub generation: u64,
 }
 
 /// A job that a worker has leased.
@@ -182,17 +183,18 @@ pub trait JobQueue: Send + Sync {
         retry: RetryPolicy,
     ) -> Result<(), QueueError>;
 
-    /// Extends the lease of a job.
+    /// Extends the lease of a job and returns the new token.
     ///
-    /// The call fails with [`QueueError::LeaseExpired`] or
-    /// [`QueueError::AlreadyLeased`] when `lease` is not the current token.
-    /// A failed call does not change the job.
+    /// The old token is not valid after this call. The call fails with
+    /// [`QueueError::LeaseExpired`] or [`QueueError::AlreadyLeased`] when
+    /// `lease` is not the current token. A failed call does not change the
+    /// job.
     async fn extend_lease(
         &self,
         job_id: JobId,
         lease: &LeaseToken,
         extend: Duration,
-    ) -> Result<(), QueueError>;
+    ) -> Result<LeaseToken, QueueError>;
 
     /// Returns the status of a job.
     async fn status(&self, job_id: JobId) -> Result<JobStatus, QueueError>;
