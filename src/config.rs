@@ -484,7 +484,7 @@ pub struct DatabaseConfig {
     /// Mirrors the master fs store in RAM for replica rebuilds.
     ///
     /// This setting is a prototype. When the field is true, the snapshot
-    /// manager keeps a [`oxkv::CachedOxKvStore`] mirror over the master fs
+    /// manager keeps a [`oxkv_cached::CachedOxKvStore`] mirror over the master fs
     /// prefix. The mirror warms up on first use. Full rebuilds then serve
     /// bulk scans from memory after the first pass. The setting costs one
     /// master key set in RAM. It is safe only while serve() holds the single

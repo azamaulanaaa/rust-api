@@ -29,7 +29,16 @@ pub struct ImportReport {
 }
 
 /// Reads every policy rule from an OxKV store.
-pub async fn export_s3(s3_store: oxkv::OxKvStore) -> anyhow::Result<PolicyDump> {
+///
+/// The function accepts any [`oxkv::Store`] whose transaction supports
+/// [`oxkv::TxCas`]. The caller can pass a fenced [`oxkv::OxKvStore`] or a
+/// read-only [`oxkv::OxKvReader`]. A reader takes no epoch, so an export
+/// through a reader cannot fence the writer.
+pub async fn export_s3<S>(s3_store: S) -> anyhow::Result<PolicyDump>
+where
+    S: oxkv::Store + Send + Sync + 'static,
+    S::Transaction: oxkv::TxCas,
+{
     use anyhow::Context as _;
     let model = DefaultModel::from_str(RBAC_MODEL)
         .await
@@ -144,6 +153,44 @@ mod tests {
         assert_eq!(again.rules_added, 0);
         assert_eq!(again.groups_added, 0);
         assert_eq!(again.duplicates, 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn export_through_a_reader_does_not_fence_the_writer() -> anyhow::Result<()> {
+        use crate::db::{build_test_reader, build_test_store_new_session, test_prefix};
+
+        let shared =
+            Arc::new(object_store::memory::InMemory::new()) as Arc<dyn object_store::ObjectStore>;
+        let prefix = test_prefix("admin-reader");
+        let writer = build_test_store_new_session(shared.clone(), &prefix).await;
+
+        let dump = PolicyDump {
+            p: vec![vec!["admin".into(), "doc".into(), "read".into()]],
+            g: vec![vec!["user-1".into(), "admin".into()]],
+        };
+        import_s3(writer.clone(), &dump, None).await?;
+
+        let reader = build_test_reader(shared, &prefix).await;
+        let exported = export_s3(reader.clone()).await?;
+        assert_eq!(exported.p, dump.p);
+        assert_eq!(exported.g, dump.g);
+
+        // The writer still owns the epoch. So this write must succeed.
+        let more = PolicyDump {
+            p: vec![vec!["admin".into(), "doc".into(), "write".into()]],
+            g: vec![],
+        };
+        let report = import_s3(writer, &more, None).await?;
+        assert_eq!(report.rules_added, 1);
+
+        // The same reader must see the write that followed its open.
+        let exported = export_s3(reader).await?;
+        assert!(
+            exported.p.contains(&more.p[0]),
+            "the reader must see the write that followed its open: {:?}",
+            exported.p
+        );
         Ok(())
     }
 

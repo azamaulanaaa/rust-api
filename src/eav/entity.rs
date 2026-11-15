@@ -135,7 +135,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use oxkv::{Direction, GetSet, KeyValue, OxKvStore, Store as _, Transaction as _};
+use oxkv::{
+    Direction, GetSet, KeyPrefix, KeyValue, OxKvStore, ScanExt as _, Store as _, StoreError,
+    Transaction as _, TxCas,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, RwLock};
@@ -201,6 +204,14 @@ const BACKFILL_PAGE: usize = 200;
 /// Maximum number of rows that one lazy backfill page reads.
 #[cfg(test)]
 const BACKFILL_PAGE: usize = 2;
+
+/// Number of reverse reference keys that one incoming scan reads.
+#[cfg(not(test))]
+const REF_SCAN_PAGE: usize = 512;
+
+/// Number of reverse reference keys that one incoming scan reads.
+#[cfg(test)]
+const REF_SCAN_PAGE: usize = 2;
 
 /// A test hook that runs after a lazy backfill page releases its locks.
 #[cfg(test)]
@@ -705,9 +716,12 @@ impl EntityStore {
         ctx: &WriteContext,
     ) -> Result<Option<(String, Vec<u8>)>, EntityError>
     where
-        S: GetSet + ?Sized,
+        S: TxCas + ?Sized + Sync,
     {
         let entity = &prepared.entity;
+        // A duplicate create in one transaction must fail before commit.
+        // The transaction reads its own staged writes, so this check sees an
+        // earlier create in the same plan.
         if store
             .get_bytes(&meta_key(&entity.id))
             .await
@@ -730,7 +744,11 @@ impl EntityStore {
             ctx,
         )?;
         check_unique_values(store, entity, &prepared.merged.attributes).await?;
-        put_entity_rows(store, entity, &prepared.merged).await?;
+        store
+            .set_if_absent(&meta_key(&entity.id), &meta_bytes(entity)?)
+            .await
+            .map_err(EntityError::Store)?;
+        put_entity_rows_except_meta(store, entity, &prepared.merged).await?;
         Ok(outbox)
     }
 
@@ -810,9 +828,10 @@ impl EntityStore {
         store: &S,
         prepared: &PreparedUpdate,
         ctx: &WriteContext,
+        guard_meta: bool,
     ) -> Result<Option<(String, Vec<u8>)>, EntityError>
     where
-        S: GetSet + ?Sized,
+        S: TxCas + ?Sized + Sync,
     {
         let before = &prepared.before;
         let after = &prepared.after;
@@ -833,7 +852,22 @@ impl EntityStore {
         delete_changed_timer_markers(store, before, after, &prepared.merged).await?;
         delete_mutable_rows(store, before, &prepared.merged).await?;
         delete_ref_rows(store, before, &prepared.merged).await?;
-        put_entity_rows(store, after, &prepared.merged).await?;
+        let before_meta = meta_bytes(before)?;
+        let after_meta = meta_bytes(after)?;
+        if guard_meta {
+            store
+                .compare_and_set(&meta_key(&after.id), Some(&before_meta), &after_meta)
+                .await
+                .map_err(EntityError::Store)?;
+        } else {
+            // A create earlier in the same plan already staged the row.
+            // Its precondition covers the committed state.
+            store
+                .set_bytes(&meta_key(&after.id), &after_meta)
+                .await
+                .map_err(EntityError::Store)?;
+        }
+        put_entity_rows_except_meta(store, after, &prepared.merged).await?;
         Ok(outbox)
     }
 
@@ -851,7 +885,7 @@ impl EntityStore {
         force: bool,
     ) -> Result<PreparedDelete, EntityError>
     where
-        S: GetSet + ?Sized,
+        S: GetSet + ?Sized + Sync,
     {
         validate_name("entity id", id)?;
         let Some(before) = load_entity(store, id).await? else {
@@ -945,7 +979,13 @@ impl EntityStore {
             if let Some((key, bytes)) = &outbox {
                 tx.set_bytes(key, bytes).await.map_err(EntityError::Store)?;
             }
-            tx.commit().await.map_err(EntityError::Store)?;
+            match tx.commit().await {
+                Ok(()) => {}
+                Err(StoreError::TxConflict { key, .. }) if key == meta_key(&prepared.entity.id) => {
+                    return Err(EntityError::AlreadyExists(prepared.entity.id.clone()));
+                }
+                Err(error) => return Err(EntityError::Store(error)),
+            }
             outbox.is_some()
         };
         if pending && let Err(error) = self.flush_after_commit().await {
@@ -995,14 +1035,18 @@ impl EntityStore {
             let prepared = self
                 .prepare_update(&tx, id, expected_version, &patch)
                 .await?;
-            let outbox = self.stage_update(&tx, &prepared, ctx).await?;
+            let outbox = self.stage_update(&tx, &prepared, ctx, true).await?;
             if outbox.is_some() {
                 increment_outbox_pending(&tx, 1).await?;
             }
             if let Some((key, bytes)) = &outbox {
                 tx.set_bytes(key, bytes).await.map_err(EntityError::Store)?;
             }
-            tx.commit().await.map_err(EntityError::Store)?;
+            match tx.commit().await {
+                Ok(()) => {}
+                Err(StoreError::TxConflict { .. }) => return Err(EntityError::VersionConflict),
+                Err(error) => return Err(EntityError::Store(error)),
+            }
             (
                 EntityChange {
                     before: Some(prepared.before),
@@ -1163,6 +1207,8 @@ impl EntityStore {
             let tx = g.begin_tx().map_err(EntityError::Store)?;
             let mut changes = Vec::with_capacity(plan.len());
             let mut outbox_rows = Vec::new();
+            let mut guarded_meta = BTreeSet::new();
+            let mut created_in_plan = BTreeSet::new();
             for effect in plan.effects() {
                 let (change, outbox) = match effect {
                     EntityEffect::Create {
@@ -1178,6 +1224,7 @@ impl EntityStore {
                             })
                             .await?;
                         let outbox = self.stage_create(&tx, &prepared, ctx).await?;
+                        created_in_plan.insert(prepared.entity.id.clone());
                         (
                             EntityChange {
                                 before: None,
@@ -1197,7 +1244,11 @@ impl EntityStore {
                         let prepared = self
                             .prepare_update(&tx, id, *expected_version, &patch)
                             .await?;
-                        let outbox = self.stage_update(&tx, &prepared, ctx).await?;
+                        let guard_meta = !created_in_plan.contains(id);
+                        let outbox = self.stage_update(&tx, &prepared, ctx, guard_meta).await?;
+                        if guard_meta {
+                            guarded_meta.insert(meta_key(id));
+                        }
                         (
                             EntityChange {
                                 before: Some(prepared.before),
@@ -1239,7 +1290,13 @@ impl EntityStore {
             if let Some((key, bytes)) = marker {
                 tx.set_bytes(key, bytes).await.map_err(EntityError::Store)?;
             }
-            tx.commit().await.map_err(EntityError::Store)?;
+            match tx.commit().await {
+                Ok(()) => {}
+                Err(StoreError::TxConflict { key, .. }) if guarded_meta.contains(&key) => {
+                    return Err(EntityError::VersionConflict);
+                }
+                Err(error) => return Err(EntityError::Store(error)),
+            }
             (changes, !outbox_rows.is_empty())
         };
         if pending && let Err(error) = self.flush_after_commit().await {
@@ -1368,7 +1425,12 @@ impl EntityStore {
         if let Some(count) = read_outbox_pending(&*g).await? {
             return Ok(count);
         }
-        let count = u64::try_from(scan_prefix(&*g, OUTBOX_PREFIX).await?.len()).unwrap_or(u64::MAX);
+        let count = u64::try_from(
+            g.count_prefix(KeyPrefix::new(OUTBOX_PREFIX), usize::MAX)
+                .await
+                .map_err(EntityError::Store)?,
+        )
+        .unwrap_or(u64::MAX);
         write_outbox_pending(&*g, count).await?;
         Ok(count)
     }
@@ -1428,11 +1490,11 @@ impl EntityStore {
         validate_name("schema id", schema_id)?;
         let g = self.store.read().await;
         let prefix = format!("{SCHEMA_INDEX_PREFIX}{schema_id}:");
-        let markers = scan_prefix(&*g, &prefix).await?;
+        let markers = scan_keys_prefix(&*g, &prefix).await?;
         let mut entities = Vec::new();
         let mut seen = BTreeSet::new();
-        for marker in markers {
-            let Some(id) = marker.key.strip_prefix(&prefix) else {
+        for key in markers {
+            let Some(id) = key.strip_prefix(&prefix) else {
                 continue;
             };
             if id.is_empty() || id.contains(':') || !seen.insert(id.to_string()) {
@@ -1465,11 +1527,11 @@ impl EntityStore {
         let g = self.store.read().await;
         let prefix = format!("{SCHEMA_INDEX_PREFIX}{schema_id}:");
         let max = offset.saturating_add(limit);
-        let markers = scan_prefix_bounded(&*g, &prefix, max).await?;
+        let markers = scan_keys_prefix_bounded(&*g, &prefix, max).await?;
         let mut ids = Vec::new();
         let mut seen = BTreeSet::new();
-        for marker in markers {
-            let Some(id) = marker.key.strip_prefix(&prefix) else {
+        for key in markers {
+            let Some(id) = key.strip_prefix(&prefix) else {
                 continue;
             };
             if id.is_empty() || id.contains(':') || !seen.insert(id.to_string()) {
@@ -1515,16 +1577,16 @@ impl EntityStore {
             }
             None => prefix.clone(),
         };
-        let max = u32::try_from(limit.saturating_add(1)).ok();
-        let cursor = (Some(start), Some(prefix_scan_end(&prefix)));
+        let max = Some(limit.saturating_add(1));
+        let cursor = (Some(start), KeyPrefix::new(&prefix).upper_bound());
         let markers = g
-            .gets_bytes(max, Direction::Next, cursor)
+            .gets_keys(max, Direction::Next, cursor)
             .await
             .map_err(EntityError::Store)?;
         let mut ids = Vec::new();
         let mut seen = BTreeSet::new();
-        for marker in markers {
-            let Some(id) = marker.key.strip_prefix(&prefix) else {
+        for key in markers {
+            let Some(id) = key.strip_prefix(&prefix) else {
                 continue;
             };
             if id.is_empty() || id.contains(':') || !seen.insert(id.to_string()) {
@@ -1908,7 +1970,7 @@ impl EntityStore {
         }
 
         let prefix = format!("{ATTR_INDEX_PREFIX}{key}:{hash}:");
-        let end = prefix_scan_end(&prefix);
+        let end = KeyPrefix::new(&prefix).upper_bound();
         let mut start = match after {
             Some(cursor) => {
                 validate_name("entity id", cursor)?;
@@ -1917,22 +1979,18 @@ impl EntityStore {
             None => prefix.clone(),
         };
         let target = limit.saturating_add(1);
-        let max = u32::try_from(target).ok();
+        let max = Some(target);
         let mut entities = Vec::new();
         let mut seen = BTreeSet::new();
         loop {
             let rows = g
-                .gets_bytes(
-                    max,
-                    Direction::Next,
-                    (Some(start.clone()), Some(end.clone())),
-                )
+                .gets_keys(max, Direction::Next, (Some(start.clone()), end.clone()))
                 .await
                 .map_err(EntityError::Store)?;
             let full = rows.len() == target;
-            for row in &rows {
-                start = format!("{}\0", row.key);
-                let Some(id) = row.key.strip_prefix(&prefix) else {
+            for marker in &rows {
+                start = format!("{marker}\0");
+                let Some(id) = marker.strip_prefix(&prefix) else {
                     continue;
                 };
                 if id.is_empty() || id.contains(':') || !seen.insert(id.to_string()) {
@@ -1991,13 +2049,13 @@ impl EntityStore {
                 .is_some()
             {
                 return Ok(time_key_marker_keys(
-                    scan_prefix(&*g, TIME_KEY_INDEX_PREFIX).await?,
+                    scan_keys_prefix(&*g, TIME_KEY_INDEX_PREFIX).await?,
                 ));
             }
         }
 
-        let end = prefix_scan_end(TIME_INDEX_PREFIX);
-        let max = u32::try_from(BACKFILL_PAGE).ok();
+        let end = KeyPrefix::new(TIME_INDEX_PREFIX).upper_bound();
+        let max = Some(BACKFILL_PAGE);
         let mut cursor = TIME_INDEX_PREFIX.to_string();
         loop {
             let page = {
@@ -2011,24 +2069,20 @@ impl EntityStore {
                     None
                 } else {
                     let rows = g
-                        .gets_bytes(
-                            max,
-                            Direction::Next,
-                            (Some(cursor.clone()), Some(end.clone())),
-                        )
+                        .gets_keys(max, Direction::Next, (Some(cursor.clone()), end.clone()))
                         .await
                         .map_err(EntityError::Store)?;
                     if rows.is_empty() {
                         None
                     } else {
                         let full = rows.len() == BACKFILL_PAGE;
-                        let last = rows.last().map(|row| row.key.clone()).unwrap_or_default();
+                        let last = rows.last().cloned().unwrap_or_default();
                         let keys = time_row_keys(rows);
                         let tx = g.begin_tx().map_err(EntityError::Store)?;
                         for key in &keys {
                             let prefix = format!("{TIME_INDEX_PREFIX}{key}:");
                             // Re-check the source row inside the page lock.
-                            if scan_prefix_bounded(&tx, &prefix, 1).await?.is_empty() {
+                            if scan_keys_prefix_bounded(&tx, &prefix, 1).await?.is_empty() {
                                 continue;
                             }
                             let marker_key = time_key_index_key(key);
@@ -2067,14 +2121,14 @@ impl EntityStore {
                 .map_err(EntityError::Store)?
                 .is_none()
             {
-                g.set_bytes(&backfill_marker, b"")
+                g.put_bytes(&backfill_marker, b"")
                     .await
                     .map_err(EntityError::Store)?;
             }
         }
         let g = self.store.read().await;
         Ok(time_key_marker_keys(
-            scan_prefix(&*g, TIME_KEY_INDEX_PREFIX).await?,
+            scan_keys_prefix(&*g, TIME_KEY_INDEX_PREFIX).await?,
         ))
     }
 
@@ -2104,13 +2158,13 @@ impl EntityStore {
         let upper = format!("{prefix}{};", encode_timestamp(at_or_before));
         let cursor = (Some(prefix.clone()), Some(upper));
         let rows = g
-            .gets_bytes(None, Direction::Next, cursor)
+            .gets_keys(None, Direction::Next, cursor)
             .await
             .map_err(EntityError::Store)?;
         let mut entities = Vec::new();
         let mut seen = BTreeSet::new();
-        for row in rows {
-            let Some(rest) = row.key.strip_prefix(&prefix) else {
+        for marker_key in rows {
+            let Some(rest) = marker_key.strip_prefix(&prefix) else {
                 continue;
             };
             let Some((encoded, id)) = rest.split_once(':') else {
@@ -2224,9 +2278,9 @@ impl EntityStore {
         if entity.attributes.get(key) != Some(&AttributeValue::Timestamp(due_at)) {
             return Ok(false);
         }
-        g.set_bytes(&timer_marker_key(entity_id, key, due_at), &bytes)
+        g.put_bytes(&timer_marker_key(entity_id, key, due_at), &bytes)
             .await
-            .map(|_| true)
+            .map(|()| true)
             .map_err(EntityError::Store)
     }
 
@@ -2273,10 +2327,10 @@ impl EntityStore {
     /// Lists every entity, sorted by id.
     pub async fn list(&self) -> Result<Vec<Entity>, EntityError> {
         let g = self.store.read().await;
-        let rows = scan_prefix(&*g, ENTITY_PREFIX).await?;
+        let rows = scan_keys_prefix(&*g, ENTITY_PREFIX).await?;
         let mut entities = Vec::new();
-        for row in rows {
-            let Some(rest) = row.key.strip_prefix(ENTITY_PREFIX) else {
+        for key in rows {
+            let Some(rest) = key.strip_prefix(ENTITY_PREFIX) else {
                 continue;
             };
             let Some(id) = rest.strip_suffix(META_SUFFIX) else {
@@ -2320,8 +2374,8 @@ impl EntityStore {
             }
         }
 
-        let end = prefix_scan_end(ENTITY_PREFIX);
-        let max = u32::try_from(BACKFILL_PAGE).ok();
+        let end = KeyPrefix::new(ENTITY_PREFIX).upper_bound();
+        let max = Some(BACKFILL_PAGE);
         let mut cursor = ENTITY_PREFIX.to_string();
         loop {
             let page = {
@@ -2335,21 +2389,17 @@ impl EntityStore {
                     None
                 } else {
                     let rows = g
-                        .gets_bytes(
-                            max,
-                            Direction::Next,
-                            (Some(cursor.clone()), Some(end.clone())),
-                        )
+                        .gets_keys(max, Direction::Next, (Some(cursor.clone()), end.clone()))
                         .await
                         .map_err(EntityError::Store)?;
                     if rows.is_empty() {
                         None
                     } else {
                         let full = rows.len() == BACKFILL_PAGE;
-                        let last = rows.last().map(|row| row.key.clone()).unwrap_or_default();
+                        let last = rows.last().cloned().unwrap_or_default();
                         let tx = g.begin_tx().map_err(EntityError::Store)?;
-                        for row in &rows {
-                            let Some(rest) = row.key.strip_prefix(ENTITY_PREFIX) else {
+                        for key in &rows {
+                            let Some(rest) = key.strip_prefix(ENTITY_PREFIX) else {
                                 continue;
                             };
                             let Some(id) = rest.strip_suffix(META_SUFFIX) else {
@@ -2394,7 +2444,7 @@ impl EntityStore {
             .map_err(EntityError::Store)?
             .is_none()
         {
-            g.set_bytes(&marker, b"")
+            g.put_bytes(&marker, b"")
                 .await
                 .map_err(EntityError::Store)?;
         }
@@ -2433,8 +2483,8 @@ impl EntityStore {
         }
 
         self.backfill_entity_index().await?;
-        let end = prefix_scan_end(ENTITY_INDEX_PREFIX);
-        let max = u32::try_from(BACKFILL_PAGE).ok();
+        let end = KeyPrefix::new(ENTITY_INDEX_PREFIX).upper_bound();
+        let max = Some(BACKFILL_PAGE);
         let mut cursor = ENTITY_INDEX_PREFIX.to_string();
         loop {
             let page = {
@@ -2448,21 +2498,17 @@ impl EntityStore {
                     None
                 } else {
                     let rows = g
-                        .gets_bytes(
-                            max,
-                            Direction::Next,
-                            (Some(cursor.clone()), Some(end.clone())),
-                        )
+                        .gets_keys(max, Direction::Next, (Some(cursor.clone()), end.clone()))
                         .await
                         .map_err(EntityError::Store)?;
                     if rows.is_empty() {
                         None
                     } else {
                         let full = rows.len() == BACKFILL_PAGE;
-                        let last = rows.last().map(|row| row.key.clone()).unwrap_or_default();
+                        let last = rows.last().cloned().unwrap_or_default();
                         let tx = g.begin_tx().map_err(EntityError::Store)?;
-                        for row in &rows {
-                            let Some(id) = row.key.strip_prefix(ENTITY_INDEX_PREFIX) else {
+                        for key in &rows {
+                            let Some(id) = key.strip_prefix(ENTITY_INDEX_PREFIX) else {
                                 continue;
                             };
                             if id.is_empty() || id.contains(':') {
@@ -2507,7 +2553,7 @@ impl EntityStore {
             .map_err(EntityError::Store)?
             .is_none()
         {
-            g.set_bytes(&marker, b"")
+            g.put_bytes(&marker, b"")
                 .await
                 .map_err(EntityError::Store)?;
         }
@@ -2578,16 +2624,19 @@ impl EntityStore {
             }
             None => ENTITY_INDEX_PREFIX.to_string(),
         };
-        let max = u32::try_from(limit.saturating_add(1)).ok();
-        let cursor = (Some(start), Some(prefix_scan_end(ENTITY_INDEX_PREFIX)));
+        let max = Some(limit.saturating_add(1));
+        let cursor = (
+            Some(start),
+            KeyPrefix::new(ENTITY_INDEX_PREFIX).upper_bound(),
+        );
         let markers = g
-            .gets_bytes(max, Direction::Next, cursor)
+            .gets_keys(max, Direction::Next, cursor)
             .await
             .map_err(EntityError::Store)?;
         let mut ids = Vec::with_capacity(markers.len());
         let mut seen = BTreeSet::new();
-        for marker in markers {
-            let Some(id) = marker.key.strip_prefix(ENTITY_INDEX_PREFIX) else {
+        for key in markers {
+            let Some(id) = key.strip_prefix(ENTITY_INDEX_PREFIX) else {
                 continue;
             };
             if id.is_empty() || id.contains(':') || !seen.insert(id.to_string()) {
@@ -2861,11 +2910,17 @@ where
 /// The addition saturates at [`u64::MAX`].
 async fn increment_outbox_pending<S>(store: &S, delta: u64) -> Result<(), EntityError>
 where
-    S: GetSet + ?Sized,
+    S: GetSet + ?Sized + Sync,
 {
     let current = match read_outbox_pending(store).await? {
         Some(count) => count,
-        None => u64::try_from(scan_prefix(store, OUTBOX_PREFIX).await?.len()).unwrap_or(u64::MAX),
+        None => u64::try_from(
+            store
+                .count_prefix(KeyPrefix::new(OUTBOX_PREFIX), usize::MAX)
+                .await
+                .map_err(EntityError::Store)?,
+        )
+        .unwrap_or(u64::MAX),
     };
     write_outbox_pending(store, current.saturating_add(delta)).await
 }
@@ -3103,7 +3158,7 @@ async fn check_unique_values<S>(
     defs: &BTreeMap<String, AttributeDef>,
 ) -> Result<(), EntityError>
 where
-    S: GetSet + ?Sized,
+    S: GetSet + ?Sized + Sync,
 {
     for (key, value) in &entity.attributes {
         if let Some(def) = defs.get(key)
@@ -3128,12 +3183,12 @@ async fn check_unique<S>(
     value: &AttributeValue,
 ) -> Result<(), EntityError>
 where
-    S: GetSet + ?Sized,
+    S: GetSet + ?Sized + Sync,
 {
     let hash = value_hash(value)?;
     let prefix = unique_prefix(key, &hash);
-    for marker in scan_prefix(store, &prefix).await? {
-        let Some(owner) = marker.key.strip_prefix(&prefix) else {
+    for marker in scan_keys_prefix(store, &prefix).await? {
+        let Some(owner) = marker.strip_prefix(&prefix) else {
             continue;
         };
         if owner.is_empty() || owner.contains(':') || owner == entity_id {
@@ -3149,6 +3204,18 @@ where
     Ok(())
 }
 
+/// Returns the JSON bytes of the metadata row of one entity.
+fn meta_bytes(entity: &Entity) -> Result<Vec<u8>, EntityError> {
+    let meta = EntityMeta {
+        id: entity.id.clone(),
+        version: entity.version,
+        schemas: entity.schemas.clone(),
+        created_at: entity.created_at,
+        updated_at: entity.updated_at,
+    };
+    serde_json::to_vec(&meta).map_err(|e| EntityError::Internal(e.to_string()))
+}
+
 /// Writes the metadata row of one entity.
 ///
 /// The call changes no attribute row and no index row.
@@ -3156,14 +3223,7 @@ async fn put_meta_row<S>(store: &S, entity: &Entity) -> Result<(), EntityError>
 where
     S: GetSet + ?Sized,
 {
-    let meta = EntityMeta {
-        id: entity.id.clone(),
-        version: entity.version,
-        schemas: entity.schemas.clone(),
-        created_at: entity.created_at,
-        updated_at: entity.updated_at,
-    };
-    let meta_bytes = serde_json::to_vec(&meta).map_err(|e| EntityError::Internal(e.to_string()))?;
+    let meta_bytes = meta_bytes(entity)?;
     store
         .set_bytes(&meta_key(&entity.id), &meta_bytes)
         .await
@@ -3171,8 +3231,10 @@ where
         .map_err(EntityError::Store)
 }
 
-/// Writes the metadata, attribute, and index rows of one entity.
-async fn put_entity_rows<S>(
+/// Writes the attribute and index rows of one entity.
+///
+/// The caller writes the metadata row.
+async fn put_entity_rows_except_meta<S>(
     store: &S,
     entity: &Entity,
     merged: &MergedSchema,
@@ -3180,18 +3242,6 @@ async fn put_entity_rows<S>(
 where
     S: GetSet + ?Sized,
 {
-    let meta = EntityMeta {
-        id: entity.id.clone(),
-        version: entity.version,
-        schemas: entity.schemas.clone(),
-        created_at: entity.created_at,
-        updated_at: entity.updated_at,
-    };
-    let meta_bytes = serde_json::to_vec(&meta).map_err(|e| EntityError::Internal(e.to_string()))?;
-    store
-        .set_bytes(&meta_key(&entity.id), &meta_bytes)
-        .await
-        .map_err(EntityError::Store)?;
     store
         .set_bytes(&entity_index_key(&entity.id), b"")
         .await
@@ -3358,21 +3408,32 @@ where
 /// A marker from `target_id` itself does not count.
 async fn count_incoming_refs<S>(store: &S, target_id: &str) -> Result<usize, EntityError>
 where
-    S: GetSet + ?Sized,
+    S: GetSet + ?Sized + Sync,
 {
     let prefix = ref_target_prefix(target_id);
     let mut sources = BTreeSet::new();
-    for row in scan_prefix(store, &prefix).await? {
-        let Some(rest) = row.key.strip_prefix(&prefix) else {
-            continue;
-        };
-        let Some((source, attribute)) = rest.split_once(':') else {
-            continue;
-        };
-        if source.is_empty() || attribute.is_empty() || source == target_id {
-            continue;
+    let mut after = None;
+    loop {
+        let page = store
+            .scan_keys(KeyPrefix::new(&prefix), after, REF_SCAN_PAGE)
+            .await
+            .map_err(EntityError::Store)?;
+        for key in &page.items {
+            let Some(rest) = key.strip_prefix(&prefix) else {
+                continue;
+            };
+            let Some((source, attribute)) = rest.split_once(':') else {
+                continue;
+            };
+            if source.is_empty() || attribute.is_empty() || source == target_id {
+                continue;
+            }
+            sources.insert(source.to_string());
         }
-        sources.insert(source.to_string());
+        match page.next {
+            Some(next) => after = Some(next),
+            None => break,
+        }
     }
     Ok(sources.len())
 }
@@ -3504,9 +3565,50 @@ where
     S: GetSet + ?Sized,
 {
     debug_assert!(prefix.ends_with(':'));
-    let cursor = (Some(prefix.to_string()), Some(prefix_scan_end(prefix)));
+    let cursor = (
+        Some(prefix.to_string()),
+        KeyPrefix::new(prefix).upper_bound(),
+    );
     store
         .gets_bytes(None, Direction::Next, cursor)
+        .await
+        .map_err(EntityError::Store)
+}
+
+/// Scans a key range that ends at the `prefix:` family bound and reads keys
+/// only.
+async fn scan_keys_prefix<S>(store: &S, prefix: &str) -> Result<Vec<String>, EntityError>
+where
+    S: GetSet + ?Sized + Sync,
+{
+    debug_assert!(prefix.ends_with(':'));
+    let cursor = (
+        Some(prefix.to_string()),
+        KeyPrefix::new(prefix).upper_bound(),
+    );
+    store
+        .gets_keys(None, Direction::Next, cursor)
+        .await
+        .map_err(EntityError::Store)
+}
+
+/// Scans at most `limit` rows of a key range and reads keys only.
+async fn scan_keys_prefix_bounded<S>(
+    store: &S,
+    prefix: &str,
+    limit: usize,
+) -> Result<Vec<String>, EntityError>
+where
+    S: GetSet + ?Sized + Sync,
+{
+    debug_assert!(prefix.ends_with(':'));
+    let max = Some(limit);
+    let cursor = (
+        Some(prefix.to_string()),
+        KeyPrefix::new(prefix).upper_bound(),
+    );
+    store
+        .gets_keys(max, Direction::Next, cursor)
         .await
         .map_err(EntityError::Store)
 }
@@ -3521,21 +3623,15 @@ where
     S: GetSet + ?Sized,
 {
     debug_assert!(prefix.ends_with(':'));
-    let max = u32::try_from(limit).ok();
-    let cursor = (Some(prefix.to_string()), Some(prefix_scan_end(prefix)));
+    let max = Some(limit);
+    let cursor = (
+        Some(prefix.to_string()),
+        KeyPrefix::new(prefix).upper_bound(),
+    );
     store
         .gets_bytes(max, Direction::Next, cursor)
         .await
         .map_err(EntityError::Store)
-}
-
-/// The exclusive upper bound for a `prefix:` range scan (`:` to `;`).
-fn prefix_scan_end(prefix: &str) -> String {
-    debug_assert!(prefix.ends_with(':'));
-    let mut end = prefix.to_string();
-    end.pop();
-    end.push(';');
-    end
 }
 
 /// The key that holds the metadata of an entity.
@@ -3629,34 +3725,34 @@ fn time_key_backfill_marker() -> String {
 }
 
 /// Returns the sorted attribute keys of a set of time key markers.
-fn time_key_marker_keys(rows: Vec<KeyValue>) -> Vec<String> {
-    let mut keys = BTreeSet::new();
-    for row in rows {
-        let Some(key) = row.key.strip_prefix(TIME_KEY_INDEX_PREFIX) else {
+fn time_key_marker_keys(keys: Vec<String>) -> Vec<String> {
+    let mut out = BTreeSet::new();
+    for key in keys {
+        let Some(key) = key.strip_prefix(TIME_KEY_INDEX_PREFIX) else {
             continue;
         };
         if !key.is_empty() {
-            keys.insert(key.to_string());
+            out.insert(key.to_string());
         }
     }
-    keys.into_iter().collect()
+    out.into_iter().collect()
 }
 
 /// Returns the sorted attribute keys of a set of time rows.
-fn time_row_keys(rows: Vec<KeyValue>) -> Vec<String> {
-    let mut keys = BTreeSet::new();
-    for row in rows {
-        let Some(rest) = row.key.strip_prefix(TIME_INDEX_PREFIX) else {
+fn time_row_keys(keys: Vec<String>) -> Vec<String> {
+    let mut out = BTreeSet::new();
+    for key in keys {
+        let Some(rest) = key.strip_prefix(TIME_INDEX_PREFIX) else {
             continue;
         };
         let Some((key, _)) = rest.split_once(':') else {
             continue;
         };
         if !key.is_empty() {
-            keys.insert(key.to_string());
+            out.insert(key.to_string());
         }
     }
-    keys.into_iter().collect()
+    out.into_iter().collect()
 }
 
 /// The marker key for one fired timer value.
@@ -4062,6 +4158,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn two_updates_from_one_version_commit_one() {
+        let (store, registry, raw) = new_store().await;
+        registry
+            .publish(schema(
+                "person",
+                &[],
+                vec![attr("age", AttributeType::Integer)],
+            ))
+            .await
+            .unwrap();
+        store
+            .create(draft("e1", &["person"], vec![("age", i(30))]), &ctx())
+            .await
+            .unwrap();
+
+        let first_patch = patch(vec![("age", Some(i(31)))]);
+        let second_patch = patch(vec![("age", Some(i(32)))]);
+        let first_tx = raw.begin_tx().unwrap();
+        let second_tx = raw.begin_tx().unwrap();
+        let first = store
+            .prepare_update(&first_tx, "e1", 1, &first_patch)
+            .await
+            .unwrap();
+        let second = store
+            .prepare_update(&second_tx, "e1", 1, &second_patch)
+            .await
+            .unwrap();
+        store
+            .stage_update(&first_tx, &first, &ctx(), true)
+            .await
+            .unwrap();
+        store
+            .stage_update(&second_tx, &second, &ctx(), true)
+            .await
+            .unwrap();
+
+        first_tx.commit().await.unwrap();
+        let error = second_tx.commit().await.unwrap_err();
+
+        assert!(matches!(error, StoreError::TxConflict { .. }));
+        let entity = store.get("e1").await.unwrap().unwrap();
+        assert_eq!(entity.version, 2);
+        assert_eq!(entity.attributes["age"], i(31));
+    }
+
+    #[tokio::test]
     async fn unknown_schema_fails() {
         let (store, _registry, raw) = new_store().await;
 
@@ -4086,6 +4228,45 @@ mod tests {
         let result = store.create(draft("e1", &["person"], vec![]), &ctx()).await;
 
         assert!(matches!(result, Err(EntityError::AlreadyExists(id)) if id == "e1"));
+    }
+
+    #[tokio::test]
+    async fn a_duplicate_create_writes_no_attribute_row() {
+        let (store, registry, raw) = new_store().await;
+        registry
+            .publish(schema(
+                "person",
+                &[],
+                vec![attr("name", AttributeType::String)],
+            ))
+            .await
+            .unwrap();
+        store
+            .create(draft("e1", &["person"], vec![("name", s("Alice"))]), &ctx())
+            .await
+            .unwrap();
+
+        let result = store
+            .create(draft("e1", &["person"], vec![("name", s("Bob"))]), &ctx())
+            .await;
+
+        assert!(matches!(result, Err(EntityError::AlreadyExists(id)) if id == "e1"));
+        let stored = raw
+            .get_bytes(&attr_key("e1", "name"))
+            .await
+            .unwrap()
+            .expect("the first attribute row must stay");
+        assert_eq!(
+            serde_json::from_slice::<AttributeValue>(&stored).unwrap(),
+            s("Alice")
+        );
+        let mut keys: Vec<String> = all_keys(&raw)
+            .await
+            .into_iter()
+            .filter(|key| key.starts_with(&attr_prefix("e1")))
+            .collect();
+        keys.sort();
+        assert_eq!(keys, vec![attr_key("e1", "name")]);
     }
 
     #[tokio::test]
@@ -6827,6 +7008,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn time_keys_stop_at_the_family_bound() {
+        let (store, registry, raw) = new_store().await;
+        registry.publish(schema("task", &[], vec![])).await.unwrap();
+        raw.set_bytes(&time_key_index_key("alpha"), b"")
+            .await
+            .unwrap();
+        raw.set_bytes("idx:time-key;outside", b"").await.unwrap();
+
+        let found = store.time_keys().await.unwrap();
+
+        assert_eq!(found, vec!["alpha".to_string()]);
+    }
+
+    #[tokio::test]
     async fn list_due_returns_due_entities_in_time_order_with_a_limit() {
         let (store, registry, raw) = new_store().await;
         registry
@@ -8407,6 +8602,22 @@ mod tests {
         assert!(message.contains('2'), "{message}");
         assert!(!message.contains("o1"), "{message}");
         assert!(!message.contains("o2"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn count_incoming_refs_covers_every_page_of_sources() {
+        let (store, _, _) = reference_store(true).await;
+        store.create(customer("c1"), &ctx()).await.unwrap();
+        for id in ["o1", "o2", "o3"] {
+            store.create(order(id, "c1"), &ctx()).await.unwrap();
+        }
+
+        let error = store.delete("c1", 1, false, &ctx()).await.unwrap_err();
+
+        assert!(
+            matches!(error, EntityError::Referenced { count: 3, .. }),
+            "unexpected error: {error}"
+        );
     }
 
     #[tokio::test]

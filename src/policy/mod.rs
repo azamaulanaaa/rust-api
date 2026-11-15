@@ -277,6 +277,7 @@ impl PolicyEngine {
     pub async fn init_with_store<S>(store: S) -> Result<Self, PolicyError>
     where
         S: oxkv::Store + Send + Sync + 'static,
+        S::Transaction: oxkv::TxCas,
     {
         let adapter = adapter::OxkvAdapter::new(store);
         let model = DefaultModel::from_str(RBAC_MODEL).await?;
@@ -778,7 +779,7 @@ mod tests {
         assert!(fenced.to_string().contains("epoch 7 superseded"));
 
         for other in [
-            oxkv::StoreError::Storage("bucket gone".into()),
+            oxkv::StoreError::storage("bucket gone"),
             oxkv::StoreError::CasConflict("two writers".into()),
             oxkv::StoreError::Other("fenced-ish wording that must not count".into()),
         ] {

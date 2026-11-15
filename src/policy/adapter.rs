@@ -14,7 +14,7 @@ use casbin::{
     Adapter, Filter, Model,
     error::{AdapterError, Error as CasbinError},
 };
-use oxkv::{Direction, GetSet, Store, StoreView, Transaction as _, Validator};
+use oxkv::{Direction, GetSet, Store, StoreError, StoreView, Transaction as _, TxCas, Validator};
 
 /// Key prefix separator. The keys have the form `{sec}:{ptype}:{rule-hash}`.
 const SEP: char = ':';
@@ -140,7 +140,10 @@ pub struct OxkvAdapter<S: Store> {
     store: S,
 }
 
-impl<S: Store> OxkvAdapter<S> {
+impl<S: Store + Sync> OxkvAdapter<S>
+where
+    S::Transaction: TxCas,
+{
     /// Wraps an existing store instance.
     pub fn new(store: S) -> Self {
         Self { store }
@@ -171,11 +174,8 @@ impl<S: Store> OxkvAdapter<S> {
     async fn clear_all(&mut self) -> Result<(), oxkv::StoreError> {
         let keys: Vec<String> = self
             .store
-            .gets_bytes(None, Direction::Next, (None, None))
-            .await?
-            .into_iter()
-            .map(|kv| kv.key)
-            .collect();
+            .gets_keys(None, Direction::Next, (None, None))
+            .await?;
         let tx = self.store.begin_tx()?;
         for key in &keys {
             tx.delete(key).await?;
@@ -199,6 +199,7 @@ impl<S: Store> OxkvAdapter<S> {
 impl<S> Adapter for OxkvAdapter<S>
 where
     S: Store + Send + Sync + 'static,
+    S::Transaction: TxCas,
 {
     async fn load_policy(&mut self, m: &mut dyn Model) -> casbin::Result<()> {
         for (sec, ptype, rule) in self.load_all().await.map_err(store_err)? {
@@ -301,14 +302,13 @@ where
 
         let tx = self.store.begin_tx().map_err(store_err)?;
         for (key, value) in &encoded {
-            if tx.has(key).await.map_err(store_err)? {
-                tx.rollback().await.map_err(store_err)?;
-                return Ok(false);
-            }
-            tx.set_bytes(key, value).await.map_err(store_err)?;
+            tx.set_if_absent(key, value).await.map_err(store_err)?;
         }
-        tx.commit().await.map_err(store_err)?;
-        Ok(true)
+        match tx.commit().await {
+            Ok(()) => Ok(true),
+            Err(StoreError::TxConflict { .. }) => Ok(false),
+            Err(error) => Err(store_err(error)),
+        }
     }
 
     async fn remove_policy(
@@ -330,7 +330,7 @@ where
 
         let tx = self.store.begin_tx().map_err(store_err)?;
         for key in &keys {
-            if tx.has(key).await.map_err(store_err)? {
+            if oxkv::GetSet::has(&tx, key).await.map_err(store_err)? {
                 tx.delete(key).await.map_err(store_err)?;
             } else {
                 tx.rollback().await.map_err(store_err)?;
@@ -414,9 +414,12 @@ mod tests {
         ) -> Result<Option<Vec<u8>>, oxkv::StoreError> {
             self.0.set_bytes(key, value).await
         }
+        async fn put_bytes(&self, key: &str, value: &[u8]) -> Result<(), oxkv::StoreError> {
+            oxkv::GetSet::put_bytes(&self.0, key, value).await
+        }
         async fn gets_bytes(
             &self,
-            limit: Option<u32>,
+            limit: Option<usize>,
             direction: oxkv::Direction,
             cursor: (Option<String>, Option<String>),
         ) -> Result<Vec<oxkv::KeyValue>, oxkv::StoreError> {
@@ -485,7 +488,7 @@ mod tests {
         }
         async fn gets_bytes(
             &self,
-            _limit: Option<u32>,
+            _limit: Option<usize>,
             _direction: oxkv::Direction,
             _cursor: (Option<String>, Option<String>),
         ) -> Result<Vec<oxkv::KeyValue>, oxkv::StoreError> {
@@ -499,6 +502,24 @@ mod tests {
             Err(oxkv::StoreError::Fenced("epoch 7 superseded".into()))
         }
         async fn rollback(self) -> Result<(), oxkv::StoreError> {
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl oxkv::TxCas for FencedTx {
+        async fn set_if_absent(&self, _key: &str, _value: &[u8]) -> Result<(), oxkv::StoreError> {
+            Ok(())
+        }
+        async fn compare_and_set(
+            &self,
+            _key: &str,
+            _expected: Option<&[u8]>,
+            _new: &[u8],
+        ) -> Result<(), oxkv::StoreError> {
+            Ok(())
+        }
+        async fn delete_if(&self, _key: &str, _expected: &[u8]) -> Result<(), oxkv::StoreError> {
             Ok(())
         }
     }

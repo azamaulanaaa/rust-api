@@ -41,7 +41,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use oxkv::{GetSet as _, Store as _, Transaction as _};
+use oxkv::{
+    GetSet as _, KeyPrefix, ScanExt as _, Store as _, StoreError, Transaction as _, TxCas as _,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::{debug, instrument};
@@ -65,6 +67,8 @@ const FAILED_PREFIX: &str = "job-status:failed:";
 const BACKFILL_KEY: &str = "job-meta:backfilled";
 /// Time that a dead, succeeded, or failed row stays in the store: 7 days.
 const TERMINAL_RETENTION_SECS: i64 = 7 * 24 * 60 * 60;
+/// Number of marker keys that one queue scan reads.
+const QUEUE_SCAN_PAGE: usize = 512;
 
 /// Persisted envelope for one job.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -138,15 +142,6 @@ impl DurableQueue {
         format!("idemp:{}", key)
     }
 
-    /// Returns the exclusive upper bound of a `prefix:` range scan.
-    fn prefix_scan_end(prefix: &str) -> String {
-        debug_assert!(prefix.ends_with(':'));
-        let mut end = prefix.to_string();
-        end.pop();
-        end.push(';');
-        end
-    }
-
     /// Returns the marker prefix for a status that has one.
     fn status_prefix(status: &JobStatus) -> Option<&'static str> {
         match status {
@@ -166,22 +161,26 @@ impl DurableQueue {
     /// Lists the job ids under one marker prefix.
     async fn ids_with_prefix(&self, prefix: &str) -> Result<Vec<JobId>, QueueError> {
         let g = self.store.read().await;
-        let rows = g
-            .gets_bytes(
-                None,
-                oxkv::Direction::Next,
-                (
-                    Some(prefix.to_string()),
-                    Some(Self::prefix_scan_end(prefix)),
-                ),
-            )
-            .await
-            .map_err(|e| QueueError::Store(e.to_string()))?;
-        Ok(rows
-            .iter()
-            .filter_map(|kv| kv.key.strip_prefix(prefix))
-            .filter_map(|id| id.parse::<Uuid>().ok())
-            .collect())
+        let mut ids = Vec::new();
+        let mut after = None;
+        loop {
+            let page = g
+                .scan_keys(KeyPrefix::new(prefix), after, QUEUE_SCAN_PAGE)
+                .await
+                .map_err(|e| QueueError::Store(e.to_string()))?;
+            for key in &page.items {
+                if let Some(id) = key.strip_prefix(prefix)
+                    && let Ok(id) = id.parse::<Uuid>()
+                {
+                    ids.push(id);
+                }
+            }
+            match page.next {
+                Some(next) => after = Some(next),
+                None => break,
+            }
+        }
+        Ok(ids)
     }
 
     /// Writes the status markers for an old store one time.
@@ -214,7 +213,7 @@ impl DurableQueue {
                 oxkv::Direction::Next,
                 (
                     Some(JOB_PREFIX.to_string()),
-                    Some(Self::prefix_scan_end(JOB_PREFIX)),
+                    KeyPrefix::new(JOB_PREFIX).upper_bound(),
                 ),
             )
             .await
@@ -430,24 +429,10 @@ impl super::JobQueue for DurableQueue {
         }
         let mut job = job;
         super::inject_trace_context(&mut job.headers);
-        if let Some(key) = &job.idempotency_key {
-            let ik = Self::idempotency_key(key);
-            let g = self.store.read().await;
-            if let Some(bytes) = g
-                .get_bytes(&ik)
-                .await
-                .map_err(|e| QueueError::Store(e.to_string()))?
-            {
-                drop(g);
-                let id_str =
-                    String::from_utf8(bytes).map_err(|e| QueueError::Store(e.to_string()))?;
-                if let Ok(id) = id_str.parse::<Uuid>() {
-                    return Ok(id);
-                }
-            } else {
-                drop(g);
-            }
-        }
+        let idempotency_key = job
+            .idempotency_key
+            .as_ref()
+            .map(|key| Self::idempotency_key(key));
         let id = job.id;
         let sj = StoredJob {
             job: job.clone(),
@@ -462,14 +447,34 @@ impl super::JobQueue for DurableQueue {
         tx.set_bytes(&Self::queued_key(id), b"")
             .await
             .map_err(|e| QueueError::Store(e.to_string()))?;
-        if let Some(key) = &job.idempotency_key {
-            tx.set_bytes(&Self::idempotency_key(key), id.to_string().as_bytes())
+        if let Some(key) = &idempotency_key {
+            tx.set_if_absent(key, id.to_string().as_bytes())
                 .await
                 .map_err(|e| QueueError::Store(e.to_string()))?;
         }
-        tx.commit()
-            .await
-            .map_err(|e| QueueError::Store(e.to_string()))?;
+        match tx.commit().await {
+            Ok(()) => {}
+            Err(StoreError::TxConflict {
+                key,
+                current: Some(current),
+            }) if Some(&key) == idempotency_key.as_ref() => {
+                drop(g);
+                let id_str =
+                    String::from_utf8(current).map_err(|e| QueueError::Store(e.to_string()))?;
+                let existing = id_str
+                    .parse::<Uuid>()
+                    .map_err(|e| QueueError::Store(e.to_string()))?;
+                return Ok(existing);
+            }
+            Err(StoreError::TxConflict { key, current: None })
+                if Some(&key) == idempotency_key.as_ref() =>
+            {
+                return Err(QueueError::Store(
+                    "idempotency key conflict has no stored id".to_string(),
+                ));
+            }
+            Err(error) => return Err(QueueError::Store(error.to_string())),
+        }
         drop(g);
         self.metrics.record_enqueued();
         // Best-effort depth for telemetry. Count the queued markers only.
@@ -895,6 +900,98 @@ mod tests {
         j2.idempotency_key = Some("key-1".to_string());
         let id2 = q.enqueue(j2).await.unwrap();
         assert_eq!(id1, id2);
+    }
+
+    #[tokio::test]
+    async fn a_duplicate_idempotent_enqueue_writes_one_job_and_one_marker() {
+        let q = queue().await;
+        let mut first = job("work");
+        first.idempotency_key = Some("key-2".to_string());
+        let first_id = first.id;
+        let got_first = q.enqueue(first).await.unwrap();
+        let mut second = job("work");
+        second.id = Uuid::now_v7();
+        second.idempotency_key = Some("key-2".to_string());
+        let got_second = q.enqueue(second).await.unwrap();
+
+        assert_eq!(got_first, first_id);
+        assert_eq!(got_second, first_id, "the stored id must be returned");
+        let g = q.store.read().await;
+        let job_rows = g
+            .count_prefix(KeyPrefix::new(JOB_PREFIX), usize::MAX)
+            .await
+            .unwrap();
+        let queued_rows = g
+            .count_prefix(KeyPrefix::new(QUEUED_PREFIX), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(job_rows, 1, "one job row must exist");
+        assert_eq!(queued_rows, 1, "one queued marker must exist");
+    }
+
+    #[tokio::test]
+    async fn ids_with_prefix_reads_every_page() {
+        let q = queue().await;
+        let mut expected = Vec::new();
+        {
+            let g = q.store.write().await;
+            let tx = g.begin_tx().unwrap();
+            for _ in 0..(QUEUE_SCAN_PAGE + 1) {
+                let id = Uuid::now_v7();
+                expected.push(id);
+                tx.set_bytes(&DurableQueue::queued_key(id), b"")
+                    .await
+                    .unwrap();
+            }
+            tx.commit().await.unwrap();
+        }
+
+        let found = q.ids_with_prefix(QUEUED_PREFIX).await.unwrap();
+
+        assert_eq!(found.len(), expected.len());
+        expected.sort_unstable();
+        let mut found = found;
+        found.sort_unstable();
+        assert_eq!(found, expected);
+    }
+
+    #[tokio::test]
+    async fn reserve_reads_every_page_and_keeps_priority_order() {
+        let q = queue().await;
+        let mut ids: Vec<Uuid> = (0..=QUEUE_SCAN_PAGE).map(|_| Uuid::now_v7()).collect();
+        ids.sort_unstable();
+        let high_id = *ids.last().expect("the test needs one job");
+        {
+            let g = q.store.write().await;
+            let tx = g.begin_tx().unwrap();
+            for id in &ids {
+                let mut row = job("work");
+                row.id = *id;
+                if *id == high_id {
+                    row.priority = 100;
+                }
+                let stored = StoredJob {
+                    job: row,
+                    status: JobStatus::Queued,
+                };
+                let value = serde_json::to_vec(&stored).unwrap();
+                tx.set_bytes(&DurableQueue::job_key(*id), &value)
+                    .await
+                    .unwrap();
+                tx.set_bytes(&DurableQueue::queued_key(*id), b"")
+                    .await
+                    .unwrap();
+            }
+            tx.commit().await.unwrap();
+        }
+
+        let leased = q.reserve("w1", 1, Duration::from_secs(30)).await.unwrap();
+
+        assert_eq!(leased.len(), 1);
+        assert_eq!(
+            leased[0].job.id, high_id,
+            "the highest priority job must win even when its key is on the last page"
+        );
     }
 
     async fn put_job(q: &DurableQueue, job: Job, status: JobStatus) {
