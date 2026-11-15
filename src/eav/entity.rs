@@ -23,7 +23,10 @@
 //!   is indexed. The marker is permanent. A stale marker only allows an
 //!   empty result.
 //! - `idx:unique:{key}:{hash}:{entity_id}` is a unique value marker.
-//! - `idx:time:{key}:{encoded_ts}:{entity_id}` is an empty time marker.
+//! - `idx:time:{key}:{encoded_ts}:{entity_id}` is a time marker.
+//!   The value holds the causation id and depth of the write that set the
+//!   timestamp.
+//!   An old row holds an empty value and reads as a write with no cause.
 //!   A timer retire removes the row when the timer fires. The index then
 //!   holds only values that have not fired.
 //! - `idx:time-key:{key}` is an empty marker for an attribute key with a
@@ -760,7 +763,7 @@ impl EntityStore {
             .set_if_absent(&meta_key(&entity.id), &meta_bytes(entity)?)
             .await
             .map_err(EntityError::Store)?;
-        put_entity_rows_except_meta(store, entity, &prepared.merged).await?;
+        put_entity_rows_except_meta(store, entity, &prepared.merged, Some(ctx)).await?;
         Ok(outbox)
     }
 
@@ -879,7 +882,7 @@ impl EntityStore {
                 .await
                 .map_err(EntityError::Store)?;
         }
-        put_entity_rows_except_meta(store, after, &prepared.merged).await?;
+        put_entity_rows_except_meta(store, after, &prepared.merged, Some(ctx)).await?;
         Ok(outbox)
     }
 
@@ -1920,7 +1923,8 @@ impl EntityStore {
                         .map_err(EntityError::Store)?;
                 }
                 put_meta_row(&tx, &write.entity).await?;
-                put_entity_rows_except_meta(&tx, &write.entity, &write.after_merged).await?;
+                put_entity_rows_except_meta(&tx, &write.entity, &write.after_merged, Some(ctx))
+                    .await?;
                 if let Some((key, bytes)) = &write.outbox {
                     tx.set_bytes(key, bytes).await.map_err(EntityError::Store)?;
                 }
@@ -2262,6 +2266,12 @@ impl EntityStore {
     /// The event has kind [`EntityEventKind::Timer`].
     /// It has an empty `changed` list and a snapshot of the current entity.
     /// The event id is stable for one entity, key, and due value.
+    /// The call reads the time row for the causation of the write that set
+    /// the timestamp.
+    /// The timer event carries that causation id.
+    /// Its depth is one more than the stored depth.
+    /// A time row with no cause gives a timer event with no cause and depth
+    /// 0.
     /// The call appends through the change feed and writes no outbox row.
     pub async fn emit_timer(
         &self,
@@ -2278,6 +2288,23 @@ impl EntityStore {
         validate_name("attribute name", key)?;
         let effective = self.resolve_refs(&entity.schemas).await?;
         let event_id = format!("timer-{}-{key}-{}", entity.id, encode_timestamp(due_at));
+        let causation = {
+            let g = self.store.read().await;
+            let bytes = g
+                .get_bytes(&time_index_key(key, due_at, &entity.id))
+                .await
+                .map_err(EntityError::Store)?;
+            decode_time_marker(bytes.as_deref())
+        };
+        let (causation_id, causation_depth) =
+            if causation.causation_id.is_none() && causation.causation_depth == 0 {
+                (None, 0)
+            } else {
+                (
+                    causation.causation_id,
+                    causation.causation_depth.saturating_add(1),
+                )
+            };
         let snapshot = Some(
             entity
                 .attributes
@@ -2293,8 +2320,8 @@ impl EntityStore {
             schemas: event_schema_ids(&effective),
             changed: Vec::new(),
             actor: "system:timer".to_string(),
-            causation_id: None,
-            causation_depth: 0,
+            causation_id,
+            causation_depth,
             correlation_id: event_id,
             snapshot,
             occurred_at: now,
@@ -3314,10 +3341,13 @@ where
 /// Writes the attribute and index rows of one entity.
 ///
 /// The caller writes the metadata row.
+/// A time row holds the causation of the write.
+/// A write with no cause stores an empty causation value.
 async fn put_entity_rows_except_meta<S>(
     store: &S,
     entity: &Entity,
     merged: &MergedSchema,
+    causation: Option<&WriteContext>,
 ) -> Result<(), EntityError>
 where
     S: GetSet + ?Sized,
@@ -3350,8 +3380,9 @@ where
         if is_time_attribute(def)
             && let AttributeValue::Timestamp(timestamp) = value
         {
+            let marker = time_marker_bytes(causation)?;
             store
-                .set_bytes(&time_index_key(key, *timestamp, &entity.id), b"")
+                .set_bytes(&time_index_key(key, *timestamp, &entity.id), &marker)
                 .await
                 .map_err(EntityError::Store)?;
             store
@@ -3794,6 +3825,44 @@ fn time_index_key(key: &str, timestamp: i64, entity_id: &str) -> String {
     )
 }
 
+/// The causation that one entity write stored in a time row.
+///
+/// An old time row holds an empty value.
+/// The default value therefore keeps the row readable.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct TimeMarkerCausation {
+    /// The causation id of the write that set the timestamp.
+    #[serde(default)]
+    causation_id: Option<String>,
+    /// The causation depth of the write that set the timestamp.
+    #[serde(default)]
+    causation_depth: u32,
+}
+
+/// Returns the value of one time row for `causation`.
+///
+/// A write without a cause stores an empty JSON object.
+fn time_marker_bytes(causation: Option<&WriteContext>) -> Result<Vec<u8>, EntityError> {
+    let marker = match causation {
+        Some(ctx) => TimeMarkerCausation {
+            causation_id: ctx.causation_id.clone(),
+            causation_depth: ctx.causation_depth,
+        },
+        None => TimeMarkerCausation::default(),
+    };
+    serde_json::to_vec(&marker).map_err(|e| EntityError::Internal(e.to_string()))
+}
+
+/// Reads the causation of one time row.
+///
+/// An old row with an empty value gives the default value.
+/// A row that does not decode also gives the default value.
+fn decode_time_marker(bytes: Option<&[u8]>) -> TimeMarkerCausation {
+    bytes
+        .and_then(|bytes| serde_json::from_slice(bytes).ok())
+        .unwrap_or_default()
+}
+
 /// The marker key for one attribute key with a time row.
 fn time_key_index_key(key: &str) -> String {
     format!("{TIME_KEY_INDEX_PREFIX}{key}")
@@ -4024,6 +4093,30 @@ mod tests {
             .await
             .unwrap();
         (store, raw)
+    }
+
+    /// Builds a store with a change feed and one `task` schema.
+    ///
+    /// The schema has a timestamp `due` attribute.
+    async fn timer_feed_store() -> (EntityStore, OxKvStore) {
+        let (store, registry, raw) = new_store().await;
+        registry
+            .publish(schema(
+                "task",
+                &[],
+                vec![full_attr(
+                    "due",
+                    AttributeType::Timestamp,
+                    false,
+                    true,
+                    false,
+                    None,
+                )],
+            ))
+            .await
+            .unwrap();
+        let feed = Arc::new(RecordingFeed::new());
+        (store.with_change_sink(feed), raw)
     }
 
     /// Creates one `task` entity with a `due` value.
@@ -7310,6 +7403,101 @@ mod tests {
 
         let again = store.emit_timer(&entity, "due", 100, 1_234).await.unwrap();
         assert_eq!(again.event_id, event.event_id);
+    }
+
+    #[tokio::test]
+    async fn emit_timer_carries_the_causation_of_the_update() {
+        let (store, _raw) = timer_feed_store().await;
+        let created = store
+            .create(draft("e1", &["task"], vec![("due", t(100))]), &ctx())
+            .await
+            .unwrap()
+            .after
+            .unwrap();
+        let changed = store
+            .update(
+                "e1",
+                created.version,
+                patch(vec![("due", Some(t(200)))]),
+                &WriteContext::new("tester").with_causation("evt-parent", 4),
+            )
+            .await
+            .unwrap();
+        let entity = changed.after.unwrap();
+
+        let event = store.emit_timer(&entity, "due", 200, 1_234).await.unwrap();
+
+        assert_eq!(event.causation_id.as_deref(), Some("evt-parent"));
+        assert_eq!(event.causation_depth, 5);
+    }
+
+    #[tokio::test]
+    async fn emit_timer_reads_an_old_empty_time_marker_with_the_default_causation() {
+        let (store, raw) = timer_feed_store().await;
+        let entity = store
+            .create(draft("e1", &["task"], vec![("due", t(100))]), &ctx())
+            .await
+            .unwrap()
+            .after
+            .unwrap();
+        raw.set_bytes(&time_index_key("due", 100, "e1"), b"")
+            .await
+            .unwrap();
+
+        let event = store.emit_timer(&entity, "due", 100, 1_234).await.unwrap();
+
+        assert_eq!(event.causation_id, None);
+        assert_eq!(event.causation_depth, 0);
+    }
+
+    #[tokio::test]
+    async fn a_timer_chain_increases_the_causation_depth() {
+        let (store, _raw) = timer_feed_store().await;
+        let entity = store
+            .create(draft("e1", &["task"], vec![("due", t(100))]), &ctx())
+            .await
+            .unwrap()
+            .after
+            .unwrap();
+        let first = store.emit_timer(&entity, "due", 100, 1_234).await.unwrap();
+
+        let changed = store
+            .update(
+                "e1",
+                entity.version,
+                patch(vec![("due", Some(t(200)))]),
+                &WriteContext::new("tester")
+                    .with_causation(first.event_id.clone(), first.causation_depth),
+            )
+            .await
+            .unwrap();
+        let entity = changed.after.unwrap();
+        let second = store.emit_timer(&entity, "due", 200, 1_235).await.unwrap();
+
+        let changed = store
+            .update(
+                "e1",
+                entity.version,
+                patch(vec![("due", Some(t(300)))]),
+                &WriteContext::new("tester")
+                    .with_causation(second.event_id.clone(), second.causation_depth),
+            )
+            .await
+            .unwrap();
+        let entity = changed.after.unwrap();
+        let third = store.emit_timer(&entity, "due", 300, 1_236).await.unwrap();
+
+        assert_eq!(first.causation_depth, 0);
+        assert_eq!(second.causation_depth, 1);
+        assert_eq!(third.causation_depth, 2);
+        assert_eq!(
+            second.causation_id.as_deref(),
+            Some(first.event_id.as_str())
+        );
+        assert_eq!(
+            third.causation_id.as_deref(),
+            Some(second.event_id.as_str())
+        );
     }
 
     #[tokio::test]
