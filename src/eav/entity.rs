@@ -7469,6 +7469,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn two_concurrent_creates_with_one_value_hash_both_commit() {
+        let (store, registry, raw) = new_store().await;
+        registry
+            .publish(schema(
+                "person",
+                &[],
+                vec![full_attr(
+                    "email",
+                    AttributeType::String,
+                    false,
+                    false,
+                    true,
+                    None,
+                )],
+            ))
+            .await
+            .unwrap();
+        let other = EntityStore::new(raw.clone(), registry.clone());
+        let first = s("a@example.com");
+        let second = s("b@example.com");
+        let forced = "0".repeat(64);
+        clear_forced_value_hashes();
+        force_equal_value_hash(&[&first, &second], &forced);
+        let write = ctx();
+
+        let (left, right) = tokio::join!(
+            store.create(
+                draft("e1", &["person"], vec![("email", first.clone())]),
+                &write
+            ),
+            other.create(
+                draft("e2", &["person"], vec![("email", second.clone())]),
+                &write
+            ),
+        );
+
+        clear_forced_value_hashes();
+        assert!(left.is_ok(), "left: {left:?}");
+        assert!(right.is_ok(), "right: {right:?}");
+        assert!(store.get("e1").await.unwrap().is_some());
+        assert!(store.get("e2").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
     async fn two_schemas_with_different_types_for_one_attribute_fail() {
         let (store, registry, _raw) = new_store().await;
         registry
