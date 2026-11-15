@@ -896,8 +896,43 @@ fn validate_draft(draft: &SchemaDraft) -> Result<(), SchemaError> {
                 "attribute name does not match its key".to_string(),
             ));
         }
+        validate_default(def)?;
     }
     Ok(())
+}
+
+/// Checks one attribute default before the registry stores it.
+///
+/// The default must match the declared type.
+/// A float default must be finite.
+/// An `EntityRef` default must be a valid entity id.
+fn validate_default(def: &AttributeDef) -> Result<(), SchemaError> {
+    let Some(default) = &def.default else {
+        return Ok(());
+    };
+    if !default_matches_type(default, def.ty) {
+        return Err(SchemaError::Invalid(format!(
+            "attribute default type mismatch: {}",
+            def.name
+        )));
+    }
+    if def.ty == AttributeType::EntityRef
+        && let Some(target) = default.as_str()
+    {
+        validate_name("entity ref default", target)?;
+    }
+    Ok(())
+}
+
+/// True when `value` has the declared type.
+fn default_matches_type(value: &serde_json::Value, ty: AttributeType) -> bool {
+    match ty {
+        AttributeType::String | AttributeType::EntityRef => value.is_string(),
+        AttributeType::Integer | AttributeType::Timestamp => value.as_i64().is_some(),
+        AttributeType::Float => value.as_f64().is_some_and(f64::is_finite),
+        AttributeType::Boolean => value.is_boolean(),
+        AttributeType::Json => true,
+    }
 }
 
 /// Checks an id or a name against the storage key rules.
@@ -989,6 +1024,56 @@ mod tests {
         assert_eq!(reg.get("user", 1).await.unwrap(), Some(def.clone()));
         assert_eq!(reg.latest("user").await.unwrap(), Some(def));
         assert_eq!(reg.get("user", 2).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn publish_rejects_a_default_with_the_wrong_type_and_stores_nothing() {
+        let reg = new_registry().await;
+
+        let result = reg
+            .publish(draft(
+                "metric",
+                &[],
+                vec![full_attr(
+                    "count",
+                    AttributeType::Integer,
+                    false,
+                    false,
+                    false,
+                    Some(serde_json::json!("x")),
+                )],
+            ))
+            .await;
+
+        assert!(
+            matches!(&result, Err(SchemaError::Invalid(message)) if message.contains("count")),
+            "the error must name the attribute"
+        );
+        assert!(!reg.exists("metric").await.unwrap());
+        assert_eq!(reg.latest("metric").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn publish_accepts_a_default_with_the_declared_type() {
+        let reg = new_registry().await;
+
+        let def = reg
+            .publish(draft(
+                "metric",
+                &[],
+                vec![full_attr(
+                    "count",
+                    AttributeType::Integer,
+                    false,
+                    false,
+                    false,
+                    Some(serde_json::json!(3)),
+                )],
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(def.attributes["count"].default, Some(serde_json::json!(3)));
     }
 
     #[tokio::test]
