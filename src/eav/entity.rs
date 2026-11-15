@@ -129,6 +129,8 @@
 //! A feed failure after the commit leaves the outbox row for the relay.
 //! The call still returns success.
 //! [`EntityStore::flush_outbox`] can deliver the row again.
+//! A timer event uses the same outbox, so it cannot overtake an earlier
+//! entity event.
 //! Delivery is at least once.
 //! A consumer must be idempotent.
 //!
@@ -2652,7 +2654,7 @@ impl EntityStore {
         Ok(entities)
     }
 
-    /// Emits one timer event for a due value and appends it to the feed.
+    /// Emits one timer event for a due value and enqueues it in the outbox.
     ///
     /// The event has kind [`EntityEventKind::Timer`].
     /// It has an empty `changed` list and a snapshot of the current entity.
@@ -2663,30 +2665,58 @@ impl EntityStore {
     /// Its depth is one more than the stored depth.
     /// A time row with no cause gives a timer event with no cause and depth
     /// 0.
-    /// The call appends through the change feed and writes no outbox row.
+    /// The call takes the write lock and then the store write guard.
+    /// It reloads the entity inside the lock.
+    /// It writes the fired marker, deletes the time row, and writes the
+    /// outbox row in one transaction.
+    /// It also increments `outbox-meta:pending` in that transaction.
+    /// The call returns `None` and changes nothing when the entity is absent,
+    /// when the current value for `key` is not [`AttributeValue::Timestamp`]
+    /// with `due_at`, or when a fired marker exists.
+    /// It returns the event after the transaction commits.
+    /// A feed is required.
+    /// The call flushes the outbox after the commit.
+    /// A failed flush leaves the outbox row for the relay.
     pub async fn emit_timer(
         &self,
         entity: &Entity,
         key: &str,
         due_at: i64,
         now: i64,
-    ) -> Result<EntityEvent, EntityError> {
-        let Some(feed) = &self.feed else {
+    ) -> Result<Option<EntityEvent>, EntityError> {
+        if self.feed.is_none() {
             return Err(EntityError::Feed(
                 "timer event needs a change feed".to_string(),
             ));
-        };
+        }
         validate_name("attribute name", key)?;
         let effective = self.resolve_refs(&entity.schemas).await?;
         let event_id = format!("timer-{}-{key}-{}", entity.id, encode_timestamp(due_at));
-        let causation = {
-            let g = self.store.read().await;
-            let bytes = g
-                .get_bytes(&time_index_key(key, due_at, &entity.id))
-                .await
-                .map_err(EntityError::Store)?;
-            decode_time_marker(bytes.as_deref())
+        let fired_at = chrono::Utc::now().timestamp();
+        let fired_bytes =
+            serde_json::to_vec(&fired_at).map_err(|e| EntityError::Internal(e.to_string()))?;
+        let _write = self.write_lock.lock().await;
+        let g = self.store.write().await;
+        let tx = g.begin_tx().map_err(EntityError::Store)?;
+        if tx
+            .get_bytes(&timer_marker_key(&entity.id, key, due_at))
+            .await
+            .map_err(EntityError::Store)?
+            .is_some()
+        {
+            return Ok(None);
+        }
+        let Some(current) = load_entity(&tx, &entity.id).await? else {
+            return Ok(None);
         };
+        if current.attributes.get(key) != Some(&AttributeValue::Timestamp(due_at)) {
+            return Ok(None);
+        }
+        let stored = tx
+            .get_bytes(&time_index_key(key, due_at, &current.id))
+            .await
+            .map_err(EntityError::Store)?;
+        let causation = decode_time_marker(stored.as_deref());
         let (causation_id, causation_depth) =
             if causation.causation_id.is_none() && causation.causation_depth == 0 {
                 (None, 0)
@@ -2697,7 +2727,7 @@ impl EntityStore {
                 )
             };
         let snapshot = Some(
-            entity
+            current
                 .attributes
                 .iter()
                 .map(|(name, value)| (name.clone(), value.as_json()))
@@ -2705,8 +2735,8 @@ impl EntityStore {
         );
         let event = EntityEvent {
             event_id: event_id.clone(),
-            entity_id: entity.id.clone(),
-            entity_version: entity.version,
+            entity_id: current.id.clone(),
+            entity_version: current.version,
             kind: EntityEventKind::Timer,
             schemas: event_schema_ids(&effective),
             changed: Vec::new(),
@@ -2717,12 +2747,27 @@ impl EntityStore {
             snapshot,
             occurred_at: now,
         };
-        feed.append(WalOp::Entity {
-            event: event.clone(),
-        })
-        .await
-        .map_err(|_| EntityError::Feed("timer feed append failed".to_string()))?;
-        Ok(event)
+        let bytes = serde_json::to_vec(&event).map_err(|e| EntityError::Internal(e.to_string()))?;
+        tx.set_bytes(&timer_marker_key(&current.id, key, due_at), &fired_bytes)
+            .await
+            .map_err(EntityError::Store)?;
+        tx.delete(&time_index_key(key, due_at, &current.id))
+            .await
+            .map_err(EntityError::Store)?;
+        increment_outbox_pending(&tx, 1).await?;
+        tx.set_bytes(&timer_outbox_key(), &bytes)
+            .await
+            .map_err(EntityError::Store)?;
+        tx.commit().await.map_err(EntityError::Store)?;
+        drop(g);
+        drop(_write);
+        if let Err(error) = self.flush_after_commit().await {
+            tracing::warn!(
+                %error,
+                "timer outbox flush failed after commit; the relay will deliver the event"
+            );
+        }
+        Ok(Some(event))
     }
 
     /// True when a timer marker exists for one entity, key, and due value.
@@ -2773,6 +2818,10 @@ impl EntityStore {
 
     /// Writes a timer marker and removes the time index row in one transaction.
     ///
+    /// The call emits no event.
+    /// [`EntityStore::emit_timer`] is the path that writes an event.
+    /// The timer pass calls this method only to drain a row that fired before
+    /// the timer retire existed.
     /// The call takes the write lock and then the store write guard.
     /// It reloads the current entity inside the lock.
     /// It returns `false` and changes nothing when the entity is absent.
@@ -3441,6 +3490,14 @@ fn attribute_json(value: &AttributeValue) -> Result<serde_json::Value, EntityErr
 /// The key for one pending outbox event.
 fn outbox_key(event_id: &str) -> String {
     format!("{OUTBOX_PREFIX}{event_id}")
+}
+
+/// The key for one pending timer outbox event.
+///
+/// A fresh UUID v7 keeps the key time-ordered.
+/// An entity row and a timer row then deliver in insert order.
+fn timer_outbox_key() -> String {
+    outbox_key(&uuid::Uuid::now_v7().to_string())
 }
 
 /// The key for one outbox row that no consumer can decode.
@@ -8613,7 +8670,11 @@ mod tests {
             .after
             .unwrap();
 
-        let event = store.emit_timer(&entity, "due", 100, 1_234).await.unwrap();
+        let event = store
+            .emit_timer(&entity, "due", 100, 1_234)
+            .await
+            .unwrap()
+            .expect("the first timer emit must produce an event");
 
         assert_eq!(event.kind, EntityEventKind::Timer);
         assert_eq!(event.entity_id, "e1");
@@ -8638,7 +8699,9 @@ mod tests {
         assert!(outbox_keys(&raw).await.is_empty());
 
         let again = store.emit_timer(&entity, "due", 100, 1_234).await.unwrap();
-        assert_eq!(again.event_id, event.event_id);
+        assert!(again.is_none(), "a fired timer must not emit again");
+        assert_eq!(feed.events().len(), 2);
+        assert!(outbox_keys(&raw).await.is_empty());
     }
 
     #[tokio::test]
@@ -8661,7 +8724,11 @@ mod tests {
             .unwrap();
         let entity = changed.after.unwrap();
 
-        let event = store.emit_timer(&entity, "due", 200, 1_234).await.unwrap();
+        let event = store
+            .emit_timer(&entity, "due", 200, 1_234)
+            .await
+            .unwrap()
+            .expect("the timer emit must produce an event");
 
         assert_eq!(event.causation_id.as_deref(), Some("evt-parent"));
         assert_eq!(event.causation_depth, 5);
@@ -8680,7 +8747,11 @@ mod tests {
             .await
             .unwrap();
 
-        let event = store.emit_timer(&entity, "due", 100, 1_234).await.unwrap();
+        let event = store
+            .emit_timer(&entity, "due", 100, 1_234)
+            .await
+            .unwrap()
+            .expect("the timer emit must produce an event");
 
         assert_eq!(event.causation_id, None);
         assert_eq!(event.causation_depth, 0);
@@ -8695,7 +8766,11 @@ mod tests {
             .unwrap()
             .after
             .unwrap();
-        let first = store.emit_timer(&entity, "due", 100, 1_234).await.unwrap();
+        let first = store
+            .emit_timer(&entity, "due", 100, 1_234)
+            .await
+            .unwrap()
+            .expect("the first timer emit must produce an event");
 
         let changed = store
             .update(
@@ -8708,7 +8783,11 @@ mod tests {
             .await
             .unwrap();
         let entity = changed.after.unwrap();
-        let second = store.emit_timer(&entity, "due", 200, 1_235).await.unwrap();
+        let second = store
+            .emit_timer(&entity, "due", 200, 1_235)
+            .await
+            .unwrap()
+            .expect("the second timer emit must produce an event");
 
         let changed = store
             .update(
@@ -8721,7 +8800,11 @@ mod tests {
             .await
             .unwrap();
         let entity = changed.after.unwrap();
-        let third = store.emit_timer(&entity, "due", 300, 1_236).await.unwrap();
+        let third = store
+            .emit_timer(&entity, "due", 300, 1_236)
+            .await
+            .unwrap()
+            .expect("the third timer emit must produce an event");
 
         assert_eq!(first.causation_depth, 0);
         assert_eq!(second.causation_depth, 1);
