@@ -12,11 +12,12 @@
 //! The client follows no redirects.
 //! The action resolves the URL host before each request.
 //! It rejects a host when any address is not global.
-//! The rejected IPv4 ranges are loopback, private, link-local, carrier-grade
-//! NAT, IETF assignment, 6to4 relay, benchmarking, documentation, and
-//! reserved.
-//! The rejected IPv6 ranges are loopback, link-local, unique-local, 6to4,
-//! Teredo, NAT64, documentation, discard-only, and ORCHID.
+//! The rejected IPv4 ranges are the current network, loopback, private,
+//! link-local, carrier-grade NAT, IETF assignment, 6to4 relay, benchmarking,
+//! documentation, multicast, and reserved.
+//! The rejected IPv6 ranges are loopback, unspecified, link-local,
+//! unique-local, 6to4, Teredo, NAT64, benchmarking, documentation,
+//! segment routing, discard-only, and ORCHID.
 //! An operator can permit a private address with
 //! `[eav].webhook_allow_private_hosts`.
 //! Rule validation also rejects a URL that the delivery path would reject
@@ -635,7 +636,7 @@ fn build_client(host: &str, addresses: &[SocketAddr]) -> reqwest::Client {
 /// Returns true when one address is global.
 ///
 /// The call checks an IPv4-mapped IPv6 address as an IPv4 address.
-/// The call rejects every non-global range in the two functions below.
+/// It rejects every network in the two tables below.
 fn is_public_ip(address: IpAddr) -> bool {
     match address {
         IpAddr::V4(address) => is_public_ipv4(address),
@@ -648,81 +649,90 @@ fn is_public_ip(address: IpAddr) -> bool {
     }
 }
 
+/// The IPv4 networks that are not global.
+const NON_GLOBAL_IPV4: &[(Ipv4Addr, u8)] = &[
+    (Ipv4Addr::new(0, 0, 0, 0), 8),  // 0.0.0.0/8 is the current network.
+    (Ipv4Addr::new(10, 0, 0, 0), 8), // 10.0.0.0/8 is private.
+    (Ipv4Addr::new(100, 64, 0, 0), 10), // 100.64.0.0/10 is carrier-grade NAT.
+    (Ipv4Addr::new(127, 0, 0, 0), 8), // 127.0.0.0/8 is loopback.
+    (Ipv4Addr::new(169, 254, 0, 0), 16), // 169.254.0.0/16 is link-local.
+    (Ipv4Addr::new(172, 16, 0, 0), 12), // 172.16.0.0/12 is private.
+    (Ipv4Addr::new(192, 0, 0, 0), 24), // 192.0.0.0/24 is an IETF assignment.
+    (Ipv4Addr::new(192, 0, 2, 0), 24), // 192.0.2.0/24 is TEST-NET-1.
+    (Ipv4Addr::new(192, 88, 99, 0), 24), // 192.88.99.0/24 is a 6to4 relay.
+    (Ipv4Addr::new(192, 168, 0, 0), 16), // 192.168.0.0/16 is private.
+    (Ipv4Addr::new(198, 18, 0, 0), 15), // 198.18.0.0/15 is benchmarking.
+    (Ipv4Addr::new(198, 51, 100, 0), 24), // 198.51.100.0/24 is TEST-NET-2.
+    (Ipv4Addr::new(203, 0, 113, 0), 24), // 203.0.113.0/24 is TEST-NET-3.
+    (Ipv4Addr::new(224, 0, 0, 0), 4), // 224.0.0.0/4 is multicast.
+    (Ipv4Addr::new(240, 0, 0, 0), 4), // 240.0.0.0/4 is reserved.
+];
+
 /// Returns true when one IPv4 address is global.
 ///
-/// The call rejects loopback, private, link-local, unspecified, broadcast,
-/// and multicast addresses.
-/// It also rejects the ranges below.
+/// The call rejects every network in [`NON_GLOBAL_IPV4`].
 fn is_public_ipv4(address: Ipv4Addr) -> bool {
-    let octets = address.octets();
-    let first = octets[0];
-    let second = octets[1];
-    let third = octets[2];
-    !(address.is_loopback()
-        || address.is_private()
-        || address.is_link_local()
-        || address.is_unspecified()
-        || address.is_broadcast()
-        || address.is_multicast()
-        // 100.64.0.0/10 is carrier-grade NAT.
-        || (first == 100 && (64..=127).contains(&second))
-        // 192.0.0.0/24 is an IETF assignment.
-        || (first == 192 && second == 0 && third == 0)
-        // 192.88.99.0/24 is the 6to4 relay anycast range.
-        || (first == 192 && second == 88 && third == 99)
-        // 198.18.0.0/15 is the benchmarking range.
-        || (first == 198 && (18..=19).contains(&second))
-        // 192.0.2.0/24 is TEST-NET-1 documentation.
-        || (first == 192 && second == 0 && third == 2)
-        // 198.51.100.0/24 is TEST-NET-2 documentation.
-        || (first == 198 && second == 51 && third == 100)
-        // 203.0.113.0/24 is TEST-NET-3 documentation.
-        || (first == 203 && second == 0 && third == 113)
-        // 240.0.0.0/4 is reserved.
-        || first >= 240)
+    !NON_GLOBAL_IPV4
+        .iter()
+        .any(|(network, prefix)| in_ipv4_network(address, *network, *prefix))
 }
+
+/// Returns true when one IPv4 address is in one network.
+fn in_ipv4_network(address: Ipv4Addr, network: Ipv4Addr, prefix: u8) -> bool {
+    if prefix == 0 {
+        return true;
+    }
+    let mask = u32::MAX << (32 - u32::from(prefix));
+    (u32::from(address) & mask) == (u32::from(network) & mask)
+}
+
+/// The IPv6 networks that are not global.
+const NON_GLOBAL_IPV6: &[(Ipv6Addr, u8)] = &[
+    (Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0), 128), // ::/128 is unspecified.
+    (Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1), 128), // ::1/128 is loopback.
+    (Ipv6Addr::new(0x0064, 0xff9b, 0, 0, 0, 0, 0, 0), 96), // 64:ff9b::/96 is NAT64.
+    (Ipv6Addr::new(0x0064, 0xff9b, 1, 0, 0, 0, 0, 0), 48), // 64:ff9b:1::/48 is local NAT64.
+    (Ipv6Addr::new(0x0100, 0, 0, 0, 0, 0, 0, 0), 64), // 100::/64 is discard-only.
+    (Ipv6Addr::new(0x2001, 0, 0, 0, 0, 0, 0, 0), 32), // 2001::/32 is Teredo.
+    (Ipv6Addr::new(0x2001, 0x0002, 0, 0, 0, 0, 0, 0), 48), // 2001:2::/48 is benchmarking.
+    (Ipv6Addr::new(0x2001, 0x0010, 0, 0, 0, 0, 0, 0), 28), // 2001:10::/28 is ORCHIDv1.
+    (Ipv6Addr::new(0x2001, 0x0020, 0, 0, 0, 0, 0, 0), 28), // 2001:20::/28 is ORCHIDv2.
+    (Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 0), 32), // 2001:db8::/32 is documentation.
+    (Ipv6Addr::new(0x2002, 0, 0, 0, 0, 0, 0, 0), 16), // 2002::/16 is 6to4.
+    (Ipv6Addr::new(0x3fff, 0, 0, 0, 0, 0, 0, 0), 20), // 3fff::/20 is documentation.
+    (Ipv6Addr::new(0x5f00, 0, 0, 0, 0, 0, 0, 0), 16), // 5f00::/16 is segment routing.
+    (Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 0), 7), // fc00::/7 is unique-local.
+    (Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0), 10), // fe80::/10 is link-local.
+    (Ipv6Addr::new(0xff00, 0, 0, 0, 0, 0, 0, 0), 8), // ff00::/8 is multicast.
+];
 
 /// Returns true when one IPv6 address is global.
 ///
-/// The call rejects loopback, unspecified, multicast, link-local, and
-/// unique-local addresses.
-/// It also rejects the ranges below.
+/// The call rejects every network in [`NON_GLOBAL_IPV6`].
 fn is_public_ipv6(address: Ipv6Addr) -> bool {
-    let segments = address.segments();
-    !(address.is_loopback()
-        || address.is_unspecified()
-        || address.is_multicast()
-        || address.is_unicast_link_local()
-        || address.is_unique_local()
-        // 2002::/16 is the 6to4 range.
-        || segments[0] == 0x2002
-        // 2001::/32 is the Teredo range.
-        || (segments[0] == 0x2001 && segments[1] == 0)
-        // 64:ff9b::/96 is the NAT64 range.
-        || (segments[0] == 0x0064
-            && segments[1] == 0xff9b
-            && segments[2] == 0
-            && segments[3] == 0
-            && segments[4] == 0
-            && segments[5] == 0)
-        // 2001:db8::/32 is the documentation range.
-        || (segments[0] == 0x2001 && segments[1] == 0x0db8)
-        // 100::/64 is the discard-only range.
-        || (segments[0] == 0x0100
-            && segments[1] == 0
-            && segments[2] == 0
-            && segments[3] == 0)
-        // 2001:10::/28 and 2001:20::/28 are the ORCHID ranges.
-        || (segments[0] == 0x2001 && (segments[1] >> 4 == 0x001 || segments[1] >> 4 == 0x002)))
+    !NON_GLOBAL_IPV6
+        .iter()
+        .any(|(network, prefix)| in_ipv6_network(address, *network, *prefix))
+}
+
+/// Returns true when one IPv6 address is in one network.
+fn in_ipv6_network(address: Ipv6Addr, network: Ipv6Addr, prefix: u8) -> bool {
+    if prefix == 0 {
+        return true;
+    }
+    let mask = u128::MAX << (128 - u32::from(prefix));
+    (u128::from(address) & mask) == (u128::from(network) & mask)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::net::Ipv6Addr;
     use std::sync::Arc;
     use std::time::Duration;
 
     use serde_json::json;
+    use tokio_util::sync::CancellationToken;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -976,14 +986,16 @@ mod tests {
     #[test]
     fn the_address_classifier_rejects_new_non_global_ipv4_ranges() {
         let rejected_ipv4 = [
-            "100.64.0.1",   // Carrier-grade NAT.
-            "192.0.0.1",    // IETF assignment.
-            "192.88.99.1",  // 6to4 relay.
-            "198.18.0.1",   // Benchmarking.
-            "192.0.2.1",    // Documentation.
-            "198.51.100.1", // Documentation.
-            "203.0.113.1",  // Documentation.
-            "240.0.0.1",    // Reserved.
+            "0.0.0.1",       // Current network.
+            "0.255.255.255", // Current network.
+            "100.64.0.1",    // Carrier-grade NAT.
+            "192.0.0.1",     // IETF assignment.
+            "192.88.99.1",   // 6to4 relay.
+            "198.18.0.1",    // Benchmarking.
+            "192.0.2.1",     // Documentation.
+            "198.51.100.1",  // Documentation.
+            "203.0.113.1",   // Documentation.
+            "240.0.0.1",     // Reserved.
         ];
         for raw in rejected_ipv4 {
             let address: Ipv4Addr = raw.parse().unwrap();
@@ -994,17 +1006,39 @@ mod tests {
     #[test]
     fn the_address_classifier_rejects_new_non_global_ipv6_ranges() {
         let rejected_ipv6 = [
-            "2002::1",     // 6to4.
-            "2001::1",     // Teredo.
-            "64:ff9b::1",  // NAT64.
-            "2001:db8::1", // Documentation.
-            "100::1",      // Discard-only.
-            "2001:10::1",  // ORCHIDv1.
-            "2001:20::1",  // ORCHIDv2.
+            "2002::1",      // 6to4.
+            "2001::1",      // Teredo.
+            "64:ff9b::1",   // NAT64.
+            "64:ff9b:1::1", // Local NAT64.
+            "2001:db8::1",  // Documentation.
+            "100::1",       // Discard-only.
+            "2001:10::1",   // ORCHIDv1.
+            "2001:20::1",   // ORCHIDv2.
+            "2001:2::1",    // Benchmarking.
+            "3fff::1",      // Documentation.
+            "5f00::1",      // Segment routing.
         ];
         for raw in rejected_ipv6 {
             let address: Ipv6Addr = raw.parse().unwrap();
             assert!(!is_public_ip(address.into()), "{raw}");
+        }
+    }
+
+    #[test]
+    fn the_address_classifier_accepts_addresses_next_to_the_ranges() {
+        for raw in ["1.0.0.0", "8.8.8.8", "1.1.1.1"] {
+            let address: Ipv4Addr = raw.parse().unwrap();
+            assert!(is_public_ip(address.into()), "{raw}");
+        }
+
+        for raw in [
+            "2001:4860:4860::8888",
+            "2606:4700:4700::1111",
+            "4000::1",
+            "6000::1",
+        ] {
+            let address: Ipv6Addr = raw.parse().unwrap();
+            assert!(is_public_ip(address.into()), "{raw}");
         }
     }
 
