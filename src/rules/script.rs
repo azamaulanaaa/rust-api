@@ -33,11 +33,16 @@
 //! Reads see committed state only.
 //! A write that the script stages does not appear in a later read.
 //!
-//! The read capability set controls `get_entity` and both find methods.
+//! The read capability set controls `get_entity`, both find methods, and the
+//! `entity` and `event.changed` values.
 //! A denied `get_entity` returns `()`.
 //! A `get_entity` result holds only the attributes that the allowed pinned
 //! schemas define.
+//! The `entity` value holds only the allowed attributes.
+//! The `event.changed` list holds only the allowed keys.
 //! A denied find returns the stable error `rule script read access denied`.
+//! A find key that the requested schema does not define or index returns the
+//! stable error `attribute is not indexed`.
 //! The write capability set controls every staged write.
 //! A create must pin only schemas in the set.
 //! An update may set only the attributes that the pinned schemas in the set
@@ -236,6 +241,8 @@ struct HostState {
 pub struct ScriptHost {
     /// The read-only host that enforces the read capability set.
     read_host: ScriptReadHost,
+    /// The schema ids that the script may read.
+    read: ScriptCapabilities,
     /// The store that supplies the entity data.
     entities: EntityStore,
     /// The schema ids that the script may write.
@@ -266,7 +273,8 @@ impl ScriptHost {
         runtime: Handle,
     ) -> Self {
         Self {
-            read_host: ScriptReadHost::new(entities.clone(), read),
+            read_host: ScriptReadHost::new(entities.clone(), read.clone()),
+            read,
             entities,
             write: write.into_iter().collect(),
             state: Arc::new(Mutex::new(HostState::default())),
@@ -294,6 +302,62 @@ impl ScriptHost {
             Ok(None) => Ok(Dynamic::UNIT),
             Err(error) => Err(self.map_read_error(error)),
         }
+    }
+
+    /// Returns the attribute keys that the read set allows.
+    ///
+    /// The call reads the allowed pinned schemas of `entity`.
+    /// It also reads the allowed schema ids of `event`.
+    /// The result holds the keys that those schemas define.
+    /// A missing schema gives an empty set for that source.
+    fn visible_attribute_keys(
+        &self,
+        entity: Option<&Entity>,
+        event: &EntityEvent,
+    ) -> Result<BTreeSet<String>, ScriptError> {
+        let mut keys = BTreeSet::new();
+        if let Some(entity) = entity {
+            let pinned: Vec<SchemaRef> = entity
+                .schemas
+                .iter()
+                .filter(|schema| self.read.allows(&schema.id))
+                .cloned()
+                .collect();
+            if !pinned.is_empty() {
+                match self.runtime.block_on(self.entities.resolve_refs(&pinned)) {
+                    Ok(effective) => keys.extend(
+                        effective
+                            .iter()
+                            .flat_map(|schema| schema.attributes.keys().cloned()),
+                    ),
+                    Err(EntityError::UnknownSchema(_))
+                    | Err(EntityError::Invalid(_))
+                    | Err(EntityError::Internal(_)) => {}
+                    Err(_) => return Err(ScriptError::Runtime),
+                }
+            }
+        }
+        let schemas: Vec<String> = event
+            .schemas
+            .iter()
+            .filter(|id| self.read.allows(id))
+            .cloned()
+            .collect();
+        if !schemas.is_empty() {
+            match self
+                .runtime
+                .block_on(self.entities.resolve_schemas(&schemas))
+            {
+                Ok(effective) => keys.extend(
+                    effective
+                        .iter()
+                        .flat_map(|schema| schema.attributes.keys().cloned()),
+                ),
+                Err(EntityError::UnknownSchema(_)) | Err(EntityError::Invalid(_)) => {}
+                Err(_) => return Err(ScriptError::Runtime),
+            }
+        }
+        Ok(keys)
     }
 
     /// Returns the ids that match one schema and one indexed attribute.
@@ -686,8 +750,8 @@ impl ScriptEngine {
     pub fn eval_bool(&self, source: &str, ctx: &ScriptContext<'_>) -> Result<bool, ScriptError> {
         let ast = self.ast_for(source)?;
         let mut scope = Scope::new();
-        scope.push_constant("event", event_map(ctx.event));
-        scope.push_constant("entity", entity_value(ctx.entity));
+        scope.push_constant("event", event_map(ctx.event, None));
+        scope.push_constant("entity", entity_value(ctx.entity, None));
         scope.push_constant("now", ctx.now);
 
         EVAL_DEADLINE.with(|deadline| deadline.set(Some(Instant::now() + self.wall_guard)));
@@ -721,9 +785,10 @@ impl ScriptEngine {
     ) -> Result<Vec<EntityEffect>, ScriptError> {
         let ast = self.ast_for(source)?;
         let staged = host.clone();
+        let visible = host.visible_attribute_keys(ctx.entity.as_ref(), &ctx.event)?;
         let mut scope = Scope::new();
-        scope.push_constant("event", event_map(&ctx.event));
-        scope.push_constant("entity", entity_value(ctx.entity.as_ref()));
+        scope.push_constant("event", event_map(&ctx.event, Some(&visible)));
+        scope.push_constant("entity", entity_value(ctx.entity.as_ref(), Some(&visible)));
         scope.push_constant("now", ctx.now);
         scope.push("host", host);
 
@@ -936,7 +1001,10 @@ fn ids_to_dynamic(ids: Vec<String>) -> Dynamic {
 }
 
 /// Returns the Rhai map for one event.
-fn event_map(event: &EntityEvent) -> Dynamic {
+///
+/// `visible` holds the attribute keys that the read set allows.
+/// A `None` set keeps every changed entry.
+fn event_map(event: &EntityEvent, visible: Option<&BTreeSet<String>>) -> Dynamic {
     let mut map = Map::new();
     map.insert("event_id".into(), Dynamic::from(event.event_id.clone()));
     map.insert("entity_id".into(), Dynamic::from(event.entity_id.clone()));
@@ -951,6 +1019,7 @@ fn event_map(event: &EntityEvent) -> Dynamic {
             event
                 .changed
                 .iter()
+                .filter(|change| visible.is_none_or(|keys| keys.contains(&change.key)))
                 .map(|change| {
                     let mut item = Map::new();
                     item.insert("key".into(), Dynamic::from(change.key.clone()));
@@ -976,7 +1045,10 @@ fn event_map(event: &EntityEvent) -> Dynamic {
 }
 
 /// Returns the Rhai value for one optional entity.
-fn entity_value(entity: Option<&Entity>) -> Dynamic {
+///
+/// `visible` holds the attribute keys that the read set allows.
+/// A `None` set keeps every attribute.
+fn entity_value(entity: Option<&Entity>, visible: Option<&BTreeSet<String>>) -> Dynamic {
     let Some(entity) = entity else {
         return Dynamic::UNIT;
     };
@@ -1000,6 +1072,9 @@ fn entity_value(entity: Option<&Entity>) -> Dynamic {
     );
     let mut attributes = Map::new();
     for (key, value) in &entity.attributes {
+        if !visible.is_none_or(|keys| keys.contains(key)) {
+            continue;
+        }
         attributes.insert(key.clone().into(), json_to_dynamic(&value.as_json()));
     }
     map.insert("attributes".into(), Dynamic::from_map(attributes));
@@ -1639,6 +1714,55 @@ abs(height(20.0, 0.7, 9.81, 1.5, 100)) < 0.000000001"#,
         .await;
 
         assert_eq!(effects, Ok(Vec::new()));
+    }
+
+    #[tokio::test]
+    async fn an_action_script_cannot_read_a_denied_attribute_through_the_context() {
+        let subject = engine();
+        let (host, store) = action_host(&["task"], &[]).await;
+        create_task_and_secret(&store, "e1", "open", "s1").await;
+        let entity = store.get("e1").await.unwrap().unwrap();
+        let mut ev = event(
+            EntityEventKind::Updated,
+            vec![AttributeChange {
+                key: "code".to_string(),
+                old: Some(serde_json::json!("s0")),
+                new: Some(serde_json::json!("s1")),
+            }],
+        );
+        ev.schemas = vec!["task".to_string(), "secret".to_string()];
+
+        let effects = eval_action(
+            &subject,
+            host,
+            r#"if entity.attributes.code != () { throw "denied entity attribute"; } if event.changed.len() != 0 { throw "denied changed attribute"; } entity.attributes.status == "open""#,
+            &ev,
+            Some(&entity),
+        )
+        .await;
+
+        assert_eq!(effects, Ok(Vec::new()));
+    }
+
+    #[tokio::test]
+    async fn an_action_script_find_rejects_a_key_that_the_allowed_schema_does_not_index() {
+        let subject = engine();
+        let (host, store) = action_host(&["task"], &[]).await;
+        create_task_and_secret(&store, "e1", "open", "s1").await;
+        let entity = store.get("e1").await.unwrap().unwrap();
+        let mut ev = event(EntityEventKind::Created, Vec::new());
+        ev.schemas = vec!["task".to_string(), "secret".to_string()];
+
+        let result = eval_action(
+            &subject,
+            host,
+            r#"host.find("task", "code", "s1", 10)"#,
+            &ev,
+            Some(&entity),
+        )
+        .await;
+
+        assert_eq!(result, Err(ScriptError::Runtime));
     }
 
     #[tokio::test]
