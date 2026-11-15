@@ -58,12 +58,6 @@ pub(crate) const ENTITY_ROW: &str = "entity";
 const DEFAULT_PAGE_LIMIT: usize = 50;
 /// The maximum page size of a list route.
 const MAX_PAGE_LIMIT: usize = 200;
-/// The maximum count of raw pages that one cursor page reads.
-///
-/// The route checks a grant on each row.
-/// A raw page can hold no visible row.
-/// The route then reads the next raw page, up to this count.
-const CURSOR_SCAN_BATCH: usize = 4;
 /// The default count of entities that a revalidation checks.
 const DEFAULT_REVALIDATE_LIMIT: usize = 100;
 /// The maximum count of entities that a revalidation checks.
@@ -425,7 +419,7 @@ pub struct EntityQueryPage {
     /// The entity id to pass as `after` for the next page.
     /// The value is the id of the last visible entity.
     /// The value never names an entity that the caller cannot read.
-    /// `None` means that the scan is exhausted or the scan budget ends.
+    /// `None` means that the scan is exhausted.
     pub next: Option<String>,
 }
 
@@ -756,12 +750,14 @@ pub(crate) async fn can_read_entity(
 
 /// Reads one cursor page and keeps only the entities that the caller can read.
 ///
-/// The call reads at most [`CURSOR_SCAN_BATCH`] raw pages.
-/// It stops when the visible page is full or the raw scan ends.
+/// The call reads raw pages until the visible page is full or the raw scan
+/// ends.
+/// A raw page can hold only rows that the caller cannot read, so a fixed raw
+/// page budget could miss a later visible row.
 /// The returned cursor is the id of the last visible entity.
 /// A raw cursor stays inside this function, so `next` never names a row that
 /// the caller cannot read.
-/// A budget that ends with no visible entity returns `None`.
+/// A scan with no visible entity returns `None`.
 /// The caller then sees no id of an unreadable row.
 pub(crate) async fn visible_cursor_page<F, Fut>(
     policy: &Authorizer,
@@ -776,7 +772,7 @@ where
 {
     let mut items: Vec<Entity> = Vec::with_capacity(limit);
     let mut cursor = after;
-    for _ in 0..CURSOR_SCAN_BATCH {
+    loop {
         let (raw, raw_next) = fetch(cursor).await?;
         let raw_len = raw.len();
         for (position, entity) in raw.into_iter().enumerate() {
@@ -796,7 +792,6 @@ where
             None => return Ok((items, None)),
         }
     }
-    Ok((items, None))
 }
 
 #[utoipa::path(post, path = "/eav/schemas", tag = "eav", request_body = SchemaDraft, responses((status=201, body=crate::eav::schema::SchemaDef), (status=400, body=crate::http::error::ErrorBody), (status=401, body=crate::http::error::ErrorBody), (status=403, body=crate::http::error::ErrorBody), (status=500, body=crate::http::error::ErrorBody)))]
@@ -1077,7 +1072,7 @@ async fn list_entities(
 /// A row grant exposes only that entity.
 /// The handler filters each result with `can_read_entity`.
 /// A caller with no grant receives an empty page, not `403`.
-/// The route reads at most `CURSOR_SCAN_BATCH` raw pages.
+/// The route reads raw pages until the page is full or the results end.
 /// The route then returns the cursor of the last visible entity.
 /// The cursor never names a row that the caller cannot read.
 /// A scan that finds no visible row returns `next: null`.
