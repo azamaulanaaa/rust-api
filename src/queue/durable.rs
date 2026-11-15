@@ -14,12 +14,28 @@
 //! | `job-status:dead:{id}` | Empty status marker. The job has no retries left. |
 //! | `job-status:succeeded:{id}` | Empty status marker. The job finished well. |
 //! | `job-status:failed:{id}` | Empty status marker. The job failed without retry. |
+//! | `job-lease-due:{expiry}:{id}` | Empty lease index entry. `expiry` is a fixed-width unix millisecond value. |
 //! | `idemp:{key}` | Job id for an idempotency key. |
 //! | `job-meta:backfilled` | Backfill marker. |
+//! | `job-meta:lease-indexed` | Lease index marker. |
 //!
 //! A job row has one status marker. The row and the marker change in one
 //! transaction. The queue lists one marker family. It does not scan the
 //! `job:` family after the backfill.
+//!
+//! # Expiry
+//!
+//! The lease expiry uses unix milliseconds. A lease below one second thus
+//! keeps its full duration.
+//!
+//! A leased job has one `job-lease-due:` entry. The key sorts by expiry, so a
+//! sweep reads only the entries that are due. It stops at the first entry
+//! that is not due and processes at most `LEASE_SWEEP_BATCH` entries.
+//! `reserve` runs this bounded sweep. `status` expires only the job that it
+//! reads, and `extend_lease` runs no sweep.
+//!
+//! A host can call [`DurableQueue::spawn_expiry_sweeper`] to run the full
+//! maintenance pass on a timer. The pass also removes old terminal rows.
 //!
 //! # Backfill
 //!
@@ -28,6 +44,16 @@
 //! for each row, including a `Succeeded` or `Failed` row. It writes the
 //! `job-meta:backfilled` marker last. Later calls skip the scan. The
 //! backfill keeps every terminal row, because the `status` query reads it.
+//!
+//! An old store also has leased markers but no lease index entries. The
+//! first `reserve` or maintenance pass scans the `leased` markers one time
+//! and writes the `job-lease-due:` entry for each one. It writes the
+//! `job-meta:lease-indexed` marker last.
+//!
+//! A lease that an older version wrote has an expiry in unix seconds. The
+//! value looks like an expiry in the past under the millisecond format, so
+//! the queue returns that job to the queue at once. The job runs again. The
+//! queue loses no job data.
 //!
 //! # Terminal retention
 //!
@@ -63,12 +89,18 @@ const DEAD_PREFIX: &str = "job-status:dead:";
 const SUCCEEDED_PREFIX: &str = "job-status:succeeded:";
 /// Prefix of a failed status marker.
 const FAILED_PREFIX: &str = "job-status:failed:";
+/// Prefix of one lease index entry.
+const LEASE_DUE_PREFIX: &str = "job-lease-due:";
+/// Key that marks a completed lease index backfill.
+const LEASE_INDEX_KEY: &str = "job-meta:lease-indexed";
 /// Key that marks a completed backfill.
 const BACKFILL_KEY: &str = "job-meta:backfilled";
 /// Time that a dead, succeeded, or failed row stays in the store: 7 days.
 const TERMINAL_RETENTION_SECS: i64 = 7 * 24 * 60 * 60;
 /// Number of marker keys that one queue scan reads.
 const QUEUE_SCAN_PAGE: usize = 512;
+/// Maximum number of due leases that one sweep processes.
+const LEASE_SWEEP_BATCH: usize = 256;
 
 /// Persisted envelope for one job.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -107,6 +139,9 @@ struct StoredJob {
 pub struct DurableQueue {
     store: Arc<RwLock<oxkv::OxKvStore>>,
     metrics: QueueMetrics,
+    /// Number of job rows that this queue read. The field exists for tests.
+    #[cfg(test)]
+    row_reads: std::sync::atomic::AtomicUsize,
 }
 
 impl DurableQueue {
@@ -115,11 +150,18 @@ impl DurableQueue {
         Self {
             store,
             metrics: QueueMetrics::new("durable"),
+            #[cfg(test)]
+            row_reads: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
     fn now() -> i64 {
         chrono::Utc::now().timestamp()
+    }
+
+    /// Returns the current time in unix milliseconds.
+    fn now_millis() -> i64 {
+        chrono::Utc::now().timestamp_millis()
     }
 
     fn job_key(id: Uuid) -> String {
@@ -144,6 +186,43 @@ impl DurableQueue {
 
     fn failed_key(id: Uuid) -> String {
         format!("{FAILED_PREFIX}{id}")
+    }
+
+    /// Returns the lease index key for one expiry.
+    ///
+    /// The expiry has a fixed width, so the keys sort by time.
+    fn lease_due_key(id: JobId, expires_at: i64) -> String {
+        format!("{LEASE_DUE_PREFIX}{expires_at:020}:{id}")
+    }
+
+    /// Returns the lease index key for a leased status.
+    fn lease_due_key_for(status: &JobStatus, id: JobId) -> Option<String> {
+        match status {
+            JobStatus::Leased { expires_at, .. } => Some(Self::lease_due_key(id, *expires_at)),
+            _ => None,
+        }
+    }
+
+    /// Parses one lease index key into its expiry and job id.
+    fn parse_lease_due_key(key: &str) -> Option<(i64, JobId)> {
+        let rest = key.strip_prefix(LEASE_DUE_PREFIX)?;
+        let (expires_at, id) = rest.split_once(':')?;
+        Some((expires_at.parse().ok()?, id.parse().ok()?))
+    }
+
+    /// Reads one job row and counts the read for tests.
+    async fn row_bytes(
+        &self,
+        guard: &oxkv::OxKvStore,
+        key: &str,
+    ) -> Result<Option<Vec<u8>>, QueueError> {
+        #[cfg(test)]
+        self.row_reads
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        guard
+            .get_bytes(key)
+            .await
+            .map_err(|e| QueueError::Store(e.to_string()))
     }
 
     fn idempotency_key(key: &str) -> String {
@@ -171,13 +250,13 @@ impl DurableQueue {
     /// The function returns [`QueueError::AlreadyLeased`] when another worker
     /// holds the job or the token has an old generation. It returns
     /// [`QueueError::LeaseExpired`] when the lease is gone or its time has
-    /// passed.
+    /// passed. The expiry is in unix milliseconds.
     fn check_lease(sj: &StoredJob, lease: &LeaseToken) -> Result<(), QueueError> {
         match &sj.status {
             JobStatus::Leased { worker, expires_at } => {
                 if worker != &lease.worker || sj.lease_generation != lease.generation {
                     Err(QueueError::AlreadyLeased)
-                } else if *expires_at <= Self::now() {
+                } else if *expires_at <= Self::now_millis() {
                     Err(QueueError::LeaseExpired)
                 } else {
                     Ok(())
@@ -212,7 +291,11 @@ impl DurableQueue {
             .ok_or(QueueError::NotFound(job_id))?;
         let mut sj = serde_json::from_slice::<StoredJob>(&bytes)
             .map_err(|e| QueueError::Store(e.to_string()))?;
-        Self::check_lease(&sj, lease)?;
+        if let Err(error) = Self::check_lease(&sj, lease) {
+            self.metrics.record_lease_lost();
+            return Err(error);
+        }
+        let old_due = Self::lease_due_key_for(&sj.status, job_id);
         update(&mut sj);
         let val = serde_json::to_vec(&sj).map_err(|e| QueueError::Store(e.to_string()))?;
         tx.compare_and_set(&key, Some(&bytes), &val)
@@ -229,14 +312,27 @@ impl DurableQueue {
                 .await
                 .map_err(|e| QueueError::Store(e.to_string()))?;
         }
+        if let Some(due) = old_due {
+            tx.delete(&due)
+                .await
+                .map_err(|e| QueueError::Store(e.to_string()))?;
+        }
         if let Some(marker) = Self::status_key(&sj.status, job_id) {
             tx.set_bytes(&marker, b"")
                 .await
                 .map_err(|e| QueueError::Store(e.to_string()))?;
         }
+        if let Some(due) = Self::lease_due_key_for(&sj.status, job_id) {
+            tx.set_bytes(&due, b"")
+                .await
+                .map_err(|e| QueueError::Store(e.to_string()))?;
+        }
         match tx.commit().await {
             Ok(()) => {}
-            Err(StoreError::TxConflict { .. }) => return Err(QueueError::AlreadyLeased),
+            Err(StoreError::TxConflict { .. }) => {
+                self.metrics.record_lease_lost();
+                return Err(QueueError::AlreadyLeased);
+            }
             Err(error) => return Err(QueueError::Store(error.to_string())),
         }
         drop(g);
@@ -327,77 +423,236 @@ impl DurableQueue {
         Ok(())
     }
 
-    /// Returns an expired lease to the queue and removes old terminal rows.
+    /// Writes the lease index entries for an old store one time.
     ///
-    /// The function lists the `leased`, `dead`, `succeeded`, and `failed`
-    /// markers. It does not scan the `job:` family.
-    async fn sweep_expired(&self) -> Result<(), QueueError> {
-        let now = Self::now();
-        for id in self.ids_with_prefix(LEASED_PREFIX).await? {
-            let key = Self::job_key(id);
-            let g = self.store.write().await;
-            let tx = g.begin_tx().map_err(|e| QueueError::Store(e.to_string()))?;
-            let bytes = tx
-                .get_bytes(&key)
+    /// The function scans the `leased` markers when the lease index marker is
+    /// absent. It writes one `job-lease-due:` entry for each leased row. It
+    /// writes the marker last.
+    async fn ensure_lease_index(&self) -> Result<(), QueueError> {
+        {
+            let g = self.store.read().await;
+            if g.has(LEASE_INDEX_KEY)
                 .await
-                .map_err(|e| QueueError::Store(e.to_string()))?;
-            let Some(bytes) = bytes else {
-                tx.delete(&Self::leased_key(id))
-                    .await
-                    .map_err(|e| QueueError::Store(e.to_string()))?;
-                tx.commit()
-                    .await
-                    .map_err(|e| QueueError::Store(e.to_string()))?;
-                continue;
-            };
-            let Ok(sj) = serde_json::from_slice::<StoredJob>(&bytes) else {
-                let _ = tx.rollback().await;
-                continue;
-            };
-            let expired =
-                matches!(sj.status, JobStatus::Leased { expires_at, .. } if expires_at <= now);
-            let is_leased = matches!(sj.status, JobStatus::Leased { .. });
-            if expired {
-                let mut new_sj = sj;
-                let attempt = new_sj.job.attempt.saturating_add(1);
-                new_sj.job.attempt = attempt;
-                new_sj.job.scheduled_at = now;
-                if attempt >= new_sj.job.max_attempts {
-                    new_sj.status = JobStatus::Dead {
-                        error: "lease expired".to_string(),
-                        finished_at: now,
-                    };
-                } else {
-                    new_sj.status = JobStatus::Queued;
-                }
-                let marker = Self::status_key(&new_sj.status, id)
-                    .ok_or_else(|| QueueError::Store("status has no marker".to_string()))?;
-                let val =
-                    serde_json::to_vec(&new_sj).map_err(|e| QueueError::Store(e.to_string()))?;
-                tx.set_bytes(&key, &val)
-                    .await
-                    .map_err(|e| QueueError::Store(e.to_string()))?;
-                tx.delete(&Self::leased_key(id))
-                    .await
-                    .map_err(|e| QueueError::Store(e.to_string()))?;
-                tx.set_bytes(&marker, b"")
-                    .await
-                    .map_err(|e| QueueError::Store(e.to_string()))?;
-                tx.commit()
-                    .await
-                    .map_err(|e| QueueError::Store(e.to_string()))?;
-            } else if is_leased {
-                let _ = tx.rollback().await;
-            } else {
-                tx.delete(&Self::leased_key(id))
-                    .await
-                    .map_err(|e| QueueError::Store(e.to_string()))?;
-                tx.commit()
-                    .await
-                    .map_err(|e| QueueError::Store(e.to_string()))?;
+                .map_err(|e| QueueError::Store(e.to_string()))?
+            {
+                return Ok(());
             }
         }
 
+        let g = self.store.write().await;
+        if g.has(LEASE_INDEX_KEY)
+            .await
+            .map_err(|e| QueueError::Store(e.to_string()))?
+        {
+            return Ok(());
+        }
+        let tx = g.begin_tx().map_err(|e| QueueError::Store(e.to_string()))?;
+        let mut after = None;
+        loop {
+            let page = g
+                .scan_keys(KeyPrefix::new(LEASED_PREFIX), after, QUEUE_SCAN_PAGE)
+                .await
+                .map_err(|e| QueueError::Store(e.to_string()))?;
+            for key in &page.items {
+                let Some(raw_id) = key.strip_prefix(LEASED_PREFIX) else {
+                    continue;
+                };
+                let Ok(id) = raw_id.parse::<JobId>() else {
+                    continue;
+                };
+                let Some(bytes) = self.row_bytes(&g, &Self::job_key(id)).await? else {
+                    continue;
+                };
+                if let Ok(sj) = serde_json::from_slice::<StoredJob>(&bytes)
+                    && let Some(due) = Self::lease_due_key_for(&sj.status, id)
+                {
+                    tx.set_bytes(&due, b"")
+                        .await
+                        .map_err(|e| QueueError::Store(e.to_string()))?;
+                }
+            }
+            match page.next {
+                Some(next) => after = Some(next),
+                None => break,
+            }
+        }
+        tx.set_bytes(LEASE_INDEX_KEY, b"1")
+            .await
+            .map_err(|e| QueueError::Store(e.to_string()))?;
+        tx.commit()
+            .await
+            .map_err(|e| QueueError::Store(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Returns the row with the next attempt when its lease is due.
+    ///
+    /// The function returns `None` when the status is not a due lease.
+    fn expired_row(sj: &StoredJob, now_ms: i64, now: i64) -> Option<StoredJob> {
+        match &sj.status {
+            JobStatus::Leased { expires_at, .. } if *expires_at <= now_ms => {
+                let mut new_sj = sj.clone();
+                let attempt = new_sj.job.attempt.saturating_add(1);
+                new_sj.job.attempt = attempt;
+                new_sj.job.scheduled_at = now;
+                new_sj.status = if attempt >= new_sj.job.max_attempts {
+                    JobStatus::Dead {
+                        error: "lease expired".to_string(),
+                        finished_at: now,
+                    }
+                } else {
+                    JobStatus::Queued
+                };
+                Some(new_sj)
+            }
+            _ => None,
+        }
+    }
+
+    /// Returns due leases to the queue.
+    ///
+    /// The function reads the lease index from the earliest entry. It stops
+    /// at the first entry that is not due and visits at most
+    /// `LEASE_SWEEP_BATCH` entries. It reads only the rows of due jobs.
+    async fn expire_due(&self) -> Result<(), QueueError> {
+        let now_ms = Self::now_millis();
+        let mut due: Vec<(String, JobId)> = Vec::new();
+        {
+            let g = self.store.read().await;
+            let mut after = None;
+            let mut visited = 0usize;
+            loop {
+                let page = g
+                    .scan_keys(KeyPrefix::new(LEASE_DUE_PREFIX), after, QUEUE_SCAN_PAGE)
+                    .await
+                    .map_err(|e| QueueError::Store(e.to_string()))?;
+                let mut stop = false;
+                for key in &page.items {
+                    let Some((expires_at, id)) = Self::parse_lease_due_key(key) else {
+                        debug!(key = %key, "skipping lease index key that does not decode");
+                        visited += 1;
+                        continue;
+                    };
+                    if expires_at > now_ms {
+                        stop = true;
+                        break;
+                    }
+                    due.push((key.clone(), id));
+                    visited += 1;
+                    if visited >= LEASE_SWEEP_BATCH {
+                        stop = true;
+                        break;
+                    }
+                }
+                if stop {
+                    break;
+                }
+                match page.next {
+                    Some(next) => after = Some(next),
+                    None => break,
+                }
+            }
+        }
+        for (due_key, id) in due {
+            self.expire_due_entry(&due_key, id, now_ms).await?;
+        }
+        Ok(())
+    }
+
+    /// Returns one indexed lease to the queue when its time has passed.
+    ///
+    /// The function also deletes an index entry that no longer matches the
+    /// row. It keeps a row that does not decode.
+    async fn expire_due_entry(
+        &self,
+        due_key: &str,
+        id: JobId,
+        now_ms: i64,
+    ) -> Result<(), QueueError> {
+        let key = Self::job_key(id);
+        let g = self.store.write().await;
+        let tx = g.begin_tx().map_err(|e| QueueError::Store(e.to_string()))?;
+        let bytes = tx
+            .get_bytes(&key)
+            .await
+            .map_err(|e| QueueError::Store(e.to_string()))?;
+        let Some(bytes) = bytes else {
+            tx.delete(due_key)
+                .await
+                .map_err(|e| QueueError::Store(e.to_string()))?;
+            tx.commit()
+                .await
+                .map_err(|e| QueueError::Store(e.to_string()))?;
+            return Ok(());
+        };
+        let Ok(sj) = serde_json::from_slice::<StoredJob>(&bytes) else {
+            debug!(key = %key, "skipping job row that does not decode");
+            let _ = tx.rollback().await;
+            return Ok(());
+        };
+        let current_due = Self::lease_due_key_for(&sj.status, id);
+        let Some(new_sj) = Self::expired_row(&sj, now_ms, Self::now()) else {
+            // A live lease keeps its own index entry. Any other entry is stale.
+            if current_due.as_deref() == Some(due_key) {
+                let _ = tx.rollback().await;
+                return Ok(());
+            }
+            tx.delete(due_key)
+                .await
+                .map_err(|e| QueueError::Store(e.to_string()))?;
+            tx.commit()
+                .await
+                .map_err(|e| QueueError::Store(e.to_string()))?;
+            return Ok(());
+        };
+        let marker = Self::status_key(&new_sj.status, id)
+            .ok_or_else(|| QueueError::Store("status has no marker".to_string()))?;
+        let val = serde_json::to_vec(&new_sj).map_err(|e| QueueError::Store(e.to_string()))?;
+        tx.set_bytes(&key, &val)
+            .await
+            .map_err(|e| QueueError::Store(e.to_string()))?;
+        tx.delete(&Self::leased_key(id))
+            .await
+            .map_err(|e| QueueError::Store(e.to_string()))?;
+        tx.delete(due_key)
+            .await
+            .map_err(|e| QueueError::Store(e.to_string()))?;
+        tx.set_bytes(&marker, b"")
+            .await
+            .map_err(|e| QueueError::Store(e.to_string()))?;
+        tx.commit()
+            .await
+            .map_err(|e| QueueError::Store(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Returns one lease to the queue when its time has passed.
+    ///
+    /// The function reads one row and changes it only when its lease is due.
+    /// It runs no full sweep.
+    async fn expire_job(&self, job_id: JobId) -> Result<(), QueueError> {
+        let sj = match self.load(job_id).await {
+            Ok(sj) => sj,
+            Err(QueueError::NotFound(_)) => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let Some(due) = Self::lease_due_key_for(&sj.status, job_id) else {
+            return Ok(());
+        };
+        self.expire_due_entry(&due, job_id, Self::now_millis())
+            .await
+    }
+
+    /// Runs the full maintenance pass.
+    ///
+    /// The function writes the lease index for an old store, returns due
+    /// leases to the queue, and removes old terminal rows. It does not scan
+    /// the `job:` family after the backfill. A host can run the pass on a
+    /// timer with [`DurableQueue::spawn_expiry_sweeper`].
+    async fn sweep_expired(&self) -> Result<(), QueueError> {
+        self.ensure_lease_index().await?;
+        self.expire_due().await?;
+        let now = Self::now();
         for prefix in [DEAD_PREFIX, SUCCEEDED_PREFIX, FAILED_PREFIX] {
             self.purge_terminal(prefix, now).await?;
         }
@@ -598,18 +853,17 @@ impl super::JobQueue for DurableQueue {
         lease: Duration,
     ) -> Result<Vec<LeasedJob>, QueueError> {
         self.backfill().await?;
-        self.sweep_expired().await?;
+        self.ensure_lease_index().await?;
+        self.expire_due().await?;
         let now = Self::now();
+        let lease_millis = super::lease_millis(lease);
         let ids = self.ids_with_prefix(QUEUED_PREFIX).await?;
         let mut candidates: Vec<StoredJob> = Vec::new();
         {
             let g = self.store.read().await;
             for id in ids {
                 let key = Self::job_key(id);
-                let bytes = g
-                    .get_bytes(&key)
-                    .await
-                    .map_err(|e| QueueError::Store(e.to_string()))?;
+                let bytes = self.row_bytes(&g, &key).await?;
                 let Some(bytes) = bytes else {
                     continue;
                 };
@@ -632,11 +886,10 @@ impl super::JobQueue for DurableQueue {
                 .then(a.job.created_at.cmp(&b.job.created_at))
         });
         candidates.truncate(limit);
-        let lease_secs = lease.as_secs() as i64;
         let mut out = Vec::new();
         for candidate in candidates {
             let id = candidate.job.id;
-            let expiry = now + lease_secs;
+            let expiry = Self::now_millis().saturating_add(lease_millis);
             let key = Self::job_key(id);
             let g = self.store.write().await;
             let tx = g.begin_tx().map_err(|e| QueueError::Store(e.to_string()))?;
@@ -675,6 +928,9 @@ impl super::JobQueue for DurableQueue {
                 .await
                 .map_err(|e| QueueError::Store(e.to_string()))?;
             tx.set_bytes(&Self::leased_key(id), b"")
+                .await
+                .map_err(|e| QueueError::Store(e.to_string()))?;
+            tx.set_bytes(&Self::lease_due_key(id, expiry), b"")
                 .await
                 .map_err(|e| QueueError::Store(e.to_string()))?;
             tx.commit()
@@ -762,8 +1018,7 @@ impl super::JobQueue for DurableQueue {
         lease: &LeaseToken,
         extend: Duration,
     ) -> Result<LeaseToken, QueueError> {
-        self.sweep_expired().await?;
-        let new_expiry = Self::now() + extend.as_secs() as i64;
+        let new_expiry = Self::now_millis().saturating_add(super::lease_millis(extend));
         let updated = self
             .transition(job_id, lease, |sj| {
                 sj.lease_generation = sj.lease_generation.saturating_add(1);
@@ -781,9 +1036,38 @@ impl super::JobQueue for DurableQueue {
 
     #[instrument(name = "queue.status", skip(self), fields(queue.backend = "durable", job.id = %job_id))]
     async fn status(&self, job_id: JobId) -> Result<JobStatus, QueueError> {
-        self.sweep_expired().await?;
+        self.expire_job(job_id).await?;
         let sj = self.load(job_id).await?;
         Ok(sj.status)
+    }
+}
+
+impl DurableQueue {
+    /// Starts a task that runs the full maintenance pass on a timer.
+    ///
+    /// The pass returns due leases to the queue and removes old terminal
+    /// rows. The first pass runs at once. The task stops when `cancel` is
+    /// cancelled.
+    pub fn spawn_expiry_sweeper(
+        self: &Arc<Self>,
+        interval: Duration,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> tokio::task::JoinHandle<()> {
+        let queue = Arc::clone(self);
+        tokio::spawn(async move {
+            let interval = interval.max(Duration::from_millis(1));
+            let mut tick = tokio::time::interval(interval);
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    _ = tick.tick() => {
+                        if let Err(error) = queue.sweep_expired().await {
+                            debug!(error = %error, "queue maintenance pass failed");
+                        }
+                    }
+                }
+            }
+        })
     }
 }
 
@@ -837,6 +1121,78 @@ mod tests {
             JobStatus::Leased { worker, .. } => assert_eq!(worker, "w1"),
             other => panic!("expected leased, got {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn a_lease_below_one_second_keeps_its_duration() {
+        let q = queue().await;
+        q.enqueue(job("work")).await.unwrap();
+
+        let started = DurableQueue::now_millis();
+        let leased = q
+            .reserve("w1", 10, Duration::from_millis(100))
+            .await
+            .unwrap();
+        let id = leased[0].job.id;
+        match q.status(id).await.unwrap() {
+            JobStatus::Leased { expires_at, .. } => {
+                assert!(
+                    expires_at >= started + 90,
+                    "a 100 ms lease must keep its millisecond duration"
+                );
+            }
+            other => panic!("expected leased, got {:?}", other),
+        }
+
+        q.ack(id, &leased[0].lease, None).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn status_keeps_the_lease_index_of_a_live_lease() {
+        let q = queue().await;
+        q.enqueue(job("work")).await.unwrap();
+        let leased = q.reserve("w1", 1, Duration::from_secs(30)).await.unwrap();
+        let id = leased[0].job.id;
+
+        let expires_at = match q.status(id).await.unwrap() {
+            JobStatus::Leased { expires_at, .. } => expires_at,
+            other => panic!("expected leased, got {:?}", other),
+        };
+
+        assert!(
+            has_key(&q, &DurableQueue::lease_due_key(id, expires_at)).await,
+            "a live lease must keep its index entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rejected_ack_counts_as_a_lease_loss_and_not_a_failure() {
+        let q = queue().await;
+        let (stale, _) = stale_and_current_lease(&q).await;
+
+        let _ = q.ack(stale.job.id, &stale.lease, None).await.unwrap_err();
+
+        assert_eq!(q.metrics.lease_lost_count(), 1);
+        assert_eq!(q.metrics.failed_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_failed_job_counts_as_a_failure_and_not_a_lease_loss() {
+        let q = queue().await;
+        q.enqueue(job("work")).await.unwrap();
+        let leased = q.reserve("w1", 10, Duration::from_secs(30)).await.unwrap();
+
+        q.nack(
+            leased[0].job.id,
+            &leased[0].lease,
+            "boom",
+            RetryPolicy::NoRetry,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(q.metrics.failed_count(), 1);
+        assert_eq!(q.metrics.lease_lost_count(), 0);
     }
 
     /// Reserves one job with an expired lease, then reserves it again.
@@ -1232,6 +1588,101 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn reserve_reads_only_the_queued_rows_in_a_large_queue() {
+        let q = queue().await;
+        let now = DurableQueue::now();
+        let now_millis = DurableQueue::now_millis();
+        {
+            let g = q.store.write().await;
+            let tx = g.begin_tx().unwrap();
+            for _ in 0..300 {
+                let mut row = job("leased");
+                row.id = Uuid::now_v7();
+                let id = row.id;
+                let status = JobStatus::Leased {
+                    worker: "other".to_string(),
+                    expires_at: now_millis + 3_600_000,
+                };
+                let stored = StoredJob {
+                    job: row,
+                    status: status.clone(),
+                    lease_generation: 1,
+                };
+                let value = serde_json::to_vec(&stored).unwrap();
+                tx.set_bytes(&DurableQueue::job_key(id), &value)
+                    .await
+                    .unwrap();
+                tx.set_bytes(&DurableQueue::leased_key(id), b"")
+                    .await
+                    .unwrap();
+                tx.set_bytes(&DurableQueue::lease_due_key_for(&status, id).unwrap(), b"")
+                    .await
+                    .unwrap();
+            }
+            for _ in 0..300 {
+                let mut row = job("done");
+                row.id = Uuid::now_v7();
+                let id = row.id;
+                let stored = StoredJob {
+                    job: row,
+                    status: JobStatus::Succeeded {
+                        result: None,
+                        finished_at: now,
+                    },
+                    lease_generation: 0,
+                };
+                let value = serde_json::to_vec(&stored).unwrap();
+                tx.set_bytes(&DurableQueue::job_key(id), &value)
+                    .await
+                    .unwrap();
+                tx.set_bytes(&DurableQueue::succeeded_key(id), b"")
+                    .await
+                    .unwrap();
+            }
+            tx.set_bytes(BACKFILL_KEY, b"1").await.unwrap();
+            tx.set_bytes(LEASE_INDEX_KEY, b"1").await.unwrap();
+            tx.commit().await.unwrap();
+        }
+        let queued = job("work");
+        let queued_id = queued.id;
+        q.enqueue(queued).await.unwrap();
+
+        let before = q.row_reads.load(std::sync::atomic::Ordering::SeqCst);
+        let leased = q.reserve("w1", 1, Duration::from_secs(30)).await.unwrap();
+        let reads = q.row_reads.load(std::sync::atomic::Ordering::SeqCst) - before;
+
+        assert_eq!(leased.len(), 1);
+        assert_eq!(leased[0].job.id, queued_id);
+        assert!(
+            reads <= 4,
+            "reserve read {reads} job rows in a queue of 600 rows"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_expiry_sweeper_returns_a_due_lease_to_the_queue() {
+        let q = Arc::new(queue().await);
+        q.enqueue(job("work")).await.unwrap();
+        let leased = q.reserve("w1", 1, Duration::from_millis(50)).await.unwrap();
+        let id = leased[0].job.id;
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let handle = q.spawn_expiry_sweeper(Duration::from_millis(5), cancel.clone());
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if matches!(q.load(id).await.unwrap().status, JobStatus::Queued) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the sweeper did not return the job to the queue"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        cancel.cancel();
+        handle.await.unwrap();
+    }
+
     async fn put_job(q: &DurableQueue, job: Job, status: JobStatus) {
         use oxkv::{Store as _, Transaction as _};
         let id = job.id;
@@ -1359,6 +1810,7 @@ mod tests {
         use oxkv::{Store as _, Transaction as _};
         let id = job.id;
         let marker = DurableQueue::status_key(&status, id);
+        let due = DurableQueue::lease_due_key_for(&status, id);
         let sj = StoredJob {
             job,
             status,
@@ -1372,6 +1824,9 @@ mod tests {
             .unwrap();
         if let Some(marker) = marker {
             tx.set_bytes(&marker, b"").await.unwrap();
+        }
+        if let Some(due) = due {
+            tx.set_bytes(&due, b"").await.unwrap();
         }
         tx.commit().await.unwrap();
     }
@@ -1689,7 +2144,7 @@ mod tests {
         )
         .await;
 
-        let _ = q.status(new_id).await.unwrap();
+        q.sweep_expired().await.unwrap();
         assert!(!has_key(&q, &DurableQueue::job_key(old_id)).await);
         assert!(!has_key(&q, &DurableQueue::dead_key(old_id)).await);
         assert!(has_key(&q, &DurableQueue::job_key(new_id)).await);
@@ -1723,7 +2178,7 @@ mod tests {
         )
         .await;
 
-        let _ = q.status(new_id).await.unwrap();
+        q.sweep_expired().await.unwrap();
         assert!(!has_key(&q, &DurableQueue::job_key(old_id)).await);
         assert!(!has_key(&q, &DurableQueue::succeeded_key(old_id)).await);
         assert!(has_key(&q, &DurableQueue::job_key(new_id)).await);
@@ -1757,7 +2212,7 @@ mod tests {
         )
         .await;
 
-        let _ = q.status(new_id).await.unwrap();
+        q.sweep_expired().await.unwrap();
         assert!(!has_key(&q, &DurableQueue::job_key(old_id)).await);
         assert!(!has_key(&q, &DurableQueue::failed_key(old_id)).await);
         assert!(has_key(&q, &DurableQueue::job_key(new_id)).await);
@@ -1791,8 +2246,8 @@ mod tests {
         )
         .await;
 
-        let _ = q.status(new_id).await.unwrap();
-        let _ = q.status(new_id).await.unwrap();
+        q.sweep_expired().await.unwrap();
+        q.sweep_expired().await.unwrap();
         assert!(!has_key(&q, &DurableQueue::job_key(old_id)).await);
         assert!(!has_key(&q, &DurableQueue::succeeded_key(old_id)).await);
         assert!(has_key(&q, &DurableQueue::job_key(new_id)).await);
