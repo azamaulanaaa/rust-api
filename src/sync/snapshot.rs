@@ -50,6 +50,10 @@
 //! `open_reader` opens one follower per call. The call then reads one key
 //! and drops the follower. So the call does not need a pin, and the loss of
 //! the pin costs nothing here.
+//!
+//! A caller that needs a fixed view can call `StoreExt::snapshot()`. The call
+//! returns a stable read-only view. It copies the whole store into memory and
+//! does not block writers.
 
 use crate::fs::error::FsError;
 use crate::fs::store::{FileScan, FsStore, KvPages};
@@ -879,9 +883,10 @@ impl SnapshotManager {
     /// It does not see the state of the moment it opened.
     ///
     /// Every caller in this module opens the follower for one short read. So
-    /// one fix per read is enough for the call. A caller that must read a
-    /// stable snapshot needs another mechanism, because `oxkv` 0.12 does not
-    /// provide one.
+    /// one fix per read is enough for the call. A caller that needs a fixed
+    /// view can call `StoreExt::snapshot()`. The call returns a stable
+    /// read-only view. It copies the whole store into memory and does not
+    /// block writers.
     async fn open_reader(&self, sub: &str) -> Result<OxKvReader, FsError> {
         let storage = std::sync::Arc::new(ObjectStoreStorage::new(self.object_store.clone()));
         oxkv::OxKvStore::builder()
