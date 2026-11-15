@@ -2727,7 +2727,10 @@ impl EntityStore {
     }
 
     /// Resolves schema ids to their latest versions and flattens them.
-    async fn resolve_schemas(&self, ids: &[String]) -> Result<Vec<EffectiveSchema>, EntityError> {
+    pub(crate) async fn resolve_schemas(
+        &self,
+        ids: &[String],
+    ) -> Result<Vec<EffectiveSchema>, EntityError> {
         if ids.is_empty() {
             return Err(EntityError::Invalid(
                 "at least one schema is required".to_string(),
@@ -2752,7 +2755,10 @@ impl EntityStore {
     }
 
     /// Flattens the exact pinned schema versions.
-    async fn resolve_refs(&self, refs: &[SchemaRef]) -> Result<Vec<EffectiveSchema>, EntityError> {
+    pub(crate) async fn resolve_refs(
+        &self,
+        refs: &[SchemaRef],
+    ) -> Result<Vec<EffectiveSchema>, EntityError> {
         let mut effective = Vec::with_capacity(refs.len());
         for schema in refs {
             let Some(flat) = self

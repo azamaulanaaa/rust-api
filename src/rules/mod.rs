@@ -69,12 +69,17 @@
 //! A write that the script stages does not appear in a later read.
 //!
 //! The `read` capability list controls the read methods.
+//! A `get_entity` result holds only the attributes that the allowed pinned
+//! schemas define.
 //! A denied `get_entity` returns `()`.
 //! A denied find returns the stable error
 //! `rule script read access denied`.
 //! The `write` capability list controls every staged write.
 //! A create needs every schema in the write set.
-//! An update or a delete needs at least one pinned schema in the write set.
+//! A create must set only attributes that its schemas define.
+//! An update may set only the attributes that the pinned schemas in the
+//! write set define.
+//! A delete needs at least one pinned schema in the write set.
 //! A write outside the set returns the stable error
 //! `rule script write access denied`.
 //!
