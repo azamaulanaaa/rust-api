@@ -716,6 +716,15 @@ impl EavRuntime {
                 }
                 Err(error) => {
                     self.metrics.record_outbox_failure();
+                    // A failed flush leaves rows in the outbox. Record the
+                    // gauge here, because the success path does not run.
+                    if let Ok(pending) = self.entities.outbox_count().await {
+                        self.metrics.record_outbox_pending(pending as u64);
+                    }
+                    if let Ok(age) = self.entities.outbox_pending_age().await {
+                        self.metrics
+                            .record_outbox_pending_age(age.unwrap_or_default());
+                    }
                     return Err(error).context("flush the EAV entity outbox");
                 }
             }
@@ -750,6 +759,10 @@ impl EavRuntime {
                 _ = ticker.tick() => {
                     if !cancel.is_cancelled() {
                         self.mark_loop_ok(LoopSlot::RuleRunner);
+                    }
+                    if let Ok(age) = self.entities.outbox_pending_age().await {
+                        self.metrics
+                            .record_outbox_pending_age(age.unwrap_or_default());
                     }
                 }
             }
