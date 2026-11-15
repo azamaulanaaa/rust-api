@@ -3,8 +3,11 @@
 use casbin::{CoreApi, DefaultModel, Enforcer, MgmtApi};
 use serde::{Deserialize, Serialize};
 
-use super::{RBAC_MODEL, adapter::OxkvAdapter};
-use crate::records::{ChangeSink, WalOp};
+use super::{
+    RBAC_MODEL,
+    adapter::{Outbox, OxkvAdapter, PolicyOutbox},
+};
+use crate::records::ChangeSink;
 
 /// A portable snapshot of every policy rule in a store.
 #[derive(Debug, Serialize, Deserialize)]
@@ -58,6 +61,11 @@ where
 /// The function announces the new rules to `feed` when the feed is wired.
 /// A replica can therefore replay the import instead of discovering it only
 /// through a full recalculation.
+///
+/// With a feed, each rule commits with an outbox row in one transaction. The
+/// function drains the rows after the write. A failed append leaves the rows,
+/// so a later import delivers them. The function then reports the rules as
+/// duplicates and still drains.
 pub async fn import_s3(
     s3_store: oxkv::OxKvStore,
     dump: &PolicyDump,
@@ -67,7 +75,14 @@ pub async fn import_s3(
     let model = DefaultModel::from_str(RBAC_MODEL)
         .await
         .context("failed to parse RBAC model")?;
-    let mut enforcer = Enforcer::new(model, OxkvAdapter::new(s3_store))
+    // Stage the announcements in the outbox only when the caller wires a
+    // feed. Without a feed no replica waits for the changes.
+    let adapter = if feed.is_some() {
+        OxkvAdapter::with_outbox(s3_store.clone())
+    } else {
+        OxkvAdapter::new(s3_store.clone())
+    };
+    let mut enforcer = Enforcer::new(model, adapter)
         .await
         .context("failed to open policy store")?;
 
@@ -79,15 +94,6 @@ pub async fn import_s3(
     for rule in &dump.p {
         if enforcer.add_policy(rule.clone()).await? {
             report.rules_added += 1;
-            if let Some(feed) = &feed {
-                feed.append(WalOp::PolicyRuleAdd {
-                    sub: rule.first().cloned().unwrap_or_default(),
-                    obj: rule.get(1).cloned().unwrap_or_default(),
-                    act: rule.get(2).cloned().unwrap_or_default(),
-                })
-                .await
-                .context("append policy change feed")?;
-            }
         } else {
             report.duplicates += 1;
         }
@@ -95,17 +101,15 @@ pub async fn import_s3(
     for link in &dump.g {
         if enforcer.add_grouping_policy(link.clone()).await? {
             report.groups_added += 1;
-            if let Some(feed) = &feed {
-                feed.append(WalOp::GroupAdd {
-                    user: link.first().cloned().unwrap_or_default(),
-                    group: link.get(1).cloned().unwrap_or_default(),
-                })
-                .await
-                .context("append policy change feed")?;
-            }
         } else {
             report.duplicates += 1;
         }
+    }
+    if let Some(feed) = &feed {
+        Outbox::new(s3_store)
+            .drain(Some(feed.as_ref()))
+            .await
+            .context("drain policy outbox")?;
     }
     Ok(report)
 }

@@ -359,6 +359,11 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
     let policy_engine = PolicyEngine::init_s3(policy_store)
         .await?
         .with_change_sink(Arc::new(wal.clone()));
+    // A crash can leave a committed policy change in the outbox with no
+    // feed entry. The feed is wired now, so deliver those rows before the
+    // server accepts traffic. A failed drain stops startup instead of
+    // leaving replicas behind.
+    policy_engine.drain_outbox().await?;
     let setup_api_module = SetupApiModule::new(policy_engine.clone(), oidc_api_module.middleware());
     let policy_api_module =
         PolicyApiModule::new(policy_engine.clone(), oidc_api_module.middleware());

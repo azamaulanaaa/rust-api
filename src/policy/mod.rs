@@ -14,10 +14,10 @@ use std::{collections::HashMap, fmt, str::FromStr, sync::Arc};
 use casbin::{CoreApi, DefaultModel, Enforcer, MgmtApi, RbacApi};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 use crate::fencing::Latch;
-use crate::records::{ChangeSink, WalOp};
+use crate::records::ChangeSink;
 
 /// Casbin storage adapter persisting policies to an embedded oxkv store.
 pub mod adapter;
@@ -190,10 +190,10 @@ pub struct PolicyEngine {
     /// Private on purpose. `Enforcer` is a type of casbin. Its methods
     /// (`add_policy`, `remove_grouping_policy`, and others) bypass the
     /// wrappers `add_rule` and `assign_group` of this engine. Those
-    /// wrappers hold the append to the feed. Exposing the enforcer made it
-    /// possible to mutate a policy without announcing the change. Replicas
-    /// then drifted silently from the master, and nothing could replay the
-    /// change.
+    /// wrappers drain the outbox after the mutation. Exposing the enforcer
+    /// made it possible to mutate a policy without announcing the change.
+    /// Replicas then drifted silently from the master, and nothing could
+    /// replay the change.
     ///
     /// Use the methods on this type to mutate, [`authorizer`](Self::authorizer)
     /// for a read-only handle, and [`is_unlocked`](Self::is_unlocked) for a
@@ -208,6 +208,15 @@ pub struct PolicyEngine {
     /// this module has no compile-time path to `sync`. See
     /// [`crate::records`].
     feed: Option<Arc<dyn ChangeSink>>,
+    /// The durable rows that hold committed changes not yet in the feed.
+    ///
+    /// Each policy mutation stages a row in the same store transaction as
+    /// the policy change. A failed drain leaves the row for a later call.
+    /// `None` means that the engine has no outbox, which only a test handle
+    /// without the durable initializer can produce.
+    outbox: Option<Arc<dyn adapter::PolicyOutbox>>,
+    /// Serializes drains, so one row reaches the feed one time at once.
+    drain_lock: Arc<Mutex<()>>,
     /// Where a lost epoch on the master policy prefix is recorded.
     ///
     /// The process-wide latch in production (see
@@ -274,18 +283,25 @@ impl PolicyEngine {
     ///
     /// The adapter validates writes through `adapter::PolicyRuleValidator`
     /// itself, before any transaction opens.
+    ///
+    /// The initializer also opens the durable outbox over the same store. A
+    /// clone of `store` backs the outbox, so a policy change and its outbox
+    /// row share one transaction.
     pub async fn init_with_store<S>(store: S) -> Result<Self, PolicyError>
     where
-        S: oxkv::Store + Send + Sync + 'static,
+        S: oxkv::Store + Clone + Send + Sync + 'static,
         S::Transaction: oxkv::TxCas,
     {
-        let adapter = adapter::OxkvAdapter::new(store);
+        let outbox: Arc<dyn adapter::PolicyOutbox> = Arc::new(adapter::Outbox::new(store.clone()));
+        let adapter = adapter::OxkvAdapter::with_outbox(store);
         let model = DefaultModel::from_str(RBAC_MODEL).await?;
         let mut enforcer = Enforcer::new(model, adapter).await?;
         enforcer.enable_auto_save(true);
         Ok(Self {
             enforcer: Arc::new(RwLock::new(enforcer)),
             feed: None,
+            outbox: Some(outbox),
+            drain_lock: Arc::new(Mutex::new(())),
             latch: crate::fencing::process_latch(),
         })
     }
@@ -314,10 +330,11 @@ impl PolicyEngine {
         classify_with(self.latch, e)
     }
 
-    /// Attaches a [`ChangeSink`] for replica sync. The module announces the
-    /// operations after each mutation. The behavior fails closed. A logging
-    /// failure fails the whole operation, so the feed never silently misses
-    /// a committed write.
+    /// Attaches a [`ChangeSink`] for replica sync. The engine drains the
+    /// committed outbox after each mutation. The behavior fails closed. A
+    /// logging failure fails the whole operation, so the feed never silently
+    /// misses a committed write. The outbox keeps the row, so a later retry
+    /// delivers it.
     ///
     /// Takes a trait object so this module never names `sync`. The
     /// concrete implementation is [`sync::wal::Wal`](crate::sync::wal::Wal).
@@ -326,15 +343,34 @@ impl PolicyEngine {
         self
     }
 
-    /// Announces `op` when a feed is wired. Otherwise the function does
-    /// nothing.
-    async fn announce(&self, op: WalOp) -> Result<(), PolicyError> {
-        if let Some(feed) = &self.feed {
-            feed.append(op)
-                .await
-                .map_err(|e| PolicyError::ChangeFeed(e.to_string()))?;
-        }
+    /// Delivers every pending policy change to the feed.
+    ///
+    /// Each mutation calls this function after its store transaction commits.
+    /// A failed append leaves the row for a later call. A retry of the same
+    /// mutation also drains, so a missed announce heals without a second
+    /// outbox row.
+    ///
+    /// An engine with no feed discards the rows. Logging is disabled in that
+    /// configuration, so no replica waits for the changes.
+    pub async fn drain_outbox(&self) -> Result<(), PolicyError> {
+        let Some(outbox) = &self.outbox else {
+            return Ok(());
+        };
+        let _drain = self.drain_lock.lock().await;
+        outbox.drain(self.feed.as_deref()).await?;
         Ok(())
+    }
+
+    /// Returns the number of policy changes that wait for the feed.
+    ///
+    /// The count comes from the durable store, not from memory. The engine
+    /// uses it in tests to show that a failed drain left the row.
+    #[cfg(test)]
+    pub(crate) async fn pending_outbox_rows(&self) -> Result<usize, PolicyError> {
+        match &self.outbox {
+            Some(outbox) => outbox.pending().await,
+            None => Ok(0),
+        }
     }
 
     /// Returns all granular permissions (p-rules).
@@ -357,14 +393,9 @@ impl PolicyEngine {
             .await
             .map_err(|e| self.classify(e))?;
         drop(ef);
-        if success {
-            self.announce(WalOp::PolicyRuleAdd {
-                sub,
-                obj,
-                act: act_str,
-            })
-            .await?;
-        }
+        // Drain on a duplicate too. A retry after a failed announce returns
+        // `Ok(false)` and still delivers the row that the first attempt left.
+        self.drain_outbox().await?;
         Ok(success)
     }
 
@@ -382,14 +413,7 @@ impl PolicyEngine {
             .await
             .map_err(|e| self.classify(e))?;
         drop(ef);
-        if success {
-            self.announce(WalOp::PolicyRuleRemove {
-                sub,
-                obj,
-                act: act_str,
-            })
-            .await?;
-        }
+        self.drain_outbox().await?;
         Ok(success)
     }
 
@@ -401,13 +425,7 @@ impl PolicyEngine {
             .await
             .map_err(|e| self.classify(e))?;
         drop(ef);
-        if success {
-            self.announce(WalOp::GroupAdd {
-                user: user_id,
-                group,
-            })
-            .await?;
-        }
+        self.drain_outbox().await?;
         Ok(success)
     }
 
@@ -429,53 +447,32 @@ impl PolicyEngine {
     pub async fn claim_superadmin(&self, user_id: &str) -> Result<bool, PolicyError> {
         let mut ef = self.enforcer.write().await;
         if !ef.get_users_for_role(SUPERADMIN_ROLE, None).is_empty() {
-            let repaired = Self::ensure_superadmin_rules(self.latch, &mut ef).await?;
+            Self::ensure_superadmin_rules(self.latch, &mut ef).await?;
             drop(ef);
-            for (obj, act) in repaired {
-                self.announce(WalOp::PolicyRuleAdd {
-                    sub: SUPERADMIN_ROLE.to_string(),
-                    obj,
-                    act: act.to_string(),
-                })
-                .await?;
-            }
+            self.drain_outbox().await?;
             return Ok(false);
         }
         ef.add_grouping_policy(vec![user_id.to_string(), SUPERADMIN_ROLE.to_string()])
             .await
             .map_err(|e| self.classify(e))?;
-        let seeded = Self::ensure_superadmin_rules(self.latch, &mut ef).await?;
+        Self::ensure_superadmin_rules(self.latch, &mut ef).await?;
         drop(ef);
-        self.announce(WalOp::GroupAdd {
-            user: user_id.to_string(),
-            group: SUPERADMIN_ROLE.to_string(),
-        })
-        .await?;
-        for (obj, act) in seeded {
-            self.announce(WalOp::PolicyRuleAdd {
-                sub: SUPERADMIN_ROLE.to_string(),
-                obj,
-                act: act.to_string(),
-            })
-            .await?;
-        }
+        self.drain_outbox().await?;
         Ok(true)
     }
 
     /// Grants [`SUPERADMIN_ROLE`] full management rights over policy rules
     /// and group membership. It runs more than once without changing the
-    /// result. Returns the newly added `(obj, act)` pairs. The caller
-    /// must hold the write lock of the enforcer, so that the bootstrap check
-    /// and the seed share one critical section.
+    /// result. The caller must hold the write lock of the enforcer, so that
+    /// the bootstrap check and the seed share one critical section.
     ///
     /// The function takes the latch as a parameter instead of reaching for
     /// the process-wide one. It is an associated function with no `&self`
     /// from which to read a per-engine latch.
-    async fn ensure_superadmin_rules(
-        latch: &Latch,
-        ef: &mut Enforcer,
-    ) -> Result<Vec<(String, Action)>, PolicyError> {
-        let mut added = Vec::new();
+    ///
+    /// Each `add_policy` stages its own outbox row when it adds a rule. A
+    /// rule that is already present stages no row.
+    async fn ensure_superadmin_rules(latch: &Latch, ef: &mut Enforcer) -> Result<(), PolicyError> {
         for (obj, act) in [
             ("rules", Action::Read),
             ("rules", Action::Write),
@@ -491,19 +488,15 @@ impl PolicyEngine {
             ("eav_rules", Action::Write),
             ("eav_rules", Action::Delete),
         ] {
-            if ef
-                .add_policy(vec![
-                    SUPERADMIN_ROLE.to_string(),
-                    obj.to_string(),
-                    act.to_string(),
-                ])
-                .await
-                .map_err(|e| classify_with(latch, e))?
-            {
-                added.push((obj.to_string(), act));
-            }
+            ef.add_policy(vec![
+                SUPERADMIN_ROLE.to_string(),
+                obj.to_string(),
+                act.to_string(),
+            ])
+            .await
+            .map_err(|e| classify_with(latch, e))?;
         }
-        Ok(added)
+        Ok(())
     }
 
     /// Removes a user from a group.
@@ -518,13 +511,7 @@ impl PolicyEngine {
             .await
             .map_err(|e| self.classify(e))?;
         drop(ef);
-        if success {
-            self.announce(WalOp::GroupRemove {
-                user: user_id,
-                group,
-            })
-            .await?;
-        }
+        self.drain_outbox().await?;
         Ok(success)
     }
 
@@ -577,12 +564,7 @@ impl PolicyEngine {
             .await
             .map_err(|e| self.classify(e))?;
         drop(ef);
-        if removed {
-            self.announce(WalOp::GroupDelete {
-                group: group.to_string(),
-            })
-            .await?;
-        }
+        self.drain_outbox().await?;
         Ok(removed)
     }
 
@@ -1218,5 +1200,127 @@ mod tests {
             if sub == "alice" && obj == "doc" && act == "read"));
         assert!(matches!(&ops[3], WalOp::GroupRemove { user, group }
             if user == "alice" && group == "admins"));
+    }
+
+    /// A feed that fails a fixed number of appends.
+    struct FlakySink {
+        /// The feed that receives the appends after the failures.
+        wal: Wal,
+        /// The number of appends that still fail.
+        failures: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FlakySink {
+        /// Wraps `wal` and fails the first `failures` appends.
+        fn new(wal: Wal, failures: usize) -> Self {
+            Self {
+                wal,
+                failures: std::sync::atomic::AtomicUsize::new(failures),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ChangeSink for FlakySink {
+        async fn append(&self, op: crate::records::WalOp) -> anyhow::Result<()> {
+            use std::sync::atomic::Ordering;
+
+            if self
+                .failures
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                    left.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err(anyhow::anyhow!("injected change feed failure"));
+            }
+            self.wal.append(op).await.map(|_| ())
+        }
+    }
+
+    /// A failed announce must leave one durable outbox row, not one rule
+    /// without a log entry.
+    ///
+    /// The old order was: commit the rule, then append to the feed. A failed
+    /// append returned an error while the rule stayed durable. A retry
+    /// returned `false`, so it never appended. Replicas missed the rule for
+    /// good.
+    ///
+    /// The rule and the outbox row now commit in one transaction. This test
+    /// fails the first append and checks four properties:
+    ///
+    /// 1. The rule is durable in a reopened engine.
+    /// 2. The outbox row is durable in the same store.
+    /// 3. A retry returns `false` and drains the row exactly one time.
+    /// 4. A second retry adds no entry.
+    #[tokio::test]
+    async fn a_failed_announce_leaves_one_row_for_a_later_drain() {
+        let store = crate::db::build_test_store(&crate::db::test_prefix("policy-outbox")).await;
+        let wal = Wal::new(
+            crate::db::build_test_store(&crate::db::test_prefix("policy-outbox-wal")).await,
+        );
+
+        let engine = PolicyEngine::init_with_store(store.clone())
+            .await
+            .unwrap()
+            .with_change_sink(Arc::new(FlakySink::new(wal.clone(), 1)));
+
+        // The policy write commits. The announce fails.
+        let err = engine
+            .add_rule("alice".into(), "doc".into(), Action::Read)
+            .await
+            .expect_err("the injected feed failure must surface");
+        assert!(matches!(err, PolicyError::ChangeFeed(_)), "{err:?}");
+        assert_eq!(
+            wal.head().await.unwrap(),
+            0,
+            "a failed append must not leave a partial announce in the feed"
+        );
+
+        // A new engine over the same store reads the rule and the outbox row
+        // from the store. Both are durable, not only in the memory of the
+        // first engine.
+        let reopened = PolicyEngine::init_with_store(store)
+            .await
+            .unwrap()
+            .with_change_sink(Arc::new(wal.clone()));
+        assert!(
+            reopened
+                .authorize("alice", "doc", Action::Read)
+                .await
+                .unwrap(),
+            "the policy write must survive the failed announce"
+        );
+        assert_eq!(
+            reopened.pending_outbox_rows().await.unwrap(),
+            1,
+            "the failed announce must leave exactly one outbox row"
+        );
+
+        // The retry is the same operation. It adds no rule and no outbox
+        // row. It drains the row that the first attempt left.
+        assert!(
+            !reopened
+                .add_rule("alice".into(), "doc".into(), Action::Read)
+                .await
+                .unwrap()
+        );
+        assert_eq!(wal.head().await.unwrap(), 1);
+        assert_eq!(reopened.pending_outbox_rows().await.unwrap(), 0);
+        let delivered = wal.range(1, 1).await.unwrap();
+        assert!(matches!(
+            &delivered[0].op,
+            crate::records::WalOp::PolicyRuleAdd { sub, obj, act }
+                if sub == "alice" && obj == "doc" && act == "read"
+        ));
+
+        // One more retry must not duplicate the entry.
+        assert!(
+            !reopened
+                .add_rule("alice".into(), "doc".into(), Action::Read)
+                .await
+                .unwrap()
+        );
+        assert_eq!(wal.head().await.unwrap(), 1);
     }
 }
