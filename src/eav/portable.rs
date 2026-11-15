@@ -806,4 +806,46 @@ mod tests {
         assert!(report.unique_claim_issues.is_empty(), "{report:?}");
         Ok(())
     }
+
+    #[tokio::test]
+    async fn an_invalid_record_removes_the_earlier_import_steps() -> anyhow::Result<()> {
+        let file = concat!(
+            "{\"kind\":\"header\",\"format\":1}\n",
+            "{\"kind\":\"schema\",\"schema\":{\"id\":\"person\",\"version\":1,\"extends\":[],\"attributes\":{},\"created_at\":0}}\n",
+            "{\"kind\":\"entity\",\"entity\":{\"id\":\"dup\",\"version\":1,\"schemas\":[\"person\"],\"attributes\":{},\"created_at\":0,\"updated_at\":0}}\n",
+            "{\"kind\":\"entity\",\"entity\":{\"id\":\"dup\",\"version\":1,\"schemas\":[\"person\"],\"attributes\":{},\"created_at\":0,\"updated_at\":0}}\n",
+            "{\"kind\":\"end\",\"schemas\":1,\"entities\":2,\"rules\":0}\n",
+        );
+        let (schemas, entities, rules, _) = triple().await;
+        let result = import(&schemas, &entities, &rules, file.as_bytes()).await;
+        assert!(
+            result.is_err(),
+            "a duplicate entity id must stop the import"
+        );
+        assert!(
+            schemas.versions().await?.is_empty(),
+            "the failed import must remove the schema keys"
+        );
+        assert!(entities.is_empty().await?, "the import wrote no entity");
+        assert!(rules.is_empty().await?, "the import wrote no rule");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_invalid_version_sequence_writes_nothing() -> anyhow::Result<()> {
+        let file = concat!(
+            "{\"kind\":\"header\",\"format\":1}\n",
+            "{\"kind\":\"schema\",\"schema\":{\"id\":\"person\",\"version\":1,\"extends\":[],\"attributes\":{},\"created_at\":0}}\n",
+            "{\"kind\":\"schema\",\"schema\":{\"id\":\"person\",\"version\":3,\"extends\":[],\"attributes\":{},\"created_at\":0}}\n",
+            "{\"kind\":\"end\",\"schemas\":2,\"entities\":0,\"rules\":0}\n",
+        );
+        let (schemas, entities, rules, _) = triple().await;
+        let result = import(&schemas, &entities, &rules, file.as_bytes()).await;
+        assert!(result.is_err(), "a version gap must stop the import");
+        assert!(
+            schemas.versions().await?.is_empty(),
+            "the failed import must write no schema key"
+        );
+        Ok(())
+    }
 }
