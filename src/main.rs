@@ -299,6 +299,7 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
     let webhook_signing_secret = config.eav.webhook_signing_secret.clone();
     let webhook_max_attempts = config.eav.webhook_max_attempts;
     let webhook_allow_private_hosts = config.eav.webhook_allow_private_hosts;
+    let setup_token = config.authorization.setup_token.clone();
 
     let telemetry = telemetry::init(
         verbose,
@@ -364,7 +365,11 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
     // server accepts traffic. A failed drain stops startup instead of
     // leaving replicas behind.
     policy_engine.drain_outbox().await?;
-    let setup_api_module = SetupApiModule::new(policy_engine.clone(), oidc_api_module.middleware());
+    let setup_api_module = SetupApiModule::new(
+        policy_engine.clone(),
+        oidc_api_module.middleware(),
+        setup_token,
+    );
     let policy_api_module =
         PolicyApiModule::new(policy_engine.clone(), oidc_api_module.middleware());
     let fs_engine = FsEngine::init(

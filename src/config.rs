@@ -3,8 +3,8 @@
 //! Secrets may also arrive through environment variables, because secret
 //! managers inject them there. A variable that is present and not empty wins
 //! over the value in the file. See [`ENV_CLIENT_SECRET`],
-//! [`ENV_S3_ACCESS_KEY_ID`], [`ENV_S3_SECRET_ACCESS_KEY`], and
-//! [`ENV_EAV_WEBHOOK_SIGNING_SECRET`].
+//! [`ENV_SETUP_TOKEN`], [`ENV_S3_ACCESS_KEY_ID`],
+//! [`ENV_S3_SECRET_ACCESS_KEY`], and [`ENV_EAV_WEBHOOK_SIGNING_SECRET`].
 
 use std::{fs, path::Path, time::Duration};
 
@@ -58,6 +58,13 @@ pub struct Config {
 /// A value that is present and not empty wins over
 /// `authorization.client_secret`.
 pub const ENV_CLIENT_SECRET: &str = "RUST_API_CLIENT_SECRET";
+
+/// Environment variable that overrides the bootstrap secret for
+/// `/setup/admin`.
+///
+/// A value that is present and not empty wins over
+/// `authorization.setup_token`.
+pub const ENV_SETUP_TOKEN: &str = "RUST_API_SETUP_TOKEN";
 
 /// Environment variable that overrides the S3 access key ID.
 ///
@@ -192,6 +199,10 @@ fn apply_overrides_from(config: &mut Config, var: impl Fn(&str) -> Option<String
         var(ENV_CLIENT_SECRET),
         std::mem::take(&mut config.authorization.client_secret),
     );
+    config.authorization.setup_token = prefer_env_opt(
+        var(ENV_SETUP_TOKEN),
+        config.authorization.setup_token.take(),
+    );
     config.s3.access_key_id =
         prefer_env_opt(var(ENV_S3_ACCESS_KEY_ID), config.s3.access_key_id.take());
     config.s3.secret_access_key = prefer_env_opt(
@@ -267,6 +278,16 @@ impl Config {
             anyhow::bail!(
                 "authorization.client_secret must not be empty (or set RUST_API_CLIENT_SECRET)"
             );
+        }
+        if let Some(token) = &self.authorization.setup_token {
+            if token.is_empty() {
+                anyhow::bail!(
+                    "authorization.setup_token must not be empty when the field is present"
+                );
+            }
+            if token.len() < 32 {
+                anyhow::bail!("authorization.setup_token must be at least 32 bytes");
+            }
         }
         if self.authorization.issuer_url.contains("{tenantid}") {
             if self
@@ -432,6 +453,18 @@ pub struct ConfigAuthorization {
     /// is pinned statically.
     #[serde(default)]
     pub allowed_tenants: Vec<String>,
+
+    /// Bootstrap secret for `POST /setup/admin`.
+    ///
+    /// The route requires the value in the `X-Setup-Token` header. The
+    /// comparison is constant time. When the field is absent, the route is
+    /// absent too. An unconfigured deployment must not hand superadmin to
+    /// the first authenticated caller.
+    ///
+    /// The value must have at least 32 bytes. Generate it with
+    /// `python3 -c "import secrets; print(secrets.token_hex(32))"`.
+    #[serde(default)]
+    pub setup_token: Option<String>,
 }
 
 /// Telemetry and observability settings.
@@ -1107,6 +1140,35 @@ mod tests {
         format!("{err:?}")
     }
 
+    /// The bootstrap secret is optional. When it is present, it must be
+    /// long enough to resist a guess.
+    #[test]
+    fn the_setup_token_is_optional_and_must_be_long() {
+        let configured = minimal_toml().replace(
+            "client_secret = \"csecret\"",
+            "client_secret = \"csecret\"\n            setup_token = \"setup-token-that-is-at-least-32-bytes\"",
+        );
+        let cfg = parse(&configured).expect("a long setup token must parse");
+        assert_eq!(
+            cfg.authorization.setup_token.as_deref(),
+            Some("setup-token-that-is-at-least-32-bytes")
+        );
+
+        let empty = minimal_toml().replace(
+            "client_secret = \"csecret\"",
+            "client_secret = \"csecret\"\n            setup_token = \"\"",
+        );
+        let err = validation_error(&empty);
+        assert!(err.contains("setup_token"), "unexpected: {err}");
+
+        let short = minimal_toml().replace(
+            "client_secret = \"csecret\"",
+            "client_secret = \"csecret\"\n            setup_token = \"short\"",
+        );
+        let err = validation_error(&short);
+        assert!(err.contains("32 bytes"), "unexpected: {err}");
+    }
+
     #[test]
     fn validate_rejects_bad_values() {
         // The sample ratio is out of range. Telemetry used to clamp the
@@ -1332,6 +1394,7 @@ mod tests {
         let mut overlaid = parse(&toml).expect("parses");
         apply_overrides_from(&mut overlaid, |name| match name {
             ENV_CLIENT_SECRET => Some("from-env".into()),
+            ENV_SETUP_TOKEN => Some(secret.clone()),
             ENV_S3_ACCESS_KEY_ID => Some("env-ak".into()),
             ENV_S3_SECRET_ACCESS_KEY => Some("env-sk".into()),
             ENV_CAPABILITY_SECRET => Some(secret.clone()),
@@ -1343,6 +1406,10 @@ mod tests {
             other => panic!("unexpected override for {other}"),
         });
         assert_eq!(overlaid.authorization.client_secret, "from-env");
+        assert_eq!(
+            overlaid.authorization.setup_token.as_deref(),
+            Some(secret.as_str())
+        );
         assert_eq!(overlaid.s3.access_key_id.as_deref(), Some("env-ak"));
         assert_eq!(overlaid.s3.secret_access_key.as_deref(), Some("env-sk"));
         assert_eq!(overlaid.capability.secret.as_deref(), Some(secret.as_str()));
@@ -1362,6 +1429,7 @@ mod tests {
         // A plain parse of the SAME document has none of those changes.
         let plain = parse(&toml).expect("parses");
         assert_eq!(plain.authorization.client_secret, "csecret");
+        assert!(plain.authorization.setup_token.is_none());
         assert_eq!(plain.s3.access_key_id.as_deref(), Some("ak"));
         assert_eq!(plain.s3.secret_access_key.as_deref(), Some("sk"));
         assert!(plain.capability.secret.is_none());

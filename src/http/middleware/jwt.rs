@@ -38,6 +38,24 @@ const TENANT_PLACEHOLDER: &str = "{tenantid}";
 /// The browser session cookie that this middleware reads.
 const AUTH_COOKIE: &str = "auth_token";
 
+/// The `/auth` routes that establish or renew a session.
+///
+/// A corrupt session must not lock the user out of these routes.
+const PUBLIC_AUTH_ROUTES: [&str; 4] = [
+    "/auth/login",
+    "/auth/callback",
+    "/auth/logout",
+    "/auth/refresh",
+];
+
+/// Reports whether `path` is a public authentication route.
+///
+/// A malformed token is an unusable session on these routes. The middleware
+/// then continues as anonymous. Every other route keeps the hard 401.
+fn is_public_auth_route(path: &str) -> bool {
+    PUBLIC_AUTH_ROUTES.contains(&path)
+}
+
 /// A template for a multi-tenant issuer. The discovery document of the
 /// provider publishes an issuer. That issuer contains the literal
 /// placeholder `{tenantid}`. Each token resolves the placeholder to the
@@ -342,6 +360,9 @@ where
         let keys = self.keys.clone();
         let validation = self.validation.clone();
         let issuer_template = self.issuer_template.clone();
+        // A malformed token is a soft failure on the routes that start or
+        // renew a session. It stays a hard failure on every other route.
+        let public_route = is_public_auth_route(req.path());
 
         // The bearer header wins over the authentication cookie. A stale or
         // expired browser session cookie must not hide a header that the
@@ -399,12 +420,16 @@ where
                 // it.
                 let claims = async {
                     let header = jsonwebtoken::decode_header(&token)
-                        .map_err(|e| (format!("undecodable header: {e}"), true))?;
+                        .map_err(|e| (format!("undecodable header: {e}"), !public_route))?;
 
+                    // A rotated-away `kid` is an unusable session on the
+                    // public routes. The user can then log in again, and the
+                    // callback writes a token under the new keys. On any
+                    // other route the miss stays a hard 401.
                     let signing_key = keys
                         .get(header.kid.as_deref())
                         .await
-                        .ok_or_else(|| ("no signing key matches kid".to_string(), true))?;
+                        .ok_or_else(|| ("no signing key matches kid".to_string(), !public_route))?;
 
                     // The code pins the validation to the algorithm of the
                     // selected key, so a token cannot change to an unexpected
@@ -849,6 +874,133 @@ mod tests {
 
         Ok(())
     }
+    /// A corrupt cookie must not lock the user out of the login route.
+    ///
+    /// The whole `/auth` scope carries this middleware. A cookie that is not
+    /// a JWT used to fail closed before the handler ran. The user could not
+    /// start a new login or clear the bad cookie.
+    #[tokio::test]
+    async fn a_malformed_cookie_reaches_the_login_route() -> anyhow::Result<()> {
+        let (key, _enc) = rsa_key("kid-t")?;
+        let server = spawn_jwks(json!({ "keys": [key] })).await;
+
+        let mw = JwtClaimsMiddleware::<TestClaims>::new_with_jks(
+            &format!("{}/jwks", server.uri()),
+            "test-aud",
+            "https://idp.test",
+        )
+        .await?;
+
+        let svc = actix_web::test::init_service(
+            actix_web::App::new()
+                .wrap(mw)
+                .service(actix_web::web::resource("/auth/login").to(|| async { "redirect" })),
+        )
+        .await;
+
+        let res = actix_web::test::try_call_service(
+            &svc,
+            actix_web::test::TestRequest::get()
+                .uri("/auth/login")
+                .insert_header(("Cookie", "auth_token=not-a-jwt"))
+                .to_request(),
+        )
+        .await
+        .expect("the malformed cookie must not refuse the login route");
+
+        assert_eq!(res.status(), 200);
+        Ok(())
+    }
+
+    /// A token whose `kid` left the JWKS must not block a new login.
+    ///
+    /// This is the state after an identity provider rotates its signing
+    /// keys. The old cookie is valid JSON but unusable. The user must still
+    /// reach the route that starts a new session.
+    #[tokio::test]
+    async fn an_unknown_kid_reaches_the_login_route() -> anyhow::Result<()> {
+        let (key, enc) = rsa_key("kid-t")?;
+        let server = spawn_jwks(json!({ "keys": [key] })).await;
+
+        let mw = JwtClaimsMiddleware::<TestClaims>::new_with_jks(
+            &format!("{}/jwks", server.uri()),
+            "test-aud",
+            "https://idp.test",
+        )
+        .await?;
+
+        let svc = actix_web::test::init_service(
+            actix_web::App::new()
+                .wrap(mw)
+                .service(actix_web::web::resource("/auth/login").to(|| async { "redirect" })),
+        )
+        .await;
+
+        let rotated_away = sign_rs256(
+            &json!({ "sub": "u1", "aud": "test-aud", "exp": 2000000000u64 }),
+            "retired-kid",
+            &enc,
+        )?;
+        let res = actix_web::test::try_call_service(
+            &svc,
+            actix_web::test::TestRequest::get()
+                .uri("/auth/login")
+                .insert_header(("Cookie", format!("auth_token={rotated_away}")))
+                .to_request(),
+        )
+        .await
+        .expect("an unknown kid must not refuse the login route");
+
+        assert_eq!(res.status(), 200);
+        Ok(())
+    }
+
+    /// The session probe still refuses a token with an unknown `kid`.
+    ///
+    /// The degradation is for the public routes only. `/auth/me` needs a
+    /// valid subject, so it must answer 401.
+    #[tokio::test]
+    async fn an_unknown_kid_still_returns_401_on_the_session_probe() -> anyhow::Result<()> {
+        let (key, enc) = rsa_key("kid-t")?;
+        let server = spawn_jwks(json!({ "keys": [key] })).await;
+
+        let mw = JwtClaimsMiddleware::<TestClaims>::new_with_jks(
+            &format!("{}/jwks", server.uri()),
+            "test-aud",
+            "https://idp.test",
+        )
+        .await?;
+
+        async fn me(claims: Validated<TestClaims>) -> actix_web::HttpResponse {
+            actix_web::HttpResponse::Ok().body(claims.sub.clone())
+        }
+
+        let svc = actix_web::test::init_service(
+            actix_web::App::new()
+                .wrap(mw)
+                .service(actix_web::web::resource("/auth/me").to(me)),
+        )
+        .await;
+
+        let rotated_away = sign_rs256(
+            &json!({ "sub": "u1", "aud": "test-aud", "exp": 2000000000u64 }),
+            "retired-kid",
+            &enc,
+        )?;
+        let res = actix_web::test::try_call_service(
+            &svc,
+            actix_web::test::TestRequest::get()
+                .uri("/auth/me")
+                .insert_header(("Cookie", format!("auth_token={rotated_away}")))
+                .to_request(),
+        )
+        .await;
+
+        let err = res.expect_err("the session probe must refuse an unknown kid");
+        assert_eq!(err.as_response_error().status_code(), 401);
+        Ok(())
+    }
+
     /// Regression test for the lockout. An unusable credential must change to
     /// anonymous instead of returning 401. Otherwise the cookie becomes the
     /// cause of the lockout.
