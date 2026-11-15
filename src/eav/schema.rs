@@ -36,6 +36,7 @@ use serde::{Deserialize, Deserializer, Serialize, de};
 use tokio::sync::{Mutex, RwLock};
 
 use crate::eav::MAX_PAGE_OFFSET;
+use crate::eav::entity::{ATTR_KEY_PREFIX, UNIQUE_KEY_PREFIX};
 use crate::eav::error::SchemaError;
 
 /// Key prefix for the whole schema family.
@@ -266,7 +267,23 @@ impl SchemaRegistry {
                 created_at: chrono::Utc::now().timestamp(),
             };
 
-            flatten(&tx, &def).await?;
+            let effective = flatten(&tx, &def).await?;
+
+            // The index and unique names are name-level facts.
+            // The name markers make a later write check every schema that
+            // uses the name.
+            for (name, attribute) in &effective.attributes {
+                if attribute.indexed {
+                    tx.set_bytes(&format!("{ATTR_KEY_PREFIX}{name}"), b"")
+                        .await
+                        .map_err(SchemaError::Store)?;
+                }
+                if attribute.unique {
+                    tx.set_bytes(&format!("{UNIQUE_KEY_PREFIX}{name}"), b"")
+                        .await
+                        .map_err(SchemaError::Store)?;
+                }
+            }
 
             let version_bytes =
                 serde_json::to_vec(&def).map_err(|e| SchemaError::Internal(e.to_string()))?;
