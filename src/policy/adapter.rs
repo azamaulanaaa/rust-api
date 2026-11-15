@@ -140,7 +140,7 @@ pub struct OxkvAdapter<S: Store> {
     store: S,
 }
 
-impl<S: Store> OxkvAdapter<S> {
+impl<S: Store + Sync> OxkvAdapter<S> {
     /// Wraps an existing store instance.
     pub fn new(store: S) -> Self {
         Self { store }
@@ -171,11 +171,8 @@ impl<S: Store> OxkvAdapter<S> {
     async fn clear_all(&mut self) -> Result<(), oxkv::StoreError> {
         let keys: Vec<String> = self
             .store
-            .gets_bytes(None, Direction::Next, (None, None))
-            .await?
-            .into_iter()
-            .map(|kv| kv.key)
-            .collect();
+            .gets_keys(None, Direction::Next, (None, None))
+            .await?;
         let tx = self.store.begin_tx()?;
         for key in &keys {
             tx.delete(key).await?;
