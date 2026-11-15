@@ -47,6 +47,34 @@ const SHUTDOWN_TIMEOUT_SECS: u64 = 30;
 /// The time a slow client has to send the request headers and body.
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Builds the query extractor configuration.
+///
+/// A query value that does not parse must answer inside the shared
+/// [`ErrorBody`](crate::http::error::ErrorBody) envelope.
+/// The actix default is a bare `400` in `text/plain`.
+/// The extractor message names the offending field. The server logs the
+/// message and does not send it.
+pub fn query_config() -> web::QueryConfig {
+    web::QueryConfig::default().error_handler(|err, _| {
+        tracing::debug!("malformed query string: {err}");
+        ApiError::BadRequest.into()
+    })
+}
+
+/// Builds the path extractor configuration.
+///
+/// A path segment that does not parse must answer inside the shared
+/// [`ErrorBody`](crate::http::error::ErrorBody) envelope.
+/// The actix default is a bare `400` in `text/plain`.
+/// The extractor message names the offending segment. The server logs the
+/// message and does not send it.
+pub fn path_config() -> web::PathConfig {
+    web::PathConfig::default().error_handler(|err, _| {
+        tracing::debug!("malformed path segment: {err}");
+        ApiError::BadRequest.into()
+    })
+}
+
 /// Applies the shared body-size limits to an Actix application.
 ///
 /// The function is separate so that unit tests can check the limits. The
@@ -63,6 +91,8 @@ where
         >,
 {
     app.app_data(web::PayloadConfig::new(MAX_PAYLOAD_BYTES))
+        .app_data(query_config())
+        .app_data(path_config())
         .app_data(
             web::JsonConfig::default()
                 .limit(MAX_JSON_BYTES)
@@ -494,7 +524,7 @@ impl ApiService {
 mod tests {
     use super::*;
     use actix_web::{
-        HttpResponse,
+        HttpResponse, get,
         http::header::CONTENT_TYPE,
         http::{Method, StatusCode},
         post, test, web,
@@ -917,6 +947,42 @@ mod tests {
         let parsed: error::ErrorBody =
             serde_json::from_slice(&test::read_body(res).await).expect("envelope");
         assert_eq!(parsed.error, "bad request");
+    }
+
+    /// A malformed query value and a malformed path segment both answer
+    /// inside the envelope. The actix default for each is a bare `400` in
+    /// `text/plain`. A documented route must not answer outside the uniform
+    /// envelope.
+    #[actix_web::test]
+    async fn malformed_query_and_path_answer_inside_the_envelope() {
+        #[get("/value/{id}")]
+        async fn read_value(_path: web::Path<u64>, _query: web::Query<Limit>) -> HttpResponse {
+            HttpResponse::Ok().finish()
+        }
+
+        #[derive(serde::Deserialize)]
+        struct Limit {
+            #[allow(dead_code)]
+            limit: usize,
+        }
+
+        let app = test::init_service(apply_limits(App::new()).service(read_value)).await;
+        for uri in ["/value/not-a-number", "/value/1?limit=abc"] {
+            let res =
+                test::call_service(&app, test::TestRequest::get().uri(uri).to_request()).await;
+            assert_eq!(res.status(), StatusCode::BAD_REQUEST, "{uri}");
+            assert_eq!(
+                res.headers()
+                    .get(CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok()),
+                Some("application/json"),
+                "{uri}"
+            );
+            let body: error::ErrorBody =
+                serde_json::from_slice(&test::read_body(res).await).expect("envelope");
+            assert_eq!(body.error, "bad request", "{uri}");
+            assert_eq!(body.code.as_deref(), Some("invalid_request"), "{uri}");
+        }
     }
 
     /// A 300 KiB body is larger than the actix default of 256 KiB for

@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use oxkv::{GetSet, OxKvStore, Store as _, StoreError, Transaction as _, TxCas as _};
+use oxkv::{Direction, GetSet, OxKvStore, Store as _, StoreError, Transaction as _, TxCas as _};
 use tokio::sync::RwLock;
 
 use crate::fencing::Latch;
@@ -177,16 +177,26 @@ impl Wal {
             )));
         }
         let g = self.store.read().await;
-        let mut out = Vec::new();
-        for seq in from..=to {
-            let Some(b) = g
-                .get_bytes(&Self::entry_key(seq))
-                .await
-                .map_err(FsError::from)?
-            else {
-                return Err(FsError::Store(format!("wal entry {seq} missing")));
-            };
-            let entry: WalEntry = serde_json::from_slice(&b)
+        let rows = g
+            .gets_bytes(
+                None,
+                Direction::Next,
+                (Some(Self::entry_key(from)), Some(Self::entry_key(to))),
+            )
+            .await
+            .map_err(FsError::from)?;
+        let expected =
+            usize::try_from(to.saturating_sub(from).saturating_add(1)).unwrap_or(usize::MAX);
+        if rows.len() != expected {
+            return Err(FsError::Store(format!(
+                "wal range {from}..={to} returned {} entries, expected {expected}",
+                rows.len()
+            )));
+        }
+        let mut out = Vec::with_capacity(expected);
+        for (offset, row) in rows.into_iter().enumerate() {
+            let seq = from.saturating_add(offset as u64);
+            let entry: WalEntry = serde_json::from_slice(&row.value)
                 .map_err(|e| FsError::Internal(format!("wal entry {seq} undecodable: {e}")))?;
             if entry.seq != seq {
                 return Err(FsError::Internal(format!(
@@ -253,6 +263,42 @@ mod tests {
         let r = wal.range(1, 2).await?;
         assert_eq!(r.len(), 2);
         assert_eq!(r[0].seq, 1);
+        Ok(())
+    }
+
+    /// A multi-entry range returns every entry in sequence order.
+    ///
+    /// The read uses one range scan, so the count and the order must match
+    /// the appended entries. A partial scan, an extra key, or a reordered
+    /// result fails the test.
+    #[tokio::test]
+    async fn a_multi_entry_range_keeps_every_entry_in_order() -> anyhow::Result<()> {
+        let wal = test_wal().await;
+        for n in 0..8u32 {
+            wal.append(WalOp::Attach {
+                row_type: "invoice".into(),
+                row_id: n.to_string(),
+                file_id: "f".into(),
+            })
+            .await?;
+        }
+
+        let entries = wal.range(1, 8).await?;
+        assert_eq!(entries.len(), 8);
+        for (offset, entry) in entries.iter().enumerate() {
+            let seq = offset as u64 + 1;
+            assert_eq!(entry.seq, seq);
+            assert!(
+                matches!(&entry.op, WalOp::Attach { row_id, .. } if row_id == &(offset as u32).to_string())
+            );
+        }
+
+        // A sub-range reads only its own entries, in order.
+        let middle = wal.range(3, 5).await?;
+        assert_eq!(
+            middle.iter().map(|entry| entry.seq).collect::<Vec<_>>(),
+            vec![3, 4, 5]
+        );
         Ok(())
     }
 

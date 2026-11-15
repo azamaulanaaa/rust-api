@@ -15,11 +15,39 @@
 //! visible at startup.
 
 use std::sync::Arc;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use object_store::ObjectStore;
 use oxkv::{LruCache, ObjectPath, OxKvStore, SstFile, StoreError};
 
 use crate::fs::s3::{S3Backend, S3ClientConfig};
+
+/// The default size of the shared SST cache, in bytes.
+///
+/// One process-wide cache serves every OxKV handle. A per-handle cache that
+/// each handle sizes at 256 MB does not fit a 512 MiB container with more
+/// than one handle. The shared cache is bounded, so the handle count does not
+/// multiply the memory budget.
+pub const DEFAULT_SST_CACHE_BYTES: usize = 128 * 1024 * 1024;
+
+/// The configured size of the shared SST cache, in bytes.
+static SST_CACHE_BYTES: AtomicUsize = AtomicUsize::new(DEFAULT_SST_CACHE_BYTES);
+
+/// The one SST cache that every OxKV handle in this process shares.
+static SST_CACHE: OnceLock<LruCache<String, Arc<SstFile>>> = OnceLock::new();
+
+/// Sets the size of the shared SST cache, in bytes.
+///
+/// Call this function before the code builds the first OxKV handle. The first
+/// call to [`default_sst_cache`] fixes the size for the process. A later call
+/// changes the stored value only, so a process with an open handle keeps its
+/// cache size.
+///
+/// The value `0` disables SST caching.
+pub fn configure_sst_cache_bytes(bytes: usize) {
+    SST_CACHE_BYTES.store(bytes, Ordering::Relaxed);
+}
 
 /// Builds an `Arc<dyn ObjectStore>` from [`S3ClientConfig`].
 ///
@@ -57,7 +85,7 @@ pub async fn build_s3_store(cfg: &S3ClientConfig, prefix: &str) -> Result<OxKvSt
     if cfg.backend == S3Backend::Memory {
         builder = builder.skip_probe(true);
     }
-    builder.build().await
+    builder.build_with_cache(default_sst_cache()).await
 }
 
 /// Builds a read-only [`oxkv::OxKvReader`] at `prefix` inside the bucket of
@@ -93,20 +121,29 @@ async fn reader_over(
     OxKvStore::builder()
         .with_store(Arc::new(oxkv_s3::ObjectStoreStorage::new(inner)))
         .with_prefix(ObjectPath::from(prefix.trim_matches('/')))
-        .build_reader()
+        .build_reader_with_cache(default_sst_cache())
         .await
 }
 
-/// Default cache of SST blocks for the calls that open a replica.
+/// Returns the one SST cache that every OxKV handle in this process shares.
 ///
-/// This is the same 256 MB S3-FIFO size that oxkv sets for each handle in
-/// `build()`. One instance that every call shares is better than a cold cache
-/// that every handle drops. Sharing means that a rebuild does not receive hot
-/// SSTs again. The clones coordinate through the shared state.
+/// The cache is bounded by [`DEFAULT_SST_CACHE_BYTES`], or by the value that
+/// [`configure_sst_cache_bytes`] sets before the first call. One instance that
+/// every handle shares is better than a cold cache that every handle drops.
+/// Sharing means that a rebuild does not receive hot SSTs again. The clones
+/// coordinate through the shared state.
+///
+/// The size is one process-wide budget. It does not grow with the number of
+/// handles.
 pub fn default_sst_cache() -> LruCache<String, Arc<SstFile>> {
-    LruCache::new(256 * 1024 * 1024, |_: &String, v: &Arc<SstFile>| {
-        u32::try_from(v.size()).unwrap_or(u32::MAX)
-    })
+    SST_CACHE
+        .get_or_init(|| {
+            let bytes = SST_CACHE_BYTES.load(Ordering::Relaxed);
+            LruCache::new(bytes, |_: &String, v: &Arc<SstFile>| {
+                u32::try_from(v.size()).unwrap_or(u32::MAX)
+            })
+        })
+        .clone()
 }
 
 /// Builds an OxKV prefix for one test that cannot collide with another.
@@ -189,6 +226,10 @@ pub async fn build_test_reader(inner: Arc<dyn ObjectStore>, prefix: &str) -> oxk
 /// `skip_probe(true)`, because `InMemory` has no probe for a
 /// conditional write. The caller must use a different `prefix` for each
 /// buffer. Using one prefix for two buffers is a bug.
+///
+/// The scratch store shares the one process-wide SST cache. A snapshot build
+/// can run beside the writer handles, so a second 256 MB cache per build would
+/// break the memory budget.
 #[allow(clippy::expect_used)]
 pub async fn build_scratch_store(prefix: &str) -> OxKvStore {
     let inner = Arc::new(object_store::memory::InMemory::new()) as Arc<dyn ObjectStore>;
@@ -196,7 +237,7 @@ pub async fn build_scratch_store(prefix: &str) -> OxKvStore {
         .with_store(Arc::new(oxkv_s3::ObjectStoreStorage::new(inner)))
         .with_prefix(ObjectPath::from(prefix))
         .skip_probe(true)
-        .build()
+        .build_with_cache(default_sst_cache())
         .await
         .expect("scratch OxKvStore must build")
 }

@@ -22,6 +22,8 @@
 //! The backoff wait stops when the cancel token fires.
 //! Tests use a 10 millisecond base.
 //! A loop clears its flag after a pass succeeds.
+//! The rule runner clears its flag only after the engine records a real
+//! cursor advance or one healthy idle poll.
 //! The readiness probe reads the flags.
 //! Readiness stays false while any loop flag is set.
 //! The flags are a signal for the operator, not a stop switch.
@@ -275,6 +277,10 @@ pub struct EavRuntime {
     wal: Wal,
     /// The OpenTelemetry instruments for the runtime.
     metrics: EavMetrics,
+    /// The byte limit for one full replica read.
+    ///
+    /// Zero disables the gate.
+    full_replica_byte_limit: usize,
     /// The failure flag of each background loop.
     ///
     /// The flags start clear.
@@ -319,7 +325,7 @@ impl EavRuntime {
         let entity_store = build_s3_store(s3, &domain_prefix(db_prefix, "entity"))
             .await
             .context("build the EAV entity store")?;
-        let rule_store = build_s3_store(s3, &domain_prefix(db_prefix, "rules"))
+        let rule_store = build_s3_store(s3, &rule_store_prefix(db_prefix))
             .await
             .context("build the EAV rule store")?;
         let replica_store = build_s3_store(s3, &domain_prefix(db_prefix, "replica"))
@@ -347,6 +353,7 @@ impl EavRuntime {
             engine,
             wal,
             metrics,
+            full_replica_byte_limit: 0,
             failed: Arc::new(LoopFailures::default()),
             #[cfg(test)]
             runtime_test: RuntimeTestHooks::default(),
@@ -396,6 +403,31 @@ impl EavRuntime {
         &self.metrics
     }
 
+    /// Replaces the runtime metrics in a test.
+    #[cfg(test)]
+    pub(crate) fn with_metrics(mut self, metrics: EavMetrics) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
+    /// Sets the byte limit for one full replica read.
+    ///
+    /// A full read with no `chunk` parameter rejects a stored replica above
+    /// this size with `400`.
+    /// The client must then read the replica in chunk mode.
+    /// A value of `0` disables the gate.
+    pub fn with_full_replica_limit(mut self, bytes: usize) -> Self {
+        self.full_replica_byte_limit = bytes;
+        self
+    }
+
+    /// Returns the byte limit for one full replica read.
+    ///
+    /// Zero means that the gate is disabled.
+    pub fn full_replica_byte_limit(&self) -> usize {
+        self.full_replica_byte_limit
+    }
+
     /// Returns `true` while any background loop is failed.
     ///
     /// The call is cheap and does not block.
@@ -440,18 +472,19 @@ impl EavRuntime {
     ///
     /// The call reads every time index key.
     /// For each key it reads at most `limit` due entities.
-    /// The call emits the timer event first.
-    /// It then retires the time index row and writes the fired marker in one
-    /// transaction.
-    /// A retire that returns `false` means the value changed after the read,
-    /// and the call does not count the timer as emitted.
+    /// The call writes the fired marker, removes the time row, and writes the
+    /// timer event to the outbox in one transaction.
+    /// It increments the pending outbox counter in that transaction.
+    /// The outbox relay then delivers the event in feed order.
+    /// A value that changed after the read returns no event, and the call
+    /// does not count the timer as emitted.
     /// When a fired marker already exists for a due value, the call retires
     /// the row without an event.
     /// That drain removes rows that fired before retirement existed, so an
     /// upgraded store recovers.
-    /// A failed retire returns the error.
+    /// A failed transaction returns the error and writes no row.
     /// The next pass then emits the same event again.
-    /// The event is already written, and a duplicate event is idempotent.
+    /// The event id is stable, and a duplicate event is idempotent.
     /// The rule engine execution marker stops a duplicate action.
     pub async fn fire_due_timers(&self, now: i64, limit: usize) -> anyhow::Result<usize> {
         let mut emitted = 0;
@@ -487,18 +520,14 @@ impl EavRuntime {
                         .context("retire the EAV timer row")?;
                     continue;
                 }
-                self.entities
+                let event = self
+                    .entities
                     .emit_timer(&entity, &key, due_at, now)
                     .await
                     .context("emit an EAV timer event")?;
-                let retired = self
-                    .entities
-                    .retire_timer(&entity.id, &key, due_at)
-                    .await
-                    .context("retire the EAV timer row")?;
-                // A false result means the value changed after the read.
-                // The event stays idempotent, and the next pass reads the new value.
-                emitted += usize::from(retired);
+                // A missing event means the value changed after the read.
+                // The next pass reads the new value.
+                emitted += usize::from(event.is_some());
             }
         }
         self.metrics.record_timer_due(due_count);
@@ -522,13 +551,15 @@ impl EavRuntime {
     /// An error in one loop does not stop the other loops or the remaining
     /// work of that loop.
     /// A loop clears its flag after a pass succeeds.
+    /// The rule runner clears its flag only after the engine records a real
+    /// cursor advance or one healthy idle poll.
     /// The flags are a signal for the operator, not a stop switch.
     /// The call returns `Ok(())` only when `cancel` is cancelled.
     /// It waits for all four supervisors to stop before it returns.
     /// A normal cancellation does not set a flag.
     ///
     /// The outbox relay flushes the pending entity events.
-    /// The rule runner tails the shared change feed.
+    /// The rule runner tails the shared change feed and reports progress.
     /// The marker cleanup deletes old execution markers.
     /// The timer pass emits the due timer events.
     pub async fn run<C: CancelToken>(
@@ -713,9 +744,22 @@ impl EavRuntime {
                     if let Ok(pending) = self.entities.outbox_count().await {
                         self.metrics.record_outbox_pending(pending as u64);
                     }
+                    if let Ok(age) = self.entities.outbox_pending_age().await {
+                        self.metrics
+                            .record_outbox_pending_age(age.unwrap_or_default());
+                    }
                 }
                 Err(error) => {
                     self.metrics.record_outbox_failure();
+                    // A failed flush leaves rows in the outbox. Record the
+                    // gauge here, because the success path does not run.
+                    if let Ok(pending) = self.entities.outbox_count().await {
+                        self.metrics.record_outbox_pending(pending as u64);
+                    }
+                    if let Ok(age) = self.entities.outbox_pending_age().await {
+                        self.metrics
+                            .record_outbox_pending_age(age.unwrap_or_default());
+                    }
                     return Err(error).context("flush the EAV entity outbox");
                 }
             }
@@ -725,8 +769,12 @@ impl EavRuntime {
     /// Runs the rule engine until `cancel` fires.
     ///
     /// The engine call returns only on an error or on cancellation.
-    /// The call treats one full poll interval without an error as a
-    /// successful pass, and clears the failure flag of the rule runner.
+    /// The engine records a health signal after each real cursor advance and
+    /// after one healthy idle poll.
+    /// The call clears the failure flag of the rule runner only after that
+    /// signal.
+    /// One poll interval without a signal does not clear the flag, so a runner
+    /// that makes no progress stays failed.
     /// A zero interval becomes one second.
     /// A failed engine call returns the error to the supervisor.
     async fn run_rule_runner<C: CancelToken>(
@@ -735,7 +783,42 @@ impl EavRuntime {
         poll_interval: Duration,
     ) -> anyhow::Result<()> {
         let interval = nonzero_duration(poll_interval);
-        let mut run = std::pin::pin!(self.engine.run(&self.wal, cancel.clone(), interval));
+        let progress = Arc::new(AtomicBool::new(false));
+        let signal = progress.clone();
+        let run = {
+            let engine = self.engine.clone();
+            let wal = self.wal.clone();
+            let cancel = cancel.clone();
+            async move {
+                let record = move || signal.store(true, Ordering::SeqCst);
+                engine
+                    .run_with_progress(&wal, cancel, interval, &record)
+                    .await
+                    .map_err(|error| anyhow::anyhow!("EAV rule runner failed: {error}"))
+            }
+        };
+        self.drive_rule_run(cancel, interval, run, progress).await
+    }
+
+    /// Clears the rule-runner flag only after the engine records progress.
+    ///
+    /// The call waits for `run` or for one poll interval.
+    /// A tick clears the failure flag only when the engine recorded a signal
+    /// since the previous tick.
+    /// A runner that polls without a signal keeps the flag set.
+    /// The call returns the error of a failed run to the supervisor.
+    async fn drive_rule_run<C, F>(
+        &self,
+        cancel: C,
+        interval: Duration,
+        run: F,
+        progress: Arc<AtomicBool>,
+    ) -> anyhow::Result<()>
+    where
+        C: CancelToken,
+        F: std::future::Future<Output = anyhow::Result<()>>,
+    {
+        let mut run = std::pin::pin!(run);
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // The first tick completes at once. Skip it, so a pass needs one full
@@ -744,11 +827,10 @@ impl EavRuntime {
         loop {
             tokio::select! {
                 result = &mut run => {
-                    return result
-                        .map_err(|error| anyhow::anyhow!("EAV rule runner failed: {error}"));
+                    return result;
                 }
                 _ = ticker.tick() => {
-                    if !cancel.is_cancelled() {
+                    if progress.swap(false, Ordering::SeqCst) && !cancel.is_cancelled() {
                         self.mark_loop_ok(LoopSlot::RuleRunner);
                     }
                 }
@@ -885,6 +967,14 @@ fn domain_prefix(db_prefix: &str, domain: &str) -> String {
     } else {
         format!("{root}/eav/{domain}")
     }
+}
+
+/// Returns the rule-store prefix under one `[database].prefix`.
+///
+/// The server and the operator commands use this function.
+/// The rule cursor and the dead-letter rows then live under one prefix.
+pub fn rule_store_prefix(db_prefix: &str) -> String {
+    domain_prefix(db_prefix, "rules")
 }
 
 #[cfg(test)]
@@ -1067,7 +1157,7 @@ mod tests {
     /// A [`ChangeSink`] that accepts timer events and refuses other events.
     ///
     /// The outbox relay fails on the created entity event.
-    /// The timer pass can still append its event to the shared feed.
+    /// The timer event then waits in the outbox behind that row.
     struct TimerOnlyFeed {
         wal: Wal,
     }
@@ -1113,7 +1203,8 @@ mod tests {
     /// The entity store uses a feed that accepts timer events and refuses
     /// other events.
     /// The created entity leaves an outbox row, so the relay fails.
-    /// The timer pass can still append its event to the runtime WAL.
+    /// The timer pass writes its event to the same outbox but cannot deliver
+    /// it before the earlier entity row.
     async fn runtime_with_a_timer_only_feed() -> EavRuntime {
         let mut runtime = build_runtime(Vec::new()).await;
         let s3 = memory_s3();
@@ -1162,6 +1253,7 @@ mod tests {
     ///
     /// The create commits the outbox row and then reports the delivery
     /// error, so the row stays for the relay to find.
+    /// The entity store has the `invoice` schema and the `timer` schema.
     async fn runtime_with_a_flaky_outbox(failures: usize) -> (EavRuntime, Arc<AtomicUsize>) {
         let mut runtime = build_runtime(Vec::new()).await;
         let s3 = memory_s3();
@@ -1182,6 +1274,7 @@ mod tests {
         });
         let entities = EntityStore::new(store, schemas.clone()).with_change_sink(feed);
         schemas.publish(schema()).await.unwrap();
+        schemas.publish(timer_schema()).await.unwrap();
         runtime.entities = entities;
         (runtime, failed_appends)
     }
@@ -1429,6 +1522,53 @@ mod tests {
             .expect("a normal cancellation must return Ok");
     }
 
+    /// A runner that polls but makes no progress keeps its failure flag.
+    ///
+    /// The fake run loop sleeps and never records a signal.
+    /// Several poll intervals must not clear the flag.
+    #[tokio::test]
+    async fn a_rule_runner_that_makes_no_progress_keeps_its_failure_flag() {
+        let runtime = build_runtime(Vec::new()).await;
+        runtime.mark_loop_failed(LoopSlot::RuleRunner);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let runner = tokio::spawn({
+            let runtime = runtime.clone();
+            let cancel = cancel.clone();
+            async move {
+                let poll_cancel = cancel.clone();
+                let run = async move {
+                    loop {
+                        if poll_cancel.is_cancelled() {
+                            return Ok(());
+                        }
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                };
+                runtime
+                    .drive_rule_run(
+                        cancel,
+                        Duration::from_millis(2),
+                        run,
+                        Arc::new(AtomicBool::new(false)),
+                    )
+                    .await
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            runtime.failed(),
+            "a runner that makes no progress must keep the failure flag"
+        );
+
+        cancel.store(true, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(2), runner)
+            .await
+            .expect("the runner must stop")
+            .expect("the task does not panic")
+            .expect("a cancelled runner must return Ok");
+    }
+
     #[tokio::test]
     async fn spawn_sets_the_failure_flag_when_the_outbox_relay_fails() {
         let runtime = runtime_with_a_failing_outbox().await;
@@ -1474,7 +1614,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_failed_outbox_loop_does_not_stop_the_timer_loop() {
+    async fn a_failed_outbox_loop_keeps_the_timer_event_pending() {
         let runtime = runtime_with_a_timer_only_feed().await;
         assert!(!runtime.failed());
 
@@ -1484,7 +1624,7 @@ mod tests {
             .create(entity(), &WriteContext::new("tester"))
             .await
             .unwrap();
-        // The due timer entity makes the timer pass emit one event.
+        // The due timer entity writes its event to the outbox.
         let now = chrono::Utc::now().timestamp();
         runtime
             .entities()
@@ -1504,12 +1644,23 @@ mod tests {
         .expect("the outbox failure must set the loop flag");
 
         tokio::time::timeout(Duration::from_secs(2), async {
-            while runtime.wal().head().await.unwrap() == 0 {
+            while runtime.entities().outbox_count().await.unwrap() < 3 {
                 tokio::time::sleep(Duration::from_millis(2)).await;
             }
         })
         .await
-        .expect("the timer loop must still emit after the outbox failure");
+        .expect("the timer event must wait in the outbox");
+
+        // The timer event does not overtake the two pending entity events.
+        assert_eq!(runtime.wal().head().await.unwrap(), 0);
+        assert!(
+            runtime
+                .entities()
+                .is_timer_fired("t1", "due", now - 10)
+                .await
+                .unwrap(),
+            "the timer row must be retired"
+        );
 
         cancel.store(true, Ordering::SeqCst);
         tokio::time::timeout(Duration::from_secs(2), handle)
@@ -1562,6 +1713,7 @@ mod tests {
         let runtime = build_runtime_with_scripts(vec![recorder.clone()]).await;
         runtime.schemas().publish(schema()).await.unwrap();
         let mut scripted = rule();
+        scripted.capabilities.read = vec!["invoice".to_string()];
         scripted.condition = Condition::Script {
             source: r#"event.kind == "created" && entity.attributes.total == 10"#.to_string(),
         };
@@ -1654,6 +1806,52 @@ mod tests {
         assert_eq!(runtime.fire_due_timers(100, 100).await.unwrap(), 1);
         assert_eq!(runtime.fire_due_timers(100, 100).await.unwrap(), 0);
         assert_eq!(runtime.wal().head().await.unwrap(), 2);
+    }
+
+    /// A due timer waits behind an earlier pending entity event.
+    ///
+    /// The feed refuses the create append, so the entity event stays in the
+    /// outbox.
+    /// The timer pass writes its event to the same outbox.
+    /// The next flush delivers the entity event first and the timer event
+    /// second.
+    #[tokio::test]
+    async fn a_pending_entity_event_reaches_the_feed_before_a_due_timer() {
+        let (runtime, failed) = runtime_with_a_flaky_outbox(1).await;
+        let now = chrono::Utc::now().timestamp();
+        runtime
+            .entities()
+            .create(timer_entity("t1", now - 10), &WriteContext::new("tester"))
+            .await
+            .unwrap();
+
+        assert_eq!(failed.load(Ordering::SeqCst), 1);
+        assert_eq!(runtime.entities().outbox_count().await.unwrap(), 1);
+        assert_eq!(runtime.wal().head().await.unwrap(), 0);
+
+        assert_eq!(runtime.fire_due_timers(now, 100).await.unwrap(), 1);
+
+        assert_eq!(runtime.entities().outbox_count().await.unwrap(), 0);
+        let head = runtime.wal().head().await.unwrap();
+        let delivered: Vec<(String, EntityEventKind)> = runtime
+            .wal()
+            .range(1, head)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|entry| match entry.op {
+                WalOp::Entity { event } => Some((event.entity_id, event.kind)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            delivered,
+            vec![
+                ("t1".to_string(), EntityEventKind::Created),
+                ("t1".to_string(), EntityEventKind::Timer),
+            ],
+            "the entity event must reach the feed first"
+        );
     }
 
     #[tokio::test]
