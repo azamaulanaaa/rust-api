@@ -277,6 +277,7 @@ impl PolicyEngine {
     pub async fn init_with_store<S>(store: S) -> Result<Self, PolicyError>
     where
         S: oxkv::Store + Send + Sync + 'static,
+        S::Transaction: oxkv::TxCas,
     {
         let adapter = adapter::OxkvAdapter::new(store);
         let model = DefaultModel::from_str(RBAC_MODEL).await?;
