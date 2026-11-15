@@ -676,6 +676,7 @@ impl From<RuleError> for EavApiError {
             RuleError::Invalid(_) | RuleError::ConditionDepth | RuleError::UnknownAction(_) => {
                 Kind::Invalid
             }
+            RuleError::VersionConflict => Kind::Conflict,
             RuleError::Store(_)
             | RuleError::Serialization(_)
             | RuleError::Action(_)
@@ -1249,9 +1250,9 @@ async fn list_schema_entities(
 /// the listed schemas.
 /// The capability ids do not need a schema that exists. A rule can be saved
 /// before its schema.
-/// The enable route does not change the capability lists, so it does not
-/// repeat these checks.
-#[utoipa::path(post, path = "/eav/rules", tag = "eav", request_body = RuleDraft, responses((status=201, body=crate::rules::rule::Rule), (status=400, body=crate::http::error::ErrorBody), (status=401, body=crate::http::error::ErrorBody), (status=403, body=crate::http::error::ErrorBody), (status=500, body=crate::http::error::ErrorBody)))]
+/// The enable route repeats these capability checks on the stored rule.
+/// A concurrent write to the same rule returns `409`.
+#[utoipa::path(post, path = "/eav/rules", tag = "eav", request_body = RuleDraft, responses((status=201, body=crate::rules::rule::Rule), (status=400, body=crate::http::error::ErrorBody), (status=401, body=crate::http::error::ErrorBody), (status=403, body=crate::http::error::ErrorBody), (status=409, body=crate::http::error::ErrorBody), (status=500, body=crate::http::error::ErrorBody)))]
 #[post("/rules")]
 async fn upsert_rule(
     runtime: web::Data<EavRuntime>,
@@ -1745,6 +1746,11 @@ mod tests {
                 EavApiError::from(RuleError::ConditionDepth),
                 400,
                 "invalid_request",
+            ),
+            (
+                EavApiError::from(RuleError::VersionConflict),
+                409,
+                "conflict",
             ),
             (
                 EavApiError::from(PolicyError::AccessDenied),
