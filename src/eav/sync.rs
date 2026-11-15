@@ -182,7 +182,7 @@ pub struct SnapshotPage {
     /// The value is `Some` only in cursor mode.
     /// The value is the id of the last visible entity.
     /// The value never names an entity that the caller cannot read.
-    /// The value is `None` when the scan is exhausted or the scan budget ends.
+    /// The value is `None` when the scan is exhausted.
     pub next: Option<String>,
     /// The head of the change log at the time of the call.
     ///
@@ -538,7 +538,9 @@ pub(crate) async fn events(
 /// `next_offset` comes from the raw page length.
 /// A filtered page can then hold fewer items than the limit.
 /// A cursor query uses the entity marker family and returns `next`.
-/// The route reads at most `CURSOR_SCAN_BATCH` raw pages for one cursor page.
+/// The route reads raw pages until the page is full or the entity list ends.
+/// A raw page can hold only rows that the caller cannot read, so a fixed raw
+/// page count could miss a later visible row.
 /// The `next` value is the id of the last visible entity.
 /// The value never names an entity that the caller cannot read.
 /// A scan that finds no visible entity returns `next: null`.
@@ -1775,6 +1777,46 @@ mod tests {
         }
 
         assert_eq!(ids, ["e2", "e4"]);
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn a_snapshot_scan_reaches_a_visible_row_after_many_invisible_rows() -> anyhow::Result<()>
+    {
+        let fx = fixture().await?;
+        publish_task_schema(&fx).await?;
+        for index in 1..=8 {
+            create_entity(&fx, &format!("n{index:02}")).await?;
+        }
+        create_entity(&fx, "v1").await?;
+        grant_row_read(&fx, "carol", "v1").await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("carol")?;
+
+        let mut ids = Vec::new();
+        let mut after: Option<String> = Some(String::new());
+        loop {
+            let uri = match &after {
+                Some(cursor) => format!("/eav/sync/snapshot?limit=1&after={cursor}"),
+                None => "/eav/sync/snapshot?limit=1".to_string(),
+            };
+            let res = get_route!(&app, &uri, &token).await;
+            assert_eq!(res.status(), http::StatusCode::OK, "{uri}");
+            let body: Value = actix_test::read_body_json(res).await;
+            for item in body["items"].as_array().expect("items") {
+                ids.push(item["id"].as_str().expect("id").to_string());
+            }
+            match body["next"].as_str() {
+                Some(cursor) => {
+                    assert_eq!(cursor, "v1", "the cursor named an unreadable entity");
+                    after = Some(cursor.to_string());
+                }
+                None => break,
+            }
+        }
+
+        assert_eq!(ids, ["v1"]);
         Ok(())
     }
 
