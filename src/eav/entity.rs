@@ -830,7 +830,7 @@ impl EntityStore {
         ctx: &WriteContext,
     ) -> Result<Option<(String, Vec<u8>)>, EntityError>
     where
-        S: GetSet + ?Sized + Sync,
+        S: TxCas + ?Sized + Sync,
     {
         let before = &prepared.before;
         let after = &prepared.after;
@@ -851,7 +851,13 @@ impl EntityStore {
         delete_changed_timer_markers(store, before, after, &prepared.merged).await?;
         delete_mutable_rows(store, before, &prepared.merged).await?;
         delete_ref_rows(store, before, &prepared.merged).await?;
-        put_entity_rows(store, after, &prepared.merged).await?;
+        let before_meta = meta_bytes(before)?;
+        let after_meta = meta_bytes(after)?;
+        store
+            .compare_and_set(&meta_key(&after.id), Some(&before_meta), &after_meta)
+            .await
+            .map_err(EntityError::Store)?;
+        put_entity_rows_except_meta(store, after, &prepared.merged).await?;
         Ok(outbox)
     }
 
@@ -1026,7 +1032,11 @@ impl EntityStore {
             if let Some((key, bytes)) = &outbox {
                 tx.set_bytes(key, bytes).await.map_err(EntityError::Store)?;
             }
-            tx.commit().await.map_err(EntityError::Store)?;
+            match tx.commit().await {
+                Ok(()) => {}
+                Err(StoreError::TxConflict { .. }) => return Err(EntityError::VersionConflict),
+                Err(error) => return Err(EntityError::Store(error)),
+            }
             (
                 EntityChange {
                     before: Some(prepared.before),
@@ -1187,6 +1197,7 @@ impl EntityStore {
             let tx = g.begin_tx().map_err(EntityError::Store)?;
             let mut changes = Vec::with_capacity(plan.len());
             let mut outbox_rows = Vec::new();
+            let mut guarded_meta = BTreeSet::new();
             for effect in plan.effects() {
                 let (change, outbox) = match effect {
                     EntityEffect::Create {
@@ -1222,6 +1233,7 @@ impl EntityStore {
                             .prepare_update(&tx, id, *expected_version, &patch)
                             .await?;
                         let outbox = self.stage_update(&tx, &prepared, ctx).await?;
+                        guarded_meta.insert(meta_key(id));
                         (
                             EntityChange {
                                 before: Some(prepared.before),
@@ -1263,7 +1275,13 @@ impl EntityStore {
             if let Some((key, bytes)) = marker {
                 tx.set_bytes(key, bytes).await.map_err(EntityError::Store)?;
             }
-            tx.commit().await.map_err(EntityError::Store)?;
+            match tx.commit().await {
+                Ok(()) => {}
+                Err(StoreError::TxConflict { key, .. }) if guarded_meta.contains(&key) => {
+                    return Err(EntityError::VersionConflict);
+                }
+                Err(error) => return Err(EntityError::Store(error)),
+            }
             (changes, !outbox_rows.is_empty())
         };
         if pending && let Err(error) = self.flush_after_commit().await {
@@ -3198,23 +3216,6 @@ where
         .map_err(EntityError::Store)
 }
 
-/// Writes the metadata, attribute, and index rows of one entity.
-async fn put_entity_rows<S>(
-    store: &S,
-    entity: &Entity,
-    merged: &MergedSchema,
-) -> Result<(), EntityError>
-where
-    S: GetSet + ?Sized,
-{
-    let meta_bytes = meta_bytes(entity)?;
-    store
-        .set_bytes(&meta_key(&entity.id), &meta_bytes)
-        .await
-        .map_err(EntityError::Store)?;
-    put_entity_rows_except_meta(store, entity, merged).await
-}
-
 /// Writes the attribute and index rows of one entity.
 ///
 /// The caller writes the metadata row.
@@ -4139,6 +4140,49 @@ mod tests {
         let entity = store.get("e1").await.unwrap().unwrap();
         assert_eq!(entity.version, 1);
         assert_eq!(entity.attributes["age"], i(30));
+    }
+
+    #[tokio::test]
+    async fn two_updates_from_one_version_commit_one() {
+        let (store, registry, raw) = new_store().await;
+        registry
+            .publish(schema(
+                "person",
+                &[],
+                vec![attr("age", AttributeType::Integer)],
+            ))
+            .await
+            .unwrap();
+        store
+            .create(draft("e1", &["person"], vec![("age", i(30))]), &ctx())
+            .await
+            .unwrap();
+
+        let first_patch = patch(vec![("age", Some(i(31)))]);
+        let second_patch = patch(vec![("age", Some(i(32)))]);
+        let first_tx = raw.begin_tx().unwrap();
+        let second_tx = raw.begin_tx().unwrap();
+        let first = store
+            .prepare_update(&first_tx, "e1", 1, &first_patch)
+            .await
+            .unwrap();
+        let second = store
+            .prepare_update(&second_tx, "e1", 1, &second_patch)
+            .await
+            .unwrap();
+        store.stage_update(&first_tx, &first, &ctx()).await.unwrap();
+        store
+            .stage_update(&second_tx, &second, &ctx())
+            .await
+            .unwrap();
+
+        first_tx.commit().await.unwrap();
+        let error = second_tx.commit().await.unwrap_err();
+
+        assert!(matches!(error, StoreError::TxConflict { .. }));
+        let entity = store.get("e1").await.unwrap().unwrap();
+        assert_eq!(entity.version, 2);
+        assert_eq!(entity.attributes["age"], i(31));
     }
 
     #[tokio::test]
