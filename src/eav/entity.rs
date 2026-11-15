@@ -906,8 +906,16 @@ impl EntityStore {
                 .await
                 .map_err(EntityError::Store)?;
         }
-        put_entity_rows_except_meta(store, entity, &prepared.merged, &facts, state, Some(ctx))
-            .await?;
+        put_entity_rows_except_meta(
+            store,
+            None,
+            entity,
+            &prepared.merged,
+            &facts,
+            state,
+            Some(ctx),
+        )
+        .await?;
         Ok(outbox)
     }
 
@@ -1036,8 +1044,16 @@ impl EntityStore {
                 .await
                 .map_err(EntityError::Store)?;
         }
-        put_entity_rows_except_meta(store, after, &prepared.merged, &facts, state, Some(ctx))
-            .await?;
+        put_entity_rows_except_meta(
+            store,
+            Some(before),
+            after,
+            &prepared.merged,
+            &facts,
+            state,
+            Some(ctx),
+        )
+        .await?;
         Ok(outbox)
     }
 
@@ -2252,6 +2268,7 @@ impl EntityStore {
                 put_meta_row(&tx, &write.entity).await?;
                 put_entity_rows_except_meta(
                     &tx,
+                    Some(&write.before),
                     &write.entity,
                     &write.after_merged,
                     &facts,
@@ -3891,13 +3908,20 @@ where
 /// Writes the attribute and index rows of one entity.
 ///
 /// The caller writes the metadata row.
+/// `before` holds the stored state, or `None` for a create.
 /// The call uses the name-level facts, so a schema that does not set a flag
 /// still writes the row when another schema sets it.
 /// The call stages one unique claim for each unique value.
-/// A time row holds the causation of the write.
+/// A new time row holds the causation of the write.
+/// The call writes a time row only when the timestamp value changed or the
+/// row is absent.
+/// An absent row is written, so a schema that adds the index repairs the
+/// entity.
+/// An unrelated update keeps the stored time row and its causation.
 /// A write with no cause stores an empty causation value.
 async fn put_entity_rows_except_meta<S>(
     store: &S,
+    before: Option<&Entity>,
     entity: &Entity,
     merged: &MergedSchema,
     facts: &NameFacts,
@@ -3938,11 +3962,23 @@ where
             && indexed
             && let AttributeValue::Timestamp(timestamp) = value
         {
-            let marker = time_marker_bytes(causation)?;
-            store
-                .set_bytes(&time_index_key(key, *timestamp, &entity.id), &marker)
-                .await
-                .map_err(EntityError::Store)?;
+            let row_key = time_index_key(key, *timestamp, &entity.id);
+            let unchanged = before.and_then(|before| before.attributes.get(key)) == Some(value);
+            let stored = if unchanged {
+                store
+                    .get_bytes(&row_key)
+                    .await
+                    .map_err(EntityError::Store)?
+            } else {
+                None
+            };
+            if !unchanged || stored.is_none() {
+                let marker = time_marker_bytes(causation)?;
+                store
+                    .set_bytes(&row_key, &marker)
+                    .await
+                    .map_err(EntityError::Store)?;
+            }
             store
                 .set_bytes(&time_key_index_key(key), b"")
                 .await
@@ -4108,19 +4144,22 @@ where
         let def = merged.attributes.get(key);
         let indexed = facts.indexed.contains(key) || def.is_some_and(|def| def.indexed);
         let unique = facts.unique.contains(key) || def.is_some_and(|def| def.unique);
+        let unchanged = after.and_then(|after| after.attributes.get(key)) == Some(value);
         if indexed {
             store
                 .delete(&attr_index_key(key, value, &entity.id)?)
                 .await
                 .map_err(EntityError::Store)?;
         }
-        if indexed && let AttributeValue::Timestamp(timestamp) = value {
+        if indexed
+            && !unchanged
+            && let AttributeValue::Timestamp(timestamp) = value
+        {
             store
                 .delete(&time_index_key(key, *timestamp, &entity.id))
                 .await
                 .map_err(EntityError::Store)?;
         }
-        let unchanged = after.and_then(|after| after.attributes.get(key)) == Some(value);
         if unique && !unchanged {
             release_unique(store, key, value, &entity.id, state).await?;
         }
@@ -4877,6 +4916,21 @@ mod tests {
             .await
             .unwrap()
             .map(|bytes| serde_json::from_slice(&bytes).unwrap())
+    }
+
+    /// Reads the stored causation of one time row.
+    async fn stored_time_causation(
+        store: &OxKvStore,
+        key: &str,
+        timestamp: i64,
+        entity_id: &str,
+    ) -> TimeMarkerCausation {
+        let bytes = store
+            .get_bytes(&time_index_key(key, timestamp, entity_id))
+            .await
+            .unwrap()
+            .expect("the time row must exist");
+        decode_time_marker(Some(&bytes))
     }
 
     fn tagged(value: &AttributeValue) -> serde_json::Value {
@@ -8895,6 +8949,67 @@ mod tests {
         // A delete removes every marker of the entity.
         store.delete("e1", 3, false, &ctx()).await.unwrap();
         assert!(!store.is_timer_fired("e1", "due", 200).await.unwrap());
+    }
+
+    /// An update that does not change the timestamp keeps the stored cause.
+    #[tokio::test]
+    async fn an_unrelated_update_keeps_the_time_row_causation() {
+        let (store, raw) = timer_store().await;
+        store
+            .create(
+                draft("e1", &["task"], vec![("due", t(100)), ("title", s("one"))]),
+                &WriteContext::new("tester").with_causation("evt-created", 2),
+            )
+            .await
+            .unwrap();
+
+        store
+            .update(
+                "e1",
+                1,
+                patch(vec![("title", Some(s("two")))]),
+                &WriteContext::new("tester").with_causation("evt-unrelated", 5),
+            )
+            .await
+            .unwrap();
+
+        let marker = stored_time_causation(&raw, "due", 100, "e1").await;
+        assert_eq!(marker.causation_id.as_deref(), Some("evt-created"));
+        assert_eq!(marker.causation_depth, 2);
+    }
+
+    /// A timestamp update stores the new cause in the new time row.
+    #[tokio::test]
+    async fn a_timestamp_update_stores_the_new_time_row_causation() {
+        let (store, raw) = timer_store().await;
+        store
+            .create(
+                draft("e1", &["task"], vec![("due", t(100))]),
+                &WriteContext::new("tester").with_causation("evt-created", 2),
+            )
+            .await
+            .unwrap();
+
+        store
+            .update(
+                "e1",
+                1,
+                patch(vec![("due", Some(t(200)))]),
+                &WriteContext::new("tester").with_causation("evt-updated", 4),
+            )
+            .await
+            .unwrap();
+
+        let marker = stored_time_causation(&raw, "due", 200, "e1").await;
+        assert_eq!(marker.causation_id.as_deref(), Some("evt-updated"));
+        assert_eq!(marker.causation_depth, 4);
+        assert!(
+            raw.get_bytes(&time_index_key("due", 100, "e1"))
+                .await
+                .unwrap()
+                .is_none(),
+            "the old time row must be removed"
+        );
     }
 
     #[tokio::test]
