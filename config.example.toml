@@ -108,6 +108,11 @@ sample_ratio = 1.0
 # Default: [].
 # allowed_origins = ["https://app.example.com", "http://localhost:5173"]
 
+# Serve /openapi.json and /swagger-ui/*. Both routes answer without
+# authentication. Keep this false in production unless the deployment needs
+# the document. Default: false.
+# expose_docs = false
+
 [limits]
 # Requests per minute for each peer address, after an initial burst of the
 # same size. 0 disables the bucket. Default: 0.

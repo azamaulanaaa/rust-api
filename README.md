@@ -474,8 +474,8 @@ Metrics cover rule execution (`eav.rules.executed`, `eav.rules.failed`) and webh
 | DELETE | `/eav/sync/replica` | Remove the caller's stored replica. A reset returns `204`, or `404` when no replica exists. | session |
 | GET | `/eav/sync/replica` | Read the stored replica as a JSON array with the current grants, or one chunk object with `?chunk=N` | session |
 | GET | `/eav/sync/replica/status` | Change feed head and stored replica head | session |
-| GET | `/openapi.json` | OpenAPI 3.1 document | none |
-| GET | `/swagger-ui/` | Swagger UI for the document | none |
+| GET | `/openapi.json` | OpenAPI 3.1 document. Only with `[http].expose_docs = true`. | none |
+| GET | `/swagger-ui/` | Swagger UI for the document. Only with `[http].expose_docs = true`. | none |
 
 ### Auth and errors
 
@@ -495,11 +495,11 @@ The optional `code` and `details` fields extend the body:
 
 A client can ignore both optional fields. The `error` field is always present. The server logs the cause and never serializes it. A malformed JSON body also uses this envelope.
 
-Some routes answer outside the envelope. `/auth/login` redirects to the provider. `/auth/callback` returns an `AuthResponse`, or a `302` when the request has `oidc_return_to`. `/auth/refresh` returns an `AuthResponse`, because the SPA reads the token from it. `/openapi.json` and `/swagger-ui/*` return documents.
+Some routes answer outside the envelope. `/auth/login` redirects to the provider. `/auth/callback` returns an `AuthResponse`, or a `302` when the request has `oidc_return_to`. `/auth/refresh` returns an `AuthResponse`, because the SPA reads the token from it. `/openapi.json` and `/swagger-ui/*` return documents when `[http].expose_docs = true`.
 
 ### OpenAPI and client generation
 
-Every API route is in the OpenAPI document at `/openapi.json`, with Swagger UI at `/swagger-ui/`. Generate a client from that document instead of hand-writing request shapes.
+Every API route is in the OpenAPI document at `/openapi.json`, with Swagger UI at `/swagger-ui/`. The server does not mount these routes by default. Both routes answer without authentication, so a production deployment leaves them off. Set `[http].expose_docs = true` to mount them. Generate a client from that document instead of hand-writing request shapes.
 
 ```bash
 # TypeScript
@@ -524,6 +524,8 @@ cargo progenitor -i openapi.json -o rust-api-client -n rust-api-client -v 0.1.0
 ```
 
 Set the client base URL to `public_address`. Send a bearer token or the session cookie on protected calls.
+
+The examples above need `[http].expose_docs = true` in the config of the server that serves the document.
 
 The test `spec_covers_all_served_routes` checks a hand-maintained route list against the document. Add each new route to that list. The `fs` route test checks the reverse for its own paths. Composition tests build the served application in-process and check that the routes answer.
 
@@ -591,6 +593,10 @@ Example: `file_size = 2500`, `part_size = 1024`, and `file_total_parts = 3`. Par
 Errors use the envelope in [Auth and errors](#auth-and-errors). The client reads `error`, and the optional `code` and `details` fields. A missing `code` or `details` is safe. The client treats `401` as unauthenticated, `403` as forbidden, `404` as absent, `416` as a bad range, and `5xx` or network failures as retryable. An empty or non-JSON body uses a generic message.
 
 For a cross-origin deployment, add the frontend origin to `[http].allowed_origins` or `RUST_API_ALLOWED_ORIGINS`. Credentials are allowed. CORS exposes `ETag`, `Content-Range`, `Accept-Ranges`, `Date`, and `X-Server-Time-Ms`. The local frontend origin is `http://localhost:5173`.
+
+Every response carries `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, and `Referrer-Policy: no-referrer`. An API response also carries `Content-Security-Policy: default-src 'none'; frame-ancestors 'none'`. The OpenAPI document and the Swagger UI omit the policy, because Swagger UI needs its own scripts and styles. A request that uses HTTPS also gets `Strict-Transport-Security: max-age=31536000; includeSubDomains`.
+
+Every response under `/auth/*` carries `Cache-Control: no-store` and `Pragma: no-cache`. A shared proxy must not store a login redirect or a session response.
 
 ### SPA and PWA flow
 
@@ -692,6 +698,7 @@ previous_secret = "<64 hex chars>"
 
 [http]
 allowed_origins = ["https://app.example.com", "http://localhost:5173"]
+expose_docs = false
 
 [limits]
 rate_per_minute = 600
@@ -876,6 +883,7 @@ Use port 4317 with the `otlp-grpc` feature and port 4318 with the default `otlp-
 - [ ] Set `[limits].max_concurrent_downloads`. A rate limit does not bound large SST reads.
 - [ ] Put a reverse proxy or WAF in front of the binary. Throttle `/auth/*`, `/setup/*`, and `/policy/*` per IP. Keep `/fs` and `/sync` reads generous.
 - [ ] Never expose the binary directly to the internet without that layer.
+- [ ] Keep `[http].expose_docs = false` unless the deployment needs the unauthenticated docs routes.
 - [ ] Set `[database].writer_lease_ttl_secs` above the worst pause between renewals. Use `0` only for a single process.
 - [ ] Configure `[capability].secret` or `RUST_API_CAPABILITY_SECRET`, so capability tokens survive a restart.
 - [ ] Wire `/ready` to a probe that drains traffic.
@@ -1013,17 +1021,23 @@ HttpServer::new(move || {
         .wrap(http::middleware::request_tracing::RequestTracingMiddleware)
         .wrap(http::middleware::bearer_token::BearerTokenMiddleware)
         .wrap(rust_api::limits::RateLimit::new(bucket.clone()))
+        // Inside the server time and outside the rate limiter. Every
+        // response then carries the security headers.
+        .wrap(http::middleware::security_headers::SecurityHeaders)
         // Outermost. Every response then carries X-Server-Time-Ms.
         .wrap(http::middleware::server_time::ServerTimeMiddleware)
         .configure(http::health_routes)
-        .configure(move |cfg| svc.configure(cfg).expect("duplicate route prefix"))
-        .configure(http::docs::config) // /openapi.json + /swagger-ui
+        .configure(move |cfg| {
+            svc.configure(cfg).expect("duplicate route prefix");
+            // /openapi.json + /swagger-ui, gated by expose_docs.
+            svc.configure_docs(cfg);
+        })
 })
 .run()
 .await?;
 ```
 
-`svc.configure` returns `Result<_, DuplicateRoutePrefix>`. The actix configure closure returns `()`, so handle the error at that point. Build one `App` per worker, as `HttpServer::new` does here. Mount `http::docs::config` last. A catch-all mount registered earlier can shadow your modules.
+`svc.configure` returns `Result<_, DuplicateRoutePrefix>`. The actix configure closure returns `()`, so handle the error at that point. Build one `App` per worker, as `HttpServer::new` does here. Call `svc.configure_docs` last. It follows the docs flag that `with_docs` set. A catch-all mount registered earlier can shadow your modules.
 
 ## Performance
 

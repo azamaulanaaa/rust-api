@@ -8,6 +8,10 @@ use crate::docs::ApiDoc;
 
 /// Mounts `/openapi.json` and `/swagger-ui/*` from the compiled `ApiDoc`.
 ///
+/// [`ApiService`](crate::http::ApiService) calls this function only when
+/// `[http].expose_docs` is true. The default is `false`, because both routes
+/// answer without authentication.
+///
 /// [`SwaggerUi`] uses absolute paths. The code registers it directly on the
 /// `ServiceConfig`.
 ///

@@ -13,6 +13,10 @@
 //! an `X-Request-Id` for each request.
 //! [`server_time`](crate::http::middleware::server_time) adds the server
 //! time in UTC milliseconds to each response.
+//! [`security_headers`](crate::http::middleware::security_headers) adds the
+//! security response headers.
+//! [`no_cache`](crate::http::middleware::no_cache) stops a shared cache from
+//! storing an authentication response.
 
 /// The middleware that extracts a bearer token for request authentication.
 pub mod bearer_token;
@@ -21,11 +25,15 @@ pub mod jwks;
 
 /// The middleware that validates JWT claims against a JWKS key store.
 pub mod jwt;
+/// The middleware that stops a shared cache from storing a response.
+pub mod no_cache;
 /// The middleware that generates or echoes `X-Request-Id`.
 pub mod request_id;
 /// The tracing span that the code creates for each request. The spans work
 /// with OpenTelemetry.
 pub mod request_tracing;
+/// The middleware that adds the security response headers.
+pub mod security_headers;
 /// The middleware that adds the server time to each response.
 pub mod server_time;
 

@@ -108,6 +108,10 @@ where
         // `Claims`-typed middleware on the resource instead. The scope
         // therefore does not have to name a concrete claims type.
         //
+        // `NoCache` is outermost in the scope. A shared proxy must not store
+        // an authentication response, a redirect, or an error from a failed
+        // authentication.
+        //
         // The whole scope lives here on purpose. A second module that
         // registers `web::scope("/auth")` matches every `/auth/*` path. Actix
         // tries services in registration order, so the routes of the later
@@ -116,6 +120,7 @@ where
             web::scope("/auth")
                 .app_data(oidc_client)
                 .wrap(self.jwt_middleware.clone())
+                .wrap(middleware::no_cache::NoCache)
                 .service(login)
                 .service(callback)
                 .service(logout)
@@ -765,6 +770,24 @@ mod tests {
         );
     }
 
+    /// Asserts that a shared proxy cannot store the response.
+    fn assert_not_cached(res: &ServiceResponse) {
+        assert_eq!(
+            res.headers()
+                .get("cache-control")
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store"),
+            "an authentication response must carry Cache-Control: no-store"
+        );
+        assert_eq!(
+            res.headers()
+                .get("pragma")
+                .and_then(|value| value.to_str().ok()),
+            Some("no-cache"),
+            "an authentication response must carry Pragma: no-cache"
+        );
+    }
+
     /// Returns the Location header of a response.
     fn location(res: &ServiceResponse) -> String {
         res.response()
@@ -1258,6 +1281,32 @@ mod tests {
             test::call_service(&svc, test::TestRequest::get().uri("/auth/me").to_request()).await;
         assert_eq!(res.status(), 401);
         Ok(())
+    }
+
+    /// A shared proxy must not store an authentication response. A stored
+    /// response can give one user the session of another user.
+    ///
+    /// The test checks the login redirect and the failed session probe. Both
+    /// come from the `/auth` scope. A route outside the scope must not get
+    /// the headers, and the `no_cache` unit tests cover that middleware
+    /// alone.
+    #[tokio::test]
+    async fn auth_responses_are_not_cached() {
+        let fx = Fixture::new().await.unwrap();
+        let svc = test_app!(fx);
+
+        let login_res = test::call_service(
+            &svc,
+            test::TestRequest::get().uri("/auth/login").to_request(),
+        )
+        .await;
+        assert_eq!(login_res.status(), 302);
+        assert_not_cached(&login_res);
+
+        let me =
+            test::call_service(&svc, test::TestRequest::get().uri("/auth/me").to_request()).await;
+        assert_eq!(me.status(), 401);
+        assert_not_cached(&me);
     }
 
     #[tokio::test]

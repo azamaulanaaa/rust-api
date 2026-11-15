@@ -554,6 +554,7 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
     // of the guard is all that there is.
     let service = ApiService::new()
         .with_cors_origins(config.http.allowed_origins.clone())
+        .with_docs(config.http.expose_docs)
         .with_rate_limit(rust_api::limits::TokenBucket::new(
             config.limits.burst_or_rate(),
             config.limits.rate_per_minute,
