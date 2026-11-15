@@ -1878,6 +1878,7 @@ impl EntityStore {
     /// The call skips `offset` ids.
     /// It then loads at most `limit` entities.
     /// A `limit` of 0 returns an empty list.
+    /// An offset above `MAX_PAGE_OFFSET` returns an invalid-input error.
     pub async fn list_by_schema_page(
         &self,
         schema_id: &str,
@@ -1885,6 +1886,11 @@ impl EntityStore {
         offset: usize,
     ) -> Result<Vec<Entity>, EntityError> {
         validate_name("schema id", schema_id)?;
+        if offset > MAX_PAGE_OFFSET {
+            return Err(EntityError::Invalid(format!(
+                "offset must be at most {MAX_PAGE_OFFSET}. Use after to page deeper."
+            )));
+        }
         if limit == 0 {
             return Ok(Vec::new());
         }
@@ -6770,6 +6776,32 @@ mod tests {
         let page = store.list_by_schema_page("task", 0, 0).await.unwrap();
 
         assert!(page.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_by_schema_page_rejects_an_offset_above_the_maximum() {
+        let (store, registry, _raw) = new_store().await;
+        registry.publish(schema("task", &[], vec![])).await.unwrap();
+
+        let result = store
+            .list_by_schema_page("task", 1, MAX_PAGE_OFFSET + 1)
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(EntityError::Invalid(message))
+                if message
+                    == format!(
+                        "offset must be at most {MAX_PAGE_OFFSET}. Use after to page deeper."
+                    )
+        ));
+        assert!(
+            store
+                .list_by_schema_page("task", 1, MAX_PAGE_OFFSET)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
