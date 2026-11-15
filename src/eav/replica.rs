@@ -380,6 +380,8 @@ impl ReplicaStore {
     ///
     /// The call returns `None` when the subject has no replica or when `index`
     /// is out of range.
+    /// A replica with no entity returns chunk 0 with a chunk count of 0 and an
+    /// empty JSON array.
     /// The call reads the head, the generation, the manifest, one chunk, then
     /// the head and the generation again.
     /// It retries when the head, the generation, or a row changed or is absent.
@@ -408,6 +410,15 @@ impl ReplicaStore {
                 }
                 if read_generation(&*g, &hash).await?.unwrap_or(0) != generation {
                     continue;
+                }
+                if chunks == 0 && index == 0 {
+                    return Ok(Some(ReplicaChunk {
+                        head,
+                        generation,
+                        index,
+                        chunks,
+                        data: b"[]".to_vec(),
+                    }));
                 }
                 return Ok(None);
             }
@@ -861,7 +872,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_zero_chunk_replica_reports_zero_and_returns_no_chunks() {
+    async fn a_zero_chunk_replica_reports_zero_and_returns_an_empty_chunk() {
         let store = store().await;
         store.put("alice", 5, Vec::new()).await.unwrap();
 
@@ -873,7 +884,13 @@ mod tests {
                 chunks: Vec::new(),
             })
         );
-        assert_eq!(store.get_chunk("alice", 0).await.unwrap(), None);
+        let chunk = store.get_chunk("alice", 0).await.unwrap().expect("chunk");
+        assert_eq!(chunk.head, 5);
+        assert_eq!(chunk.generation, 1);
+        assert_eq!(chunk.index, 0);
+        assert_eq!(chunk.chunks, 0);
+        assert_eq!(chunk.data, b"[]".to_vec());
+        assert_eq!(store.get_chunk("alice", 1).await.unwrap(), None);
 
         let hash = sub_hash("alice");
         let g = store.store.read().await;

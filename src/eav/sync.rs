@@ -12,6 +12,9 @@
 //! `GET /eav/sync/snapshot` returns one page of entity state for the first
 //! load of an offline client.
 //! The client then reads the events feed for each change.
+//! The first snapshot page returns the current feed head.
+//! Each later page sends that head and gets the same value back.
+//! A head above the current feed head returns `409`.
 //!
 //! `POST /eav/sync/replica` stores a chunked JSON snapshot for the caller.
 //! `GET /eav/sync/replica` returns the stored snapshot as one JSON array.
@@ -76,6 +79,7 @@ use crate::eav::entity::Entity;
 use crate::eav::entity_error::EntityError;
 use crate::eav::route::{
     ENTITIES, ENTITY_ROW, EavApiError, PageMode, PageQuery, can_read_entity, page_next_offset,
+    visible_cursor_page,
 };
 use crate::eav::runtime::EavRuntime;
 use crate::fs::error::FsError;
@@ -170,12 +174,15 @@ pub struct SnapshotPage {
     ///
     /// The value comes from the raw page length, not from `items`.
     /// A filtered page can then hold fewer items than the limit.
+    /// The value is `None` when the next offset would pass the cap.
     /// Continue while `next_offset` is `Some`.
     pub next_offset: Option<usize>,
     /// The id to resume after for the next page.
     ///
     /// The value is `Some` only in cursor mode.
-    /// The value is `None` when the scan is exhausted.
+    /// The value is the id of the last visible entity.
+    /// The value never names an entity that the caller cannot read.
+    /// The value is `None` when the scan is exhausted or the scan budget ends.
     pub next: Option<String>,
     /// The head of the change log at the time of the call.
     ///
@@ -293,6 +300,61 @@ impl std::fmt::Display for CursorAhead {
 }
 
 impl std::error::Error for CursorAhead {}
+
+/// The query of the snapshot route.
+///
+/// The first request of a paging sequence omits `head`.
+/// The route then returns the current feed head.
+/// Each later request sends that head.
+/// The route then returns the same head on every page.
+#[derive(Debug, Clone, Default, serde::Deserialize, utoipa::ToSchema, utoipa::IntoParams)]
+pub struct SnapshotQuery {
+    /// The page size. The default is 50. The maximum is 200.
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// The number of items to skip. The default is 0.
+    ///
+    /// The maximum is 1000. Use `after` for a deeper page.
+    #[serde(default)]
+    pub offset: Option<usize>,
+    /// The id to resume after.
+    ///
+    /// A present value selects cursor mode.
+    /// Omit the field to use offset paging.
+    #[serde(default)]
+    pub after: Option<String>,
+    /// The head that pins this paging sequence.
+    ///
+    /// Omit it on the first request.
+    /// A value above the current feed head returns `409`.
+    #[serde(default)]
+    pub head: Option<u64>,
+}
+
+impl SnapshotQuery {
+    /// Resolves the page size, the paging mode, and the pinned head.
+    fn resolve(self) -> Result<(usize, PageMode, Option<u64>), EavApiError> {
+        let page = PageQuery {
+            limit: self.limit,
+            offset: self.offset,
+            after: self.after,
+        };
+        let (limit, mode) = page.resolve()?;
+        Ok((limit, mode, self.head))
+    }
+}
+
+/// The source of a snapshot head that is ahead of the current feed head.
+#[derive(Debug)]
+struct SnapshotHeadAhead;
+
+impl std::fmt::Display for SnapshotHeadAhead {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("head is ahead of the feed head")
+    }
+}
+
+impl std::error::Error for SnapshotHeadAhead {}
 
 /// Converts a change-log failure to a sanitized server error.
 fn internal(error: FsError) -> EavApiError {
@@ -476,50 +538,54 @@ pub(crate) async fn events(
 /// `next_offset` comes from the raw page length.
 /// A filtered page can then hold fewer items than the limit.
 /// A cursor query uses the entity marker family and returns `next`.
-/// A matching `If-None-Match` returns `304` with no body.
-#[utoipa::path(get, path = "/eav/sync/snapshot", tag = "eav", params(PageQuery), responses((status = 200, body = SnapshotPage), (status = 304, description = "not modified"), (status = 400, body = crate::http::error::ErrorBody), (status = 401, body = crate::http::error::ErrorBody), (status = 500, body = crate::http::error::ErrorBody)))]
+/// The route reads at most `CURSOR_SCAN_BATCH` raw pages for one cursor page.
+/// The `next` value is the id of the last visible entity.
+/// The value never names an entity that the caller cannot read.
+/// A scan that finds no visible entity returns `next: null`.
+/// The first request of a paging sequence omits `head`.
+/// The route then returns the current feed head.
+/// Each later request sends that head and gets the same head.
+/// A head above the current feed head returns `409`.
+/// The route sets no `ETag` and ignores `If-None-Match`.
+/// The response depends on the current grants and on the page, so it has no
+/// stable validator.
+#[utoipa::path(get, path = "/eav/sync/snapshot", tag = "eav", params(SnapshotQuery), responses((status = 200, body = SnapshotPage), (status = 400, body = crate::http::error::ErrorBody), (status = 401, body = crate::http::error::ErrorBody), (status = 409, body = crate::http::error::ErrorBody), (status = 500, body = crate::http::error::ErrorBody)))]
 #[get("/sync/snapshot")]
 pub(crate) async fn snapshot(
     runtime: web::Data<EavRuntime>,
     policy: web::Data<Authorizer>,
     claims: Validated<Claims>,
-    query: web::Query<PageQuery>,
-    req: HttpRequest,
+    query: web::Query<SnapshotQuery>,
 ) -> Result<HttpResponse, EavApiError> {
-    let (limit, mode) = query.into_inner().resolve()?;
-    let head = runtime.wal().head().await.map_err(internal)?;
-    let etag = status_etag(head);
-    if let Some(header) = req
-        .headers()
-        .get(IF_NONE_MATCH)
-        .and_then(|value| value.to_str().ok())
-        && etag_matches(header, &etag)
-    {
-        return Ok(HttpResponse::NotModified()
-            .insert_header((ETAG, etag))
-            .finish());
-    }
+    let (limit, mode, pinned) = query.into_inner().resolve()?;
+    let current = runtime.wal().head().await.map_err(internal)?;
+    let head = match pinned {
+        Some(head) if head > current => {
+            return Err(EavApiError::Conflict(Box::new(SnapshotHeadAhead)));
+        }
+        Some(head) => head,
+        None => current,
+    };
 
     match mode {
         PageMode::Cursor(after) => {
-            let (raw, next) = runtime
-                .entities()
-                .list_after(limit, after.as_deref())
-                .await?;
-            let mut items = Vec::with_capacity(raw.len());
-            for entity in raw {
-                if can_read_entity(&policy, &claims.sub, &entity.id).await? {
-                    items.push(entity);
+            let (items, next) = visible_cursor_page(&policy, &claims.sub, limit, after, |cursor| {
+                let runtime = runtime.clone();
+                async move {
+                    runtime
+                        .entities()
+                        .list_after(limit, cursor.as_deref())
+                        .await
+                        .map_err(EavApiError::from)
                 }
-            }
-            Ok(HttpResponse::Ok()
-                .insert_header((ETAG, etag))
-                .json(SnapshotPage {
-                    items,
-                    next_offset: None,
-                    next,
-                    head,
-                }))
+            })
+            .await?;
+            Ok(HttpResponse::Ok().json(SnapshotPage {
+                items,
+                next_offset: None,
+                next,
+                head,
+            }))
         }
         PageMode::Offset(offset) => {
             let raw = runtime.entities().list_page(limit, offset).await?;
@@ -531,14 +597,12 @@ pub(crate) async fn snapshot(
                 }
             }
             let next_offset = page_next_offset(offset, raw_len, limit);
-            Ok(HttpResponse::Ok()
-                .insert_header((ETAG, etag))
-                .json(SnapshotPage {
-                    items,
-                    next_offset,
-                    next: None,
-                    head,
-                }))
+            Ok(HttpResponse::Ok().json(SnapshotPage {
+                items,
+                next_offset,
+                next: None,
+                head,
+            }))
         }
     }
 }
@@ -743,6 +807,8 @@ impl std::error::Error for ReplicaChunkOutOfRange {}
 /// The route sets no `ETag` and ignores `If-None-Match`.
 /// The response depends on the current grants, so it has no stable validator.
 /// An out-of-range `chunk` returns `400`.
+/// A replica with no entity returns chunk 0 with `chunks: 0`, an empty `items`,
+/// and `next: null`.
 /// The client applies the events after the stored head.
 #[utoipa::path(get, path = "/eav/sync/replica", tag = "eav", params(ReplicaChunkQuery), responses((status = 200, body = ReplicaReadResponse), (status = 400, body = crate::http::error::ErrorBody), (status = 401, body = crate::http::error::ErrorBody), (status = 404, body = crate::http::error::ErrorBody), (status = 500, body = crate::http::error::ErrorBody)))]
 #[get("/sync/replica")]
@@ -1529,13 +1595,7 @@ mod tests {
 
         let res = get_route!(&app, "/eav/sync/snapshot", &fx.token("alice")?).await;
         assert_eq!(res.status(), http::StatusCode::OK);
-        let etag = res
-            .headers()
-            .get(ETAG)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or_default()
-            .to_string();
-        assert_eq!(etag, format!("\"{head}\""));
+        assert!(res.headers().get(ETAG).is_none(), "snapshot sets no ETag");
         let body: Value = actix_test::read_body_json(res).await;
         let items = body["items"].as_array().expect("items");
         assert_eq!(items.len(), 2);
@@ -1578,6 +1638,50 @@ mod tests {
     }
 
     #[actix_web::test]
+    async fn a_snapshot_paging_sequence_keeps_one_head() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        publish_task_schema(&fx).await?;
+        for id in ["e1", "e2", "e3"] {
+            create_entity(&fx, id).await?;
+        }
+        grant_collection_read(&fx, "alice").await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+
+        let res = get_route!(&app, "/eav/sync/snapshot?limit=1", &token).await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let first: Value = actix_test::read_body_json(res).await;
+        let head = first["head"].as_u64().expect("head");
+        assert_eq!(first["next_offset"], 1);
+
+        create_entity(&fx, "e4").await?;
+        assert!(fx.runtime.wal().head().await? > head);
+
+        let uri = format!("/eav/sync/snapshot?limit=1&offset=1&head={head}");
+        let res = get_route!(&app, &uri, &token).await;
+        assert_eq!(res.status(), http::StatusCode::OK, "{uri}");
+        let second: Value = actix_test::read_body_json(res).await;
+        assert_eq!(second["head"], head, "page 2 kept the pinned head");
+        assert_eq!(second["next_offset"], 2);
+        assert_eq!(second["items"][0]["id"], "e2");
+
+        let uri = format!("/eav/sync/snapshot?limit=1&offset=2&head={head}");
+        let res = get_route!(&app, &uri, &token).await;
+        assert_eq!(res.status(), http::StatusCode::OK, "{uri}");
+        let third: Value = actix_test::read_body_json(res).await;
+        assert_eq!(third["head"], head, "page 3 kept the pinned head");
+
+        let current = fx.runtime.wal().head().await?;
+        let uri = format!("/eav/sync/snapshot?head={}", current + 1);
+        let res = get_route!(&app, &uri, &token).await;
+        assert_eq!(res.status(), http::StatusCode::CONFLICT, "{uri}");
+        let body: crate::http::error::ErrorBody = actix_test::read_body_json(res).await;
+        assert_eq!(body.code.as_deref(), Some("conflict"));
+        Ok(())
+    }
+
+    #[actix_web::test]
     async fn a_snapshot_cursor_pages_through_every_visible_entity_once() -> anyhow::Result<()> {
         let fx = fixture().await?;
         publish_task_schema(&fx).await?;
@@ -1591,12 +1695,16 @@ mod tests {
 
         let mut ids = Vec::new();
         let mut after: Option<String> = Some(String::new());
+        let mut head: Option<u64> = None;
         let mut first = true;
         loop {
-            let uri = match &after {
+            let mut uri = match &after {
                 Some(cursor) => format!("/eav/sync/snapshot?limit=1&after={cursor}"),
                 None => "/eav/sync/snapshot?limit=1".to_string(),
             };
+            if let Some(head) = head {
+                uri.push_str(&format!("&head={head}"));
+            }
             let res = get_route!(&app, &uri, &token).await;
             assert_eq!(res.status(), http::StatusCode::OK, "{uri}");
             let body: Value = actix_test::read_body_json(res).await;
@@ -1610,7 +1718,10 @@ mod tests {
             if first {
                 assert_eq!(page_ids, vec!["e1"], "{uri}");
                 assert_eq!(body["next"], "e1", "{uri}");
+                head = Some(body["head"].as_u64().expect("head"));
                 first = false;
+            } else {
+                assert_eq!(body["head"], head.expect("head"), "{uri}");
             }
             ids.extend(page_ids.iter().map(|id| id.to_string()));
             match body["next"].as_str() {
@@ -1620,6 +1731,74 @@ mod tests {
         }
 
         assert_eq!(ids, vec!["e1", "e2", "e3"]);
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn a_row_grant_snapshot_pages_every_visible_entity_once() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        publish_task_schema(&fx).await?;
+        for id in ["e1", "e2", "e3", "e4", "e5"] {
+            create_entity(&fx, id).await?;
+        }
+        for id in ["e2", "e4"] {
+            grant_row_read(&fx, "carol", id).await?;
+        }
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("carol")?;
+
+        let mut ids = Vec::new();
+        let mut after: Option<String> = Some(String::new());
+        loop {
+            let uri = match &after {
+                Some(cursor) => format!("/eav/sync/snapshot?limit=1&after={cursor}"),
+                None => "/eav/sync/snapshot?limit=1".to_string(),
+            };
+            let res = get_route!(&app, &uri, &token).await;
+            assert_eq!(res.status(), http::StatusCode::OK, "{uri}");
+            let body: Value = actix_test::read_body_json(res).await;
+            for item in body["items"].as_array().expect("items") {
+                ids.push(item["id"].as_str().expect("id").to_string());
+            }
+            let next = body["next"].as_str().map(str::to_string);
+            if let Some(cursor) = &next {
+                assert!(
+                    cursor == "e2" || cursor == "e4",
+                    "the cursor named an unreadable entity: {cursor}"
+                );
+            }
+            match next {
+                Some(cursor) => after = Some(cursor),
+                None => break,
+            }
+        }
+
+        assert_eq!(ids, ["e2", "e4"]);
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn a_no_grant_snapshot_cursor_returns_no_entity_id() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        publish_task_schema(&fx).await?;
+        for id in ["e1", "e2", "e3"] {
+            create_entity(&fx, id).await?;
+        }
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("bob")?;
+
+        for uri in [
+            "/eav/sync/snapshot?limit=1&after=",
+            "/eav/sync/snapshot?limit=1&after=e1",
+        ] {
+            let res = get_route!(&app, uri, &token).await;
+            assert_eq!(res.status(), http::StatusCode::OK, "{uri}");
+            let body: Value = actix_test::read_body_json(res).await;
+            assert_eq!(body["items"].as_array().map(Vec::len), Some(0), "{uri}");
+            assert!(body["next"].is_null(), "{uri} leaked a cursor");
+        }
         Ok(())
     }
 
@@ -1659,7 +1838,7 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn a_matching_snapshot_if_none_match_returns_304() -> anyhow::Result<()> {
+    async fn a_snapshot_ignores_if_none_match_and_a_revocation_is_fresh() -> anyhow::Result<()> {
         let fx = fixture().await?;
         publish_task_schema(&fx).await?;
         create_entity(&fx, "e1").await?;
@@ -1667,6 +1846,9 @@ mod tests {
         let head = fx.runtime.wal().head().await?;
         let module = fx.module().await?;
         let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+
+        revoke_collection_read(&fx).await?;
 
         let res = actix_test::call_service(
             &app,
@@ -1674,14 +1856,19 @@ mod tests {
                 actix_test::TestRequest::get()
                     .uri("/eav/sync/snapshot")
                     .insert_header((IF_NONE_MATCH, format!("\"{head}\""))),
-                &fx.token("alice")?,
+                &token,
             )
             .to_request(),
         )
         .await;
-        assert_eq!(res.status(), http::StatusCode::NOT_MODIFIED);
-        let body = actix_test::read_body(res).await;
-        assert!(body.is_empty());
+        assert_eq!(res.status(), http::StatusCode::OK);
+        assert!(res.headers().get(ETAG).is_none(), "snapshot sets no ETag");
+        let body: Value = actix_test::read_body_json(res).await;
+        assert_eq!(
+            body["items"].as_array().map(Vec::len),
+            Some(0),
+            "a revoked grant must not return stale data"
+        );
         Ok(())
     }
 
@@ -1698,6 +1885,41 @@ mod tests {
             assert_eq!(res.status(), http::StatusCode::BAD_REQUEST, "{uri}");
             let body: crate::http::error::ErrorBody = actix_test::read_body_json(res).await;
             assert_eq!(body.code.as_deref(), Some("invalid_request"), "{uri}");
+        }
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn an_eav_response_forbids_a_shared_cache() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        publish_task_schema(&fx).await?;
+        create_entity(&fx, "e1").await?;
+        grant_collection_read(&fx, "alice").await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+
+        let res = post_replica!(&app, &token).await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+
+        for res in [
+            get_route!(&app, "/eav/sync/snapshot", &token).await,
+            get_route!(&app, "/eav/sync/replica", &token).await,
+        ] {
+            assert_eq!(res.status(), http::StatusCode::OK);
+            assert_eq!(
+                res.headers()
+                    .get("cache-control")
+                    .and_then(|value| value.to_str().ok()),
+                Some("no-store"),
+                "a shared cache must not store an EAV response"
+            );
+            assert_eq!(
+                res.headers()
+                    .get("pragma")
+                    .and_then(|value| value.to_str().ok()),
+                Some("no-cache")
+            );
         }
         Ok(())
     }
@@ -2068,6 +2290,20 @@ mod tests {
         assert_eq!(res.status(), http::StatusCode::OK);
         let items: Vec<Value> = actix_test::read_body_json(res).await;
         assert!(items.is_empty());
+
+        let res = get_route!(&app, "/eav/sync/replica?chunk=0", &token).await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        assert_eq!(
+            res.headers()
+                .get("X-Replica-Chunks")
+                .and_then(|value| value.to_str().ok()),
+            Some("0")
+        );
+        let body: Value = actix_test::read_body_json(res).await;
+        assert_eq!(body["chunk"], 0);
+        assert_eq!(body["chunks"], 0);
+        assert_eq!(body["items"].as_array().map(Vec::len), Some(0));
+        assert!(body["next"].is_null());
         Ok(())
     }
 
