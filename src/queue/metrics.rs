@@ -11,9 +11,16 @@ pub struct QueueMetrics {
     reserved: Counter<u64>,
     completed: Counter<u64>,
     failed: Counter<u64>,
+    lease_lost: Counter<u64>,
     dead_lettered: Counter<u64>,
     depth: Gauge<u64>,
     processing_duration: Histogram<f64>,
+    /// Number of calls to [`QueueMetrics::record_failed`] in this process.
+    #[cfg(test)]
+    failed_total: std::sync::atomic::AtomicU64,
+    /// Number of calls to [`QueueMetrics::record_lease_lost`] in this process.
+    #[cfg(test)]
+    lease_lost_total: std::sync::atomic::AtomicU64,
 }
 
 impl QueueMetrics {
@@ -26,9 +33,14 @@ impl QueueMetrics {
             reserved: meter.u64_counter("queue.reserved").build(),
             completed: meter.u64_counter("queue.completed").build(),
             failed: meter.u64_counter("queue.failed").build(),
+            lease_lost: meter.u64_counter("queue.lease_lost").build(),
             dead_lettered: meter.u64_counter("queue.dead_lettered").build(),
             depth: meter.u64_gauge("queue.depth").build(),
             processing_duration: meter.f64_histogram("queue.processing_duration").build(),
+            #[cfg(test)]
+            failed_total: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            lease_lost_total: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -54,6 +66,35 @@ impl QueueMetrics {
     pub fn record_failed(&self) {
         let attrs = [KeyValue::new("queue.backend", self.backend)];
         self.failed.add(1, &attrs);
+        #[cfg(test)]
+        self.failed_total
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Records a rejected ack, nack, or lease extension.
+    ///
+    /// The lease is gone when the call returns `LeaseExpired` or
+    /// `AlreadyLeased`. The job did not fail in that case, so the call does
+    /// not change the `queue.failed` counter.
+    pub fn record_lease_lost(&self) {
+        let attrs = [KeyValue::new("queue.backend", self.backend)];
+        self.lease_lost.add(1, &attrs);
+        #[cfg(test)]
+        self.lease_lost_total
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Returns the number of recorded failures. The method exists for tests.
+    #[cfg(test)]
+    pub(crate) fn failed_count(&self) -> u64 {
+        self.failed_total.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Returns the number of recorded lease losses. The method exists for tests.
+    #[cfg(test)]
+    pub(crate) fn lease_lost_count(&self) -> u64 {
+        self.lease_lost_total
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Records a dead-lettered job.
