@@ -43,7 +43,7 @@ use sha2::Sha256;
 use url::Url;
 
 use crate::eav::metrics::EavMetrics;
-use crate::queue::{Job, JobHandler, JobQueue};
+use crate::queue::{Job, JobError, JobHandler, JobQueue};
 use crate::records::{AttributeChange, EntityEventKind};
 use crate::rules::action::{ActionContext, RuleAction};
 
@@ -58,6 +58,9 @@ const MAX_URL_BYTES: usize = 2048;
 
 /// The request timeout in seconds.
 const TIMEOUT_SECS: u64 = 10;
+
+/// The maximum retry delay that a `Retry-After` header can set, in seconds.
+const MAX_RETRY_AFTER_SECS: u64 = 3600;
 
 /// Records the result of one webhook delivery.
 ///
@@ -396,7 +399,8 @@ struct AllowedHost {
 /// It rejects the request when any address is not public, unless the caller
 /// allows a private host.
 /// It signs the exact body bytes when a secret exists.
-/// It returns an error for any status that is not 2xx.
+/// It returns a permanent [`JobError`] for a non-retryable status.
+/// It returns a retryable [`JobError`] for a temporary status.
 async fn send_webhook(
     url: Url,
     body: &[u8],
@@ -421,12 +425,62 @@ async fn send_webhook(
         .await
         .map_err(|_| anyhow::anyhow!("webhook request failed"))?;
     if !response.status().is_success() {
-        return Err(anyhow::anyhow!(
-            "webhook returned status {}",
-            response.status().as_u16()
-        ));
+        let status = response.status();
+        let retry_after = retry_after(&response);
+        return Err(classify_response(status, retry_after).into());
     }
     Ok(())
+}
+
+/// Returns the retry decision for one non-2xx response.
+///
+/// The call retries `408`, `425`, `429`, and `503`.
+/// A retry for `429` or `503` uses the `Retry-After` delay when it exists.
+/// The call retries every other `5xx` status.
+/// The call does not retry every other status.
+fn classify_response(status: reqwest::StatusCode, retry_after: Option<Duration>) -> JobError {
+    let message = format!("webhook returned status {}", status.as_u16());
+    match status.as_u16() {
+        429 | 503 => match retry_after {
+            Some(delay) => JobError::retry_after(message, delay),
+            None => JobError::retryable(message),
+        },
+        408 | 425 => JobError::retryable(message),
+        code if (500..600).contains(&code) => JobError::retryable(message),
+        _ => JobError::permanent(message),
+    }
+}
+
+/// Reads the `Retry-After` header as a delay.
+///
+/// The call accepts the delta-seconds form and the HTTP-date form.
+/// It caps the delay at [`MAX_RETRY_AFTER_SECS`].
+/// It returns `None` for a missing or an invalid value.
+fn retry_after(response: &reqwest::Response) -> Option<Duration> {
+    let value = response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?;
+    parse_retry_after(value)
+}
+
+/// Parses one `Retry-After` value as a delay.
+///
+/// The call accepts the delta-seconds form and the HTTP-date form.
+/// It caps the delay at [`MAX_RETRY_AFTER_SECS`].
+/// It returns `None` for an invalid value.
+fn parse_retry_after(value: &str) -> Option<Duration> {
+    let value = value.trim();
+    let seconds = match value.parse::<u64>() {
+        Ok(seconds) => seconds,
+        Err(_) => {
+            let date = chrono::DateTime::parse_from_rfc2822(value).ok()?;
+            let now = chrono::Utc::now().timestamp();
+            date.timestamp().saturating_sub(now).max(0) as u64
+        }
+    };
+    Some(Duration::from_secs(seconds.min(MAX_RETRY_AFTER_SECS)))
 }
 
 /// Signs one body with HMAC-SHA256.
@@ -740,7 +794,7 @@ mod tests {
     use crate::db::{build_test_store, test_prefix};
     use crate::eav::entity::EntityStore;
     use crate::eav::schema::SchemaRegistry;
-    use crate::queue::{JobQueue, MemoryQueue};
+    use crate::queue::{JobQueue, JobStatus, MemoryQueue, QueueWorker};
     use crate::records::{AttributeChange, EntityEvent};
     use crate::rules::engine::RuleEngine;
     use crate::rules::rule::{ActionRef, Condition, Rule, RuleCapabilities, RuleTrigger};
@@ -806,6 +860,71 @@ mod tests {
     /// Returns a fixed signing secret for the tests.
     fn secret() -> Vec<u8> {
         b"0123456789abcdef0123456789abcdef".to_vec()
+    }
+
+    /// Builds one queued webhook job for a test server.
+    fn webhook_job(server: &MockServer) -> Job {
+        let envelope = WebhookJobPayload {
+            url: format!("{}/hook", server.uri()),
+            body: json!({"event_id": "evt-1", "rule_id": "alpha"}),
+        };
+        Job {
+            id: uuid::Uuid::now_v7(),
+            kind: JOB_KIND.to_string(),
+            payload: serde_json::to_vec(&envelope).unwrap(),
+            priority: 0,
+            attempt: 0,
+            max_attempts: 5,
+            created_at: 0,
+            scheduled_at: 0,
+            idempotency_key: None,
+            headers: BTreeMap::new(),
+        }
+    }
+
+    /// Starts one worker for the webhook handler.
+    fn start_worker(
+        queue: Arc<MemoryQueue>,
+        handler: WebhookJobHandler,
+    ) -> (CancellationToken, tokio::task::JoinHandle<()>) {
+        let worker = QueueWorker::new(
+            queue as Arc<dyn JobQueue>,
+            vec![Arc::new(handler) as Arc<dyn JobHandler>],
+            "worker-1".to_string(),
+        )
+        .with_poll_interval(Duration::from_millis(1))
+        .with_retry_base(Duration::from_secs(60))
+        .with_retry_max(Duration::from_secs(60));
+        let cancel = CancellationToken::new();
+        let token = cancel.clone();
+        let handle = tokio::spawn(async move { worker.run(token).await });
+        (cancel, handle)
+    }
+
+    /// Waits until the mock server receives `count` requests.
+    async fn wait_for_requests(server: &MockServer, count: usize) {
+        for _ in 0..2000 {
+            if server.received_requests().await.unwrap().len() >= count {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        panic!("the mock server did not receive {count} requests");
+    }
+
+    /// Waits until a job reaches the expected status.
+    async fn wait_for_status<F>(queue: &MemoryQueue, id: uuid::Uuid, ready: F) -> JobStatus
+    where
+        F: Fn(&JobStatus) -> bool,
+    {
+        for _ in 0..2000 {
+            let status = queue.status(id).await.unwrap();
+            if ready(&status) {
+                return status;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        panic!("the job did not reach the expected status");
     }
 
     #[test]
@@ -1394,6 +1513,120 @@ mod tests {
             .unwrap();
 
         assert!(handler.handle(&leased[0].job).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_400_response_fails_the_job_with_one_attempt() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/hook"))
+            .respond_with(ResponseTemplate::new(400))
+            .mount(&server)
+            .await;
+        let queue = Arc::new(MemoryQueue::new());
+        let action =
+            WebhookAction::new(vec![server.address().to_string()]).allow_private_hosts(true);
+        let job = webhook_job(&server);
+        let id = job.id;
+        queue.enqueue(job).await.unwrap();
+        let (cancel, run) = start_worker(queue.clone(), action.job_handler());
+
+        wait_for_requests(&server, 1).await;
+        let status = wait_for_status(&queue, id, |s| matches!(s, JobStatus::Failed { .. })).await;
+        cancel.cancel();
+        run.await.unwrap();
+
+        assert!(matches!(status, JobStatus::Failed { .. }), "got {status:?}");
+        assert!(
+            queue
+                .reserve("probe", 1, Duration::from_secs(30))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_429_response_queues_a_retry_with_the_retry_after_delay() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/hook"))
+            .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "2"))
+            .mount(&server)
+            .await;
+        let queue = Arc::new(MemoryQueue::new());
+        let action =
+            WebhookAction::new(vec![server.address().to_string()]).allow_private_hosts(true);
+        let job = webhook_job(&server);
+        let id = job.id;
+        queue.enqueue(job).await.unwrap();
+        let (cancel, run) = start_worker(queue.clone(), action.job_handler());
+
+        wait_for_requests(&server, 1).await;
+        let status = wait_for_status(&queue, id, |s| matches!(s, JobStatus::Queued)).await;
+        cancel.cancel();
+        run.await.unwrap();
+
+        assert!(matches!(status, JobStatus::Queued), "got {status:?}");
+        assert!(
+            queue
+                .reserve("probe", 1, Duration::from_secs(30))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        tokio::time::sleep(Duration::from_millis(2100)).await;
+        let leased = queue
+            .reserve("probe", 1, Duration::from_secs(30))
+            .await
+            .unwrap();
+        assert_eq!(leased.len(), 1);
+        assert_eq!(leased[0].job.attempt, 1);
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_500_response_queues_a_retry() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/hook"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let queue = Arc::new(MemoryQueue::new());
+        let action =
+            WebhookAction::new(vec![server.address().to_string()]).allow_private_hosts(true);
+        let job = webhook_job(&server);
+        let id = job.id;
+        queue.enqueue(job).await.unwrap();
+        let (cancel, run) = start_worker(queue.clone(), action.job_handler());
+
+        wait_for_requests(&server, 1).await;
+        let status = wait_for_status(&queue, id, |s| matches!(s, JobStatus::Queued)).await;
+        cancel.cancel();
+        run.await.unwrap();
+
+        assert!(matches!(status, JobStatus::Queued), "got {status:?}");
+        assert!(
+            queue
+                .reserve("probe", 1, Duration::from_secs(30))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn the_retry_after_parser_reads_and_caps_the_delay() {
+        assert_eq!(parse_retry_after("2"), Some(Duration::from_secs(2)));
+        assert_eq!(parse_retry_after("0"), Some(Duration::ZERO));
+        assert_eq!(
+            parse_retry_after("99999"),
+            Some(Duration::from_secs(MAX_RETRY_AFTER_SECS))
+        );
+        assert_eq!(parse_retry_after("not a date"), None);
     }
 
     #[test]
