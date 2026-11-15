@@ -452,6 +452,7 @@ impl RuleStore {
             .stage_set_enabled(&tx, id, enabled, expected_version)
             .await?;
         map_rule_commit(id, tx.commit().await)?;
+        self.invalidate_match_cache();
         Ok(rule)
     }
 
