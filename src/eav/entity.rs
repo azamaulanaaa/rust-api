@@ -305,6 +305,17 @@ const EXECUTION_GC_BATCH: usize = 200;
 #[cfg(test)]
 const EXECUTION_GC_BATCH: usize = 2;
 
+/// The key that holds the last entity id of a committed rebuild page.
+const REBUILD_CURSOR_KEY: &str = "idx:rebuild:cursor";
+
+/// The largest number of entities that one rebuild page reads.
+#[cfg(not(test))]
+const REBUILD_PAGE: usize = 200;
+
+/// The largest number of entities that one rebuild page reads.
+#[cfg(test)]
+const REBUILD_PAGE: usize = 2;
+
 /// Maximum size of an entity id or an attribute name, in bytes.
 const MAX_NAME_BYTES: usize = 128;
 
@@ -456,6 +467,85 @@ pub struct MigrationReport {
     /// The id to resume after for the next page.
     /// `None` means the pass is complete.
     pub next: Option<String>,
+}
+
+/// One entity that pins a schema version that the store does not hold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MissingSchemaIssue {
+    /// The entity id.
+    pub entity_id: String,
+    /// The schema id.
+    pub schema_id: String,
+    /// The missing version.
+    pub version: u64,
+}
+
+/// One entity reference that names no stored entity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DanglingRefIssue {
+    /// The entity that holds the reference.
+    pub entity_id: String,
+    /// The attribute name.
+    pub attribute: String,
+    /// The target entity id.
+    pub target: String,
+}
+
+/// One unique claim that is missing, stale, or shared.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UniqueClaimIssue {
+    /// The attribute name.
+    pub attribute: String,
+    /// A short description of the problem.
+    pub detail: String,
+}
+
+/// The result of one index validation pass.
+///
+/// An empty issue list means that the entity index is consistent.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IndexValidationReport {
+    /// The number of stored entities that the pass read.
+    pub entities: usize,
+    /// The number of unique claims that the pass expected.
+    pub unique_claims: usize,
+    /// The entities that pin a schema version that is absent.
+    pub missing_schemas: Vec<MissingSchemaIssue>,
+    /// The references that name no stored entity.
+    pub dangling_refs: Vec<DanglingRefIssue>,
+    /// The unique claims that fail the check.
+    pub unique_claim_issues: Vec<UniqueClaimIssue>,
+    /// The entities whose pinned schemas conflict.
+    pub schema_conflicts: Vec<String>,
+}
+
+impl IndexValidationReport {
+    /// Returns true when the pass found no problem.
+    pub fn is_ok(&self) -> bool {
+        self.missing_schemas.is_empty()
+            && self.dangling_refs.is_empty()
+            && self.unique_claim_issues.is_empty()
+            && self.schema_conflicts.is_empty()
+    }
+}
+
+/// The counts from one index rebuild.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RebuildReport {
+    /// The number of entity pages that the rebuild committed.
+    pub pages: usize,
+    /// The number of entities that the rebuild rewrote.
+    pub entities: usize,
+    /// The number of attribute index rows that the rebuild wrote.
+    pub attribute_rows: usize,
+    /// The number of unique claims that the rebuild wrote.
+    pub unique_claims: usize,
+    /// The number of time rows that the rebuild wrote.
+    pub time_rows: usize,
+    /// The number of name markers that the rebuild wrote.
+    pub name_markers: usize,
+    /// The entity id that a resumed run started after.
+    pub resumed_after: Option<String>,
 }
 
 /// The counts from one atomic schema migration batch.
@@ -3707,6 +3797,515 @@ impl EntityStore {
             }
         }
         Ok(facts)
+    }
+
+    /// Returns true when the store holds no entity row.
+    ///
+    /// The call reads the first key of the `entity:` family.
+    /// It writes no key.
+    pub(crate) async fn is_empty(&self) -> Result<bool, EntityError> {
+        let g = self.store.read().await;
+        let rows = g
+            .gets_keys(
+                Some(1),
+                Direction::Next,
+                (
+                    Some(ENTITY_PREFIX.to_string()),
+                    KeyPrefix::new(ENTITY_PREFIX).upper_bound(),
+                ),
+            )
+            .await
+            .map_err(EntityError::Store)?;
+        Ok(rows.is_empty())
+    }
+
+    /// Imports exact entity records into an empty store.
+    ///
+    /// The call validates every entity before it writes any key.
+    /// It writes the metadata, attribute, and index rows of one entity in one
+    /// transaction.
+    /// It keeps the version and the timestamps of each record.
+    /// It writes no event and no outbox row.
+    /// A dangling reference is allowed, because a restore check reports it
+    /// later.
+    pub(crate) async fn import_entities(&self, entities: &[Entity]) -> Result<usize, EntityError> {
+        let mut seen_ids = BTreeSet::new();
+        let mut seen_unique: BTreeSet<(String, String)> = BTreeSet::new();
+
+        let all_keys: BTreeSet<String> = entities
+            .iter()
+            .flat_map(|entity| entity.attributes.keys().cloned())
+            .collect();
+        let facts = {
+            let g = self.store.read().await;
+            self.name_facts(&*g, &all_keys).await?
+        };
+
+        for entity in entities {
+            self.validate_import_entity(entity, &facts, &mut seen_ids, &mut seen_unique)
+                .await?;
+        }
+
+        for entity in entities {
+            let _write = self.write_lock.lock().await;
+            let g = self.store.write().await;
+            let effective = self.resolve_import_refs(entity).await?;
+            let merged = merge_schemas(&effective)?;
+            let tx = g.begin_tx().map_err(EntityError::Store)?;
+            let facts = self.name_facts(&tx, &name_keys(entity, None)).await?;
+            check_unique_values(&tx, entity, &merged.attributes, &facts).await?;
+            let meta = meta_key(&entity.id);
+            let bytes = meta_bytes(entity)?;
+            if tx
+                .get_bytes(&meta)
+                .await
+                .map_err(EntityError::Store)?
+                .is_some()
+            {
+                return Err(EntityError::AlreadyExists(entity.id.clone()));
+            }
+            tx.set_bytes(&meta, &bytes)
+                .await
+                .map_err(EntityError::Store)?;
+            let mut state = WriteState::default();
+            put_entity_rows_except_meta(&tx, None, entity, &merged, &facts, &mut state, None)
+                .await?;
+            tx.commit().await.map_err(EntityError::Store)?;
+        }
+        Ok(entities.len())
+    }
+
+    /// Checks one entity record before an import writes it.
+    async fn validate_import_entity(
+        &self,
+        entity: &Entity,
+        facts: &NameFacts,
+        seen_ids: &mut BTreeSet<String>,
+        seen_unique: &mut BTreeSet<(String, String)>,
+    ) -> Result<(), EntityError> {
+        validate_name("entity id", &entity.id)?;
+        if entity.version == 0 {
+            return Err(EntityError::Invalid(format!(
+                "entity {} has version 0",
+                entity.id
+            )));
+        }
+        if !seen_ids.insert(entity.id.clone()) {
+            return Err(EntityError::Invalid(format!(
+                "entity {} has two records",
+                entity.id
+            )));
+        }
+        let effective = self.resolve_import_refs(entity).await?;
+        let merged = merge_schemas(&effective)?;
+        check_known(&entity.attributes, &merged.attributes)?;
+        validate_defaults(&merged.attributes)?;
+        check_types(&entity.attributes, &merged.attributes)?;
+        check_required(&entity.attributes, &merged.attributes)?;
+        for (name, value) in &entity.attributes {
+            if let AttributeValue::EntityRef(target) = value {
+                validate_name("entity id", target)?;
+            }
+            let unique = facts.unique.contains(name)
+                || merged
+                    .attributes
+                    .get(name)
+                    .is_some_and(|attribute| attribute.unique);
+            if unique {
+                let hash = value_hash(value)?;
+                if !seen_unique.insert((name.clone(), hash)) {
+                    return Err(EntityError::UniqueViolation(name.clone()));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolves the pinned schema versions of one import record.
+    async fn resolve_import_refs(
+        &self,
+        entity: &Entity,
+    ) -> Result<Vec<EffectiveSchema>, EntityError> {
+        let mut seen = BTreeSet::new();
+        let mut effective = Vec::with_capacity(entity.schemas.len());
+        for schema in &entity.schemas {
+            validate_name("schema id", &schema.id)?;
+            if !seen.insert((schema.id.clone(), schema.version)) {
+                return Err(EntityError::Invalid(format!(
+                    "entity {} pins schema {} twice",
+                    entity.id, schema.id
+                )));
+            }
+            let Some(flat) = self
+                .schemas
+                .effective(&schema.id, schema.version)
+                .await
+                .map_err(map_schema_error)?
+            else {
+                return Err(EntityError::Invalid(format!(
+                    "entity {} pins a missing schema version: {}@{}",
+                    entity.id, schema.id, schema.version
+                )));
+            };
+            effective.push(flat);
+        }
+        Ok(effective)
+    }
+
+    /// Rewrites every index row of the stored entities.
+    ///
+    /// The call first writes the name markers from the stored schema versions.
+    /// It then reads the entities in id order, one page at a time.
+    /// Each page rewrites the index rows in one transaction.
+    /// The call keeps a cursor after each page, so a later run resumes.
+    /// The cursor is removed after the last page.
+    /// A second run writes the same rows and changes no value.
+    /// With `schema`, the call rewrites only the entities that pin that schema.
+    pub(crate) async fn rebuild_indexes(
+        &self,
+        schema: Option<&str>,
+    ) -> Result<RebuildReport, EntityError> {
+        if let Some(schema) = schema {
+            validate_name("schema id", schema)?;
+        }
+        let mut report = RebuildReport::default();
+        self.backfill_entity_index().await?;
+
+        {
+            let _write = self.write_lock.lock().await;
+            let g = self.store.write().await;
+            let tx = g.begin_tx().map_err(EntityError::Store)?;
+            let mut markers = 0;
+            for def in self.schemas.versions().await.map_err(map_schema_error)? {
+                let Some(effective) = self
+                    .schemas
+                    .effective(&def.id, def.version)
+                    .await
+                    .map_err(map_schema_error)?
+                else {
+                    continue;
+                };
+                for (name, attribute) in &effective.attributes {
+                    if attribute.indexed {
+                        tx.set_bytes(&attr_key_index_key(name), b"")
+                            .await
+                            .map_err(EntityError::Store)?;
+                        markers += 1;
+                        if is_time_attribute(attribute) {
+                            tx.set_bytes(&time_key_index_key(name), b"")
+                                .await
+                                .map_err(EntityError::Store)?;
+                            markers += 1;
+                        }
+                    }
+                    if attribute.unique {
+                        tx.set_bytes(&unique_name_key(name), b"")
+                            .await
+                            .map_err(EntityError::Store)?;
+                        markers += 1;
+                    }
+                }
+            }
+            tx.commit().await.map_err(EntityError::Store)?;
+            report.name_markers = markers;
+        }
+
+        let resume = {
+            let g = self.store.read().await;
+            match g
+                .get_bytes(REBUILD_CURSOR_KEY)
+                .await
+                .map_err(EntityError::Store)?
+            {
+                Some(bytes) => serde_json::from_slice::<String>(&bytes).ok(),
+                None => None,
+            }
+        };
+        report.resumed_after = resume.clone();
+        let mut cursor = resume
+            .as_deref()
+            .map(|id| format!("{ENTITY_INDEX_PREFIX}{id}\0"))
+            .unwrap_or_else(|| ENTITY_INDEX_PREFIX.to_string());
+        let end = KeyPrefix::new(ENTITY_INDEX_PREFIX).upper_bound();
+
+        loop {
+            let page = {
+                let _write = self.write_lock.lock().await;
+                let g = self.store.write().await;
+                let rows = g
+                    .gets_keys(
+                        Some(REBUILD_PAGE),
+                        Direction::Next,
+                        (Some(cursor.clone()), end.clone()),
+                    )
+                    .await
+                    .map_err(EntityError::Store)?;
+                if rows.is_empty() {
+                    None
+                } else {
+                    let full = rows.len() == REBUILD_PAGE;
+                    let mut last_id = None;
+                    let tx = g.begin_tx().map_err(EntityError::Store)?;
+                    for key in &rows {
+                        let Some(id) = key.strip_prefix(ENTITY_INDEX_PREFIX) else {
+                            continue;
+                        };
+                        if id.is_empty() || id.contains(':') {
+                            continue;
+                        }
+                        last_id = Some(id.to_string());
+                        let Some(entity) = load_entity(&tx, id).await? else {
+                            continue;
+                        };
+                        if let Some(schema) = schema
+                            && !entity.schemas.iter().any(|pinned| pinned.id == schema)
+                        {
+                            continue;
+                        }
+                        let effective = self.resolve_refs(&entity.schemas).await?;
+                        let merged = merge_schemas(&effective)?;
+                        let facts = self.name_facts(&tx, &name_keys(&entity, None)).await?;
+                        let mut preserved = Vec::new();
+                        for (name, value) in &entity.attributes {
+                            let indexed = facts.indexed.contains(name)
+                                || merged
+                                    .attributes
+                                    .get(name)
+                                    .is_some_and(|attribute| attribute.indexed);
+                            if !indexed {
+                                continue;
+                            }
+                            if let AttributeValue::Timestamp(timestamp) = value {
+                                let key = time_index_key(name, *timestamp, &entity.id);
+                                if let Some(bytes) =
+                                    tx.get_bytes(&key).await.map_err(EntityError::Store)?
+                                {
+                                    preserved.push((key, bytes));
+                                }
+                                report.time_rows += 1;
+                            }
+                            report.attribute_rows += 1;
+                        }
+                        for name in entity.attributes.keys() {
+                            let unique = facts.unique.contains(name)
+                                || merged
+                                    .attributes
+                                    .get(name)
+                                    .is_some_and(|attribute| attribute.unique);
+                            if unique {
+                                report.unique_claims += 1;
+                            }
+                        }
+                        let mut state = WriteState::default();
+                        delete_mutable_rows(&tx, &entity, None, &merged, &facts, &mut state)
+                            .await?;
+                        delete_ref_rows(&tx, &entity, &merged).await?;
+                        put_entity_rows_except_meta(
+                            &tx,
+                            Some(&entity),
+                            &entity,
+                            &merged,
+                            &facts,
+                            &mut state,
+                            None,
+                        )
+                        .await?;
+                        for (key, bytes) in preserved {
+                            tx.set_bytes(&key, &bytes)
+                                .await
+                                .map_err(EntityError::Store)?;
+                        }
+                        report.entities += 1;
+                    }
+                    tx.commit().await.map_err(EntityError::Store)?;
+                    report.pages += 1;
+                    if let Some(id) = &last_id {
+                        let bytes = serde_json::to_vec(id)
+                            .map_err(|e| EntityError::Internal(e.to_string()))?;
+                        g.put_bytes(REBUILD_CURSOR_KEY, &bytes)
+                            .await
+                            .map_err(EntityError::Store)?;
+                    }
+                    last_id.map(|id| (format!("{ENTITY_INDEX_PREFIX}{id}\0"), full))
+                }
+            };
+            let Some((next, full)) = page else {
+                break;
+            };
+            cursor = next;
+            if !full {
+                break;
+            }
+        }
+
+        let _write = self.write_lock.lock().await;
+        let g = self.store.write().await;
+        g.delete(REBUILD_CURSOR_KEY)
+            .await
+            .map_err(EntityError::Store)?;
+        Ok(report)
+    }
+
+    /// Checks the pinned schemas, the unique claims, and the references.
+    ///
+    /// The call reads every stored entity.
+    /// It reports a pinned schema version that is absent.
+    /// It reports a reference that names no stored entity.
+    /// It reports a unique claim that is missing, stale, or shared.
+    /// It writes no key.
+    pub(crate) async fn validate_indexes(&self) -> Result<IndexValidationReport, EntityError> {
+        let mut report = IndexValidationReport::default();
+        let g = self.store.read().await;
+        let keys = scan_keys_prefix(&*g, ENTITY_PREFIX).await?;
+        let mut expected: BTreeMap<(String, String, String), BTreeSet<String>> = BTreeMap::new();
+
+        for key in keys {
+            let Some(rest) = key.strip_prefix(ENTITY_PREFIX) else {
+                continue;
+            };
+            let Some(id) = rest.strip_suffix(META_SUFFIX) else {
+                continue;
+            };
+            if id.is_empty() || id.contains(':') {
+                continue;
+            }
+            let Some(entity) = load_entity(&*g, id).await? else {
+                continue;
+            };
+            report.entities += 1;
+
+            let mut effective = Vec::new();
+            let mut missing = false;
+            for schema in &entity.schemas {
+                match self
+                    .schemas
+                    .effective(&schema.id, schema.version)
+                    .await
+                    .map_err(map_schema_error)?
+                {
+                    Some(flat) => effective.push(flat),
+                    None => {
+                        report.missing_schemas.push(MissingSchemaIssue {
+                            entity_id: entity.id.clone(),
+                            schema_id: schema.id.clone(),
+                            version: schema.version,
+                        });
+                        missing = true;
+                    }
+                }
+            }
+            if missing {
+                continue;
+            }
+            let merged = match merge_schemas(&effective) {
+                Ok(merged) => merged,
+                Err(error) => {
+                    report
+                        .schema_conflicts
+                        .push(format!("{}: {error}", entity.id));
+                    continue;
+                }
+            };
+
+            for (name, value) in &entity.attributes {
+                match value {
+                    AttributeValue::EntityRef(target) if target != &entity.id => {
+                        let exists = g
+                            .get_bytes(&meta_key(target))
+                            .await
+                            .map_err(EntityError::Store)?
+                            .is_some();
+                        if !exists {
+                            report.dangling_refs.push(DanglingRefIssue {
+                                entity_id: entity.id.clone(),
+                                attribute: name.clone(),
+                                target: target.clone(),
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+                if merged
+                    .attributes
+                    .get(name)
+                    .is_some_and(|attribute| attribute.unique)
+                {
+                    let hash = value_hash(value)?;
+                    let fingerprint = value_fingerprint(value)?;
+                    expected
+                        .entry((name.clone(), hash, fingerprint))
+                        .or_default()
+                        .insert(entity.id.clone());
+                }
+            }
+        }
+
+        for ((name, hash, fingerprint), owners) in &expected {
+            report.unique_claims += 1;
+            let claim = unique_claim_key(name, hash, fingerprint);
+            if owners.len() > 1 {
+                let mut ids: Vec<&str> = owners.iter().map(String::as_str).collect();
+                ids.sort_unstable();
+                report.unique_claim_issues.push(UniqueClaimIssue {
+                    attribute: name.clone(),
+                    detail: format!("value has more than one owner: {}", ids.join(", ")),
+                });
+            }
+            match g
+                .get_bytes(&claim)
+                .await
+                .map_err(EntityError::Store)?
+                .as_deref()
+                .and_then(claim_owner)
+            {
+                Some(owner) if owners.len() == 1 && owners.contains(owner) => {}
+                Some(owner) => report.unique_claim_issues.push(UniqueClaimIssue {
+                    attribute: name.clone(),
+                    detail: format!("claim names the wrong owner: {owner}"),
+                }),
+                None => report.unique_claim_issues.push(UniqueClaimIssue {
+                    attribute: name.clone(),
+                    detail: "claim is missing or has no owner".to_string(),
+                }),
+            }
+        }
+
+        for key in scan_keys_prefix(&*g, UNIQUE_CLAIM_PREFIX).await? {
+            let Some(rest) = key.strip_prefix(UNIQUE_CLAIM_PREFIX) else {
+                continue;
+            };
+            let parts: Vec<&str> = rest.split(':').collect();
+            if parts.len() != 2 {
+                continue;
+            }
+            let bytes = g.get_bytes(&key).await.map_err(EntityError::Store)?;
+            let Some(owner) = bytes.as_deref().and_then(claim_owner) else {
+                report.unique_claim_issues.push(UniqueClaimIssue {
+                    attribute: parts[0].to_string(),
+                    detail: "claim has no owner".to_string(),
+                });
+                continue;
+            };
+            let Some(entity) = load_entity(&*g, owner).await? else {
+                report.unique_claim_issues.push(UniqueClaimIssue {
+                    attribute: parts[0].to_string(),
+                    detail: format!("claim names a missing entity: {owner}"),
+                });
+                continue;
+            };
+            let holds = match entity.attributes.get(parts[0]) {
+                Some(value) => value_hash(value).ok().as_deref() == Some(parts[1]),
+                None => false,
+            };
+            if !holds {
+                report.unique_claim_issues.push(UniqueClaimIssue {
+                    attribute: parts[0].to_string(),
+                    detail: format!("entity {owner} does not hold the claimed value"),
+                });
+            }
+        }
+
+        Ok(report)
     }
 }
 

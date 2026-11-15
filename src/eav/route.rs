@@ -60,6 +60,12 @@ pub(crate) const ENTITY_ROW: &str = "entity";
 const DEFAULT_PAGE_LIMIT: usize = 50;
 /// The maximum page size of a list route.
 const MAX_PAGE_LIMIT: usize = 200;
+/// The maximum count of raw pages that one cursor page reads.
+///
+/// The route checks a grant on each row.
+/// A raw page can hold no visible row.
+/// The route then reads the next raw page, up to this count.
+const CURSOR_SCAN_BATCH: usize = 4;
 /// The default count of entities that a revalidation checks.
 const DEFAULT_REVALIDATE_LIMIT: usize = 100;
 /// The maximum count of entities that a revalidation checks.
