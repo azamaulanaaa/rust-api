@@ -145,6 +145,8 @@ pub struct ExpectedVersionQuery {
 /// A present `after` field selects cursor mode.
 /// The offset cap is 1000.
 /// Use `after` to page deeper than the cap.
+/// A full page whose next offset would pass the cap returns no
+/// `next_offset`.
 /// `GET /eav/rules` supports offset paging only, so it rejects a cursor.
 #[derive(Debug, Clone, Deserialize, utoipa::IntoParams)]
 pub struct PageQuery {
@@ -295,6 +297,7 @@ pub struct SchemaPage {
     pub items: Vec<SchemaDef>,
     /// `Some` means the page was full and a following page may exist.
     /// Fetch it and stop when the page is empty.
+    /// The value is `None` when the next offset would pass the cap.
     pub next_offset: Option<usize>,
     /// The id to resume after for the next page.
     ///
@@ -310,6 +313,7 @@ pub struct EntityPage {
     pub items: Vec<Entity>,
     /// `Some` means the page was full and a following page may exist.
     /// Fetch it and stop when the page is empty.
+    /// The value is `None` when the next offset would pass the cap.
     pub next_offset: Option<usize>,
     /// The id to resume after for the next page.
     ///
@@ -325,6 +329,7 @@ pub struct RulePage {
     pub items: Vec<Rule>,
     /// `Some` means the page was full and a following page may exist.
     /// Fetch it and stop when the page is empty.
+    /// The value is `None` when the next offset would pass the cap.
     pub next_offset: Option<usize>,
 }
 
@@ -444,11 +449,18 @@ impl fmt::Display for InvalidMigrateLimit {
 
 impl std::error::Error for InvalidMigrateLimit {}
 
-/// Returns the next offset when the page is full.
+/// Returns the next offset when the page is full and the offset stays in range.
 ///
 /// The call returns `None` when the page is not full.
+/// The call returns `None` when the next offset would pass
+/// [`MAX_PAGE_OFFSET`], because the route rejects that offset.
+/// A client that pages deeper uses `after`.
 pub(crate) fn page_next_offset(offset: usize, len: usize, limit: usize) -> Option<usize> {
-    (len == limit).then_some(offset.saturating_add(len))
+    if len != limit {
+        return None;
+    }
+    let next = offset.saturating_add(len);
+    (next <= MAX_PAGE_OFFSET).then_some(next)
 }
 
 /// The body of the entity patch route.
@@ -1658,6 +1670,17 @@ mod tests {
         assert_eq!(mode, PageMode::Offset(MAX_PAGE_OFFSET));
     }
 
+    /// A full page returns no next offset when the cap rejects that offset.
+    #[test]
+    fn a_full_page_omits_a_next_offset_above_the_cap() {
+        assert_eq!(page_next_offset(900, 200, 200), None);
+        assert_eq!(page_next_offset(800, 200, 200), Some(MAX_PAGE_OFFSET));
+        assert_eq!(page_next_offset(1000, 1, 1), None);
+        assert_eq!(page_next_offset(999, 1, 1), Some(MAX_PAGE_OFFSET));
+        assert_eq!(page_next_offset(0, 50, 50), Some(50));
+        assert_eq!(page_next_offset(0, 49, 50), None);
+    }
+
     #[test]
     fn page_query_rejects_an_offset_above_the_maximum() {
         let query = PageQuery {
@@ -2619,6 +2642,32 @@ mod tests {
             assert_eq!(res.status(), http::StatusCode::OK, "{uri}");
             let page: Value = actix_test::read_body_json(res).await;
             assert_eq!(page["items"].as_array().map(Vec::len), Some(0), "{uri}");
+            assert!(page["next_offset"].is_null(), "{uri}");
+        }
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn the_offset_cap_accepts_a_page_at_the_boundary() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        assert!(fx.engine.claim_superadmin("alice").await?);
+        publish_task_schema(&fx).await?;
+        create_task(&fx, "e1").await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+
+        for uri in [
+            format!("/eav/entities?offset={MAX_PAGE_OFFSET}&limit=1"),
+            "/eav/entities?offset=900&limit=200".to_string(),
+        ] {
+            let res = actix_test::call_service(
+                &app,
+                auth(actix_test::TestRequest::get().uri(&uri), &token).to_request(),
+            )
+            .await;
+            assert_eq!(res.status(), http::StatusCode::OK, "{uri}");
+            let page: Value = actix_test::read_body_json(res).await;
             assert!(page["next_offset"].is_null(), "{uri}");
         }
         Ok(())
