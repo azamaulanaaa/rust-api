@@ -22,6 +22,8 @@
 //! The backoff wait stops when the cancel token fires.
 //! Tests use a 10 millisecond base.
 //! A loop clears its flag after a pass succeeds.
+//! The rule runner clears its flag only after the engine records a real
+//! cursor advance or one healthy idle poll.
 //! The readiness probe reads the flags.
 //! Readiness stays false while any loop flag is set.
 //! The flags are a signal for the operator, not a stop switch.
@@ -522,13 +524,15 @@ impl EavRuntime {
     /// An error in one loop does not stop the other loops or the remaining
     /// work of that loop.
     /// A loop clears its flag after a pass succeeds.
+    /// The rule runner clears its flag only after the engine records a real
+    /// cursor advance or one healthy idle poll.
     /// The flags are a signal for the operator, not a stop switch.
     /// The call returns `Ok(())` only when `cancel` is cancelled.
     /// It waits for all four supervisors to stop before it returns.
     /// A normal cancellation does not set a flag.
     ///
     /// The outbox relay flushes the pending entity events.
-    /// The rule runner tails the shared change feed.
+    /// The rule runner tails the shared change feed and reports progress.
     /// The marker cleanup deletes old execution markers.
     /// The timer pass emits the due timer events.
     pub async fn run<C: CancelToken>(
@@ -725,8 +729,12 @@ impl EavRuntime {
     /// Runs the rule engine until `cancel` fires.
     ///
     /// The engine call returns only on an error or on cancellation.
-    /// The call treats one full poll interval without an error as a
-    /// successful pass, and clears the failure flag of the rule runner.
+    /// The engine records a health signal after each real cursor advance and
+    /// after one healthy idle poll.
+    /// The call clears the failure flag of the rule runner only after that
+    /// signal.
+    /// One poll interval without a signal does not clear the flag, so a runner
+    /// that makes no progress stays failed.
     /// A zero interval becomes one second.
     /// A failed engine call returns the error to the supervisor.
     async fn run_rule_runner<C: CancelToken>(
@@ -735,7 +743,42 @@ impl EavRuntime {
         poll_interval: Duration,
     ) -> anyhow::Result<()> {
         let interval = nonzero_duration(poll_interval);
-        let mut run = std::pin::pin!(self.engine.run(&self.wal, cancel.clone(), interval));
+        let progress = Arc::new(AtomicBool::new(false));
+        let signal = progress.clone();
+        let run = {
+            let engine = self.engine.clone();
+            let wal = self.wal.clone();
+            let cancel = cancel.clone();
+            async move {
+                let record = move || signal.store(true, Ordering::SeqCst);
+                engine
+                    .run_with_progress(&wal, cancel, interval, &record)
+                    .await
+                    .map_err(|error| anyhow::anyhow!("EAV rule runner failed: {error}"))
+            }
+        };
+        self.drive_rule_run(cancel, interval, run, progress).await
+    }
+
+    /// Clears the rule-runner flag only after the engine records progress.
+    ///
+    /// The call waits for `run` or for one poll interval.
+    /// A tick clears the failure flag only when the engine recorded a signal
+    /// since the previous tick.
+    /// A runner that polls without a signal keeps the flag set.
+    /// The call returns the error of a failed run to the supervisor.
+    async fn drive_rule_run<C, F>(
+        &self,
+        cancel: C,
+        interval: Duration,
+        run: F,
+        progress: Arc<AtomicBool>,
+    ) -> anyhow::Result<()>
+    where
+        C: CancelToken,
+        F: std::future::Future<Output = anyhow::Result<()>>,
+    {
+        let mut run = std::pin::pin!(run);
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // The first tick completes at once. Skip it, so a pass needs one full
@@ -744,11 +787,10 @@ impl EavRuntime {
         loop {
             tokio::select! {
                 result = &mut run => {
-                    return result
-                        .map_err(|error| anyhow::anyhow!("EAV rule runner failed: {error}"));
+                    return result;
                 }
                 _ = ticker.tick() => {
-                    if !cancel.is_cancelled() {
+                    if progress.swap(false, Ordering::SeqCst) && !cancel.is_cancelled() {
                         self.mark_loop_ok(LoopSlot::RuleRunner);
                     }
                 }
@@ -1429,6 +1471,53 @@ mod tests {
             .expect("a normal cancellation must return Ok");
     }
 
+    /// A runner that polls but makes no progress keeps its failure flag.
+    ///
+    /// The fake run loop sleeps and never records a signal.
+    /// Several poll intervals must not clear the flag.
+    #[tokio::test]
+    async fn a_rule_runner_that_makes_no_progress_keeps_its_failure_flag() {
+        let runtime = build_runtime(Vec::new()).await;
+        runtime.mark_loop_failed(LoopSlot::RuleRunner);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let runner = tokio::spawn({
+            let runtime = runtime.clone();
+            let cancel = cancel.clone();
+            async move {
+                let poll_cancel = cancel.clone();
+                let run = async move {
+                    loop {
+                        if poll_cancel.is_cancelled() {
+                            return Ok(());
+                        }
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                };
+                runtime
+                    .drive_rule_run(
+                        cancel,
+                        Duration::from_millis(2),
+                        run,
+                        Arc::new(AtomicBool::new(false)),
+                    )
+                    .await
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            runtime.failed(),
+            "a runner that makes no progress must keep the failure flag"
+        );
+
+        cancel.store(true, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(2), runner)
+            .await
+            .expect("the runner must stop")
+            .expect("the task does not panic")
+            .expect("a cancelled runner must return Ok");
+    }
+
     #[tokio::test]
     async fn spawn_sets_the_failure_flag_when_the_outbox_relay_fails() {
         let runtime = runtime_with_a_failing_outbox().await;
@@ -1562,6 +1651,7 @@ mod tests {
         let runtime = build_runtime_with_scripts(vec![recorder.clone()]).await;
         runtime.schemas().publish(schema()).await.unwrap();
         let mut scripted = rule();
+        scripted.capabilities.read = vec!["invoice".to_string()];
         scripted.condition = Condition::Script {
             source: r#"event.kind == "created" && entity.attributes.total == 10"#.to_string(),
         };
