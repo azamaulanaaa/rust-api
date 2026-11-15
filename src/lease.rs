@@ -77,6 +77,10 @@ struct LeaseRecord {
     renewed_at: i64,
     /// TTL that the holder operates under.
     ttl_secs: u64,
+    /// True when the holder wrote this record to release the lease. A
+    /// released record is stale, even when its `renewed_at` is recent.
+    #[serde(default)]
+    released: bool,
     /// Process ID of the holder. The field is here for an operator who
     /// reads the object by hand.
     pid: u32,
@@ -96,7 +100,13 @@ impl LeaseRecord {
     /// `checked_sub` yields `None` when the clock of the holder is behind
     /// ours. The function reads that case as live. A negative age from clock
     /// skew is the safe direction in which to be wrong here.
+    ///
+    /// A record with `released` set is never live. The holder wrote that
+    /// record to give the lease up.
     fn is_live_at(&self, now: i64) -> bool {
+        if self.released {
+            return false;
+        }
         match now.checked_sub(self.renewed_at) {
             Some(age) => u64::try_from(age).is_ok_and(|age| age < self.ttl_secs),
             None => true,
@@ -172,6 +182,10 @@ impl WriterLease {
     /// [`build_s3_store`](crate::db::build_s3_store) for the same scope.
     /// Building a store takes an epoch, so a check after that would report
     /// that the function had already displaced the current holder.
+    ///
+    /// A create response can be lost. The function then reads its own record
+    /// and compares the instance. A matching instance means that the claim
+    /// succeeded.
     pub async fn acquire(
         store: Arc<dyn ObjectStore>,
         db_prefix: &str,
@@ -185,6 +199,7 @@ impl WriterLease {
             claimed_at: now,
             renewed_at: now,
             ttl_secs,
+            released: false,
             pid: std::process::id(),
         };
 
@@ -212,7 +227,23 @@ impl WriterLease {
                     source: "lease vanished between create and read".into(),
                 },
             })?;
-        let age = now - held.record.renewed_at;
+
+        // A lost create response is not a lost race. The read shows our own
+        // record when the create landed but its response did not. Compare
+        // the instance before we report another holder.
+        if held.record.instance == record.instance {
+            tracing::info!(
+                prefix = %prefix,
+                instance = %record.instance,
+                "claimed single-writer lease (the create response was lost)"
+            );
+            return Ok(Self::new(store, path, record));
+        }
+
+        // A corrupt record can put `renewed_at` in the future. `is_live_at`
+        // treats that case as live. Report the age as 0, so this subtraction
+        // cannot overflow.
+        let age = now.checked_sub(held.record.renewed_at).unwrap_or(0);
         if held.record.is_live_at(now) {
             return Err(LeaseError::held(&prefix, &held.record, age));
         }
@@ -286,29 +317,23 @@ impl WriterLease {
     /// renewal that wrote first would replace the record of a successor. It
     /// would then read back its *own* write, and conclude that it still held
     /// the lease. That is the exact split brain that this module exists to
-    /// prevent. The displaced process would keep taking the record back that
+    /// prevent. The displaced process would keep taking back a record that
     /// it had already lost.
+    ///
+    /// The write is a compare-and-set on the version that the read observed.
+    /// A successor can replace the record between the read and the write.
+    /// The write then fails its precondition, and this process latches
+    /// `lost`. A failed renewal must not confirm a record that it replaced.
     ///
     /// A renewal that cannot confirm ownership also returns `false`. The
     /// causes are an S3 error and an unreadable record. Treating a
     /// temporary I/O error as "still fine" would let a node on a partition
     /// keep serving after its lease expired somewhere else.
-    ///
-    /// A successor can still get the record between the read and the write.
-    /// That successor must have judged us to be stale, which means the TTL
-    /// had passed. The remaining window is one round trip inside a TTL
-    /// violation. It is not a condition that lasts.
-    ///
-    /// The write in this function stays unconditional, unlike the take-over
-    /// in [`WriterLease::acquire`]. This process has already established that
-    /// it is the holder. A compare-and-set on the renewal would only turn a
-    /// harmless replace into a false "lease lost" the first time a successor
-    /// took over.
     pub async fn renew(&mut self) -> bool {
         if self.lost.load(Ordering::Relaxed) {
             return false;
         }
-        match fetch(&*self.store, &self.path, "").await {
+        let current = match fetch(&*self.store, &self.path, "").await {
             Ok(Some(current)) if current.record.instance != self.record.instance => {
                 tracing::error!(
                     instance = %self.record.instance,
@@ -319,7 +344,15 @@ impl WriterLease {
                 self.lost.store(true, Ordering::Relaxed);
                 return false;
             }
-            Ok(_) => {}
+            Ok(Some(current)) => current,
+            Ok(None) => {
+                tracing::warn!(
+                    instance = %self.record.instance,
+                    "single-writer lease record is gone; reporting unready"
+                );
+                self.lost.store(true, Ordering::Relaxed);
+                return false;
+            }
             Err(e) => {
                 tracing::warn!(
                     instance = %self.record.instance,
@@ -329,47 +362,69 @@ impl WriterLease {
                 self.lost.store(true, Ordering::Relaxed);
                 return false;
             }
-        }
+        };
         self.record.renewed_at = chrono::Utc::now().timestamp();
-        if write_record(&*self.store, &self.path, &self.record, WriteMode::Overwrite)
-            .await
-            .is_err()
-        {
-            tracing::warn!(
-                instance = %self.record.instance,
-                "failed to renew single-writer lease; reporting unready"
-            );
-            self.lost.store(true, Ordering::Relaxed);
-            return false;
+        let result = write_record(
+            &*self.store,
+            &self.path,
+            &self.record,
+            WriteMode::Unchanged(current.version),
+        )
+        .await;
+        match result {
+            Ok(()) => true,
+            Err(object_store::Error::Precondition { .. }) => {
+                tracing::error!(
+                    instance = %self.record.instance,
+                    "single-writer lease changed during renewal; \
+                     this process must stop serving writes"
+                );
+                self.lost.store(true, Ordering::Relaxed);
+                false
+            }
+            Err(e) => {
+                tracing::warn!(
+                    instance = %self.record.instance,
+                    error = %e,
+                    "failed to renew single-writer lease; reporting unready"
+                );
+                self.lost.store(true, Ordering::Relaxed);
+                false
+            }
         }
-        true
     }
 
     /// Releases the lease if this process still holds it. A replacement can
     /// then start at once, instead of waiting out the TTL.
     ///
+    /// The function first marks the record as released with a
+    /// compare-and-set. A successor that took the lease in the gap changes
+    /// the version. The mark then fails its precondition, and the successor's
+    /// record stays. The function deletes the marked record after that.
+    ///
+    /// The delete has no condition, because `object_store` has no conditional
+    /// delete. The mark is the part that protects the successor. A released
+    /// record is stale, so the next claim works even when the delete fails.
+    ///
     /// The function makes a best effort. A failure here costs the next start
     /// only `ttl_secs`, so the function logs the failure instead of passing
     /// it on.
     pub async fn release(&mut self) {
-        match fetch(&*self.store, &self.path, "").await {
+        let held = match fetch(&*self.store, &self.path, "").await {
             Ok(Some(current)) if current.record.instance != self.record.instance => {
                 tracing::info!(
                     instance = %self.record.instance,
                     "lease already held by another instance; leaving it alone"
                 );
+                return;
             }
-            Ok(_) => {
-                if let Err(e) = self.store.delete(&self.path).await {
-                    tracing::warn!(
-                        instance = %self.record.instance,
-                        error = %e,
-                        "failed to release single-writer lease; it will expire in {}s",
-                        self.record.ttl_secs
-                    );
-                } else {
-                    tracing::info!(instance = %self.record.instance, "released single-writer lease");
-                }
+            Ok(Some(current)) => current,
+            Ok(None) => {
+                tracing::info!(
+                    instance = %self.record.instance,
+                    "lease record is already gone; nothing to release"
+                );
+                return;
             }
             Err(e) => {
                 tracing::warn!(
@@ -378,7 +433,49 @@ impl WriterLease {
                     "could not read the lease to release it; it will expire in {}s",
                     self.record.ttl_secs
                 );
+                return;
             }
+        };
+
+        let mut released = self.record.clone();
+        released.released = true;
+        released.renewed_at = chrono::Utc::now().timestamp();
+        match write_record(
+            &*self.store,
+            &self.path,
+            &released,
+            WriteMode::Unchanged(held.version),
+        )
+        .await
+        {
+            Ok(()) => {}
+            Err(object_store::Error::Precondition { .. }) => {
+                tracing::info!(
+                    instance = %self.record.instance,
+                    "lease was taken over before release; leaving the successor's record alone"
+                );
+                return;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    instance = %self.record.instance,
+                    error = %e,
+                    "failed to release single-writer lease; it will expire in {}s",
+                    self.record.ttl_secs
+                );
+                return;
+            }
+        }
+
+        if let Err(e) = self.store.delete(&self.path).await {
+            tracing::warn!(
+                instance = %self.record.instance,
+                error = %e,
+                "failed to delete the released single-writer lease; it will expire in {}s",
+                self.record.ttl_secs
+            );
+        } else {
+            tracing::info!(instance = %self.record.instance, "released single-writer lease");
         }
     }
 }
@@ -617,8 +714,6 @@ async fn fetch(
 enum WriteMode {
     /// Only if the object does not exist.
     Create,
-    /// Replaces whatever is there.
-    Overwrite,
     /// Replaces only the exact version that was observed.
     Unchanged(UpdateVersion),
 }
@@ -635,7 +730,6 @@ async fn write_record(
     })?;
     let mode = match mode {
         WriteMode::Create => PutMode::Create,
-        WriteMode::Overwrite => PutMode::Overwrite,
         WriteMode::Unchanged(version) => PutMode::Update(version),
     };
     store
@@ -662,6 +756,16 @@ mod tests {
     }
 
     const TTL: u64 = 60;
+
+    /// Writes `record` to `path` without a condition. The tests use the
+    /// helper to seed a record that the code under test must read.
+    async fn overwrite_record(store: &dyn ObjectStore, path: &ObjectPath, record: &LeaseRecord) {
+        let bytes = serde_json::to_vec(record).expect("encode a lease record");
+        store
+            .put(path, PutPayload::from(bytes))
+            .await
+            .expect("seed a lease record");
+    }
 
     /// A fresh lease blocks a second writer, and the error names the holder.
     /// This is the case that the whole module exists for. Without this case,
@@ -734,6 +838,52 @@ mod tests {
         );
     }
 
+    /// A create whose response is lost must not look like a live lease that
+    /// another process holds.
+    #[tokio::test]
+    async fn a_lost_create_response_is_a_successful_claim() {
+        let store = mem();
+        let prefix = "lease-test-lost-create";
+        let store: Arc<dyn ObjectStore> = Arc::new(LostCreateResponseStore {
+            inner: Arc::clone(&store),
+        });
+
+        let lease = WriterLease::acquire(Arc::clone(&store), prefix, TTL)
+            .await
+            .expect("our own record is not another holder");
+        assert!(
+            !lease.lost_flag().load(Ordering::Relaxed),
+            "a successful claim must not report a lost lease"
+        );
+    }
+
+    /// A record whose `renewed_at` is the minimum `i64` must not panic the
+    /// age subtraction. The function treats the record as live, because an
+    /// extreme timestamp is the safe direction to be wrong.
+    #[tokio::test]
+    async fn an_extreme_renewal_time_does_not_overflow_the_age() {
+        let store = mem();
+        let prefix = "lease-test-extreme-renewal";
+        let now = chrono::Utc::now().timestamp();
+        let record = LeaseRecord {
+            instance: "extreme-holder".to_string(),
+            claimed_at: now,
+            renewed_at: i64::MIN,
+            ttl_secs: TTL,
+            released: false,
+            pid: std::process::id(),
+        };
+        overwrite_record(&*store, &lease_path(prefix), &record).await;
+
+        let err = WriterLease::acquire(Arc::clone(&store), prefix, TTL)
+            .await
+            .expect_err("an extreme renewal time must still look live");
+        let LeaseError::Held { age, .. } = &err else {
+            panic!("expected Held, got {err:?}");
+        };
+        assert_eq!(*age, 0, "the age must not overflow: {err}");
+    }
+
     /// A holder that stops renewing, such as after a crash, must not block
     /// recovery. After the TTL passes, the next start takes over, and it
     /// says which holder it displaced.
@@ -752,9 +902,7 @@ mod tests {
             serde_json::from_slice(&store.get(&path).await.unwrap().bytes().await.unwrap())
                 .unwrap();
         stale.renewed_at -= TTL as i64 * 10;
-        write_record(&*store, &path, &stale, WriteMode::Overwrite)
-            .await
-            .unwrap();
+        overwrite_record(&*store, &path, &stale).await;
 
         let second = WriterLease::acquire(Arc::clone(&store), prefix, TTL)
             .await
@@ -857,6 +1005,7 @@ mod tests {
             claimed_at: now,
             renewed_at: now,
             ttl_secs: TTL,
+            released: false,
             pid: std::process::id(),
         }
     }
@@ -875,11 +1024,10 @@ mod tests {
             claimed_at: now - TTL as i64 * 10,
             renewed_at: now - TTL as i64 * 10,
             ttl_secs: TTL,
+            released: false,
             pid: std::process::id(),
         };
-        write_record(&**store, &lease_path(prefix), &record, WriteMode::Overwrite)
-            .await
-            .expect("seed a stale record");
+        overwrite_record(&**store, &lease_path(prefix), &record).await;
         record
     }
 
@@ -923,6 +1071,26 @@ mod tests {
         async fn run(&self) {
             (self.0)().await
         }
+    }
+
+    /// A race hook that writes the winner's record. A conditional write from
+    /// the code under test then fails its precondition.
+    fn competitor_write(store: Arc<dyn ObjectStore>, path: ObjectPath) -> RaceHook {
+        RaceHook::new(move || {
+            let store = Arc::clone(&store);
+            let path = path.clone();
+            Box::pin(async move {
+                let bytes = serde_json::to_vec(&winner_record()).expect("encode");
+                store
+                    .put_opts(
+                        &path,
+                        PutPayload::from(bytes),
+                        object_store::PutOptions::default(),
+                    )
+                    .await
+                    .expect("competitor write");
+            })
+        })
     }
 
     impl std::fmt::Display for RaceStore {
@@ -1016,9 +1184,7 @@ mod tests {
             serde_json::from_slice(&store.get(&path).await.unwrap().bytes().await.unwrap())
                 .unwrap();
         stale.renewed_at -= TTL as i64 * 10;
-        write_record(&*store, &path, &stale, WriteMode::Overwrite)
-            .await
-            .unwrap();
+        overwrite_record(&*store, &path, &stale).await;
         let _second = WriterLease::acquire(Arc::clone(&store), prefix, TTL)
             .await
             .expect("stale lease is takeable");
@@ -1062,9 +1228,7 @@ mod tests {
             serde_json::from_slice(&store.get(&path).await.unwrap().bytes().await.unwrap())
                 .unwrap();
         stale.renewed_at -= TTL as i64 * 10;
-        write_record(&*store, &path, &stale, WriteMode::Overwrite)
-            .await
-            .unwrap();
+        overwrite_record(&*store, &path, &stale).await;
         let second = WriterLease::acquire(Arc::clone(&store), prefix, TTL)
             .await
             .expect("stale lease is takeable");
@@ -1077,6 +1241,42 @@ mod tests {
             on_disk.instance,
             second.instance(),
             "the displaced writer overwrote its successor's lease"
+        );
+    }
+
+    /// A renewal that loses the record between its read and its write must
+    /// fail and latch unready. The renewal must not replace the record of the
+    /// successor that won the gap.
+    #[tokio::test]
+    async fn a_renewal_that_loses_the_race_latches_unready() {
+        let store = mem();
+        let prefix = "lease-test-renew-race";
+        let path = lease_path(prefix);
+        let racing: Arc<dyn ObjectStore> = Arc::new(RaceStore {
+            inner: Arc::clone(&store),
+            before_put: competitor_write(Arc::clone(&store), path.clone()),
+        });
+        let mut lease = WriterLease::acquire(Arc::clone(&racing), prefix, TTL)
+            .await
+            .expect("claims");
+        let lost = lease.lost_flag();
+
+        assert!(
+            !lease.renew().await,
+            "a renewal that lost the race must report loss"
+        );
+        assert!(
+            lost.load(Ordering::Relaxed),
+            "the lost flag must latch after the failed renewal"
+        );
+
+        let on_disk: LeaseRecord =
+            serde_json::from_slice(&store.get(&path).await.unwrap().bytes().await.unwrap())
+                .unwrap();
+        assert_eq!(
+            on_disk.instance,
+            winner_record().instance,
+            "the renewal replaced the record of the successor"
         );
     }
 
@@ -1238,6 +1438,7 @@ mod tests {
             claimed_at: now,
             renewed_at: now,
             ttl_secs: TTL,
+            released: false,
             pid: std::process::id(),
         };
         // Build the lease directly instead of claiming it. `acquire` needs a
@@ -1265,6 +1466,85 @@ mod tests {
             started.elapsed() >= std::time::Duration::from_millis(50),
             "the release gave up before even trying; the bound is a no-op",
         );
+    }
+
+    /// An [`ObjectStore`] that writes a created object but reports an error
+    /// for the response. The create landed. The caller did not see the answer.
+    #[derive(Debug)]
+    struct LostCreateResponseStore {
+        inner: Arc<dyn ObjectStore>,
+    }
+
+    impl std::fmt::Display for LostCreateResponseStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("LostCreateResponseStore")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for LostCreateResponseStore {
+        async fn put_opts(
+            &self,
+            location: &ObjectPath,
+            payload: PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            let is_create = matches!(opts.mode, PutMode::Create);
+            let out = self.inner.put_opts(location, payload, opts).await?;
+            if is_create {
+                return Err(object_store::Error::Generic {
+                    store: "lost-create-response",
+                    source: "the create landed but its response was lost".into(),
+                });
+            }
+            Ok(out)
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &ObjectPath,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &ObjectPath,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        async fn delete(&self, location: &ObjectPath) -> object_store::Result<()> {
+            self.inner.delete(location).await
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy(&self, from: &ObjectPath, to: &ObjectPath) -> object_store::Result<()> {
+            self.inner.copy(from, to).await
+        }
+
+        async fn copy_if_not_exists(
+            &self,
+            from: &ObjectPath,
+            to: &ObjectPath,
+        ) -> object_store::Result<()> {
+            self.inner.copy_if_not_exists(from, to).await
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+            self.inner.list(prefix)
+        }
     }
 
     /// A store that never answers, so that the release of a shutdown cannot
@@ -1351,9 +1631,7 @@ mod tests {
             serde_json::from_slice(&store.get(&path).await.unwrap().bytes().await.unwrap())
                 .unwrap();
         stale.renewed_at -= TTL as i64 * 10;
-        write_record(&*store, &path, &stale, WriteMode::Overwrite)
-            .await
-            .unwrap();
+        overwrite_record(&*store, &path, &stale).await;
         let _second = WriterLease::acquire(Arc::clone(&store), prefix, TTL)
             .await
             .expect("stale lease is takeable");
@@ -1363,6 +1641,56 @@ mod tests {
             store.get(&path).await.is_ok(),
             "release deleted the successor's lease"
         );
+    }
+
+    /// A release that loses the race must not delete the successor's record.
+    #[tokio::test]
+    async fn a_release_that_loses_the_race_keeps_the_successors_record() {
+        let store = mem();
+        let prefix = "lease-test-release-race";
+        let path = lease_path(prefix);
+        let racing: Arc<dyn ObjectStore> = Arc::new(RaceStore {
+            inner: Arc::clone(&store),
+            before_put: competitor_write(Arc::clone(&store), path.clone()),
+        });
+        let mut lease = WriterLease::acquire(Arc::clone(&racing), prefix, TTL)
+            .await
+            .expect("claims");
+
+        lease.release().await;
+
+        let on_disk: LeaseRecord =
+            serde_json::from_slice(&store.get(&path).await.unwrap().bytes().await.unwrap())
+                .unwrap();
+        assert_eq!(
+            on_disk.instance,
+            winner_record().instance,
+            "the release deleted or replaced the successor's record"
+        );
+    }
+
+    /// A released record is stale, even when it is recent. The next acquire
+    /// takes it over, so a release that cannot delete still hands the prefix
+    /// on.
+    #[tokio::test]
+    async fn a_released_record_is_stale_to_the_next_acquire() {
+        let store = mem();
+        let prefix = "lease-test-released-record";
+        let now = chrono::Utc::now().timestamp();
+        let record = LeaseRecord {
+            instance: "departing-holder".to_string(),
+            claimed_at: now,
+            renewed_at: now,
+            ttl_secs: TTL,
+            released: true,
+            pid: std::process::id(),
+        };
+        overwrite_record(&*store, &lease_path(prefix), &record).await;
+
+        let next = WriterLease::acquire(Arc::clone(&store), prefix, TTL)
+            .await
+            .expect("a released record must not block the next writer");
+        assert_ne!(next.instance(), record.instance);
     }
 
     /// A record that cannot be parsed must be refused, never guessed at. A
