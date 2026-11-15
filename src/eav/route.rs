@@ -50,6 +50,12 @@ pub(crate) const ENTITY_ROW: &str = "entity";
 const DEFAULT_PAGE_LIMIT: usize = 50;
 /// The maximum page size of a list route.
 const MAX_PAGE_LIMIT: usize = 200;
+/// The maximum count of raw pages that one cursor page reads.
+///
+/// The route checks a grant on each row.
+/// A raw page can hold no visible row.
+/// The route then reads the next raw page, up to this count.
+const CURSOR_SCAN_BATCH: usize = 4;
 /// The default count of entities that a revalidation checks.
 const DEFAULT_REVALIDATE_LIMIT: usize = 100;
 /// The maximum count of entities that a revalidation checks.
@@ -370,7 +376,9 @@ pub struct EntityQueryPage {
     /// The entities on this page.
     pub items: Vec<Entity>,
     /// The entity id to pass as `after` for the next page.
-    /// `None` means that the scan is exhausted.
+    /// The value is the id of the last visible entity.
+    /// The value never names an entity that the caller cannot read.
+    /// `None` means that the scan is exhausted or the scan budget ends.
     pub next: Option<String>,
 }
 
@@ -699,6 +707,51 @@ pub(crate) async fn can_read_entity(
         .map_err(Into::into)
 }
 
+/// Reads one cursor page and keeps only the entities that the caller can read.
+///
+/// The call reads at most [`CURSOR_SCAN_BATCH`] raw pages.
+/// It stops when the visible page is full or the raw scan ends.
+/// The returned cursor is the id of the last visible entity.
+/// A raw cursor stays inside this function, so `next` never names a row that
+/// the caller cannot read.
+/// A budget that ends with no visible entity returns `None`.
+/// The caller then sees no id of an unreadable row.
+pub(crate) async fn visible_cursor_page<F, Fut>(
+    policy: &Authorizer,
+    sub: &str,
+    limit: usize,
+    after: Option<String>,
+    mut fetch: F,
+) -> Result<(Vec<Entity>, Option<String>), EavApiError>
+where
+    F: FnMut(Option<String>) -> Fut,
+    Fut: std::future::Future<Output = Result<(Vec<Entity>, Option<String>), EavApiError>>,
+{
+    let mut items: Vec<Entity> = Vec::with_capacity(limit);
+    let mut cursor = after;
+    for _ in 0..CURSOR_SCAN_BATCH {
+        let (raw, raw_next) = fetch(cursor).await?;
+        let raw_len = raw.len();
+        for (position, entity) in raw.into_iter().enumerate() {
+            if can_read_entity(policy, sub, &entity.id).await? {
+                let id = entity.id.clone();
+                items.push(entity);
+                if items.len() == limit {
+                    if position + 1 == raw_len && raw_next.is_none() {
+                        return Ok((items, None));
+                    }
+                    return Ok((items, Some(id)));
+                }
+            }
+        }
+        match raw_next {
+            Some(next) => cursor = Some(next),
+            None => return Ok((items, None)),
+        }
+    }
+    Ok((items, None))
+}
+
 #[utoipa::path(post, path = "/eav/schemas", tag = "eav", request_body = SchemaDraft, responses((status=201, body=crate::eav::schema::SchemaDef), (status=400, body=crate::http::error::ErrorBody), (status=401, body=crate::http::error::ErrorBody), (status=403, body=crate::http::error::ErrorBody), (status=500, body=crate::http::error::ErrorBody)))]
 #[post("/schemas")]
 async fn publish_schema(
@@ -971,7 +1024,10 @@ async fn list_entities(
 /// A row grant exposes only that entity.
 /// The handler filters each result with `can_read_entity`.
 /// A caller with no grant receives an empty page, not `403`.
-/// The response holds the next cursor when the page is full.
+/// The route reads at most `CURSOR_SCAN_BATCH` raw pages.
+/// The route then returns the cursor of the last visible entity.
+/// The cursor never names a row that the caller cannot read.
+/// A scan that finds no visible row returns `next: null`.
 /// An attribute that no applied schema indexes returns `400`.
 #[utoipa::path(post, path = "/eav/entities/query", tag = "eav", request_body = EntityQueryRequest, responses((status=200, body=EntityQueryPage), (status=400, body=crate::http::error::ErrorBody), (status=401, body=crate::http::error::ErrorBody), (status=403, body=crate::http::error::ErrorBody), (status=500, body=crate::http::error::ErrorBody)))]
 #[post("/entities/query")]
@@ -983,16 +1039,21 @@ async fn query_entities(
 ) -> Result<HttpResponse, EavApiError> {
     let request = body.into_inner();
     let (limit, after) = request.resolve()?;
-    let (entities, next) = runtime
-        .entities()
-        .list_by_attribute_after(&request.attribute, &request.value, limit, after.as_deref())
-        .await?;
-    let mut items = Vec::with_capacity(entities.len());
-    for entity in entities {
-        if can_read_entity(&policy, &claims.sub, &entity.id).await? {
-            items.push(entity);
+    let attribute = request.attribute;
+    let value = request.value;
+    let (items, next) = visible_cursor_page(&policy, &claims.sub, limit, after, |cursor| {
+        let attribute = attribute.clone();
+        let value = value.clone();
+        let runtime = runtime.clone();
+        async move {
+            runtime
+                .entities()
+                .list_by_attribute_after(&attribute, &value, limit, cursor.as_deref())
+                .await
+                .map_err(EavApiError::from)
         }
-    }
+    })
+    .await?;
     Ok(HttpResponse::Ok().json(EntityQueryPage { items, next }))
 }
 
@@ -2598,6 +2659,101 @@ mod tests {
             .map(|item| item["id"].as_str().expect("id"))
             .collect();
         assert_eq!(ids, vec!["e1"]);
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn a_query_cursor_never_names_an_unreadable_entity() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        publish_indexed_tag_schema(&fx).await?;
+        for id in ["e1", "e2", "e3", "e4", "e5"] {
+            create_tagged_task(&fx, id, "alpha").await?;
+        }
+        fx.engine
+            .assign_group("carol".into(), "row-readers".into())
+            .await?;
+        for id in ["e2", "e4"] {
+            fx.engine
+                .add_rule("row-readers".into(), format!("entity:{id}"), Action::Read)
+                .await?;
+        }
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("carol")?;
+
+        let mut ids = Vec::new();
+        let mut after = String::new();
+        loop {
+            let res = actix_test::call_service(
+                &app,
+                auth(
+                    actix_test::TestRequest::post()
+                        .uri("/eav/entities/query")
+                        .set_json(json!({
+                            "attribute": "tag",
+                            "value": {"type": "string", "value": "alpha"},
+                            "limit": 1,
+                            "after": after,
+                        })),
+                    &token,
+                )
+                .to_request(),
+            )
+            .await;
+            assert_eq!(res.status(), http::StatusCode::OK);
+            let page: Value = actix_test::read_body_json(res).await;
+            for item in page["items"].as_array().expect("items") {
+                ids.push(item["id"].as_str().expect("id").to_string());
+            }
+            match page["next"].as_str() {
+                Some(cursor) => {
+                    assert!(
+                        cursor == "e2" || cursor == "e4",
+                        "the cursor named an unreadable entity: {cursor}"
+                    );
+                    after = cursor.to_string();
+                }
+                None => break,
+            }
+        }
+
+        assert_eq!(ids, ["e2", "e4"]);
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn a_no_grant_query_returns_no_cursor_or_entity_id() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        publish_indexed_tag_schema(&fx).await?;
+        for id in ["e1", "e2", "e3"] {
+            create_tagged_task(&fx, id, "alpha").await?;
+        }
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("bob")?;
+
+        for after in ["", "e1"] {
+            let res = actix_test::call_service(
+                &app,
+                auth(
+                    actix_test::TestRequest::post()
+                        .uri("/eav/entities/query")
+                        .set_json(json!({
+                            "attribute": "tag",
+                            "value": {"type": "string", "value": "alpha"},
+                            "limit": 1,
+                            "after": after,
+                        })),
+                    &token,
+                )
+                .to_request(),
+            )
+            .await;
+            assert_eq!(res.status(), http::StatusCode::OK);
+            let page: Value = actix_test::read_body_json(res).await;
+            assert_eq!(page["items"].as_array().map(Vec::len), Some(0));
+            assert!(page["next"].is_null(), "a cursor leaked for after={after}");
+        }
         Ok(())
     }
 
