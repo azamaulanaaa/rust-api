@@ -575,6 +575,9 @@ pub enum EavApiError {
     /// The store or the server failed. HTTP 500.
     #[error("internal server error")]
     Internal(#[source] Box<dyn std::error::Error + Send + Sync>),
+    /// A full replica read is above the configured size gate. HTTP 400.
+    #[error("replica is too large for a full read; use chunk mode with chunk=0")]
+    ReplicaTooLarge,
 }
 
 impl EavApiError {
@@ -600,7 +603,7 @@ impl EavApiError {
         use actix_web::http::StatusCode;
         match self {
             Self::NotFound(_) => StatusCode::NOT_FOUND,
-            Self::Invalid(_) | Self::NotIndexed => StatusCode::BAD_REQUEST,
+            Self::Invalid(_) | Self::NotIndexed | Self::ReplicaTooLarge => StatusCode::BAD_REQUEST,
             Self::Conflict(_) => StatusCode::CONFLICT,
             Self::Forbidden(_) => StatusCode::FORBIDDEN,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -612,6 +615,7 @@ impl EavApiError {
         match self {
             Self::NotFound(_) => "not_found",
             Self::Invalid(_) | Self::NotIndexed => "invalid_request",
+            Self::ReplicaTooLarge => "replica_too_large",
             Self::Conflict(_) => "conflict",
             Self::Forbidden(_) => "forbidden",
             Self::Internal(_) => "internal_error",

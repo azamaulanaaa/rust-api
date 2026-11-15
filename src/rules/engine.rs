@@ -158,6 +158,16 @@ pub trait RuleObserver: Send + Sync {
 
     /// Records one action failure.
     fn on_action_failure(&self);
+
+    /// Records one or more dead-letter rows.
+    ///
+    /// The default does nothing.
+    fn on_dead_letter(&self, _count: u64) {}
+
+    /// Records the distance from the rule cursor to the feed head.
+    ///
+    /// The default does nothing.
+    fn on_feed_lag(&self, _entries: u64) {}
 }
 
 /// Receives the health signal from [`RuleEngine::run_with_progress`].
@@ -375,6 +385,20 @@ impl RuleEngine {
     fn observe_action_failure(&self) {
         if let Some(observer) = &self.observer {
             observer.on_action_failure();
+        }
+    }
+
+    /// Records dead-letter rows when an observer exists.
+    fn observe_dead_letters(&self, count: u64) {
+        if let Some(observer) = &self.observer {
+            observer.on_dead_letter(count);
+        }
+    }
+
+    /// Records the feed lag when an observer exists.
+    fn observe_feed_lag(&self, entries: u64) {
+        if let Some(observer) = &self.observer {
+            observer.on_feed_lag(entries);
         }
     }
 
@@ -790,6 +814,7 @@ impl RuleEngine {
                 return Ok(());
             }
             let head = wal.head().await.map_err(map_wal_error)?;
+            self.observe_feed_lag(head.saturating_sub(cursor));
             if cursor > head {
                 return Err(RuleError::Wal(format!(
                     "rule cursor {cursor} is ahead of feed head {head}"
@@ -836,6 +861,7 @@ impl RuleEngine {
                                         at: chrono::Utc::now().timestamp(),
                                     };
                                     self.rules.write_dead_letter(&dead).await?;
+                                    self.observe_dead_letters(1);
                                 }
                                 self.rules
                                     .clear_entry_attempts(entry.seq, &event.event_id)
@@ -878,6 +904,7 @@ impl RuleEngine {
                                     at: chrono::Utc::now().timestamp(),
                                 };
                                 self.rules.write_dead_letter(&dead).await?;
+                                self.observe_dead_letters(1);
                                 self.rules
                                     .clear_entry_attempts(entry.seq, &event.event_id)
                                     .await?;
@@ -1130,6 +1157,8 @@ mod tests {
     struct RecordingObserver {
         outcomes: std::sync::Mutex<Vec<ExecutionOutcome>>,
         failures: AtomicUsize,
+        dead_letters: AtomicUsize,
+        max_feed_lag: AtomicUsize,
     }
 
     impl RecordingObserver {
@@ -1137,6 +1166,8 @@ mod tests {
             Self {
                 outcomes: std::sync::Mutex::new(Vec::new()),
                 failures: AtomicUsize::new(0),
+                dead_letters: AtomicUsize::new(0),
+                max_feed_lag: AtomicUsize::new(0),
             }
         }
 
@@ -1147,6 +1178,14 @@ mod tests {
         fn failures(&self) -> usize {
             self.failures.load(Ordering::SeqCst)
         }
+
+        fn dead_letters(&self) -> usize {
+            self.dead_letters.load(Ordering::SeqCst)
+        }
+
+        fn max_feed_lag(&self) -> usize {
+            self.max_feed_lag.load(Ordering::SeqCst)
+        }
     }
 
     impl RuleObserver for RecordingObserver {
@@ -1156,6 +1195,20 @@ mod tests {
 
         fn on_action_failure(&self) {
             self.failures.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn on_dead_letter(&self, count: u64) {
+            self.dead_letters.fetch_add(
+                usize::try_from(count).unwrap_or(usize::MAX),
+                Ordering::SeqCst,
+            );
+        }
+
+        fn on_feed_lag(&self, entries: u64) {
+            self.max_feed_lag.fetch_max(
+                usize::try_from(entries).unwrap_or(usize::MAX),
+                Ordering::SeqCst,
+            );
         }
     }
 
@@ -2175,7 +2228,8 @@ mod tests {
     async fn a_poison_entry_dead_letters_after_the_limit_and_a_later_event_runs() {
         let stores = stores().await;
         let recorder = Arc::new(RecordingAction::new("record"));
-        let engine = engine(&stores, vec![recorder.clone()]);
+        let observer = Arc::new(RecordingObserver::new());
+        let engine = engine(&stores, vec![recorder.clone()]).with_observer(observer.clone());
         make_entity(&stores.entities).await;
         stores.rules.upsert(draft("alpha", "record")).await.unwrap();
         let wal = test_wal().await;
@@ -2204,6 +2258,11 @@ mod tests {
         assert_eq!(dead[0].seq, 1);
         assert_eq!(dead[0].event_id, "evt-1");
         assert_eq!(dead[0].attempts, MAX_ENTRY_ATTEMPTS);
+        assert_eq!(observer.dead_letters(), 1);
+        assert!(
+            observer.max_feed_lag() >= 1,
+            "the runner must report the head-to-cursor distance"
+        );
 
         recorder.set_failing(false);
         wal.append(WalOp::Entity { event: event_at(2) })
