@@ -807,6 +807,8 @@ impl std::error::Error for ReplicaChunkOutOfRange {}
 /// The route sets no `ETag` and ignores `If-None-Match`.
 /// The response depends on the current grants, so it has no stable validator.
 /// An out-of-range `chunk` returns `400`.
+/// A replica with no entity returns chunk 0 with `chunks: 0`, an empty `items`,
+/// and `next: null`.
 /// The client applies the events after the stored head.
 #[utoipa::path(get, path = "/eav/sync/replica", tag = "eav", params(ReplicaChunkQuery), responses((status = 200, body = ReplicaReadResponse), (status = 400, body = crate::http::error::ErrorBody), (status = 401, body = crate::http::error::ErrorBody), (status = 404, body = crate::http::error::ErrorBody), (status = 500, body = crate::http::error::ErrorBody)))]
 #[get("/sync/replica")]
@@ -2288,6 +2290,20 @@ mod tests {
         assert_eq!(res.status(), http::StatusCode::OK);
         let items: Vec<Value> = actix_test::read_body_json(res).await;
         assert!(items.is_empty());
+
+        let res = get_route!(&app, "/eav/sync/replica?chunk=0", &token).await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        assert_eq!(
+            res.headers()
+                .get("X-Replica-Chunks")
+                .and_then(|value| value.to_str().ok()),
+            Some("0")
+        );
+        let body: Value = actix_test::read_body_json(res).await;
+        assert_eq!(body["chunk"], 0);
+        assert_eq!(body["chunks"], 0);
+        assert_eq!(body["items"].as_array().map(Vec::len), Some(0));
+        assert!(body["next"].is_null());
         Ok(())
     }
 
