@@ -20,6 +20,9 @@ pub enum RuleError {
     /// The rule does not exist.
     #[error("rule not found: {0}")]
     NotFound(String),
+    /// The stored rule changed before the write could commit.
+    #[error("rule version conflict")]
+    VersionConflict,
     /// Data could not be encoded or decoded.
     #[error("rule serialization failed")]
     Serialization(String),
