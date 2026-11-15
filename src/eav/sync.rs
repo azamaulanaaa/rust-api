@@ -12,6 +12,9 @@
 //! `GET /eav/sync/snapshot` returns one page of entity state for the first
 //! load of an offline client.
 //! The client then reads the events feed for each change.
+//! The first snapshot page returns the current feed head.
+//! Each later page sends that head and gets the same value back.
+//! A head above the current feed head returns `409`.
 //!
 //! `POST /eav/sync/replica` stores a chunked JSON snapshot for the caller.
 //! `GET /eav/sync/replica` returns the stored snapshot as one JSON array.
@@ -294,6 +297,61 @@ impl std::fmt::Display for CursorAhead {
 
 impl std::error::Error for CursorAhead {}
 
+/// The query of the snapshot route.
+///
+/// The first request of a paging sequence omits `head`.
+/// The route then returns the current feed head.
+/// Each later request sends that head.
+/// The route then returns the same head on every page.
+#[derive(Debug, Clone, Default, serde::Deserialize, utoipa::ToSchema, utoipa::IntoParams)]
+pub struct SnapshotQuery {
+    /// The page size. The default is 50. The maximum is 200.
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// The number of items to skip. The default is 0.
+    ///
+    /// The maximum is 1000. Use `after` for a deeper page.
+    #[serde(default)]
+    pub offset: Option<usize>,
+    /// The id to resume after.
+    ///
+    /// A present value selects cursor mode.
+    /// Omit the field to use offset paging.
+    #[serde(default)]
+    pub after: Option<String>,
+    /// The head that pins this paging sequence.
+    ///
+    /// Omit it on the first request.
+    /// A value above the current feed head returns `409`.
+    #[serde(default)]
+    pub head: Option<u64>,
+}
+
+impl SnapshotQuery {
+    /// Resolves the page size, the paging mode, and the pinned head.
+    fn resolve(self) -> Result<(usize, PageMode, Option<u64>), EavApiError> {
+        let page = PageQuery {
+            limit: self.limit,
+            offset: self.offset,
+            after: self.after,
+        };
+        let (limit, mode) = page.resolve()?;
+        Ok((limit, mode, self.head))
+    }
+}
+
+/// The source of a snapshot head that is ahead of the current feed head.
+#[derive(Debug)]
+struct SnapshotHeadAhead;
+
+impl std::fmt::Display for SnapshotHeadAhead {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("head is ahead of the feed head")
+    }
+}
+
+impl std::error::Error for SnapshotHeadAhead {}
+
 /// Converts a change-log failure to a sanitized server error.
 fn internal(error: FsError) -> EavApiError {
     EavApiError::Internal(Box::new(error))
@@ -476,18 +534,29 @@ pub(crate) async fn events(
 /// `next_offset` comes from the raw page length.
 /// A filtered page can then hold fewer items than the limit.
 /// A cursor query uses the entity marker family and returns `next`.
+/// The first request of a paging sequence omits `head`.
+/// The route then returns the current feed head.
+/// Each later request sends that head and gets the same head.
+/// A head above the current feed head returns `409`.
 /// A matching `If-None-Match` returns `304` with no body.
-#[utoipa::path(get, path = "/eav/sync/snapshot", tag = "eav", params(PageQuery), responses((status = 200, body = SnapshotPage), (status = 304, description = "not modified"), (status = 400, body = crate::http::error::ErrorBody), (status = 401, body = crate::http::error::ErrorBody), (status = 500, body = crate::http::error::ErrorBody)))]
+#[utoipa::path(get, path = "/eav/sync/snapshot", tag = "eav", params(SnapshotQuery), responses((status = 200, body = SnapshotPage), (status = 304, description = "not modified"), (status = 400, body = crate::http::error::ErrorBody), (status = 401, body = crate::http::error::ErrorBody), (status = 409, body = crate::http::error::ErrorBody), (status = 500, body = crate::http::error::ErrorBody)))]
 #[get("/sync/snapshot")]
 pub(crate) async fn snapshot(
     runtime: web::Data<EavRuntime>,
     policy: web::Data<Authorizer>,
     claims: Validated<Claims>,
-    query: web::Query<PageQuery>,
+    query: web::Query<SnapshotQuery>,
     req: HttpRequest,
 ) -> Result<HttpResponse, EavApiError> {
-    let (limit, mode) = query.into_inner().resolve()?;
-    let head = runtime.wal().head().await.map_err(internal)?;
+    let (limit, mode, pinned) = query.into_inner().resolve()?;
+    let current = runtime.wal().head().await.map_err(internal)?;
+    let head = match pinned {
+        Some(head) if head > current => {
+            return Err(EavApiError::Conflict(Box::new(SnapshotHeadAhead)));
+        }
+        Some(head) => head,
+        None => current,
+    };
     let etag = status_etag(head);
     if let Some(header) = req
         .headers()
@@ -1578,6 +1647,50 @@ mod tests {
     }
 
     #[actix_web::test]
+    async fn a_snapshot_paging_sequence_keeps_one_head() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        publish_task_schema(&fx).await?;
+        for id in ["e1", "e2", "e3"] {
+            create_entity(&fx, id).await?;
+        }
+        grant_collection_read(&fx, "alice").await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+
+        let res = get_route!(&app, "/eav/sync/snapshot?limit=1", &token).await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let first: Value = actix_test::read_body_json(res).await;
+        let head = first["head"].as_u64().expect("head");
+        assert_eq!(first["next_offset"], 1);
+
+        create_entity(&fx, "e4").await?;
+        assert!(fx.runtime.wal().head().await? > head);
+
+        let uri = format!("/eav/sync/snapshot?limit=1&offset=1&head={head}");
+        let res = get_route!(&app, &uri, &token).await;
+        assert_eq!(res.status(), http::StatusCode::OK, "{uri}");
+        let second: Value = actix_test::read_body_json(res).await;
+        assert_eq!(second["head"], head, "page 2 kept the pinned head");
+        assert_eq!(second["next_offset"], 2);
+        assert_eq!(second["items"][0]["id"], "e2");
+
+        let uri = format!("/eav/sync/snapshot?limit=1&offset=2&head={head}");
+        let res = get_route!(&app, &uri, &token).await;
+        assert_eq!(res.status(), http::StatusCode::OK, "{uri}");
+        let third: Value = actix_test::read_body_json(res).await;
+        assert_eq!(third["head"], head, "page 3 kept the pinned head");
+
+        let current = fx.runtime.wal().head().await?;
+        let uri = format!("/eav/sync/snapshot?head={}", current + 1);
+        let res = get_route!(&app, &uri, &token).await;
+        assert_eq!(res.status(), http::StatusCode::CONFLICT, "{uri}");
+        let body: crate::http::error::ErrorBody = actix_test::read_body_json(res).await;
+        assert_eq!(body.code.as_deref(), Some("conflict"));
+        Ok(())
+    }
+
+    #[actix_web::test]
     async fn a_snapshot_cursor_pages_through_every_visible_entity_once() -> anyhow::Result<()> {
         let fx = fixture().await?;
         publish_task_schema(&fx).await?;
@@ -1591,12 +1704,16 @@ mod tests {
 
         let mut ids = Vec::new();
         let mut after: Option<String> = Some(String::new());
+        let mut head: Option<u64> = None;
         let mut first = true;
         loop {
-            let uri = match &after {
+            let mut uri = match &after {
                 Some(cursor) => format!("/eav/sync/snapshot?limit=1&after={cursor}"),
                 None => "/eav/sync/snapshot?limit=1".to_string(),
             };
+            if let Some(head) = head {
+                uri.push_str(&format!("&head={head}"));
+            }
             let res = get_route!(&app, &uri, &token).await;
             assert_eq!(res.status(), http::StatusCode::OK, "{uri}");
             let body: Value = actix_test::read_body_json(res).await;
@@ -1610,7 +1727,10 @@ mod tests {
             if first {
                 assert_eq!(page_ids, vec!["e1"], "{uri}");
                 assert_eq!(body["next"], "e1", "{uri}");
+                head = Some(body["head"].as_u64().expect("head"));
                 first = false;
+            } else {
+                assert_eq!(body["head"], head.expect("head"), "{uri}");
             }
             ids.extend(page_ids.iter().map(|id| id.to_string()));
             match body["next"].as_str() {
