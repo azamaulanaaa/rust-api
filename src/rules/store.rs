@@ -68,8 +68,9 @@
 //! the cursor is reset.
 //! The retention window must be longer than any replay window.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 
 use oxkv::{
     Direction, GetSet, KeyPrefix, KeyValue, OxKvStore, ScanExt as _, Store as _, StoreError,
@@ -125,12 +126,71 @@ const GC_BATCH: usize = 200;
 #[cfg(test)]
 const GC_BATCH: usize = 2;
 
+/// The largest number of event shapes that the match cache holds.
+const RULE_CACHE_CAPACITY: usize = 64;
+
+/// One bounded cache of match results.
+///
+/// The key is the event kind and the sorted event schema ids.
+/// A write increments `generation`. A read records the generation before it
+/// scans the store and inserts its result only when the generation did not
+/// move. A write therefore cannot leave a stale result in the cache.
+#[derive(Default)]
+struct RuleMatchCache {
+    /// The number of writes that changed a rule.
+    generation: u64,
+    /// The cached result for each event shape.
+    entries: HashMap<String, Arc<Vec<Rule>>>,
+    /// The insertion order, used to evict the oldest entry.
+    order: VecDeque<String>,
+    /// The number of cache hits in a test build.
+    #[cfg(test)]
+    hits: usize,
+    /// The number of cache misses in a test build.
+    #[cfg(test)]
+    misses: usize,
+}
+
+impl RuleMatchCache {
+    /// Returns the cached result for `key`.
+    fn get(&mut self, key: &str) -> Option<Arc<Vec<Rule>>> {
+        let result = self.entries.get(key).cloned();
+        #[cfg(test)]
+        if result.is_some() {
+            self.hits += 1;
+        } else {
+            self.misses += 1;
+        }
+        result
+    }
+
+    /// Adds one result and evicts the oldest entry when the cache is full.
+    fn insert(&mut self, key: String, rules: Arc<Vec<Rule>>) {
+        if self.entries.len() >= RULE_CACHE_CAPACITY
+            && !self.entries.contains_key(&key)
+            && let Some(old) = self.order.pop_front()
+        {
+            self.entries.remove(&old);
+        }
+        if self.entries.insert(key.clone(), rules).is_none() {
+            self.order.push_back(key);
+        }
+    }
+
+    /// Removes every result and moves the generation forward.
+    fn invalidate(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.entries.clear();
+        self.order.clear();
+    }
+}
+
 /// One entry that the engine failed by policy.
 ///
 /// The engine writes this row after `MAX_ENTRY_ATTEMPTS` failed attempts.
 /// The row holds the feed sequence, the event id, the attempt count, the
 /// sanitized error text, and the Unix time of the write.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 pub struct RuleDeadLetter {
     /// The feed sequence of the failed entry.
     pub seq: u64,
@@ -159,6 +219,8 @@ pub struct RuleStore {
     store: Arc<RwLock<OxKvStore>>,
     /// Serializes writes, so two callers cannot claim one version.
     publish_lock: Arc<Mutex<()>>,
+    /// The bounded cache of match results.
+    match_cache: Arc<StdMutex<RuleMatchCache>>,
     /// Largest execution-marker page that a cleanup read.
     ///
     /// The field exists only in a test build.
@@ -172,9 +234,34 @@ impl RuleStore {
         Self {
             store: Arc::new(RwLock::new(store)),
             publish_lock: Arc::new(Mutex::new(())),
+            match_cache: Arc::new(StdMutex::new(RuleMatchCache::default())),
             #[cfg(test)]
             gc_page_high_water: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
+    }
+
+    /// Locks the match cache and ignores a poisoned lock.
+    fn cache(&self) -> std::sync::MutexGuard<'_, RuleMatchCache> {
+        self.match_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Removes every cached match result after a rule change.
+    fn invalidate_match_cache(&self) {
+        self.cache().invalidate();
+    }
+
+    /// Returns the cache hit count in a test build.
+    #[cfg(test)]
+    pub(crate) fn cache_hits(&self) -> usize {
+        self.cache().hits
+    }
+
+    /// Returns the cache miss count in a test build.
+    #[cfg(test)]
+    pub(crate) fn cache_misses(&self) -> usize {
+        self.cache().misses
     }
 
     /// Adds one rule or replaces the rule with the same id.
@@ -193,15 +280,8 @@ impl RuleStore {
         let g = self.store.write().await;
         let tx = g.begin_tx().map_err(RuleError::Store)?;
         let rule = self.stage_upsert(&tx, draft).await?;
-        match tx.commit().await {
-            Ok(()) => {}
-            Err(StoreError::TxConflict { key, .. }) if key == meta_key(&rule.id) => {
-                return Err(RuleError::Invalid(
-                    "rule changed during the write".to_string(),
-                ));
-            }
-            Err(error) => return Err(RuleError::Store(error)),
-        }
+        map_rule_commit(&rule.id, tx.commit().await)?;
+        self.invalidate_match_cache();
         Ok(rule)
     }
 
@@ -331,6 +411,7 @@ impl RuleStore {
         }
         tx.delete(&meta_key(id)).await.map_err(RuleError::Store)?;
         tx.commit().await.map_err(RuleError::Store)?;
+        self.invalidate_match_cache();
         Ok(true)
     }
 
@@ -338,23 +419,82 @@ impl RuleStore {
     ///
     /// The call changes the stored rule only.
     /// It does not change the index.
+    /// The rule row uses a compare-and-set against the row that the call
+    /// read.
+    /// A concurrent upsert, delete, or toggle fails at commit and writes
+    /// nothing.
     pub async fn set_enabled(&self, id: &str, enabled: bool) -> Result<Rule, RuleError> {
+        self.set_enabled_version(id, enabled, None).await
+    }
+
+    /// Sets the enabled flag of one rule when its version matches.
+    ///
+    /// The call changes the stored rule only.
+    /// It does not change the index.
+    /// The rule row uses a compare-and-set against the row that the call
+    /// read.
+    /// A concurrent upsert, delete, or toggle fails at commit and writes
+    /// nothing.
+    /// A `expected_version` that differs from the stored version returns a
+    /// version conflict.
+    pub async fn set_enabled_version(
+        &self,
+        id: &str,
+        enabled: bool,
+        expected_version: Option<u64>,
+    ) -> Result<Rule, RuleError> {
         validate_identifier("rule id", id)?;
 
         let _publish = self.publish_lock.lock().await;
         let g = self.store.write().await;
         let tx = g.begin_tx().map_err(RuleError::Store)?;
-        let Some(mut rule) = load_rule(&tx, id).await? else {
+        let rule = self
+            .stage_set_enabled(&tx, id, enabled, expected_version)
+            .await?;
+        map_rule_commit(id, tx.commit().await)?;
+        self.invalidate_match_cache();
+        Ok(rule)
+    }
+
+    /// Stages one enable write in `tx`.
+    ///
+    /// The call reads the previous row and uses it as the compare-and-set
+    /// precondition.
+    ///
+    /// A `expected_version` that differs from the stored version returns a
+    /// version conflict before the write.
+    async fn stage_set_enabled<S>(
+        &self,
+        tx: &S,
+        id: &str,
+        enabled: bool,
+        expected_version: Option<u64>,
+    ) -> Result<Rule, RuleError>
+    where
+        S: TxCas + ?Sized,
+    {
+        let key = meta_key(id);
+        let Some(previous) = tx.get_bytes(&key).await.map_err(RuleError::Store)? else {
             return Err(RuleError::NotFound(id.to_string()));
         };
+        let mut rule: Rule = serde_json::from_slice(&previous)
+            .map_err(|error| RuleError::Serialization(error.to_string()))?;
+        if let Some(expected) = expected_version
+            && rule.version != expected
+        {
+            return Err(RuleError::VersionConflict);
+        }
         rule.enabled = enabled;
         rule.version = rule
             .version
             .checked_add(1)
             .ok_or_else(|| RuleError::Invalid("rule version overflow".to_string()))?;
         rule.updated_at = chrono::Utc::now().timestamp();
-        put_rule(&tx, &rule).await?;
-        tx.commit().await.map_err(RuleError::Store)?;
+        let bytes = serde_json::to_vec(&rule)
+            .map_err(|error| RuleError::Serialization(error.to_string()))?;
+        tx.compare_and_set(&key, Some(&previous), &bytes)
+            .await
+            .map_err(RuleError::Store)?;
         Ok(rule)
     }
 
@@ -364,7 +504,18 @@ impl RuleStore {
     /// schema.
     /// The result is sorted by priority in descending order.
     /// Two rules with the same priority are sorted by id.
+    /// The call caches the result for one event kind and schema set.
+    /// A rule upsert, delete, or enable change clears the cache.
     pub async fn matching(&self, event: &EntityEvent) -> Result<Vec<Rule>, RuleError> {
+        let cache_key = match_cache_key(event);
+        let generation = {
+            let mut cache = self.cache();
+            if let Some(rules) = cache.get(&cache_key) {
+                return Ok((*rules).clone());
+            }
+            cache.generation
+        };
+
         let kind = event_kind_key(event.kind);
         let mut ids = BTreeSet::new();
         {
@@ -393,6 +544,11 @@ impl RuleStore {
             }
         }
         sort_rules(&mut rules);
+
+        let mut cache = self.cache();
+        if cache.generation == generation {
+            cache.insert(cache_key, Arc::new(rules.clone()));
+        }
         Ok(rules)
     }
 
@@ -415,6 +571,33 @@ impl RuleStore {
         g.put_bytes(CURSOR_KEY, &bytes)
             .await
             .map_err(RuleError::Store)
+    }
+
+    /// Resets the durable change-feed cursor and reports the old and new
+    /// sequence.
+    ///
+    /// The call reads the stored cursor first.
+    /// A missing cursor is 0.
+    /// The call then writes `seq`.
+    /// The return value is `(old, new)`.
+    ///
+    /// The caller must stop the writer that owns the prefix first.
+    /// A reset behind the writer replays feed entries.
+    /// Use this call only for operator recovery.
+    pub async fn reset_cursor(&self, seq: u64) -> Result<(u64, u64), RuleError> {
+        let _publish = self.publish_lock.lock().await;
+        let g = self.store.write().await;
+        let old = match g.get_bytes(CURSOR_KEY).await.map_err(RuleError::Store)? {
+            Some(bytes) => serde_json::from_slice(&bytes)
+                .map_err(|error| RuleError::Serialization(error.to_string()))?,
+            None => 0,
+        };
+        let bytes = serde_json::to_vec(&seq)
+            .map_err(|error| RuleError::Serialization(error.to_string()))?;
+        g.put_bytes(CURSOR_KEY, &bytes)
+            .await
+            .map_err(RuleError::Store)?;
+        Ok((old, seq))
     }
 
     /// Returns the key of one execution marker.
@@ -535,7 +718,7 @@ impl RuleStore {
     ///
     /// The result is sorted by `at` in descending order.
     /// Two rows with the same `at` are sorted by `seq` in descending order.
-    /// The call is for tests and for a future operator surface.
+    /// The call is for tests and for the operator surface.
     pub async fn dead_letters(&self) -> Result<Vec<RuleDeadLetter>, RuleError> {
         let g = self.store.read().await;
         let rows = scan_family(&*g, DEAD_PREFIX).await?;
@@ -552,6 +735,64 @@ impl RuleStore {
                 .then_with(|| right.seq.cmp(&left.seq))
         });
         Ok(dead)
+    }
+
+    /// Lists one page of dead-letter rows, newest first.
+    ///
+    /// The call sorts the rows in the same order as
+    /// [`RuleStore::dead_letters`].
+    /// It skips `offset` rows.
+    /// It then returns at most `limit` rows.
+    /// A `limit` of 0 returns an empty list.
+    pub async fn dead_letters_page(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<RuleDeadLetter>, RuleError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let dead = self.dead_letters().await?;
+        Ok(dead.into_iter().skip(offset).take(limit).collect())
+    }
+
+    /// Reads one dead-letter row.
+    ///
+    /// The key is `rule-dead:{seq}:{event_id}:{rule_id}`.
+    /// The call returns `None` when the row does not exist.
+    pub async fn dead_letter(
+        &self,
+        seq: u64,
+        event_id: &str,
+        rule_id: &str,
+    ) -> Result<Option<RuleDeadLetter>, RuleError> {
+        let g = self.store.read().await;
+        let Some(bytes) = g
+            .get_bytes(&dead_key(seq, event_id, rule_id))
+            .await
+            .map_err(RuleError::Store)?
+        else {
+            return Ok(None);
+        };
+        let entry = serde_json::from_slice(&bytes)
+            .map_err(|error| RuleError::Serialization(error.to_string()))?;
+        Ok(Some(entry))
+    }
+
+    /// Deletes one dead-letter row.
+    ///
+    /// The key is `rule-dead:{seq}:{event_id}:{rule_id}`.
+    /// The call returns false when the row does not exist.
+    pub async fn delete_dead_letter(
+        &self,
+        seq: u64,
+        event_id: &str,
+        rule_id: &str,
+    ) -> Result<bool, RuleError> {
+        let g = self.store.write().await;
+        g.delete(&dead_key(seq, event_id, rule_id))
+            .await
+            .map_err(RuleError::Store)
     }
 
     /// Deletes expired cleanup rows.
@@ -701,6 +942,102 @@ impl RuleStore {
         self.gc_page_high_water
             .load(std::sync::atomic::Ordering::Relaxed)
     }
+
+    /// Returns true when the store holds no rule row.
+    ///
+    /// The call reads the first key of the `rule:meta:` family.
+    /// It writes no key.
+    pub(crate) async fn is_empty(&self) -> Result<bool, RuleError> {
+        let g = self.store.read().await;
+        let rows = g
+            .gets_keys(
+                Some(1),
+                Direction::Next,
+                (
+                    Some(META_PREFIX.to_string()),
+                    KeyPrefix::new(META_PREFIX).upper_bound(),
+                ),
+            )
+            .await
+            .map_err(RuleError::Store)?;
+        Ok(rows.is_empty())
+    }
+
+    /// Imports exact rule records into an empty store.
+    ///
+    /// The call validates every rule before it writes any key.
+    /// It writes the rule rows and the index markers in one transaction.
+    /// It returns the keys that it wrote, so a failed import can remove them.
+    /// The call rejects a rule id that the store already holds.
+    pub(crate) async fn import_rules(&self, rules: &[Rule]) -> Result<Vec<String>, RuleError> {
+        let mut seen = BTreeSet::new();
+        for rule in rules {
+            let draft = RuleDraft {
+                id: rule.id.clone(),
+                name: rule.name.clone(),
+                enabled: rule.enabled,
+                priority: rule.priority,
+                trigger: rule.trigger.clone(),
+                condition: rule.condition.clone(),
+                action: rule.action.clone(),
+                capabilities: rule.capabilities.clone(),
+            };
+            draft.validate()?;
+            if rule.version == 0 {
+                return Err(RuleError::Invalid(format!(
+                    "rule {} has version 0",
+                    rule.id
+                )));
+            }
+            if !seen.insert(rule.id.clone()) {
+                return Err(RuleError::Invalid(format!(
+                    "rule {} has two records",
+                    rule.id
+                )));
+            }
+        }
+
+        let _publish = self.publish_lock.lock().await;
+        let g = self.store.write().await;
+        let tx = g.begin_tx().map_err(RuleError::Store)?;
+        let mut keys = Vec::new();
+        for rule in rules {
+            if load_rule(&tx, &rule.id).await?.is_some() {
+                return Err(RuleError::Invalid(format!(
+                    "rule {} already exists in the target prefix",
+                    rule.id
+                )));
+            }
+        }
+        for rule in rules {
+            let key = meta_key(&rule.id);
+            let bytes = serde_json::to_vec(rule)
+                .map_err(|error| RuleError::Serialization(error.to_string()))?;
+            tx.set_bytes(&key, &bytes).await.map_err(RuleError::Store)?;
+            keys.push(key);
+            for key in index_keys(&rule.trigger, &rule.id) {
+                tx.set_bytes(&key, b"").await.map_err(RuleError::Store)?;
+                keys.push(key);
+            }
+        }
+        tx.commit().await.map_err(RuleError::Store)?;
+        Ok(keys)
+    }
+
+    /// Removes the keys that [`import_rules`](Self::import_rules) wrote.
+    ///
+    /// The call runs after a later import step failed.
+    /// It is safe only when the target prefix was empty before the import.
+    pub(crate) async fn remove_import_keys(&self, keys: &[String]) -> Result<(), RuleError> {
+        let _publish = self.publish_lock.lock().await;
+        let g = self.store.write().await;
+        let tx = g.begin_tx().map_err(RuleError::Store)?;
+        for key in keys {
+            tx.delete(key).await.map_err(RuleError::Store)?;
+        }
+        tx.commit().await.map_err(RuleError::Store)?;
+        Ok(())
+    }
 }
 
 /// Returns the stable lowercase key of one event kind.
@@ -715,6 +1052,22 @@ fn event_kind_key(kind: EntityEventKind) -> &'static str {
     }
 }
 
+/// Returns the cache key for one event shape.
+///
+/// The key holds the event kind and the sorted, distinct schema ids.
+/// The schema order in the event does not change the match result, so the
+/// sort makes two equal schema sets share one entry.
+fn match_cache_key(event: &EntityEvent) -> String {
+    let mut schemas = event.schemas.clone();
+    schemas.sort();
+    schemas.dedup();
+    format!(
+        "{}\u{1f}{}",
+        event_kind_key(event.kind),
+        schemas.join("\u{1f}")
+    )
+}
+
 /// Returns every index key for one trigger and rule id.
 fn index_keys(trigger: &RuleTrigger, rule_id: &str) -> Vec<String> {
     let mut keys = Vec::with_capacity(trigger.events.len() * trigger.schemas.len());
@@ -727,18 +1080,18 @@ fn index_keys(trigger: &RuleTrigger, rule_id: &str) -> Vec<String> {
     keys
 }
 
-/// Writes one rule row.
-async fn put_rule<S>(store: &S, rule: &Rule) -> Result<(), RuleError>
-where
-    S: GetSet + ?Sized,
-{
-    let bytes =
-        serde_json::to_vec(rule).map_err(|error| RuleError::Serialization(error.to_string()))?;
-    store
-        .set_bytes(&meta_key(&rule.id), &bytes)
-        .await
-        .map(|_| ())
-        .map_err(RuleError::Store)
+/// Maps one rule-row commit result to a rule error.
+///
+/// A conflict on the rule row is a version conflict. It is retryable.
+/// A conflict on another key is a store error.
+fn map_rule_commit(id: &str, result: Result<(), StoreError>) -> Result<(), RuleError> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(StoreError::TxConflict { key, .. }) if key == meta_key(id) => {
+            Err(RuleError::VersionConflict)
+        }
+        Err(error) => Err(RuleError::Store(error)),
+    }
 }
 
 /// Reads one rule row.
@@ -996,6 +1349,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_conflicting_upsert_is_a_version_conflict() {
+        let (store, raw) = store_with_raw().await;
+        let first_tx = raw.begin_tx().unwrap();
+        let second_tx = raw.begin_tx().unwrap();
+        let first = store.stage_upsert(&first_tx, draft("alpha")).await.unwrap();
+        let second = store
+            .stage_upsert(&second_tx, draft("alpha"))
+            .await
+            .unwrap();
+        assert_eq!(first.version, 1);
+        assert_eq!(second.version, 1);
+
+        first_tx.commit().await.unwrap();
+        let error = map_rule_commit(&second.id, second_tx.commit().await).unwrap_err();
+
+        assert!(matches!(error, RuleError::VersionConflict));
+        assert_eq!(store.get("alpha").await.unwrap().unwrap().version, 1);
+    }
+
+    #[tokio::test]
+    async fn a_concurrent_enable_toggle_is_a_version_conflict() {
+        let (store, raw) = store_with_raw().await;
+        let saved = store.upsert(draft("alpha")).await.unwrap();
+        assert!(saved.enabled);
+
+        let first_tx = raw.begin_tx().unwrap();
+        let second_tx = raw.begin_tx().unwrap();
+        let first = store
+            .stage_set_enabled(&first_tx, "alpha", false, None)
+            .await
+            .unwrap();
+        let second = store
+            .stage_set_enabled(&second_tx, "alpha", true, None)
+            .await
+            .unwrap();
+        assert_eq!(first.version, 2);
+        assert_eq!(second.version, 2);
+
+        first_tx.commit().await.unwrap();
+        let error = map_rule_commit("alpha", second_tx.commit().await).unwrap_err();
+
+        assert!(matches!(error, RuleError::VersionConflict));
+        let stored = store.get("alpha").await.unwrap().expect("rule exists");
+        assert!(!stored.enabled, "the failed toggle changed the rule");
+        assert_eq!(stored.version, 2);
+    }
+
+    #[tokio::test]
+    async fn a_stale_enable_version_is_a_version_conflict() {
+        let store = new_store().await;
+        let saved = store.upsert(draft("alpha")).await.unwrap();
+
+        let error = store
+            .set_enabled_version("alpha", false, Some(saved.version + 1))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, RuleError::VersionConflict));
+        let stored = store.get("alpha").await.unwrap().expect("rule exists");
+        assert!(stored.enabled, "the refused toggle changed the rule");
+        assert_eq!(stored.version, saved.version);
+    }
+
+    #[tokio::test]
     async fn list_sorts_by_priority_then_id() {
         let store = new_store().await;
         for (id, priority) in [("b", 5), ("a", 5), ("c", 9)] {
@@ -1202,6 +1619,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn matching_caches_results_and_invalidates_on_rule_changes() {
+        let store = new_store().await;
+        store.upsert(draft("alpha")).await.unwrap();
+        let created = event(EntityEventKind::Created, &["invoice"], &[]);
+
+        assert_eq!(store.matching(&created).await.unwrap().len(), 1);
+        assert_eq!(store.matching(&created).await.unwrap().len(), 1);
+        assert_eq!(store.cache_hits(), 1);
+        assert_eq!(store.cache_misses(), 1);
+
+        // An upsert clears the cache, so the new rule appears at once.
+        store.upsert(draft("beta")).await.unwrap();
+        assert_eq!(store.matching(&created).await.unwrap().len(), 2);
+
+        // A delete also clears the cache.
+        store.delete("beta").await.unwrap();
+        assert_eq!(store.matching(&created).await.unwrap().len(), 1);
+
+        // An enable change clears the cache.
+        store.set_enabled("alpha", false).await.unwrap();
+        assert!(store.matching(&created).await.unwrap().is_empty());
+        assert_eq!(store.cache_hits(), 1);
+        assert_eq!(store.cache_misses(), 4);
+    }
+
+    #[tokio::test]
     async fn an_update_that_changes_the_trigger_removes_the_old_marker() {
         let (store, raw) = store_with_raw().await;
         let mut rule = draft("alpha");
@@ -1377,6 +1820,72 @@ mod tests {
         let seqs: Vec<u64> = dead.into_iter().map(|entry| entry.seq).collect();
 
         assert_eq!(seqs, vec![3, 2, 1]);
+    }
+
+    #[tokio::test]
+    async fn reset_cursor_reports_the_old_and_new_sequence() {
+        let store = new_store().await;
+        store.set_cursor(9).await.unwrap();
+
+        let (old, new) = store.reset_cursor(3).await.unwrap();
+
+        assert_eq!((old, new), (9, 3));
+        assert_eq!(store.cursor().await.unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn reset_cursor_uses_zero_for_a_missing_cursor() {
+        let store = new_store().await;
+
+        let (old, new) = store.reset_cursor(4).await.unwrap();
+
+        assert_eq!((old, new), (0, 4));
+        assert_eq!(store.cursor().await.unwrap(), 4);
+    }
+
+    #[tokio::test]
+    async fn dead_letters_page_skips_and_limits_newest_first() {
+        let (store, _raw) = store_with_raw().await;
+        for (seq, at) in [(1, 100), (2, 200), (3, 300)] {
+            store
+                .write_dead_letter(&dead_letter(seq, &format!("evt-{seq}"), at))
+                .await
+                .unwrap();
+        }
+
+        let first = store.dead_letters_page(2, 0).await.unwrap();
+        let second = store.dead_letters_page(2, 2).await.unwrap();
+
+        assert_eq!(
+            first.iter().map(|entry| entry.seq).collect::<Vec<_>>(),
+            vec![3, 2]
+        );
+        assert_eq!(
+            second.iter().map(|entry| entry.seq).collect::<Vec<_>>(),
+            vec![1]
+        );
+        assert!(store.dead_letters_page(0, 0).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_dead_letter_is_read_and_deleted_by_its_stable_key() {
+        let (store, _raw) = store_with_raw().await;
+        let dead = dead_letter(7, "evt-7", 700);
+        store.write_dead_letter(&dead).await.unwrap();
+
+        assert_eq!(
+            store.dead_letter(7, "evt-7", "alpha").await.unwrap(),
+            Some(dead)
+        );
+        assert!(store.delete_dead_letter(7, "evt-7", "alpha").await.unwrap());
+        assert!(
+            store
+                .dead_letter(7, "evt-7", "alpha")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(!store.delete_dead_letter(7, "evt-7", "alpha").await.unwrap());
     }
 
     #[tokio::test]

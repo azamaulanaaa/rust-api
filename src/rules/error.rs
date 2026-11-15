@@ -20,12 +20,18 @@ pub enum RuleError {
     /// The rule does not exist.
     #[error("rule not found: {0}")]
     NotFound(String),
+    /// The stored rule changed before the write could commit.
+    #[error("rule version conflict")]
+    VersionConflict,
     /// Data could not be encoded or decoded.
     #[error("rule serialization failed")]
     Serialization(String),
     /// The condition tree is deeper than 16 levels.
     #[error("rule condition depth exceeds 16")]
     ConditionDepth,
+    /// The trigger names an event that no code path emits.
+    #[error("rule trigger event is not accepted: {0}")]
+    UnsupportedTrigger(String),
     /// The rule names an action that the engine does not know.
     #[error("unknown action: {0}")]
     UnknownAction(String),

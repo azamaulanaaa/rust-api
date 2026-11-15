@@ -25,11 +25,15 @@
 //! - `idx:unique-key:{key}` is an empty name marker that records that some
 //!   schema version marks the attribute as unique. A schema publish writes
 //!   the marker. The marker is permanent.
-//! - `idx:unique:{key}:{hash}` is the claim for one unique value. The value
-//!   is the owning entity id. The key holds no entity id, so a write from
-//!   another handle conflicts at commit.
-//! - `idx:unique-c:{key}:{hash}:{entity_id}` is a claim for a value whose
-//!   hash collides with the primary claim.
+//! - `idx:unique-x:{key}:{hash}:{fingerprint}` is the claim for one exact
+//!   unique value. The value is the owning entity id. The key holds no entity
+//!   id, so a write from another handle conflicts at commit. The key holds
+//!   two hashes, so two values that share one hash use different keys.
+//! - `idx:unique:{key}:{hash}` is a legacy primary claim. A write still checks
+//!   it and releases it. No new claim uses this form.
+//! - `idx:unique-c:{key}:{hash}:{entity_id}` is a claim for a value that
+//!   shares both claim hashes with another value. A write still checks it and
+//!   releases it.
 //! - `idx:unique:{key}:{hash}:{entity_id}` is a legacy unique value marker.
 //!   A write still checks it and releases it. No new marker uses this form.
 //! - `idx:time:{key}:{encoded_ts}:{entity_id}` is a time marker.
@@ -49,6 +53,8 @@
 //!   include it.
 //!
 //! The `hash` is the lowercase SHA-256 hex of the canonical tagged JSON value.
+//! The `fingerprint` is the first 32 bytes of SHA-512 over the same bytes, as
+//! 64 lowercase hex digits.
 //! The `encoded_ts` is the timestamp XORed with the sign bit, as 16 hex digits.
 //! Lexicographic key order then equals numeric time order.
 //! A schema marker exists for the pinned schema and for each inherited schema.
@@ -129,6 +135,8 @@
 //! A feed failure after the commit leaves the outbox row for the relay.
 //! The call still returns success.
 //! [`EntityStore::flush_outbox`] can deliver the row again.
+//! A timer event uses the same outbox, so it cannot overtake an earlier
+//! entity event.
 //! Delivery is at least once.
 //! A consumer must be idempotent.
 //!
@@ -153,18 +161,20 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use oxkv::{
     Direction, GetSet, KeyPrefix, KeyValue, OxKvStore, ScanExt as _, Store as _, StoreError,
     Transaction as _, TxCas,
 };
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha256, Sha512};
 use tokio::sync::{Mutex, RwLock};
 
 use crate::eav::MAX_PAGE_OFFSET;
 use crate::eav::entity_error::EntityError;
 use crate::eav::error::SchemaError;
+use crate::eav::metrics::EavMetrics;
 use crate::eav::schema::{AttributeDef, AttributeType, EffectiveSchema, SchemaRef, SchemaRegistry};
 use crate::records::{AttributeChange, ChangeSink, EntityEvent, EntityEventKind, WalOp};
 use crate::rules::effect::{EffectPlan, EntityEffect};
@@ -249,13 +259,19 @@ const ATTR_INDEX_PREFIX: &str = "idx:attr:";
 /// Key prefix for the name marker of an indexed attribute.
 pub(crate) const ATTR_KEY_PREFIX: &str = "idx:attr-key:";
 
-/// Key prefix for unique value claims.
+/// Key prefix for legacy unique value claims.
 const UNIQUE_CLAIM_PREFIX: &str = "idx:unique:";
+
+/// Key prefix for exact unique value claims.
+///
+/// The prefix is separate from [`UNIQUE_CLAIM_PREFIX`], so a legacy claim
+/// scan cannot read a new claim as a legacy marker.
+const UNIQUE_EXACT_PREFIX: &str = "idx:unique-x:";
 
 /// Key prefix for the name marker of a unique attribute.
 pub(crate) const UNIQUE_KEY_PREFIX: &str = "idx:unique-key:";
 
-/// Key prefix for a unique claim that resolves a hash collision.
+/// Key prefix for a claim that resolves a double hash collision.
 const UNIQUE_EXTRA_PREFIX: &str = "idx:unique-c:";
 
 /// Key prefix for time index markers.
@@ -288,6 +304,17 @@ const EXECUTION_GC_BATCH: usize = 200;
 /// Test builds use a small page, so that a test can cross a page boundary.
 #[cfg(test)]
 const EXECUTION_GC_BATCH: usize = 2;
+
+/// The key that holds the last entity id of a committed rebuild page.
+const REBUILD_CURSOR_KEY: &str = "idx:rebuild:cursor";
+
+/// The largest number of entities that one rebuild page reads.
+#[cfg(not(test))]
+const REBUILD_PAGE: usize = 200;
+
+/// The largest number of entities that one rebuild page reads.
+#[cfg(test)]
+const REBUILD_PAGE: usize = 2;
 
 /// Maximum size of an entity id or an attribute name, in bytes.
 const MAX_NAME_BYTES: usize = 128;
@@ -442,6 +469,85 @@ pub struct MigrationReport {
     pub next: Option<String>,
 }
 
+/// One entity that pins a schema version that the store does not hold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MissingSchemaIssue {
+    /// The entity id.
+    pub entity_id: String,
+    /// The schema id.
+    pub schema_id: String,
+    /// The missing version.
+    pub version: u64,
+}
+
+/// One entity reference that names no stored entity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DanglingRefIssue {
+    /// The entity that holds the reference.
+    pub entity_id: String,
+    /// The attribute name.
+    pub attribute: String,
+    /// The target entity id.
+    pub target: String,
+}
+
+/// One unique claim that is missing, stale, or shared.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UniqueClaimIssue {
+    /// The attribute name.
+    pub attribute: String,
+    /// A short description of the problem.
+    pub detail: String,
+}
+
+/// The result of one index validation pass.
+///
+/// An empty issue list means that the entity index is consistent.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IndexValidationReport {
+    /// The number of stored entities that the pass read.
+    pub entities: usize,
+    /// The number of unique claims that the pass expected.
+    pub unique_claims: usize,
+    /// The entities that pin a schema version that is absent.
+    pub missing_schemas: Vec<MissingSchemaIssue>,
+    /// The references that name no stored entity.
+    pub dangling_refs: Vec<DanglingRefIssue>,
+    /// The unique claims that fail the check.
+    pub unique_claim_issues: Vec<UniqueClaimIssue>,
+    /// The entities whose pinned schemas conflict.
+    pub schema_conflicts: Vec<String>,
+}
+
+impl IndexValidationReport {
+    /// Returns true when the pass found no problem.
+    pub fn is_ok(&self) -> bool {
+        self.missing_schemas.is_empty()
+            && self.dangling_refs.is_empty()
+            && self.unique_claim_issues.is_empty()
+            && self.schema_conflicts.is_empty()
+    }
+}
+
+/// The counts from one index rebuild.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RebuildReport {
+    /// The number of entity pages that the rebuild committed.
+    pub pages: usize,
+    /// The number of entities that the rebuild rewrote.
+    pub entities: usize,
+    /// The number of attribute index rows that the rebuild wrote.
+    pub attribute_rows: usize,
+    /// The number of unique claims that the rebuild wrote.
+    pub unique_claims: usize,
+    /// The number of time rows that the rebuild wrote.
+    pub time_rows: usize,
+    /// The number of name markers that the rebuild wrote.
+    pub name_markers: usize,
+    /// The entity id that a resumed run started after.
+    pub resumed_after: Option<String>,
+}
+
 /// The counts from one atomic schema migration batch.
 #[derive(Debug, Default)]
 struct MigrationBatchResult {
@@ -557,6 +663,8 @@ pub struct EntityStore {
     /// The check is on by default.
     /// A host can turn it off for a store that holds legacy references.
     check_entity_refs: bool,
+    /// The runtime metrics that the store records.
+    metrics: EavMetrics,
     /// The number of outbox row deletes to fail in a test.
     #[cfg(test)]
     outbox_delete_failures: Arc<std::sync::atomic::AtomicUsize>,
@@ -574,6 +682,10 @@ pub struct EntityStore {
     /// test.
     #[cfg(test)]
     delete_prepare_hook: Arc<std::sync::Mutex<Option<BackfillPageHook>>>,
+    /// A hook that runs after a migration prepares and before it commits in a
+    /// test.
+    #[cfg(test)]
+    migration_commit_hook: Arc<std::sync::Mutex<Option<BackfillPageHook>>>,
 }
 
 /// One create after validation.
@@ -626,6 +738,16 @@ enum RevalidationFailure {
     Error(EntityError),
 }
 
+/// The dry-run result for one entity and one target schema version.
+enum DryRunOutcome {
+    /// The entity passes and does not pin the target version.
+    Migrated,
+    /// The entity passes and already pins the target version.
+    Unchanged,
+    /// The entity fails the target version.
+    Invalid(RevalidationIssue),
+}
+
 /// The name-level index facts for one write.
 ///
 /// A durable name marker is the fast path.
@@ -665,6 +787,7 @@ impl EntityStore {
             flush_lock: Arc::new(Mutex::new(())),
             feed: None,
             check_entity_refs: true,
+            metrics: EavMetrics::global(),
             #[cfg(test)]
             outbox_delete_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
@@ -675,6 +798,8 @@ impl EntityStore {
             backfill_page_hook: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
             delete_prepare_hook: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            migration_commit_hook: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -741,6 +866,34 @@ impl EntityStore {
             .expect("backfill page hook lock") = hook;
     }
 
+    /// Runs the hook that stands in for a write between a migration prepare
+    /// and the commit.
+    #[cfg(test)]
+    async fn run_migration_commit_hook(&self) {
+        let hook = self
+            .migration_commit_hook
+            .lock()
+            .expect("migration commit hook lock")
+            .clone();
+        if let Some(hook) = hook {
+            hook().await;
+        }
+    }
+
+    /// Runs the hook that stands in for a write between a migration prepare
+    /// and the commit.
+    #[cfg(not(test))]
+    async fn run_migration_commit_hook(&self) {}
+
+    /// Sets the test hook that runs before a migration commit.
+    #[cfg(test)]
+    fn set_migration_commit_hook(&self, hook: Option<BackfillPageHook>) {
+        *self
+            .migration_commit_hook
+            .lock()
+            .expect("migration commit hook lock") = hook;
+    }
+
     /// Sets whether a write checks that every `EntityRef` target exists.
     ///
     /// The default is `true`.
@@ -749,6 +902,32 @@ impl EntityStore {
     pub fn with_entity_ref_check(mut self, check: bool) -> Self {
         self.check_entity_refs = check;
         self
+    }
+
+    /// Replaces the runtime metrics in a test.
+    #[cfg(test)]
+    pub(crate) fn with_metrics(mut self, metrics: EavMetrics) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
+    /// Records one successful write or delete.
+    fn record_change(&self, writes: u64, deletes: u64) {
+        if writes > 0 {
+            self.metrics.record_entity_writes(writes);
+        }
+        if deletes > 0 {
+            self.metrics.record_entity_deletes(deletes);
+        }
+    }
+
+    /// Records a version or unique conflict.
+    fn record_failure(&self, error: &EntityError) {
+        match error {
+            EntityError::VersionConflict => self.metrics.record_entity_version_conflict(),
+            EntityError::UniqueViolation(_) => self.metrics.record_entity_unique_conflict(),
+            _ => {}
+        }
     }
 
     /// Checks every `EntityRef` value in one write.
@@ -906,8 +1085,16 @@ impl EntityStore {
                 .await
                 .map_err(EntityError::Store)?;
         }
-        put_entity_rows_except_meta(store, entity, &prepared.merged, &facts, state, Some(ctx))
-            .await?;
+        put_entity_rows_except_meta(
+            store,
+            None,
+            entity,
+            &prepared.merged,
+            &facts,
+            state,
+            Some(ctx),
+        )
+        .await?;
         Ok(outbox)
     }
 
@@ -1036,8 +1223,16 @@ impl EntityStore {
                 .await
                 .map_err(EntityError::Store)?;
         }
-        put_entity_rows_except_meta(store, after, &prepared.merged, &facts, state, Some(ctx))
-            .await?;
+        put_entity_rows_except_meta(
+            store,
+            Some(before),
+            after,
+            &prepared.merged,
+            &facts,
+            state,
+            Some(ctx),
+        )
+        .await?;
         Ok(outbox)
     }
 
@@ -1149,6 +1344,20 @@ impl EntityStore {
         draft: EntityDraft,
         ctx: &WriteContext,
     ) -> Result<EntityChange, EntityError> {
+        let result = self.create_inner(draft, ctx).await;
+        match &result {
+            Ok(_) => self.record_change(1, 0),
+            Err(error) => self.record_failure(error),
+        }
+        result
+    }
+
+    /// Creates an entity and returns the change.
+    async fn create_inner(
+        &self,
+        draft: EntityDraft,
+        ctx: &WriteContext,
+    ) -> Result<EntityChange, EntityError> {
         let prepared = self.prepare_create(draft).await?;
         let pending = {
             let _write = self.write_lock.lock().await;
@@ -1210,6 +1419,22 @@ impl EntityStore {
     /// A feed failure after the commit leaves the outbox row for the relay.
     /// The call still returns success.
     pub async fn update(
+        &self,
+        id: &str,
+        expected_version: u64,
+        patch: EntityPatch,
+        ctx: &WriteContext,
+    ) -> Result<EntityChange, EntityError> {
+        let result = self.update_inner(id, expected_version, patch, ctx).await;
+        match &result {
+            Ok(_) => self.record_change(1, 0),
+            Err(error) => self.record_failure(error),
+        }
+        result
+    }
+
+    /// Updates the attributes of one entity and returns the change.
+    async fn update_inner(
         &self,
         id: &str,
         expected_version: u64,
@@ -1278,6 +1503,22 @@ impl EntityStore {
     /// A feed failure after the commit leaves the outbox row for the relay.
     /// The call still returns success.
     pub async fn delete(
+        &self,
+        id: &str,
+        expected_version: u64,
+        force: bool,
+        ctx: &WriteContext,
+    ) -> Result<EntityChange, EntityError> {
+        let result = self.delete_inner(id, expected_version, force, ctx).await;
+        match &result {
+            Ok(_) => self.record_change(0, 1),
+            Err(error) => self.record_failure(error),
+        }
+        result
+    }
+
+    /// Deletes one entity and returns the change.
+    async fn delete_inner(
         &self,
         id: &str,
         expected_version: u64,
@@ -1389,6 +1630,34 @@ impl EntityStore {
     /// A flush failure leaves the rows for the relay.
     /// The call returns the changes in plan order.
     pub async fn apply_effects_with_marker(
+        &self,
+        plan: &EffectPlan,
+        ctx: &WriteContext,
+        marker: Option<(&str, &[u8])>,
+    ) -> Result<Vec<EntityChange>, EntityError> {
+        let writes = plan
+            .effects()
+            .iter()
+            .filter(|effect| !matches!(effect, EntityEffect::Delete { .. }))
+            .count() as u64;
+        let deletes = plan
+            .effects()
+            .iter()
+            .filter(|effect| matches!(effect, EntityEffect::Delete { .. }))
+            .count() as u64;
+        let result = self
+            .apply_effects_with_marker_inner(plan, ctx, marker)
+            .await;
+        match &result {
+            Ok(_) => self.record_change(writes, deletes),
+            Err(error) => self.record_failure(error),
+        }
+        result
+    }
+
+    /// Applies an effect plan and an optional execution marker as one atomic
+    /// write.
+    async fn apply_effects_with_marker_inner(
         &self,
         plan: &EffectPlan,
         ctx: &WriteContext,
@@ -1712,6 +1981,25 @@ impl EntityStore {
         Ok(usize::try_from(count).unwrap_or(usize::MAX))
     }
 
+    /// Returns the age of the oldest pending outbox row.
+    ///
+    /// The call reads one bounded page of the outbox family in key order.
+    /// It returns `None` when no pending row exists.
+    /// The event id orders the keys, so the first page holds the oldest rows
+    /// for the events that this process writes.
+    /// A row that does not decode is skipped.
+    pub async fn outbox_pending_age(&self) -> Result<Option<Duration>, EntityError> {
+        let g = self.store.read().await;
+        let rows = scan_prefix_bounded(&*g, OUTBOX_PREFIX, OUTBOX_FLUSH_BATCH).await?;
+        let now = chrono::Utc::now().timestamp();
+        let oldest = rows
+            .iter()
+            .filter_map(|row| serde_json::from_slice::<EntityEvent>(&row.value).ok())
+            .map(|event| event.occurred_at)
+            .min();
+        Ok(oldest.map(|at| Duration::from_secs(now.saturating_sub(at).max(0) as u64)))
+    }
+
     /// Returns the pending outbox count and backfills the key when absent.
     ///
     /// The call reads the counter on the normal path.
@@ -1822,6 +2110,7 @@ impl EntityStore {
     /// The call skips `offset` ids.
     /// It then loads at most `limit` entities.
     /// A `limit` of 0 returns an empty list.
+    /// An offset above `MAX_PAGE_OFFSET` returns an invalid-input error.
     pub async fn list_by_schema_page(
         &self,
         schema_id: &str,
@@ -1829,6 +2118,11 @@ impl EntityStore {
         offset: usize,
     ) -> Result<Vec<Entity>, EntityError> {
         validate_name("schema id", schema_id)?;
+        if offset > MAX_PAGE_OFFSET {
+            return Err(EntityError::Invalid(format!(
+                "offset must be at most {MAX_PAGE_OFFSET}. Use after to page deeper."
+            )));
+        }
         if limit == 0 {
             return Ok(Vec::new());
         }
@@ -1915,6 +2209,86 @@ impl EntityStore {
         Ok((entities, next))
     }
 
+    /// Lists one page of the distinct entity ids that reference `target_id`.
+    ///
+    /// The call reads the `idx:ref:{target_id}:` family only.
+    /// A marker from `target_id` itself does not count.
+    /// The result is sorted by source entity id.
+    /// The call skips `offset` ids.
+    /// It then returns at most `limit` ids.
+    /// A `limit` of 0 returns an empty list.
+    ///
+    /// The call reads the index, not the entity rows.
+    /// A marker whose source entity is gone stays visible.
+    /// An operator can then find the stale marker.
+    pub async fn list_referrers_page(
+        &self,
+        target_id: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<String>, EntityError> {
+        validate_name("entity id", target_id)?;
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let g = self.store.read().await;
+        let sources =
+            scan_referrer_sources(&*g, target_id, None, offset.saturating_add(limit)).await?;
+        Ok(sources.into_iter().skip(offset).take(limit).collect())
+    }
+
+    /// Lists one page of the distinct entity ids that reference `target_id`.
+    ///
+    /// The call reads the `idx:ref:{target_id}:` family only.
+    /// A marker from `target_id` itself does not count.
+    /// The result is sorted by source entity id.
+    /// The scan starts after the `after` source id when the caller gives a
+    /// cursor.
+    /// The call reads one extra source id as a look-ahead.
+    /// The cursor is the last source id of the page when the extra id exists.
+    /// The cursor is `None` when the scan is exhausted.
+    /// A `limit` of 0 returns an empty list and no cursor.
+    pub async fn list_referrers_after(
+        &self,
+        target_id: &str,
+        limit: usize,
+        after: Option<&str>,
+    ) -> Result<(Vec<String>, Option<String>), EntityError> {
+        validate_name("entity id", target_id)?;
+        if limit == 0 {
+            return Ok((Vec::new(), None));
+        }
+        let g = self.store.read().await;
+        let mut sources =
+            scan_referrer_sources(&*g, target_id, after, limit.saturating_add(1)).await?;
+        let has_more = sources.len() > limit;
+        sources.truncate(limit);
+        let next = if has_more {
+            sources.last().cloned()
+        } else {
+            None
+        };
+        Ok((sources, next))
+    }
+
+    /// Writes one reverse reference marker. The call exists only in a test
+    /// build.
+    ///
+    /// The route tests use it to model a marker whose source entity is gone.
+    #[cfg(test)]
+    pub(crate) async fn write_referrer_marker_for_test(
+        &self,
+        target_id: &str,
+        source_id: &str,
+        attribute: &str,
+    ) -> Result<(), EntityError> {
+        let g = self.store.write().await;
+        g.set_bytes(&ref_index_key(target_id, source_id, attribute), b"")
+            .await
+            .map(|_| ())
+            .map_err(EntityError::Store)
+    }
+
     /// Checks stored entities against a target schema version.
     ///
     /// The call reads at most `limit` entities that pin `schema_id`.
@@ -1926,6 +2300,10 @@ impl EntityStore {
     /// A store failure is an error and not an issue.
     /// The report holds the cursor for the next page.
     /// A missing target version is [`EntityError::UnknownSchema`].
+    /// When the target version marks an attribute unique, the call also
+    /// checks every entity that pins `schema_id`, so that a duplicate value
+    /// across two pages is visible. That pass ignores `limit` and costs one
+    /// scan of the schema entities.
     pub async fn revalidation_report(
         &self,
         schema_id: &str,
@@ -1945,44 +2323,138 @@ impl EntityStore {
         }
 
         let (entities, next) = self.list_by_schema_after(schema_id, limit, after).await?;
+        let outcomes = self
+            .dry_run_outcomes(schema_id, target_version, &entities)
+            .await?;
         let mut report = RevalidationReport {
             scanned: 0,
             compatible: 0,
             invalid: Vec::new(),
             next,
         };
-        let mut seen_unique: BTreeSet<(String, String)> = BTreeSet::new();
-        for entity in entities {
-            if !entity.schemas.iter().any(|schema| schema.id == schema_id) {
-                continue;
-            }
+        for (entity, outcome) in entities.iter().zip(outcomes) {
             report.scanned += 1;
-            match self
-                .revalidate_one(&entity, schema_id, target_version)
-                .await
-            {
-                Ok(revalidated) => {
-                    if let Some(issue) = note_unique_values(
-                        &revalidated.attributes,
-                        &revalidated.merged.attributes,
-                        &mut seen_unique,
-                    )? {
-                        report.invalid.push(InvalidEntity {
-                            entity_id: entity.id.clone(),
-                            issue,
-                        });
-                    } else {
-                        report.compatible += 1;
-                    }
-                }
-                Err(RevalidationFailure::Issue(issue)) => report.invalid.push(InvalidEntity {
+            match outcome {
+                DryRunOutcome::Migrated | DryRunOutcome::Unchanged => report.compatible += 1,
+                DryRunOutcome::Invalid(issue) => report.invalid.push(InvalidEntity {
                     entity_id: entity.id.clone(),
                     issue,
                 }),
-                Err(RevalidationFailure::Error(error)) => return Err(error),
             }
         }
         Ok(report)
+    }
+
+    /// Returns one dry-run result for each entity of one page.
+    ///
+    /// A target version with no unique attribute checks the page only.
+    /// A target version with a unique attribute checks every entity that
+    /// pins `schema_id` in id order, so that a duplicate value across two
+    /// pages is visible. That pass ignores `limit` and costs one scan of the
+    /// schema entities.
+    /// The call returns one result for each entity of `page`, in page order.
+    async fn dry_run_outcomes(
+        &self,
+        schema_id: &str,
+        target_version: u64,
+        page: &[Entity],
+    ) -> Result<Vec<DryRunOutcome>, EntityError> {
+        let mut seen_unique = BTreeSet::new();
+        if !self
+            .target_marks_a_unique_attribute(schema_id, target_version)
+            .await?
+        {
+            let mut outcomes = Vec::with_capacity(page.len());
+            for entity in page {
+                outcomes.push(
+                    self.dry_run_one(entity, schema_id, target_version, &mut seen_unique)
+                        .await?,
+                );
+            }
+            return Ok(outcomes);
+        }
+
+        let page_ids: BTreeSet<&str> = page.iter().map(|entity| entity.id.as_str()).collect();
+        let mut results: BTreeMap<String, DryRunOutcome> = BTreeMap::new();
+        for entity in self.list_by_schema(schema_id).await? {
+            if !entity.schemas.iter().any(|schema| schema.id == schema_id) {
+                continue;
+            }
+            let outcome = self
+                .dry_run_one(&entity, schema_id, target_version, &mut seen_unique)
+                .await?;
+            if page_ids.contains(entity.id.as_str()) {
+                results.insert(entity.id, outcome);
+            }
+        }
+        let mut outcomes = Vec::with_capacity(page.len());
+        for entity in page {
+            if let Some(outcome) = results.remove(&entity.id) {
+                outcomes.push(outcome);
+            } else {
+                // A concurrent write changed the schema markers between the
+                // page read and the full scan.
+                outcomes.push(
+                    self.dry_run_one(entity, schema_id, target_version, &mut seen_unique)
+                        .await?,
+                );
+            }
+        }
+        Ok(outcomes)
+    }
+
+    /// Checks one entity for a dry run.
+    ///
+    /// A duplicate unique value leaves `seen_unique` unchanged.
+    async fn dry_run_one(
+        &self,
+        entity: &Entity,
+        schema_id: &str,
+        target_version: u64,
+        seen_unique: &mut BTreeSet<(String, String, String)>,
+    ) -> Result<DryRunOutcome, EntityError> {
+        match self.revalidate_one(entity, schema_id, target_version).await {
+            Ok(revalidated) => {
+                if let Some(issue) = note_unique_values(
+                    &revalidated.attributes,
+                    &revalidated.merged.attributes,
+                    seen_unique,
+                )? {
+                    return Ok(DryRunOutcome::Invalid(issue));
+                }
+                if entity
+                    .schemas
+                    .iter()
+                    .any(|schema| schema.id == schema_id && schema.version == target_version)
+                {
+                    Ok(DryRunOutcome::Unchanged)
+                } else {
+                    Ok(DryRunOutcome::Migrated)
+                }
+            }
+            Err(RevalidationFailure::Issue(issue)) => Ok(DryRunOutcome::Invalid(issue)),
+            Err(RevalidationFailure::Error(error)) => Err(error),
+        }
+    }
+
+    /// True when the target version marks an attribute unique.
+    ///
+    /// The call reads the effective schema of the target version, so it also
+    /// sees a unique attribute on a parent schema.
+    async fn target_marks_a_unique_attribute(
+        &self,
+        schema_id: &str,
+        target_version: u64,
+    ) -> Result<bool, EntityError> {
+        let Some(effective) = self
+            .schemas
+            .effective(schema_id, target_version)
+            .await
+            .map_err(map_schema_error)?
+        else {
+            return Ok(false);
+        };
+        Ok(effective.attributes.values().any(|def| def.unique))
     }
 
     /// Applies one target schema version to compatible entities.
@@ -2003,10 +2475,16 @@ impl EntityStore {
     /// A duplicate unique value marks the entity as invalid.
     /// A dangling reference marks the entity as invalid.
     /// A stale entity version aborts the batch with no write.
+    /// A concurrent update aborts the batch with
+    /// [`EntityError::VersionConflict`] and no write.
     /// A store error aborts the batch with no write.
     /// A missing target version is [`EntityError::UnknownSchema`].
     /// The report holds the cursor for the next page.
     /// A `limit` of 0 returns an empty report.
+    /// When the target version marks an attribute unique, a dry run also
+    /// checks every entity that pins `schema_id`, so that a duplicate value
+    /// across two pages is visible. That pass ignores `limit` and costs one
+    /// scan of the schema entities.
     pub async fn migrate_schema(
         &self,
         schema_id: &str,
@@ -2042,41 +2520,18 @@ impl EntityStore {
         let (entities, next) = self.list_by_schema_after(schema_id, limit, after).await?;
         report.next = next;
         if dry_run {
-            let mut seen_unique: BTreeSet<(String, String)> = BTreeSet::new();
-            for entity in entities {
-                if !entity.schemas.iter().any(|schema| schema.id == schema_id) {
-                    continue;
-                }
+            let outcomes = self
+                .dry_run_outcomes(schema_id, target_version, &entities)
+                .await?;
+            for (entity, outcome) in entities.iter().zip(outcomes) {
                 report.scanned += 1;
-                match self
-                    .revalidate_one(&entity, schema_id, target_version)
-                    .await
-                {
-                    Ok(revalidated) => {
-                        if let Some(issue) = note_unique_values(
-                            &revalidated.attributes,
-                            &revalidated.merged.attributes,
-                            &mut seen_unique,
-                        )? {
-                            report.invalid.push(InvalidEntity {
-                                entity_id: entity.id.clone(),
-                                issue,
-                            });
-                        } else if entity.schemas.iter().any(|schema| {
-                            schema.id == schema_id && schema.version == target_version
-                        }) {
-                            report.unchanged += 1;
-                        } else {
-                            report.migrated += 1;
-                        }
-                    }
-                    Err(RevalidationFailure::Issue(issue)) => {
-                        report.invalid.push(InvalidEntity {
-                            entity_id: entity.id.clone(),
-                            issue,
-                        });
-                    }
-                    Err(RevalidationFailure::Error(error)) => return Err(error),
+                match outcome {
+                    DryRunOutcome::Migrated => report.migrated += 1,
+                    DryRunOutcome::Unchanged => report.unchanged += 1,
+                    DryRunOutcome::Invalid(issue) => report.invalid.push(InvalidEntity {
+                        entity_id: entity.id.clone(),
+                        issue,
+                    }),
                 }
             }
             return Ok(report);
@@ -2108,6 +2563,9 @@ impl EntityStore {
     /// rows of the target schema.
     /// It writes the metadata row and the outbox row in the same transaction,
     /// or it writes no row.
+    /// The metadata write is a compare-and-set on the reloaded metadata row,
+    /// so a concurrent update between the reload and the commit fails the
+    /// batch with [`EntityError::VersionConflict`].
     /// The call flushes the outbox one time after the commit.
     /// A feed failure after the commit leaves the outbox rows for the relay.
     async fn apply_schema_migration_batch(
@@ -2120,7 +2578,7 @@ impl EntityStore {
         let _write = self.write_lock.lock().await;
         let mut result = MigrationBatchResult::default();
         let mut writes: Vec<SchemaMigrationWrite> = Vec::new();
-        let mut seen_unique: BTreeSet<(String, String)> = BTreeSet::new();
+        let mut seen_unique: BTreeSet<(String, String, String)> = BTreeSet::new();
 
         for entity in entities {
             let current = {
@@ -2218,6 +2676,8 @@ impl EntityStore {
             return Ok(result);
         }
 
+        self.run_migration_commit_hook().await;
+
         let pending = writes.iter().any(|write| write.outbox.is_some());
         let outbox_rows = writes.iter().filter(|write| write.outbox.is_some()).count();
         {
@@ -2249,9 +2709,10 @@ impl EntityStore {
                         .await
                         .map_err(EntityError::Store)?;
                 }
-                put_meta_row(&tx, &write.entity).await?;
+                put_meta_row(&tx, &write.before, &write.entity).await?;
                 put_entity_rows_except_meta(
                     &tx,
+                    Some(&write.before),
                     &write.entity,
                     &write.after_merged,
                     &facts,
@@ -2263,7 +2724,13 @@ impl EntityStore {
                     tx.set_bytes(key, bytes).await.map_err(EntityError::Store)?;
                 }
             }
-            tx.commit().await.map_err(EntityError::Store)?;
+            match tx.commit().await {
+                Ok(()) => {}
+                Err(StoreError::TxConflict { key, .. }) => {
+                    return Err(conflict_error(&state, &key));
+                }
+                Err(error) => return Err(EntityError::Store(error)),
+            }
         }
         drop(_write);
         if pending && let Err(error) = self.flush_after_commit().await {
@@ -2635,7 +3102,7 @@ impl EntityStore {
         Ok(entities)
     }
 
-    /// Emits one timer event for a due value and appends it to the feed.
+    /// Emits one timer event for a due value and enqueues it in the outbox.
     ///
     /// The event has kind [`EntityEventKind::Timer`].
     /// It has an empty `changed` list and a snapshot of the current entity.
@@ -2646,30 +3113,58 @@ impl EntityStore {
     /// Its depth is one more than the stored depth.
     /// A time row with no cause gives a timer event with no cause and depth
     /// 0.
-    /// The call appends through the change feed and writes no outbox row.
+    /// The call takes the write lock and then the store write guard.
+    /// It reloads the entity inside the lock.
+    /// It writes the fired marker, deletes the time row, and writes the
+    /// outbox row in one transaction.
+    /// It also increments `outbox-meta:pending` in that transaction.
+    /// The call returns `None` and changes nothing when the entity is absent,
+    /// when the current value for `key` is not [`AttributeValue::Timestamp`]
+    /// with `due_at`, or when a fired marker exists.
+    /// It returns the event after the transaction commits.
+    /// A feed is required.
+    /// The call flushes the outbox after the commit.
+    /// A failed flush leaves the outbox row for the relay.
     pub async fn emit_timer(
         &self,
         entity: &Entity,
         key: &str,
         due_at: i64,
         now: i64,
-    ) -> Result<EntityEvent, EntityError> {
-        let Some(feed) = &self.feed else {
+    ) -> Result<Option<EntityEvent>, EntityError> {
+        if self.feed.is_none() {
             return Err(EntityError::Feed(
                 "timer event needs a change feed".to_string(),
             ));
-        };
+        }
         validate_name("attribute name", key)?;
         let effective = self.resolve_refs(&entity.schemas).await?;
         let event_id = format!("timer-{}-{key}-{}", entity.id, encode_timestamp(due_at));
-        let causation = {
-            let g = self.store.read().await;
-            let bytes = g
-                .get_bytes(&time_index_key(key, due_at, &entity.id))
-                .await
-                .map_err(EntityError::Store)?;
-            decode_time_marker(bytes.as_deref())
+        let fired_at = chrono::Utc::now().timestamp();
+        let fired_bytes =
+            serde_json::to_vec(&fired_at).map_err(|e| EntityError::Internal(e.to_string()))?;
+        let _write = self.write_lock.lock().await;
+        let g = self.store.write().await;
+        let tx = g.begin_tx().map_err(EntityError::Store)?;
+        if tx
+            .get_bytes(&timer_marker_key(&entity.id, key, due_at))
+            .await
+            .map_err(EntityError::Store)?
+            .is_some()
+        {
+            return Ok(None);
+        }
+        let Some(current) = load_entity(&tx, &entity.id).await? else {
+            return Ok(None);
         };
+        if current.attributes.get(key) != Some(&AttributeValue::Timestamp(due_at)) {
+            return Ok(None);
+        }
+        let stored = tx
+            .get_bytes(&time_index_key(key, due_at, &current.id))
+            .await
+            .map_err(EntityError::Store)?;
+        let causation = decode_time_marker(stored.as_deref());
         let (causation_id, causation_depth) =
             if causation.causation_id.is_none() && causation.causation_depth == 0 {
                 (None, 0)
@@ -2680,7 +3175,7 @@ impl EntityStore {
                 )
             };
         let snapshot = Some(
-            entity
+            current
                 .attributes
                 .iter()
                 .map(|(name, value)| (name.clone(), value.as_json()))
@@ -2688,8 +3183,8 @@ impl EntityStore {
         );
         let event = EntityEvent {
             event_id: event_id.clone(),
-            entity_id: entity.id.clone(),
-            entity_version: entity.version,
+            entity_id: current.id.clone(),
+            entity_version: current.version,
             kind: EntityEventKind::Timer,
             schemas: event_schema_ids(&effective),
             changed: Vec::new(),
@@ -2700,12 +3195,27 @@ impl EntityStore {
             snapshot,
             occurred_at: now,
         };
-        feed.append(WalOp::Entity {
-            event: event.clone(),
-        })
-        .await
-        .map_err(|_| EntityError::Feed("timer feed append failed".to_string()))?;
-        Ok(event)
+        let bytes = serde_json::to_vec(&event).map_err(|e| EntityError::Internal(e.to_string()))?;
+        tx.set_bytes(&timer_marker_key(&current.id, key, due_at), &fired_bytes)
+            .await
+            .map_err(EntityError::Store)?;
+        tx.delete(&time_index_key(key, due_at, &current.id))
+            .await
+            .map_err(EntityError::Store)?;
+        increment_outbox_pending(&tx, 1).await?;
+        tx.set_bytes(&timer_outbox_key(), &bytes)
+            .await
+            .map_err(EntityError::Store)?;
+        tx.commit().await.map_err(EntityError::Store)?;
+        drop(g);
+        drop(_write);
+        if let Err(error) = self.flush_after_commit().await {
+            tracing::warn!(
+                %error,
+                "timer outbox flush failed after commit; the relay will deliver the event"
+            );
+        }
+        Ok(Some(event))
     }
 
     /// True when a timer marker exists for one entity, key, and due value.
@@ -2756,6 +3266,10 @@ impl EntityStore {
 
     /// Writes a timer marker and removes the time index row in one transaction.
     ///
+    /// The call emits no event.
+    /// [`EntityStore::emit_timer`] is the path that writes an event.
+    /// The timer pass calls this method only to drain a row that fired before
+    /// the timer retire existed.
     /// The call takes the write lock and then the store write guard.
     /// It reloads the current entity inside the lock.
     /// It returns `false` and changes nothing when the entity is absent.
@@ -3284,6 +3798,515 @@ impl EntityStore {
         }
         Ok(facts)
     }
+
+    /// Returns true when the store holds no entity row.
+    ///
+    /// The call reads the first key of the `entity:` family.
+    /// It writes no key.
+    pub(crate) async fn is_empty(&self) -> Result<bool, EntityError> {
+        let g = self.store.read().await;
+        let rows = g
+            .gets_keys(
+                Some(1),
+                Direction::Next,
+                (
+                    Some(ENTITY_PREFIX.to_string()),
+                    KeyPrefix::new(ENTITY_PREFIX).upper_bound(),
+                ),
+            )
+            .await
+            .map_err(EntityError::Store)?;
+        Ok(rows.is_empty())
+    }
+
+    /// Imports exact entity records into an empty store.
+    ///
+    /// The call validates every entity before it writes any key.
+    /// It writes the metadata, attribute, and index rows of one entity in one
+    /// transaction.
+    /// It keeps the version and the timestamps of each record.
+    /// It writes no event and no outbox row.
+    /// A dangling reference is allowed, because a restore check reports it
+    /// later.
+    pub(crate) async fn import_entities(&self, entities: &[Entity]) -> Result<usize, EntityError> {
+        let mut seen_ids = BTreeSet::new();
+        let mut seen_unique: BTreeSet<(String, String)> = BTreeSet::new();
+
+        let all_keys: BTreeSet<String> = entities
+            .iter()
+            .flat_map(|entity| entity.attributes.keys().cloned())
+            .collect();
+        let facts = {
+            let g = self.store.read().await;
+            self.name_facts(&*g, &all_keys).await?
+        };
+
+        for entity in entities {
+            self.validate_import_entity(entity, &facts, &mut seen_ids, &mut seen_unique)
+                .await?;
+        }
+
+        for entity in entities {
+            let _write = self.write_lock.lock().await;
+            let g = self.store.write().await;
+            let effective = self.resolve_import_refs(entity).await?;
+            let merged = merge_schemas(&effective)?;
+            let tx = g.begin_tx().map_err(EntityError::Store)?;
+            let facts = self.name_facts(&tx, &name_keys(entity, None)).await?;
+            check_unique_values(&tx, entity, &merged.attributes, &facts).await?;
+            let meta = meta_key(&entity.id);
+            let bytes = meta_bytes(entity)?;
+            if tx
+                .get_bytes(&meta)
+                .await
+                .map_err(EntityError::Store)?
+                .is_some()
+            {
+                return Err(EntityError::AlreadyExists(entity.id.clone()));
+            }
+            tx.set_bytes(&meta, &bytes)
+                .await
+                .map_err(EntityError::Store)?;
+            let mut state = WriteState::default();
+            put_entity_rows_except_meta(&tx, None, entity, &merged, &facts, &mut state, None)
+                .await?;
+            tx.commit().await.map_err(EntityError::Store)?;
+        }
+        Ok(entities.len())
+    }
+
+    /// Checks one entity record before an import writes it.
+    async fn validate_import_entity(
+        &self,
+        entity: &Entity,
+        facts: &NameFacts,
+        seen_ids: &mut BTreeSet<String>,
+        seen_unique: &mut BTreeSet<(String, String)>,
+    ) -> Result<(), EntityError> {
+        validate_name("entity id", &entity.id)?;
+        if entity.version == 0 {
+            return Err(EntityError::Invalid(format!(
+                "entity {} has version 0",
+                entity.id
+            )));
+        }
+        if !seen_ids.insert(entity.id.clone()) {
+            return Err(EntityError::Invalid(format!(
+                "entity {} has two records",
+                entity.id
+            )));
+        }
+        let effective = self.resolve_import_refs(entity).await?;
+        let merged = merge_schemas(&effective)?;
+        check_known(&entity.attributes, &merged.attributes)?;
+        validate_defaults(&merged.attributes)?;
+        check_types(&entity.attributes, &merged.attributes)?;
+        check_required(&entity.attributes, &merged.attributes)?;
+        for (name, value) in &entity.attributes {
+            if let AttributeValue::EntityRef(target) = value {
+                validate_name("entity id", target)?;
+            }
+            let unique = facts.unique.contains(name)
+                || merged
+                    .attributes
+                    .get(name)
+                    .is_some_and(|attribute| attribute.unique);
+            if unique {
+                let hash = value_hash(value)?;
+                if !seen_unique.insert((name.clone(), hash)) {
+                    return Err(EntityError::UniqueViolation(name.clone()));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolves the pinned schema versions of one import record.
+    async fn resolve_import_refs(
+        &self,
+        entity: &Entity,
+    ) -> Result<Vec<EffectiveSchema>, EntityError> {
+        let mut seen = BTreeSet::new();
+        let mut effective = Vec::with_capacity(entity.schemas.len());
+        for schema in &entity.schemas {
+            validate_name("schema id", &schema.id)?;
+            if !seen.insert((schema.id.clone(), schema.version)) {
+                return Err(EntityError::Invalid(format!(
+                    "entity {} pins schema {} twice",
+                    entity.id, schema.id
+                )));
+            }
+            let Some(flat) = self
+                .schemas
+                .effective(&schema.id, schema.version)
+                .await
+                .map_err(map_schema_error)?
+            else {
+                return Err(EntityError::Invalid(format!(
+                    "entity {} pins a missing schema version: {}@{}",
+                    entity.id, schema.id, schema.version
+                )));
+            };
+            effective.push(flat);
+        }
+        Ok(effective)
+    }
+
+    /// Rewrites every index row of the stored entities.
+    ///
+    /// The call first writes the name markers from the stored schema versions.
+    /// It then reads the entities in id order, one page at a time.
+    /// Each page rewrites the index rows in one transaction.
+    /// The call keeps a cursor after each page, so a later run resumes.
+    /// The cursor is removed after the last page.
+    /// A second run writes the same rows and changes no value.
+    /// With `schema`, the call rewrites only the entities that pin that schema.
+    pub(crate) async fn rebuild_indexes(
+        &self,
+        schema: Option<&str>,
+    ) -> Result<RebuildReport, EntityError> {
+        if let Some(schema) = schema {
+            validate_name("schema id", schema)?;
+        }
+        let mut report = RebuildReport::default();
+        self.backfill_entity_index().await?;
+
+        {
+            let _write = self.write_lock.lock().await;
+            let g = self.store.write().await;
+            let tx = g.begin_tx().map_err(EntityError::Store)?;
+            let mut markers = 0;
+            for def in self.schemas.versions().await.map_err(map_schema_error)? {
+                let Some(effective) = self
+                    .schemas
+                    .effective(&def.id, def.version)
+                    .await
+                    .map_err(map_schema_error)?
+                else {
+                    continue;
+                };
+                for (name, attribute) in &effective.attributes {
+                    if attribute.indexed {
+                        tx.set_bytes(&attr_key_index_key(name), b"")
+                            .await
+                            .map_err(EntityError::Store)?;
+                        markers += 1;
+                        if is_time_attribute(attribute) {
+                            tx.set_bytes(&time_key_index_key(name), b"")
+                                .await
+                                .map_err(EntityError::Store)?;
+                            markers += 1;
+                        }
+                    }
+                    if attribute.unique {
+                        tx.set_bytes(&unique_name_key(name), b"")
+                            .await
+                            .map_err(EntityError::Store)?;
+                        markers += 1;
+                    }
+                }
+            }
+            tx.commit().await.map_err(EntityError::Store)?;
+            report.name_markers = markers;
+        }
+
+        let resume = {
+            let g = self.store.read().await;
+            match g
+                .get_bytes(REBUILD_CURSOR_KEY)
+                .await
+                .map_err(EntityError::Store)?
+            {
+                Some(bytes) => serde_json::from_slice::<String>(&bytes).ok(),
+                None => None,
+            }
+        };
+        report.resumed_after = resume.clone();
+        let mut cursor = resume
+            .as_deref()
+            .map(|id| format!("{ENTITY_INDEX_PREFIX}{id}\0"))
+            .unwrap_or_else(|| ENTITY_INDEX_PREFIX.to_string());
+        let end = KeyPrefix::new(ENTITY_INDEX_PREFIX).upper_bound();
+
+        loop {
+            let page = {
+                let _write = self.write_lock.lock().await;
+                let g = self.store.write().await;
+                let rows = g
+                    .gets_keys(
+                        Some(REBUILD_PAGE),
+                        Direction::Next,
+                        (Some(cursor.clone()), end.clone()),
+                    )
+                    .await
+                    .map_err(EntityError::Store)?;
+                if rows.is_empty() {
+                    None
+                } else {
+                    let full = rows.len() == REBUILD_PAGE;
+                    let mut last_id = None;
+                    let tx = g.begin_tx().map_err(EntityError::Store)?;
+                    for key in &rows {
+                        let Some(id) = key.strip_prefix(ENTITY_INDEX_PREFIX) else {
+                            continue;
+                        };
+                        if id.is_empty() || id.contains(':') {
+                            continue;
+                        }
+                        last_id = Some(id.to_string());
+                        let Some(entity) = load_entity(&tx, id).await? else {
+                            continue;
+                        };
+                        if let Some(schema) = schema
+                            && !entity.schemas.iter().any(|pinned| pinned.id == schema)
+                        {
+                            continue;
+                        }
+                        let effective = self.resolve_refs(&entity.schemas).await?;
+                        let merged = merge_schemas(&effective)?;
+                        let facts = self.name_facts(&tx, &name_keys(&entity, None)).await?;
+                        let mut preserved = Vec::new();
+                        for (name, value) in &entity.attributes {
+                            let indexed = facts.indexed.contains(name)
+                                || merged
+                                    .attributes
+                                    .get(name)
+                                    .is_some_and(|attribute| attribute.indexed);
+                            if !indexed {
+                                continue;
+                            }
+                            if let AttributeValue::Timestamp(timestamp) = value {
+                                let key = time_index_key(name, *timestamp, &entity.id);
+                                if let Some(bytes) =
+                                    tx.get_bytes(&key).await.map_err(EntityError::Store)?
+                                {
+                                    preserved.push((key, bytes));
+                                }
+                                report.time_rows += 1;
+                            }
+                            report.attribute_rows += 1;
+                        }
+                        for name in entity.attributes.keys() {
+                            let unique = facts.unique.contains(name)
+                                || merged
+                                    .attributes
+                                    .get(name)
+                                    .is_some_and(|attribute| attribute.unique);
+                            if unique {
+                                report.unique_claims += 1;
+                            }
+                        }
+                        let mut state = WriteState::default();
+                        delete_mutable_rows(&tx, &entity, None, &merged, &facts, &mut state)
+                            .await?;
+                        delete_ref_rows(&tx, &entity, &merged).await?;
+                        put_entity_rows_except_meta(
+                            &tx,
+                            Some(&entity),
+                            &entity,
+                            &merged,
+                            &facts,
+                            &mut state,
+                            None,
+                        )
+                        .await?;
+                        for (key, bytes) in preserved {
+                            tx.set_bytes(&key, &bytes)
+                                .await
+                                .map_err(EntityError::Store)?;
+                        }
+                        report.entities += 1;
+                    }
+                    tx.commit().await.map_err(EntityError::Store)?;
+                    report.pages += 1;
+                    if let Some(id) = &last_id {
+                        let bytes = serde_json::to_vec(id)
+                            .map_err(|e| EntityError::Internal(e.to_string()))?;
+                        g.put_bytes(REBUILD_CURSOR_KEY, &bytes)
+                            .await
+                            .map_err(EntityError::Store)?;
+                    }
+                    last_id.map(|id| (format!("{ENTITY_INDEX_PREFIX}{id}\0"), full))
+                }
+            };
+            let Some((next, full)) = page else {
+                break;
+            };
+            cursor = next;
+            if !full {
+                break;
+            }
+        }
+
+        let _write = self.write_lock.lock().await;
+        let g = self.store.write().await;
+        g.delete(REBUILD_CURSOR_KEY)
+            .await
+            .map_err(EntityError::Store)?;
+        Ok(report)
+    }
+
+    /// Checks the pinned schemas, the unique claims, and the references.
+    ///
+    /// The call reads every stored entity.
+    /// It reports a pinned schema version that is absent.
+    /// It reports a reference that names no stored entity.
+    /// It reports a unique claim that is missing, stale, or shared.
+    /// It writes no key.
+    pub(crate) async fn validate_indexes(&self) -> Result<IndexValidationReport, EntityError> {
+        let mut report = IndexValidationReport::default();
+        let g = self.store.read().await;
+        let keys = scan_keys_prefix(&*g, ENTITY_PREFIX).await?;
+        let mut expected: BTreeMap<(String, String, String), BTreeSet<String>> = BTreeMap::new();
+
+        for key in keys {
+            let Some(rest) = key.strip_prefix(ENTITY_PREFIX) else {
+                continue;
+            };
+            let Some(id) = rest.strip_suffix(META_SUFFIX) else {
+                continue;
+            };
+            if id.is_empty() || id.contains(':') {
+                continue;
+            }
+            let Some(entity) = load_entity(&*g, id).await? else {
+                continue;
+            };
+            report.entities += 1;
+
+            let mut effective = Vec::new();
+            let mut missing = false;
+            for schema in &entity.schemas {
+                match self
+                    .schemas
+                    .effective(&schema.id, schema.version)
+                    .await
+                    .map_err(map_schema_error)?
+                {
+                    Some(flat) => effective.push(flat),
+                    None => {
+                        report.missing_schemas.push(MissingSchemaIssue {
+                            entity_id: entity.id.clone(),
+                            schema_id: schema.id.clone(),
+                            version: schema.version,
+                        });
+                        missing = true;
+                    }
+                }
+            }
+            if missing {
+                continue;
+            }
+            let merged = match merge_schemas(&effective) {
+                Ok(merged) => merged,
+                Err(error) => {
+                    report
+                        .schema_conflicts
+                        .push(format!("{}: {error}", entity.id));
+                    continue;
+                }
+            };
+
+            for (name, value) in &entity.attributes {
+                match value {
+                    AttributeValue::EntityRef(target) if target != &entity.id => {
+                        let exists = g
+                            .get_bytes(&meta_key(target))
+                            .await
+                            .map_err(EntityError::Store)?
+                            .is_some();
+                        if !exists {
+                            report.dangling_refs.push(DanglingRefIssue {
+                                entity_id: entity.id.clone(),
+                                attribute: name.clone(),
+                                target: target.clone(),
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+                if merged
+                    .attributes
+                    .get(name)
+                    .is_some_and(|attribute| attribute.unique)
+                {
+                    let hash = value_hash(value)?;
+                    let fingerprint = value_fingerprint(value)?;
+                    expected
+                        .entry((name.clone(), hash, fingerprint))
+                        .or_default()
+                        .insert(entity.id.clone());
+                }
+            }
+        }
+
+        for ((name, hash, fingerprint), owners) in &expected {
+            report.unique_claims += 1;
+            let claim = unique_claim_key(name, hash, fingerprint);
+            if owners.len() > 1 {
+                let mut ids: Vec<&str> = owners.iter().map(String::as_str).collect();
+                ids.sort_unstable();
+                report.unique_claim_issues.push(UniqueClaimIssue {
+                    attribute: name.clone(),
+                    detail: format!("value has more than one owner: {}", ids.join(", ")),
+                });
+            }
+            match g
+                .get_bytes(&claim)
+                .await
+                .map_err(EntityError::Store)?
+                .as_deref()
+                .and_then(claim_owner)
+            {
+                Some(owner) if owners.len() == 1 && owners.contains(owner) => {}
+                Some(owner) => report.unique_claim_issues.push(UniqueClaimIssue {
+                    attribute: name.clone(),
+                    detail: format!("claim names the wrong owner: {owner}"),
+                }),
+                None => report.unique_claim_issues.push(UniqueClaimIssue {
+                    attribute: name.clone(),
+                    detail: "claim is missing or has no owner".to_string(),
+                }),
+            }
+        }
+
+        for key in scan_keys_prefix(&*g, UNIQUE_CLAIM_PREFIX).await? {
+            let Some(rest) = key.strip_prefix(UNIQUE_CLAIM_PREFIX) else {
+                continue;
+            };
+            let parts: Vec<&str> = rest.split(':').collect();
+            if parts.len() != 2 {
+                continue;
+            }
+            let bytes = g.get_bytes(&key).await.map_err(EntityError::Store)?;
+            let Some(owner) = bytes.as_deref().and_then(claim_owner) else {
+                report.unique_claim_issues.push(UniqueClaimIssue {
+                    attribute: parts[0].to_string(),
+                    detail: "claim has no owner".to_string(),
+                });
+                continue;
+            };
+            let Some(entity) = load_entity(&*g, owner).await? else {
+                report.unique_claim_issues.push(UniqueClaimIssue {
+                    attribute: parts[0].to_string(),
+                    detail: format!("claim names a missing entity: {owner}"),
+                });
+                continue;
+            };
+            let holds = match entity.attributes.get(parts[0]) {
+                Some(value) => value_hash(value).ok().as_deref() == Some(parts[1]),
+                None => false,
+            };
+            if !holds {
+                report.unique_claim_issues.push(UniqueClaimIssue {
+                    attribute: parts[0].to_string(),
+                    detail: format!("entity {owner} does not hold the claimed value"),
+                });
+            }
+        }
+
+        Ok(report)
+    }
 }
 
 /// Returns the schema ids that apply to one entity.
@@ -3424,6 +4447,14 @@ fn attribute_json(value: &AttributeValue) -> Result<serde_json::Value, EntityErr
 /// The key for one pending outbox event.
 fn outbox_key(event_id: &str) -> String {
     format!("{OUTBOX_PREFIX}{event_id}")
+}
+
+/// The key for one pending timer outbox event.
+///
+/// A fresh UUID v7 keeps the key time-ordered.
+/// An entity row and a timer row then deliver in insert order.
+fn timer_outbox_key() -> String {
+    outbox_key(&uuid::Uuid::now_v7().to_string())
 }
 
 /// The key for one outbox row that no consumer can decode.
@@ -3732,21 +4763,22 @@ fn revalidation_failure(error: EntityError) -> RevalidationFailure {
 
 /// Records the unique values of one candidate entity.
 ///
-/// The call uses `seen` to detect a duplicate across one page.
+/// The call uses `seen` to detect a duplicate across one page or one dry-run
+/// pass.
 /// A duplicate leaves `seen` unchanged.
 fn note_unique_values(
     attributes: &BTreeMap<String, AttributeValue>,
     defs: &BTreeMap<String, AttributeDef>,
-    seen: &mut BTreeSet<(String, String)>,
+    seen: &mut BTreeSet<(String, String, String)>,
 ) -> Result<Option<RevalidationIssue>, EntityError> {
-    let mut values: Vec<(String, String)> = Vec::new();
+    let mut values: Vec<(String, String, String)> = Vec::new();
     for (key, value) in attributes {
         if !defs.get(key).is_some_and(|def| def.unique) {
             continue;
         }
-        values.push((key.clone(), value_hash(value)?));
+        values.push((key.clone(), value_hash(value)?, value_fingerprint(value)?));
     }
-    if let Some((key, _)) = values.iter().find(|value| seen.contains(*value)) {
+    if let Some((key, _, _)) = values.iter().find(|value| seen.contains(*value)) {
         return Ok(Some(RevalidationIssue::DuplicateUnique(key.clone())));
     }
     seen.extend(values);
@@ -3783,7 +4815,8 @@ where
 /// An entity that holds the same value is idempotent.
 /// A claim that names another entity is a violation only when the exact
 /// stored value is the same.
-/// The call also checks the collision claims and the legacy markers.
+/// The call also checks the legacy primary claim, the collision claims, and
+/// the legacy markers.
 async fn check_unique<S>(
     store: &S,
     entity_id: &str,
@@ -3794,8 +4827,19 @@ where
     S: GetSet + ?Sized + Sync,
 {
     let hash = value_hash(value)?;
-    let claim = unique_claim_key(key, &hash);
+    let fingerprint = value_fingerprint(value)?;
+    let claim = unique_claim_key(key, &hash, &fingerprint);
     if let Some(bytes) = store.get_bytes(&claim).await.map_err(EntityError::Store)?
+        && let Some(owner) = claim_owner(&bytes)
+        && owner != entity_id
+    {
+        check_unique_owner(store, owner, key, value).await?;
+    }
+    let legacy_primary = unique_legacy_primary_key(key, &hash);
+    if let Some(bytes) = store
+        .get_bytes(&legacy_primary)
+        .await
+        .map_err(EntityError::Store)?
         && let Some(owner) = claim_owner(&bytes)
         && owner != entity_id
     {
@@ -3873,31 +4917,41 @@ fn meta_bytes(entity: &Entity) -> Result<Vec<u8>, EntityError> {
     serde_json::to_vec(&meta).map_err(|e| EntityError::Internal(e.to_string()))
 }
 
-/// Writes the metadata row of one entity.
+/// Replaces the metadata row of one entity with a compare-and-set.
 ///
+/// The expected value is the metadata row of `before`.
+/// A concurrent update changes that row, so the commit fails with a version
+/// conflict.
 /// The call changes no attribute row and no index row.
-async fn put_meta_row<S>(store: &S, entity: &Entity) -> Result<(), EntityError>
+async fn put_meta_row<S>(store: &S, before: &Entity, after: &Entity) -> Result<(), EntityError>
 where
-    S: GetSet + ?Sized,
+    S: TxCas + ?Sized,
 {
-    let meta_bytes = meta_bytes(entity)?;
+    let expected = meta_bytes(before)?;
+    let bytes = meta_bytes(after)?;
     store
-        .set_bytes(&meta_key(&entity.id), &meta_bytes)
+        .compare_and_set(&meta_key(&after.id), Some(&expected), &bytes)
         .await
-        .map(|_| ())
         .map_err(EntityError::Store)
 }
 
 /// Writes the attribute and index rows of one entity.
 ///
 /// The caller writes the metadata row.
+/// `before` holds the stored state, or `None` for a create.
 /// The call uses the name-level facts, so a schema that does not set a flag
 /// still writes the row when another schema sets it.
 /// The call stages one unique claim for each unique value.
-/// A time row holds the causation of the write.
+/// A new time row holds the causation of the write.
+/// The call writes a time row only when the timestamp value changed or the
+/// row is absent.
+/// An absent row is written, so a schema that adds the index repairs the
+/// entity.
+/// An unrelated update keeps the stored time row and its causation.
 /// A write with no cause stores an empty causation value.
 async fn put_entity_rows_except_meta<S>(
     store: &S,
+    before: Option<&Entity>,
     entity: &Entity,
     merged: &MergedSchema,
     facts: &NameFacts,
@@ -3938,11 +4992,23 @@ where
             && indexed
             && let AttributeValue::Timestamp(timestamp) = value
         {
-            let marker = time_marker_bytes(causation)?;
-            store
-                .set_bytes(&time_index_key(key, *timestamp, &entity.id), &marker)
-                .await
-                .map_err(EntityError::Store)?;
+            let row_key = time_index_key(key, *timestamp, &entity.id);
+            let unchanged = before.and_then(|before| before.attributes.get(key)) == Some(value);
+            let stored = if unchanged {
+                store
+                    .get_bytes(&row_key)
+                    .await
+                    .map_err(EntityError::Store)?
+            } else {
+                None
+            };
+            if !unchanged || stored.is_none() {
+                let marker = time_marker_bytes(causation)?;
+                store
+                    .set_bytes(&row_key, &marker)
+                    .await
+                    .map_err(EntityError::Store)?;
+            }
             store
                 .set_bytes(&time_key_index_key(key), b"")
                 .await
@@ -3969,10 +5035,11 @@ where
 
 /// Stages the unique claim of one value.
 ///
-/// The call requires the claim to be absent at commit, so two handles that
-/// write the same value produce one success and one conflict.
+/// The call requires the primary claim to be absent at commit, so two handles
+/// that write the same exact value produce one success and one conflict.
 /// A claim key that this transaction released uses an unconditional write.
-/// A hash collision uses a second claim key that holds the entity id.
+/// A value that shares both claim hashes with another value uses a second
+/// claim key that holds the entity id.
 async fn claim_unique<S>(
     store: &S,
     entity: &Entity,
@@ -3984,7 +5051,8 @@ where
     S: TxCas + ?Sized,
 {
     let hash = value_hash(value)?;
-    let claim = unique_claim_key(key, &hash);
+    let fingerprint = value_fingerprint(value)?;
+    let claim = unique_claim_key(key, &hash, &fingerprint);
     let owner = entity.id.as_bytes();
     let current = store.get_bytes(&claim).await.map_err(EntityError::Store)?;
     match current.as_deref().and_then(claim_owner) {
@@ -4012,6 +5080,8 @@ where
             }
         }
         Some(owner_id) => {
+            // Two different values can share both claim hashes only with two
+            // deliberate collisions. The exact-value check keeps them apart.
             check_unique_owner(store, owner_id, key, value).await?;
             let extra = unique_extra_key(key, &hash, &entity.id);
             if state.released_claims.contains(&extra) {
@@ -4108,19 +5178,22 @@ where
         let def = merged.attributes.get(key);
         let indexed = facts.indexed.contains(key) || def.is_some_and(|def| def.indexed);
         let unique = facts.unique.contains(key) || def.is_some_and(|def| def.unique);
+        let unchanged = after.and_then(|after| after.attributes.get(key)) == Some(value);
         if indexed {
             store
                 .delete(&attr_index_key(key, value, &entity.id)?)
                 .await
                 .map_err(EntityError::Store)?;
         }
-        if indexed && let AttributeValue::Timestamp(timestamp) = value {
+        if indexed
+            && !unchanged
+            && let AttributeValue::Timestamp(timestamp) = value
+        {
             store
                 .delete(&time_index_key(key, *timestamp, &entity.id))
                 .await
                 .map_err(EntityError::Store)?;
         }
-        let unchanged = after.and_then(|after| after.attributes.get(key)) == Some(value);
         if unique && !unchanged {
             release_unique(store, key, value, &entity.id, state).await?;
         }
@@ -4195,6 +5268,74 @@ where
     Ok(sources.len())
 }
 
+/// Reads the distinct source ids of the reverse references to `target_id`.
+///
+/// The call scans the `idx:ref:{target_id}:` family in pages.
+/// It skips the markers of `target_id` itself.
+/// It skips the markers of the `after` source id.
+/// It stops when it holds `take` distinct source ids or the family ends.
+/// The result is sorted by source entity id.
+async fn scan_referrer_sources<S>(
+    store: &S,
+    target_id: &str,
+    after: Option<&str>,
+    take: usize,
+) -> Result<Vec<String>, EntityError>
+where
+    S: GetSet + ?Sized + Sync,
+{
+    if take == 0 {
+        return Ok(Vec::new());
+    }
+    let prefix = ref_target_prefix(target_id);
+    let end = KeyPrefix::new(&prefix).upper_bound();
+    let mut start = match after {
+        Some(cursor) => {
+            validate_name("entity id", cursor)?;
+            format!("{prefix}{cursor}\0")
+        }
+        None => prefix.clone(),
+    };
+    let mut sources = Vec::new();
+    let mut seen = BTreeSet::new();
+    loop {
+        let rows = store
+            .gets_keys(
+                Some(REF_SCAN_PAGE),
+                Direction::Next,
+                (Some(start.clone()), end.clone()),
+            )
+            .await
+            .map_err(EntityError::Store)?;
+        let full = rows.len() == REF_SCAN_PAGE;
+        for marker in &rows {
+            start = format!("{marker}\0");
+            let Some(rest) = marker.strip_prefix(&prefix) else {
+                continue;
+            };
+            let Some((source, attribute)) = rest.split_once(':') else {
+                continue;
+            };
+            if source.is_empty() || attribute.is_empty() || source == target_id {
+                continue;
+            }
+            if after == Some(source) {
+                continue;
+            }
+            if seen.insert(source.to_string()) {
+                sources.push(source.to_string());
+                if sources.len() == take {
+                    return Ok(sources);
+                }
+            }
+        }
+        if !full {
+            break;
+        }
+    }
+    Ok(sources)
+}
+
 /// Deletes the timer markers of timestamp values that changed.
 ///
 /// A removed attribute also counts as a change.
@@ -4253,7 +5394,8 @@ where
 
 /// Releases the unique claim of one value.
 ///
-/// The call deletes the primary claim only when this entity owns it.
+/// The call deletes the exact claim and the legacy primary claim only when
+/// this entity owns them.
 /// It deletes the collision claim and the legacy marker of this entity.
 /// The transaction remembers each deleted claim key, so a later claim in the
 /// same plan writes it without a guard.
@@ -4268,7 +5410,8 @@ where
     S: GetSet + ?Sized,
 {
     let hash = value_hash(value)?;
-    let claim = unique_claim_key(key, &hash);
+    let fingerprint = value_fingerprint(value)?;
+    let claim = unique_claim_key(key, &hash, &fingerprint);
     let owned = store
         .get_bytes(&claim)
         .await
@@ -4279,6 +5422,21 @@ where
     if owned {
         store.delete(&claim).await.map_err(EntityError::Store)?;
         state.released_claims.insert(claim);
+    }
+    let legacy_primary = unique_legacy_primary_key(key, &hash);
+    let legacy_owned = store
+        .get_bytes(&legacy_primary)
+        .await
+        .map_err(EntityError::Store)?
+        .as_deref()
+        .and_then(claim_owner)
+        == Some(entity_id);
+    if legacy_owned {
+        store
+            .delete(&legacy_primary)
+            .await
+            .map_err(EntityError::Store)?;
+        state.released_claims.insert(legacy_primary);
     }
     let extra = unique_extra_key(key, &hash, entity_id);
     if store
@@ -4515,15 +5673,22 @@ pub(crate) fn unique_name_key(key: &str) -> String {
     format!("{UNIQUE_KEY_PREFIX}{key}")
 }
 
-/// The claim key for one unique attribute value.
+/// The exact claim key for one unique attribute value.
 ///
-/// The key holds no entity id, so two writers of one value contend for one
-/// key.
-fn unique_claim_key(key: &str, hash: &str) -> String {
+/// The key holds two hashes of the canonical value, so two values that share
+/// one hash use different keys.
+/// The key holds no entity id, so two writers of one exact value contend for
+/// one key.
+fn unique_claim_key(key: &str, hash: &str, fingerprint: &str) -> String {
+    format!("{UNIQUE_EXACT_PREFIX}{key}:{hash}:{fingerprint}")
+}
+
+/// The legacy primary claim key for one unique attribute value.
+fn unique_legacy_primary_key(key: &str, hash: &str) -> String {
     format!("{UNIQUE_CLAIM_PREFIX}{key}:{hash}")
 }
 
-/// The claim key for one hash collision and entity.
+/// The claim key for one double hash collision and entity.
 fn unique_extra_key(key: &str, hash: &str, entity_id: &str) -> String {
     format!("{UNIQUE_EXTRA_PREFIX}{key}:{hash}:{entity_id}")
 }
@@ -4654,14 +5819,69 @@ fn is_time_attribute(def: &AttributeDef) -> bool {
 /// Returns the lowercase SHA-256 hex of the canonical tagged JSON value.
 fn value_hash(value: &AttributeValue) -> Result<String, EntityError> {
     let bytes = serde_json::to_vec(value).map_err(|e| EntityError::Internal(e.to_string()))?;
-    let digest = Sha256::digest(&bytes);
+    #[cfg(test)]
+    if let Some(hash) = forced_value_hash(&bytes) {
+        return Ok(hash);
+    }
+    Ok(hex_digest(&Sha256::digest(&bytes)))
+}
+
+/// Returns the first 32 bytes of SHA-512 of the canonical tagged JSON value,
+/// as lowercase hex.
+///
+/// The fingerprint is independent from [`value_hash`].
+/// The unique claim key holds both hashes, so two values that share one hash
+/// still use different claim keys.
+fn value_fingerprint(value: &AttributeValue) -> Result<String, EntityError> {
+    let bytes = serde_json::to_vec(value).map_err(|e| EntityError::Internal(e.to_string()))?;
+    let digest = Sha512::digest(&bytes);
+    let first = &digest[..32];
+    Ok(hex_digest(first))
+}
+
+/// Returns the lowercase hex form of a digest.
+fn hex_digest(digest: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(64);
+    let mut out = String::with_capacity(digest.len() * 2);
     for byte in digest {
         out.push(HEX[(byte >> 4) as usize] as char);
         out.push(HEX[(byte & 0x0f) as usize] as char);
     }
-    Ok(out)
+    out
+}
+
+// The test-only SHA-256 overrides of one thread.
+#[cfg(test)]
+thread_local! {
+    /// Maps canonical value bytes to a forced SHA-256 hash.
+    static FORCED_VALUE_HASHES: std::cell::RefCell<BTreeMap<Vec<u8>, String>> =
+        const { std::cell::RefCell::new(BTreeMap::new()) };
+}
+/// Forces one SHA-256 hash for each value in a test.
+///
+/// The test uses the helper to inject two values that share one hash without
+/// a real SHA-256 collision.
+#[cfg(test)]
+fn force_equal_value_hash(values: &[&AttributeValue], hash: &str) {
+    FORCED_VALUE_HASHES.with(|overrides| {
+        let mut overrides = overrides.borrow_mut();
+        for value in values {
+            let bytes = serde_json::to_vec(value).unwrap();
+            overrides.insert(bytes, hash.to_string());
+        }
+    });
+}
+
+/// Reads a forced SHA-256 hash for one canonical value in a test.
+#[cfg(test)]
+fn forced_value_hash(bytes: &[u8]) -> Option<String> {
+    FORCED_VALUE_HASHES.with(|overrides| overrides.borrow().get(bytes).cloned())
+}
+
+/// Clears every forced SHA-256 hash of one thread in a test.
+#[cfg(test)]
+fn clear_forced_value_hashes() {
+    FORCED_VALUE_HASHES.with(|overrides| overrides.borrow_mut().clear());
 }
 
 /// Maps a schema registry error into an entity error.
@@ -4719,6 +5939,7 @@ pub(crate) fn validate_name(kind: &str, value: &str) -> Result<(), EntityError> 
 mod tests {
     use super::*;
     use crate::db::{build_test_store, test_prefix};
+    use crate::eav::metrics::test_support::MetricCapture;
     use crate::eav::schema::SchemaDraft;
     use std::sync::atomic::Ordering;
 
@@ -4728,6 +5949,57 @@ mod tests {
         let raw = build_test_store(&test_prefix("eav-store")).await;
         let store = EntityStore::new(raw.clone(), registry.clone());
         (store, registry, raw)
+    }
+
+    /// A committed write, a delete, and each conflict kind increment one
+    /// counter.
+    #[tokio::test]
+    async fn the_store_records_write_delete_and_conflict_counters() {
+        let (store, registry, _raw) = new_store().await;
+        let (metrics, capture) = MetricCapture::new();
+        let store = store.with_metrics(metrics);
+        registry
+            .publish(schema(
+                "person",
+                &[],
+                vec![
+                    attr("name", AttributeType::String),
+                    full_attr("email", AttributeType::String, false, true, true, None),
+                ],
+            ))
+            .await
+            .unwrap();
+
+        let first = draft(
+            "p1",
+            &["person"],
+            vec![("name", s("Alice")), ("email", s("a@example.com"))],
+        );
+        store.create(first, &ctx()).await.unwrap();
+        let duplicate = draft(
+            "p2",
+            &["person"],
+            vec![("name", s("Bob")), ("email", s("a@example.com"))],
+        );
+        let error = store.create(duplicate, &ctx()).await.unwrap_err();
+        assert!(matches!(error, EntityError::UniqueViolation(_)));
+
+        let error = store
+            .update("p1", 9, patch(vec![("name", Some(s("Alice Two")))]), &ctx())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, EntityError::VersionConflict));
+
+        store
+            .update("p1", 1, patch(vec![("name", Some(s("Alice Two")))]), &ctx())
+            .await
+            .unwrap();
+        store.delete("p1", 2, false, &ctx()).await.unwrap();
+
+        assert_eq!(capture.counter("eav.entity.writes"), 2);
+        assert_eq!(capture.counter("eav.entity.deletes"), 1);
+        assert_eq!(capture.counter("eav.entity.version_conflicts"), 1);
+        assert_eq!(capture.counter("eav.entity.unique_conflicts"), 1);
     }
 
     fn attr(name: &str, ty: AttributeType) -> AttributeDef {
@@ -4877,6 +6149,21 @@ mod tests {
             .await
             .unwrap()
             .map(|bytes| serde_json::from_slice(&bytes).unwrap())
+    }
+
+    /// Reads the stored causation of one time row.
+    async fn stored_time_causation(
+        store: &OxKvStore,
+        key: &str,
+        timestamp: i64,
+        entity_id: &str,
+    ) -> TimeMarkerCausation {
+        let bytes = store
+            .get_bytes(&time_index_key(key, timestamp, entity_id))
+            .await
+            .unwrap()
+            .expect("the time row must exist");
+        decode_time_marker(Some(&bytes))
     }
 
     fn tagged(value: &AttributeValue) -> serde_json::Value {
@@ -6526,6 +7813,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_by_schema_page_rejects_an_offset_above_the_maximum() {
+        let (store, registry, _raw) = new_store().await;
+        registry.publish(schema("task", &[], vec![])).await.unwrap();
+
+        let result = store
+            .list_by_schema_page("task", 1, MAX_PAGE_OFFSET + 1)
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(EntityError::Invalid(message))
+                if message
+                    == format!(
+                        "offset must be at most {MAX_PAGE_OFFSET}. Use after to page deeper."
+                    )
+        ));
+        assert!(
+            store
+                .list_by_schema_page("task", 1, MAX_PAGE_OFFSET)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
     async fn list_by_schema_after_skips_exactly_the_cursor_and_returns_no_cursor() {
         let (store, registry, _raw) = new_store().await;
         registry.publish(schema("task", &[], vec![])).await.unwrap();
@@ -6852,6 +8165,7 @@ mod tests {
             .await
             .unwrap();
         let old_hash = value_hash(&s("a@example.com")).unwrap();
+        let old_fingerprint = value_fingerprint(&s("a@example.com")).unwrap();
         // Simulate a collision: `b` also claims the hash of the value of `a`.
         // The exact value of `b` is different, so the claim does not block a
         // different value.
@@ -6868,7 +8182,7 @@ mod tests {
             .await;
         assert!(matches!(duplicate, Err(EntityError::UniqueViolation(key)) if key == "email"));
         let claim_a = raw
-            .get_bytes(&unique_claim_key("email", &old_hash))
+            .get_bytes(&unique_claim_key("email", &old_hash, &old_fingerprint))
             .await
             .unwrap();
         assert_eq!(claim_a.as_deref(), Some(b"a".as_slice()));
@@ -6893,12 +8207,13 @@ mod tests {
             .unwrap();
 
         let new_hash = value_hash(&s("new@example.com")).unwrap();
+        let new_fingerprint = value_fingerprint(&s("new@example.com")).unwrap();
         let claim_new = raw
-            .get_bytes(&unique_claim_key("email", &new_hash))
+            .get_bytes(&unique_claim_key("email", &new_hash, &new_fingerprint))
             .await
             .unwrap();
         let claim_old = raw
-            .get_bytes(&unique_claim_key("email", &old_hash))
+            .get_bytes(&unique_claim_key("email", &old_hash, &old_fingerprint))
             .await
             .unwrap();
         let extra_b = raw
@@ -6908,6 +8223,12 @@ mod tests {
         assert_eq!(claim_new.as_deref(), Some(b"a".as_slice()));
         assert_eq!(claim_old.as_deref(), Some(b"c".as_slice()));
         assert_eq!(extra_b.as_deref(), Some(b"b".as_slice()));
+        assert!(
+            raw.get_bytes(&unique_legacy_primary_key("email", &old_hash))
+                .await
+                .unwrap()
+                .is_none()
+        );
 
         let result = store
             .create(
@@ -7098,6 +8419,131 @@ mod tests {
             )
             .await;
         assert!(matches!(result, Err(EntityError::UniqueViolation(_))));
+    }
+
+    #[tokio::test]
+    async fn two_values_that_share_a_hash_keep_separate_unique_claims() {
+        let (store, registry, raw) = new_store().await;
+        registry
+            .publish(schema(
+                "person",
+                &[],
+                vec![full_attr(
+                    "email",
+                    AttributeType::String,
+                    false,
+                    false,
+                    true,
+                    None,
+                )],
+            ))
+            .await
+            .unwrap();
+        let first = s("a@example.com");
+        let second = s("b@example.com");
+        let forced = "0".repeat(64);
+        clear_forced_value_hashes();
+        force_equal_value_hash(&[&first, &second], &forced);
+
+        store
+            .create(
+                draft("e1", &["person"], vec![("email", first.clone())]),
+                &ctx(),
+            )
+            .await
+            .unwrap();
+        store
+            .create(
+                draft("e2", &["person"], vec![("email", second.clone())]),
+                &ctx(),
+            )
+            .await
+            .unwrap();
+
+        let first_hash = value_hash(&first).unwrap();
+        let second_hash = value_hash(&second).unwrap();
+        let first_fingerprint = value_fingerprint(&first).unwrap();
+        let second_fingerprint = value_fingerprint(&second).unwrap();
+        assert_eq!(first_hash, forced);
+        assert_eq!(second_hash, forced);
+        assert_ne!(first_fingerprint, second_fingerprint);
+        assert_eq!(
+            raw.get_bytes(&unique_claim_key("email", &first_hash, &first_fingerprint))
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(b"e1".as_slice())
+        );
+        assert_eq!(
+            raw.get_bytes(&unique_claim_key(
+                "email",
+                &second_hash,
+                &second_fingerprint
+            ))
+            .await
+            .unwrap()
+            .as_deref(),
+            Some(b"e2".as_slice())
+        );
+        assert!(
+            raw.get_bytes(&unique_legacy_primary_key("email", &forced))
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        for value in [first, second] {
+            let duplicate = store
+                .create(draft("e3", &["person"], vec![("email", value)]), &ctx())
+                .await;
+            assert!(matches!(duplicate, Err(EntityError::UniqueViolation(key)) if key == "email"));
+        }
+        assert!(store.get("e3").await.unwrap().is_none());
+        clear_forced_value_hashes();
+    }
+
+    #[tokio::test]
+    async fn two_concurrent_creates_with_one_value_hash_both_commit() {
+        let (store, registry, raw) = new_store().await;
+        registry
+            .publish(schema(
+                "person",
+                &[],
+                vec![full_attr(
+                    "email",
+                    AttributeType::String,
+                    false,
+                    false,
+                    true,
+                    None,
+                )],
+            ))
+            .await
+            .unwrap();
+        let other = EntityStore::new(raw.clone(), registry.clone());
+        let first = s("a@example.com");
+        let second = s("b@example.com");
+        let forced = "0".repeat(64);
+        clear_forced_value_hashes();
+        force_equal_value_hash(&[&first, &second], &forced);
+        let write = ctx();
+
+        let (left, right) = tokio::join!(
+            store.create(
+                draft("e1", &["person"], vec![("email", first.clone())]),
+                &write
+            ),
+            other.create(
+                draft("e2", &["person"], vec![("email", second.clone())]),
+                &write
+            ),
+        );
+
+        clear_forced_value_hashes();
+        assert!(left.is_ok(), "left: {left:?}");
+        assert!(right.is_ok(), "right: {right:?}");
+        assert!(store.get("e1").await.unwrap().is_some());
+        assert!(store.get("e2").await.unwrap().is_some());
     }
 
     #[tokio::test]
@@ -7682,6 +9128,39 @@ mod tests {
         feed.set_failing(false);
         assert_eq!(store.flush_outbox().await.unwrap(), 3);
         assert_eq!(store.outbox_count().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn outbox_pending_age_reports_the_oldest_row() {
+        let (store, registry, raw) = new_store().await;
+        registry
+            .publish(schema("person", &[], vec![]))
+            .await
+            .unwrap();
+        let feed = Arc::new(RecordingFeed::new());
+        feed.set_failing(true);
+        let store = store.with_change_sink(feed);
+        store
+            .create(draft("e1", &["person"], vec![]), &ctx())
+            .await
+            .unwrap();
+
+        let keys = outbox_keys(&raw).await;
+        assert_eq!(keys.len(), 1);
+        let mut event: EntityEvent =
+            serde_json::from_slice(&raw.get_bytes(&keys[0]).await.unwrap().expect("outbox row"))
+                .unwrap();
+        event.occurred_at = chrono::Utc::now().timestamp() - 120;
+        raw.set_bytes(&keys[0], &serde_json::to_vec(&event).unwrap())
+            .await
+            .unwrap();
+
+        let age = store
+            .outbox_pending_age()
+            .await
+            .unwrap()
+            .expect("a pending row has an age");
+        assert!(age.as_secs() >= 120, "oldest row age was {age:?}");
     }
 
     #[tokio::test]
@@ -8559,7 +10038,11 @@ mod tests {
             .after
             .unwrap();
 
-        let event = store.emit_timer(&entity, "due", 100, 1_234).await.unwrap();
+        let event = store
+            .emit_timer(&entity, "due", 100, 1_234)
+            .await
+            .unwrap()
+            .expect("the first timer emit must produce an event");
 
         assert_eq!(event.kind, EntityEventKind::Timer);
         assert_eq!(event.entity_id, "e1");
@@ -8584,7 +10067,9 @@ mod tests {
         assert!(outbox_keys(&raw).await.is_empty());
 
         let again = store.emit_timer(&entity, "due", 100, 1_234).await.unwrap();
-        assert_eq!(again.event_id, event.event_id);
+        assert!(again.is_none(), "a fired timer must not emit again");
+        assert_eq!(feed.events().len(), 2);
+        assert!(outbox_keys(&raw).await.is_empty());
     }
 
     #[tokio::test]
@@ -8607,7 +10092,11 @@ mod tests {
             .unwrap();
         let entity = changed.after.unwrap();
 
-        let event = store.emit_timer(&entity, "due", 200, 1_234).await.unwrap();
+        let event = store
+            .emit_timer(&entity, "due", 200, 1_234)
+            .await
+            .unwrap()
+            .expect("the timer emit must produce an event");
 
         assert_eq!(event.causation_id.as_deref(), Some("evt-parent"));
         assert_eq!(event.causation_depth, 5);
@@ -8626,7 +10115,11 @@ mod tests {
             .await
             .unwrap();
 
-        let event = store.emit_timer(&entity, "due", 100, 1_234).await.unwrap();
+        let event = store
+            .emit_timer(&entity, "due", 100, 1_234)
+            .await
+            .unwrap()
+            .expect("the timer emit must produce an event");
 
         assert_eq!(event.causation_id, None);
         assert_eq!(event.causation_depth, 0);
@@ -8641,7 +10134,11 @@ mod tests {
             .unwrap()
             .after
             .unwrap();
-        let first = store.emit_timer(&entity, "due", 100, 1_234).await.unwrap();
+        let first = store
+            .emit_timer(&entity, "due", 100, 1_234)
+            .await
+            .unwrap()
+            .expect("the first timer emit must produce an event");
 
         let changed = store
             .update(
@@ -8654,7 +10151,11 @@ mod tests {
             .await
             .unwrap();
         let entity = changed.after.unwrap();
-        let second = store.emit_timer(&entity, "due", 200, 1_235).await.unwrap();
+        let second = store
+            .emit_timer(&entity, "due", 200, 1_235)
+            .await
+            .unwrap()
+            .expect("the second timer emit must produce an event");
 
         let changed = store
             .update(
@@ -8667,7 +10168,11 @@ mod tests {
             .await
             .unwrap();
         let entity = changed.after.unwrap();
-        let third = store.emit_timer(&entity, "due", 300, 1_236).await.unwrap();
+        let third = store
+            .emit_timer(&entity, "due", 300, 1_236)
+            .await
+            .unwrap()
+            .expect("the third timer emit must produce an event");
 
         assert_eq!(first.causation_depth, 0);
         assert_eq!(second.causation_depth, 1);
@@ -8895,6 +10400,67 @@ mod tests {
         // A delete removes every marker of the entity.
         store.delete("e1", 3, false, &ctx()).await.unwrap();
         assert!(!store.is_timer_fired("e1", "due", 200).await.unwrap());
+    }
+
+    /// An update that does not change the timestamp keeps the stored cause.
+    #[tokio::test]
+    async fn an_unrelated_update_keeps_the_time_row_causation() {
+        let (store, raw) = timer_store().await;
+        store
+            .create(
+                draft("e1", &["task"], vec![("due", t(100)), ("title", s("one"))]),
+                &WriteContext::new("tester").with_causation("evt-created", 2),
+            )
+            .await
+            .unwrap();
+
+        store
+            .update(
+                "e1",
+                1,
+                patch(vec![("title", Some(s("two")))]),
+                &WriteContext::new("tester").with_causation("evt-unrelated", 5),
+            )
+            .await
+            .unwrap();
+
+        let marker = stored_time_causation(&raw, "due", 100, "e1").await;
+        assert_eq!(marker.causation_id.as_deref(), Some("evt-created"));
+        assert_eq!(marker.causation_depth, 2);
+    }
+
+    /// A timestamp update stores the new cause in the new time row.
+    #[tokio::test]
+    async fn a_timestamp_update_stores_the_new_time_row_causation() {
+        let (store, raw) = timer_store().await;
+        store
+            .create(
+                draft("e1", &["task"], vec![("due", t(100))]),
+                &WriteContext::new("tester").with_causation("evt-created", 2),
+            )
+            .await
+            .unwrap();
+
+        store
+            .update(
+                "e1",
+                1,
+                patch(vec![("due", Some(t(200)))]),
+                &WriteContext::new("tester").with_causation("evt-updated", 4),
+            )
+            .await
+            .unwrap();
+
+        let marker = stored_time_causation(&raw, "due", 200, "e1").await;
+        assert_eq!(marker.causation_id.as_deref(), Some("evt-updated"));
+        assert_eq!(marker.causation_depth, 4);
+        assert!(
+            raw.get_bytes(&time_index_key("due", 100, "e1"))
+                .await
+                .unwrap()
+                .is_none(),
+            "the old time row must be removed"
+        );
     }
 
     #[tokio::test]
@@ -9413,6 +10979,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_duplicate_unique_value_across_two_pages_fails_both_dry_runs_and_the_apply() {
+        let (store, registry, _raw) = new_store().await;
+        registry
+            .publish(schema(
+                "task",
+                &[],
+                vec![attr("tag", AttributeType::String)],
+            ))
+            .await
+            .unwrap();
+        for id in ["a", "b"] {
+            store
+                .create(draft(id, &["task"], vec![("tag", s("alpha"))]), &ctx())
+                .await
+                .unwrap();
+        }
+        registry
+            .publish(schema(
+                "task",
+                &[],
+                vec![full_attr(
+                    "tag",
+                    AttributeType::String,
+                    false,
+                    false,
+                    true,
+                    None,
+                )],
+            ))
+            .await
+            .unwrap();
+
+        let revalidation_first = store.revalidation_report("task", 2, 1, None).await.unwrap();
+        assert_eq!(revalidation_first.scanned, 1);
+        assert_eq!(revalidation_first.compatible, 1);
+        assert!(revalidation_first.invalid.is_empty());
+        let revalidation_second = store
+            .revalidation_report("task", 2, 1, revalidation_first.next.as_deref())
+            .await
+            .unwrap();
+        assert_eq!(revalidation_second.scanned, 1);
+        assert_eq!(revalidation_second.compatible, 0);
+        assert_eq!(revalidation_second.invalid.len(), 1);
+        assert_eq!(revalidation_second.invalid[0].entity_id, "b");
+        assert_eq!(
+            revalidation_second.invalid[0].issue,
+            RevalidationIssue::DuplicateUnique("tag".to_string())
+        );
+
+        let dry_first = store
+            .migrate_schema("task", 2, 1, None, true, &ctx())
+            .await
+            .unwrap();
+        assert_eq!(dry_first.scanned, 1);
+        assert_eq!(dry_first.migrated, 1);
+        assert!(dry_first.invalid.is_empty());
+        assert_eq!(dry_first.next.as_deref(), Some("a"));
+        let dry_second = store
+            .migrate_schema("task", 2, 1, dry_first.next.as_deref(), true, &ctx())
+            .await
+            .unwrap();
+        assert_eq!(dry_second.scanned, 1);
+        assert_eq!(dry_second.migrated, 0);
+        assert_eq!(dry_second.invalid.len(), 1);
+        assert_eq!(dry_second.invalid[0].entity_id, "b");
+        assert_eq!(
+            dry_second.invalid[0].issue,
+            RevalidationIssue::DuplicateUnique("tag".to_string())
+        );
+        assert_eq!(dry_second.invalid, revalidation_second.invalid);
+
+        let apply_first = store
+            .migrate_schema("task", 2, 1, None, false, &ctx())
+            .await
+            .unwrap();
+        assert_eq!(apply_first.scanned, 1);
+        assert_eq!(apply_first.migrated, 1);
+        assert!(apply_first.invalid.is_empty());
+        let apply_second = store
+            .migrate_schema("task", 2, 1, apply_first.next.as_deref(), false, &ctx())
+            .await
+            .unwrap();
+        assert_eq!(apply_second.scanned, 1);
+        assert_eq!(apply_second.migrated, 0);
+        assert_eq!(apply_second.invalid, dry_second.invalid);
+
+        assert_eq!(store.get("a").await.unwrap().unwrap().version, 2);
+        assert_eq!(store.get("b").await.unwrap().unwrap().version, 1);
+    }
+
+    #[tokio::test]
     async fn a_migration_counts_an_entity_that_already_pins_the_target_as_unchanged() {
         let (store, registry, _raw) = new_store().await;
         registry
@@ -9653,6 +11310,55 @@ mod tests {
         assert_eq!(entity.version, 2);
         assert_eq!(entity.schemas[0].version, 1);
         assert_eq!(entity.attributes["title"], s("two"));
+    }
+
+    #[tokio::test]
+    async fn a_concurrent_update_between_the_migration_read_and_commit_is_a_version_conflict() {
+        let (store, registry, raw) = new_store().await;
+        registry
+            .publish(schema(
+                "task",
+                &[],
+                vec![attr("title", AttributeType::String)],
+            ))
+            .await
+            .unwrap();
+        store
+            .create(draft("e1", &["task"], vec![("title", s("one"))]), &ctx())
+            .await
+            .unwrap();
+        registry
+            .publish(schema(
+                "task",
+                &[],
+                vec![
+                    attr("title", AttributeType::String),
+                    attr("note", AttributeType::String),
+                ],
+            ))
+            .await
+            .unwrap();
+        let other = EntityStore::new(raw.clone(), registry.clone());
+        store.set_migration_commit_hook(Some(Arc::new(move || {
+            let other = other.clone();
+            Box::pin(async move {
+                other
+                    .update("e1", 1, patch(vec![("title", Some(s("two")))]), &ctx())
+                    .await
+                    .unwrap();
+            })
+        })));
+
+        let result = store
+            .migrate_schema("task", 2, 100, None, false, &ctx())
+            .await;
+
+        assert!(matches!(result, Err(EntityError::VersionConflict)));
+        let entity = store.get("e1").await.unwrap().unwrap();
+        assert_eq!(entity.version, 2);
+        assert_eq!(entity.schemas[0].version, 1);
+        assert_eq!(entity.attributes["title"], s("two"));
+        assert!(!entity.attributes.contains_key("note"));
     }
 
     #[tokio::test]
@@ -10354,6 +12060,62 @@ mod tests {
             matches!(error, EntityError::Referenced { count: 3, .. }),
             "unexpected error: {error}"
         );
+    }
+
+    #[tokio::test]
+    async fn referrer_list_excludes_the_target_and_lists_each_source_once() {
+        let (store, _, _) = reference_store(false).await;
+        store.create(customer("c1"), &ctx()).await.unwrap();
+        store.create(order("o1", "c1"), &ctx()).await.unwrap();
+        store.create(order("o2", "c1"), &ctx()).await.unwrap();
+        store.create(order("s1", "s1"), &ctx()).await.unwrap();
+
+        let refs = store.list_referrers_page("c1", 10, 0).await.unwrap();
+        let self_refs = store.list_referrers_page("s1", 10, 0).await.unwrap();
+
+        assert_eq!(refs, vec!["o1".to_string(), "o2".to_string()]);
+        assert!(self_refs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn referrer_pages_cross_the_scan_page_and_use_a_cursor() {
+        let (store, _, _) = reference_store(true).await;
+        store.create(customer("c1"), &ctx()).await.unwrap();
+        for id in ["o1", "o2", "o3"] {
+            store.create(order(id, "c1"), &ctx()).await.unwrap();
+        }
+
+        assert_eq!(
+            store.list_referrers_page("c1", 2, 0).await.unwrap(),
+            vec!["o1".to_string(), "o2".to_string()]
+        );
+        assert_eq!(
+            store.list_referrers_page("c1", 2, 2).await.unwrap(),
+            vec!["o3".to_string()]
+        );
+
+        let (first, next) = store.list_referrers_after("c1", 1, None).await.unwrap();
+        assert_eq!(first, vec!["o1".to_string()]);
+        assert_eq!(next.as_deref(), Some("o1"));
+        let (second, next) = store
+            .list_referrers_after("c1", 2, next.as_deref())
+            .await
+            .unwrap();
+        assert_eq!(second, vec!["o2".to_string(), "o3".to_string()]);
+        assert!(next.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_referrer_marker_with_no_source_entity_stays_visible() {
+        let (store, _, raw) = reference_store(true).await;
+        store.create(customer("c1"), &ctx()).await.unwrap();
+        raw.set_bytes(&ref_index_key("c1", "ghost", "customer"), b"")
+            .await
+            .unwrap();
+
+        let refs = store.list_referrers_page("c1", 10, 0).await.unwrap();
+
+        assert_eq!(refs, vec!["ghost".to_string()]);
     }
 
     #[tokio::test]

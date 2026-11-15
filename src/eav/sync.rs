@@ -74,6 +74,7 @@ use actix_web::{
     post, web,
 };
 use serde::Serialize;
+use std::time::Instant;
 
 use crate::eav::entity::Entity;
 use crate::eav::entity_error::EntityError;
@@ -182,7 +183,7 @@ pub struct SnapshotPage {
     /// The value is `Some` only in cursor mode.
     /// The value is the id of the last visible entity.
     /// The value never names an entity that the caller cannot read.
-    /// The value is `None` when the scan is exhausted or the scan budget ends.
+    /// The value is `None` when the scan is exhausted.
     pub next: Option<String>,
     /// The head of the change log at the time of the call.
     ///
@@ -538,7 +539,9 @@ pub(crate) async fn events(
 /// `next_offset` comes from the raw page length.
 /// A filtered page can then hold fewer items than the limit.
 /// A cursor query uses the entity marker family and returns `next`.
-/// The route reads at most `CURSOR_SCAN_BATCH` raw pages for one cursor page.
+/// The route reads raw pages until the page is full or the entity list ends.
+/// A raw page can hold only rows that the caller cannot read, so a fixed raw
+/// page count could miss a later visible row.
 /// The `next` value is the id of the last visible entity.
 /// The value never names an entity that the caller cannot read.
 /// A scan that finds no visible entity returns `next: null`.
@@ -678,6 +681,22 @@ pub(crate) async fn build_replica(
     policy: web::Data<Authorizer>,
     claims: Validated<Claims>,
 ) -> Result<HttpResponse, EavApiError> {
+    let started = Instant::now();
+    let metrics = runtime.metrics().clone();
+    let result = build_replica_inner(runtime, policy, claims).await;
+    match &result {
+        Ok(_) => metrics.record_replica_build(started.elapsed()),
+        Err(_) => metrics.record_replica_build_failure(),
+    }
+    result
+}
+
+/// Builds a stored replica for the caller.
+async fn build_replica_inner(
+    runtime: web::Data<EavRuntime>,
+    policy: web::Data<Authorizer>,
+    claims: Validated<Claims>,
+) -> Result<HttpResponse, EavApiError> {
     #[cfg(test)]
     runtime.replica_test().reset_read();
     let entity_limit = replica_entity_limit(&runtime);
@@ -797,6 +816,9 @@ impl std::error::Error for ReplicaChunkOutOfRange {}
 /// A policy change takes effect on the next read.
 /// Without a `chunk` parameter, the route returns every permitted entity as
 /// one JSON array and sets `X-Replica-Head` and `X-Replica-Generation`.
+/// A full read above `[limits].max_full_replica_bytes` returns `400`.
+/// The client must then use chunk mode.
+/// The value `0` disables the gate.
 /// With `chunk=N`, the route returns one stored chunk and sets
 /// `X-Replica-Head`, `X-Replica-Generation`, `X-Replica-Chunk`, and
 /// `X-Replica-Chunks`.
@@ -822,6 +844,13 @@ pub(crate) async fn replica(
         let Some(stored) = runtime.replicas().get(&claims.sub).await? else {
             return Err(EavApiError::NotFound(Box::new(MissingReplica)));
         };
+        let limit = runtime.full_replica_byte_limit();
+        if limit > 0 {
+            let bytes: usize = stored.chunks.iter().map(Vec::len).sum();
+            if bytes > limit {
+                return Err(EavApiError::ReplicaTooLarge);
+            }
+        }
         let mut items: Vec<Entity> = Vec::new();
         for chunk in stored.chunks {
             items.extend(decode_chunk(&chunk)?);
@@ -889,6 +918,7 @@ mod tests {
     use crate::db::{build_s3_store, build_test_store, test_prefix};
     use crate::docs::ApiDoc;
     use crate::eav::entity::{AttributeValue, EntityDraft};
+    use crate::eav::metrics::test_support::MetricCapture;
     use crate::eav::route::EavApiModule;
     use crate::eav::schema::{AttributeDef, AttributeType, SchemaDraft};
     use crate::fs::s3::{S3Backend, S3ClientConfig};
@@ -1779,6 +1809,46 @@ mod tests {
     }
 
     #[actix_web::test]
+    async fn a_snapshot_scan_reaches_a_visible_row_after_many_invisible_rows() -> anyhow::Result<()>
+    {
+        let fx = fixture().await?;
+        publish_task_schema(&fx).await?;
+        for index in 1..=8 {
+            create_entity(&fx, &format!("n{index:02}")).await?;
+        }
+        create_entity(&fx, "v1").await?;
+        grant_row_read(&fx, "carol", "v1").await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("carol")?;
+
+        let mut ids = Vec::new();
+        let mut after: Option<String> = Some(String::new());
+        loop {
+            let uri = match &after {
+                Some(cursor) => format!("/eav/sync/snapshot?limit=1&after={cursor}"),
+                None => "/eav/sync/snapshot?limit=1".to_string(),
+            };
+            let res = get_route!(&app, &uri, &token).await;
+            assert_eq!(res.status(), http::StatusCode::OK, "{uri}");
+            let body: Value = actix_test::read_body_json(res).await;
+            for item in body["items"].as_array().expect("items") {
+                ids.push(item["id"].as_str().expect("id").to_string());
+            }
+            match body["next"].as_str() {
+                Some(cursor) => {
+                    assert_eq!(cursor, "v1", "the cursor named an unreadable entity");
+                    after = Some(cursor.to_string());
+                }
+                None => break,
+            }
+        }
+
+        assert_eq!(ids, ["v1"]);
+        Ok(())
+    }
+
+    #[actix_web::test]
     async fn a_no_grant_snapshot_cursor_returns_no_entity_id() -> anyhow::Result<()> {
         let fx = fixture().await?;
         publish_task_schema(&fx).await?;
@@ -1983,6 +2053,60 @@ mod tests {
         assert_eq!(items.len(), 2);
         assert_eq!(items[0]["id"], "e1");
         assert_eq!(items[1]["id"], "e2");
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn a_full_replica_read_at_the_size_gate_is_allowed_and_one_byte_over_is_400()
+    -> anyhow::Result<()> {
+        let mut fx = fixture().await?;
+        publish_task_schema(&fx).await?;
+        create_entity(&fx, "e1").await?;
+        create_entity(&fx, "e2").await?;
+        grant_collection_read(&fx, "alice").await?;
+        let (metrics, capture) = MetricCapture::new();
+        fx.runtime = fx.runtime.with_metrics(metrics);
+        let token = fx.token("alice")?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+
+        let res = post_replica!(&app, &token).await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        assert_eq!(capture.counter("eav.replica.builds"), 1);
+        assert_eq!(capture.histogram_count("eav.replica.build_duration"), 1);
+        let stored = fx
+            .runtime
+            .replicas()
+            .get("alice")
+            .await?
+            .expect("stored replica");
+        let bytes: usize = stored.chunks.iter().map(Vec::len).sum();
+        assert!(bytes > 0);
+
+        // A replica that is exactly at the gate is allowed.
+        fx.runtime = fx.runtime.with_full_replica_limit(bytes);
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let res = get_route!(&app, "/eav/sync/replica", &token).await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+
+        // One byte over the gate returns a clear 400 and names chunk mode.
+        fx.runtime = fx.runtime.with_full_replica_limit(bytes - 1);
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let res = get_route!(&app, "/eav/sync/replica", &token).await;
+        assert_eq!(res.status(), http::StatusCode::BAD_REQUEST);
+        let body: crate::http::error::ErrorBody = actix_test::read_body_json(res).await;
+        assert_eq!(body.code.as_deref(), Some("replica_too_large"));
+        assert!(
+            body.error.contains("use chunk mode"),
+            "the 400 must name chunk mode: {}",
+            body.error
+        );
+
+        // Chunk mode stays available.
+        let res = get_route!(&app, "/eav/sync/replica?chunk=0", &token).await;
+        assert_eq!(res.status(), http::StatusCode::OK);
         Ok(())
     }
 

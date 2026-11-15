@@ -53,11 +53,20 @@ impl MemoryQueue {
         chrono::Utc::now().timestamp()
     }
 
+    /// Returns the current time in unix milliseconds.
+    ///
+    /// The lease expiry uses milliseconds, so a lease below one second keeps
+    /// its full duration.
+    fn now_millis() -> i64 {
+        chrono::Utc::now().timestamp_millis()
+    }
+
     fn sweep_expired(state: &mut State) {
         let now = Self::now();
+        let now_millis = Self::now_millis();
         for rec in state.records.values_mut() {
             if let JobStatus::Leased { expires_at, .. } = rec.status
-                && expires_at <= now
+                && expires_at <= now_millis
             {
                 let attempt = rec.job.attempt.saturating_add(1);
                 rec.job.attempt = attempt;
@@ -87,7 +96,7 @@ impl MemoryQueue {
             JobStatus::Leased { worker, expires_at } => {
                 if worker != &lease.worker || rec.lease_generation != lease.generation {
                     Err(QueueError::AlreadyLeased)
-                } else if *expires_at <= Self::now() {
+                } else if *expires_at <= Self::now_millis() {
                     Err(QueueError::LeaseExpired)
                 } else {
                     Ok(())
@@ -151,7 +160,8 @@ impl super::JobQueue for MemoryQueue {
         let mut state = self.state.lock().await;
         Self::sweep_expired(&mut state);
         let now = Self::now();
-        let lease_secs = lease.as_secs() as i64;
+        let now_millis = Self::now_millis();
+        let lease_millis = super::lease_millis(lease);
         let mut candidates: Vec<JobId> = state
             .records
             .iter()
@@ -172,7 +182,7 @@ impl super::JobQueue for MemoryQueue {
             let Some(rec) = state.records.get_mut(&id) else {
                 continue;
             };
-            let expires_at = now + lease_secs;
+            let expires_at = now_millis.saturating_add(lease_millis);
             rec.lease_generation = rec.lease_generation.saturating_add(1);
             let generation = rec.lease_generation;
             rec.status = JobStatus::Leased {
@@ -204,7 +214,10 @@ impl super::JobQueue for MemoryQueue {
             .records
             .get_mut(&job_id)
             .ok_or(QueueError::NotFound(job_id))?;
-        Self::check_lease(rec, lease)?;
+        if let Err(error) = Self::check_lease(rec, lease) {
+            self.metrics.record_lease_lost();
+            return Err(error);
+        }
         let finished = Self::now();
         rec.status = JobStatus::Succeeded {
             result: result.clone(),
@@ -230,7 +243,10 @@ impl super::JobQueue for MemoryQueue {
             .records
             .get_mut(&job_id)
             .ok_or(QueueError::NotFound(job_id))?;
-        Self::check_lease(rec, lease)?;
+        if let Err(error) = Self::check_lease(rec, lease) {
+            self.metrics.record_lease_lost();
+            return Err(error);
+        }
         let finished = Self::now();
         match retry {
             RetryPolicy::NoRetry => {
@@ -281,8 +297,11 @@ impl super::JobQueue for MemoryQueue {
             .records
             .get_mut(&job_id)
             .ok_or(QueueError::NotFound(job_id))?;
-        Self::check_lease(rec, lease)?;
-        let new_expiry = Self::now() + extend.as_secs() as i64;
+        if let Err(error) = Self::check_lease(rec, lease) {
+            self.metrics.record_lease_lost();
+            return Err(error);
+        }
+        let new_expiry = Self::now_millis().saturating_add(super::lease_millis(extend));
         rec.lease_generation = rec.lease_generation.saturating_add(1);
         rec.status = JobStatus::Leased {
             worker: lease.worker.clone(),
@@ -347,6 +366,60 @@ mod tests {
             JobStatus::Leased { worker, .. } => assert_eq!(worker, "w1"),
             other => panic!("expected leased, got {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn a_lease_below_one_second_keeps_its_duration() {
+        let q = MemoryQueue::new();
+        q.enqueue(job("work")).await.unwrap();
+
+        let started = MemoryQueue::now_millis();
+        let leased = q
+            .reserve("w1", 10, Duration::from_millis(100))
+            .await
+            .unwrap();
+        let id = leased[0].job.id;
+        match q.status(id).await.unwrap() {
+            JobStatus::Leased { expires_at, .. } => {
+                assert!(
+                    expires_at >= started + 90,
+                    "a 100 ms lease must keep its millisecond duration"
+                );
+            }
+            other => panic!("expected leased, got {:?}", other),
+        }
+
+        q.ack(id, &leased[0].lease, None).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_rejected_ack_counts_as_a_lease_loss_and_not_a_failure() {
+        let q = MemoryQueue::new();
+        let (stale, _) = stale_and_current_lease(&q).await;
+
+        let _ = q.ack(stale.job.id, &stale.lease, None).await.unwrap_err();
+
+        assert_eq!(q.metrics.lease_lost_count(), 1);
+        assert_eq!(q.metrics.failed_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_failed_job_counts_as_a_failure_and_not_a_lease_loss() {
+        let q = MemoryQueue::new();
+        q.enqueue(job("work")).await.unwrap();
+        let leased = q.reserve("w1", 10, Duration::from_secs(30)).await.unwrap();
+
+        q.nack(
+            leased[0].job.id,
+            &leased[0].lease,
+            "boom",
+            RetryPolicy::NoRetry,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(q.metrics.failed_count(), 1);
+        assert_eq!(q.metrics.lease_lost_count(), 0);
     }
 
     /// Reserves one job with an expired lease, then reserves it again.

@@ -319,8 +319,8 @@ impl QueueWorker {
                 }
                 Err(e) => {
                     // The lease was lost. The job stays leased and the queue
-                    // can run it again. Do not record a completion.
-                    self.metrics.record_failed();
+                    // can run it again. Do not record a completion or a job
+                    // failure. The backend records the lease loss.
                     span.in_scope(|| {
                         warn!(
                             job_id = %job_id,
@@ -947,6 +947,16 @@ mod tests {
             queue.acks.load(Ordering::SeqCst),
             1,
             "the worker must attempt the ack"
+        );
+        assert_eq!(
+            worker.metrics.failed_count(),
+            0,
+            "a lost lease is not a job failure"
+        );
+        assert_eq!(
+            worker.metrics.lease_lost_count(),
+            0,
+            "the backend records a lease loss; the worker must not count it twice"
         );
         let status = queue.inner.status(id).await.unwrap();
         assert!(

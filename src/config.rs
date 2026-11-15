@@ -514,6 +514,15 @@ pub struct DatabaseConfig {
     /// `"oxkv"`. The default is `"oxkv"`.
     #[serde(default = "default_db_prefix")]
     pub prefix: String,
+    /// Size of the shared SST block cache, in MiB.
+    ///
+    /// One cache serves every OxKV handle in the process. The default is 128
+    /// MiB. A value of `0` disables SST caching.
+    ///
+    /// The server sets the value before it builds the first handle. A later
+    /// change has no effect on the handles that are open.
+    #[serde(default = "default_sst_cache_mb")]
+    pub sst_cache_mb: usize,
     /// Mirrors the master fs store in RAM for replica rebuilds.
     ///
     /// This setting is a prototype. When the field is true, the snapshot
@@ -548,6 +557,10 @@ fn default_db_prefix() -> String {
     "oxkv".to_string()
 }
 
+fn default_sst_cache_mb() -> usize {
+    128
+}
+
 fn default_writer_lease_ttl_secs() -> u64 {
     rust_api::lease::DEFAULT_LEASE_TTL_SECS
 }
@@ -577,7 +590,7 @@ pub struct HttpConfig {
 
 /// Cost limits for requests whose work a single request does not bound.
 ///
-/// Both limits default to off, which means `0`, not to a number that the
+/// Every limit defaults to off, which means `0`, not to a number that the
 /// crate guesses. A default limit is a default outage. If the limit is too
 /// low, a valid burst gets 429 responses. If the limit is too high, it does
 /// not limit anything. The values that a deployment needs depend on its
@@ -604,6 +617,15 @@ pub struct LimitsConfig {
     /// an allowed rate can still run at the same time.
     #[serde(default)]
     pub max_concurrent_downloads: usize,
+
+    /// Largest stored EAV replica, in bytes, that one full `GET
+    /// /eav/sync/replica` read may load. A value of `0` disables the gate.
+    ///
+    /// A full read decodes and filters every stored chunk in one request. A
+    /// client above the limit must read the replica in chunk mode with
+    /// `?chunk=N`.
+    #[serde(default)]
+    pub max_full_replica_bytes: usize,
 }
 
 impl LimitsConfig {
