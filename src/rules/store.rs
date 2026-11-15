@@ -190,7 +190,7 @@ impl RuleMatchCache {
 /// The engine writes this row after `MAX_ENTRY_ATTEMPTS` failed attempts.
 /// The row holds the feed sequence, the event id, the attempt count, the
 /// sanitized error text, and the Unix time of the write.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 pub struct RuleDeadLetter {
     /// The feed sequence of the failed entry.
     pub seq: u64,
@@ -572,6 +572,33 @@ impl RuleStore {
             .map_err(RuleError::Store)
     }
 
+    /// Resets the durable change-feed cursor and reports the old and new
+    /// sequence.
+    ///
+    /// The call reads the stored cursor first.
+    /// A missing cursor is 0.
+    /// The call then writes `seq`.
+    /// The return value is `(old, new)`.
+    ///
+    /// The caller must stop the writer that owns the prefix first.
+    /// A reset behind the writer replays feed entries.
+    /// Use this call only for operator recovery.
+    pub async fn reset_cursor(&self, seq: u64) -> Result<(u64, u64), RuleError> {
+        let _publish = self.publish_lock.lock().await;
+        let g = self.store.write().await;
+        let old = match g.get_bytes(CURSOR_KEY).await.map_err(RuleError::Store)? {
+            Some(bytes) => serde_json::from_slice(&bytes)
+                .map_err(|error| RuleError::Serialization(error.to_string()))?,
+            None => 0,
+        };
+        let bytes = serde_json::to_vec(&seq)
+            .map_err(|error| RuleError::Serialization(error.to_string()))?;
+        g.put_bytes(CURSOR_KEY, &bytes)
+            .await
+            .map_err(RuleError::Store)?;
+        Ok((old, seq))
+    }
+
     /// Returns the key of one execution marker.
     ///
     /// The key is `rule:exec:{rule_id}:{event_id}`.
@@ -690,7 +717,7 @@ impl RuleStore {
     ///
     /// The result is sorted by `at` in descending order.
     /// Two rows with the same `at` are sorted by `seq` in descending order.
-    /// The call is for tests and for a future operator surface.
+    /// The call is for tests and for the operator surface.
     pub async fn dead_letters(&self) -> Result<Vec<RuleDeadLetter>, RuleError> {
         let g = self.store.read().await;
         let rows = scan_family(&*g, DEAD_PREFIX).await?;
@@ -707,6 +734,64 @@ impl RuleStore {
                 .then_with(|| right.seq.cmp(&left.seq))
         });
         Ok(dead)
+    }
+
+    /// Lists one page of dead-letter rows, newest first.
+    ///
+    /// The call sorts the rows in the same order as
+    /// [`RuleStore::dead_letters`].
+    /// It skips `offset` rows.
+    /// It then returns at most `limit` rows.
+    /// A `limit` of 0 returns an empty list.
+    pub async fn dead_letters_page(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<RuleDeadLetter>, RuleError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let dead = self.dead_letters().await?;
+        Ok(dead.into_iter().skip(offset).take(limit).collect())
+    }
+
+    /// Reads one dead-letter row.
+    ///
+    /// The key is `rule-dead:{seq}:{event_id}:{rule_id}`.
+    /// The call returns `None` when the row does not exist.
+    pub async fn dead_letter(
+        &self,
+        seq: u64,
+        event_id: &str,
+        rule_id: &str,
+    ) -> Result<Option<RuleDeadLetter>, RuleError> {
+        let g = self.store.read().await;
+        let Some(bytes) = g
+            .get_bytes(&dead_key(seq, event_id, rule_id))
+            .await
+            .map_err(RuleError::Store)?
+        else {
+            return Ok(None);
+        };
+        let entry = serde_json::from_slice(&bytes)
+            .map_err(|error| RuleError::Serialization(error.to_string()))?;
+        Ok(Some(entry))
+    }
+
+    /// Deletes one dead-letter row.
+    ///
+    /// The key is `rule-dead:{seq}:{event_id}:{rule_id}`.
+    /// The call returns false when the row does not exist.
+    pub async fn delete_dead_letter(
+        &self,
+        seq: u64,
+        event_id: &str,
+        rule_id: &str,
+    ) -> Result<bool, RuleError> {
+        let g = self.store.write().await;
+        g.delete(&dead_key(seq, event_id, rule_id))
+            .await
+            .map_err(RuleError::Store)
     }
 
     /// Deletes expired cleanup rows.
@@ -1638,6 +1723,72 @@ mod tests {
         let seqs: Vec<u64> = dead.into_iter().map(|entry| entry.seq).collect();
 
         assert_eq!(seqs, vec![3, 2, 1]);
+    }
+
+    #[tokio::test]
+    async fn reset_cursor_reports_the_old_and_new_sequence() {
+        let store = new_store().await;
+        store.set_cursor(9).await.unwrap();
+
+        let (old, new) = store.reset_cursor(3).await.unwrap();
+
+        assert_eq!((old, new), (9, 3));
+        assert_eq!(store.cursor().await.unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn reset_cursor_uses_zero_for_a_missing_cursor() {
+        let store = new_store().await;
+
+        let (old, new) = store.reset_cursor(4).await.unwrap();
+
+        assert_eq!((old, new), (0, 4));
+        assert_eq!(store.cursor().await.unwrap(), 4);
+    }
+
+    #[tokio::test]
+    async fn dead_letters_page_skips_and_limits_newest_first() {
+        let (store, _raw) = store_with_raw().await;
+        for (seq, at) in [(1, 100), (2, 200), (3, 300)] {
+            store
+                .write_dead_letter(&dead_letter(seq, &format!("evt-{seq}"), at))
+                .await
+                .unwrap();
+        }
+
+        let first = store.dead_letters_page(2, 0).await.unwrap();
+        let second = store.dead_letters_page(2, 2).await.unwrap();
+
+        assert_eq!(
+            first.iter().map(|entry| entry.seq).collect::<Vec<_>>(),
+            vec![3, 2]
+        );
+        assert_eq!(
+            second.iter().map(|entry| entry.seq).collect::<Vec<_>>(),
+            vec![1]
+        );
+        assert!(store.dead_letters_page(0, 0).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_dead_letter_is_read_and_deleted_by_its_stable_key() {
+        let (store, _raw) = store_with_raw().await;
+        let dead = dead_letter(7, "evt-7", 700);
+        store.write_dead_letter(&dead).await.unwrap();
+
+        assert_eq!(
+            store.dead_letter(7, "evt-7", "alpha").await.unwrap(),
+            Some(dead)
+        );
+        assert!(store.delete_dead_letter(7, "evt-7", "alpha").await.unwrap());
+        assert!(
+            store
+                .dead_letter(7, "evt-7", "alpha")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(!store.delete_dead_letter(7, "evt-7", "alpha").await.unwrap());
     }
 
     #[tokio::test]

@@ -460,6 +460,47 @@ impl RuleEngine {
         Ok(pass.executions)
     }
 
+    /// Re-runs the feed entry of one dead-letter row.
+    ///
+    /// The call reads the feed entry at `dead.seq`.
+    /// The entry must hold an entity event with the id `dead.event_id`.
+    /// The call then runs the matching rules for that event.
+    /// A successful run deletes the dead-letter row.
+    /// A failed run keeps the row, so an operator can try again.
+    /// The call does not move the cursor.
+    ///
+    /// A feed entry that is not an entity event or an id that does not match
+    /// returns [`RuleError::Invalid`].
+    /// A missing feed entry returns [`RuleError::Wal`].
+    pub async fn retry_dead_letter(
+        &self,
+        dead: &RuleDeadLetter,
+        wal: &Wal,
+    ) -> Result<Vec<RuleExecution>, RuleError> {
+        let entries = wal.range(dead.seq, dead.seq).await.map_err(map_wal_error)?;
+        let Some(entry) = entries.into_iter().next() else {
+            return Err(RuleError::Wal(format!(
+                "dead-letter sequence {} is missing from the feed",
+                dead.seq
+            )));
+        };
+        let WalOp::Entity { event } = entry.op else {
+            return Err(RuleError::Invalid(
+                "dead-letter entry is not an entity event".to_string(),
+            ));
+        };
+        if event.event_id != dead.event_id {
+            return Err(RuleError::Invalid(
+                "dead-letter event id does not match the feed".to_string(),
+            ));
+        }
+        let executions = self.process(&event).await?;
+        self.rules
+            .delete_dead_letter(dead.seq, &dead.event_id, &dead.rule_id)
+            .await?;
+        Ok(executions)
+    }
+
     /// Runs one pass and keeps the rule failures.
     ///
     /// The caller uses the failures to name each failed rule.
