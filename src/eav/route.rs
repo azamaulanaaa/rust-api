@@ -162,7 +162,6 @@ pub struct ExpectedVersionQuery {
 /// Use `after` to page deeper than the cap.
 /// A full page whose next offset would pass the cap returns no
 /// `next_offset`.
-/// `GET /eav/rules` supports offset paging only, so it rejects a cursor.
 #[derive(Debug, Clone, Deserialize, utoipa::IntoParams)]
 pub struct PageQuery {
     /// The page size. The default is 50. The maximum is 200.
@@ -181,7 +180,6 @@ pub struct PageQuery {
     /// A non-empty value starts after that id.
     /// Omit the field to use offset paging.
     /// Do not combine it with a non-zero `offset`.
-    /// `GET /eav/rules` rejects this field.
     #[serde(default)]
     pub after: Option<String>,
 }
@@ -227,6 +225,46 @@ impl PageQuery {
             None => PageMode::Offset(offset),
         };
         Ok((limit, mode))
+    }
+}
+
+/// The paging query of the rule list route.
+///
+/// The rule list supports offset paging only.
+/// A present `after` field returns `400`.
+/// A client that pages deeper than the offset cap must start a new query.
+#[derive(Debug, Clone, Deserialize, utoipa::IntoParams)]
+pub struct RulePageQuery {
+    /// The page size. The default is 50. The maximum is 200.
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// The number of items to skip. The default is 0.
+    ///
+    /// The maximum is 1000.
+    #[serde(default)]
+    pub offset: Option<usize>,
+    /// Rejected. The rule list supports offset paging only.
+    #[serde(default)]
+    pub after: Option<String>,
+}
+
+impl RulePageQuery {
+    /// Resolves the page size and the offset.
+    ///
+    /// A present `after` field is invalid.
+    fn resolve(self) -> Result<(usize, usize), EavApiError> {
+        let limit = self.limit.unwrap_or(DEFAULT_PAGE_LIMIT);
+        if limit == 0 || limit > MAX_PAGE_LIMIT {
+            return Err(EavApiError::Invalid(Box::new(InvalidPageLimit)));
+        }
+        let offset = self.offset.unwrap_or(0);
+        if offset > MAX_PAGE_OFFSET {
+            return Err(EavApiError::Invalid(Box::new(InvalidPageOffset)));
+        }
+        if self.after.is_some() {
+            return Err(EavApiError::Invalid(Box::new(InvalidRuleCursor)));
+        }
+        Ok((limit, offset))
     }
 }
 
@@ -882,7 +920,7 @@ async fn list_schema_children(
     Ok(HttpResponse::Ok().json(children))
 }
 
-#[utoipa::path(get, path = "/eav/schemas/{id}/diff", tag = "eav", params(("id" = String, Path), SchemaDiffQuery), responses((status=200, body=crate::eav::schema::SchemaDiff), (status=401, body=crate::http::error::ErrorBody), (status=403, body=crate::http::error::ErrorBody), (status=404, body=crate::http::error::ErrorBody), (status=500, body=crate::http::error::ErrorBody)))]
+#[utoipa::path(get, path = "/eav/schemas/{id}/diff", tag = "eav", params(("id" = String, Path), SchemaDiffQuery), responses((status=200, body=crate::eav::schema::SchemaDiff), (status=400, body=crate::http::error::ErrorBody), (status=401, body=crate::http::error::ErrorBody), (status=403, body=crate::http::error::ErrorBody), (status=404, body=crate::http::error::ErrorBody), (status=500, body=crate::http::error::ErrorBody)))]
 #[get("/schemas/{id}/diff")]
 async fn diff_schema(
     runtime: web::Data<EavRuntime>,
@@ -929,7 +967,7 @@ async fn revalidate_schema(
 /// A real run requires `write` on both objects.
 /// A real run writes the entities, so it also needs the write grant.
 /// The default `dry_run` value is true.
-#[utoipa::path(post, path = "/eav/schemas/{id}/migrate", tag = "eav", params(("id" = String, Path)), request_body = MigrateRequest, responses((status=200, body=crate::eav::entity::MigrationReport), (status=400, body=crate::http::error::ErrorBody), (status=401, body=crate::http::error::ErrorBody), (status=403, body=crate::http::error::ErrorBody), (status=404, body=crate::http::error::ErrorBody), (status=500, body=crate::http::error::ErrorBody)))]
+#[utoipa::path(post, path = "/eav/schemas/{id}/migrate", tag = "eav", params(("id" = String, Path)), request_body = MigrateRequest, responses((status=200, body=crate::eav::entity::MigrationReport), (status=400, body=crate::http::error::ErrorBody), (status=401, body=crate::http::error::ErrorBody), (status=403, body=crate::http::error::ErrorBody), (status=404, body=crate::http::error::ErrorBody), (status=409, body=crate::http::error::ErrorBody), (status=500, body=crate::http::error::ErrorBody)))]
 #[post("/schemas/{id}/migrate")]
 async fn migrate_schema(
     runtime: web::Data<EavRuntime>,
@@ -957,7 +995,7 @@ async fn migrate_schema(
     Ok(HttpResponse::Ok().json(report))
 }
 
-#[utoipa::path(post, path = "/eav/entities", tag = "eav", request_body = crate::eav::entity::EntityDraft, responses((status=201, body=crate::eav::entity::Entity), (status=400, body=crate::http::error::ErrorBody), (status=401, body=crate::http::error::ErrorBody), (status=403, body=crate::http::error::ErrorBody), (status=409, body=crate::http::error::ErrorBody), (status=500, body=crate::http::error::ErrorBody)))]
+#[utoipa::path(post, path = "/eav/entities", tag = "eav", request_body = crate::eav::entity::EntityDraft, responses((status=201, body=crate::eav::entity::Entity), (status=400, body=crate::http::error::ErrorBody), (status=401, body=crate::http::error::ErrorBody), (status=403, body=crate::http::error::ErrorBody), (status=404, body=crate::http::error::ErrorBody), (status=409, body=crate::http::error::ErrorBody), (status=500, body=crate::http::error::ErrorBody)))]
 #[post("/entities")]
 async fn create_entity(
     runtime: web::Data<EavRuntime>,
@@ -1240,20 +1278,16 @@ async fn upsert_rule(
 /// The route supports offset paging only.
 /// A cursor in `after` returns `400`.
 /// The caller needs `read` on `eav_rules`.
-#[utoipa::path(get, path = "/eav/rules", tag = "eav", params(PageQuery), responses((status=200, body=RulePage), (status=400, body=crate::http::error::ErrorBody), (status=401, body=crate::http::error::ErrorBody), (status=403, body=crate::http::error::ErrorBody), (status=500, body=crate::http::error::ErrorBody)))]
+#[utoipa::path(get, path = "/eav/rules", tag = "eav", params(RulePageQuery), responses((status=200, body=RulePage), (status=400, body=crate::http::error::ErrorBody), (status=401, body=crate::http::error::ErrorBody), (status=403, body=crate::http::error::ErrorBody), (status=500, body=crate::http::error::ErrorBody)))]
 #[get("/rules")]
 async fn list_rules(
     runtime: web::Data<EavRuntime>,
     policy: web::Data<Authorizer>,
     claims: Validated<Claims>,
-    query: web::Query<PageQuery>,
+    query: web::Query<RulePageQuery>,
 ) -> Result<HttpResponse, EavApiError> {
     require_management(&policy, &claims.sub, RULES, Action::Read).await?;
-    let (limit, mode) = query.into_inner().resolve()?;
-    let offset = match mode {
-        PageMode::Offset(offset) => offset,
-        PageMode::Cursor(_) => return Err(EavApiError::Invalid(Box::new(InvalidRuleCursor))),
-    };
+    let (limit, offset) = query.into_inner().resolve()?;
     let items = runtime.rules().list_page(limit, offset).await?;
     let next_offset = page_next_offset(offset, items.len(), limit);
     Ok(HttpResponse::Ok().json(RulePage { items, next_offset }))
