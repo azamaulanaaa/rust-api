@@ -17,8 +17,10 @@ use super::{Job, JobId, JobStatus, LeaseToken, LeasedJob, QueueError, QueueMetri
 struct Record {
     job: Job,
     status: JobStatus,
-    worker: Option<String>,
-    lease_expires_at: Option<i64>,
+    /// Generation of the current or last lease. The backend increments the
+    /// value on each reserve and each extension. An old token has a lower
+    /// value.
+    lease_generation: u64,
     result: Option<Vec<u8>>,
     error: Option<String>,
     finished_at: Option<i64>,
@@ -60,8 +62,6 @@ impl MemoryQueue {
                 let attempt = rec.job.attempt.saturating_add(1);
                 rec.job.attempt = attempt;
                 rec.job.scheduled_at = now;
-                rec.worker = None;
-                rec.lease_expires_at = None;
                 if attempt >= rec.job.max_attempts {
                     rec.status = JobStatus::Dead {
                         error: "lease expired".to_string(),
@@ -79,12 +79,13 @@ impl MemoryQueue {
     /// Checks a lease token against the record status.
     ///
     /// The function returns [`QueueError::AlreadyLeased`] when another worker
-    /// holds the job. It returns [`QueueError::LeaseExpired`] when the lease
-    /// is gone or its time has passed.
+    /// holds the job or the token has an old generation. It returns
+    /// [`QueueError::LeaseExpired`] when the lease is gone or its time has
+    /// passed.
     fn check_lease(rec: &Record, lease: &LeaseToken) -> Result<(), QueueError> {
         match &rec.status {
             JobStatus::Leased { worker, expires_at } => {
-                if worker != &lease.worker || *expires_at != lease.expires_at {
+                if worker != &lease.worker || rec.lease_generation != lease.generation {
                     Err(QueueError::AlreadyLeased)
                 } else if *expires_at <= Self::now() {
                     Err(QueueError::LeaseExpired)
@@ -124,8 +125,7 @@ impl super::JobQueue for MemoryQueue {
         let rec = Record {
             job: job.clone(),
             status: JobStatus::Queued,
-            worker: None,
-            lease_expires_at: None,
+            lease_generation: 0,
             result: None,
             error: None,
             finished_at: None,
@@ -173,17 +173,17 @@ impl super::JobQueue for MemoryQueue {
                 continue;
             };
             let expires_at = now + lease_secs;
+            rec.lease_generation = rec.lease_generation.saturating_add(1);
+            let generation = rec.lease_generation;
             rec.status = JobStatus::Leased {
                 worker: worker.to_string(),
                 expires_at,
             };
-            rec.worker = Some(worker.to_string());
-            rec.lease_expires_at = Some(expires_at);
             out.push(LeasedJob {
                 job: rec.job.clone(),
                 lease: LeaseToken {
                     worker: worker.to_string(),
-                    expires_at,
+                    generation,
                 },
             });
         }
@@ -212,8 +212,6 @@ impl super::JobQueue for MemoryQueue {
         };
         rec.result = result;
         rec.finished_at = Some(finished);
-        rec.worker = None;
-        rec.lease_expires_at = None;
         drop(state);
         self.metrics.record_completed();
         Ok(())
@@ -242,8 +240,6 @@ impl super::JobQueue for MemoryQueue {
                 };
                 rec.error = Some(error.to_string());
                 rec.finished_at = Some(finished);
-                rec.worker = None;
-                rec.lease_expires_at = None;
                 drop(state);
                 self.metrics.record_failed();
             }
@@ -256,8 +252,6 @@ impl super::JobQueue for MemoryQueue {
                     };
                     rec.error = Some(error.to_string());
                     rec.finished_at = Some(finished);
-                    rec.worker = None;
-                    rec.lease_expires_at = None;
                     drop(state);
                     self.metrics.record_dead_lettered();
                     self.metrics.record_failed();
@@ -266,8 +260,6 @@ impl super::JobQueue for MemoryQueue {
                     rec.job.scheduled_at = finished + delay.as_secs() as i64;
                     rec.status = JobStatus::Queued;
                     rec.error = Some(error.to_string());
-                    rec.worker = None;
-                    rec.lease_expires_at = None;
                     drop(state);
                     self.metrics.record_failed();
                 }
@@ -282,7 +274,7 @@ impl super::JobQueue for MemoryQueue {
         job_id: JobId,
         lease: &LeaseToken,
         extend: Duration,
-    ) -> Result<(), QueueError> {
+    ) -> Result<LeaseToken, QueueError> {
         let mut state = self.state.lock().await;
         Self::sweep_expired(&mut state);
         let rec = state
@@ -291,12 +283,15 @@ impl super::JobQueue for MemoryQueue {
             .ok_or(QueueError::NotFound(job_id))?;
         Self::check_lease(rec, lease)?;
         let new_expiry = Self::now() + extend.as_secs() as i64;
+        rec.lease_generation = rec.lease_generation.saturating_add(1);
         rec.status = JobStatus::Leased {
             worker: lease.worker.clone(),
             expires_at: new_expiry,
         };
-        rec.lease_expires_at = Some(new_expiry);
-        Ok(())
+        Ok(LeaseToken {
+            worker: lease.worker.clone(),
+            generation: rec.lease_generation,
+        })
     }
 
     #[instrument(name = "queue.status", skip(self), fields(queue.backend = "memory", job.id = %job_id))]
@@ -454,10 +449,16 @@ mod tests {
     async fn a_current_lease_can_extend_a_lease() {
         let q = MemoryQueue::new();
         let (_, current) = stale_and_current_lease(&q).await;
-        let before = current.lease.expires_at;
-        q.extend_lease(current.job.id, &current.lease, Duration::from_secs(60))
+        let before = match q.status(current.job.id).await.unwrap() {
+            JobStatus::Leased { expires_at, .. } => expires_at,
+            other => panic!("expected leased, got {:?}", other),
+        };
+        let renewed = q
+            .extend_lease(current.job.id, &current.lease, Duration::from_secs(60))
             .await
             .unwrap();
+        assert_eq!(renewed.worker, current.lease.worker);
+        assert!(renewed.generation > current.lease.generation);
         match q.status(current.job.id).await.unwrap() {
             JobStatus::Leased { worker, expires_at } => {
                 assert_eq!(worker, "w2");
@@ -465,6 +466,75 @@ mod tests {
             }
             other => panic!("expected leased, got {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn a_renewed_lease_can_ack_the_job() {
+        let q = MemoryQueue::new();
+        q.enqueue(job("work")).await.unwrap();
+        let leased = q.reserve("w1", 10, Duration::from_secs(30)).await.unwrap();
+        let id = leased[0].job.id;
+        let renewed = q
+            .extend_lease(id, &leased[0].lease, Duration::from_secs(30))
+            .await
+            .unwrap();
+
+        q.ack(id, &renewed, Some(vec![5])).await.unwrap();
+
+        match q.status(id).await.unwrap() {
+            JobStatus::Succeeded { result, .. } => assert_eq!(result, Some(vec![5])),
+            other => panic!("expected succeeded, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn two_extensions_then_nack_succeeds() {
+        let q = MemoryQueue::new();
+        q.enqueue(job("work")).await.unwrap();
+        let leased = q.reserve("w1", 10, Duration::from_secs(30)).await.unwrap();
+        let id = leased[0].job.id;
+        let second = q
+            .extend_lease(id, &leased[0].lease, Duration::from_secs(30))
+            .await
+            .unwrap();
+        let third = q
+            .extend_lease(id, &second, Duration::from_secs(30))
+            .await
+            .unwrap();
+
+        q.nack(id, &third, "boom", RetryPolicy::NoRetry)
+            .await
+            .unwrap();
+
+        match q.status(id).await.unwrap() {
+            JobStatus::Failed { error, .. } => assert_eq!(error, "boom"),
+            other => panic!("expected failed, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_token_from_before_an_extension_is_rejected() {
+        let q = MemoryQueue::new();
+        q.enqueue(job("work")).await.unwrap();
+        let leased = q.reserve("w1", 10, Duration::from_secs(30)).await.unwrap();
+        let id = leased[0].job.id;
+        let old = leased[0].lease.clone();
+        let renewed = q
+            .extend_lease(id, &old, Duration::from_secs(30))
+            .await
+            .unwrap();
+
+        let error = q.ack(id, &old, Some(vec![1])).await.unwrap_err();
+        assert!(matches!(
+            error,
+            QueueError::AlreadyLeased | QueueError::LeaseExpired
+        ));
+        match q.status(id).await.unwrap() {
+            JobStatus::Leased { .. } => {}
+            other => panic!("expected leased, got {:?}", other),
+        }
+
+        q.ack(id, &renewed, Some(vec![1])).await.unwrap();
     }
 
     #[tokio::test]
