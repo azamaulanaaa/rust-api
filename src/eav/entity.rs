@@ -135,7 +135,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use oxkv::{Direction, GetSet, KeyValue, OxKvStore, Store as _, Transaction as _};
+use oxkv::{
+    Direction, GetSet, KeyPrefix, KeyValue, OxKvStore, ScanExt as _, Store as _, StoreError,
+    Transaction as _, TxCas,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, RwLock};
@@ -812,7 +815,7 @@ impl EntityStore {
         ctx: &WriteContext,
     ) -> Result<Option<(String, Vec<u8>)>, EntityError>
     where
-        S: GetSet + ?Sized,
+        S: GetSet + ?Sized + Sync,
     {
         let before = &prepared.before;
         let after = &prepared.after;
@@ -851,7 +854,7 @@ impl EntityStore {
         force: bool,
     ) -> Result<PreparedDelete, EntityError>
     where
-        S: GetSet + ?Sized,
+        S: GetSet + ?Sized + Sync,
     {
         validate_name("entity id", id)?;
         let Some(before) = load_entity(store, id).await? else {
@@ -1368,7 +1371,12 @@ impl EntityStore {
         if let Some(count) = read_outbox_pending(&*g).await? {
             return Ok(count);
         }
-        let count = u64::try_from(scan_prefix(&*g, OUTBOX_PREFIX).await?.len()).unwrap_or(u64::MAX);
+        let count = u64::try_from(
+            g.count_prefix(KeyPrefix::new(OUTBOX_PREFIX), usize::MAX)
+                .await
+                .map_err(EntityError::Store)?,
+        )
+        .unwrap_or(u64::MAX);
         write_outbox_pending(&*g, count).await?;
         Ok(count)
     }
@@ -1428,11 +1436,11 @@ impl EntityStore {
         validate_name("schema id", schema_id)?;
         let g = self.store.read().await;
         let prefix = format!("{SCHEMA_INDEX_PREFIX}{schema_id}:");
-        let markers = scan_prefix(&*g, &prefix).await?;
+        let markers = scan_keys_prefix(&*g, &prefix).await?;
         let mut entities = Vec::new();
         let mut seen = BTreeSet::new();
-        for marker in markers {
-            let Some(id) = marker.key.strip_prefix(&prefix) else {
+        for key in markers {
+            let Some(id) = key.strip_prefix(&prefix) else {
                 continue;
             };
             if id.is_empty() || id.contains(':') || !seen.insert(id.to_string()) {
@@ -1465,11 +1473,11 @@ impl EntityStore {
         let g = self.store.read().await;
         let prefix = format!("{SCHEMA_INDEX_PREFIX}{schema_id}:");
         let max = offset.saturating_add(limit);
-        let markers = scan_prefix_bounded(&*g, &prefix, max).await?;
+        let markers = scan_keys_prefix_bounded(&*g, &prefix, max).await?;
         let mut ids = Vec::new();
         let mut seen = BTreeSet::new();
-        for marker in markers {
-            let Some(id) = marker.key.strip_prefix(&prefix) else {
+        for key in markers {
+            let Some(id) = key.strip_prefix(&prefix) else {
                 continue;
             };
             if id.is_empty() || id.contains(':') || !seen.insert(id.to_string()) {
@@ -1518,13 +1526,13 @@ impl EntityStore {
         let max = Some(limit.saturating_add(1));
         let cursor = (Some(start), Some(prefix_scan_end(&prefix)));
         let markers = g
-            .gets_bytes(max, Direction::Next, cursor)
+            .gets_keys(max, Direction::Next, cursor)
             .await
             .map_err(EntityError::Store)?;
         let mut ids = Vec::new();
         let mut seen = BTreeSet::new();
-        for marker in markers {
-            let Some(id) = marker.key.strip_prefix(&prefix) else {
+        for key in markers {
+            let Some(id) = key.strip_prefix(&prefix) else {
                 continue;
             };
             if id.is_empty() || id.contains(':') || !seen.insert(id.to_string()) {
@@ -1922,7 +1930,7 @@ impl EntityStore {
         let mut seen = BTreeSet::new();
         loop {
             let rows = g
-                .gets_bytes(
+                .gets_keys(
                     max,
                     Direction::Next,
                     (Some(start.clone()), Some(end.clone())),
@@ -1930,9 +1938,9 @@ impl EntityStore {
                 .await
                 .map_err(EntityError::Store)?;
             let full = rows.len() == target;
-            for row in &rows {
-                start = format!("{}\0", row.key);
-                let Some(id) = row.key.strip_prefix(&prefix) else {
+            for marker in &rows {
+                start = format!("{marker}\0");
+                let Some(id) = marker.strip_prefix(&prefix) else {
                     continue;
                 };
                 if id.is_empty() || id.contains(':') || !seen.insert(id.to_string()) {
@@ -1991,7 +1999,7 @@ impl EntityStore {
                 .is_some()
             {
                 return Ok(time_key_marker_keys(
-                    scan_prefix(&*g, TIME_KEY_INDEX_PREFIX).await?,
+                    scan_keys_prefix(&*g, TIME_KEY_INDEX_PREFIX).await?,
                 ));
             }
         }
@@ -2011,7 +2019,7 @@ impl EntityStore {
                     None
                 } else {
                     let rows = g
-                        .gets_bytes(
+                        .gets_keys(
                             max,
                             Direction::Next,
                             (Some(cursor.clone()), Some(end.clone())),
@@ -2022,13 +2030,13 @@ impl EntityStore {
                         None
                     } else {
                         let full = rows.len() == BACKFILL_PAGE;
-                        let last = rows.last().map(|row| row.key.clone()).unwrap_or_default();
+                        let last = rows.last().cloned().unwrap_or_default();
                         let keys = time_row_keys(rows);
                         let tx = g.begin_tx().map_err(EntityError::Store)?;
                         for key in &keys {
                             let prefix = format!("{TIME_INDEX_PREFIX}{key}:");
                             // Re-check the source row inside the page lock.
-                            if scan_prefix_bounded(&tx, &prefix, 1).await?.is_empty() {
+                            if scan_keys_prefix_bounded(&tx, &prefix, 1).await?.is_empty() {
                                 continue;
                             }
                             let marker_key = time_key_index_key(key);
@@ -2074,7 +2082,7 @@ impl EntityStore {
         }
         let g = self.store.read().await;
         Ok(time_key_marker_keys(
-            scan_prefix(&*g, TIME_KEY_INDEX_PREFIX).await?,
+            scan_keys_prefix(&*g, TIME_KEY_INDEX_PREFIX).await?,
         ))
     }
 
@@ -2104,13 +2112,13 @@ impl EntityStore {
         let upper = format!("{prefix}{};", encode_timestamp(at_or_before));
         let cursor = (Some(prefix.clone()), Some(upper));
         let rows = g
-            .gets_bytes(None, Direction::Next, cursor)
+            .gets_keys(None, Direction::Next, cursor)
             .await
             .map_err(EntityError::Store)?;
         let mut entities = Vec::new();
         let mut seen = BTreeSet::new();
-        for row in rows {
-            let Some(rest) = row.key.strip_prefix(&prefix) else {
+        for marker_key in rows {
+            let Some(rest) = marker_key.strip_prefix(&prefix) else {
                 continue;
             };
             let Some((encoded, id)) = rest.split_once(':') else {
@@ -2273,10 +2281,10 @@ impl EntityStore {
     /// Lists every entity, sorted by id.
     pub async fn list(&self) -> Result<Vec<Entity>, EntityError> {
         let g = self.store.read().await;
-        let rows = scan_prefix(&*g, ENTITY_PREFIX).await?;
+        let rows = scan_keys_prefix(&*g, ENTITY_PREFIX).await?;
         let mut entities = Vec::new();
-        for row in rows {
-            let Some(rest) = row.key.strip_prefix(ENTITY_PREFIX) else {
+        for key in rows {
+            let Some(rest) = key.strip_prefix(ENTITY_PREFIX) else {
                 continue;
             };
             let Some(id) = rest.strip_suffix(META_SUFFIX) else {
@@ -2335,7 +2343,7 @@ impl EntityStore {
                     None
                 } else {
                     let rows = g
-                        .gets_bytes(
+                        .gets_keys(
                             max,
                             Direction::Next,
                             (Some(cursor.clone()), Some(end.clone())),
@@ -2346,10 +2354,10 @@ impl EntityStore {
                         None
                     } else {
                         let full = rows.len() == BACKFILL_PAGE;
-                        let last = rows.last().map(|row| row.key.clone()).unwrap_or_default();
+                        let last = rows.last().cloned().unwrap_or_default();
                         let tx = g.begin_tx().map_err(EntityError::Store)?;
-                        for row in &rows {
-                            let Some(rest) = row.key.strip_prefix(ENTITY_PREFIX) else {
+                        for key in &rows {
+                            let Some(rest) = key.strip_prefix(ENTITY_PREFIX) else {
                                 continue;
                             };
                             let Some(id) = rest.strip_suffix(META_SUFFIX) else {
@@ -2448,7 +2456,7 @@ impl EntityStore {
                     None
                 } else {
                     let rows = g
-                        .gets_bytes(
+                        .gets_keys(
                             max,
                             Direction::Next,
                             (Some(cursor.clone()), Some(end.clone())),
@@ -2459,10 +2467,10 @@ impl EntityStore {
                         None
                     } else {
                         let full = rows.len() == BACKFILL_PAGE;
-                        let last = rows.last().map(|row| row.key.clone()).unwrap_or_default();
+                        let last = rows.last().cloned().unwrap_or_default();
                         let tx = g.begin_tx().map_err(EntityError::Store)?;
-                        for row in &rows {
-                            let Some(id) = row.key.strip_prefix(ENTITY_INDEX_PREFIX) else {
+                        for key in &rows {
+                            let Some(id) = key.strip_prefix(ENTITY_INDEX_PREFIX) else {
                                 continue;
                             };
                             if id.is_empty() || id.contains(':') {
@@ -2581,13 +2589,13 @@ impl EntityStore {
         let max = Some(limit.saturating_add(1));
         let cursor = (Some(start), Some(prefix_scan_end(ENTITY_INDEX_PREFIX)));
         let markers = g
-            .gets_bytes(max, Direction::Next, cursor)
+            .gets_keys(max, Direction::Next, cursor)
             .await
             .map_err(EntityError::Store)?;
         let mut ids = Vec::with_capacity(markers.len());
         let mut seen = BTreeSet::new();
-        for marker in markers {
-            let Some(id) = marker.key.strip_prefix(ENTITY_INDEX_PREFIX) else {
+        for key in markers {
+            let Some(id) = key.strip_prefix(ENTITY_INDEX_PREFIX) else {
                 continue;
             };
             if id.is_empty() || id.contains(':') || !seen.insert(id.to_string()) {
@@ -2861,11 +2869,17 @@ where
 /// The addition saturates at [`u64::MAX`].
 async fn increment_outbox_pending<S>(store: &S, delta: u64) -> Result<(), EntityError>
 where
-    S: GetSet + ?Sized,
+    S: GetSet + ?Sized + Sync,
 {
     let current = match read_outbox_pending(store).await? {
         Some(count) => count,
-        None => u64::try_from(scan_prefix(store, OUTBOX_PREFIX).await?.len()).unwrap_or(u64::MAX),
+        None => u64::try_from(
+            store
+                .count_prefix(KeyPrefix::new(OUTBOX_PREFIX), usize::MAX)
+                .await
+                .map_err(EntityError::Store)?,
+        )
+        .unwrap_or(u64::MAX),
     };
     write_outbox_pending(store, current.saturating_add(delta)).await
 }
@@ -3103,7 +3117,7 @@ async fn check_unique_values<S>(
     defs: &BTreeMap<String, AttributeDef>,
 ) -> Result<(), EntityError>
 where
-    S: GetSet + ?Sized,
+    S: GetSet + ?Sized + Sync,
 {
     for (key, value) in &entity.attributes {
         if let Some(def) = defs.get(key)
@@ -3128,12 +3142,12 @@ async fn check_unique<S>(
     value: &AttributeValue,
 ) -> Result<(), EntityError>
 where
-    S: GetSet + ?Sized,
+    S: GetSet + ?Sized + Sync,
 {
     let hash = value_hash(value)?;
     let prefix = unique_prefix(key, &hash);
-    for marker in scan_prefix(store, &prefix).await? {
-        let Some(owner) = marker.key.strip_prefix(&prefix) else {
+    for marker in scan_keys_prefix(store, &prefix).await? {
+        let Some(owner) = marker.strip_prefix(&prefix) else {
             continue;
         };
         if owner.is_empty() || owner.contains(':') || owner == entity_id {
@@ -3511,6 +3525,38 @@ where
         .map_err(EntityError::Store)
 }
 
+/// Scans a key range that ends at the `prefix:` family bound and reads keys
+/// only.
+async fn scan_keys_prefix<S>(store: &S, prefix: &str) -> Result<Vec<String>, EntityError>
+where
+    S: GetSet + ?Sized + Sync,
+{
+    debug_assert!(prefix.ends_with(':'));
+    let cursor = (Some(prefix.to_string()), Some(prefix_scan_end(prefix)));
+    store
+        .gets_keys(None, Direction::Next, cursor)
+        .await
+        .map_err(EntityError::Store)
+}
+
+/// Scans at most `limit` rows of a key range and reads keys only.
+async fn scan_keys_prefix_bounded<S>(
+    store: &S,
+    prefix: &str,
+    limit: usize,
+) -> Result<Vec<String>, EntityError>
+where
+    S: GetSet + ?Sized + Sync,
+{
+    debug_assert!(prefix.ends_with(':'));
+    let max = Some(limit);
+    let cursor = (Some(prefix.to_string()), Some(prefix_scan_end(prefix)));
+    store
+        .gets_keys(max, Direction::Next, cursor)
+        .await
+        .map_err(EntityError::Store)
+}
+
 /// Scans at most `limit` rows of a key range that ends at the `prefix:` bound.
 async fn scan_prefix_bounded<S>(
     store: &S,
@@ -3629,34 +3675,34 @@ fn time_key_backfill_marker() -> String {
 }
 
 /// Returns the sorted attribute keys of a set of time key markers.
-fn time_key_marker_keys(rows: Vec<KeyValue>) -> Vec<String> {
-    let mut keys = BTreeSet::new();
-    for row in rows {
-        let Some(key) = row.key.strip_prefix(TIME_KEY_INDEX_PREFIX) else {
+fn time_key_marker_keys(keys: Vec<String>) -> Vec<String> {
+    let mut out = BTreeSet::new();
+    for key in keys {
+        let Some(key) = key.strip_prefix(TIME_KEY_INDEX_PREFIX) else {
             continue;
         };
         if !key.is_empty() {
-            keys.insert(key.to_string());
+            out.insert(key.to_string());
         }
     }
-    keys.into_iter().collect()
+    out.into_iter().collect()
 }
 
 /// Returns the sorted attribute keys of a set of time rows.
-fn time_row_keys(rows: Vec<KeyValue>) -> Vec<String> {
-    let mut keys = BTreeSet::new();
-    for row in rows {
-        let Some(rest) = row.key.strip_prefix(TIME_INDEX_PREFIX) else {
+fn time_row_keys(keys: Vec<String>) -> Vec<String> {
+    let mut out = BTreeSet::new();
+    for key in keys {
+        let Some(rest) = key.strip_prefix(TIME_INDEX_PREFIX) else {
             continue;
         };
         let Some((key, _)) = rest.split_once(':') else {
             continue;
         };
         if !key.is_empty() {
-            keys.insert(key.to_string());
+            out.insert(key.to_string());
         }
     }
-    keys.into_iter().collect()
+    out.into_iter().collect()
 }
 
 /// The marker key for one fired timer value.
