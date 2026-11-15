@@ -350,6 +350,12 @@ pub enum RevalidationIssue {
     TypeMismatch(String),
     /// The target version requires an attribute that the entity lacks.
     MissingRequired(String),
+    /// Another entity already holds the same unique attribute value.
+    DuplicateUnique(String),
+    /// An `EntityRef` value names an entity that does not exist.
+    ///
+    /// The field is the attribute name.
+    DanglingRef(String),
     /// The effective target schemas conflict.
     SchemaConflict(String),
 }
@@ -557,6 +563,24 @@ struct PreparedDelete {
     merged: MergedSchema,
 }
 
+/// One entity after validation against a target schema version.
+struct RevalidatedEntity {
+    /// The stored attributes with the schema defaults applied.
+    attributes: BTreeMap<String, AttributeValue>,
+    /// The effective schemas of the target version.
+    effective: Vec<EffectiveSchema>,
+    /// The merged attribute definitions of the target version.
+    merged: MergedSchema,
+}
+
+/// One failed revalidation.
+enum RevalidationFailure {
+    /// The entity fails the target schema version.
+    Issue(RevalidationIssue),
+    /// The store failed, so the call must propagate the error.
+    Error(EntityError),
+}
+
 impl EntityStore {
     /// Creates an entity store over `store` with `schemas`.
     pub fn new(store: OxKvStore, schemas: SchemaRegistry) -> Self {
@@ -695,7 +719,7 @@ impl EntityStore {
         let mut attributes = draft.attributes;
         check_known(&attributes, &merged.attributes)?;
         validate_defaults(&merged.attributes)?;
-        apply_defaults(&mut attributes, &merged.attributes)?;
+        apply_defaults(&mut attributes, &merged.attributes, &BTreeSet::new())?;
         check_types(&attributes, &merged.attributes)?;
         check_required(&attributes, &merged.attributes)?;
 
@@ -768,6 +792,7 @@ impl EntityStore {
     ///
     /// The call loads the entity and checks the expected version.
     /// It applies the patch and the schema defaults.
+    /// A key that the patch removes stays removed.
     /// It checks every attribute.
     /// The call writes no row.
     async fn prepare_update<S>(
@@ -792,6 +817,7 @@ impl EntityStore {
         let merged = merge_schemas(&effective)?;
         validate_defaults(&merged.attributes)?;
         let mut attributes = before.attributes.clone();
+        let mut removed: BTreeSet<String> = BTreeSet::new();
         for (key, value) in &patch.attributes {
             if !merged.attributes.contains_key(key) {
                 return Err(EntityError::UnknownAttribute(key.clone()));
@@ -802,10 +828,11 @@ impl EntityStore {
                 }
                 None => {
                     attributes.remove(key);
+                    removed.insert(key.clone());
                 }
             }
         }
-        apply_defaults(&mut attributes, &merged.attributes)?;
+        apply_defaults(&mut attributes, &merged.attributes, &removed)?;
         check_types(&attributes, &merged.attributes)?;
         check_required(&attributes, &merged.attributes)?;
 
@@ -1027,6 +1054,8 @@ impl EntityStore {
     /// A mismatch is a version conflict and changes nothing.
     /// The call applies the schema defaults after the patch and checks every
     /// attribute.
+    /// A key that the patch removes stays removed.
+    /// A required key that the patch removes returns an error.
     /// The version increases by one.
     /// The write succeeds when the entity rows and the outbox row commit.
     /// A feed failure after the commit leaves the outbox row for the relay.
@@ -1646,7 +1675,10 @@ impl EntityStore {
     /// The call reads at most `limit` entities that pin `schema_id`.
     /// The scan starts after the `after` id when the caller gives a cursor.
     /// It changes no key, no entity version, and no pinned schema.
+    /// The check applies the schema defaults.
+    /// It also checks the unique values and the references.
     /// It records one issue for each invalid entity.
+    /// A store failure is an error and not an issue.
     /// The report holds the cursor for the next page.
     /// A missing target version is [`EntityError::UnknownSchema`].
     pub async fn revalidation_report(
@@ -1674,6 +1706,7 @@ impl EntityStore {
             invalid: Vec::new(),
             next,
         };
+        let mut seen_unique: BTreeSet<(String, String)> = BTreeSet::new();
         for entity in entities {
             if !entity.schemas.iter().any(|schema| schema.id == schema_id) {
                 continue;
@@ -1683,11 +1716,25 @@ impl EntityStore {
                 .revalidate_one(&entity, schema_id, target_version)
                 .await
             {
-                Ok(()) => report.compatible += 1,
-                Err(issue) => report.invalid.push(InvalidEntity {
+                Ok(revalidated) => {
+                    if let Some(issue) = note_unique_values(
+                        &revalidated.attributes,
+                        &revalidated.merged.attributes,
+                        &mut seen_unique,
+                    )? {
+                        report.invalid.push(InvalidEntity {
+                            entity_id: entity.id.clone(),
+                            issue,
+                        });
+                    } else {
+                        report.compatible += 1;
+                    }
+                }
+                Err(RevalidationFailure::Issue(issue)) => report.invalid.push(InvalidEntity {
                     entity_id: entity.id.clone(),
                     issue,
                 }),
+                Err(RevalidationFailure::Error(error)) => return Err(error),
             }
         }
         Ok(report)
@@ -1698,6 +1745,8 @@ impl EntityStore {
     /// The call reads at most `limit` entities that pin `schema_id`.
     /// The scan starts after the `after` id when the caller gives a cursor.
     /// It checks each entity with the target version.
+    /// The check applies the schema defaults.
+    /// It also checks the unique values and the references.
     /// An invalid entity stays unchanged and goes into `invalid`.
     /// A valid entity that already pins `target_version` counts as unchanged.
     /// Any other valid entity counts as migrated.
@@ -1706,7 +1755,8 @@ impl EntityStore {
     /// index rows of the target schema.
     /// An apply writes every entity row and every outbox row in one
     /// transaction.
-    /// A duplicate unique value aborts the batch with no write.
+    /// A duplicate unique value marks the entity as invalid.
+    /// A dangling reference marks the entity as invalid.
     /// A stale entity version aborts the batch with no write.
     /// A store error aborts the batch with no write.
     /// A missing target version is [`EntityError::UnknownSchema`].
@@ -1747,6 +1797,7 @@ impl EntityStore {
         let (entities, next) = self.list_by_schema_after(schema_id, limit, after).await?;
         report.next = next;
         if dry_run {
+            let mut seen_unique: BTreeSet<(String, String)> = BTreeSet::new();
             for entity in entities {
                 if !entity.schemas.iter().any(|schema| schema.id == schema_id) {
                     continue;
@@ -1756,8 +1807,17 @@ impl EntityStore {
                     .revalidate_one(&entity, schema_id, target_version)
                     .await
                 {
-                    Ok(()) => {
-                        if entity.schemas.iter().any(|schema| {
+                    Ok(revalidated) => {
+                        if let Some(issue) = note_unique_values(
+                            &revalidated.attributes,
+                            &revalidated.merged.attributes,
+                            &mut seen_unique,
+                        )? {
+                            report.invalid.push(InvalidEntity {
+                                entity_id: entity.id.clone(),
+                                issue,
+                            });
+                        } else if entity.schemas.iter().any(|schema| {
                             schema.id == schema_id && schema.version == target_version
                         }) {
                             report.unchanged += 1;
@@ -1765,10 +1825,13 @@ impl EntityStore {
                             report.migrated += 1;
                         }
                     }
-                    Err(issue) => report.invalid.push(InvalidEntity {
-                        entity_id: entity.id.clone(),
-                        issue,
-                    }),
+                    Err(RevalidationFailure::Issue(issue)) => {
+                        report.invalid.push(InvalidEntity {
+                            entity_id: entity.id.clone(),
+                            issue,
+                        });
+                    }
+                    Err(RevalidationFailure::Error(error)) => return Err(error),
                 }
             }
             return Ok(report);
@@ -1793,7 +1856,8 @@ impl EntityStore {
     /// The call holds the write lock for the whole batch.
     /// It reloads each entity and rejects a stale version.
     /// An invalid entity goes into `invalid` and is skipped.
-    /// It builds every after entity and every outbox row in memory.
+    /// It builds every after entity from the defaulted attributes.
+    /// It builds every outbox row in memory.
     /// It checks every unique value against the target schema.
     /// One transaction removes the rows of the previous schema and writes the
     /// rows of the target schema.
@@ -1811,6 +1875,7 @@ impl EntityStore {
         let _write = self.write_lock.lock().await;
         let mut result = MigrationBatchResult::default();
         let mut writes: Vec<SchemaMigrationWrite> = Vec::new();
+        let mut seen_unique: BTreeSet<(String, String)> = BTreeSet::new();
 
         for entity in entities {
             let current = {
@@ -1829,18 +1894,30 @@ impl EntityStore {
             if !current.schemas.iter().any(|schema| schema.id == schema_id) {
                 continue;
             }
-            match self
+            let revalidated = match self
                 .revalidate_one(&current, schema_id, target_version)
                 .await
             {
-                Ok(()) => {}
-                Err(issue) => {
+                Ok(revalidated) => revalidated,
+                Err(RevalidationFailure::Issue(issue)) => {
                     result.invalid.push(InvalidEntity {
                         entity_id: current.id.clone(),
                         issue,
                     });
                     continue;
                 }
+                Err(RevalidationFailure::Error(error)) => return Err(error),
+            };
+            if let Some(issue) = note_unique_values(
+                &revalidated.attributes,
+                &revalidated.merged.attributes,
+                &mut seen_unique,
+            )? {
+                result.invalid.push(InvalidEntity {
+                    entity_id: current.id.clone(),
+                    issue,
+                });
+                continue;
             }
             if current
                 .schemas
@@ -1870,21 +1947,16 @@ impl EntityStore {
                 .version
                 .checked_add(1)
                 .ok_or_else(|| EntityError::Internal("entity version overflow".to_string()))?;
+            let effective = revalidated.effective;
+            let merged = revalidated.merged;
             let after = Entity {
                 id: current.id.clone(),
                 version,
                 schemas,
-                attributes: current.attributes.clone(),
+                attributes: revalidated.attributes,
                 created_at: current.created_at,
                 updated_at: chrono::Utc::now().timestamp(),
             };
-            let effective = self.resolve_refs(&after.schemas).await?;
-            let merged = merge_schemas(&effective)?;
-            {
-                let g = self.store.read().await;
-                self.check_entity_refs(&*g, &after.id, &after.attributes, &merged.attributes)
-                    .await?;
-            }
             let outbox =
                 self.prepare_schema_applied_outbox(&after, event_schema_ids(&effective), ctx)?;
             result.migrated += 1;
@@ -1940,13 +2012,16 @@ impl EntityStore {
     /// Validates one entity against a candidate pinned list.
     ///
     /// The candidate replaces `schema_id` with `target_version`.
-    /// The call clones the attributes before it applies defaults.
+    /// The call clones the attributes and applies the schema defaults.
+    /// It checks the types, the required attributes, the unique values, and
+    /// the references.
+    /// A store failure is an error and not a schema conflict.
     async fn revalidate_one(
         &self,
         entity: &Entity,
         schema_id: &str,
         target_version: u64,
-    ) -> Result<(), RevalidationIssue> {
+    ) -> Result<RevalidatedEntity, RevalidationFailure> {
         let refs: Vec<SchemaRef> = entity
             .schemas
             .iter()
@@ -1964,10 +2039,42 @@ impl EntityStore {
         let effective = self
             .resolve_refs(&refs)
             .await
-            .map_err(|error| RevalidationIssue::SchemaConflict(error.to_string()))?;
-        let merged = merge_schemas(&effective)
-            .map_err(|error| RevalidationIssue::SchemaConflict(error.to_string()))?;
-        validate_attributes(&entity.attributes, &merged.attributes)
+            .map_err(revalidation_failure)?;
+        let merged = merge_schemas(&effective).map_err(revalidation_failure)?;
+        let mut attributes = entity.attributes.clone();
+        check_known(&attributes, &merged.attributes).map_err(revalidation_failure)?;
+        validate_defaults(&merged.attributes).map_err(revalidation_failure)?;
+        apply_defaults(&mut attributes, &merged.attributes, &BTreeSet::new())
+            .map_err(revalidation_failure)?;
+        check_types(&attributes, &merged.attributes).map_err(revalidation_failure)?;
+        check_required(&attributes, &merged.attributes).map_err(revalidation_failure)?;
+        let candidate = Entity {
+            id: entity.id.clone(),
+            version: entity.version,
+            schemas: refs,
+            attributes,
+            created_at: entity.created_at,
+            updated_at: entity.updated_at,
+        };
+        {
+            let g = self.store.read().await;
+            self.check_entity_refs(
+                &*g,
+                &candidate.id,
+                &candidate.attributes,
+                &merged.attributes,
+            )
+            .await
+            .map_err(revalidation_failure)?;
+            check_unique_values(&*g, &candidate, &merged.attributes)
+                .await
+                .map_err(revalidation_failure)?;
+        }
+        Ok(RevalidatedEntity {
+            attributes: candidate.attributes,
+            effective,
+            merged,
+        })
     }
 
     /// Lists the entities with an indexed attribute equal to `value`.
@@ -3125,12 +3232,16 @@ fn validate_defaults(defs: &BTreeMap<String, AttributeDef>) -> Result<(), Entity
 }
 
 /// Fills each missing attribute from its schema default.
+///
+/// The call skips each name in `removed`, because the caller removed it
+/// explicitly.
 fn apply_defaults(
     attributes: &mut BTreeMap<String, AttributeValue>,
     defs: &BTreeMap<String, AttributeDef>,
+    removed: &BTreeSet<String>,
 ) -> Result<(), EntityError> {
     for (name, def) in defs {
-        if attributes.contains_key(name) {
+        if attributes.contains_key(name) || removed.contains(name) {
             continue;
         }
         let Some(raw) = &def.default else {
@@ -3151,7 +3262,10 @@ fn value_from_json(value: &serde_json::Value, ty: AttributeType) -> Option<Attri
             .as_str()
             .map(|value| AttributeValue::String(value.to_string())),
         AttributeType::Integer => value.as_i64().map(AttributeValue::Integer),
-        AttributeType::Float => value.as_f64().map(AttributeValue::Float),
+        AttributeType::Float => value
+            .as_f64()
+            .filter(|value| value.is_finite())
+            .map(AttributeValue::Float),
         AttributeType::Boolean => value.as_bool().map(AttributeValue::Boolean),
         AttributeType::Timestamp => value.as_i64().map(AttributeValue::Timestamp),
         AttributeType::Json => Some(AttributeValue::Json(value.clone())),
@@ -3162,6 +3276,8 @@ fn value_from_json(value: &serde_json::Value, ty: AttributeType) -> Option<Attri
 }
 
 /// Checks that every value matches its declared type.
+///
+/// The call rejects a float that is not finite.
 fn check_types(
     attributes: &BTreeMap<String, AttributeValue>,
     defs: &BTreeMap<String, AttributeDef>,
@@ -3170,6 +3286,13 @@ fn check_types(
         let Some(def) = defs.get(key) else {
             return Err(EntityError::UnknownAttribute(key.clone()));
         };
+        if let AttributeValue::Float(value) = value
+            && !value.is_finite()
+        {
+            return Err(EntityError::Invalid(format!(
+                "attribute float is not finite: {key}"
+            )));
+        }
         if !type_matches(def.ty, value) {
             return Err(EntityError::TypeMismatch(key.clone()));
         }
@@ -3179,16 +3302,16 @@ fn check_types(
 
 /// True when `value` has the declared type.
 fn type_matches(ty: AttributeType, value: &AttributeValue) -> bool {
-    matches!(
-        (ty, value),
+    match (ty, value) {
+        (AttributeType::Float, AttributeValue::Float(value)) => value.is_finite(),
         (AttributeType::String, AttributeValue::String(_))
-            | (AttributeType::Integer, AttributeValue::Integer(_))
-            | (AttributeType::Float, AttributeValue::Float(_))
-            | (AttributeType::Boolean, AttributeValue::Boolean(_))
-            | (AttributeType::Timestamp, AttributeValue::Timestamp(_))
-            | (AttributeType::Json, AttributeValue::Json(_))
-            | (AttributeType::EntityRef, AttributeValue::EntityRef(_))
-    )
+        | (AttributeType::Integer, AttributeValue::Integer(_))
+        | (AttributeType::Boolean, AttributeValue::Boolean(_))
+        | (AttributeType::Timestamp, AttributeValue::Timestamp(_))
+        | (AttributeType::Json, AttributeValue::Json(_))
+        | (AttributeType::EntityRef, AttributeValue::EntityRef(_)) => true,
+        _ => false,
+    }
 }
 
 /// Checks that every required attribute has a value.
@@ -3204,31 +3327,50 @@ fn check_required(
     Ok(())
 }
 
-/// Validates cloned attributes against a target attribute map.
-///
-/// The call applies defaults to the clone only.
-/// The call returns the first issue.
-fn validate_attributes(
-    attributes: &BTreeMap<String, AttributeValue>,
-    defs: &BTreeMap<String, AttributeDef>,
-) -> Result<(), RevalidationIssue> {
-    let mut candidate = attributes.clone();
-    check_known(&candidate, defs).map_err(revalidation_issue)?;
-    validate_defaults(defs).map_err(revalidation_issue)?;
-    apply_defaults(&mut candidate, defs).map_err(revalidation_issue)?;
-    check_types(&candidate, defs).map_err(revalidation_issue)?;
-    check_required(&candidate, defs).map_err(revalidation_issue)?;
-    Ok(())
-}
-
 /// Converts an entity error into one revalidation issue.
 fn revalidation_issue(error: EntityError) -> RevalidationIssue {
     match error {
         EntityError::UnknownAttribute(name) => RevalidationIssue::UnknownAttribute(name),
         EntityError::TypeMismatch(name) => RevalidationIssue::TypeMismatch(name),
         EntityError::MissingRequired(name) => RevalidationIssue::MissingRequired(name),
+        EntityError::UniqueViolation(name) => RevalidationIssue::DuplicateUnique(name),
+        EntityError::DanglingRef(name, _) => RevalidationIssue::DanglingRef(name),
         other => RevalidationIssue::SchemaConflict(other.to_string()),
     }
+}
+
+/// Converts an entity error into a revalidation failure.
+///
+/// A store failure and an internal failure stay errors.
+/// The other failures are issues for one entity.
+fn revalidation_failure(error: EntityError) -> RevalidationFailure {
+    match error {
+        EntityError::Store(_) | EntityError::Internal(_) => RevalidationFailure::Error(error),
+        other => RevalidationFailure::Issue(revalidation_issue(other)),
+    }
+}
+
+/// Records the unique values of one candidate entity.
+///
+/// The call uses `seen` to detect a duplicate across one page.
+/// A duplicate leaves `seen` unchanged.
+fn note_unique_values(
+    attributes: &BTreeMap<String, AttributeValue>,
+    defs: &BTreeMap<String, AttributeDef>,
+    seen: &mut BTreeSet<(String, String)>,
+) -> Result<Option<RevalidationIssue>, EntityError> {
+    let mut values: Vec<(String, String)> = Vec::new();
+    for (key, value) in attributes {
+        if !defs.get(key).is_some_and(|def| def.unique) {
+            continue;
+        }
+        values.push((key.clone(), value_hash(value)?));
+    }
+    if let Some((key, _)) = values.iter().find(|value| seen.contains(*value)) {
+        return Ok(Some(RevalidationIssue::DuplicateUnique(key.clone())));
+    }
+    seen.extend(values);
+    Ok(None)
 }
 
 /// Checks every unique value against the unique index.
@@ -4388,6 +4530,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_create_rejects_a_non_finite_float_and_writes_nothing() {
+        let (store, registry, _raw) = new_store().await;
+        registry
+            .publish(schema(
+                "person",
+                &[],
+                vec![attr("score", AttributeType::Float)],
+            ))
+            .await
+            .unwrap();
+
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let result = store
+                .create(
+                    draft(
+                        "e1",
+                        &["person"],
+                        vec![("score", AttributeValue::Float(value))],
+                    ),
+                    &ctx(),
+                )
+                .await;
+
+            assert!(
+                matches!(result, Err(EntityError::Invalid(message)) if message.contains("score"))
+            );
+            assert!(store.get("e1").await.unwrap().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn an_update_rejects_a_non_finite_float_and_keeps_the_stored_value() {
+        let (store, registry, _raw) = new_store().await;
+        registry
+            .publish(schema(
+                "person",
+                &[],
+                vec![attr("score", AttributeType::Float)],
+            ))
+            .await
+            .unwrap();
+        store
+            .create(
+                draft(
+                    "e1",
+                    &["person"],
+                    vec![("score", AttributeValue::Float(1.5))],
+                ),
+                &ctx(),
+            )
+            .await
+            .unwrap();
+
+        let result = store
+            .update(
+                "e1",
+                1,
+                patch(vec![("score", Some(AttributeValue::Float(f64::NAN)))]),
+                &ctx(),
+            )
+            .await;
+
+        assert!(matches!(result, Err(EntityError::Invalid(message)) if message.contains("score")));
+        let stored = store.get("e1").await.unwrap().unwrap();
+        assert_eq!(stored.version, 1);
+        assert_eq!(
+            stored.attributes.get("score"),
+            Some(&AttributeValue::Float(1.5))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_finite_float_survives_the_json_round_trip() {
+        let (store, registry, _raw) = new_store().await;
+        registry
+            .publish(schema(
+                "person",
+                &[],
+                vec![attr("score", AttributeType::Float)],
+            ))
+            .await
+            .unwrap();
+        store
+            .create(
+                draft(
+                    "e1",
+                    &["person"],
+                    vec![("score", AttributeValue::Float(1.5))],
+                ),
+                &ctx(),
+            )
+            .await
+            .unwrap();
+
+        let entity = store.get("e1").await.unwrap().unwrap();
+        let bytes = serde_json::to_vec(&entity).unwrap();
+        let decoded: Entity = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(decoded, entity);
+    }
+
+    #[tokio::test]
     async fn missing_required_attribute_fails() {
         let (store, registry, _raw) = new_store().await;
         registry
@@ -4487,6 +4731,73 @@ mod tests {
         assert!(!removed.attributes.contains_key("title"));
         assert!(!removed.attributes.contains_key("priority"));
         assert_eq!(removed.version, 3);
+    }
+
+    #[tokio::test]
+    async fn a_patch_removes_an_optional_attribute_that_has_a_default() {
+        let (store, registry, _raw) = new_store().await;
+        registry
+            .publish(schema(
+                "task",
+                &[],
+                vec![full_attr(
+                    "status",
+                    AttributeType::String,
+                    false,
+                    false,
+                    false,
+                    Some(serde_json::json!("new")),
+                )],
+            ))
+            .await
+            .unwrap();
+        store
+            .create(draft("e1", &["task"], vec![]), &ctx())
+            .await
+            .unwrap();
+
+        let after = store
+            .update("e1", 1, patch(vec![("status", None)]), &ctx())
+            .await
+            .unwrap()
+            .after
+            .unwrap();
+
+        assert!(!after.attributes.contains_key("status"));
+        assert_eq!(store.get("e1").await.unwrap(), Some(after));
+    }
+
+    #[tokio::test]
+    async fn a_patch_rejects_the_removal_of_a_required_attribute_that_has_a_default() {
+        let (store, registry, _raw) = new_store().await;
+        registry
+            .publish(schema(
+                "task",
+                &[],
+                vec![full_attr(
+                    "status",
+                    AttributeType::String,
+                    true,
+                    false,
+                    false,
+                    Some(serde_json::json!("new")),
+                )],
+            ))
+            .await
+            .unwrap();
+        store
+            .create(draft("e1", &["task"], vec![]), &ctx())
+            .await
+            .unwrap();
+
+        let result = store
+            .update("e1", 1, patch(vec![("status", None)]), &ctx())
+            .await;
+
+        assert!(matches!(result, Err(EntityError::MissingRequired(key)) if key == "status"));
+        let stored = store.get("e1").await.unwrap().unwrap();
+        assert_eq!(stored.version, 1);
+        assert_eq!(stored.attributes.get("status"), Some(&s("new")));
     }
 
     #[tokio::test]
@@ -7798,6 +8109,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_migration_stores_the_schema_default_and_indexes_it() {
+        let (store, registry, _raw) = new_store().await;
+        registry
+            .publish(schema(
+                "task",
+                &[],
+                vec![attr("title", AttributeType::String)],
+            ))
+            .await
+            .unwrap();
+        store
+            .create(draft("e1", &["task"], vec![("title", s("one"))]), &ctx())
+            .await
+            .unwrap();
+        registry
+            .publish(schema(
+                "task",
+                &[],
+                vec![
+                    attr("title", AttributeType::String),
+                    full_attr(
+                        "owner",
+                        AttributeType::String,
+                        true,
+                        true,
+                        false,
+                        Some(serde_json::json!("system")),
+                    ),
+                ],
+            ))
+            .await
+            .unwrap();
+        let feed = Arc::new(RecordingFeed::new());
+        let store = store.with_change_sink(feed.clone());
+
+        let report = store
+            .migrate_schema("task", 2, 100, None, false, &ctx())
+            .await
+            .unwrap();
+
+        assert_eq!(report.migrated, 1);
+        assert!(report.invalid.is_empty());
+        let entity = store.get("e1").await.unwrap().unwrap();
+        assert_eq!(entity.version, 2);
+        assert_eq!(entity.attributes.get("owner"), Some(&s("system")));
+        let found = store
+            .list_by_attribute("owner", &s("system"))
+            .await
+            .unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, "e1");
+        let events = feed.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, EntityEventKind::SchemaApplied);
+        assert_eq!(
+            events[0].snapshot.as_ref().unwrap()["owner"],
+            serde_json::json!("system")
+        );
+    }
+
+    #[tokio::test]
     async fn schema_migration_adds_an_index_row() {
         let (store, registry, _raw) = new_store().await;
         registry
@@ -7840,7 +8212,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn schema_migration_rejects_a_duplicate_unique_value() {
+    async fn schema_migration_reports_a_duplicate_unique_value_in_the_dry_run_and_the_apply() {
         let (store, registry, _raw) = new_store().await;
         registry
             .publish(schema(
@@ -7872,12 +8244,25 @@ mod tests {
             .await
             .unwrap();
 
-        let result = store
+        let dry_run = store
+            .migrate_schema("task", 2, 100, None, true, &ctx())
+            .await
+            .unwrap();
+        let applied = store
             .migrate_schema("task", 2, 100, None, false, &ctx())
-            .await;
+            .await
+            .unwrap();
 
-        assert!(matches!(result, Err(EntityError::UniqueViolation(ref key)) if key == "tag"));
-        assert_eq!(store.get("e1").await.unwrap().unwrap().version, 1);
+        for report in [&dry_run, &applied] {
+            assert_eq!(report.migrated, 1);
+            assert_eq!(report.invalid.len(), 1);
+            assert_eq!(report.invalid[0].entity_id, "e2");
+            assert_eq!(
+                report.invalid[0].issue,
+                RevalidationIssue::DuplicateUnique("tag".to_string())
+            );
+        }
+        assert_eq!(store.get("e1").await.unwrap().unwrap().version, 2);
         assert_eq!(store.get("e2").await.unwrap().unwrap().version, 1);
     }
 
@@ -8700,7 +9085,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_migration_that_introduces_a_dangling_reference_writes_no_row() {
+    async fn a_migration_reports_a_dangling_reference_in_the_dry_run_and_the_apply() {
         let (store, registry, _) = reference_store(true).await;
         store.create(customer("c1"), &ctx()).await.unwrap();
         store.create(order("o1", "c1"), &ctx()).await.unwrap();
@@ -8717,11 +9102,24 @@ mod tests {
             .await
             .unwrap();
 
-        let result = store
+        let dry_run = store
+            .migrate_schema("order", 2, 100, None, true, &ctx())
+            .await
+            .unwrap();
+        let applied = store
             .migrate_schema("order", 2, 100, None, false, &ctx())
-            .await;
+            .await
+            .unwrap();
 
-        assert!(matches!(result, Err(EntityError::DanglingRef(_, _))));
+        for report in [&dry_run, &applied] {
+            assert_eq!(report.migrated, 0);
+            assert_eq!(report.invalid.len(), 1);
+            assert_eq!(report.invalid[0].entity_id, "o1");
+            assert_eq!(
+                report.invalid[0].issue,
+                RevalidationIssue::DanglingRef("customer".to_string())
+            );
+        }
         let stored = store.get("o1").await.unwrap().unwrap();
         assert_eq!(stored.version, 1);
         assert_eq!(stored.schemas[0].version, 1);
