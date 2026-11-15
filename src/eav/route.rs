@@ -124,6 +124,7 @@ impl ApiModule for EavApiModule {
             .service(create_entity)
             .service(list_entities)
             .service(query_entities)
+            .service(list_entity_referrers)
             .service(get_entity)
             .service(patch_entity)
             .service(delete_entity)
@@ -399,6 +400,22 @@ pub struct DeadLetterPage {
     /// Fetch it and stop when the page is empty.
     /// The value is `None` when the next offset would pass the cap.
     pub next_offset: Option<usize>,
+}
+
+/// A page of entity ids that reference one target entity.
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
+pub struct ReferrerPage {
+    /// The distinct source entity ids on this page, sorted by id.
+    pub items: Vec<String>,
+    /// `Some` means the page was full and a following page may exist.
+    /// Fetch it and stop when the page is empty.
+    /// The value is `None` when the next offset would pass the cap.
+    pub next_offset: Option<usize>,
+    /// The id to resume after for the next page.
+    ///
+    /// The value is `Some` only in cursor mode.
+    /// The value is `None` when the scan is exhausted.
+    pub next: Option<String>,
 }
 
 /// The body of the entity query route.
@@ -1125,6 +1142,105 @@ async fn query_entities(
     Ok(HttpResponse::Ok().json(EntityQueryPage { items, next }))
 }
 
+/// Reads one cursor page of referrer ids and keeps only the rows that the
+/// caller can read.
+///
+/// The call reads at most [`CURSOR_SCAN_BATCH`] raw pages.
+/// It stops when the visible page is full or the raw scan ends.
+/// The returned cursor is the last visible source id.
+/// A raw cursor stays inside this function, so `next` never names a row that
+/// the caller cannot read.
+async fn visible_referrer_page(
+    runtime: &EavRuntime,
+    policy: &Authorizer,
+    sub: &str,
+    target_id: &str,
+    limit: usize,
+    after: Option<String>,
+) -> Result<(Vec<String>, Option<String>), EavApiError> {
+    let mut items: Vec<String> = Vec::with_capacity(limit);
+    let mut cursor = after;
+    for _ in 0..CURSOR_SCAN_BATCH {
+        let (raw, raw_next) = runtime
+            .entities()
+            .list_referrers_after(target_id, limit, cursor.as_deref())
+            .await?;
+        let raw_len = raw.len();
+        for (position, source) in raw.into_iter().enumerate() {
+            if can_read_entity(policy, sub, &source).await? {
+                let id = source.clone();
+                items.push(source);
+                if items.len() == limit {
+                    if position + 1 == raw_len && raw_next.is_none() {
+                        return Ok((items, None));
+                    }
+                    return Ok((items, Some(id)));
+                }
+            }
+        }
+        match raw_next {
+            Some(next) => cursor = Some(next),
+            None => return Ok((items, None)),
+        }
+    }
+    Ok((items, None))
+}
+
+/// Lists the distinct entity ids that reference one entity.
+///
+/// The caller needs a row grant or a collection grant on the target entity.
+/// An unknown target returns `404`.
+/// The handler filters each source id with the same rule.
+/// An id that the caller cannot read is not in the page and is not a cursor.
+/// A marker whose source entity is gone stays visible, so an operator can
+/// find the stale marker.
+#[utoipa::path(get, path = "/eav/entities/{id}/referrers", tag = "eav", params(("id" = String, Path), PageQuery), responses((status=200, body=ReferrerPage), (status=400, body=crate::http::error::ErrorBody), (status=401, body=crate::http::error::ErrorBody), (status=403, body=crate::http::error::ErrorBody), (status=404, body=crate::http::error::ErrorBody), (status=500, body=crate::http::error::ErrorBody)))]
+#[get("/entities/{id}/referrers")]
+async fn list_entity_referrers(
+    runtime: web::Data<EavRuntime>,
+    policy: web::Data<Authorizer>,
+    claims: Validated<Claims>,
+    path: web::Path<String>,
+    query: web::Query<PageQuery>,
+) -> Result<HttpResponse, EavApiError> {
+    let id = path.into_inner();
+    require_entity(&policy, &claims.sub, &id, Action::Read).await?;
+    if runtime.entities().get(&id).await?.is_none() {
+        return Err(EavApiError::not_found());
+    }
+    let (limit, mode) = query.into_inner().resolve()?;
+    match mode {
+        PageMode::Cursor(after) => {
+            let (items, next) =
+                visible_referrer_page(&runtime, &policy, &claims.sub, &id, limit, after).await?;
+            Ok(HttpResponse::Ok().json(ReferrerPage {
+                items,
+                next_offset: None,
+                next,
+            }))
+        }
+        PageMode::Offset(offset) => {
+            let raw = runtime
+                .entities()
+                .list_referrers_page(&id, limit, offset)
+                .await?;
+            let raw_len = raw.len();
+            let mut items = Vec::with_capacity(raw_len);
+            for source in raw {
+                if can_read_entity(&policy, &claims.sub, &source).await? {
+                    items.push(source);
+                }
+            }
+            let next_offset = page_next_offset(offset, raw_len, limit);
+            Ok(HttpResponse::Ok().json(ReferrerPage {
+                items,
+                next_offset,
+                next: None,
+            }))
+        }
+    }
+}
+
 #[utoipa::path(get, path = "/eav/entities/{id}", tag = "eav", params(("id" = String, Path)), responses((status=200, body=crate::eav::entity::Entity), (status=401, body=crate::http::error::ErrorBody), (status=403, body=crate::http::error::ErrorBody), (status=404, body=crate::http::error::ErrorBody), (status=500, body=crate::http::error::ErrorBody)))]
 #[get("/entities/{id}")]
 async fn get_entity(
@@ -1489,6 +1605,7 @@ mod tests {
         "/eav/entities",
         "/eav/entities/query",
         "/eav/entities/{id}",
+        "/eav/entities/{id}/referrers",
         "/eav/rules",
         "/eav/rules/{id}",
         "/eav/rules/{id}/enabled",
@@ -1688,6 +1805,36 @@ mod tests {
                 },
                 &WriteContext::new("alice"),
             )
+            .await?;
+        Ok(())
+    }
+
+    async fn publish_node_schema(fx: &Fixture) -> anyhow::Result<()> {
+        publish_schema_version(fx, "node", vec![attr("parent", AttributeType::EntityRef)]).await
+    }
+
+    fn node_draft(id: &str, parent: Option<&str>) -> EntityDraft {
+        let attributes = parent
+            .map(|parent| {
+                [(
+                    "parent".to_string(),
+                    AttributeValue::EntityRef(parent.to_string()),
+                )]
+                .into_iter()
+                .collect()
+            })
+            .unwrap_or_default();
+        EntityDraft {
+            id: id.to_string(),
+            schemas: vec!["node".to_string()],
+            attributes,
+        }
+    }
+
+    async fn create_node(fx: &Fixture, id: &str, parent: Option<&str>) -> anyhow::Result<()> {
+        fx.runtime
+            .entities()
+            .create(node_draft(id, parent), &WriteContext::new("alice"))
             .await?;
         Ok(())
     }
@@ -4217,6 +4364,263 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0]["id"], "e1");
         assert_eq!(page["next_offset"], Value::Null);
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn referrers_list_distinct_sources_without_the_target_or_a_self_reference()
+    -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        assert!(fx.engine.claim_superadmin("alice").await?);
+        publish_node_schema(&fx).await?;
+        create_node(&fx, "root", None).await?;
+        create_node(&fx, "a", Some("root")).await?;
+        create_node(&fx, "b", Some("root")).await?;
+        create_node(&fx, "s1", None).await?;
+        fx.runtime
+            .entities()
+            .update(
+                "s1",
+                1,
+                EntityPatch {
+                    attributes: [(
+                        "parent".to_string(),
+                        Some(AttributeValue::EntityRef("s1".to_string())),
+                    )]
+                    .into_iter()
+                    .collect(),
+                },
+                &WriteContext::new("alice"),
+            )
+            .await?;
+
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::get().uri("/eav/entities/root/referrers"),
+                &token,
+            )
+            .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let page: Value = actix_test::read_body_json(res).await;
+        assert_eq!(page["items"], json!(["a", "b"]));
+        assert!(page["next_offset"].is_null());
+        assert!(page["next"].is_null());
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::get().uri("/eav/entities/s1/referrers"),
+                &token,
+            )
+            .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let page: Value = actix_test::read_body_json(res).await;
+        assert_eq!(page["items"], json!([]));
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn referrers_page_with_offset_and_with_a_cursor() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        assert!(fx.engine.claim_superadmin("alice").await?);
+        publish_node_schema(&fx).await?;
+        create_node(&fx, "root", None).await?;
+        for id in ["a", "b", "c"] {
+            create_node(&fx, id, Some("root")).await?;
+        }
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::get().uri("/eav/entities/root/referrers?limit=2&offset=0"),
+                &token,
+            )
+            .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let page: Value = actix_test::read_body_json(res).await;
+        assert_eq!(page["items"], json!(["a", "b"]));
+        assert_eq!(page["next_offset"], 2);
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::get().uri("/eav/entities/root/referrers?limit=2&offset=2"),
+                &token,
+            )
+            .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let page: Value = actix_test::read_body_json(res).await;
+        assert_eq!(page["items"], json!(["c"]));
+        assert!(page["next_offset"].is_null());
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::get().uri("/eav/entities/root/referrers?limit=2&after="),
+                &token,
+            )
+            .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let page: Value = actix_test::read_body_json(res).await;
+        assert_eq!(page["items"], json!(["a", "b"]));
+        assert_eq!(page["next"], "b");
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::get().uri("/eav/entities/root/referrers?limit=2&after=b"),
+                &token,
+            )
+            .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let page: Value = actix_test::read_body_json(res).await;
+        assert_eq!(page["items"], json!(["c"]));
+        assert!(page["next"].is_null());
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn a_dangling_referrer_marker_stays_visible() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        assert!(fx.engine.claim_superadmin("alice").await?);
+        publish_node_schema(&fx).await?;
+        create_node(&fx, "root", None).await?;
+        fx.runtime
+            .entities()
+            .write_referrer_marker_for_test("root", "ghost", "parent")
+            .await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::get().uri("/eav/entities/root/referrers"),
+                &token,
+            )
+            .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let page: Value = actix_test::read_body_json(res).await;
+        assert_eq!(page["items"], json!(["ghost"]));
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn referrers_are_404_for_an_unknown_target() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        assert!(fx.engine.claim_superadmin("alice").await?);
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::get().uri("/eav/entities/ghost/referrers"),
+                &fx.token("alice")?,
+            )
+            .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::NOT_FOUND);
+        let body: crate::http::error::ErrorBody = actix_test::read_body_json(res).await;
+        assert_eq!(body.code.as_deref(), Some("not_found"));
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn referrers_are_404_for_a_deleted_target() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        assert!(fx.engine.claim_superadmin("alice").await?);
+        publish_node_schema(&fx).await?;
+        create_node(&fx, "root", None).await?;
+        create_node(&fx, "a", Some("root")).await?;
+        fx.runtime
+            .entities()
+            .delete("root", 1, true, &WriteContext::new("alice"))
+            .await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::get().uri("/eav/entities/root/referrers"),
+                &fx.token("alice")?,
+            )
+            .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::NOT_FOUND);
+        let body: crate::http::error::ErrorBody = actix_test::read_body_json(res).await;
+        assert_eq!(body.code.as_deref(), Some("not_found"));
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn referrers_apply_the_row_grant_and_refuse_an_unauthorized_caller() -> anyhow::Result<()>
+    {
+        let fx = fixture().await?;
+        publish_node_schema(&fx).await?;
+        create_node(&fx, "root", None).await?;
+        create_node(&fx, "a", Some("root")).await?;
+        create_node(&fx, "b", Some("root")).await?;
+        fx.engine
+            .assign_group("carol".into(), "row-readers".into())
+            .await?;
+        for id in ["root", "a"] {
+            fx.engine
+                .add_rule("row-readers".into(), format!("entity:{id}"), Action::Read)
+                .await?;
+        }
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::get().uri("/eav/entities/root/referrers"),
+                &fx.token("carol")?,
+            )
+            .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let page: Value = actix_test::read_body_json(res).await;
+        assert_eq!(page["items"], json!(["a"]));
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::get().uri("/eav/entities/root/referrers"),
+                &fx.token("bob")?,
+            )
+            .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::FORBIDDEN);
         Ok(())
     }
 

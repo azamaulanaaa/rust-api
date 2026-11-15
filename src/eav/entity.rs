@@ -1915,6 +1915,86 @@ impl EntityStore {
         Ok((entities, next))
     }
 
+    /// Lists one page of the distinct entity ids that reference `target_id`.
+    ///
+    /// The call reads the `idx:ref:{target_id}:` family only.
+    /// A marker from `target_id` itself does not count.
+    /// The result is sorted by source entity id.
+    /// The call skips `offset` ids.
+    /// It then returns at most `limit` ids.
+    /// A `limit` of 0 returns an empty list.
+    ///
+    /// The call reads the index, not the entity rows.
+    /// A marker whose source entity is gone stays visible.
+    /// An operator can then find the stale marker.
+    pub async fn list_referrers_page(
+        &self,
+        target_id: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<String>, EntityError> {
+        validate_name("entity id", target_id)?;
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let g = self.store.read().await;
+        let sources =
+            scan_referrer_sources(&*g, target_id, None, offset.saturating_add(limit)).await?;
+        Ok(sources.into_iter().skip(offset).take(limit).collect())
+    }
+
+    /// Lists one page of the distinct entity ids that reference `target_id`.
+    ///
+    /// The call reads the `idx:ref:{target_id}:` family only.
+    /// A marker from `target_id` itself does not count.
+    /// The result is sorted by source entity id.
+    /// The scan starts after the `after` source id when the caller gives a
+    /// cursor.
+    /// The call reads one extra source id as a look-ahead.
+    /// The cursor is the last source id of the page when the extra id exists.
+    /// The cursor is `None` when the scan is exhausted.
+    /// A `limit` of 0 returns an empty list and no cursor.
+    pub async fn list_referrers_after(
+        &self,
+        target_id: &str,
+        limit: usize,
+        after: Option<&str>,
+    ) -> Result<(Vec<String>, Option<String>), EntityError> {
+        validate_name("entity id", target_id)?;
+        if limit == 0 {
+            return Ok((Vec::new(), None));
+        }
+        let g = self.store.read().await;
+        let mut sources =
+            scan_referrer_sources(&*g, target_id, after, limit.saturating_add(1)).await?;
+        let has_more = sources.len() > limit;
+        sources.truncate(limit);
+        let next = if has_more {
+            sources.last().cloned()
+        } else {
+            None
+        };
+        Ok((sources, next))
+    }
+
+    /// Writes one reverse reference marker. The call exists only in a test
+    /// build.
+    ///
+    /// The route tests use it to model a marker whose source entity is gone.
+    #[cfg(test)]
+    pub(crate) async fn write_referrer_marker_for_test(
+        &self,
+        target_id: &str,
+        source_id: &str,
+        attribute: &str,
+    ) -> Result<(), EntityError> {
+        let g = self.store.write().await;
+        g.set_bytes(&ref_index_key(target_id, source_id, attribute), b"")
+            .await
+            .map(|_| ())
+            .map_err(EntityError::Store)
+    }
+
     /// Checks stored entities against a target schema version.
     ///
     /// The call reads at most `limit` entities that pin `schema_id`.
@@ -4193,6 +4273,74 @@ where
         }
     }
     Ok(sources.len())
+}
+
+/// Reads the distinct source ids of the reverse references to `target_id`.
+///
+/// The call scans the `idx:ref:{target_id}:` family in pages.
+/// It skips the markers of `target_id` itself.
+/// It skips the markers of the `after` source id.
+/// It stops when it holds `take` distinct source ids or the family ends.
+/// The result is sorted by source entity id.
+async fn scan_referrer_sources<S>(
+    store: &S,
+    target_id: &str,
+    after: Option<&str>,
+    take: usize,
+) -> Result<Vec<String>, EntityError>
+where
+    S: GetSet + ?Sized + Sync,
+{
+    if take == 0 {
+        return Ok(Vec::new());
+    }
+    let prefix = ref_target_prefix(target_id);
+    let end = KeyPrefix::new(&prefix).upper_bound();
+    let mut start = match after {
+        Some(cursor) => {
+            validate_name("entity id", cursor)?;
+            format!("{prefix}{cursor}\0")
+        }
+        None => prefix.clone(),
+    };
+    let mut sources = Vec::new();
+    let mut seen = BTreeSet::new();
+    loop {
+        let rows = store
+            .gets_keys(
+                Some(REF_SCAN_PAGE),
+                Direction::Next,
+                (Some(start.clone()), end.clone()),
+            )
+            .await
+            .map_err(EntityError::Store)?;
+        let full = rows.len() == REF_SCAN_PAGE;
+        for marker in &rows {
+            start = format!("{marker}\0");
+            let Some(rest) = marker.strip_prefix(&prefix) else {
+                continue;
+            };
+            let Some((source, attribute)) = rest.split_once(':') else {
+                continue;
+            };
+            if source.is_empty() || attribute.is_empty() || source == target_id {
+                continue;
+            }
+            if after == Some(source) {
+                continue;
+            }
+            if seen.insert(source.to_string()) {
+                sources.push(source.to_string());
+                if sources.len() == take {
+                    return Ok(sources);
+                }
+            }
+        }
+        if !full {
+            break;
+        }
+    }
+    Ok(sources)
 }
 
 /// Deletes the timer markers of timestamp values that changed.
@@ -10354,6 +10502,62 @@ mod tests {
             matches!(error, EntityError::Referenced { count: 3, .. }),
             "unexpected error: {error}"
         );
+    }
+
+    #[tokio::test]
+    async fn referrer_list_excludes_the_target_and_lists_each_source_once() {
+        let (store, _, _) = reference_store(false).await;
+        store.create(customer("c1"), &ctx()).await.unwrap();
+        store.create(order("o1", "c1"), &ctx()).await.unwrap();
+        store.create(order("o2", "c1"), &ctx()).await.unwrap();
+        store.create(order("s1", "s1"), &ctx()).await.unwrap();
+
+        let refs = store.list_referrers_page("c1", 10, 0).await.unwrap();
+        let self_refs = store.list_referrers_page("s1", 10, 0).await.unwrap();
+
+        assert_eq!(refs, vec!["o1".to_string(), "o2".to_string()]);
+        assert!(self_refs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn referrer_pages_cross_the_scan_page_and_use_a_cursor() {
+        let (store, _, _) = reference_store(true).await;
+        store.create(customer("c1"), &ctx()).await.unwrap();
+        for id in ["o1", "o2", "o3"] {
+            store.create(order(id, "c1"), &ctx()).await.unwrap();
+        }
+
+        assert_eq!(
+            store.list_referrers_page("c1", 2, 0).await.unwrap(),
+            vec!["o1".to_string(), "o2".to_string()]
+        );
+        assert_eq!(
+            store.list_referrers_page("c1", 2, 2).await.unwrap(),
+            vec!["o3".to_string()]
+        );
+
+        let (first, next) = store.list_referrers_after("c1", 1, None).await.unwrap();
+        assert_eq!(first, vec!["o1".to_string()]);
+        assert_eq!(next.as_deref(), Some("o1"));
+        let (second, next) = store
+            .list_referrers_after("c1", 2, next.as_deref())
+            .await
+            .unwrap();
+        assert_eq!(second, vec!["o2".to_string(), "o3".to_string()]);
+        assert!(next.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_referrer_marker_with_no_source_entity_stays_visible() {
+        let (store, _, raw) = reference_store(true).await;
+        store.create(customer("c1"), &ctx()).await.unwrap();
+        raw.set_bytes(&ref_index_key("c1", "ghost", "customer"), b"")
+            .await
+            .unwrap();
+
+        let refs = store.list_referrers_page("c1", 10, 0).await.unwrap();
+
+        assert_eq!(refs, vec!["ghost".to_string()]);
     }
 
     #[tokio::test]
