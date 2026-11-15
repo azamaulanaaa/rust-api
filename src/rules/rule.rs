@@ -62,8 +62,10 @@ impl RuleDraft {
     /// Checks the draft before the store writes it.
     ///
     /// The call rejects an empty trigger, a duplicate trigger entry, an
-    /// invalid identifier, a condition tree deeper than 16 levels, or an
-    /// invalid capability list.
+    /// unsupported trigger event, an invalid identifier, a condition tree
+    /// deeper than 16 levels, or an invalid capability list.
+    /// The trigger must not name [`EntityEventKind::SchemaRemoved`], because
+    /// no code path emits that event.
     pub fn validate(&self) -> Result<(), RuleError> {
         validate_identifier("rule id", &self.id)?;
         validate_identifier("action kind", &self.action.kind)?;
@@ -72,6 +74,13 @@ impl RuleDraft {
         }
         if self.trigger.schemas.is_empty() {
             return Err(RuleError::Invalid("trigger schemas are empty".to_string()));
+        }
+        if self
+            .trigger
+            .events
+            .contains(&EntityEventKind::SchemaRemoved)
+        {
+            return Err(RuleError::UnsupportedTrigger("schema_removed".to_string()));
         }
         for (index, event) in self.trigger.events.iter().enumerate() {
             if self.trigger.events[..index].contains(event) {
@@ -795,6 +804,24 @@ mod tests {
             },
             capabilities: RuleCapabilities::default(),
         }
+    }
+
+    /// The draft rejects a trigger event that no code path emits.
+    #[test]
+    fn a_rule_draft_rejects_the_schema_removed_trigger() {
+        let mut rule = draft();
+        rule.trigger.events = vec![EntityEventKind::SchemaRemoved];
+
+        assert!(matches!(
+            rule.validate(),
+            Err(RuleError::UnsupportedTrigger(message)) if message == "schema_removed"
+        ));
+
+        rule.trigger.events = vec![EntityEventKind::Created, EntityEventKind::SchemaRemoved];
+        assert!(matches!(
+            rule.validate(),
+            Err(RuleError::UnsupportedTrigger(message)) if message == "schema_removed"
+        ));
     }
 
     /// An old stored rule has no capability field, so it gets two empty lists.

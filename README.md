@@ -322,7 +322,7 @@ A `Script` condition is a sandboxed Rhai expression that returns a boolean. The 
 
 A script reads three values:
 
-- `event`: a map with `event_id`, `entity_id`, `kind`, `schemas`, `changed`, `correlation_id`, and `causation_id`. `kind` is one of `created`, `updated`, `deleted`, `schema_applied`, or `timer`. The type also defines `schema_removed`, but no code path emits it today. `changed` holds `{key, before, after}` maps.
+- `event`: a map with `event_id`, `entity_id`, `kind`, `schemas`, `changed`, `correlation_id`, and `causation_id`. `kind` is one of `created`, `updated`, `deleted`, `schema_applied`, or `timer`. The type also defines `schema_removed`, but no code path emits it today. A rule trigger cannot name `schema_removed`. `changed` holds `{key, before, after}` maps.
 - `entity`: `()` when the entity is absent, or a map with `id`, `version`, `schemas`, and `attributes`. The attribute values are plain JSON.
 - `now`: the current Unix time in seconds.
 
