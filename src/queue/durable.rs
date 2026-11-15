@@ -41,7 +41,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use oxkv::{GetSet as _, Store as _, Transaction as _};
+use oxkv::{
+    GetSet as _, KeyPrefix, ScanExt as _, Store as _, StoreError, Transaction as _, TxCas as _,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::{debug, instrument};
@@ -430,24 +432,10 @@ impl super::JobQueue for DurableQueue {
         }
         let mut job = job;
         super::inject_trace_context(&mut job.headers);
-        if let Some(key) = &job.idempotency_key {
-            let ik = Self::idempotency_key(key);
-            let g = self.store.read().await;
-            if let Some(bytes) = g
-                .get_bytes(&ik)
-                .await
-                .map_err(|e| QueueError::Store(e.to_string()))?
-            {
-                drop(g);
-                let id_str =
-                    String::from_utf8(bytes).map_err(|e| QueueError::Store(e.to_string()))?;
-                if let Ok(id) = id_str.parse::<Uuid>() {
-                    return Ok(id);
-                }
-            } else {
-                drop(g);
-            }
-        }
+        let idempotency_key = job
+            .idempotency_key
+            .as_ref()
+            .map(|key| Self::idempotency_key(key));
         let id = job.id;
         let sj = StoredJob {
             job: job.clone(),
@@ -462,14 +450,34 @@ impl super::JobQueue for DurableQueue {
         tx.set_bytes(&Self::queued_key(id), b"")
             .await
             .map_err(|e| QueueError::Store(e.to_string()))?;
-        if let Some(key) = &job.idempotency_key {
-            tx.set_bytes(&Self::idempotency_key(key), id.to_string().as_bytes())
+        if let Some(key) = &idempotency_key {
+            tx.set_if_absent(key, id.to_string().as_bytes())
                 .await
                 .map_err(|e| QueueError::Store(e.to_string()))?;
         }
-        tx.commit()
-            .await
-            .map_err(|e| QueueError::Store(e.to_string()))?;
+        match tx.commit().await {
+            Ok(()) => {}
+            Err(StoreError::TxConflict {
+                key,
+                current: Some(current),
+            }) if Some(&key) == idempotency_key.as_ref() => {
+                drop(g);
+                let id_str =
+                    String::from_utf8(current).map_err(|e| QueueError::Store(e.to_string()))?;
+                let existing = id_str
+                    .parse::<Uuid>()
+                    .map_err(|e| QueueError::Store(e.to_string()))?;
+                return Ok(existing);
+            }
+            Err(StoreError::TxConflict { key, current: None })
+                if Some(&key) == idempotency_key.as_ref() =>
+            {
+                return Err(QueueError::Store(
+                    "idempotency key conflict has no stored id".to_string(),
+                ));
+            }
+            Err(error) => return Err(QueueError::Store(error.to_string())),
+        }
         drop(g);
         self.metrics.record_enqueued();
         // Best-effort depth for telemetry. Count the queued markers only.
@@ -895,6 +903,33 @@ mod tests {
         j2.idempotency_key = Some("key-1".to_string());
         let id2 = q.enqueue(j2).await.unwrap();
         assert_eq!(id1, id2);
+    }
+
+    #[tokio::test]
+    async fn a_duplicate_idempotent_enqueue_writes_one_job_and_one_marker() {
+        let q = queue().await;
+        let mut first = job("work");
+        first.idempotency_key = Some("key-2".to_string());
+        let first_id = first.id;
+        let got_first = q.enqueue(first).await.unwrap();
+        let mut second = job("work");
+        second.id = Uuid::now_v7();
+        second.idempotency_key = Some("key-2".to_string());
+        let got_second = q.enqueue(second).await.unwrap();
+
+        assert_eq!(got_first, first_id);
+        assert_eq!(got_second, first_id, "the stored id must be returned");
+        let g = q.store.read().await;
+        let job_rows = g
+            .count_prefix(KeyPrefix::new(JOB_PREFIX), usize::MAX)
+            .await
+            .unwrap();
+        let queued_rows = g
+            .count_prefix(KeyPrefix::new(QUEUED_PREFIX), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(job_rows, 1, "one job row must exist");
+        assert_eq!(queued_rows, 1, "one queued marker must exist");
     }
 
     async fn put_job(q: &DurableQueue, job: Job, status: JobStatus) {
