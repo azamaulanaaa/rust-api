@@ -251,6 +251,22 @@ const TIME_KEY_BACKFILL_SUFFIX: &str = "backfilled";
 /// Key prefix for fired timer markers.
 const TIMER_MARKER_PREFIX: &str = "timer:fired:";
 
+/// Key prefix for script execution markers.
+///
+/// A script action writes its marker in the entity-store transaction.
+/// The rule engine reads the marker from this store.
+const EXECUTION_MARKER_PREFIX: &str = "rule:exec:";
+
+/// The largest number of execution markers that one cleanup page reads.
+#[cfg(not(test))]
+const EXECUTION_GC_BATCH: usize = 200;
+
+/// The largest number of execution markers that one cleanup page reads.
+///
+/// Test builds use a small page, so that a test can cross a page boundary.
+#[cfg(test)]
+const EXECUTION_GC_BATCH: usize = 2;
+
 /// Maximum size of an entity id or an attribute name, in bytes.
 const MAX_NAME_BYTES: usize = 128;
 
@@ -1321,6 +1337,80 @@ impl EntityStore {
             );
         }
         Ok(changes)
+    }
+
+    /// True when one execution marker key exists.
+    ///
+    /// The key is the full marker key.
+    /// A script action writes its marker in the entity-store transaction.
+    pub(crate) async fn has_execution_marker(&self, key: &str) -> Result<bool, EntityError> {
+        let g = self.store.read().await;
+        Ok(g.get_bytes(key)
+            .await
+            .map_err(EntityError::Store)?
+            .is_some())
+    }
+
+    /// Deletes the old script execution markers.
+    ///
+    /// Each marker holds a JSON Unix timestamp in seconds.
+    /// The call deletes a marker when its timestamp is less than `older_than`.
+    /// A marker that does not decode stays in place.
+    /// The call logs a warning for that row and continues the pass.
+    ///
+    /// The call reads the `rule:exec:` family in pages of
+    /// `EXECUTION_GC_BATCH` rows.
+    /// It deletes the expired rows of one page, then reads again.
+    /// It moves its cursor forward only when a page holds no expired row.
+    /// Thus a delete cannot skip a live row.
+    /// The return value is the number of deleted rows.
+    pub(crate) async fn gc_execution_markers(&self, older_than: i64) -> Result<usize, EntityError> {
+        let mut deleted = 0usize;
+        // None starts at the first row. A set value resumes at that key.
+        let mut cursor: Option<String> = None;
+        loop {
+            let rows = {
+                let g = self.store.read().await;
+                execution_marker_page(&g, cursor.as_deref()).await?
+            };
+            if rows.is_empty() {
+                break;
+            }
+            let Some(last_key) = rows.last().map(|row| row.key.clone()) else {
+                break;
+            };
+            let mut expired = Vec::new();
+            for row in rows {
+                match serde_json::from_slice::<i64>(&row.value) {
+                    Ok(at) if at < older_than => expired.push(row.key),
+                    Ok(_) => {}
+                    Err(_) => {
+                        tracing::warn!(
+                            key = %row.key,
+                            "execution marker does not decode; keep it"
+                        );
+                    }
+                }
+            }
+            if expired.is_empty() {
+                cursor = Some(last_key);
+                continue;
+            }
+            let count = expired.len();
+            {
+                let _write = self.write_lock.lock().await;
+                let g = self.store.write().await;
+                let tx = g.begin_tx().map_err(EntityError::Store)?;
+                for key in &expired {
+                    tx.delete(key).await.map_err(EntityError::Store)?;
+                }
+                tx.commit().await.map_err(EntityError::Store)?;
+            }
+            deleted += count;
+            // Do not move the cursor. The next page starts at the same key,
+            // because a delete can otherwise skip a live row.
+        }
+        Ok(deleted)
     }
 
     /// Delivers pending outbox rows to the change feed in batches.
@@ -3743,6 +3833,32 @@ where
         .gets_bytes(max, Direction::Next, cursor)
         .await
         .map_err(EntityError::Store)
+}
+
+/// Reads one bounded page of script execution markers.
+///
+/// The cursor is inclusive.
+/// When `after` is set, the call drops the resume key itself, so that the
+/// caller does not read one key twice.
+async fn execution_marker_page(
+    store: &OxKvStore,
+    after: Option<&str>,
+) -> Result<Vec<KeyValue>, EntityError> {
+    let start = after.map_or_else(|| EXECUTION_MARKER_PREFIX.to_string(), ToString::to_string);
+    let cursor = (
+        Some(start),
+        KeyPrefix::new(EXECUTION_MARKER_PREFIX).upper_bound(),
+    );
+    let mut rows = store
+        .gets_bytes(Some(EXECUTION_GC_BATCH), Direction::Next, cursor)
+        .await
+        .map_err(EntityError::Store)?;
+    if let Some(resume) = after
+        && rows.first().is_some_and(|row| row.key == resume)
+    {
+        rows.remove(0);
+    }
+    Ok(rows)
 }
 
 /// The key that holds the metadata of an entity.

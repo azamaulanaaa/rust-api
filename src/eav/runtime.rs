@@ -587,6 +587,10 @@ impl EavRuntime {
                 .gc_executions(older_than)
                 .await
                 .context("delete the old EAV execution markers")?;
+            self.entities
+                .gc_execution_markers(older_than)
+                .await
+                .context("delete the old EAV script markers")?;
         }
     }
 

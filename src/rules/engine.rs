@@ -31,6 +31,11 @@
 //! attempt count, the sanitized error text, and the write time.
 //! The execution-marker cleanup deletes a dead letter older than 7 days.
 //!
+//! A script action writes its execution marker in the entity-store
+//! transaction.
+//! The engine reads that marker from the entity store.
+//! Every other action uses the rule-store marker.
+//!
 //! The process lock is per event.
 //! Two calls for one event do not run one rule action twice.
 //! Two calls for different events run at the same time.
@@ -449,15 +454,25 @@ impl RuleEngine {
 
     /// Runs one rule for one event.
     ///
-    /// The rule-store marker stops a duplicate run.
-    /// A failed rule writes no marker.
+    /// A script action reads its marker from the entity store.
+    /// Every other action reads its marker from the rule store.
+    /// A script action writes its marker in the effect transaction.
     async fn run_one_rule(
         &self,
         rule: &Rule,
         event: &EntityEvent,
         entity: Option<&Entity>,
     ) -> Result<ExecutionOutcome, RuleError> {
-        if self.rules.is_executed(&rule.id, &event.event_id).await? {
+        let marker_exists = if rule.action.kind == SCRIPT_ACTION_KIND {
+            let key = RuleStore::execution_key(&rule.id, &event.event_id);
+            self.entities
+                .has_execution_marker(&key)
+                .await
+                .map_err(map_entity_error)?
+        } else {
+            self.rules.is_executed(&rule.id, &event.event_id).await?
+        };
+        if marker_exists {
             return Ok(ExecutionOutcome::AlreadyExecuted);
         }
         if !self.eval_condition(&rule.condition, event, entity)? {
@@ -843,7 +858,7 @@ mod tests {
     use crate::records::{ChangeSink, EntityEventKind};
     use crate::rules::rule::{ActionRef, CompareOp, Condition, RuleDraft, RuleTrigger};
     use crate::rules::script::{MAX_SOURCE_BYTES, ScriptError};
-    use oxkv::Hooks as _;
+    use oxkv::{GetSet as _, Hooks as _, KeyPrefix, OxKvStore, ScanExt as _};
 
     /// A [`RuleAction`] test double that records each context.
     ///
@@ -1067,6 +1082,23 @@ mod tests {
             entities: EntityStore::new(raw.clone(), registry),
             raw,
         }
+    }
+
+    /// Builds one rule store and one entity store on different raw stores.
+    ///
+    /// The production runtime builds the two stores this way.
+    async fn separate_stores() -> (RuleStore, EntityStore, OxKvStore, OxKvStore) {
+        let registry =
+            SchemaRegistry::new(build_test_store(&test_prefix("rules-engine-schema")).await);
+        registry.publish(schema()).await.unwrap();
+        let rule_raw = build_test_store(&test_prefix("rules-engine-rules")).await;
+        let entity_raw = build_test_store(&test_prefix("rules-engine-entities")).await;
+        (
+            RuleStore::new(rule_raw.clone()),
+            EntityStore::new(entity_raw.clone(), registry),
+            rule_raw,
+            entity_raw,
+        )
     }
 
     fn engine(stores: &TestStores, actions: Vec<Arc<dyn RuleAction>>) -> RuleEngine {
@@ -2884,6 +2916,67 @@ mod tests {
         assert_eq!(first[0].outcome, ExecutionOutcome::Executed);
         assert_eq!(second[0].outcome, ExecutionOutcome::AlreadyExecuted);
         assert!(stores.rules.is_executed("alpha", "evt-1").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_script_marker_lives_in_the_entity_store_and_stops_a_replay() {
+        let (rules, entities, rule_raw, entity_raw) = separate_stores().await;
+        let engine = RuleEngine::new(rules.clone(), entities.clone(), Vec::new())
+            .unwrap()
+            .with_script_enabled(true);
+        make_entity(&entities).await;
+        rules
+            .upsert(script_rule(
+                "alpha",
+                r#"host.create_entity("e3", ["invoice"], #{ total: 5 });"#,
+                &["invoice"],
+                &["invoice"],
+            ))
+            .await
+            .unwrap();
+        let subject = event(EntityEventKind::Created);
+
+        let first = engine.process(&subject).await.unwrap();
+        let second = engine.process(&subject).await.unwrap();
+
+        assert_eq!(first[0].outcome, ExecutionOutcome::Executed);
+        assert_eq!(second[0].outcome, ExecutionOutcome::AlreadyExecuted);
+        let e3 = entities.get("e3").await.unwrap().unwrap();
+        assert_eq!(e3.version, 1);
+        assert_eq!(
+            e3.attributes.get("total"),
+            Some(&AttributeValue::Integer(5))
+        );
+        let key = RuleStore::execution_key("alpha", "evt-1");
+        assert!(entities.has_execution_marker(&key).await.unwrap());
+        assert_eq!(
+            entity_raw
+                .count_prefix(KeyPrefix::new("rule:exec:"), usize::MAX)
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(!rules.is_executed("alpha", "evt-1").await.unwrap());
+        assert_eq!(
+            rule_raw
+                .count_prefix(KeyPrefix::new("rule:exec:"), usize::MAX)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn gc_execution_markers_deletes_an_old_script_marker() {
+        let (_rules, entities, _rule_raw, entity_raw) = separate_stores().await;
+        let key = RuleStore::execution_key("alpha", "evt-old");
+        let bytes = RuleStore::execution_marker_value(100).unwrap();
+        entity_raw.set_bytes(&key, &bytes).await.unwrap();
+
+        let deleted = entities.gc_execution_markers(200).await.unwrap();
+
+        assert_eq!(deleted, 1);
+        assert!(!entities.has_execution_marker(&key).await.unwrap());
     }
 
     #[tokio::test]
