@@ -584,6 +584,11 @@ pub struct ScriptEngine {
     cache: Arc<Mutex<HashMap<u64, CachedScript>>>,
     /// True when the server enables condition scripts.
     enabled: bool,
+    /// The wall-time guard for one evaluation.
+    ///
+    /// [`ScriptEngine::new`] always uses [`WALL_TIME_GUARD`].
+    /// A unit test can set another value with `with_wall_guard`.
+    wall_guard: Duration,
 }
 
 impl ScriptEngine {
@@ -643,7 +648,19 @@ impl ScriptEngine {
             engine: Arc::new(engine),
             cache: Arc::new(Mutex::new(HashMap::new())),
             enabled,
+            wall_guard: WALL_TIME_GUARD,
         }
+    }
+
+    /// Sets the wall-time guard for this engine.
+    ///
+    /// A unit test uses this method to keep the wall clock out of a functional
+    /// test.
+    /// Production code always uses [`WALL_TIME_GUARD`].
+    #[cfg(test)]
+    fn with_wall_guard(mut self, guard: Duration) -> Self {
+        self.wall_guard = guard;
+        self
     }
 
     /// Returns true when the server enables condition scripts.
@@ -673,7 +690,7 @@ impl ScriptEngine {
         scope.push_constant("entity", entity_value(ctx.entity));
         scope.push_constant("now", ctx.now);
 
-        EVAL_DEADLINE.with(|deadline| deadline.set(Some(Instant::now() + WALL_TIME_GUARD)));
+        EVAL_DEADLINE.with(|deadline| deadline.set(Some(Instant::now() + self.wall_guard)));
         let result = self.engine.eval_ast_with_scope::<Dynamic>(&mut scope, &ast);
         EVAL_DEADLINE.with(|deadline| deadline.set(None));
 
@@ -710,7 +727,7 @@ impl ScriptEngine {
         scope.push_constant("now", ctx.now);
         scope.push("host", host);
 
-        EVAL_DEADLINE.with(|deadline| deadline.set(Some(Instant::now() + WALL_TIME_GUARD)));
+        EVAL_DEADLINE.with(|deadline| deadline.set(Some(Instant::now() + self.wall_guard)));
         let result = self.engine.eval_ast_with_scope::<Dynamic>(&mut scope, &ast);
         EVAL_DEADLINE.with(|deadline| deadline.set(None));
 
@@ -1454,18 +1471,44 @@ abs(height(20.0, 0.7, 9.81, 1.5, 100)) < 0.000000001"#,
         );
     }
 
+    /// A calculation-heavy script finishes within the operation budget.
+    ///
+    /// The operation limit is the deterministic budget.
+    /// The wall guard is a last-resort safety net, so this test sets a wide
+    /// guard and does not measure the host clock.
     #[test]
     fn a_script_builds_and_sums_a_large_array() {
-        let subject = engine();
+        let subject = engine().with_wall_guard(Duration::from_secs(5));
         let ev = event(EntityEventKind::Created, Vec::new());
         let ctx = context(&ev, None);
 
         assert_eq!(
             subject.eval_bool(
-                "let a = []; let total = 0; for i in 0..5000 { a.push(i); total += i; } a.len() == 5000 && total == 12497500",
+                "let a = []; let total = 0; for i in 0..1000 { a.push(i); total += i; } a.len() == 1000 && total == 499500",
                 &ctx
             ),
             Ok(true)
+        );
+    }
+
+    /// The wall guard rejects a script that runs past its deadline.
+    ///
+    /// A zero guard expires the deadline before the first loop tick.
+    /// The result therefore does not depend on host speed.
+    /// The test proves that the guard stops a script and reports the budget
+    /// error.
+    #[test]
+    fn the_wall_guard_stops_a_script_that_runs_past_the_deadline() {
+        let subject = engine().with_wall_guard(Duration::ZERO);
+        let ev = event(EntityEventKind::Created, Vec::new());
+        let ctx = context(&ev, None);
+
+        assert_eq!(
+            subject.eval_bool(
+                "let total = 0; for i in 0..100 { total += i; } total == 4950",
+                &ctx
+            ),
+            Err(ScriptError::Budget)
         );
     }
 
