@@ -6,7 +6,10 @@
 
 use std::sync::Arc;
 
-use oxkv::{Direction, GetSet, KeyPrefix, KeyValue, OxKvStore, Store as _, Transaction as _};
+use oxkv::{
+    Direction, GetSet, KeyPrefix, KeyValue, OxKvStore, Store as _, StoreError, Transaction as _,
+    TxCas as _,
+};
 use oxkv_cached::{CachedOxKvStore, WarmMode};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
@@ -561,29 +564,42 @@ impl FsStore {
         let rel = rel_key(row_type, row_id, file_id);
         let refs = refs_key(file_id);
         let g = self.inner.write().await;
-        let tx = g.begin_tx().map_err(|e| self.store_err(e))?;
-        if tx
-            .get_bytes(&rel)
-            .await
-            .map_err(|e| self.store_err(e))?
-            .is_some()
-        {
-            let info = read_ref_info(&tx, file_id, self.latch, self.primary).await?;
-            tx.rollback().await.map_err(|e| self.store_err(e))?;
-            return Ok(info.count);
+        for _attempt in 0..RELATION_ATTEMPTS {
+            let tx = g.begin_tx().map_err(|e| self.store_err(e))?;
+            if tx
+                .get_bytes(&rel)
+                .await
+                .map_err(|e| self.store_err(e))?
+                .is_some()
+            {
+                let info = read_ref_info(&tx, file_id, self.latch, self.primary).await?;
+                tx.rollback().await.map_err(|e| self.store_err(e))?;
+                return Ok(info.count);
+            }
+            let expected = tx.get_bytes(&refs).await.map_err(|e| self.store_err(e))?;
+            let mut info = read_ref_info(&tx, file_id, self.latch, self.primary).await?;
+            info.count = info.count.saturating_add(1);
+            info.orphan_since = None;
+            let val = serde_json::to_vec(&info).map_err(|e| FsError::Internal(e.to_string()))?;
+            tx.set_if_absent(&rel, b"1")
+                .await
+                .map_err(|e| self.store_err(e))?;
+            tx.compare_and_set(&refs, expected.as_deref(), &val)
+                .await
+                .map_err(|e| self.store_err(e))?;
+            match tx.commit().await {
+                Ok(()) => return Ok(info.count),
+                Err(StoreError::TxConflict { key, .. }) if key == rel => {
+                    let info = read_ref_info(&*g, file_id, self.latch, self.primary).await?;
+                    return Ok(info.count);
+                }
+                Err(StoreError::TxConflict { .. }) => continue,
+                Err(error) => return Err(self.store_err(error)),
+            }
         }
-        let mut info = read_ref_info(&tx, file_id, self.latch, self.primary).await?;
-        info.count = info.count.saturating_add(1);
-        info.orphan_since = None;
-        tx.set_bytes(&rel, b"1")
-            .await
-            .map_err(|e| self.store_err(e))?;
-        let val = serde_json::to_vec(&info).map_err(|e| FsError::Internal(e.to_string()))?;
-        tx.set_bytes(&refs, &val)
-            .await
-            .map_err(|e| self.store_err(e))?;
-        tx.commit().await.map_err(|e| self.store_err(e))?;
-        Ok(info.count)
+        Err(FsError::Store(
+            "relation attach conflicted with another writer".to_string(),
+        ))
     }
 
     /// Detaches a file from a row. The function is idempotent.
@@ -598,29 +614,44 @@ impl FsStore {
         let rel = rel_key(row_type, row_id, file_id);
         let refs = refs_key(file_id);
         let g = self.inner.write().await;
-        let tx = g.begin_tx().map_err(|e| self.store_err(e))?;
-        if tx
-            .get_bytes(&rel)
-            .await
-            .map_err(|e| self.store_err(e))?
-            .is_none()
-        {
-            let info = read_ref_info(&tx, file_id, self.latch, self.primary).await?;
-            tx.rollback().await.map_err(|e| self.store_err(e))?;
-            return Ok(info.count);
+        for _attempt in 0..RELATION_ATTEMPTS {
+            let tx = g.begin_tx().map_err(|e| self.store_err(e))?;
+            if tx
+                .get_bytes(&rel)
+                .await
+                .map_err(|e| self.store_err(e))?
+                .is_none()
+            {
+                let info = read_ref_info(&tx, file_id, self.latch, self.primary).await?;
+                tx.rollback().await.map_err(|e| self.store_err(e))?;
+                return Ok(info.count);
+            }
+            let expected = tx.get_bytes(&refs).await.map_err(|e| self.store_err(e))?;
+            let mut info = read_ref_info(&tx, file_id, self.latch, self.primary).await?;
+            info.count = info.count.saturating_sub(1);
+            if info.count == 0 {
+                info.orphan_since = Some(chrono::Utc::now().timestamp());
+            }
+            let val = serde_json::to_vec(&info).map_err(|e| FsError::Internal(e.to_string()))?;
+            tx.delete_if(&rel, b"1")
+                .await
+                .map_err(|e| self.store_err(e))?;
+            tx.compare_and_set(&refs, expected.as_deref(), &val)
+                .await
+                .map_err(|e| self.store_err(e))?;
+            match tx.commit().await {
+                Ok(()) => return Ok(info.count),
+                Err(StoreError::TxConflict { key, .. }) if key == rel => {
+                    let info = read_ref_info(&*g, file_id, self.latch, self.primary).await?;
+                    return Ok(info.count);
+                }
+                Err(StoreError::TxConflict { .. }) => continue,
+                Err(error) => return Err(self.store_err(error)),
+            }
         }
-        let mut info = read_ref_info(&tx, file_id, self.latch, self.primary).await?;
-        tx.delete(&rel).await.map_err(|e| self.store_err(e))?;
-        info.count = info.count.saturating_sub(1);
-        if info.count == 0 {
-            info.orphan_since = Some(chrono::Utc::now().timestamp());
-        }
-        let val = serde_json::to_vec(&info).map_err(|e| FsError::Internal(e.to_string()))?;
-        tx.set_bytes(&refs, &val)
-            .await
-            .map_err(|e| self.store_err(e))?;
-        tx.commit().await.map_err(|e| self.store_err(e))?;
-        Ok(info.count)
+        Err(FsError::Store(
+            "relation detach conflicted with another writer".to_string(),
+        ))
     }
 
     /// Lists rows referencing a file (scan bounded to `fs:rel:`).
@@ -840,6 +871,9 @@ impl FsStore {
 /// The value is small enough that a full scan of a large replica is not
 /// one large allocation.
 const SCAN_PAGE: usize = 512;
+
+/// Number of times an attach or detach retries after a ref-count conflict.
+const RELATION_ATTEMPTS: usize = 8;
 
 /// A key-ordered walk over an oxkv store. The walk holds one page at a
 /// time.
@@ -1575,6 +1609,25 @@ mod tests {
         // No marker and no ref-count entry stays behind.
         assert!(store.rows_for_file("rel-file").await?.is_empty());
         assert_eq!(store.get_ref_info("rel-file").await?.count, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn two_attaches_to_one_file_keep_both_references() -> anyhow::Result<()> {
+        let raw = build_test_store(&crate::db::test_prefix("fs-attach-race")).await;
+        let first = FsStore::new(raw.clone());
+        let second = FsStore::new(raw.clone());
+        let probe = FsStore::new(raw);
+
+        let first_call =
+            tokio::spawn(async move { first.attach("invoice", "1", "race-file").await });
+        let second_call =
+            tokio::spawn(async move { second.attach("invoice", "2", "race-file").await });
+        let (first_result, second_result) = tokio::join!(first_call, second_call);
+
+        first_result.unwrap()?;
+        second_result.unwrap()?;
+        assert_eq!(probe.get_ref_info("race-file").await?.count, 2);
         Ok(())
     }
 
