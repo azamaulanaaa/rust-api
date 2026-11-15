@@ -48,7 +48,7 @@
 
 use std::sync::Arc;
 
-use oxkv::{GetSet, OxKvStore, Store as _, Transaction as _};
+use oxkv::{GetSet, OxKvStore, Store as _, StoreError, Transaction as _, TxCas as _};
 use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 
@@ -56,6 +56,9 @@ use crate::eav::entity_error::EntityError;
 
 /// The number of times a read tries to read one consistent snapshot.
 const GET_ATTEMPTS: u32 = 16;
+
+/// The number of times a put retries after a head or generation conflict.
+const PUT_ATTEMPTS: u32 = 8;
 
 /// One stored replica snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -170,52 +173,92 @@ impl ReplicaStore {
         let meta_bytes =
             serde_json::to_vec(&meta).map_err(|e| EntityError::Internal(e.to_string()))?;
         let g = self.store.write().await;
-        let tx = g.begin_tx().map_err(EntityError::Store)?;
-        let old_head = read_head(&tx, &hash).await?;
-        if let Some(stored) = old_head
-            && head < stored
-        {
-            return Err(EntityError::StaleHead {
-                stored,
-                incoming: head,
-            });
-        }
-        let stored_generation = read_generation(&tx, &hash).await?.unwrap_or(0);
-        let generation = stored_generation
-            .checked_add(1)
-            .ok_or_else(|| EntityError::Internal("replica generation is exhausted".to_string()))?;
-        let generation_bytes =
-            serde_json::to_vec(&generation).map_err(|e| EntityError::Internal(e.to_string()))?;
-        if let Some(old_head) = old_head {
-            let old_chunks = read_meta(&tx, &hash, old_head)
-                .await?
-                .map(|meta| meta.chunks)
-                .unwrap_or(0);
-            for index in 0..old_chunks {
-                tx.delete(&data_key(&hash, old_head, index as usize))
+        for _attempt in 0..PUT_ATTEMPTS {
+            let tx = g.begin_tx().map_err(EntityError::Store)?;
+            let old_head = read_head(&tx, &hash).await?;
+            if let Some(stored) = old_head
+                && head < stored
+            {
+                return Err(EntityError::StaleHead {
+                    stored,
+                    incoming: head,
+                });
+            }
+            let stored_generation = read_generation(&tx, &hash).await?;
+            let generation = stored_generation
+                .unwrap_or(0)
+                .checked_add(1)
+                .ok_or_else(|| {
+                    EntityError::Internal("replica generation is exhausted".to_string())
+                })?;
+            let generation_bytes = serde_json::to_vec(&generation)
+                .map_err(|e| EntityError::Internal(e.to_string()))?;
+            let expected_generation = match stored_generation {
+                Some(value) => Some(
+                    serde_json::to_vec(&value).map_err(|e| EntityError::Internal(e.to_string()))?,
+                ),
+                None => None,
+            };
+            if let Some(old_head) = old_head {
+                let old_chunks = read_meta(&tx, &hash, old_head)
+                    .await?
+                    .map(|meta| meta.chunks)
+                    .unwrap_or(0);
+                for index in 0..old_chunks {
+                    tx.delete(&data_key(&hash, old_head, index as usize))
+                        .await
+                        .map_err(EntityError::Store)?;
+                }
+                tx.delete(&meta_key(&hash, old_head))
                     .await
                     .map_err(EntityError::Store)?;
             }
-            tx.delete(&meta_key(&hash, old_head))
+            for (index, data) in chunks.iter().enumerate() {
+                tx.set_bytes(&data_key(&hash, head, index), data)
+                    .await
+                    .map_err(EntityError::Store)?;
+            }
+            tx.set_bytes(&meta_key(&hash, head), &meta_bytes)
                 .await
                 .map_err(EntityError::Store)?;
-        }
-        for (index, data) in chunks.iter().enumerate() {
-            tx.set_bytes(&data_key(&hash, head, index), data)
+            let expected_head = match old_head {
+                Some(value) => Some(
+                    serde_json::to_vec(&value).map_err(|e| EntityError::Internal(e.to_string()))?,
+                ),
+                None => None,
+            };
+            tx.compare_and_set(&head_key(&hash), expected_head.as_deref(), &head_bytes)
                 .await
                 .map_err(EntityError::Store)?;
+            tx.compare_and_set(
+                &generation_key(&hash),
+                expected_generation.as_deref(),
+                &generation_bytes,
+            )
+            .await
+            .map_err(EntityError::Store)?;
+            match tx.commit().await {
+                Ok(()) => return Ok(generation),
+                Err(StoreError::TxConflict { key, current }) if key == head_key(&hash) => {
+                    let stored = match current {
+                        Some(bytes) => serde_json::from_slice::<u64>(&bytes)
+                            .map_err(|e| EntityError::Internal(e.to_string()))?,
+                        None => 0,
+                    };
+                    if head < stored {
+                        return Err(EntityError::StaleHead {
+                            stored,
+                            incoming: head,
+                        });
+                    }
+                }
+                Err(StoreError::TxConflict { .. }) => {}
+                Err(error) => return Err(EntityError::Store(error)),
+            }
         }
-        tx.set_bytes(&meta_key(&hash, head), &meta_bytes)
-            .await
-            .map_err(EntityError::Store)?;
-        tx.set_bytes(&head_key(&hash), &head_bytes)
-            .await
-            .map_err(EntityError::Store)?;
-        tx.set_bytes(&generation_key(&hash), &generation_bytes)
-            .await
-            .map_err(EntityError::Store)?;
-        tx.commit().await.map_err(EntityError::Store)?;
-        Ok(generation)
+        Err(EntityError::Internal(
+            "replica put conflicted with another writer".to_string(),
+        ))
     }
 
     /// Removes the stored replica for `sub`.
@@ -977,6 +1020,27 @@ mod tests {
             Some(b"1".to_vec()),
             "a stale put changed the generation"
         );
+    }
+
+    #[tokio::test]
+    async fn concurrent_puts_keep_the_higher_head() {
+        let raw = build_test_store(&test_prefix("eav-replica-race")).await;
+        let higher = ReplicaStore::new(raw.clone());
+        let lower = ReplicaStore::new(raw.clone());
+
+        let high = tokio::spawn(async move { higher.put("alice", 9, chunks(&[b"high"])).await });
+        let low = tokio::spawn(async move { lower.put("alice", 3, chunks(&[b"low"])).await });
+        let (high_result, low_result) = tokio::join!(high, low);
+
+        high_result.unwrap().unwrap();
+        let _ = low_result.unwrap();
+        let snapshot = ReplicaStore::new(raw)
+            .get("alice")
+            .await
+            .unwrap()
+            .expect("the higher head must stay");
+        assert_eq!(snapshot.head, 9);
+        assert_eq!(snapshot.chunks, chunks(&[b"high"]));
     }
 
     #[tokio::test]
