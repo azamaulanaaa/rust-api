@@ -205,6 +205,14 @@ const BACKFILL_PAGE: usize = 200;
 #[cfg(test)]
 const BACKFILL_PAGE: usize = 2;
 
+/// Number of reverse reference keys that one incoming scan reads.
+#[cfg(not(test))]
+const REF_SCAN_PAGE: usize = 512;
+
+/// Number of reverse reference keys that one incoming scan reads.
+#[cfg(test)]
+const REF_SCAN_PAGE: usize = 2;
+
 /// A test hook that runs after a lazy backfill page releases its locks.
 #[cfg(test)]
 type BackfillPageHook =
@@ -3372,21 +3380,32 @@ where
 /// A marker from `target_id` itself does not count.
 async fn count_incoming_refs<S>(store: &S, target_id: &str) -> Result<usize, EntityError>
 where
-    S: GetSet + ?Sized,
+    S: GetSet + ?Sized + Sync,
 {
     let prefix = ref_target_prefix(target_id);
     let mut sources = BTreeSet::new();
-    for row in scan_prefix(store, &prefix).await? {
-        let Some(rest) = row.key.strip_prefix(&prefix) else {
-            continue;
-        };
-        let Some((source, attribute)) = rest.split_once(':') else {
-            continue;
-        };
-        if source.is_empty() || attribute.is_empty() || source == target_id {
-            continue;
+    let mut after = None;
+    loop {
+        let page = store
+            .scan_keys(KeyPrefix::new(&prefix), after, REF_SCAN_PAGE)
+            .await
+            .map_err(EntityError::Store)?;
+        for key in &page.items {
+            let Some(rest) = key.strip_prefix(&prefix) else {
+                continue;
+            };
+            let Some((source, attribute)) = rest.split_once(':') else {
+                continue;
+            };
+            if source.is_empty() || attribute.is_empty() || source == target_id {
+                continue;
+            }
+            sources.insert(source.to_string());
         }
-        sources.insert(source.to_string());
+        match page.next {
+            Some(next) => after = Some(next),
+            None => break,
+        }
     }
     Ok(sources.len())
 }
@@ -8453,6 +8472,22 @@ mod tests {
         assert!(message.contains('2'), "{message}");
         assert!(!message.contains("o1"), "{message}");
         assert!(!message.contains("o2"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn count_incoming_refs_covers_every_page_of_sources() {
+        let (store, _, _) = reference_store(true).await;
+        store.create(customer("c1"), &ctx()).await.unwrap();
+        for id in ["o1", "o2", "o3"] {
+            store.create(order(id, "c1"), &ctx()).await.unwrap();
+        }
+
+        let error = store.delete("c1", 1, false, &ctx()).await.unwrap_err();
+
+        assert!(
+            matches!(error, EntityError::Referenced { count: 3, .. }),
+            "unexpected error: {error}"
+        );
     }
 
     #[tokio::test]
