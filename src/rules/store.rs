@@ -70,7 +70,9 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use oxkv::{Direction, GetSet, KeyValue, OxKvStore, Store as _, Transaction as _};
+use oxkv::{
+    Direction, GetSet, KeyPrefix, KeyValue, OxKvStore, ScanExt as _, Store as _, Transaction as _,
+};
 use tokio::sync::{Mutex, RwLock};
 
 use crate::eav::MAX_PAGE_OFFSET;
@@ -328,8 +330,8 @@ impl RuleStore {
             let g = self.store.read().await;
             for schema in &event.schemas {
                 let prefix = format!("{INDEX_PREFIX}{kind}:{schema}:");
-                for marker in scan_prefix(&*g, &prefix).await? {
-                    let Some(id) = marker.key.strip_prefix(&prefix) else {
+                for key in scan_keys_prefix(&*g, &prefix).await? {
+                    let Some(id) = key.strip_prefix(&prefix) else {
                         continue;
                     };
                     if !id.is_empty() && !id.contains(':') {
@@ -639,20 +641,10 @@ impl RuleStore {
     /// It reads the family in pages of `GC_BATCH` rows.
     /// Memory use is proportional to `GC_BATCH` and not to the marker count.
     pub async fn execution_count(&self) -> Result<usize, RuleError> {
-        let mut total = 0usize;
-        let mut cursor: Option<String> = None;
-        loop {
-            let rows = {
-                let g = self.store.read().await;
-                family_page(&g, EXEC_PREFIX, cursor.as_deref()).await?
-            };
-            let Some(last) = rows.last() else {
-                break;
-            };
-            total += rows.len();
-            cursor = Some(last.key.clone());
-        }
-        Ok(total)
+        let g = self.store.read().await;
+        g.count_prefix(KeyPrefix::new(EXEC_PREFIX), usize::MAX)
+            .await
+            .map_err(RuleError::Store)
     }
 
     /// Records the size of one cleanup page.
@@ -763,6 +755,20 @@ where
 {
     debug_assert!(prefix.starts_with(RULE_PREFIX));
     scan_family(store, prefix).await
+}
+
+/// Scans a key range that ends at the `prefix:` family bound and reads keys
+/// only.
+async fn scan_keys_prefix<S>(store: &S, prefix: &str) -> Result<Vec<String>, RuleError>
+where
+    S: GetSet + ?Sized + Sync,
+{
+    debug_assert!(prefix.starts_with(RULE_PREFIX));
+    let cursor = (Some(prefix.to_string()), Some(prefix_scan_end(prefix)));
+    store
+        .gets_keys(None, Direction::Next, cursor)
+        .await
+        .map_err(RuleError::Store)
 }
 
 /// Scans one key family that ends at the `prefix:` family bound.
@@ -1416,6 +1422,21 @@ mod tests {
         }
 
         assert_eq!(store.execution_count().await.unwrap(), 7);
+    }
+
+    #[tokio::test]
+    async fn execution_count_matches_every_marker_across_pages() {
+        let (store, raw) = store_with_raw().await;
+        for index in 0..300 {
+            put_execution_marker(&raw, "alpha", &format!("evt-{index}"), 100).await;
+        }
+
+        let expected = raw
+            .count_prefix(KeyPrefix::new(EXEC_PREFIX), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(expected, 300);
+        assert_eq!(store.execution_count().await.unwrap(), expected);
     }
 
     #[tokio::test]

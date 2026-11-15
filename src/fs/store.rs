@@ -335,6 +335,22 @@ impl FsStore {
             .map_err(FsError::from)
     }
 
+    /// Scans a key range that stops at the end of the `prefix:` family and
+    /// reads keys only.
+    async fn scan_keys_prefix(&self, prefix: &str) -> Result<Vec<String>, FsError> {
+        let cursor = (Some(prefix.to_string()), Some(prefix_scan_end(prefix)));
+        if let Some(mirror) = &self.mirror {
+            return mirror
+                .gets_keys(None, Direction::Next, cursor)
+                .await
+                .map_err(FsError::from);
+        }
+        let g = self.inner.read().await;
+        g.gets_keys(None, Direction::Next, cursor)
+            .await
+            .map_err(FsError::from)
+    }
+
     fn session_key(id: &str) -> String {
         format!("fs:uploads:{id}:meta")
     }
@@ -500,13 +516,13 @@ impl FsStore {
             Some(REL_PREFIX.to_string()),
             Some(prefix_scan_end(REL_PREFIX)),
         );
-        let kvs = tx
-            .gets_bytes(None, Direction::Next, cursor)
+        let keys = tx
+            .gets_keys(None, Direction::Next, cursor)
             .await
             .map_err(|e| self.store_err(e))?;
-        for kv in &kvs {
-            if kv.key.starts_with(REL_PREFIX) && kv.key.ends_with(&suffix) {
-                tx.delete(&kv.key).await.map_err(|e| self.store_err(e))?;
+        for key in &keys {
+            if key.starts_with(REL_PREFIX) && key.ends_with(&suffix) {
+                tx.delete(key).await.map_err(|e| self.store_err(e))?;
             }
         }
         tx.delete(&key).await.map_err(|e| self.store_err(e))?;
@@ -604,11 +620,11 @@ impl FsStore {
     /// Lists rows referencing a file (scan bounded to `fs:rel:`).
     pub async fn rows_for_file(&self, file_id: &str) -> Result<Vec<(String, String)>, FsError> {
         let suffix = format!(":{file_id}");
-        let kvs = self.scan_prefix(REL_PREFIX).await?;
+        let keys = self.scan_keys_prefix(REL_PREFIX).await?;
         let mut out = Vec::new();
-        for kv in kvs {
-            if kv.key.starts_with(REL_PREFIX) && kv.key.ends_with(&suffix) {
-                let rest = &kv.key[REL_PREFIX.len()..];
+        for key in keys {
+            if key.starts_with(REL_PREFIX) && key.ends_with(&suffix) {
+                let rest = &key[REL_PREFIX.len()..];
                 if let Some((ty, rem)) = rest.split_once(':')
                     && let Some((rid, _)) = rem.split_once(':')
                 {
@@ -632,10 +648,10 @@ impl FsStore {
         row_id: &str,
     ) -> Result<Vec<String>, FsError> {
         let prefix = crate::fs::relation::rel_prefix_for_row(row_type, row_id);
-        let kvs = self.scan_prefix(&prefix).await?;
+        let keys = self.scan_keys_prefix(&prefix).await?;
         let mut out = Vec::new();
-        for kv in kvs {
-            if let Some(file_id) = kv.key.strip_prefix(&prefix)
+        for key in keys {
+            if let Some(file_id) = key.strip_prefix(&prefix)
                 && !file_id.is_empty()
                 && !file_id.contains(':')
             {

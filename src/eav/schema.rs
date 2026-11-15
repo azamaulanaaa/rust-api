@@ -574,10 +574,10 @@ impl SchemaRegistry {
         validate_name("schema id", id)?;
         let g = self.store.read().await;
         let prefix = format!("{CHILD_PREFIX}{id}:");
-        let markers = scan_prefix(&*g, &prefix).await?;
+        let markers = scan_keys_prefix(&*g, &prefix).await?;
         let mut out: Vec<String> = markers
             .into_iter()
-            .filter_map(|kv| kv.key.strip_prefix(&prefix).map(str::to_string))
+            .filter_map(|key| key.strip_prefix(&prefix).map(str::to_string))
             .collect();
         out.sort();
         out.dedup();
@@ -788,6 +788,20 @@ where
     let cursor = (Some(prefix.to_string()), Some(prefix_scan_end(prefix)));
     store
         .gets_bytes(None, Direction::Next, cursor)
+        .await
+        .map_err(SchemaError::Store)
+}
+
+/// Scans a key range that ends at the `prefix:` family bound and reads keys
+/// only.
+async fn scan_keys_prefix<S>(store: &S, prefix: &str) -> Result<Vec<String>, SchemaError>
+where
+    S: GetSet + ?Sized + Sync,
+{
+    debug_assert!(prefix.starts_with(SCHEMA_PREFIX));
+    let cursor = (Some(prefix.to_string()), Some(prefix_scan_end(prefix)));
+    store
+        .gets_keys(None, Direction::Next, cursor)
         .await
         .map_err(SchemaError::Store)
 }
