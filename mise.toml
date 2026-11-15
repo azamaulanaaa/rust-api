@@ -1,5 +1,6 @@
 [tools]
 rust = { version = "stable", components = "rust-analyzer" }
+zig = "latest"
 "cargo:cargo-llvm-cov" = "latest"
 "cargo:cargo-deny" = "latest"
 "cargo:cargo-dist" = "0.32.0"
@@ -25,7 +26,7 @@ run = [
 ]
 
 [tasks.cov]
-run = "cargo llvm-cov --all-features --summary-only"
+run = "cargo llvm-cov --all-features --summary-only --fail-under-lines 90"
 description = "Print a coverage summary for the test suite"
 
 [tasks.cov-html]
@@ -36,7 +37,7 @@ description = "Write an HTML coverage report and open it"
 run = "cargo fmt --all --check"
 
 [tasks.clippy]
-run = "cargo clippy --all-targets --all-features"
+run = "cargo clippy --all-targets --all-features --locked -- -D warnings"
 
 [tasks.lint]
 depends = ["fmt", "clippy"]
@@ -53,8 +54,12 @@ description = "Known vulnerabilities and yanked releases in the resolved graph"
 run = "cargo deny check bans"
 description = "Wildcard dependencies and duplicate versions"
 
+[tasks.sources]
+run = "cargo deny check sources"
+description = "Every dependency comes from a known registry or a git source"
+
 [tasks.deps]
-depends = ["licenses", "advisories", "bans"]
+depends = ["licenses", "advisories", "bans", "sources"]
 
 [tasks.msrv-install]
 run = '''

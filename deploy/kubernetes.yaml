@@ -1,0 +1,136 @@
+# Reference manifest for rust-api.
+#
+# This manifest has not been tested against a live cluster. Replace the image,
+# the configuration values, and the credentials before you use it. Keep the
+# secrets in a Kubernetes Secret, not in this file.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rust-api-config
+  labels:
+    app.kubernetes.io/name: rust-api
+data:
+  config.toml: |
+    public_address = "https://rust-api.example.com"
+    listen_port = 8080
+
+    [authorization]
+    client_id = "rust-api"
+    client_secret = "replace-me"
+    issuer_url = "https://idp.example.com"
+
+    [database]
+    prefix = "oxkv"
+
+    [s3]
+    bucket = "my-bucket"
+    region = "us-east-1"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rust-api
+  labels:
+    app.kubernetes.io/name: rust-api
+spec:
+  # The server takes a single-writer lease. Recreate keeps two pods from
+  # overlapping during a rollout.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: rust-api
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: rust-api
+    spec:
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: rust-api
+          image: ghcr.io/azamaulanaaa/rust-api:0.1.0
+          imagePullPolicy: IfNotPresent
+          args: ["serve", "--config", "/etc/rust-api/config.toml"]
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            - name: RUST_API_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: rust-api-secrets
+                  key: client-secret
+                  optional: true
+            - name: RUST_API_S3_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: rust-api-secrets
+                  key: s3-access-key-id
+                  optional: true
+            - name: RUST_API_S3_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: rust-api-secrets
+                  key: s3-secret-access-key
+                  optional: true
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: config
+              mountPath: /etc/rust-api
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: rust-api-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rust-api
+  labels:
+    app.kubernetes.io/name: rust-api
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: rust-api
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP

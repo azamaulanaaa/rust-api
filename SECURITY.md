@@ -11,9 +11,11 @@
 
 Report vulnerabilities privately. Do not open a public issue.
 
-Preferred channel: use GitHub's private vulnerability reporting for this repository.
+Preferred channel: use GitHub's private vulnerability reporting for this repository:
 
-Alternative: email the maintainer at `security@example.com`. Replace this placeholder with the real address before release.
+https://github.com/azamaulanaaa/rust-api/security/advisories/new
+
+This repository has no security email address. Use the GitHub report form.
 
 Include these details in the report:
 

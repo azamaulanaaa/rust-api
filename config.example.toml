@@ -14,6 +14,7 @@
 #   RUST_API_S3_SECRET_ACCESS_KEY
 #   RUST_API_CAPABILITY_SECRET
 #   RUST_API_CAPABILITY_SECRET_PREV
+#   RUST_API_EAV_WEBHOOK_SIGNING_SECRET
 #   RUST_API_ALLOWED_ORIGINS  (comma-separated list of origins)
 
 # Public base URL of this deployment. Used to build the OIDC redirect.
@@ -93,7 +94,7 @@ service_name = "rust-api"
 
 # OTLP collector endpoint. Span export is off when absent. Transport follows
 # the compiled cargo feature (otlp-http or otlp-grpc). Default: none.
-# otlp_endpoint = "http://localhost:4317"
+# otlp_endpoint = "http://localhost:4318"
 
 # Fraction of traces sampled, between 0.0 and 1.0. Default: 1.0.
 sample_ratio = 1.0

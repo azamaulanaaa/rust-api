@@ -613,7 +613,7 @@ impl SnapshotManager {
     /// key. The caller of this function reads them as different strings.
     /// Serving the alias gave two URLs for one object that changes on each
     /// commit. The code also chose the cache headers from the raw tail. See
-    /// [`crate::sync::route::object_handler`].
+    /// the `object_handler` function in `crate::sync::route`.
     pub fn resolve_object(&self, sub: &str, tail: &str) -> Result<String, FsError> {
         if tail.split('/').any(|seg| seg.is_empty() || seg == "..") {
             return Err(FsError::BadRequest("invalid object path".into()));
