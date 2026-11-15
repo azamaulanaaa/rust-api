@@ -12,6 +12,12 @@ use std::time::Duration;
 
 use actix_web::{HttpResponse, Responder, get, web};
 
+/// How often the background task refreshes the dependency flags.
+const PROBE_INTERVAL: Duration = Duration::from_secs(10);
+
+/// The longest time that one probe operation may take.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// The synchronous dependency check that backs `/ready`.
 ///
 /// The server runs the check on every probe poll. An implementation must
@@ -155,39 +161,65 @@ impl DependencyHealth {
     /// Spawns a background task that refreshes both flags periodically.
     ///
     /// The task never blocks the request path. The first probe runs as soon
-    /// as the task is scheduled.
+    /// as the task is scheduled. Each interval runs one probe pass with a
+    /// timeout around each probe operation.
     pub fn spawn_probes<C: crate::CancelToken>(
         &self,
         s3_store: Arc<dyn object_store::ObjectStore>,
         oidc_discovery_url: String,
         cancel: C,
     ) -> tokio::task::JoinHandle<()> {
+        self.spawn_probes_with_interval(
+            s3_store,
+            oidc_discovery_url,
+            cancel,
+            PROBE_INTERVAL,
+            PROBE_TIMEOUT,
+        )
+    }
+
+    /// Spawns the probes with explicit timing. Tests use this function to
+    /// avoid a ten second wait.
+    fn spawn_probes_with_interval<C: crate::CancelToken>(
+        &self,
+        s3_store: Arc<dyn object_store::ObjectStore>,
+        oidc_discovery_url: String,
+        cancel: C,
+        interval: Duration,
+        probe_timeout: Duration,
+    ) -> tokio::task::JoinHandle<()> {
         let dep_health = self.clone();
         tokio::spawn(async move {
             let client = reqwest::Client::new();
-            let mut interval = tokio::time::interval(Duration::from_secs(10));
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
-                interval.tick().await;
+                ticker.tick().await;
                 if cancel.is_cancelled() {
                     break;
                 }
-                if tokio::time::timeout(Duration::from_millis(100), interval.tick())
-                    .await
-                    .is_err()
-                {
-                    continue;
-                }
-                if cancel.is_cancelled() {
-                    break;
-                }
-                let s3_ok = s3_store.list_with_delimiter(None).await.is_ok();
+                // A failed request and a timeout both report the dependency
+                // as down.
+                let s3_ok =
+                    match tokio::time::timeout(probe_timeout, s3_store.list_with_delimiter(None))
+                        .await
+                    {
+                        Ok(result) => result.is_ok(),
+                        Err(_) => false,
+                    };
                 dep_health.set_s3(s3_ok);
-                let oidc_ok = client
-                    .get(&oidc_discovery_url)
-                    .send()
-                    .await
-                    .map(|response| response.status().is_success())
-                    .unwrap_or(false);
+                if cancel.is_cancelled() {
+                    break;
+                }
+                let oidc_ok = match tokio::time::timeout(
+                    probe_timeout,
+                    client.get(&oidc_discovery_url).send(),
+                )
+                .await
+                {
+                    Ok(Ok(response)) => response.status().is_success(),
+                    Ok(Err(_)) | Err(_) => false,
+                };
                 dep_health.set_oidc(oidc_ok);
             }
         })
@@ -228,6 +260,185 @@ pub async fn health() -> impl Responder {
 mod tests {
     use super::*;
     use actix_web::{App, test};
+
+    /// An in-memory object store that fails listing on demand.
+    ///
+    /// The wrapper delegates every other operation to
+    /// [`object_store::memory::InMemory`].
+    #[derive(Debug)]
+    struct FlakyStore {
+        inner: Arc<dyn object_store::ObjectStore>,
+        fail: Arc<AtomicBool>,
+    }
+
+    impl std::fmt::Display for FlakyStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("FlakyStore")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl object_store::ObjectStore for FlakyStore {
+        async fn put_opts(
+            &self,
+            location: &object_store::path::Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            _location: &object_store::path::Path,
+            _opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            Err(object_store::Error::NotSupported {
+                source: "the probe test does not use multipart".to_string().into(),
+            })
+        }
+
+        async fn get_opts(
+            &self,
+            location: &object_store::path::Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        async fn delete(&self, location: &object_store::path::Path) -> object_store::Result<()> {
+            self.inner.delete(location).await
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures_util::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            if self.fail.load(Ordering::Relaxed) {
+                return Err(object_store::Error::Generic {
+                    store: "probe-test",
+                    source: Box::new(std::io::Error::other("injected failure")),
+                });
+            }
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+        ) -> object_store::Result<()> {
+            self.inner.copy(from, to).await
+        }
+
+        async fn copy_if_not_exists(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+        ) -> object_store::Result<()> {
+            self.inner.copy_if_not_exists(from, to).await
+        }
+
+        fn list_with_offset(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+            offset: &object_store::path::Path,
+        ) -> futures_util::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list_with_offset(prefix, offset)
+        }
+    }
+
+    /// Serves the OIDC discovery document with `status`.
+    async fn serve_oidc(server: &wiremock::MockServer, status: u16) {
+        server.reset().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/oidc"))
+            .respond_with(wiremock::ResponseTemplate::new(status))
+            .mount(server)
+            .await;
+    }
+
+    /// Yields until `condition` is true.
+    ///
+    /// The test pauses the tokio clock. Each yield lets a pending probe
+    /// finish, so the call needs no wall-clock timer.
+    async fn wait_for(what: &str, mut condition: impl FnMut() -> bool) {
+        for _ in 0..10_000 {
+            if condition() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    /// Advances the paused clock by `by`, then yields until `condition` is
+    /// true.
+    async fn advance_until(by: Duration, what: &str, condition: impl FnMut() -> bool) {
+        tokio::time::advance(by).await;
+        wait_for(what, condition).await;
+    }
+
+    /// A failed probe clears the flag. A later successful probe sets it
+    /// again. This is the regression test for a probe loop that never ran.
+    #[tokio::test(start_paused = true)]
+    async fn probes_clear_and_restore_the_dependency_flags() {
+        let server = wiremock::MockServer::start().await;
+        serve_oidc(&server, 200).await;
+
+        let fail_s3 = Arc::new(AtomicBool::new(true));
+        let store: Arc<dyn object_store::ObjectStore> = Arc::new(FlakyStore {
+            inner: Arc::new(object_store::memory::InMemory::new()),
+            fail: Arc::clone(&fail_s3),
+        });
+        let dep_health = DependencyHealth::new();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let handle = dep_health.spawn_probes_with_interval(
+            store,
+            format!("{}/oidc", server.uri()),
+            Arc::clone(&cancel),
+            Duration::from_millis(100),
+            Duration::from_secs(60),
+        );
+
+        // The first tick is immediate. The failing store clears the S3 flag.
+        wait_for("the S3 flag to clear", || !dep_health.s3()).await;
+
+        // A passing store restores the S3 flag.
+        fail_s3.store(false, Ordering::Relaxed);
+        advance_until(Duration::from_millis(100), "the S3 flag to recover", || {
+            dep_health.s3()
+        })
+        .await;
+
+        // A failing OIDC endpoint clears the OIDC flag.
+        serve_oidc(&server, 500).await;
+        advance_until(Duration::from_millis(100), "the OIDC flag to clear", || {
+            !dep_health.oidc()
+        })
+        .await;
+
+        // A passing OIDC endpoint restores the OIDC flag.
+        serve_oidc(&server, 200).await;
+        advance_until(
+            Duration::from_millis(100),
+            "the OIDC flag to recover",
+            || dep_health.oidc(),
+        )
+        .await;
+
+        cancel.store(true, Ordering::Relaxed);
+        handle.abort();
+    }
 
     #[actix_web::test]
     async fn health_returns_200() {
