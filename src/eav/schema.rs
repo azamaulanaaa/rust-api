@@ -28,7 +28,10 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
-use oxkv::{Direction, GetSet, KeyValue, OxKvStore, Store as _, Transaction as _};
+use oxkv::{
+    Direction, GetSet, KeyPrefix, KeyValue, OxKvStore, Store as _, StoreError, Transaction as _,
+    TxCas as _,
+};
 use serde::{Deserialize, Deserializer, Serialize, de};
 use tokio::sync::{Mutex, RwLock};
 
@@ -46,6 +49,9 @@ const VERSION_PREFIX: &str = "schema:version:";
 
 /// Key prefix for child markers.
 const CHILD_PREFIX: &str = "schema:child:";
+
+/// Number of times a publish retries after a head conflict.
+const PUBLISH_ATTEMPTS: usize = 4;
 
 /// Maximum size of a schema id or an attribute name, in bytes.
 const MAX_NAME_BYTES: usize = 128;
@@ -212,83 +218,102 @@ impl SchemaRegistry {
     /// A mutex serializes concurrent publishes.
     /// The version row and the head row commit in one transaction.
     /// Parent markers update in the same transaction.
+    /// The head row uses a compare-and-set against the version that the call
+    /// read. A concurrent publish on another registry handle conflicts and
+    /// retries with the new head.
     pub async fn publish(&self, draft: SchemaDraft) -> Result<SchemaDef, SchemaError> {
         validate_draft(&draft)?;
 
         let _publish = self.publish_lock.lock().await;
         let g = self.store.write().await;
-        let tx = g.begin_tx().map_err(SchemaError::Store)?;
+        for _attempt in 0..PUBLISH_ATTEMPTS {
+            let tx = g.begin_tx().map_err(SchemaError::Store)?;
 
-        let head = read_head(&tx, &draft.id).await?;
-        let previous = match head {
-            Some(version) => load_version(&tx, &draft.id, version)
-                .await?
-                .ok_or_else(|| {
-                    SchemaError::Internal("schema head points to a missing version".to_string())
-                })?,
-            None => SchemaDef {
+            let head = read_head(&tx, &draft.id).await?;
+            let previous = match head {
+                Some(version) => load_version(&tx, &draft.id, version)
+                    .await?
+                    .ok_or_else(|| {
+                        SchemaError::Internal("schema head points to a missing version".to_string())
+                    })?,
+                None => SchemaDef {
+                    id: draft.id.clone(),
+                    version: 0,
+                    extends: Vec::new(),
+                    attributes: BTreeMap::new(),
+                    created_at: 0,
+                },
+            };
+            let version = head
+                .unwrap_or(0)
+                .checked_add(1)
+                .ok_or_else(|| SchemaError::Internal("schema version overflow".to_string()))?;
+            let mut extends = Vec::with_capacity(draft.extends.len());
+            for parent in &draft.extends {
+                let parent_def = load_latest(&tx, parent)
+                    .await?
+                    .ok_or_else(|| SchemaError::NotFound("parent schema not found".to_string()))?;
+                extends.push(SchemaRef {
+                    id: parent_def.id,
+                    version: parent_def.version,
+                });
+            }
+            let def = SchemaDef {
                 id: draft.id.clone(),
-                version: 0,
-                extends: Vec::new(),
-                attributes: BTreeMap::new(),
-                created_at: 0,
-            },
-        };
-        let version = head
-            .unwrap_or(0)
-            .checked_add(1)
-            .ok_or_else(|| SchemaError::Internal("schema version overflow".to_string()))?;
-        let mut extends = Vec::with_capacity(draft.extends.len());
-        for parent in &draft.extends {
-            let parent_def = load_latest(&tx, parent)
-                .await?
-                .ok_or_else(|| SchemaError::NotFound("parent schema not found".to_string()))?;
-            extends.push(SchemaRef {
-                id: parent_def.id,
-                version: parent_def.version,
-            });
-        }
-        let def = SchemaDef {
-            id: draft.id.clone(),
-            version,
-            extends,
-            attributes: draft.attributes.clone(),
-            created_at: chrono::Utc::now().timestamp(),
-        };
+                version,
+                extends,
+                attributes: draft.attributes.clone(),
+                created_at: chrono::Utc::now().timestamp(),
+            };
 
-        flatten(&tx, &def).await?;
+            flatten(&tx, &def).await?;
 
-        let version_bytes =
-            serde_json::to_vec(&def).map_err(|e| SchemaError::Internal(e.to_string()))?;
-        let head_bytes =
-            serde_json::to_vec(&version).map_err(|e| SchemaError::Internal(e.to_string()))?;
-        tx.set_bytes(&version_key(&def.id, version), &version_bytes)
-            .await
-            .map_err(SchemaError::Store)?;
-        tx.set_bytes(&head_key(&def.id), &head_bytes)
-            .await
-            .map_err(SchemaError::Store)?;
-
-        let new_parents: HashSet<&str> = def
-            .extends
-            .iter()
-            .map(|parent| parent.id.as_str())
-            .collect();
-        for parent in &def.extends {
-            tx.set_bytes(&child_key(&parent.id, &def.id), b"")
+            let version_bytes =
+                serde_json::to_vec(&def).map_err(|e| SchemaError::Internal(e.to_string()))?;
+            let head_key = head_key(&def.id);
+            let expected_head = match head {
+                Some(version) => Some(
+                    serde_json::to_vec(&version)
+                        .map_err(|e| SchemaError::Internal(e.to_string()))?,
+                ),
+                None => None,
+            };
+            let head_bytes =
+                serde_json::to_vec(&version).map_err(|e| SchemaError::Internal(e.to_string()))?;
+            tx.set_bytes(&version_key(&def.id, version), &version_bytes)
                 .await
                 .map_err(SchemaError::Store)?;
-        }
-        for parent in &previous.extends {
-            if !new_parents.contains(parent.id.as_str()) {
-                tx.delete(&child_key(&parent.id, &def.id))
+            tx.compare_and_set(&head_key, expected_head.as_deref(), &head_bytes)
+                .await
+                .map_err(SchemaError::Store)?;
+
+            let new_parents: HashSet<&str> = def
+                .extends
+                .iter()
+                .map(|parent| parent.id.as_str())
+                .collect();
+            for parent in &def.extends {
+                tx.set_bytes(&child_key(&parent.id, &def.id), b"")
                     .await
                     .map_err(SchemaError::Store)?;
             }
-        }
+            for parent in &previous.extends {
+                if !new_parents.contains(parent.id.as_str()) {
+                    tx.delete(&child_key(&parent.id, &def.id))
+                        .await
+                        .map_err(SchemaError::Store)?;
+                }
+            }
 
-        tx.commit().await.map_err(SchemaError::Store)?;
-        Ok(def)
+            match tx.commit().await {
+                Ok(()) => return Ok(def),
+                Err(StoreError::TxConflict { key, .. }) if key == head_key => continue,
+                Err(error) => return Err(SchemaError::Store(error)),
+            }
+        }
+        Err(SchemaError::Internal(
+            "schema publish conflicted with another writer".to_string(),
+        ))
     }
 
     /// Reads one exact schema version.
@@ -408,8 +433,8 @@ impl SchemaRegistry {
             }
             None => HEAD_PREFIX.to_string(),
         };
-        let max = u32::try_from(limit.saturating_add(1)).ok();
-        let cursor = (Some(start), Some(prefix_scan_end(HEAD_PREFIX)));
+        let max = Some(limit.saturating_add(1));
+        let cursor = (Some(start), KeyPrefix::new(HEAD_PREFIX).upper_bound());
         let heads = g
             .gets_bytes(max, Direction::Next, cursor)
             .await
@@ -574,10 +599,10 @@ impl SchemaRegistry {
         validate_name("schema id", id)?;
         let g = self.store.read().await;
         let prefix = format!("{CHILD_PREFIX}{id}:");
-        let markers = scan_prefix(&*g, &prefix).await?;
+        let markers = scan_keys_prefix(&*g, &prefix).await?;
         let mut out: Vec<String> = markers
             .into_iter()
-            .filter_map(|kv| kv.key.strip_prefix(&prefix).map(str::to_string))
+            .filter_map(|key| key.strip_prefix(&prefix).map(str::to_string))
             .collect();
         out.sort();
         out.dedup();
@@ -785,9 +810,29 @@ where
     S: GetSet + ?Sized,
 {
     debug_assert!(prefix.starts_with(SCHEMA_PREFIX));
-    let cursor = (Some(prefix.to_string()), Some(prefix_scan_end(prefix)));
+    let cursor = (
+        Some(prefix.to_string()),
+        KeyPrefix::new(prefix).upper_bound(),
+    );
     store
         .gets_bytes(None, Direction::Next, cursor)
+        .await
+        .map_err(SchemaError::Store)
+}
+
+/// Scans a key range that ends at the `prefix:` family bound and reads keys
+/// only.
+async fn scan_keys_prefix<S>(store: &S, prefix: &str) -> Result<Vec<String>, SchemaError>
+where
+    S: GetSet + ?Sized + Sync,
+{
+    debug_assert!(prefix.starts_with(SCHEMA_PREFIX));
+    let cursor = (
+        Some(prefix.to_string()),
+        KeyPrefix::new(prefix).upper_bound(),
+    );
+    store
+        .gets_keys(None, Direction::Next, cursor)
         .await
         .map_err(SchemaError::Store)
 }
@@ -802,21 +847,15 @@ where
     S: GetSet + ?Sized,
 {
     debug_assert!(prefix.starts_with(SCHEMA_PREFIX));
-    let max = u32::try_from(limit).ok();
-    let cursor = (Some(prefix.to_string()), Some(prefix_scan_end(prefix)));
+    let max = Some(limit);
+    let cursor = (
+        Some(prefix.to_string()),
+        KeyPrefix::new(prefix).upper_bound(),
+    );
     store
         .gets_bytes(max, Direction::Next, cursor)
         .await
         .map_err(SchemaError::Store)
-}
-
-/// The exclusive upper bound for a `prefix:` range scan (`:` -> `;`).
-fn prefix_scan_end(prefix: &str) -> String {
-    debug_assert!(prefix.ends_with(':'));
-    let mut end = prefix.to_string();
-    end.pop();
-    end.push(';');
-    end
 }
 
 /// The key that holds the latest version of `id`.
@@ -912,6 +951,26 @@ mod tests {
             extends: extends.iter().map(|s| s.to_string()).collect(),
             attributes: attrs.into_iter().map(|a| (a.name.clone(), a)).collect(),
         }
+    }
+
+    #[tokio::test]
+    async fn concurrent_publishes_get_distinct_versions() {
+        let raw = build_test_store(&test_prefix("eav-schema-race")).await;
+        let first = SchemaRegistry::new(raw.clone());
+        let second = SchemaRegistry::new(raw.clone());
+        let first_draft = draft("user", &[], vec![attr("email", AttributeType::String)]);
+        let second_draft = first_draft.clone();
+
+        let (first_def, second_def) =
+            tokio::join!(first.publish(first_draft), second.publish(second_draft));
+        let first_def = first_def.unwrap();
+        let second_def = second_def.unwrap();
+
+        let mut versions = [first_def.version, second_def.version];
+        versions.sort_unstable();
+        assert_eq!(versions, [1, 2], "each publish must get its own version");
+        let head = read_head(&raw, "user").await.unwrap();
+        assert_eq!(head, Some(2), "the head must point at the last version");
     }
 
     #[tokio::test]
@@ -1404,7 +1463,7 @@ mod tests {
         let g = reg.store.read().await;
         let cursor = (
             Some(SCHEMA_PREFIX.to_string()),
-            Some(prefix_scan_end(SCHEMA_PREFIX)),
+            KeyPrefix::new(SCHEMA_PREFIX).upper_bound(),
         );
         let keys = g.gets_bytes(None, Direction::Next, cursor).await.unwrap();
         assert!(keys.is_empty(), "a rejected publish must write no key");

@@ -52,12 +52,49 @@ pub async fn build_s3_store(cfg: &S3ClientConfig, prefix: &str) -> Result<OxKvSt
     let inner = build_object_store(cfg).map_err(|e| StoreError::Other(e.to_string()))?;
     let object_prefix = ObjectPath::from(prefix.trim_matches('/'));
     let mut builder = OxKvStore::builder()
-        .with_object_store(inner)
+        .with_store(Arc::new(oxkv_s3::ObjectStoreStorage::new(inner)))
         .with_prefix(object_prefix);
     if cfg.backend == S3Backend::Memory {
         builder = builder.skip_probe(true);
     }
     builder.build().await
+}
+
+/// Builds a read-only [`oxkv::OxKvReader`] at `prefix` inside the bucket of
+/// `cfg`.
+///
+/// The reader takes no epoch. It does not write `ownership.json`, so it cannot
+/// fence the writer that holds the prefix. The reader revalidates the manifest
+/// on each read. It also replays new WAL files. So it sees a committed write
+/// after the manifest CAS lands.
+///
+/// Use this function for a read-only command such as `policy export`. Use
+/// [`build_s3_store`] when the caller must write.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Storage`] when the object store cannot be read.
+pub async fn build_s3_reader(
+    cfg: &S3ClientConfig,
+    prefix: &str,
+) -> Result<oxkv::OxKvReader, StoreError> {
+    let inner = build_object_store(cfg).map_err(|e| StoreError::Other(e.to_string()))?;
+    reader_over(inner, prefix).await
+}
+
+/// Builds a reader over the object store `inner` at `prefix`.
+///
+/// [`build_s3_reader`] and the test helper `build_test_reader` share this
+/// function, so the prefix handling stays the same.
+async fn reader_over(
+    inner: Arc<dyn ObjectStore>,
+    prefix: &str,
+) -> Result<oxkv::OxKvReader, StoreError> {
+    OxKvStore::builder()
+        .with_store(Arc::new(oxkv_s3::ObjectStoreStorage::new(inner)))
+        .with_prefix(ObjectPath::from(prefix.trim_matches('/')))
+        .build_reader()
+        .await
 }
 
 /// Default cache of SST blocks for the calls that open a replica.
@@ -103,7 +140,7 @@ pub fn test_prefix(name: &str) -> String {
 pub async fn build_test_store(prefix: &str) -> OxKvStore {
     let inner = Arc::new(object_store::memory::InMemory::new()) as Arc<dyn ObjectStore>;
     OxKvStore::builder()
-        .with_object_store(inner)
+        .with_store(Arc::new(oxkv_s3::ObjectStoreStorage::new(inner)))
         .with_prefix(ObjectPath::from(prefix))
         .skip_probe(true)
         .build()
@@ -122,12 +159,25 @@ pub async fn build_test_store(prefix: &str) -> OxKvStore {
 #[allow(clippy::expect_used)]
 pub async fn build_test_store_new_session(inner: Arc<dyn ObjectStore>, prefix: &str) -> OxKvStore {
     OxKvStore::builder()
-        .with_object_store(inner)
+        .with_store(Arc::new(oxkv_s3::ObjectStoreStorage::new(inner)))
         .with_prefix(ObjectPath::from(prefix))
         .skip_probe(true)
         .build()
         .await
         .expect("test OxKvStore must build")
+}
+
+/// Builds an [`oxkv::OxKvReader`] in memory over the backend `inner` at
+/// `prefix`.
+///
+/// The reader takes no epoch. So it does not fence the writer over the same
+/// prefix. Use it to test a read path that must not disturb a live writer.
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+pub async fn build_test_reader(inner: Arc<dyn ObjectStore>, prefix: &str) -> oxkv::OxKvReader {
+    reader_over(inner, prefix)
+        .await
+        .expect("test OxKvReader must build")
 }
 
 /// Builds an [`OxKvStore`] that is not durable, over a new in-memory object
@@ -143,7 +193,7 @@ pub async fn build_test_store_new_session(inner: Arc<dyn ObjectStore>, prefix: &
 pub async fn build_scratch_store(prefix: &str) -> OxKvStore {
     let inner = Arc::new(object_store::memory::InMemory::new()) as Arc<dyn ObjectStore>;
     OxKvStore::builder()
-        .with_object_store(inner)
+        .with_store(Arc::new(oxkv_s3::ObjectStoreStorage::new(inner)))
         .with_prefix(ObjectPath::from(prefix))
         .skip_probe(true)
         .build()
@@ -184,6 +234,7 @@ mod tests {
             "test_prefix",
             "build_test_store",
             "build_test_store_new_session",
+            "build_test_reader",
         ] {
             let src = std::fs::read_to_string("src/db.rs").expect("readable");
             let needle = format!("pub fn {name}");
@@ -217,6 +268,33 @@ mod tests {
         tx.set_bytes("a", b"1").await?;
         tx.commit().await?;
         assert_eq!(s.get_bytes("a").await?, Some(b"1".to_vec()));
+        Ok(())
+    }
+
+    /// A reader must see the writes of the live writer. The writer must keep
+    /// its epoch.
+    ///
+    /// The reader takes no epoch. So the second write of the writer must
+    /// succeed. A reader that fenced the writer would make this write fail
+    /// with `StoreError::Fenced`.
+    #[tokio::test]
+    async fn reader_does_not_fence_the_writer() -> anyhow::Result<()> {
+        use oxkv::GetSet as _;
+
+        let inner = Arc::new(object_store::memory::InMemory::new()) as Arc<dyn ObjectStore>;
+        let prefix = test_prefix("db-reader");
+        let writer = build_test_store_new_session(inner.clone(), &prefix).await;
+        writer.set_bytes("first", b"1").await?;
+
+        let reader = build_test_reader(inner, &prefix).await;
+        assert_eq!(reader.get_bytes("first").await?, Some(b"1".to_vec()));
+
+        writer.set_bytes("second", b"2").await?;
+        assert_eq!(
+            reader.get_bytes("second").await?,
+            Some(b"2".to_vec()),
+            "the reader must replay the WAL file that the second write added"
+        );
         Ok(())
     }
 }

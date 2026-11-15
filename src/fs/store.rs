@@ -7,8 +7,10 @@
 use std::sync::Arc;
 
 use oxkv::{
-    CachedOxKvStore, Direction, GetSet, KeyValue, OxKvStore, Store as _, Transaction as _, WarmMode,
+    Direction, GetSet, KeyPrefix, KeyValue, OxKvStore, Store as _, StoreError, Transaction as _,
+    TxCas as _,
 };
+use oxkv_cached::{CachedOxKvStore, WarmMode};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
@@ -323,7 +325,10 @@ impl FsStore {
     /// Bounding the scan to a key prefix keeps the size of each scan
     /// proportional to its own key family, and not to the whole store.
     async fn scan_prefix(&self, prefix: &str) -> Result<Vec<KeyValue>, FsError> {
-        let cursor = (Some(prefix.to_string()), Some(prefix_scan_end(prefix)));
+        let cursor = (
+            Some(prefix.to_string()),
+            KeyPrefix::new(prefix).upper_bound(),
+        );
         if let Some(mirror) = &self.mirror {
             return mirror
                 .gets_bytes(None, Direction::Next, cursor)
@@ -332,6 +337,25 @@ impl FsStore {
         }
         let g = self.inner.read().await;
         g.gets_bytes(None, Direction::Next, cursor)
+            .await
+            .map_err(FsError::from)
+    }
+
+    /// Scans a key range that stops at the end of the `prefix:` family and
+    /// reads keys only.
+    async fn scan_keys_prefix(&self, prefix: &str) -> Result<Vec<String>, FsError> {
+        let cursor = (
+            Some(prefix.to_string()),
+            KeyPrefix::new(prefix).upper_bound(),
+        );
+        if let Some(mirror) = &self.mirror {
+            return mirror
+                .gets_keys(None, Direction::Next, cursor)
+                .await
+                .map_err(FsError::from);
+        }
+        let g = self.inner.read().await;
+        g.gets_keys(None, Direction::Next, cursor)
             .await
             .map_err(FsError::from)
     }
@@ -354,7 +378,7 @@ impl FsStore {
         let key = Self::session_key(&s.id);
         let val = serde_json::to_vec(s).map_err(|e| FsError::Internal(e.to_string()))?;
         let g = self.inner.write().await;
-        g.set_bytes(&key, &val)
+        g.put_bytes(&key, &val)
             .await
             .map_err(|e| self.store_err(e))?;
         Ok(())
@@ -424,7 +448,7 @@ impl FsStore {
         let key = Self::multipart_key(&m.upload_id);
         let val = serde_json::to_vec(m).map_err(|e| FsError::Internal(e.to_string()))?;
         let g = self.inner.write().await;
-        g.set_bytes(&key, &val)
+        g.put_bytes(&key, &val)
             .await
             .map_err(|e| self.store_err(e))?;
         Ok(())
@@ -455,7 +479,7 @@ impl FsStore {
     pub async fn save_staged_part(&self, id: &str, idx: u64, data: Vec<u8>) -> Result<(), FsError> {
         let key = Self::staged_key(id, idx);
         let g = self.inner.write().await;
-        g.set_bytes(&key, &data)
+        g.put_bytes(&key, &data)
             .await
             .map_err(|e| self.store_err(e))?;
         Ok(())
@@ -472,7 +496,7 @@ impl FsStore {
         let key = Self::file_key(&rec.id);
         let val = serde_json::to_vec(rec).map_err(|e| FsError::Internal(e.to_string()))?;
         let g = self.inner.write().await;
-        g.set_bytes(&key, &val)
+        g.put_bytes(&key, &val)
             .await
             .map_err(|e| self.store_err(e))?;
         Ok(())
@@ -499,15 +523,15 @@ impl FsStore {
         let suffix = format!(":{id}");
         let cursor = (
             Some(REL_PREFIX.to_string()),
-            Some(prefix_scan_end(REL_PREFIX)),
+            KeyPrefix::new(REL_PREFIX).upper_bound(),
         );
-        let kvs = tx
-            .gets_bytes(None, Direction::Next, cursor)
+        let keys = tx
+            .gets_keys(None, Direction::Next, cursor)
             .await
             .map_err(|e| self.store_err(e))?;
-        for kv in &kvs {
-            if kv.key.starts_with(REL_PREFIX) && kv.key.ends_with(&suffix) {
-                tx.delete(&kv.key).await.map_err(|e| self.store_err(e))?;
+        for key in &keys {
+            if key.starts_with(REL_PREFIX) && key.ends_with(&suffix) {
+                tx.delete(key).await.map_err(|e| self.store_err(e))?;
             }
         }
         tx.delete(&key).await.map_err(|e| self.store_err(e))?;
@@ -540,29 +564,42 @@ impl FsStore {
         let rel = rel_key(row_type, row_id, file_id);
         let refs = refs_key(file_id);
         let g = self.inner.write().await;
-        let tx = g.begin_tx().map_err(|e| self.store_err(e))?;
-        if tx
-            .get_bytes(&rel)
-            .await
-            .map_err(|e| self.store_err(e))?
-            .is_some()
-        {
-            let info = read_ref_info(&tx, file_id, self.latch, self.primary).await?;
-            tx.rollback().await.map_err(|e| self.store_err(e))?;
-            return Ok(info.count);
+        for _attempt in 0..RELATION_ATTEMPTS {
+            let tx = g.begin_tx().map_err(|e| self.store_err(e))?;
+            if tx
+                .get_bytes(&rel)
+                .await
+                .map_err(|e| self.store_err(e))?
+                .is_some()
+            {
+                let info = read_ref_info(&tx, file_id, self.latch, self.primary).await?;
+                tx.rollback().await.map_err(|e| self.store_err(e))?;
+                return Ok(info.count);
+            }
+            let expected = tx.get_bytes(&refs).await.map_err(|e| self.store_err(e))?;
+            let mut info = read_ref_info(&tx, file_id, self.latch, self.primary).await?;
+            info.count = info.count.saturating_add(1);
+            info.orphan_since = None;
+            let val = serde_json::to_vec(&info).map_err(|e| FsError::Internal(e.to_string()))?;
+            tx.set_if_absent(&rel, b"1")
+                .await
+                .map_err(|e| self.store_err(e))?;
+            tx.compare_and_set(&refs, expected.as_deref(), &val)
+                .await
+                .map_err(|e| self.store_err(e))?;
+            match tx.commit().await {
+                Ok(()) => return Ok(info.count),
+                Err(StoreError::TxConflict { key, .. }) if key == rel => {
+                    let info = read_ref_info(&*g, file_id, self.latch, self.primary).await?;
+                    return Ok(info.count);
+                }
+                Err(StoreError::TxConflict { .. }) => continue,
+                Err(error) => return Err(self.store_err(error)),
+            }
         }
-        let mut info = read_ref_info(&tx, file_id, self.latch, self.primary).await?;
-        info.count = info.count.saturating_add(1);
-        info.orphan_since = None;
-        tx.set_bytes(&rel, b"1")
-            .await
-            .map_err(|e| self.store_err(e))?;
-        let val = serde_json::to_vec(&info).map_err(|e| FsError::Internal(e.to_string()))?;
-        tx.set_bytes(&refs, &val)
-            .await
-            .map_err(|e| self.store_err(e))?;
-        tx.commit().await.map_err(|e| self.store_err(e))?;
-        Ok(info.count)
+        Err(FsError::Store(
+            "relation attach conflicted with another writer".to_string(),
+        ))
     }
 
     /// Detaches a file from a row. The function is idempotent.
@@ -577,39 +614,54 @@ impl FsStore {
         let rel = rel_key(row_type, row_id, file_id);
         let refs = refs_key(file_id);
         let g = self.inner.write().await;
-        let tx = g.begin_tx().map_err(|e| self.store_err(e))?;
-        if tx
-            .get_bytes(&rel)
-            .await
-            .map_err(|e| self.store_err(e))?
-            .is_none()
-        {
-            let info = read_ref_info(&tx, file_id, self.latch, self.primary).await?;
-            tx.rollback().await.map_err(|e| self.store_err(e))?;
-            return Ok(info.count);
+        for _attempt in 0..RELATION_ATTEMPTS {
+            let tx = g.begin_tx().map_err(|e| self.store_err(e))?;
+            if tx
+                .get_bytes(&rel)
+                .await
+                .map_err(|e| self.store_err(e))?
+                .is_none()
+            {
+                let info = read_ref_info(&tx, file_id, self.latch, self.primary).await?;
+                tx.rollback().await.map_err(|e| self.store_err(e))?;
+                return Ok(info.count);
+            }
+            let expected = tx.get_bytes(&refs).await.map_err(|e| self.store_err(e))?;
+            let mut info = read_ref_info(&tx, file_id, self.latch, self.primary).await?;
+            info.count = info.count.saturating_sub(1);
+            if info.count == 0 {
+                info.orphan_since = Some(chrono::Utc::now().timestamp());
+            }
+            let val = serde_json::to_vec(&info).map_err(|e| FsError::Internal(e.to_string()))?;
+            tx.delete_if(&rel, b"1")
+                .await
+                .map_err(|e| self.store_err(e))?;
+            tx.compare_and_set(&refs, expected.as_deref(), &val)
+                .await
+                .map_err(|e| self.store_err(e))?;
+            match tx.commit().await {
+                Ok(()) => return Ok(info.count),
+                Err(StoreError::TxConflict { key, .. }) if key == rel => {
+                    let info = read_ref_info(&*g, file_id, self.latch, self.primary).await?;
+                    return Ok(info.count);
+                }
+                Err(StoreError::TxConflict { .. }) => continue,
+                Err(error) => return Err(self.store_err(error)),
+            }
         }
-        let mut info = read_ref_info(&tx, file_id, self.latch, self.primary).await?;
-        tx.delete(&rel).await.map_err(|e| self.store_err(e))?;
-        info.count = info.count.saturating_sub(1);
-        if info.count == 0 {
-            info.orphan_since = Some(chrono::Utc::now().timestamp());
-        }
-        let val = serde_json::to_vec(&info).map_err(|e| FsError::Internal(e.to_string()))?;
-        tx.set_bytes(&refs, &val)
-            .await
-            .map_err(|e| self.store_err(e))?;
-        tx.commit().await.map_err(|e| self.store_err(e))?;
-        Ok(info.count)
+        Err(FsError::Store(
+            "relation detach conflicted with another writer".to_string(),
+        ))
     }
 
     /// Lists rows referencing a file (scan bounded to `fs:rel:`).
     pub async fn rows_for_file(&self, file_id: &str) -> Result<Vec<(String, String)>, FsError> {
         let suffix = format!(":{file_id}");
-        let kvs = self.scan_prefix(REL_PREFIX).await?;
+        let keys = self.scan_keys_prefix(REL_PREFIX).await?;
         let mut out = Vec::new();
-        for kv in kvs {
-            if kv.key.starts_with(REL_PREFIX) && kv.key.ends_with(&suffix) {
-                let rest = &kv.key[REL_PREFIX.len()..];
+        for key in keys {
+            if key.starts_with(REL_PREFIX) && key.ends_with(&suffix) {
+                let rest = &key[REL_PREFIX.len()..];
                 if let Some((ty, rem)) = rest.split_once(':')
                     && let Some((rid, _)) = rem.split_once(':')
                 {
@@ -633,10 +685,10 @@ impl FsStore {
         row_id: &str,
     ) -> Result<Vec<String>, FsError> {
         let prefix = crate::fs::relation::rel_prefix_for_row(row_type, row_id);
-        let kvs = self.scan_prefix(&prefix).await?;
+        let keys = self.scan_keys_prefix(&prefix).await?;
         let mut out = Vec::new();
-        for kv in kvs {
-            if let Some(file_id) = kv.key.strip_prefix(&prefix)
+        for key in keys {
+            if let Some(file_id) = key.strip_prefix(&prefix)
                 && !file_id.is_empty()
                 && !file_id.contains(':')
             {
@@ -818,7 +870,10 @@ impl FsStore {
 /// receives a page that holds only the duplicate key.
 /// The value is small enough that a full scan of a large replica is not
 /// one large allocation.
-const SCAN_PAGE: u32 = 512;
+const SCAN_PAGE: usize = 512;
+
+/// Number of times an attach or detach retries after a ref-count conflict.
+const RELATION_ATTEMPTS: usize = 8;
 
 /// A key-ordered walk over an oxkv store. The walk holds one page at a
 /// time.
@@ -944,20 +999,6 @@ async fn read_ref_info<T: GetSet>(
     serde_json::from_slice(&bytes).map_err(|e| FsError::Internal(e.to_string()))
 }
 
-/// The exclusive upper bound for a `prefix:` range scan (`:` -> `;`).
-///
-/// Every key that starts with `prefix:` sorts strictly below the bound.
-/// The engine can then stop at the end of the key family, instead of
-/// walking the rest of the store.
-/// No stored key is ever equal to the bare prefix.
-fn prefix_scan_end(prefix: &str) -> String {
-    debug_assert!(prefix.ends_with(':'));
-    let mut end = prefix.to_string();
-    end.pop();
-    end.push(';');
-    end
-}
-
 #[cfg(test)]
 mod tests {
     use super::{FileRecord, FsStore, PersistedMultipart, SCAN_PAGE, UploadSession};
@@ -987,7 +1028,7 @@ mod tests {
             FsStore::new(build_test_store(&crate::db::test_prefix("latch-replica")).await);
 
         let fenced = FsError::from(oxkv::StoreError::Fenced("epoch 2".into()));
-        let other = FsError::from(oxkv::StoreError::Storage("bucket gone".into()));
+        let other = FsError::from(oxkv::StoreError::storage("bucket gone"));
 
         assert!(master.latches(&fenced), "a fenced master write is terminal");
         assert!(!replica.latches(&fenced), "a replica build race is not");
@@ -1196,7 +1237,7 @@ mod tests {
     async fn paged_walk_visits_every_key_exactly_once() {
         /// The test uses more keys than `SCAN_PAGE`, so at least one page
         /// boundary falls strictly inside the keyspace.
-        const KEYS: usize = SCAN_PAGE as usize * 3 + 7;
+        const KEYS: usize = SCAN_PAGE * 3 + 7;
 
         let store = test_store().await;
         let expected: Vec<String> = (0..KEYS).map(|i| format!("k:{i:06}")).collect();
@@ -1237,11 +1278,7 @@ mod tests {
     /// hidden.
     #[tokio::test]
     async fn paged_walk_handles_exact_page_multiples() {
-        for size in [
-            SCAN_PAGE as usize,
-            SCAN_PAGE as usize + 1,
-            SCAN_PAGE as usize * 2,
-        ] {
+        for size in [SCAN_PAGE, SCAN_PAGE + 1, SCAN_PAGE * 2] {
             let store = test_store().await;
             let expected: Vec<String> = (0..size).map(|i| format!("k:{i:06}")).collect();
             for key in &expected {
@@ -1572,6 +1609,25 @@ mod tests {
         // No marker and no ref-count entry stays behind.
         assert!(store.rows_for_file("rel-file").await?.is_empty());
         assert_eq!(store.get_ref_info("rel-file").await?.count, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn two_attaches_to_one_file_keep_both_references() -> anyhow::Result<()> {
+        let raw = build_test_store(&crate::db::test_prefix("fs-attach-race")).await;
+        let first = FsStore::new(raw.clone());
+        let second = FsStore::new(raw.clone());
+        let probe = FsStore::new(raw);
+
+        let first_call =
+            tokio::spawn(async move { first.attach("invoice", "1", "race-file").await });
+        let second_call =
+            tokio::spawn(async move { second.attach("invoice", "2", "race-file").await });
+        let (first_result, second_result) = tokio::join!(first_call, second_call);
+
+        first_result.unwrap()?;
+        second_result.unwrap()?;
+        assert_eq!(probe.get_ref_info("race-file").await?.count, 2);
         Ok(())
     }
 

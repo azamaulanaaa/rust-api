@@ -29,3 +29,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Policy export and import commands.
 - CLI with `serve`, `policy export`, and `policy import`.
 - Conventional Commits style for commit messages.
+- Transaction-level conditional writes for entity versions, schema publish, rule upsert, replica head and generation, file relation ref-counts, WAL sequence, and policy rule claims.
+- Policy export through a read-only follower, so export does not fence the writer.
+
+### Changed
+
+- Migrated to oxkv 0.12.1.
+- Family scans read keys only and stop at a bounded page.
+- Blind writes use `put_bytes` and skip the old-value read.
