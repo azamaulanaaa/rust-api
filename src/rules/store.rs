@@ -371,9 +371,8 @@ impl RuleStore {
         let bytes = serde_json::to_vec(&seq)
             .map_err(|error| RuleError::Serialization(error.to_string()))?;
         let g = self.store.write().await;
-        g.set_bytes(CURSOR_KEY, &bytes)
+        g.put_bytes(CURSOR_KEY, &bytes)
             .await
-            .map(|_| ())
             .map_err(RuleError::Store)
     }
 
@@ -416,9 +415,8 @@ impl RuleStore {
         let now = chrono::Utc::now().timestamp();
         let bytes = Self::execution_marker_value(now)?;
         let g = self.store.write().await;
-        g.set_bytes(&Self::execution_key(rule_id, event_id), &bytes)
+        g.put_bytes(&Self::execution_key(rule_id, event_id), &bytes)
             .await
-            .map(|_| ())
             .map_err(RuleError::Store)
     }
 
@@ -460,10 +458,7 @@ impl RuleStore {
         };
         let bytes = serde_json::to_vec(&attempts)
             .map_err(|error| RuleError::Serialization(error.to_string()))?;
-        g.set_bytes(&key, &bytes)
-            .await
-            .map(|_| ())
-            .map_err(RuleError::Store)?;
+        g.put_bytes(&key, &bytes).await.map_err(RuleError::Store)?;
         Ok(attempts)
     }
 
@@ -490,9 +485,8 @@ impl RuleStore {
         let bytes = serde_json::to_vec(dead)
             .map_err(|error| RuleError::Serialization(error.to_string()))?;
         let g = self.store.write().await;
-        g.set_bytes(&dead_key(dead.seq, &dead.event_id), &bytes)
+        g.put_bytes(&dead_key(dead.seq, &dead.event_id), &bytes)
             .await
-            .map(|_| ())
             .map_err(RuleError::Store)
     }
 
