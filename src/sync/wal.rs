@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use oxkv::{GetSet, OxKvStore, Store as _, Transaction as _};
+use oxkv::{GetSet, OxKvStore, Store as _, StoreError, Transaction as _, TxCas as _};
 use tokio::sync::RwLock;
 
 use crate::fencing::Latch;
@@ -20,6 +20,9 @@ use crate::records::{ChangeSink, WalEntry, WalOp};
 /// fencing-loss log line names it so that an operator can tell which prefix
 /// died.
 const WAL_PREFIX: &str = "{db}/wal";
+
+/// Number of times an append retries after a sequence conflict.
+const APPEND_ATTEMPTS: u32 = 8;
 
 /// WAL stored in an [`OxKvStore`]. The store is per-user on S3 and scales.
 ///
@@ -99,35 +102,45 @@ impl Wal {
     async fn append_entry_locked(&self, op: WalOp) -> Result<u64, FsError> {
         let _guard = self.append_lock.lock().await;
         let g = self.store.write().await;
-        // An absent head means an empty feed, and only absence means that. A
-        // present value that will not decode means a damaged head pointer.
-        // Treating it as "empty" is not a recovery. The next sequence becomes
-        // 1. Then `set_bytes` overwrites `wal:{...001}`, the first entry of
-        // the feed. Every replica that applied 1..N reads `range(1, 1)` and
-        // gets one op. It then applies the wrong op. Only `head()` reads this
-        // key, and it complains after the damage.
-        let cur = match g.get_bytes(Self::seq_key()).await.map_err(FsError::from)? {
-            None => 0,
-            Some(b) => serde_json::from_slice::<u64>(&b)
-                .map_err(|e| FsError::Internal(format!("wal head pointer is undecodable: {e}")))?,
-        };
-        let seq = cur + 1;
-        let entry = WalEntry {
-            seq,
-            op,
-            ts: chrono::Utc::now().timestamp(),
-        };
-        let val = serde_json::to_vec(&entry).map_err(|e| FsError::Internal(e.to_string()))?;
-        let seq_val = serde_json::to_vec(&seq).map_err(|e| FsError::Internal(e.to_string()))?;
-        let tx = g.begin_tx().map_err(FsError::from)?;
-        tx.set_bytes(&Self::entry_key(seq), &val)
-            .await
-            .map_err(FsError::from)?;
-        tx.set_bytes(Self::seq_key(), &seq_val)
-            .await
-            .map_err(FsError::from)?;
-        tx.commit().await.map_err(FsError::from)?;
-        Ok(seq)
+        for _attempt in 0..APPEND_ATTEMPTS {
+            // An absent head means an empty feed, and only absence means that. A
+            // present value that will not decode means a damaged head pointer.
+            // Treating it as "empty" is not a recovery. The next sequence becomes
+            // 1. Then the write overwrites `wal:{...001}`, the first entry of
+            // the feed. Every replica that applied 1..N reads `range(1, 1)` and
+            // gets one op. It then applies the wrong op. Only `head()` reads this
+            // key, and it complains after the damage.
+            let cur_bytes = g.get_bytes(Self::seq_key()).await.map_err(FsError::from)?;
+            let cur = match &cur_bytes {
+                None => 0,
+                Some(b) => serde_json::from_slice::<u64>(b).map_err(|e| {
+                    FsError::Internal(format!("wal head pointer is undecodable: {e}"))
+                })?,
+            };
+            let seq = cur + 1;
+            let entry = WalEntry {
+                seq,
+                op: op.clone(),
+                ts: chrono::Utc::now().timestamp(),
+            };
+            let val = serde_json::to_vec(&entry).map_err(|e| FsError::Internal(e.to_string()))?;
+            let seq_val = serde_json::to_vec(&seq).map_err(|e| FsError::Internal(e.to_string()))?;
+            let tx = g.begin_tx().map_err(FsError::from)?;
+            tx.set_bytes(&Self::entry_key(seq), &val)
+                .await
+                .map_err(FsError::from)?;
+            tx.compare_and_set(Self::seq_key(), cur_bytes.as_deref(), &seq_val)
+                .await
+                .map_err(FsError::from)?;
+            match tx.commit().await {
+                Ok(()) => return Ok(seq),
+                Err(StoreError::TxConflict { key, .. }) if key == Self::seq_key() => continue,
+                Err(error) => return Err(FsError::from(error)),
+            }
+        }
+        Err(FsError::Store(
+            "wal append conflicted with another writer".to_string(),
+        ))
     }
 
     /// Current head seq.
@@ -471,6 +484,49 @@ mod tests {
         seqs.sort_unstable();
         seqs.dedup();
         assert_eq!(seqs.len(), 200);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn appends_from_two_handles_keep_unique_seqs() -> anyhow::Result<()> {
+        let raw = build_test_store(&crate::db::test_prefix("wal-race")).await;
+        let first = Wal::new(raw.clone());
+        let second = Wal::new(raw.clone());
+        let reader = second.clone();
+
+        let first_task = tokio::spawn(async move {
+            for _ in 0..25u32 {
+                first
+                    .append(WalOp::Attach {
+                        row_type: "t".into(),
+                        row_id: "first".into(),
+                        file_id: "f".into(),
+                    })
+                    .await
+                    .unwrap();
+            }
+        });
+        let second_task = tokio::spawn(async move {
+            for _ in 0..25u32 {
+                second
+                    .append(WalOp::Attach {
+                        row_type: "t".into(),
+                        row_id: "second".into(),
+                        file_id: "f".into(),
+                    })
+                    .await
+                    .unwrap();
+            }
+        });
+
+        first_task.await.unwrap();
+        second_task.await.unwrap();
+        assert_eq!(reader.head().await?, 50);
+        let entries = reader.range(1, 50).await?;
+        let mut seqs: Vec<u64> = entries.iter().map(|e| e.seq).collect();
+        seqs.sort_unstable();
+        seqs.dedup();
+        assert_eq!(seqs.len(), 50);
         Ok(())
     }
 
