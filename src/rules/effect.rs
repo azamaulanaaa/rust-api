@@ -151,6 +151,7 @@ impl EffectPlan {
     ///
     /// The call rejects more than [`MAX_EFFECTS`] effects.
     /// It checks every id and every attribute name.
+    /// It rejects an update or a delete after a delete of the same id.
     /// An empty plan is valid, because a script can decide to do nothing.
     pub fn validate_allow_empty(&self) -> Result<(), EntityError> {
         if self.effects.len() > MAX_EFFECTS {
@@ -158,8 +159,25 @@ impl EffectPlan {
                 "effect plan has more than {MAX_EFFECTS} effects"
             )));
         }
-        for effect in &self.effects {
+        let mut deleted: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        for (index, effect) in self.effects.iter().enumerate() {
             effect.validate()?;
+            match effect {
+                EntityEffect::Update { id, .. } | EntityEffect::Delete { id, .. }
+                    if deleted.contains(id.as_str()) =>
+                {
+                    return Err(EntityError::Invalid(format!(
+                        "effect {index} changes entity {id} after a delete in the same plan"
+                    )));
+                }
+                EntityEffect::Delete { id, .. } => {
+                    deleted.insert(id.as_str());
+                }
+                EntityEffect::Create { id, .. } => {
+                    deleted.remove(id.as_str());
+                }
+                EntityEffect::Update { .. } => {}
+            }
         }
         Ok(())
     }
@@ -231,6 +249,22 @@ mod tests {
             matches!(&error, EntityError::Invalid(message) if message == "effect plan is empty"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn a_plan_rejects_an_update_or_a_delete_after_a_delete_of_one_id() {
+        let update_after_delete = EffectPlan::new(vec![delete("e1"), update("e1")]);
+        let delete_after_delete = EffectPlan::new(vec![delete("e1"), delete("e1")]);
+        let create_after_delete = EffectPlan::new(vec![delete("e1"), create("e1")]);
+
+        for plan in [update_after_delete, delete_after_delete] {
+            let error = plan.validate().unwrap_err();
+            assert!(
+                matches!(&error, EntityError::Invalid(message) if message.contains("after a delete")),
+                "unexpected error: {error}"
+            );
+        }
+        assert!(create_after_delete.validate().is_ok());
     }
 
     #[test]
