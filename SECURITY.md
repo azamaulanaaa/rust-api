@@ -43,7 +43,9 @@ In scope:
 - Single-writer lease and fencing.
 - EAV schema and entity API, including schema defaults, entity validation, unique and index facts, and version checks.
 - EAV rule scripts, including the Rhai sandbox, its operation limits, and its read and write capability sets.
-- EAV webhook egress, including the host allowlist, DNS resolution and address pinning, disabled system proxies, and HMAC signing.
+- EAV condition-script visibility, including the rule read set, the hidden attributes and changes, and the visible entity identity and event metadata.
+- EAV webhook egress, including the host allowlist, DNS resolution and address pinning, disabled system proxies, the body-only legacy signature, the timestamped `X-Signature-V2` signature, and the replay window in the signature verifier.
+- EAV log action redaction, including secret-like parameter keys and URL user information and query values.
 - EAV replica authorization, including the build-time grant filter and the read-time grant filter.
 
 Out of scope:
