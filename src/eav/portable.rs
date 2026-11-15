@@ -31,11 +31,22 @@
 //! The import writes no entity event and no outbox row.
 //! A restore must not replay the history of the source prefix.
 //!
+//! # Restore checks
+//!
+//! [`validate`] reads the stored data and reports these problems:
+//!
+//! - An entity pins a schema version that is absent.
+//! - A unique claim is missing, stale, or shared.
+//! - A reference names no stored entity.
+
 use std::io::{BufRead, Write};
 
 use serde::{Deserialize, Serialize};
 
-use crate::eav::entity::{Entity, EntityStore, RebuildReport};
+use crate::eav::entity::{
+    DanglingRefIssue, Entity, EntityStore, IndexValidationReport, MissingSchemaIssue,
+    RebuildReport, UniqueClaimIssue,
+};
 use crate::eav::entity_error::EntityError;
 use crate::eav::error::SchemaError;
 use crate::eav::schema::{SchemaDef, SchemaRegistry};
@@ -137,6 +148,35 @@ pub struct ImportReport {
     pub entities: usize,
     /// The number of rule records that the import wrote.
     pub rules: usize,
+}
+
+/// The result of one restore check.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ValidationReport {
+    /// The number of stored schema versions.
+    pub schemas: usize,
+    /// The number of stored entities.
+    pub entities: usize,
+    /// The number of stored rules.
+    pub rules: usize,
+    /// The entities that pin an absent schema version.
+    pub missing_schemas: Vec<MissingSchemaIssue>,
+    /// The references that name no stored entity.
+    pub dangling_refs: Vec<DanglingRefIssue>,
+    /// The unique claims that fail the check.
+    pub unique_claim_issues: Vec<UniqueClaimIssue>,
+    /// The entities whose pinned schemas conflict.
+    pub schema_conflicts: Vec<String>,
+}
+
+impl ValidationReport {
+    /// Returns true when the check found no problem.
+    pub fn is_ok(&self) -> bool {
+        self.missing_schemas.is_empty()
+            && self.dangling_refs.is_empty()
+            && self.unique_claim_issues.is_empty()
+            && self.schema_conflicts.is_empty()
+    }
 }
 
 /// Writes the stored schemas, entities, and rules to `out`.
@@ -244,6 +284,28 @@ pub async fn import<R: BufRead>(
         schemas: schema_rows.len(),
         entities: entity_rows.len(),
         rules: rule_rows.len(),
+    })
+}
+
+/// Checks the stored schemas, entities, and rules.
+///
+/// The call reports an absent pinned schema version.
+/// It reports a unique claim that is missing, stale, or shared.
+/// It reports a reference that names no stored entity.
+pub async fn validate(
+    schemas: &SchemaRegistry,
+    entities: &EntityStore,
+    rules: &RuleStore,
+) -> Result<ValidationReport, PortableError> {
+    let index: IndexValidationReport = entities.validate_indexes().await?;
+    Ok(ValidationReport {
+        schemas: schemas.versions().await?.len(),
+        entities: index.entities,
+        rules: rules.list().await?.len(),
+        missing_schemas: index.missing_schemas,
+        dangling_refs: index.dangling_refs,
+        unique_claim_issues: index.unique_claim_issues,
+        schema_conflicts: index.schema_conflicts,
     })
 }
 
@@ -604,6 +666,11 @@ mod tests {
         let bob = target_entities.get("bob").await?.expect("bob is present");
         assert_eq!(bob.schemas[0].version, 2, "bob keeps his pinned version");
 
+        let validation = validate(&target_schemas, &target_entities, &target_rules).await?;
+        assert!(
+            validation.is_ok(),
+            "the restored prefix must pass: {validation:?}"
+        );
         Ok(())
     }
 
@@ -678,6 +745,65 @@ mod tests {
         assert_eq!(first.entities, second.entities);
         assert_eq!(before, after, "a second rebuild must change no index row");
         assert_eq!(entities.list_by_attribute("tag", &red).await?.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn validate_reports_a_dangling_reference() -> anyhow::Result<()> {
+        let (schemas, entities, rules, _) = triple().await;
+        let mut schema = draft("post");
+        schema.attributes.insert(
+            "author".to_string(),
+            attr("author", AttributeType::EntityRef, false, false),
+        );
+        schemas.publish(schema).await?;
+
+        let ctx = WriteContext::new("test");
+        entities
+            .create(
+                EntityDraft {
+                    id: "target".to_string(),
+                    schemas: vec!["post".to_string()],
+                    attributes: BTreeMap::new(),
+                },
+                &ctx,
+            )
+            .await?;
+        entities
+            .create(
+                EntityDraft {
+                    id: "source".to_string(),
+                    schemas: vec!["post".to_string()],
+                    attributes: values(&[(
+                        "author",
+                        AttributeValue::EntityRef("target".to_string()),
+                    )]),
+                },
+                &ctx,
+            )
+            .await?;
+
+        let mut bytes = Vec::new();
+        export(&schemas, &entities, &rules, &mut bytes).await?;
+        let text = String::from_utf8(bytes).expect("the export is UTF-8");
+        let text = text.replace("\"value\":\"target\"", "\"value\":\"missing\"");
+
+        let (target_schemas, target_entities, target_rules, _) = triple().await;
+        import(
+            &target_schemas,
+            &target_entities,
+            &target_rules,
+            text.as_bytes(),
+        )
+        .await?;
+
+        let report = validate(&target_schemas, &target_entities, &target_rules).await?;
+        assert!(!report.is_ok(), "a dangling reference must fail the check");
+        assert_eq!(report.dangling_refs.len(), 1, "{report:?}");
+        assert_eq!(report.dangling_refs[0].entity_id, "source");
+        assert_eq!(report.dangling_refs[0].target, "missing");
+        assert!(report.missing_schemas.is_empty(), "{report:?}");
+        assert!(report.unique_claim_issues.is_empty(), "{report:?}");
         Ok(())
     }
 }
