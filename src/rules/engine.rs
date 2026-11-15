@@ -395,18 +395,7 @@ impl RuleEngine {
                 });
                 continue;
             }
-            let passed = match &rule.condition {
-                Condition::Script { source } => {
-                    let ctx = ScriptContext {
-                        event,
-                        entity: entity.as_ref(),
-                        now: chrono::Utc::now().timestamp(),
-                    };
-                    self.script.eval_bool(source, &ctx)?
-                }
-                other => other.eval(entity.as_ref(), event),
-            };
-            if !passed {
+            if !self.eval_condition(&rule.condition, event, entity.as_ref())? {
                 let outcome = ExecutionOutcome::ConditionFalse;
                 self.observe(outcome);
                 executions.push(RuleExecution {
@@ -445,6 +434,58 @@ impl RuleEngine {
             });
         }
         Ok(executions)
+    }
+
+    /// Evaluates one condition tree, including every nested script.
+    ///
+    /// A script condition runs through
+    /// [`ScriptEngine::eval_bool`].
+    /// Every other condition runs through [`Condition::eval`].
+    /// A script error stops the rule and returns the sanitized error.
+    fn eval_condition(
+        &self,
+        condition: &Condition,
+        event: &EntityEvent,
+        entity: Option<&Entity>,
+    ) -> Result<bool, RuleError> {
+        let ctx = ScriptContext {
+            event,
+            entity,
+            now: chrono::Utc::now().timestamp(),
+        };
+        self.eval_condition_with(condition, &ctx)
+    }
+
+    /// Evaluates one condition node against one script context.
+    fn eval_condition_with(
+        &self,
+        condition: &Condition,
+        ctx: &ScriptContext<'_>,
+    ) -> Result<bool, RuleError> {
+        match condition {
+            Condition::Script { source } => self
+                .script
+                .eval_bool(source, ctx)
+                .map_err(RuleError::Script),
+            Condition::All(children) => {
+                for child in children {
+                    if !self.eval_condition_with(child, ctx)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+            Condition::Any(children) => {
+                for child in children {
+                    if self.eval_condition_with(child, ctx)? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+            Condition::Not(child) => Ok(!self.eval_condition_with(child, ctx)?),
+            other => Ok(other.eval(ctx.entity, ctx.event)),
+        }
     }
 
     /// Runs one script action and commits its effects with the marker.
@@ -2252,6 +2293,95 @@ mod tests {
                 .all(|item| item.outcome == ExecutionOutcome::Executed)
         );
         assert_eq!(recorder.records().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn nested_scripts_are_evaluated_in_all_any_and_not() {
+        let stores = stores().await;
+        let recorder = Arc::new(RecordingAction::new("record"));
+        let subject = engine(&stores, vec![recorder.clone()]).with_script_enabled(true);
+        make_entity(&stores.entities).await;
+        let total = Condition::Compare {
+            key: "total".to_string(),
+            op: CompareOp::Eq,
+            value: serde_json::json!(10),
+        };
+        let yes = Condition::Script {
+            source: "true".to_string(),
+        };
+        let no = Condition::Script {
+            source: "false".to_string(),
+        };
+
+        let mut all = draft("all", "record");
+        all.priority = 30;
+        all.condition = Condition::All(vec![yes.clone(), total.clone()]);
+        let mut any = draft("any", "record");
+        any.priority = 20;
+        any.condition = Condition::Any(vec![no.clone(), total.clone()]);
+        let mut not = draft("not", "record");
+        not.priority = 10;
+        not.condition = Condition::Not(Box::new(no));
+        stores.rules.upsert(all).await.unwrap();
+        stores.rules.upsert(any).await.unwrap();
+        stores.rules.upsert(not).await.unwrap();
+
+        let executions = subject
+            .process(&event(EntityEventKind::Created))
+            .await
+            .unwrap();
+
+        assert_eq!(executions.len(), 3);
+        assert!(
+            executions
+                .iter()
+                .all(|item| item.outcome == ExecutionOutcome::Executed)
+        );
+        assert_eq!(recorder.records().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_nested_script_error_propagates() {
+        let stores = stores().await;
+        let recorder = Arc::new(RecordingAction::new("record"));
+        let subject = engine(&stores, vec![recorder.clone()]).with_script_enabled(true);
+        make_entity(&stores.entities).await;
+        let mut rule = draft("alpha", "record");
+        rule.condition = Condition::All(vec![Condition::Script {
+            source: r#"http_get("https://example.test")"#.to_string(),
+        }]);
+        stores.rules.upsert(rule).await.unwrap();
+
+        let result = subject.process(&event(EntityEventKind::Created)).await;
+
+        assert!(matches!(
+            result,
+            Err(RuleError::Script(ScriptError::Runtime))
+        ));
+        assert!(recorder.records().is_empty());
+        assert!(!stores.rules.is_executed("alpha", "evt-1").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_false_top_level_script_skips_the_action() {
+        let stores = stores().await;
+        let recorder = Arc::new(RecordingAction::new("record"));
+        let subject = engine(&stores, vec![recorder.clone()]).with_script_enabled(true);
+        make_entity(&stores.entities).await;
+        let mut rule = draft("alpha", "record");
+        rule.condition = Condition::Script {
+            source: "false".to_string(),
+        };
+        stores.rules.upsert(rule).await.unwrap();
+
+        let executions = subject
+            .process(&event(EntityEventKind::Created))
+            .await
+            .unwrap();
+
+        assert_eq!(executions[0].outcome, ExecutionOutcome::ConditionFalse);
+        assert!(recorder.records().is_empty());
+        assert!(!stores.rules.is_executed("alpha", "evt-1").await.unwrap());
     }
 
     #[tokio::test]
