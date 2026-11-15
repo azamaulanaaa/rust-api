@@ -156,6 +156,12 @@ const ENTITY_PREFIX: &str = "entity:";
 /// Key prefix for pending outbox rows.
 const OUTBOX_PREFIX: &str = "outbox:";
 
+/// Key prefix for outbox rows that no consumer can decode.
+///
+/// The key does not start with [`OUTBOX_PREFIX`], so a poison row does not
+/// appear in a later outbox scan.
+const OUTBOX_POISON_PREFIX: &str = "outbox-poison:";
+
 /// Key for the durable pending outbox row counter.
 ///
 /// The key does not start with [`OUTBOX_PREFIX`], so an outbox scan does not
@@ -400,10 +406,16 @@ struct MigrationBatchResult {
     invalid: Vec<InvalidEntity>,
 }
 
-/// One meta row and one optional outbox row for a batch write.
+/// One entity state and one optional outbox row for a batch write.
 struct SchemaMigrationWrite {
+    /// The entity before the migration.
+    before: Entity,
+    /// The merged schema before the migration.
+    before_merged: MergedSchema,
     /// The entity after the migration.
     entity: Entity,
+    /// The merged schema after the migration.
+    after_merged: MergedSchema,
     /// The outbox key and bytes, when a feed is configured.
     outbox: Option<(String, Vec<u8>)>,
 }
@@ -1319,6 +1331,9 @@ impl EntityStore {
     /// For each row, the call appends the event to the feed.
     /// The call then deletes the row and decrements the counter in one
     /// transaction.
+    /// A row that does not decode moves to an `outbox-poison:` key in one
+    /// transaction with the counter decrement.
+    /// The call writes a warning with the key and continues the batch.
     /// The transaction commits both changes or neither change.
     /// The counter never goes below zero.
     /// The call stops when a batch returns zero rows.
@@ -1359,8 +1374,27 @@ impl EntityStore {
                 }
             }
             for row in rows {
-                let event: EntityEvent = serde_json::from_slice(&row.value)
-                    .map_err(|e| EntityError::Internal(format!("outbox event is invalid: {e}")))?;
+                let event: EntityEvent = match serde_json::from_slice(&row.value) {
+                    Ok(event) => event,
+                    Err(error) => {
+                        let event_id = row.key.strip_prefix(OUTBOX_PREFIX).unwrap_or(&row.key);
+                        tracing::warn!(
+                            key = %row.key,
+                            %error,
+                            "outbox event is invalid, moved to the poison key"
+                        );
+                        let g = self.store.write().await;
+                        let tx = g.begin_tx().map_err(EntityError::Store)?;
+                        decrement_outbox_pending(&tx, 1).await?;
+                        tx.set_bytes(&outbox_poison_key(event_id), &row.value)
+                            .await
+                            .map_err(EntityError::Store)?;
+                        tx.delete(&row.key).await.map_err(EntityError::Store)?;
+                        tx.commit().await.map_err(EntityError::Store)?;
+                        drop(g);
+                        continue;
+                    }
+                };
                 feed.append(WalOp::Entity { event })
                     .await
                     .map_err(|_| EntityError::Feed("entity feed append failed".to_string()))?;
@@ -1668,7 +1702,11 @@ impl EntityStore {
     /// A valid entity that already pins `target_version` counts as unchanged.
     /// Any other valid entity counts as migrated.
     /// A dry run writes no key and no event.
-    /// An apply writes every meta row and every outbox row in one transaction.
+    /// An apply removes the index rows of the previous schema and writes the
+    /// index rows of the target schema.
+    /// An apply writes every entity row and every outbox row in one
+    /// transaction.
+    /// A duplicate unique value aborts the batch with no write.
     /// A stale entity version aborts the batch with no write.
     /// A store error aborts the batch with no write.
     /// A missing target version is [`EntityError::UnknownSchema`].
@@ -1756,7 +1794,10 @@ impl EntityStore {
     /// It reloads each entity and rejects a stale version.
     /// An invalid entity goes into `invalid` and is skipped.
     /// It builds every after entity and every outbox row in memory.
-    /// One transaction writes every row and increments the pending counter,
+    /// It checks every unique value against the target schema.
+    /// One transaction removes the rows of the previous schema and writes the
+    /// rows of the target schema.
+    /// It writes the metadata row and the outbox row in the same transaction,
     /// or it writes no row.
     /// The call flushes the outbox one time after the commit.
     /// A feed failure after the commit leaves the outbox rows for the relay.
@@ -1809,6 +1850,8 @@ impl EntityStore {
                 result.unchanged += 1;
                 continue;
             }
+            let before_effective = self.resolve_refs(&current.schemas).await?;
+            let before_merged = merge_schemas(&before_effective)?;
             let schemas: Vec<SchemaRef> = current
                 .schemas
                 .iter()
@@ -1846,7 +1889,10 @@ impl EntityStore {
                 self.prepare_schema_applied_outbox(&after, event_schema_ids(&effective), ctx)?;
             result.migrated += 1;
             writes.push(SchemaMigrationWrite {
+                before: current,
+                before_merged,
                 entity: after,
+                after_merged: merged,
                 outbox,
             });
         }
@@ -1865,7 +1911,16 @@ impl EntityStore {
                     .await?;
             }
             for write in &writes {
+                check_unique_values(&tx, &write.entity, &write.after_merged.attributes).await?;
+                delete_mutable_rows(&tx, &write.before, &write.before_merged).await?;
+                delete_ref_rows(&tx, &write.before, &write.before_merged).await?;
+                for schema_id in &write.before_merged.schema_ids {
+                    tx.delete(&schema_index_key(schema_id, &write.entity.id))
+                        .await
+                        .map_err(EntityError::Store)?;
+                }
                 put_meta_row(&tx, &write.entity).await?;
+                put_entity_rows_except_meta(&tx, &write.entity, &write.after_merged).await?;
                 if let Some((key, bytes)) = &write.outbox {
                     tx.set_bytes(key, bytes).await.map_err(EntityError::Store)?;
                 }
@@ -2142,6 +2197,9 @@ impl EntityStore {
     /// An entity appears only when its current value for `key` is a
     /// [`AttributeValue::Timestamp`] at or before `at_or_before`.
     /// That check drops a stale index row.
+    /// The call reads at most `limit` rows in one page.
+    /// When a page holds stale rows, the scan continues from a cursor until
+    /// the result holds `limit` entities or the range ends.
     /// A `limit` of 0 returns an empty list.
     pub async fn list_due(
         &self,
@@ -2156,32 +2214,43 @@ impl EntityStore {
         let g = self.store.read().await;
         let prefix = format!("{TIME_INDEX_PREFIX}{key}:");
         let upper = format!("{prefix}{};", encode_timestamp(at_or_before));
-        let cursor = (Some(prefix.clone()), Some(upper));
-        let rows = g
-            .gets_keys(None, Direction::Next, cursor)
-            .await
-            .map_err(EntityError::Store)?;
+        let mut cursor = prefix.clone();
         let mut entities = Vec::new();
         let mut seen = BTreeSet::new();
-        for marker_key in rows {
-            let Some(rest) = marker_key.strip_prefix(&prefix) else {
-                continue;
-            };
-            let Some((encoded, id)) = rest.split_once(':') else {
-                continue;
-            };
-            if encoded.len() != 16 || id.is_empty() || !seen.insert(id.to_string()) {
-                continue;
+        loop {
+            let rows = g
+                .gets_keys(
+                    Some(limit),
+                    Direction::Next,
+                    (Some(cursor.clone()), Some(upper.clone())),
+                )
+                .await
+                .map_err(EntityError::Store)?;
+            let full = rows.len() == limit;
+            for marker_key in rows {
+                cursor = format!("{marker_key}\0");
+                let Some(rest) = marker_key.strip_prefix(&prefix) else {
+                    continue;
+                };
+                let Some((encoded, id)) = rest.split_once(':') else {
+                    continue;
+                };
+                if encoded.len() != 16 || id.is_empty() || !seen.insert(id.to_string()) {
+                    continue;
+                }
+                let Some(entity) = load_entity(&*g, id).await? else {
+                    continue;
+                };
+                if let Some(AttributeValue::Timestamp(value)) = entity.attributes.get(key)
+                    && *value <= at_or_before
+                {
+                    entities.push(entity);
+                }
+                if entities.len() >= limit {
+                    break;
+                }
             }
-            let Some(entity) = load_entity(&*g, id).await? else {
-                continue;
-            };
-            if let Some(AttributeValue::Timestamp(value)) = entity.attributes.get(key)
-                && *value <= at_or_before
-            {
-                entities.push(entity);
-            }
-            if entities.len() >= limit {
+            if entities.len() >= limit || !full {
                 break;
             }
         }
@@ -2862,6 +2931,11 @@ fn attribute_json(value: &AttributeValue) -> Result<serde_json::Value, EntityErr
 /// The key for one pending outbox event.
 fn outbox_key(event_id: &str) -> String {
     format!("{OUTBOX_PREFIX}{event_id}")
+}
+
+/// The key for one outbox row that no consumer can decode.
+fn outbox_poison_key(event_id: &str) -> String {
+    format!("{OUTBOX_POISON_PREFIX}{event_id}")
 }
 
 /// The key that holds the durable pending outbox row count.
@@ -6671,6 +6745,42 @@ mod tests {
         assert!(outbox_keys(&raw).await.is_empty());
     }
 
+    #[tokio::test]
+    async fn a_poison_outbox_row_does_not_block_the_good_row() {
+        let (store, registry, raw) = new_store().await;
+        registry
+            .publish(schema("person", &[], vec![]))
+            .await
+            .unwrap();
+        let feed = Arc::new(RecordingFeed::new());
+        let store = store.with_change_sink(feed.clone());
+        feed.set_failing(true);
+        store
+            .create(draft("e1", &["person"], vec![]), &ctx())
+            .await
+            .unwrap();
+        feed.set_failing(false);
+        assert_eq!(outbox_keys(&raw).await.len(), 1);
+        let poison_id = "00000000-0000-7000-8000-000000000000";
+        raw.set_bytes(&outbox_key(poison_id), b"not an event")
+            .await
+            .unwrap();
+        raw.set_bytes(outbox_pending_key(), b"2").await.unwrap();
+
+        let delivered = store.flush_outbox().await.unwrap();
+
+        assert_eq!(delivered, 1);
+        let events = feed.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].entity_id, "e1");
+        assert!(outbox_keys(&raw).await.is_empty());
+        assert_eq!(
+            raw.get_bytes(&outbox_poison_key(poison_id)).await.unwrap(),
+            Some(b"not an event".to_vec())
+        );
+        assert_eq!(pending_counter(&raw).await, Some(0));
+    }
+
     /// An indexed timestamp writes one time row with the biased encoding.
     #[tokio::test]
     async fn an_indexed_timestamp_writes_a_time_index_row() {
@@ -7063,6 +7173,43 @@ mod tests {
             .unwrap();
         let stale = store.list_due("due", 20, 100).await.unwrap();
         assert!(stale.iter().all(|entity| entity.id != "e1"));
+    }
+
+    #[tokio::test]
+    async fn list_due_continues_past_a_full_page_of_stale_rows() {
+        let (store, registry, raw) = new_store().await;
+        registry
+            .publish(schema(
+                "task",
+                &[],
+                vec![full_attr(
+                    "due",
+                    AttributeType::Timestamp,
+                    false,
+                    true,
+                    false,
+                    None,
+                )],
+            ))
+            .await
+            .unwrap();
+        for (id, due) in [("e1", 100), ("e2", 10), ("e3", 20)] {
+            create_task(&store, id, due).await;
+        }
+        raw.set_bytes(&time_index_key("due", 1, "ghost"), b"")
+            .await
+            .unwrap();
+        raw.set_bytes(&time_index_key("due", 2, "e1"), b"")
+            .await
+            .unwrap();
+
+        let due = store.list_due("due", 60, 2).await.unwrap();
+        let ids: Vec<&str> = due.iter().map(|entity| entity.id.as_str()).collect();
+        assert_eq!(ids, vec!["e2", "e3"]);
+
+        let all = store.list_due("due", 60, 100).await.unwrap();
+        let ids: Vec<&str> = all.iter().map(|entity| entity.id.as_str()).collect();
+        assert_eq!(ids, vec!["e2", "e3"]);
     }
 
     #[tokio::test]
@@ -7642,6 +7789,132 @@ mod tests {
             serde_json::json!("one")
         );
         assert!(outbox_keys(&raw).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn schema_migration_adds_an_index_row() {
+        let (store, registry, _raw) = new_store().await;
+        registry
+            .publish(schema(
+                "task",
+                &[],
+                vec![attr("tag", AttributeType::String)],
+            ))
+            .await
+            .unwrap();
+        store
+            .create(draft("e1", &["task"], vec![("tag", s("alpha"))]), &ctx())
+            .await
+            .unwrap();
+        registry
+            .publish(schema(
+                "task",
+                &[],
+                vec![full_attr(
+                    "tag",
+                    AttributeType::String,
+                    false,
+                    true,
+                    false,
+                    None,
+                )],
+            ))
+            .await
+            .unwrap();
+
+        let report = store
+            .migrate_schema("task", 2, 100, None, false, &ctx())
+            .await
+            .unwrap();
+
+        assert_eq!(report.migrated, 1);
+        let found = store.list_by_attribute("tag", &s("alpha")).await.unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, "e1");
+    }
+
+    #[tokio::test]
+    async fn schema_migration_rejects_a_duplicate_unique_value() {
+        let (store, registry, _raw) = new_store().await;
+        registry
+            .publish(schema(
+                "task",
+                &[],
+                vec![attr("tag", AttributeType::String)],
+            ))
+            .await
+            .unwrap();
+        for id in ["e1", "e2"] {
+            store
+                .create(draft(id, &["task"], vec![("tag", s("alpha"))]), &ctx())
+                .await
+                .unwrap();
+        }
+        registry
+            .publish(schema(
+                "task",
+                &[],
+                vec![full_attr(
+                    "tag",
+                    AttributeType::String,
+                    false,
+                    false,
+                    true,
+                    None,
+                )],
+            ))
+            .await
+            .unwrap();
+
+        let result = store
+            .migrate_schema("task", 2, 100, None, false, &ctx())
+            .await;
+
+        assert!(matches!(result, Err(EntityError::UniqueViolation(ref key)) if key == "tag"));
+        assert_eq!(store.get("e1").await.unwrap().unwrap().version, 1);
+        assert_eq!(store.get("e2").await.unwrap().unwrap().version, 1);
+    }
+
+    #[tokio::test]
+    async fn schema_migration_adds_a_parent_schema_row() {
+        let (store, registry, _raw) = new_store().await;
+        registry
+            .publish(schema("parent", &[], vec![]))
+            .await
+            .unwrap();
+        registry
+            .publish(schema(
+                "task",
+                &[],
+                vec![attr("title", AttributeType::String)],
+            ))
+            .await
+            .unwrap();
+        store
+            .create(draft("e1", &["task"], vec![("title", s("one"))]), &ctx())
+            .await
+            .unwrap();
+        registry
+            .publish(schema(
+                "task",
+                &["parent"],
+                vec![attr("title", AttributeType::String)],
+            ))
+            .await
+            .unwrap();
+
+        let report = store
+            .migrate_schema("task", 2, 100, None, false, &ctx())
+            .await
+            .unwrap();
+
+        assert_eq!(report.migrated, 1);
+        let parents = store.list_by_schema("parent").await.unwrap();
+        assert_eq!(parents.len(), 1);
+        assert_eq!(parents[0].id, "e1");
+        let tasks = store.list_by_schema("task").await.unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].id, "e1");
     }
 
     #[tokio::test]

@@ -114,6 +114,12 @@ const MAX_REPLICA_ENTITIES: usize = 100_000;
 /// A small entity cap in tests, so a build can exceed it.
 #[cfg(test)]
 const MAX_REPLICA_ENTITIES: usize = 2;
+/// The largest serialized byte size of one replica build.
+#[cfg(not(test))]
+const REPLICA_BUILD_MAX_BYTES: usize = 64 * 1024 * 1024;
+/// A small byte cap in tests, so a build can exceed it.
+#[cfg(test)]
+const REPLICA_BUILD_MAX_BYTES: usize = 16 * 1024;
 
 /// The current head of the entity change feed.
 #[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
@@ -549,13 +555,13 @@ impl std::fmt::Display for MissingReplica {
 
 impl std::error::Error for MissingReplica {}
 
-/// The source of a replica build that exceeds the entity limit.
+/// The source of a replica build that exceeds a size limit.
 #[derive(Debug)]
-struct ReplicaBuildTooLarge;
+struct ReplicaBuildTooLarge(&'static str);
 
 impl std::fmt::Display for ReplicaBuildTooLarge {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("replica build exceeds the entity limit")
+        f.write_str(self.0)
     }
 }
 
@@ -585,6 +591,13 @@ fn replica_entity_limit(runtime: &EavRuntime) -> usize {
 /// The build holds at most `MAX_REPLICA_ENTITIES` visible entities.
 /// The current limit is 100,000.
 /// A build that exceeds the limit stops the entity scan and returns `400`.
+/// The build serializes each chunk as it fills and holds the total serialized
+/// size under `REPLICA_BUILD_MAX_BYTES`.
+/// A build that exceeds the byte limit returns `400`.
+/// The current byte limit is 64 MiB.
+/// `ReplicaStore::put` takes every serialized chunk, so the build holds all
+/// chunks in memory until the put returns.
+/// The byte cap bounds that memory.
 /// The build writes no snapshot, so the stored replica stays unchanged.
 /// The build replaces the previous replica and its chunks for the same
 /// subject.
@@ -609,6 +622,7 @@ pub(crate) async fn build_replica(
         attempt += 1;
         let head = runtime.wal().head().await.map_err(internal)?;
         let mut chunks: Vec<Vec<u8>> = Vec::new();
+        let mut chunk_bytes = 0usize;
         let mut pending: Vec<Entity> = Vec::new();
         let mut count = 0;
         let mut after: Option<String> = None;
@@ -623,14 +637,21 @@ pub(crate) async fn build_replica(
                 if can_read_entity(&policy, &claims.sub, &entity.id).await? {
                     count += 1;
                     if count > entity_limit {
-                        return Err(EavApiError::Invalid(Box::new(ReplicaBuildTooLarge)));
+                        return Err(EavApiError::Invalid(Box::new(ReplicaBuildTooLarge(
+                            "replica build exceeds the entity limit",
+                        ))));
                     }
                     pending.push(entity);
                     if pending.len() == REPLICA_CHUNK_ENTITIES {
-                        chunks.push(
-                            serde_json::to_vec(&pending)
-                                .map_err(|e| EavApiError::Internal(Box::new(e)))?,
-                        );
+                        let chunk = serde_json::to_vec(&pending)
+                            .map_err(|e| EavApiError::Internal(Box::new(e)))?;
+                        chunk_bytes = chunk_bytes.saturating_add(chunk.len());
+                        if chunk_bytes > REPLICA_BUILD_MAX_BYTES {
+                            return Err(EavApiError::Invalid(Box::new(ReplicaBuildTooLarge(
+                                "replica build exceeds the byte limit",
+                            ))));
+                        }
+                        chunks.push(chunk);
                         pending.clear();
                     }
                 }
@@ -641,9 +662,15 @@ pub(crate) async fn build_replica(
             }
         }
         if !pending.is_empty() {
-            chunks.push(
-                serde_json::to_vec(&pending).map_err(|e| EavApiError::Internal(Box::new(e)))?,
-            );
+            let chunk =
+                serde_json::to_vec(&pending).map_err(|e| EavApiError::Internal(Box::new(e)))?;
+            chunk_bytes = chunk_bytes.saturating_add(chunk.len());
+            if chunk_bytes > REPLICA_BUILD_MAX_BYTES {
+                return Err(EavApiError::Invalid(Box::new(ReplicaBuildTooLarge(
+                    "replica build exceeds the byte limit",
+                ))));
+            }
+            chunks.push(chunk);
         }
         let chunk_count = chunks.len();
         match runtime.replicas().put(&claims.sub, head, chunks).await {
@@ -1755,9 +1782,66 @@ mod tests {
         assert_eq!(body.code.as_deref(), Some("invalid_request"));
         assert_eq!(body.error, "invalid request");
         assert_eq!(
-            ReplicaBuildTooLarge.to_string(),
+            ReplicaBuildTooLarge("replica build exceeds the entity limit").to_string(),
             "replica build exceeds the entity limit"
         );
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn a_replica_build_over_the_byte_limit_is_400() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        let mut attributes = std::collections::BTreeMap::new();
+        attributes.insert(
+            "body".to_string(),
+            AttributeDef {
+                name: "body".to_string(),
+                ty: AttributeType::String,
+                required: false,
+                indexed: false,
+                unique: false,
+                default: None,
+            },
+        );
+        fx.runtime
+            .schemas()
+            .publish(SchemaDraft {
+                id: "task".to_string(),
+                extends: Vec::new(),
+                attributes,
+            })
+            .await?;
+        let mut body = std::collections::BTreeMap::new();
+        body.insert(
+            "body".to_string(),
+            AttributeValue::String("x".repeat(REPLICA_BUILD_MAX_BYTES + 1024)),
+        );
+        fx.runtime
+            .entities()
+            .create(
+                EntityDraft {
+                    id: "e1".to_string(),
+                    schemas: vec!["task".to_string()],
+                    attributes: body,
+                },
+                &crate::eav::entity::WriteContext::new("alice"),
+            )
+            .await?;
+        grant_collection_read(&fx, "alice").await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+
+        let res = post_replica!(&app, &token).await;
+
+        assert_eq!(res.status(), http::StatusCode::BAD_REQUEST);
+        let body: crate::http::error::ErrorBody = actix_test::read_body_json(res).await;
+        assert_eq!(body.code.as_deref(), Some("invalid_request"));
+        assert_eq!(
+            ReplicaBuildTooLarge("replica build exceeds the byte limit").to_string(),
+            "replica build exceeds the byte limit"
+        );
+        assert_eq!(fx.runtime.replicas().get("alice").await?, None);
         Ok(())
     }
 
