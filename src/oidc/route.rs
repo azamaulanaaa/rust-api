@@ -194,9 +194,15 @@ pub async fn logout(oidc_client: web::Data<OidcClient>, req: HttpRequest) -> imp
         && oidc_client.has_revocation_endpoint()
     {
         let oidc_client = oidc_client.clone();
+        // The task is detached, so it must carry its own bound. The client
+        // timeout covers a slow provider, and this timeout covers the task
+        // itself.
+        let timeout = oidc_client.request_timeout();
         tokio::spawn(async move {
-            if let Err(e) = oidc_client.revoke_token(&token).await {
-                tracing::warn!("OIDC token revocation failed: {e}");
+            match tokio::time::timeout(timeout, oidc_client.revoke_token(&token)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => tracing::warn!("OIDC token revocation failed: {e}"),
+                Err(_) => tracing::warn!("OIDC token revocation timed out"),
             }
         });
     }
@@ -342,7 +348,7 @@ pub async fn login(
         });
     }
 
-    let auth_data = oidc_client.get_auth_url();
+    let auth_data = oidc_client.get_auth_url().await;
     let cookie_duration = Duration::minutes(5);
     let secure = oidc_client.secure_cookies();
 
@@ -622,6 +628,7 @@ fn clear_cookie(name: String, secure: bool) -> Cookie<'static> {
 mod tests {
     use super::*;
 
+    use crate::http::middleware::jwks::test_support::rsa_key;
     use crate::oidc::OidcConfig;
     use actix_web::{dev::ServiceResponse, http::header::LOCATION, test};
     use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -1307,6 +1314,93 @@ mod tests {
             test::call_service(&svc, test::TestRequest::get().uri("/auth/me").to_request()).await;
         assert_eq!(me.status(), 401);
         assert_not_cached(&me);
+    }
+
+    /// A provider can rotate its signing keys after startup. The callback
+    /// must fetch the new JWKS and complete the login.
+    ///
+    /// The verifier used to keep the startup key set. Every callback then
+    /// failed with an unknown `kid` until the server restarted.
+    #[tokio::test]
+    async fn callback_succeeds_after_the_provider_rotates_the_jwks() -> anyhow::Result<()> {
+        let fx = Fixture::new().await?;
+        let svc = test_app!(fx);
+        let login_res = test::call_service(
+            &svc,
+            test::TestRequest::get().uri("/auth/login").to_request(),
+        )
+        .await;
+        let (csrf, nonce, pkce, state) = login_parts(&login_res)?;
+
+        // The provider rotates its keys. The mock then serves the new key
+        // and a token that the new key signed.
+        let (rotated_jwk, rotated_encoding_key) = rsa_key("rotated-key-id")?;
+        fx.server.reset().await;
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({ "keys": [rotated_jwk] })),
+            )
+            .mount(&fx.server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "issuer": fx.server.uri(),
+                "authorization_endpoint": format!("{}/auth", fx.server.uri()),
+                "token_endpoint": format!("{}/token", fx.server.uri()),
+                "jwks_uri": format!("{}/jwks", fx.server.uri()),
+                "response_types_supported": ["code"],
+                "subject_types_supported": ["public"],
+                "id_token_signing_alg_values_supported": ["RS256"],
+            })))
+            .mount(&fx.server)
+            .await;
+
+        let id_token = {
+            let mut header = Header::new(jsonwebtoken::Algorithm::RS256);
+            header.kid = Some("rotated-key-id".to_string());
+            encode(
+                &header,
+                &json!({
+                    "iss": fx.server.uri(),
+                    "sub": "user-123",
+                    "aud": CLIENT_ID,
+                    "exp": 2_000_000_000i64,
+                    "iat": 1_000_000_000i64,
+                    "nonce": nonce,
+                }),
+                &rotated_encoding_key,
+            )?
+        };
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "mock-access",
+                "token_type": "Bearer",
+                "id_token": id_token,
+            })))
+            .mount(&fx.server)
+            .await;
+
+        let req = test::TestRequest::get()
+            .uri(&format!("/auth/callback?code=test-code&state={state}"))
+            .insert_header(("Cookie", cookie_header(&csrf, &nonce, &pkce)))
+            .to_request();
+        let res = test::call_service(&svc, req).await;
+
+        assert_eq!(
+            res.status(),
+            200,
+            "a callback after a key rotation must refresh the JWKS and succeed"
+        );
+        assert!(
+            res.response()
+                .cookies()
+                .any(|cookie| cookie.name() == "auth_token"),
+            "the rotated-key login must set the session cookie"
+        );
+        Ok(())
     }
 
     #[tokio::test]

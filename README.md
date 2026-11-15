@@ -51,6 +51,7 @@ listen_port = 8080
 client_id = "rust-api"
 client_secret = "replace-me"
 issuer_url = "https://idp.example.com"
+setup_token = "replace-with-a-32-byte-secret-value"
 
 [database]
 prefix = "oxkv"
@@ -60,9 +61,9 @@ bucket = "my-bucket"
 region = "us-east-1"
 ```
 
-Replace `client_secret`, `issuer_url`, `bucket`, and `region`. For MinIO or R2, add `endpoint_url` and set `force_path_style = true` under `[s3]`.
+Replace `client_secret`, `issuer_url`, `setup_token`, `bucket`, and `region`. For MinIO or R2, add `endpoint_url` and set `force_path_style = true` under `[s3]`.
 
-You can keep secrets out of the file. Set `RUST_API_CLIENT_SECRET`, `RUST_API_S3_ACCESS_KEY_ID`, `RUST_API_S3_SECRET_ACCESS_KEY`, and `RUST_API_EAV_WEBHOOK_SIGNING_SECRET` instead. A non-empty environment value wins over the file.
+You can keep secrets out of the file. Set `RUST_API_CLIENT_SECRET`, `RUST_API_SETUP_TOKEN`, `RUST_API_S3_ACCESS_KEY_ID`, `RUST_API_S3_SECRET_ACCESS_KEY`, and `RUST_API_EAV_WEBHOOK_SIGNING_SECRET` instead. A non-empty environment value wins over the file.
 
 The database prefix defaults to `oxkv`. See [Configuration](#configuration) and [config.example.toml](config.example.toml) for every field.
 
@@ -89,10 +90,11 @@ Run this call once:
 
 ```bash
 curl -X POST http://localhost:8080/setup/admin \
+  -H "X-Setup-Token: <setup_token>" \
   -H "Authorization: Bearer <token>"
 ```
 
-The call returns `201` and grants the caller the `superadmin` role. Later calls return `409`.
+The call returns `201` and grants the caller the `superadmin` role. Later calls return `409`. The route requires `[authorization].setup_token` and compares the header in constant time. When the value is unset, the route is absent and returns `404`.
 
 ### Make the first call
 
@@ -181,7 +183,7 @@ m = g(r.sub, p.sub) && r.obj == p.obj && r.act == p.act
 
 A request is allowed when the subject holds a matching `p` rule, directly or through a group. Grant permissions to groups, then manage membership through `/policy/groups`.
 
-A fresh policy store has no roles. `POST /setup/admin` grants the first caller the `superadmin` role and the rules that role needs. Later calls return `409`.
+A fresh policy store has no roles. `POST /setup/admin` grants the first caller the `superadmin` role and the rules that role needs. The caller must send `X-Setup-Token` with the value of `[authorization].setup_token`. Later calls return `409`. The route is absent when the secret is unset.
 
 Business rows authorize as `{type}:{id}` objects through `RowAuthorizer`. Files do not use a coarse `fs` gate. A file delegates to the rows it is attached to. See module `policy` in the rustdoc.
 
@@ -424,7 +426,7 @@ Metrics cover rule execution (`eav.rules.executed`, `eav.rules.failed`) and webh
 | GET | `/auth/me` | Session probe: `sub`, `iss`, `aud`, `exp` | session |
 | POST | `/auth/logout` | Clear `auth_token` and `refresh_token`; best-effort revocation. Always `204`. | none |
 | POST | `/auth/refresh` | Renew the session from the `refresh_token` cookie | refresh cookie |
-| POST | `/setup/admin` | One-time bootstrap: grant the caller `superadmin` | session |
+| POST | `/setup/admin` | One-time bootstrap: grant the caller `superadmin`. Requires `X-Setup-Token`. Absent when no secret is configured. | session |
 | GET | `/policy/rules` | List policy rules | session |
 | POST | `/policy/rules` | Add a policy rule | session |
 | DELETE | `/policy/rules` | Remove a policy rule | session |
@@ -723,6 +725,7 @@ A variable that is present and not empty wins over the file.
 | Variable | Overrides |
 |---|---|
 | `RUST_API_CLIENT_SECRET` | `authorization.client_secret` |
+| `RUST_API_SETUP_TOKEN` | `authorization.setup_token` |
 | `RUST_API_S3_ACCESS_KEY_ID` | `s3.access_key_id` |
 | `RUST_API_S3_SECRET_ACCESS_KEY` | `s3.secret_access_key` |
 | `RUST_API_CAPABILITY_SECRET` | `capability.secret` |

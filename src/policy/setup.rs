@@ -4,14 +4,17 @@
 //! A fresh deployment starts with an empty policy store. Nobody can pass
 //! the self-authorization checks on the `/policy` routes. This module
 //! closes that gap. The first authenticated user that calls
-//! `POST /setup/admin` claims the superadmin role. Every later call is a
-//! hard conflict (409). This holds even after a restart. The claim check
-//! and the write share one lock. That lock covers the persisted state of
-//! the enforcer.
+//! `POST /setup/admin` with the configured bootstrap secret claims the
+//! superadmin role. Every later call is a hard conflict (409). This holds
+//! even after a restart. The claim check and the write share one lock. That
+//! lock covers the persisted state of the enforcer.
+//!
+//! The route is absent when `[authorization].setup_token` is unset. An
+//! unconfigured deployment must not hand superadmin to the first caller.
 
 use std::sync::Arc;
 
-use actix_web::{HttpResponse, Responder, post, web};
+use actix_web::{HttpRequest, HttpResponse, Responder, post, web};
 use serde::Serialize;
 
 use super::{PolicyEngine, SUPERADMIN_ROLE};
@@ -21,22 +24,55 @@ use crate::http::{
     middleware::jwt::{Claims, JwtClaimsMiddleware, Validated},
 };
 
+/// The request header that carries the bootstrap secret.
+const SETUP_TOKEN_HEADER: &str = "X-Setup-Token";
+
+/// The configured bootstrap secret, as request data.
+struct SetupToken(String);
+
+/// The request presented a token that does not match the configured value.
+#[derive(Debug, thiserror::Error)]
+#[error("setup token mismatch")]
+struct SetupTokenMismatch;
+
+/// Compares two byte strings in constant time.
+///
+/// The function checks the length first. A length difference leaks only the
+/// length. The byte comparison visits every position, so the time does not
+/// depend on the first mismatch.
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut difference = 0u8;
+    for (a, b) in left.iter().zip(right) {
+        difference |= a ^ b;
+    }
+    difference == 0
+}
+
 /// API module exposing the one-time `/setup/admin` bootstrap route. The
 /// module uses JWT validation only, because authorization is impossible.
 /// The store starts with no roles at all.
 pub struct SetupApiModule {
     policy_engine: Arc<PolicyEngine>,
     jwt_middleware: JwtClaimsMiddleware<Claims>,
+    setup_token: Option<String>,
 }
 
 impl SetupApiModule {
-    /// Wraps a [`PolicyEngine`] with the given JWT middleware. Pass a clone
-    /// of the engine that other modules share, because all clones see one
-    /// policy state.
-    pub fn new(policy_engine: PolicyEngine, jwt_middleware: JwtClaimsMiddleware<Claims>) -> Self {
+    /// Wraps a [`PolicyEngine`] with the given JWT middleware and bootstrap
+    /// secret. Pass a clone of the engine that other modules share, because
+    /// all clones see one policy state. Pass `None` to disable the route.
+    pub fn new(
+        policy_engine: PolicyEngine,
+        jwt_middleware: JwtClaimsMiddleware<Claims>,
+        setup_token: Option<String>,
+    ) -> Self {
         Self {
             policy_engine: Arc::new(policy_engine),
             jwt_middleware,
+            setup_token,
         }
     }
 }
@@ -47,11 +83,17 @@ impl ApiModule for SetupApiModule {
     }
 
     fn configure(&self, cfg: &mut web::ServiceConfig) {
+        // No token means no bootstrap path. The route is then absent, and
+        // the request gets a 404.
+        let Some(token) = &self.setup_token else {
+            return;
+        };
         let policy_engine = web::Data::from(self.policy_engine.clone());
         let jwt_middleware = self.jwt_middleware.clone();
 
         let scope = web::scope("/setup")
             .app_data(policy_engine)
+            .app_data(web::Data::new(SetupToken(token.clone())))
             .wrap(jwt_middleware)
             .service(claim_admin);
 
@@ -69,12 +111,23 @@ pub struct SetupResponse {
 }
 
 /// Grants the caller the superadmin role if nobody holds it yet.
-#[utoipa::path(post, path = "/setup/admin", tag = "setup", responses((status = 201, body = SetupResponse), (status = 401, body = crate::http::error::ErrorBody), (status = 409, body = crate::http::error::ErrorBody)))]
+#[utoipa::path(post, path = "/setup/admin", tag = "setup", params(("X-Setup-Token" = String, Header, description = "Bootstrap secret from [authorization].setup_token")), responses((status = 201, body = SetupResponse), (status = 401, body = crate::http::error::ErrorBody), (status = 409, body = crate::http::error::ErrorBody)))]
 #[post("/admin")]
 async fn claim_admin(
+    setup_token: web::Data<SetupToken>,
+    req: HttpRequest,
     policy_engine: web::Data<PolicyEngine>,
     auth_claims: Validated<Claims>,
 ) -> Result<impl Responder, ApiError> {
+    let supplied = req
+        .headers()
+        .get(SETUP_TOKEN_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if !constant_time_eq(supplied.as_bytes(), setup_token.0.as_bytes()) {
+        return Err(ApiError::InvalidCredentials(Box::new(SetupTokenMismatch)));
+    }
+
     let claimed = policy_engine.claim_superadmin(&auth_claims.sub).await?;
     if !claimed {
         return Err(ApiError::Conflict);
@@ -100,6 +153,7 @@ mod tests {
 
     const KID: &str = "setup-test-key";
     const AUDIENCE: &str = "test-aud";
+    const SETUP_TOKEN: &str = "setup-token-that-is-at-least-32-bytes";
 
     struct Fixture {
         server: wiremock::MockServer,
@@ -150,7 +204,10 @@ mod tests {
     /// Builds the API module against the JWKS server and the shared engine
     /// state of the fixture. Each test wires the module into an inline app,
     /// so that actix infers the service types as concrete types.
-    async fn setup_module(fx: &Fixture) -> anyhow::Result<SetupApiModule> {
+    async fn setup_module(
+        fx: &Fixture,
+        setup_token: Option<&str>,
+    ) -> anyhow::Result<SetupApiModule> {
         let middleware = JwtClaimsMiddleware::<Claims>::new_with_jks(
             &format!("{}/jwks", fx.server.uri()),
             AUDIENCE,
@@ -166,13 +223,14 @@ mod tests {
                 latch: fx.engine.latch,
             },
             middleware,
+            setup_token.map(str::to_string),
         ))
     }
 
     #[actix_web::test]
     async fn first_claim_succeeds_then_conflicts() -> anyhow::Result<()> {
         let fx = fixture().await?;
-        let module = setup_module(&fx).await?;
+        let module = setup_module(&fx, Some(SETUP_TOKEN)).await?;
         let app =
             test::init_service(App::new().configure(|cfg| ApiModule::configure(&module, cfg)))
                 .await;
@@ -182,6 +240,7 @@ mod tests {
             &app,
             test::TestRequest::post()
                 .uri("/setup/admin")
+                .insert_header((SETUP_TOKEN_HEADER, SETUP_TOKEN))
                 .insert_header(("Cookie", format!("auth_token={}", fx.token("alice")?)))
                 .to_request(),
         )
@@ -196,6 +255,7 @@ mod tests {
             &app,
             test::TestRequest::post()
                 .uri("/setup/admin")
+                .insert_header((SETUP_TOKEN_HEADER, SETUP_TOKEN))
                 .insert_header(("Cookie", format!("auth_token={}", fx.token("mallory")?)))
                 .to_request(),
         )
@@ -205,17 +265,82 @@ mod tests {
         Ok(())
     }
 
+    /// An unset bootstrap secret must not leave an open route.
+    ///
+    /// The route is absent, so a deployment that forgot the secret cannot
+    /// hand superadmin to the first authenticated caller.
     #[actix_web::test]
-    async fn unauthenticated_call_is_unauthorized() -> anyhow::Result<()> {
+    async fn the_route_is_absent_when_no_setup_token_is_configured() -> anyhow::Result<()> {
         let fx = fixture().await?;
-        let module = setup_module(&fx).await?;
+        let module = setup_module(&fx, None).await?;
         let app =
             test::init_service(App::new().configure(|cfg| ApiModule::configure(&module, cfg)))
                 .await;
 
         let res = test::call_service(
             &app,
-            test::TestRequest::post().uri("/setup/admin").to_request(),
+            test::TestRequest::post()
+                .uri("/setup/admin")
+                .insert_header((SETUP_TOKEN_HEADER, SETUP_TOKEN))
+                .insert_header(("Cookie", format!("auth_token={}", fx.token("alice")?)))
+                .to_request(),
+        )
+        .await;
+
+        assert_eq!(res.status(), http::StatusCode::NOT_FOUND);
+        Ok(())
+    }
+
+    /// A wrong bootstrap secret is an invalid credential.
+    #[actix_web::test]
+    async fn a_wrong_setup_token_is_unauthorized() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        let module = setup_module(&fx, Some(SETUP_TOKEN)).await?;
+        let app =
+            test::init_service(App::new().configure(|cfg| ApiModule::configure(&module, cfg)))
+                .await;
+        let alice = fx.token("alice")?;
+
+        let res = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/setup/admin")
+                .insert_header((SETUP_TOKEN_HEADER, "wrong-token-that-is-at-least-32-bytes"))
+                .insert_header(("Cookie", format!("auth_token={alice}")))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::UNAUTHORIZED);
+
+        // The rejected call granted nothing, so the right token still works.
+        let res = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/setup/admin")
+                .insert_header((SETUP_TOKEN_HEADER, SETUP_TOKEN))
+                .insert_header(("Cookie", format!("auth_token={alice}")))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::CREATED);
+
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn unauthenticated_call_is_unauthorized() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        let module = setup_module(&fx, Some(SETUP_TOKEN)).await?;
+        let app =
+            test::init_service(App::new().configure(|cfg| ApiModule::configure(&module, cfg)))
+                .await;
+
+        let res = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/setup/admin")
+                .insert_header((SETUP_TOKEN_HEADER, SETUP_TOKEN))
+                .to_request(),
         )
         .await;
         assert_eq!(res.status(), http::StatusCode::UNAUTHORIZED);
@@ -225,6 +350,7 @@ mod tests {
             &app,
             test::TestRequest::post()
                 .uri("/setup/admin")
+                .insert_header((SETUP_TOKEN_HEADER, SETUP_TOKEN))
                 .insert_header(("Cookie", format!("auth_token={}", fx.token("alice")?)))
                 .to_request(),
         )
@@ -239,7 +365,7 @@ mod tests {
         let fx = fixture().await?;
 
         {
-            let module = setup_module(&fx).await?;
+            let module = setup_module(&fx, Some(SETUP_TOKEN)).await?;
             let app =
                 test::init_service(App::new().configure(|cfg| ApiModule::configure(&module, cfg)))
                     .await;
@@ -247,6 +373,7 @@ mod tests {
                 &app,
                 test::TestRequest::post()
                     .uri("/setup/admin")
+                    .insert_header((SETUP_TOKEN_HEADER, SETUP_TOKEN))
                     .insert_header(("Cookie", format!("auth_token={}", fx.token("alice")?)))
                     .to_request(),
             )
@@ -277,7 +404,7 @@ mod tests {
         };
         let middleware =
             JwtClaimsMiddleware::<Claims>::new_with_jks(&jwks_url, AUDIENCE, &issuer).await?;
-        let module = SetupApiModule::new(engine_clone, middleware);
+        let module = SetupApiModule::new(engine_clone, middleware, Some(SETUP_TOKEN.to_string()));
         let app =
             test::init_service(App::new().configure(|cfg| ApiModule::configure(&module, cfg)))
                 .await;
@@ -286,6 +413,7 @@ mod tests {
             &app,
             test::TestRequest::post()
                 .uri("/setup/admin")
+                .insert_header((SETUP_TOKEN_HEADER, SETUP_TOKEN))
                 .insert_header(("Cookie", format!("auth_token={bob_token}")))
                 .to_request(),
         )
@@ -293,5 +421,13 @@ mod tests {
         assert_eq!(res.status(), 409);
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn constant_time_eq_matches_only_equal_values() {
+        assert!(constant_time_eq(b"same-value", b"same-value"));
+        assert!(!constant_time_eq(b"same-value", b"different-value"));
+        assert!(!constant_time_eq(b"short", b"a-longer-value"));
+        assert!(constant_time_eq(b"", b""));
     }
 }

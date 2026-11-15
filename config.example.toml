@@ -9,6 +9,7 @@
 # Secrets may also come from the environment. A value that is present and
 # not empty wins over the value in this file:
 #   RUST_API_CLIENT_SECRET
+#   RUST_API_SETUP_TOKEN
 #   RUST_API_S3_ACCESS_KEY_ID
 #   RUST_API_S3_SECRET_ACCESS_KEY
 #   RUST_API_CAPABILITY_SECRET
@@ -38,6 +39,14 @@ issuer_url = "https://idp.example.com"
 # https://login.microsoftonline.com/{tenantid}/v2.0. Ignored for a
 # single-tenant issuer. Default: [].
 # allowed_tenants = ["tenant-a"]
+
+# Bootstrap secret for POST /setup/admin. The route requires this value in
+# the X-Setup-Token header. The route is absent when the field is unset.
+# The value must have at least 32 bytes. Generate with:
+#   python3 -c "import secrets; print(secrets.token_hex(32))"
+# Override with RUST_API_SETUP_TOKEN. Default: none, which disables the
+# route.
+# setup_token = "<32+ byte secret>"
 
 [database]
 # Object prefix inside the S3 bucket for OxKV keys. Default: "oxkv".
