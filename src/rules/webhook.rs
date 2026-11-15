@@ -105,6 +105,7 @@ impl WebhookAction {
     /// Creates the action from the allowed host entries.
     ///
     /// Each entry is a host or a `host:port` pair.
+    /// A host entry matches only the default port of the URL scheme.
     /// An empty list rejects every webhook rule.
     /// The direct mode uses no queue and no signing secret.
     /// The action rejects a private address by default.
@@ -267,6 +268,7 @@ impl WebhookJobHandler {
     /// Adds the parsed allowlist entries.
     ///
     /// Each entry is a host or a `host:port` pair.
+    /// A host entry matches only the default port of the URL scheme.
     /// An empty list rejects every webhook job.
     fn with_allowed_hosts(mut self, allowed_hosts: Vec<AllowedHost>) -> Self {
         self.allowed_hosts = allowed_hosts;
@@ -379,7 +381,10 @@ struct WebhookJobPayload {
 struct AllowedHost {
     /// The host in lowercase, without brackets.
     host: String,
-    /// The optional port. `None` matches any port.
+    /// The optional port.
+    ///
+    /// `None` matches only the default port of the URL scheme.
+    /// `Some` matches only that port.
     port: Option<u16>,
 }
 
@@ -474,22 +479,39 @@ fn validate_url(
     if url.scheme() == "http" && !is_loopback(&host) {
         bail!("webhook URL must use https for this host");
     }
-    if !allows(allowed_hosts, &host, url.port_or_known_default()) {
+    if !allows(
+        allowed_hosts,
+        &host,
+        url.port_or_known_default(),
+        url.scheme(),
+    ) {
         bail!("webhook host is not allowed");
     }
     Ok(())
 }
 
 /// Returns true when the URL host and port are in the allowlist.
-fn allows(allowed_hosts: &[AllowedHost], host: &str, port: Option<u16>) -> bool {
+///
+/// An entry with no port matches only the default port of `scheme`.
+fn allows(allowed_hosts: &[AllowedHost], host: &str, port: Option<u16>, scheme: &str) -> bool {
     let host = normalize_host(host);
+    let default_port = default_port_for_scheme(scheme);
     allowed_hosts.iter().any(|allowed| {
         allowed.host == host
             && match allowed.port {
-                None => true,
+                None => port == default_port,
                 Some(expected) => port == Some(expected),
             }
     })
+}
+
+/// Returns the default port for one URL scheme.
+fn default_port_for_scheme(scheme: &str) -> Option<u16> {
+    match scheme {
+        "http" => Some(80),
+        "https" => Some(443),
+        _ => None,
+    }
 }
 
 /// Parses one allowlist entry as a host or a `host:port` pair.
@@ -802,16 +824,38 @@ mod tests {
         let action = WebhookAction::new(vec![
             "example.com".to_string(),
             "api.example.com:8443".to_string(),
-            "127.0.0.1".to_string(),
+            "127.0.0.1:8080".to_string(),
         ])
         .allow_private_hosts(true);
         for params in [
             json!({"url": "https://example.com/hook"}),
-            json!({"url": "https://example.com:9443/hook"}),
             json!({"url": "https://api.example.com:8443/hook"}),
             json!({"url": "http://127.0.0.1:8080/hook"}),
         ] {
             assert!(action.validate(&params).is_ok(), "{params}");
+        }
+    }
+
+    #[test]
+    fn a_host_entry_matches_only_the_default_port() {
+        let cases = [
+            ("example.com", "https://example.com/hook", true),
+            ("example.com", "https://example.com:443/hook", true),
+            ("example.com", "https://example.com:8443/hook", false),
+            ("127.0.0.1", "http://127.0.0.1/hook", true),
+            ("127.0.0.1", "http://127.0.0.1:8080/hook", false),
+            ("127.0.0.1", "https://127.0.0.1/hook", true),
+            ("127.0.0.1:8080", "http://127.0.0.1:8080/hook", true),
+            ("127.0.0.1:8080", "http://127.0.0.1/hook", false),
+        ];
+        for (entry, url, expected) in cases {
+            let action = WebhookAction::new(vec![entry.to_string()]).allow_private_hosts(true);
+            let result = action.validate(&json!({ "url": url }));
+            assert_eq!(
+                result.is_ok(),
+                expected,
+                "entry {entry} and url {url}: {result:?}"
+            );
         }
     }
 
