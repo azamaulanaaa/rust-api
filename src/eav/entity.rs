@@ -1036,7 +1036,8 @@ impl EntityStore {
                 .await
                 .map_err(EntityError::Store)?;
         }
-        put_entity_rows_except_meta(store, after, &prepared.merged, &facts, state, Some(ctx)).await?;
+        put_entity_rows_except_meta(store, after, &prepared.merged, &facts, state, Some(ctx))
+            .await?;
         Ok(outbox)
     }
 
