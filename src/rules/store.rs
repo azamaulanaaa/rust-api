@@ -71,7 +71,8 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use oxkv::{
-    Direction, GetSet, KeyPrefix, KeyValue, OxKvStore, ScanExt as _, Store as _, Transaction as _,
+    Direction, GetSet, KeyPrefix, KeyValue, OxKvStore, ScanExt as _, Store as _, StoreError,
+    Transaction as _, TxCas,
 };
 use tokio::sync::{Mutex, RwLock};
 
@@ -177,13 +178,37 @@ impl RuleStore {
     /// The first version is 1.
     /// The rule row, the new index markers, and the removal of stale markers
     /// commit in one transaction.
+    /// The rule row uses a compare-and-set against the version that the call
+    /// read. A concurrent writer fails at commit and writes nothing.
     pub async fn upsert(&self, draft: RuleDraft) -> Result<Rule, RuleError> {
         draft.validate()?;
 
         let _publish = self.publish_lock.lock().await;
         let g = self.store.write().await;
         let tx = g.begin_tx().map_err(RuleError::Store)?;
-        let previous = load_rule(&tx, &draft.id).await?;
+        let rule = self.stage_upsert(&tx, draft).await?;
+        match tx.commit().await {
+            Ok(()) => {}
+            Err(StoreError::TxConflict { key, .. }) if key == meta_key(&rule.id) => {
+                return Err(RuleError::Invalid(
+                    "rule changed during the write".to_string(),
+                ));
+            }
+            Err(error) => return Err(RuleError::Store(error)),
+        }
+        Ok(rule)
+    }
+
+    /// Stages one rule write in `tx`.
+    ///
+    /// The call reads the previous row and sets the next version.
+    /// The rule row precondition compares the committed row with the row that
+    /// the call read.
+    async fn stage_upsert<S>(&self, tx: &S, draft: RuleDraft) -> Result<Rule, RuleError>
+    where
+        S: TxCas + ?Sized,
+    {
+        let previous = load_rule(tx, &draft.id).await?;
         let now = chrono::Utc::now().timestamp();
         let version = match &previous {
             Some(rule) => rule
@@ -206,7 +231,18 @@ impl RuleStore {
             updated_at: now,
         };
 
-        put_rule(&tx, &rule).await?;
+        let expected = match &previous {
+            Some(previous) => Some(
+                serde_json::to_vec(previous)
+                    .map_err(|error| RuleError::Serialization(error.to_string()))?,
+            ),
+            None => None,
+        };
+        let bytes = serde_json::to_vec(&rule)
+            .map_err(|error| RuleError::Serialization(error.to_string()))?;
+        tx.compare_and_set(&meta_key(&rule.id), expected.as_deref(), &bytes)
+            .await
+            .map_err(RuleError::Store)?;
         let new_markers: BTreeSet<String> =
             index_keys(&rule.trigger, &rule.id).into_iter().collect();
         for key in &new_markers {
@@ -219,7 +255,6 @@ impl RuleStore {
                 }
             }
         }
-        tx.commit().await.map_err(RuleError::Store)?;
         Ok(rule)
     }
 
@@ -932,6 +967,26 @@ mod tests {
         assert_eq!(first.version, 1);
         assert_eq!(second.version, 2);
         assert_eq!(store.get("alpha").await.unwrap(), Some(second));
+    }
+
+    #[tokio::test]
+    async fn two_upserts_from_one_version_commit_one() {
+        let (store, raw) = store_with_raw().await;
+        let first_tx = raw.begin_tx().unwrap();
+        let second_tx = raw.begin_tx().unwrap();
+        let first = store.stage_upsert(&first_tx, draft("alpha")).await.unwrap();
+        let second = store
+            .stage_upsert(&second_tx, draft("alpha"))
+            .await
+            .unwrap();
+        assert_eq!(first.version, 1);
+        assert_eq!(second.version, 1);
+
+        first_tx.commit().await.unwrap();
+        let error = second_tx.commit().await.unwrap_err();
+
+        assert!(matches!(error, StoreError::TxConflict { .. }));
+        assert_eq!(store.get("alpha").await.unwrap().unwrap().version, 1);
     }
 
     #[tokio::test]
