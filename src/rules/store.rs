@@ -735,7 +735,7 @@ async fn family_page(
     after: Option<&str>,
 ) -> Result<Vec<KeyValue>, RuleError> {
     let start = after.map_or_else(|| prefix.to_string(), ToString::to_string);
-    let cursor = (Some(start), Some(prefix_scan_end(prefix)));
+    let cursor = (Some(start), KeyPrefix::new(prefix).upper_bound());
     let mut rows = store
         .gets_bytes(Some(GC_BATCH), Direction::Next, cursor)
         .await
@@ -764,7 +764,10 @@ where
     S: GetSet + ?Sized + Sync,
 {
     debug_assert!(prefix.starts_with(RULE_PREFIX));
-    let cursor = (Some(prefix.to_string()), Some(prefix_scan_end(prefix)));
+    let cursor = (
+        Some(prefix.to_string()),
+        KeyPrefix::new(prefix).upper_bound(),
+    );
     store
         .gets_keys(None, Direction::Next, cursor)
         .await
@@ -777,20 +780,14 @@ where
     S: GetSet + ?Sized,
 {
     debug_assert!(prefix.ends_with(':'));
-    let cursor = (Some(prefix.to_string()), Some(prefix_scan_end(prefix)));
+    let cursor = (
+        Some(prefix.to_string()),
+        KeyPrefix::new(prefix).upper_bound(),
+    );
     store
         .gets_bytes(None, Direction::Next, cursor)
         .await
         .map_err(RuleError::Store)
-}
-
-/// The exclusive upper bound for a `prefix:` range scan (`:` to `;`).
-fn prefix_scan_end(prefix: &str) -> String {
-    debug_assert!(prefix.ends_with(':'));
-    let mut end = prefix.to_string();
-    end.pop();
-    end.push(';');
-    end
 }
 
 /// The key that holds one rule.

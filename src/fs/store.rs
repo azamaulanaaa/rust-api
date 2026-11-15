@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use oxkv::{Direction, GetSet, KeyValue, OxKvStore, Store as _, Transaction as _};
+use oxkv::{Direction, GetSet, KeyPrefix, KeyValue, OxKvStore, Store as _, Transaction as _};
 use oxkv_cached::{CachedOxKvStore, WarmMode};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
@@ -322,7 +322,10 @@ impl FsStore {
     /// Bounding the scan to a key prefix keeps the size of each scan
     /// proportional to its own key family, and not to the whole store.
     async fn scan_prefix(&self, prefix: &str) -> Result<Vec<KeyValue>, FsError> {
-        let cursor = (Some(prefix.to_string()), Some(prefix_scan_end(prefix)));
+        let cursor = (
+            Some(prefix.to_string()),
+            KeyPrefix::new(prefix).upper_bound(),
+        );
         if let Some(mirror) = &self.mirror {
             return mirror
                 .gets_bytes(None, Direction::Next, cursor)
@@ -338,7 +341,10 @@ impl FsStore {
     /// Scans a key range that stops at the end of the `prefix:` family and
     /// reads keys only.
     async fn scan_keys_prefix(&self, prefix: &str) -> Result<Vec<String>, FsError> {
-        let cursor = (Some(prefix.to_string()), Some(prefix_scan_end(prefix)));
+        let cursor = (
+            Some(prefix.to_string()),
+            KeyPrefix::new(prefix).upper_bound(),
+        );
         if let Some(mirror) = &self.mirror {
             return mirror
                 .gets_keys(None, Direction::Next, cursor)
@@ -514,7 +520,7 @@ impl FsStore {
         let suffix = format!(":{id}");
         let cursor = (
             Some(REL_PREFIX.to_string()),
-            Some(prefix_scan_end(REL_PREFIX)),
+            KeyPrefix::new(REL_PREFIX).upper_bound(),
         );
         let keys = tx
             .gets_keys(None, Direction::Next, cursor)
@@ -957,20 +963,6 @@ async fn read_ref_info<T: GetSet>(
         return Ok(RefInfo::default());
     };
     serde_json::from_slice(&bytes).map_err(|e| FsError::Internal(e.to_string()))
-}
-
-/// The exclusive upper bound for a `prefix:` range scan (`:` -> `;`).
-///
-/// Every key that starts with `prefix:` sorts strictly below the bound.
-/// The engine can then stop at the end of the key family, instead of
-/// walking the rest of the store.
-/// No stored key is ever equal to the bare prefix.
-fn prefix_scan_end(prefix: &str) -> String {
-    debug_assert!(prefix.ends_with(':'));
-    let mut end = prefix.to_string();
-    end.pop();
-    end.push(';');
-    end
 }
 
 #[cfg(test)]

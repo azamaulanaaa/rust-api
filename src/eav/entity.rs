@@ -1545,7 +1545,7 @@ impl EntityStore {
             None => prefix.clone(),
         };
         let max = Some(limit.saturating_add(1));
-        let cursor = (Some(start), Some(prefix_scan_end(&prefix)));
+        let cursor = (Some(start), KeyPrefix::new(&prefix).upper_bound());
         let markers = g
             .gets_keys(max, Direction::Next, cursor)
             .await
@@ -1937,7 +1937,7 @@ impl EntityStore {
         }
 
         let prefix = format!("{ATTR_INDEX_PREFIX}{key}:{hash}:");
-        let end = prefix_scan_end(&prefix);
+        let end = KeyPrefix::new(&prefix).upper_bound();
         let mut start = match after {
             Some(cursor) => {
                 validate_name("entity id", cursor)?;
@@ -1951,11 +1951,7 @@ impl EntityStore {
         let mut seen = BTreeSet::new();
         loop {
             let rows = g
-                .gets_keys(
-                    max,
-                    Direction::Next,
-                    (Some(start.clone()), Some(end.clone())),
-                )
+                .gets_keys(max, Direction::Next, (Some(start.clone()), end.clone()))
                 .await
                 .map_err(EntityError::Store)?;
             let full = rows.len() == target;
@@ -2025,7 +2021,7 @@ impl EntityStore {
             }
         }
 
-        let end = prefix_scan_end(TIME_INDEX_PREFIX);
+        let end = KeyPrefix::new(TIME_INDEX_PREFIX).upper_bound();
         let max = Some(BACKFILL_PAGE);
         let mut cursor = TIME_INDEX_PREFIX.to_string();
         loop {
@@ -2040,11 +2036,7 @@ impl EntityStore {
                     None
                 } else {
                     let rows = g
-                        .gets_keys(
-                            max,
-                            Direction::Next,
-                            (Some(cursor.clone()), Some(end.clone())),
-                        )
+                        .gets_keys(max, Direction::Next, (Some(cursor.clone()), end.clone()))
                         .await
                         .map_err(EntityError::Store)?;
                     if rows.is_empty() {
@@ -2349,7 +2341,7 @@ impl EntityStore {
             }
         }
 
-        let end = prefix_scan_end(ENTITY_PREFIX);
+        let end = KeyPrefix::new(ENTITY_PREFIX).upper_bound();
         let max = Some(BACKFILL_PAGE);
         let mut cursor = ENTITY_PREFIX.to_string();
         loop {
@@ -2364,11 +2356,7 @@ impl EntityStore {
                     None
                 } else {
                     let rows = g
-                        .gets_keys(
-                            max,
-                            Direction::Next,
-                            (Some(cursor.clone()), Some(end.clone())),
-                        )
+                        .gets_keys(max, Direction::Next, (Some(cursor.clone()), end.clone()))
                         .await
                         .map_err(EntityError::Store)?;
                     if rows.is_empty() {
@@ -2462,7 +2450,7 @@ impl EntityStore {
         }
 
         self.backfill_entity_index().await?;
-        let end = prefix_scan_end(ENTITY_INDEX_PREFIX);
+        let end = KeyPrefix::new(ENTITY_INDEX_PREFIX).upper_bound();
         let max = Some(BACKFILL_PAGE);
         let mut cursor = ENTITY_INDEX_PREFIX.to_string();
         loop {
@@ -2477,11 +2465,7 @@ impl EntityStore {
                     None
                 } else {
                     let rows = g
-                        .gets_keys(
-                            max,
-                            Direction::Next,
-                            (Some(cursor.clone()), Some(end.clone())),
-                        )
+                        .gets_keys(max, Direction::Next, (Some(cursor.clone()), end.clone()))
                         .await
                         .map_err(EntityError::Store)?;
                     if rows.is_empty() {
@@ -2608,7 +2592,10 @@ impl EntityStore {
             None => ENTITY_INDEX_PREFIX.to_string(),
         };
         let max = Some(limit.saturating_add(1));
-        let cursor = (Some(start), Some(prefix_scan_end(ENTITY_INDEX_PREFIX)));
+        let cursor = (
+            Some(start),
+            KeyPrefix::new(ENTITY_INDEX_PREFIX).upper_bound(),
+        );
         let markers = g
             .gets_keys(max, Direction::Next, cursor)
             .await
@@ -3562,7 +3549,10 @@ where
     S: GetSet + ?Sized,
 {
     debug_assert!(prefix.ends_with(':'));
-    let cursor = (Some(prefix.to_string()), Some(prefix_scan_end(prefix)));
+    let cursor = (
+        Some(prefix.to_string()),
+        KeyPrefix::new(prefix).upper_bound(),
+    );
     store
         .gets_bytes(None, Direction::Next, cursor)
         .await
@@ -3576,7 +3566,10 @@ where
     S: GetSet + ?Sized + Sync,
 {
     debug_assert!(prefix.ends_with(':'));
-    let cursor = (Some(prefix.to_string()), Some(prefix_scan_end(prefix)));
+    let cursor = (
+        Some(prefix.to_string()),
+        KeyPrefix::new(prefix).upper_bound(),
+    );
     store
         .gets_keys(None, Direction::Next, cursor)
         .await
@@ -3594,7 +3587,10 @@ where
 {
     debug_assert!(prefix.ends_with(':'));
     let max = Some(limit);
-    let cursor = (Some(prefix.to_string()), Some(prefix_scan_end(prefix)));
+    let cursor = (
+        Some(prefix.to_string()),
+        KeyPrefix::new(prefix).upper_bound(),
+    );
     store
         .gets_keys(max, Direction::Next, cursor)
         .await
@@ -3612,20 +3608,14 @@ where
 {
     debug_assert!(prefix.ends_with(':'));
     let max = Some(limit);
-    let cursor = (Some(prefix.to_string()), Some(prefix_scan_end(prefix)));
+    let cursor = (
+        Some(prefix.to_string()),
+        KeyPrefix::new(prefix).upper_bound(),
+    );
     store
         .gets_bytes(max, Direction::Next, cursor)
         .await
         .map_err(EntityError::Store)
-}
-
-/// The exclusive upper bound for a `prefix:` range scan (`:` to `;`).
-fn prefix_scan_end(prefix: &str) -> String {
-    debug_assert!(prefix.ends_with(':'));
-    let mut end = prefix.to_string();
-    end.pop();
-    end.push(';');
-    end
 }
 
 /// The key that holds the metadata of an entity.
@@ -6953,6 +6943,20 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[tokio::test]
+    async fn time_keys_stop_at_the_family_bound() {
+        let (store, registry, raw) = new_store().await;
+        registry.publish(schema("task", &[], vec![])).await.unwrap();
+        raw.set_bytes(&time_key_index_key("alpha"), b"")
+            .await
+            .unwrap();
+        raw.set_bytes("idx:time-key;outside", b"").await.unwrap();
+
+        let found = store.time_keys().await.unwrap();
+
+        assert_eq!(found, vec!["alpha".to_string()]);
     }
 
     #[tokio::test]

@@ -142,15 +142,6 @@ impl DurableQueue {
         format!("idemp:{}", key)
     }
 
-    /// Returns the exclusive upper bound of a `prefix:` range scan.
-    fn prefix_scan_end(prefix: &str) -> String {
-        debug_assert!(prefix.ends_with(':'));
-        let mut end = prefix.to_string();
-        end.pop();
-        end.push(';');
-        end
-    }
-
     /// Returns the marker prefix for a status that has one.
     fn status_prefix(status: &JobStatus) -> Option<&'static str> {
         match status {
@@ -222,7 +213,7 @@ impl DurableQueue {
                 oxkv::Direction::Next,
                 (
                     Some(JOB_PREFIX.to_string()),
-                    Some(Self::prefix_scan_end(JOB_PREFIX)),
+                    KeyPrefix::new(JOB_PREFIX).upper_bound(),
                 ),
             )
             .await

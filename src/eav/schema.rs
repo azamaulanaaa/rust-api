@@ -28,7 +28,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
-use oxkv::{Direction, GetSet, KeyValue, OxKvStore, Store as _, Transaction as _};
+use oxkv::{Direction, GetSet, KeyPrefix, KeyValue, OxKvStore, Store as _, Transaction as _};
 use serde::{Deserialize, Deserializer, Serialize, de};
 use tokio::sync::{Mutex, RwLock};
 
@@ -409,7 +409,7 @@ impl SchemaRegistry {
             None => HEAD_PREFIX.to_string(),
         };
         let max = Some(limit.saturating_add(1));
-        let cursor = (Some(start), Some(prefix_scan_end(HEAD_PREFIX)));
+        let cursor = (Some(start), KeyPrefix::new(HEAD_PREFIX).upper_bound());
         let heads = g
             .gets_bytes(max, Direction::Next, cursor)
             .await
@@ -785,7 +785,10 @@ where
     S: GetSet + ?Sized,
 {
     debug_assert!(prefix.starts_with(SCHEMA_PREFIX));
-    let cursor = (Some(prefix.to_string()), Some(prefix_scan_end(prefix)));
+    let cursor = (
+        Some(prefix.to_string()),
+        KeyPrefix::new(prefix).upper_bound(),
+    );
     store
         .gets_bytes(None, Direction::Next, cursor)
         .await
@@ -799,7 +802,10 @@ where
     S: GetSet + ?Sized + Sync,
 {
     debug_assert!(prefix.starts_with(SCHEMA_PREFIX));
-    let cursor = (Some(prefix.to_string()), Some(prefix_scan_end(prefix)));
+    let cursor = (
+        Some(prefix.to_string()),
+        KeyPrefix::new(prefix).upper_bound(),
+    );
     store
         .gets_keys(None, Direction::Next, cursor)
         .await
@@ -817,20 +823,14 @@ where
 {
     debug_assert!(prefix.starts_with(SCHEMA_PREFIX));
     let max = Some(limit);
-    let cursor = (Some(prefix.to_string()), Some(prefix_scan_end(prefix)));
+    let cursor = (
+        Some(prefix.to_string()),
+        KeyPrefix::new(prefix).upper_bound(),
+    );
     store
         .gets_bytes(max, Direction::Next, cursor)
         .await
         .map_err(SchemaError::Store)
-}
-
-/// The exclusive upper bound for a `prefix:` range scan (`:` -> `;`).
-fn prefix_scan_end(prefix: &str) -> String {
-    debug_assert!(prefix.ends_with(':'));
-    let mut end = prefix.to_string();
-    end.pop();
-    end.push(';');
-    end
 }
 
 /// The key that holds the latest version of `id`.
@@ -1418,7 +1418,7 @@ mod tests {
         let g = reg.store.read().await;
         let cursor = (
             Some(SCHEMA_PREFIX.to_string()),
-            Some(prefix_scan_end(SCHEMA_PREFIX)),
+            KeyPrefix::new(SCHEMA_PREFIX).upper_bound(),
         );
         let keys = g.gets_bytes(None, Direction::Next, cursor).await.unwrap();
         assert!(keys.is_empty(), "a rejected publish must write no key");
