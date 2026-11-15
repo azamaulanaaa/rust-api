@@ -42,6 +42,7 @@ use crate::policy::row::RowAuthorizer;
 use crate::policy::{Action, Authorizer, PolicyError};
 use crate::rules::error::RuleError;
 use crate::rules::rule::{Rule, RuleDraft};
+use crate::rules::store::RuleDeadLetter;
 
 /// The route prefix of this module.
 const EAV_PREFIX: &str = "/eav";
@@ -129,6 +130,9 @@ impl ApiModule for EavApiModule {
             .service(list_schema_entities)
             .service(upsert_rule)
             .service(list_rules)
+            .service(list_dead_letters)
+            .service(retry_dead_letter)
+            .service(retry_entry_dead_letter)
             .service(get_rule)
             .service(delete_rule)
             .service(set_rule_enabled)
@@ -380,6 +384,17 @@ pub struct EntityPage {
 pub struct RulePage {
     /// The rules on this page.
     pub items: Vec<Rule>,
+    /// `Some` means the page was full and a following page may exist.
+    /// Fetch it and stop when the page is empty.
+    /// The value is `None` when the next offset would pass the cap.
+    pub next_offset: Option<usize>,
+}
+
+/// A page of dead-letter rows.
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
+pub struct DeadLetterPage {
+    /// The dead-letter rows on this page, newest first.
+    pub items: Vec<RuleDeadLetter>,
     /// `Some` means the page was full and a following page may exist.
     /// Fetch it and stop when the page is empty.
     /// The value is `None` when the next offset would pass the cap.
@@ -1293,6 +1308,87 @@ async fn list_rules(
     Ok(HttpResponse::Ok().json(RulePage { items, next_offset }))
 }
 
+/// Lists one page of dead-letter rows, newest first.
+///
+/// The caller needs `read` on `eav_rules`.
+/// The rows keep the dead-letter key `rule-dead:{seq}:{event_id}:{rule_id}`.
+/// A row whose source event is gone stays visible until the retention window
+/// ends.
+#[utoipa::path(get, path = "/eav/rules/dead-letters", tag = "eav", params(RulePageQuery), responses((status=200, body=DeadLetterPage), (status=400, body=crate::http::error::ErrorBody), (status=401, body=crate::http::error::ErrorBody), (status=403, body=crate::http::error::ErrorBody), (status=500, body=crate::http::error::ErrorBody)))]
+#[get("/rules/dead-letters")]
+async fn list_dead_letters(
+    runtime: web::Data<EavRuntime>,
+    policy: web::Data<Authorizer>,
+    claims: Validated<Claims>,
+    query: web::Query<RulePageQuery>,
+) -> Result<HttpResponse, EavApiError> {
+    require_management(&policy, &claims.sub, RULES, Action::Read).await?;
+    let (limit, offset) = query.into_inner().resolve()?;
+    let items = runtime.rules().dead_letters_page(limit, offset).await?;
+    let next_offset = page_next_offset(offset, items.len(), limit);
+    Ok(HttpResponse::Ok().json(DeadLetterPage { items, next_offset }))
+}
+
+/// Re-runs the feed entry of one dead-letter row.
+///
+/// The caller needs `write` on `eav_rules`.
+/// An unknown key returns `404`.
+/// The handler reads the feed entry at `seq` and runs the matching rules.
+/// A successful run deletes the dead-letter row.
+/// A failed run keeps the row, so the caller can try again.
+/// The call does not move the rule cursor.
+#[utoipa::path(post, path = "/eav/rules/dead-letters/{seq}/{event_id}/{rule_id}/retry", tag = "eav", params(("seq" = u64, Path), ("event_id" = String, Path), ("rule_id" = String, Path)), responses((status=204, description="retry completed"), (status=400, body=crate::http::error::ErrorBody), (status=401, body=crate::http::error::ErrorBody), (status=403, body=crate::http::error::ErrorBody), (status=404, body=crate::http::error::ErrorBody), (status=500, body=crate::http::error::ErrorBody)))]
+#[post("/rules/dead-letters/{seq}/{event_id}/{rule_id}/retry")]
+async fn retry_dead_letter(
+    runtime: web::Data<EavRuntime>,
+    policy: web::Data<Authorizer>,
+    claims: Validated<Claims>,
+    path: web::Path<(u64, String, String)>,
+) -> Result<HttpResponse, EavApiError> {
+    require_management(&policy, &claims.sub, RULES, Action::Write).await?;
+    let (seq, event_id, rule_id) = path.into_inner();
+    retry_dead_letter_row(&runtime, seq, &event_id, &rule_id).await
+}
+
+/// Re-runs the feed entry of one entry-level dead-letter row.
+///
+/// An entry-level row has no rule id. The three-part route cannot address an
+/// empty path segment, so this route addresses that row.
+/// The caller needs `write` on `eav_rules`.
+#[utoipa::path(post, path = "/eav/rules/dead-letters/{seq}/{event_id}/retry", tag = "eav", params(("seq" = u64, Path), ("event_id" = String, Path)), responses((status=204, description="retry completed"), (status=400, body=crate::http::error::ErrorBody), (status=401, body=crate::http::error::ErrorBody), (status=403, body=crate::http::error::ErrorBody), (status=404, body=crate::http::error::ErrorBody), (status=500, body=crate::http::error::ErrorBody)))]
+#[post("/rules/dead-letters/{seq}/{event_id}/retry")]
+async fn retry_entry_dead_letter(
+    runtime: web::Data<EavRuntime>,
+    policy: web::Data<Authorizer>,
+    claims: Validated<Claims>,
+    path: web::Path<(u64, String)>,
+) -> Result<HttpResponse, EavApiError> {
+    require_management(&policy, &claims.sub, RULES, Action::Write).await?;
+    let (seq, event_id) = path.into_inner();
+    retry_dead_letter_row(&runtime, seq, &event_id, "").await
+}
+
+/// Runs one dead-letter row and returns `204` on success.
+///
+/// The call deletes the row only after the run succeeds.
+async fn retry_dead_letter_row(
+    runtime: &EavRuntime,
+    seq: u64,
+    event_id: &str,
+    rule_id: &str,
+) -> Result<HttpResponse, EavApiError> {
+    let dead = runtime
+        .rules()
+        .dead_letter(seq, event_id, rule_id)
+        .await?
+        .ok_or_else(EavApiError::not_found)?;
+    runtime
+        .engine()
+        .retry_dead_letter(&dead, runtime.wal())
+        .await?;
+    Ok(HttpResponse::NoContent().finish())
+}
+
 #[utoipa::path(get, path = "/eav/rules/{id}", tag = "eav", params(("id" = String, Path)), responses((status=200, body=crate::rules::rule::Rule), (status=401, body=crate::http::error::ErrorBody), (status=403, body=crate::http::error::ErrorBody), (status=404, body=crate::http::error::ErrorBody), (status=500, body=crate::http::error::ErrorBody)))]
 #[get("/rules/{id}")]
 async fn get_rule(
@@ -1371,6 +1467,7 @@ mod tests {
     use crate::fs::s3::{S3Backend, S3ClientConfig};
     use crate::http::middleware::jwks::test_support::{rsa_key, sign_rs256, spawn_jwks};
     use crate::policy::PolicyEngine;
+    use crate::records::WalOp;
     use crate::rules::action::{ActionContext, RuleAction};
     use crate::rules::webhook::WebhookAction;
     use crate::sync::wal::Wal;
@@ -1395,6 +1492,9 @@ mod tests {
         "/eav/rules",
         "/eav/rules/{id}",
         "/eav/rules/{id}/enabled",
+        "/eav/rules/dead-letters",
+        "/eav/rules/dead-letters/{seq}/{event_id}/{rule_id}/retry",
+        "/eav/rules/dead-letters/{seq}/{event_id}/retry",
         "/eav/sync/status",
         "/eav/sync/events",
         "/eav/sync/snapshot",
@@ -1590,6 +1690,16 @@ mod tests {
             )
             .await?;
         Ok(())
+    }
+
+    async fn last_feed_event(fx: &Fixture) -> anyhow::Result<(u64, String)> {
+        let seq = fx.runtime.wal().head().await?;
+        let entries = fx.runtime.wal().range(seq, seq).await?;
+        let event_id = match &entries[0].op {
+            WalOp::Entity { event } => event.event_id.clone(),
+            other => anyhow::bail!("unexpected feed op: {other:?}"),
+        };
+        Ok((seq, event_id))
     }
 
     async fn publish_indexed_tag_schema(fx: &Fixture) -> anyhow::Result<()> {
@@ -4107,6 +4217,282 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0]["id"], "e1");
         assert_eq!(page["next_offset"], Value::Null);
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn dead_letters_list_newest_first_with_paging() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        assert!(fx.engine.claim_superadmin("alice").await?);
+        for (seq, at) in [(1, 100), (2, 200), (3, 300)] {
+            fx.runtime
+                .rules()
+                .write_dead_letter(&RuleDeadLetter {
+                    seq,
+                    event_id: format!("evt-{seq}"),
+                    rule_id: "alpha".to_string(),
+                    attempts: 5,
+                    error: "rule action failed: record".to_string(),
+                    at,
+                })
+                .await?;
+        }
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::get().uri("/eav/rules/dead-letters?limit=2&offset=0"),
+                &token,
+            )
+            .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let page: Value = actix_test::read_body_json(res).await;
+        assert_eq!(page["items"][0]["seq"], 3);
+        assert_eq!(page["items"][1]["seq"], 2);
+        assert_eq!(page["next_offset"], 2);
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::get().uri("/eav/rules/dead-letters?limit=2&offset=2"),
+                &token,
+            )
+            .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let page: Value = actix_test::read_body_json(res).await;
+        assert_eq!(page["items"].as_array().map(Vec::len), Some(1));
+        assert_eq!(page["items"][0]["seq"], 1);
+        assert!(page["next_offset"].is_null());
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn dead_letters_list_requires_read_on_rules() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::get().uri("/eav/rules/dead-letters"),
+                &fx.token("bob")?,
+            )
+            .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::FORBIDDEN);
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn dead_letter_retry_reruns_the_entry_and_removes_the_row() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        assert!(fx.engine.claim_superadmin("alice").await?);
+        publish_schema_version(&fx, "invoice", vec![attr("total", AttributeType::Integer)]).await?;
+        fx.runtime
+            .entities()
+            .create(
+                EntityDraft {
+                    id: "e1".to_string(),
+                    schemas: vec!["invoice".to_string()],
+                    attributes: [("total".to_string(), AttributeValue::Integer(10))]
+                        .into_iter()
+                        .collect(),
+                },
+                &WriteContext::new("alice"),
+            )
+            .await?;
+        let (seq, event_id) = last_feed_event(&fx).await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::post()
+                    .uri("/eav/rules")
+                    .set_json(rule_body()),
+                &token,
+            )
+            .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::CREATED);
+
+        fx.runtime
+            .rules()
+            .write_dead_letter(&RuleDeadLetter {
+                seq,
+                event_id: event_id.clone(),
+                rule_id: "alpha".to_string(),
+                attempts: 5,
+                error: "rule action failed: record".to_string(),
+                at: 1,
+            })
+            .await?;
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::post().uri(&format!(
+                    "/eav/rules/dead-letters/{seq}/{event_id}/alpha/retry"
+                )),
+                &token,
+            )
+            .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::NO_CONTENT);
+        assert!(
+            fx.runtime
+                .rules()
+                .dead_letter(seq, &event_id, "alpha")
+                .await?
+                .is_none()
+        );
+        assert!(fx.runtime.rules().is_executed("alpha", &event_id).await?);
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::post().uri(&format!(
+                    "/eav/rules/dead-letters/{seq}/{event_id}/alpha/retry"
+                )),
+                &token,
+            )
+            .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::NOT_FOUND);
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn dead_letter_retry_of_an_entry_level_row_uses_the_two_part_route() -> anyhow::Result<()>
+    {
+        let fx = fixture().await?;
+        assert!(fx.engine.claim_superadmin("alice").await?);
+        publish_schema_version(&fx, "invoice", vec![attr("total", AttributeType::Integer)]).await?;
+        fx.runtime
+            .entities()
+            .create(
+                EntityDraft {
+                    id: "e1".to_string(),
+                    schemas: vec!["invoice".to_string()],
+                    attributes: [("total".to_string(), AttributeValue::Integer(10))]
+                        .into_iter()
+                        .collect(),
+                },
+                &WriteContext::new("alice"),
+            )
+            .await?;
+        let (seq, event_id) = last_feed_event(&fx).await?;
+        fx.runtime
+            .rules()
+            .write_dead_letter(&RuleDeadLetter {
+                seq,
+                event_id: event_id.clone(),
+                rule_id: String::new(),
+                attempts: 5,
+                error: "rule feed failed: record".to_string(),
+                at: 1,
+            })
+            .await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::post()
+                    .uri(&format!("/eav/rules/dead-letters/{seq}/{event_id}/retry")),
+                &fx.token("alice")?,
+            )
+            .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::NO_CONTENT);
+        assert!(
+            fx.runtime
+                .rules()
+                .dead_letter(seq, &event_id, "")
+                .await?
+                .is_none()
+        );
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn dead_letter_retry_requires_write_on_rules() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        let (seq, event_id) = (1u64, "evt-1".to_string());
+        fx.runtime
+            .rules()
+            .write_dead_letter(&RuleDeadLetter {
+                seq,
+                event_id: event_id.clone(),
+                rule_id: "alpha".to_string(),
+                attempts: 5,
+                error: "rule action failed: record".to_string(),
+                at: 1,
+            })
+            .await?;
+        fx.engine
+            .add_rule("bob".into(), "eav_rules".into(), Action::Read)
+            .await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::post().uri(&format!(
+                    "/eav/rules/dead-letters/{seq}/{event_id}/alpha/retry"
+                )),
+                &fx.token("bob")?,
+            )
+            .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::FORBIDDEN);
+        assert!(
+            fx.runtime
+                .rules()
+                .dead_letter(seq, &event_id, "alpha")
+                .await?
+                .is_some()
+        );
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn dead_letter_retry_with_a_missing_key_is_404() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        assert!(fx.engine.claim_superadmin("alice").await?);
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::post().uri("/eav/rules/dead-letters/1/evt-1/alpha/retry"),
+                &fx.token("alice")?,
+            )
+            .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::NOT_FOUND);
+        let body: crate::http::error::ErrorBody = actix_test::read_body_json(res).await;
+        assert_eq!(body.code.as_deref(), Some("not_found"));
         Ok(())
     }
 }
