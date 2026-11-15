@@ -67,6 +67,8 @@ const FAILED_PREFIX: &str = "job-status:failed:";
 const BACKFILL_KEY: &str = "job-meta:backfilled";
 /// Time that a dead, succeeded, or failed row stays in the store: 7 days.
 const TERMINAL_RETENTION_SECS: i64 = 7 * 24 * 60 * 60;
+/// Number of marker keys that one queue scan reads.
+const QUEUE_SCAN_PAGE: usize = 512;
 
 /// Persisted envelope for one job.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -168,22 +170,26 @@ impl DurableQueue {
     /// Lists the job ids under one marker prefix.
     async fn ids_with_prefix(&self, prefix: &str) -> Result<Vec<JobId>, QueueError> {
         let g = self.store.read().await;
-        let rows = g
-            .gets_bytes(
-                None,
-                oxkv::Direction::Next,
-                (
-                    Some(prefix.to_string()),
-                    Some(Self::prefix_scan_end(prefix)),
-                ),
-            )
-            .await
-            .map_err(|e| QueueError::Store(e.to_string()))?;
-        Ok(rows
-            .iter()
-            .filter_map(|kv| kv.key.strip_prefix(prefix))
-            .filter_map(|id| id.parse::<Uuid>().ok())
-            .collect())
+        let mut ids = Vec::new();
+        let mut after = None;
+        loop {
+            let page = g
+                .scan_keys(KeyPrefix::new(prefix), after, QUEUE_SCAN_PAGE)
+                .await
+                .map_err(|e| QueueError::Store(e.to_string()))?;
+            for key in &page.items {
+                if let Some(id) = key.strip_prefix(prefix)
+                    && let Ok(id) = id.parse::<Uuid>()
+                {
+                    ids.push(id);
+                }
+            }
+            match page.next {
+                Some(next) => after = Some(next),
+                None => break,
+            }
+        }
+        Ok(ids)
     }
 
     /// Writes the status markers for an old store one time.
@@ -930,6 +936,32 @@ mod tests {
             .unwrap();
         assert_eq!(job_rows, 1, "one job row must exist");
         assert_eq!(queued_rows, 1, "one queued marker must exist");
+    }
+
+    #[tokio::test]
+    async fn ids_with_prefix_reads_every_page() {
+        let q = queue().await;
+        let mut expected = Vec::new();
+        {
+            let g = q.store.write().await;
+            let tx = g.begin_tx().unwrap();
+            for _ in 0..(QUEUE_SCAN_PAGE + 1) {
+                let id = Uuid::now_v7();
+                expected.push(id);
+                tx.set_bytes(&DurableQueue::queued_key(id), b"")
+                    .await
+                    .unwrap();
+            }
+            tx.commit().await.unwrap();
+        }
+
+        let found = q.ids_with_prefix(QUEUED_PREFIX).await.unwrap();
+
+        assert_eq!(found.len(), expected.len());
+        expected.sort_unstable();
+        let mut found = found;
+        found.sort_unstable();
+        assert_eq!(found, expected);
     }
 
     async fn put_job(q: &DurableQueue, job: Job, status: JobStatus) {
