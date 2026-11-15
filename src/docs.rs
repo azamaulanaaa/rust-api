@@ -255,9 +255,12 @@ mod tests {
     /// uses must appear in the specification. Drift therefore breaks this
     /// test instead of the front end at run time.
     ///
-    /// Maintain this list by hand:
+    /// The test also checks the method of each route and the status codes that
+    /// a client must handle.
     ///
-    /// 1. Update the list when you add a route to a module's `configure`.
+    /// Maintain these lists by hand:
+    ///
+    /// 1. Update a list when you change a route in a module's `configure`.
     /// 2. Do not wait for a new `utoipa::path` handler before you update
     ///    the list.
     #[test]
@@ -266,53 +269,95 @@ mod tests {
             serde_json::from_str(&ApiDoc::openapi().to_json().expect("spec serializes"))
                 .expect("spec is JSON");
         let paths = spec.get("paths").and_then(Value::as_object).expect("paths");
-        for route in [
-            "/health",
-            "/ready",
-            "/auth/login",
-            "/auth/callback",
-            "/auth/me",
-            "/auth/logout",
-            "/auth/refresh",
-            "/setup/admin",
-            "/fs/uploads",
-            "/fs/uploads/{id}/parts/{idx}",
-            "/fs/uploads/{id}/complete",
-            "/fs/uploads/{id}",
-            "/fs/files/{id}/meta",
-            "/fs/files/{id}",
-            "/policy/rules",
-            "/policy/groups",
-            "/policy/groups/{user_id}",
-            "/policy/groups/{group_name}/users",
-            "/policy/groups/{group_name}/users/{user_id}",
-            "/policy/groups/{group_name}",
-            "/policy/users",
-            "/sync/status",
-            "/sync/sync",
-            "/sync/db/{object}",
-            "/eav/schemas",
-            "/eav/schemas/{id}",
-            "/eav/schemas/{id}/versions/{version}",
-            "/eav/schemas/{id}/effective/{version}",
-            "/eav/schemas/{id}/children",
-            "/eav/schemas/{id}/diff",
-            "/eav/schemas/{id}/revalidate",
-            "/eav/schemas/{id}/migrate",
-            "/eav/schemas/{id}/entities",
-            "/eav/entities",
-            "/eav/entities/query",
-            "/eav/entities/{id}",
-            "/eav/rules",
-            "/eav/rules/{id}",
-            "/eav/rules/{id}/enabled",
-            "/eav/sync/status",
-            "/eav/sync/events",
-            "/eav/sync/snapshot",
-            "/eav/sync/replica",
-            "/eav/sync/replica/status",
-        ] {
-            assert!(paths.contains_key(route), "spec missing {route}");
+
+        let routes = [
+            ("/health", "get"),
+            ("/ready", "get"),
+            ("/auth/login", "get"),
+            ("/auth/callback", "get"),
+            ("/auth/me", "get"),
+            ("/auth/logout", "post"),
+            ("/auth/refresh", "post"),
+            ("/setup/admin", "post"),
+            ("/fs/uploads", "post"),
+            ("/fs/uploads/{id}/parts/{idx}", "put"),
+            ("/fs/uploads/{id}/complete", "post"),
+            ("/fs/uploads/{id}", "get"),
+            ("/fs/uploads/{id}", "delete"),
+            ("/fs/files/{id}/meta", "get"),
+            ("/fs/files/{id}", "get"),
+            ("/fs/files/{id}", "delete"),
+            ("/policy/rules", "get"),
+            ("/policy/rules", "post"),
+            ("/policy/rules", "delete"),
+            ("/policy/groups", "get"),
+            ("/policy/groups", "post"),
+            ("/policy/groups/{user_id}", "get"),
+            ("/policy/groups/{group_name}/users", "get"),
+            ("/policy/groups/{group_name}/users/{user_id}", "delete"),
+            ("/policy/groups/{group_name}", "delete"),
+            ("/policy/users", "get"),
+            ("/sync/status", "get"),
+            ("/sync/sync", "post"),
+            ("/sync/db/{object}", "get"),
+            ("/eav/schemas", "post"),
+            ("/eav/schemas", "get"),
+            ("/eav/schemas/{id}", "get"),
+            ("/eav/schemas/{id}/versions/{version}", "get"),
+            ("/eav/schemas/{id}/effective/{version}", "get"),
+            ("/eav/schemas/{id}/children", "get"),
+            ("/eav/schemas/{id}/diff", "get"),
+            ("/eav/schemas/{id}/revalidate", "post"),
+            ("/eav/schemas/{id}/migrate", "post"),
+            ("/eav/schemas/{id}/entities", "get"),
+            ("/eav/entities", "post"),
+            ("/eav/entities", "get"),
+            ("/eav/entities/query", "post"),
+            ("/eav/entities/{id}", "get"),
+            ("/eav/entities/{id}", "patch"),
+            ("/eav/entities/{id}", "delete"),
+            ("/eav/rules", "post"),
+            ("/eav/rules", "get"),
+            ("/eav/rules/{id}", "get"),
+            ("/eav/rules/{id}", "delete"),
+            ("/eav/rules/{id}/enabled", "post"),
+            ("/eav/sync/status", "get"),
+            ("/eav/sync/events", "get"),
+            ("/eav/sync/snapshot", "get"),
+            ("/eav/sync/replica", "post"),
+            ("/eav/sync/replica", "get"),
+            ("/eav/sync/replica", "delete"),
+            ("/eav/sync/replica/status", "get"),
+        ];
+        for (path, method) in routes {
+            let item = paths
+                .get(path)
+                .unwrap_or_else(|| panic!("spec missing {path}"));
+            assert!(
+                item.get(method).is_some(),
+                "spec missing {method} {path}: {item}"
+            );
+        }
+
+        let statuses: &[(&str, &str, &[u16])] = &[
+            ("/eav/schemas/{id}/children", "get", &[200, 404]),
+            ("/eav/schemas/{id}/diff", "get", &[200, 400, 404]),
+            ("/eav/schemas/{id}/migrate", "post", &[200, 409]),
+            ("/eav/entities", "post", &[201, 404, 409]),
+            ("/eav/rules", "get", &[200, 400]),
+            ("/eav/sync/snapshot", "get", &[200, 400, 409]),
+            ("/eav/sync/replica", "get", &[200, 400, 404]),
+        ];
+        for (path, method, expected) in statuses {
+            let responses = paths[*path][*method]["responses"]
+                .as_object()
+                .unwrap_or_else(|| panic!("spec missing responses for {method} {path}"));
+            for status in *expected {
+                assert!(
+                    responses.contains_key(&status.to_string()),
+                    "spec missing status {status} for {method} {path}: {responses:?}"
+                );
+            }
         }
     }
 }

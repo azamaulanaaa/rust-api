@@ -144,15 +144,16 @@ sample_ratio = 1.0
 # Default: 200.
 # rule_poll_interval_ms = 200
 
-# Pause in milliseconds between execution marker cleanups. Must be above 0.
+# Pause in milliseconds between execution marker cleanups. The cleanup covers
+# the rule store and the entity-store script markers. Must be above 0.
 # Default: 3600000.
 # gc_interval_ms = 3600000
 
-# Retention window in seconds for execution markers. Must be above 0.
-# Values below 604800 (7 days) log a warning. A shorter window can delete a
-# marker before a replay reads it, so the action can run twice. The server
-# does not reject the value. Keep it longer than any replay window for WAL
-# events. Default: 2592000.
+# Retention window in seconds for execution markers in both stores. Must be
+# above 0. Values below 604800 (7 days) log a warning. A shorter window can
+# delete a marker before a replay reads it, so the action can run twice. The
+# server does not reject the value. Keep it longer than any replay window for
+# WAL events. Default: 2592000.
 # execution_retention_secs = 2592000
 
 # Pause in milliseconds between due timer passes. Must be above 0.
@@ -178,7 +179,9 @@ sample_ratio = 1.0
 # check_entity_refs = true
 
 # Hosts that a webhook rule can call. Each value is a host or a host:port pair.
-# An empty list rejects every webhook rule. Default: empty.
+# An entry with no port matches only the default port of the URL scheme: 80 for
+# http and 443 for https. An empty list rejects every webhook rule. Default:
+# empty.
 # webhook_allowed_hosts = ["example.com", "example.com:8443"]
 
 # Optional HMAC-SHA256 secret for webhook signing. It must have at least
