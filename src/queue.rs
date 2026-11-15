@@ -114,6 +114,71 @@ pub enum RetryPolicy {
     },
 }
 
+/// Retry decision that a [`JobError`] carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobRetry {
+    /// Do not retry the job.
+    NoRetry,
+    /// Retry the job after the given delay.
+    RetryAfter(Duration),
+    /// Retry the job with the worker retry schedule.
+    RetryDefault,
+}
+
+/// A job error that carries the retry decision.
+///
+/// A handler returns this error to control the next action of the worker.
+/// The worker maps [`JobRetry::NoRetry`] to [`RetryPolicy::NoRetry`].
+/// It maps [`JobRetry::RetryAfter`] to [`RetryPolicy::Retry`] with the same
+/// delay.
+/// It maps [`JobRetry::RetryDefault`] to the worker retry schedule.
+/// An error without this type uses the worker retry schedule.
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+pub struct JobError {
+    /// The error text.
+    message: String,
+    /// The retry decision.
+    retry: JobRetry,
+}
+
+impl JobError {
+    /// Creates an error for a permanent failure.
+    ///
+    /// The worker does not retry the job.
+    pub fn permanent(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            retry: JobRetry::NoRetry,
+        }
+    }
+
+    /// Creates an error for a temporary failure.
+    ///
+    /// The worker uses its own retry schedule.
+    pub fn retryable(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            retry: JobRetry::RetryDefault,
+        }
+    }
+
+    /// Creates an error for a temporary failure with a delay.
+    ///
+    /// The worker retries the job after `delay`.
+    pub fn retry_after(message: impl Into<String>, delay: Duration) -> Self {
+        Self {
+            message: message.into(),
+            retry: JobRetry::RetryAfter(delay),
+        }
+    }
+
+    /// Returns the retry decision.
+    pub fn retry(&self) -> JobRetry {
+        self.retry
+    }
+}
+
 /// Error returned by queue operations.
 #[derive(Debug, thiserror::Error)]
 pub enum QueueError {
