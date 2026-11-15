@@ -814,6 +814,9 @@ impl std::error::Error for ReplicaChunkOutOfRange {}
 /// A policy change takes effect on the next read.
 /// Without a `chunk` parameter, the route returns every permitted entity as
 /// one JSON array and sets `X-Replica-Head` and `X-Replica-Generation`.
+/// A full read above `[limits].max_full_replica_bytes` returns `400`.
+/// The client must then use chunk mode.
+/// The value `0` disables the gate.
 /// With `chunk=N`, the route returns one stored chunk and sets
 /// `X-Replica-Head`, `X-Replica-Generation`, `X-Replica-Chunk`, and
 /// `X-Replica-Chunks`.
@@ -839,6 +842,13 @@ pub(crate) async fn replica(
         let Some(stored) = runtime.replicas().get(&claims.sub).await? else {
             return Err(EavApiError::NotFound(Box::new(MissingReplica)));
         };
+        let limit = runtime.full_replica_byte_limit();
+        if limit > 0 {
+            let bytes: usize = stored.chunks.iter().map(Vec::len).sum();
+            if bytes > limit {
+                return Err(EavApiError::ReplicaTooLarge);
+            }
+        }
         let mut items: Vec<Entity> = Vec::new();
         for chunk in stored.chunks {
             items.extend(decode_chunk(&chunk)?);
@@ -906,6 +916,7 @@ mod tests {
     use crate::db::{build_s3_store, build_test_store, test_prefix};
     use crate::docs::ApiDoc;
     use crate::eav::entity::{AttributeValue, EntityDraft};
+    use crate::eav::metrics::test_support::MetricCapture;
     use crate::eav::route::EavApiModule;
     use crate::eav::schema::{AttributeDef, AttributeType, SchemaDraft};
     use crate::fs::s3::{S3Backend, S3ClientConfig};
@@ -2000,6 +2011,60 @@ mod tests {
         assert_eq!(items.len(), 2);
         assert_eq!(items[0]["id"], "e1");
         assert_eq!(items[1]["id"], "e2");
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn a_full_replica_read_at_the_size_gate_is_allowed_and_one_byte_over_is_400()
+    -> anyhow::Result<()> {
+        let mut fx = fixture().await?;
+        publish_task_schema(&fx).await?;
+        create_entity(&fx, "e1").await?;
+        create_entity(&fx, "e2").await?;
+        grant_collection_read(&fx, "alice").await?;
+        let (metrics, capture) = MetricCapture::new();
+        fx.runtime = fx.runtime.with_metrics(metrics);
+        let token = fx.token("alice")?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+
+        let res = post_replica!(&app, &token).await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        assert_eq!(capture.counter("eav.replica.builds"), 1);
+        assert_eq!(capture.histogram_count("eav.replica.build_duration"), 1);
+        let stored = fx
+            .runtime
+            .replicas()
+            .get("alice")
+            .await?
+            .expect("stored replica");
+        let bytes: usize = stored.chunks.iter().map(Vec::len).sum();
+        assert!(bytes > 0);
+
+        // A replica that is exactly at the gate is allowed.
+        fx.runtime = fx.runtime.with_full_replica_limit(bytes);
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let res = get_route!(&app, "/eav/sync/replica", &token).await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+
+        // One byte over the gate returns a clear 400 and names chunk mode.
+        fx.runtime = fx.runtime.with_full_replica_limit(bytes - 1);
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let res = get_route!(&app, "/eav/sync/replica", &token).await;
+        assert_eq!(res.status(), http::StatusCode::BAD_REQUEST);
+        let body: crate::http::error::ErrorBody = actix_test::read_body_json(res).await;
+        assert_eq!(body.code.as_deref(), Some("replica_too_large"));
+        assert!(
+            body.error.contains("use chunk mode"),
+            "the 400 must name chunk mode: {}",
+            body.error
+        );
+
+        // Chunk mode stays available.
+        let res = get_route!(&app, "/eav/sync/replica?chunk=0", &token).await;
+        assert_eq!(res.status(), http::StatusCode::OK);
         Ok(())
     }
 

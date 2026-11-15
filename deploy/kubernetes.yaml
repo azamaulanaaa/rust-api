@@ -29,6 +29,11 @@ data:
     [s3]
     bucket = "my-bucket"
     region = "us-east-1"
+
+    [limits]
+    # A full GET /eav/sync/replica above 8 MiB returns 400. The client must use
+    # ?chunk=N. The build itself is capped at 64 MiB.
+    max_full_replica_bytes = 8388608
 ---
 apiVersion: apps/v1
 kind: Deployment

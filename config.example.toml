@@ -140,6 +140,11 @@ sample_ratio = 1.0
 # Concurrent downloads of /sync/db/{object}. 0 disables the gate. Default: 0.
 # max_concurrent_downloads = 0
 
+# Largest stored EAV replica, in bytes, that one full
+# GET /eav/sync/replica read may load. A larger replica must be read in chunk
+# mode with ?chunk=N. 0 disables the gate. Default: 0.
+# max_full_replica_bytes = 0
+
 [eav]
 # Pause in milliseconds between outbox flushes. Must be above 0.
 # Default: 1000.
