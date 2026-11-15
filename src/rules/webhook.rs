@@ -1635,6 +1635,10 @@ mod tests {
             parse_retry_after("99999"),
             Some(Duration::from_secs(MAX_RETRY_AFTER_SECS))
         );
+        assert_eq!(
+            parse_retry_after("Sun, 06 Nov 1994 08:49:37 GMT"),
+            Some(Duration::ZERO)
+        );
         assert_eq!(parse_retry_after("not a date"), None);
     }
 
