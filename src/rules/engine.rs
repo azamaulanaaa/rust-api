@@ -21,12 +21,14 @@
 //! Below the limit, the run keeps the cursor before the failed entry.
 //! The runtime supervisor restarts a failed run after a backoff delay.
 //! The delay starts at one second and doubles up to 60 seconds.
-//! At the limit, the engine writes a dead-letter row in
-//! `rule-dead:{seq}:{event_id}`.
+//! A failed rule does not stop the later rules in the same entry.
+//! The engine runs every matching rule and collects the failures.
+//! At the limit, the engine writes one dead-letter row for each failed rule
+//! in `rule-dead:{seq}:{event_id}:{rule_id}`.
 //! It deletes the attempt row, writes the cursor at the failed sequence, and
 //! continues with the next entry.
-//! A dead-letter row holds the sequence, the event id, the attempt count,
-//! the sanitized error text, and the write time.
+//! A dead-letter row holds the sequence, the event id, the rule id, the
+//! attempt count, the sanitized error text, and the write time.
 //! The execution-marker cleanup deletes a dead letter older than 7 days.
 //!
 //! The process lock is per event.
@@ -132,6 +134,34 @@ pub trait RuleObserver: Send + Sync {
 
     /// Records one action failure.
     fn on_action_failure(&self);
+}
+
+/// One rule that failed during one pass.
+#[derive(Debug)]
+struct RuleFailure {
+    /// The id of the failed rule.
+    rule_id: String,
+    /// The rule error.
+    error: RuleError,
+}
+
+/// The complete result of one pass over the matching rules.
+#[derive(Debug)]
+struct RulePass {
+    /// The result for each rule that did not fail.
+    executions: Vec<RuleExecution>,
+    /// The rules that failed in this pass.
+    failures: Vec<RuleFailure>,
+}
+
+impl RulePass {
+    /// Returns one empty pass.
+    fn empty() -> Self {
+        Self {
+            executions: Vec::new(),
+            failures: Vec::new(),
+        }
+    }
 }
 
 /// The generic rule runner.
@@ -342,8 +372,23 @@ impl RuleEngine {
     /// Calls for different events do not serialize.
     /// A successful action writes the marker for this rule and event.
     /// A failed action writes no marker, so a later retry can run it again.
+    /// A failed rule does not stop the later rules in the same pass.
+    /// The call returns the first rule error after the pass finishes.
     /// The call removes the lock entry when the last caller releases it.
     pub async fn process(&self, event: &EntityEvent) -> Result<Vec<RuleExecution>, RuleError> {
+        let pass = self.process_pass(event).await?;
+        if let Some(failure) = pass.failures.into_iter().next() {
+            return Err(failure.error);
+        }
+        Ok(pass.executions)
+    }
+
+    /// Runs one pass and keeps the rule failures.
+    ///
+    /// The caller uses the failures to name each failed rule.
+    /// An entry-level error returns `Err`.
+    /// A rule-level error enters the returned [`RulePass`].
+    async fn process_pass(&self, event: &EntityEvent) -> Result<RulePass, RuleError> {
         let entity = self
             .entities
             .get(&event.entity_id)
@@ -351,25 +396,24 @@ impl RuleEngine {
             .map_err(map_entity_error)?;
         let rules = self.rules.matching(event).await?;
         if event.causation_depth > self.max_causation_depth {
-            return Ok(rules
-                .into_iter()
-                .map(|rule| {
-                    let outcome = ExecutionOutcome::CausationLimit;
-                    self.observe(outcome);
-                    RuleExecution {
-                        rule_id: rule.id,
-                        outcome,
-                    }
-                })
-                .collect());
+            let mut pass = RulePass::empty();
+            for rule in rules {
+                let outcome = ExecutionOutcome::CausationLimit;
+                self.observe(outcome);
+                pass.executions.push(RuleExecution {
+                    rule_id: rule.id,
+                    outcome,
+                });
+            }
+            return Ok(pass);
         }
 
         let lock = self.event_process_lock(&event.event_id).await;
         let guard = lock.lock().await;
-        let result = self.run_rules(event, entity, rules).await;
+        let pass = self.run_rules(event, entity, rules).await;
         drop(guard);
         self.release_process_lock(&event.event_id, &lock).await;
-        result
+        Ok(pass)
     }
 
     /// Runs the loaded rules for one event under the event lock.
@@ -377,63 +421,71 @@ impl RuleEngine {
     /// The caller holds the lock for `event.event_id`.
     /// A successful action writes the marker for this rule and event.
     /// A failed action writes no marker.
+    /// The call continues with the later rules after one rule fails.
     async fn run_rules(
         &self,
         event: &EntityEvent,
         entity: Option<Entity>,
         rules: Vec<Rule>,
-    ) -> Result<Vec<RuleExecution>, RuleError> {
-        let mut executions = Vec::with_capacity(rules.len());
-
+    ) -> RulePass {
+        let mut pass = RulePass::empty();
         for rule in rules {
-            if self.rules.is_executed(&rule.id, &event.event_id).await? {
-                let outcome = ExecutionOutcome::AlreadyExecuted;
-                self.observe(outcome);
-                executions.push(RuleExecution {
+            match self.run_one_rule(&rule, event, entity.as_ref()).await {
+                Ok(outcome) => {
+                    self.observe(outcome);
+                    pass.executions.push(RuleExecution {
+                        rule_id: rule.id,
+                        outcome,
+                    });
+                }
+                Err(error) => pass.failures.push(RuleFailure {
                     rule_id: rule.id,
-                    outcome,
-                });
-                continue;
+                    error,
+                }),
             }
-            if !self.eval_condition(&rule.condition, event, entity.as_ref())? {
-                let outcome = ExecutionOutcome::ConditionFalse;
-                self.observe(outcome);
-                executions.push(RuleExecution {
-                    rule_id: rule.id,
-                    outcome,
-                });
-                continue;
-            }
-            if rule.action.kind == SCRIPT_ACTION_KIND {
-                self.run_script_action(&rule, event, entity.as_ref())
-                    .await
-                    .inspect_err(|_| self.observe_action_failure())?;
-            } else {
-                let Some(action) = self.actions.get(&rule.action.kind) else {
-                    self.observe_action_failure();
-                    return Err(RuleError::UnknownAction(rule.action.kind.clone()));
-                };
-                let kind = rule.action.kind.clone();
-                let ctx = ActionContext {
-                    rule: rule.clone(),
-                    event: event.clone(),
-                    entity: entity.clone(),
-                    params: rule.action.params.clone(),
-                };
-                action.execute(ctx).await.map_err(|_| {
-                    self.observe_action_failure();
-                    RuleError::Action(kind)
-                })?;
-                self.rules.mark_executed(&rule.id, &event.event_id).await?;
-            }
-            let outcome = ExecutionOutcome::Executed;
-            self.observe(outcome);
-            executions.push(RuleExecution {
-                rule_id: rule.id,
-                outcome,
-            });
         }
-        Ok(executions)
+        pass
+    }
+
+    /// Runs one rule for one event.
+    ///
+    /// The rule-store marker stops a duplicate run.
+    /// A failed rule writes no marker.
+    async fn run_one_rule(
+        &self,
+        rule: &Rule,
+        event: &EntityEvent,
+        entity: Option<&Entity>,
+    ) -> Result<ExecutionOutcome, RuleError> {
+        if self.rules.is_executed(&rule.id, &event.event_id).await? {
+            return Ok(ExecutionOutcome::AlreadyExecuted);
+        }
+        if !self.eval_condition(&rule.condition, event, entity)? {
+            return Ok(ExecutionOutcome::ConditionFalse);
+        }
+        if rule.action.kind == SCRIPT_ACTION_KIND {
+            self.run_script_action(rule, event, entity)
+                .await
+                .inspect_err(|_| self.observe_action_failure())?;
+        } else {
+            let Some(action) = self.actions.get(&rule.action.kind) else {
+                self.observe_action_failure();
+                return Err(RuleError::UnknownAction(rule.action.kind.clone()));
+            };
+            let kind = rule.action.kind.clone();
+            let ctx = ActionContext {
+                rule: rule.clone(),
+                event: event.clone(),
+                entity: entity.cloned(),
+                params: rule.action.params.clone(),
+            };
+            action.execute(ctx).await.map_err(|_| {
+                self.observe_action_failure();
+                RuleError::Action(kind)
+            })?;
+            self.rules.mark_executed(&rule.id, &event.event_id).await?;
+        }
+        Ok(ExecutionOutcome::Executed)
     }
 
     /// Evaluates one condition tree, including every nested script.
@@ -564,18 +616,20 @@ impl RuleEngine {
     /// count.
     /// The limit is `MAX_ENTRY_ATTEMPTS`: 5 in a normal build and 2 in a test
     /// build.
+    /// A rule failure does not stop the later rules in the same entry.
     /// Below the limit, the call writes the last successful sequence and
-    /// returns the error.
+    /// returns the first rule error.
     /// The cursor stays before the failed entry.
     /// The failed entry and the entries after it replay on the next run.
     /// The runtime supervisor restarts a failed run after a backoff delay.
     /// The delay starts at one second and doubles up to 60 seconds.
     /// The retried batch starts at the entry that failed.
     ///
-    /// At the limit, the call writes one dead-letter row
-    /// `rule-dead:{seq}:{event_id}`.
-    /// The row holds the sequence, the event id, the attempt count, the
-    /// sanitized error text, and the Unix time.
+    /// At the limit, the call writes one dead-letter row for each failed rule
+    /// in `rule-dead:{seq}:{event_id}:{rule_id}`.
+    /// Each row holds the sequence, the event id, the rule id, the attempt
+    /// count, the sanitized error text, and the Unix time.
+    /// An entry-level error writes one row with an empty rule id.
     /// The call then deletes the attempt row, writes the cursor at the failed
     /// sequence, resets the pending count, and continues with the next entry.
     /// A later entry can therefore make progress.
@@ -622,11 +676,58 @@ impl RuleEngine {
                 let entries = wal.range(cursor + 1, end).await.map_err(map_wal_error)?;
                 for entry in entries {
                     if let WalOp::Entity { event } = &entry.op {
-                        match self.process(event).await {
-                            Ok(_) => {
+                        match self.process_pass(event).await {
+                            Ok(pass) if pass.failures.is_empty() => {
                                 self.rules
                                     .clear_entry_attempts(entry.seq, &event.event_id)
                                     .await?;
+                            }
+                            Ok(pass) => {
+                                let attempts = self
+                                    .rules
+                                    .increment_entry_attempts(entry.seq, &event.event_id)
+                                    .await?;
+                                if attempts < MAX_ENTRY_ATTEMPTS {
+                                    // Do not move the cursor past the failed
+                                    // entry. Write the last successful
+                                    // sequence, so the next run starts at the
+                                    // failed entry.
+                                    if pending > 0 {
+                                        self.rules.set_cursor(cursor).await?;
+                                    }
+                                    let Some(failure) = pass.failures.into_iter().next() else {
+                                        return Err(RuleError::Invalid(
+                                            "rule pass holds no failure".to_string(),
+                                        ));
+                                    };
+                                    return Err(failure.error);
+                                }
+                                for failure in pass.failures {
+                                    let dead = RuleDeadLetter {
+                                        seq: entry.seq,
+                                        event_id: event.event_id.clone(),
+                                        rule_id: failure.rule_id,
+                                        attempts,
+                                        error: failure.error.to_string(),
+                                        at: chrono::Utc::now().timestamp(),
+                                    };
+                                    self.rules.write_dead_letter(&dead).await?;
+                                }
+                                self.rules
+                                    .clear_entry_attempts(entry.seq, &event.event_id)
+                                    .await?;
+                                // The entry is failed by policy. Move the
+                                // cursor past it, so later entries can run.
+                                self.rules.set_cursor(entry.seq).await?;
+                                tracing::warn!(
+                                    seq = entry.seq,
+                                    event_id = %event.event_id,
+                                    attempts,
+                                    "rule entry dead-lettered after the attempt limit"
+                                );
+                                cursor = entry.seq;
+                                pending = 0;
+                                continue;
                             }
                             Err(error) => {
                                 let attempts = self
@@ -646,6 +747,7 @@ impl RuleEngine {
                                 let dead = RuleDeadLetter {
                                     seq: entry.seq,
                                     event_id: event.event_id.clone(),
+                                    rule_id: String::new(),
                                     attempts,
                                     error: error.to_string(),
                                     at: chrono::Utc::now().timestamp(),
@@ -1563,6 +1665,70 @@ mod tests {
         assert_eq!(retry[0].outcome, ExecutionOutcome::Executed);
         assert!(stores.rules.is_executed("alpha", "evt-1").await.unwrap());
         assert_eq!(recorder.records().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_poison_rule_does_not_stop_a_later_rule() {
+        let stores = stores().await;
+        let poison = Arc::new(RecordingAction::new("poison"));
+        poison.set_failing(true);
+        let good = Arc::new(RecordingAction::new("record"));
+        let engine = engine(&stores, vec![poison.clone(), good.clone()]);
+        make_entity(&stores.entities).await;
+        let mut bad = draft("bad", "poison");
+        bad.priority = 10;
+        let mut later = draft("later", "record");
+        later.priority = 1;
+        stores.rules.upsert(bad).await.unwrap();
+        stores.rules.upsert(later).await.unwrap();
+
+        let result = engine.process(&event(EntityEventKind::Created)).await;
+
+        assert!(matches!(
+            result,
+            Err(RuleError::Action(kind)) if kind == "poison"
+        ));
+        assert_eq!(good.records().len(), 1);
+        assert!(stores.rules.is_executed("later", "evt-1").await.unwrap());
+        assert!(!stores.rules.is_executed("bad", "evt-1").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_poison_rule_dead_letters_and_a_later_rule_keeps_its_progress() {
+        let stores = stores().await;
+        let poison = Arc::new(RecordingAction::new("poison"));
+        poison.set_failing(true);
+        let good = Arc::new(RecordingAction::new("record"));
+        let engine = engine(&stores, vec![poison.clone(), good.clone()]);
+        make_entity(&stores.entities).await;
+        let mut bad = draft("bad", "poison");
+        bad.priority = 10;
+        let mut later = draft("later", "record");
+        later.priority = 1;
+        stores.rules.upsert(bad).await.unwrap();
+        stores.rules.upsert(later).await.unwrap();
+        let wal = test_wal().await;
+        wal.append(WalOp::Entity { event: event_at(1) })
+            .await
+            .unwrap();
+
+        for _ in 1..MAX_ENTRY_ATTEMPTS {
+            assert!(run_once(&engine, &wal).await.is_err());
+            assert!(stores.rules.is_executed("later", "evt-1").await.unwrap());
+            assert!(stores.rules.dead_letters().await.unwrap().is_empty());
+        }
+        run_to_cursor(&engine, &wal, &stores.rules, 1).await;
+
+        assert_eq!(stores.rules.cursor().await.unwrap(), 1);
+        assert_eq!(stores.rules.entry_attempts(1, "evt-1").await.unwrap(), 0);
+        let dead = stores.rules.dead_letters().await.unwrap();
+        assert_eq!(dead.len(), 1);
+        assert_eq!(dead[0].seq, 1);
+        assert_eq!(dead[0].event_id, "evt-1");
+        assert_eq!(dead[0].rule_id, "bad");
+        assert_eq!(dead[0].attempts, MAX_ENTRY_ATTEMPTS);
+        assert_eq!(dead[0].error, "rule action failed: poison");
+        assert_eq!(good.records().len(), 1);
     }
 
     #[tokio::test]
