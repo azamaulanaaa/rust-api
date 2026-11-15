@@ -453,6 +453,66 @@ pub struct MigrationReport {
     pub next: Option<String>,
 }
 
+/// One entity that pins a schema version that the store does not hold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MissingSchemaIssue {
+    /// The entity id.
+    pub entity_id: String,
+    /// The schema id.
+    pub schema_id: String,
+    /// The missing version.
+    pub version: u64,
+}
+
+/// One entity reference that names no stored entity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DanglingRefIssue {
+    /// The entity that holds the reference.
+    pub entity_id: String,
+    /// The attribute name.
+    pub attribute: String,
+    /// The target entity id.
+    pub target: String,
+}
+
+/// One unique claim that is missing, stale, or shared.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UniqueClaimIssue {
+    /// The attribute name.
+    pub attribute: String,
+    /// A short description of the problem.
+    pub detail: String,
+}
+
+/// The result of one index validation pass.
+///
+/// An empty issue list means that the entity index is consistent.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IndexValidationReport {
+    /// The number of stored entities that the pass read.
+    pub entities: usize,
+    /// The number of unique claims that the pass expected.
+    pub unique_claims: usize,
+    /// The entities that pin a schema version that is absent.
+    pub missing_schemas: Vec<MissingSchemaIssue>,
+    /// The references that name no stored entity.
+    pub dangling_refs: Vec<DanglingRefIssue>,
+    /// The unique claims that fail the check.
+    pub unique_claim_issues: Vec<UniqueClaimIssue>,
+    /// The entities whose pinned schemas conflict.
+    pub schema_conflicts: Vec<String>,
+}
+
+impl IndexValidationReport {
+    /// Returns true when the pass found no problem.
+    pub fn is_ok(&self) -> bool {
+        self.missing_schemas.is_empty()
+            && self.dangling_refs.is_empty()
+            && self.unique_claim_issues.is_empty()
+            && self.schema_conflicts.is_empty()
+    }
+}
+
 /// The counts from one index rebuild.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RebuildReport {
@@ -3652,6 +3712,167 @@ impl EntityStore {
         g.delete(REBUILD_CURSOR_KEY)
             .await
             .map_err(EntityError::Store)?;
+        Ok(report)
+    }
+
+    /// Checks the pinned schemas, the unique claims, and the references.
+    ///
+    /// The call reads every stored entity.
+    /// It reports a pinned schema version that is absent.
+    /// It reports a reference that names no stored entity.
+    /// It reports a unique claim that is missing, stale, or shared.
+    /// It writes no key.
+    pub(crate) async fn validate_indexes(&self) -> Result<IndexValidationReport, EntityError> {
+        let mut report = IndexValidationReport::default();
+        let g = self.store.read().await;
+        let keys = scan_keys_prefix(&*g, ENTITY_PREFIX).await?;
+        let mut expected: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
+
+        for key in keys {
+            let Some(rest) = key.strip_prefix(ENTITY_PREFIX) else {
+                continue;
+            };
+            let Some(id) = rest.strip_suffix(META_SUFFIX) else {
+                continue;
+            };
+            if id.is_empty() || id.contains(':') {
+                continue;
+            }
+            let Some(entity) = load_entity(&*g, id).await? else {
+                continue;
+            };
+            report.entities += 1;
+
+            let mut effective = Vec::new();
+            let mut missing = false;
+            for schema in &entity.schemas {
+                match self
+                    .schemas
+                    .effective(&schema.id, schema.version)
+                    .await
+                    .map_err(map_schema_error)?
+                {
+                    Some(flat) => effective.push(flat),
+                    None => {
+                        report.missing_schemas.push(MissingSchemaIssue {
+                            entity_id: entity.id.clone(),
+                            schema_id: schema.id.clone(),
+                            version: schema.version,
+                        });
+                        missing = true;
+                    }
+                }
+            }
+            if missing {
+                continue;
+            }
+            let merged = match merge_schemas(&effective) {
+                Ok(merged) => merged,
+                Err(error) => {
+                    report
+                        .schema_conflicts
+                        .push(format!("{}: {error}", entity.id));
+                    continue;
+                }
+            };
+
+            for (name, value) in &entity.attributes {
+                match value {
+                    AttributeValue::EntityRef(target) if target != &entity.id => {
+                        let exists = g
+                            .get_bytes(&meta_key(target))
+                            .await
+                            .map_err(EntityError::Store)?
+                            .is_some();
+                        if !exists {
+                            report.dangling_refs.push(DanglingRefIssue {
+                                entity_id: entity.id.clone(),
+                                attribute: name.clone(),
+                                target: target.clone(),
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+                if merged
+                    .attributes
+                    .get(name)
+                    .is_some_and(|attribute| attribute.unique)
+                {
+                    let hash = value_hash(value)?;
+                    expected
+                        .entry((name.clone(), hash))
+                        .or_default()
+                        .insert(entity.id.clone());
+                }
+            }
+        }
+
+        for ((name, hash), owners) in &expected {
+            report.unique_claims += 1;
+            let claim = unique_claim_key(name, hash);
+            if owners.len() > 1 {
+                let mut ids: Vec<&str> = owners.iter().map(String::as_str).collect();
+                ids.sort_unstable();
+                report.unique_claim_issues.push(UniqueClaimIssue {
+                    attribute: name.clone(),
+                    detail: format!("value has more than one owner: {}", ids.join(", ")),
+                });
+            }
+            match g
+                .get_bytes(&claim)
+                .await
+                .map_err(EntityError::Store)?
+                .as_deref()
+                .and_then(claim_owner)
+            {
+                Some(owner) if owners.len() == 1 && owners.contains(owner) => {}
+                Some(owner) => report.unique_claim_issues.push(UniqueClaimIssue {
+                    attribute: name.clone(),
+                    detail: format!("claim names the wrong owner: {owner}"),
+                }),
+                None => report.unique_claim_issues.push(UniqueClaimIssue {
+                    attribute: name.clone(),
+                    detail: "claim is missing or has no owner".to_string(),
+                }),
+            }
+        }
+
+        for key in scan_keys_prefix(&*g, UNIQUE_CLAIM_PREFIX).await? {
+            let Some(rest) = key.strip_prefix(UNIQUE_CLAIM_PREFIX) else {
+                continue;
+            };
+            let parts: Vec<&str> = rest.split(':').collect();
+            if parts.len() != 2 {
+                continue;
+            }
+            let bytes = g.get_bytes(&key).await.map_err(EntityError::Store)?;
+            let Some(owner) = bytes.as_deref().and_then(claim_owner) else {
+                report.unique_claim_issues.push(UniqueClaimIssue {
+                    attribute: parts[0].to_string(),
+                    detail: "claim has no owner".to_string(),
+                });
+                continue;
+            };
+            let Some(entity) = load_entity(&*g, owner).await? else {
+                report.unique_claim_issues.push(UniqueClaimIssue {
+                    attribute: parts[0].to_string(),
+                    detail: format!("claim names a missing entity: {owner}"),
+                });
+                continue;
+            };
+            let holds = match entity.attributes.get(parts[0]) {
+                Some(value) => value_hash(value).ok().as_deref() == Some(parts[1]),
+                None => false,
+            };
+            if !holds {
+                report.unique_claim_issues.push(UniqueClaimIssue {
+                    attribute: parts[0].to_string(),
+                    detail: format!("entity {owner} does not hold the claimed value"),
+                });
+            }
+        }
+
         Ok(report)
     }
 }

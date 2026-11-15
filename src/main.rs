@@ -21,7 +21,12 @@ use clap::{Parser, Subcommand};
 use url::Url;
 
 use rust_api::{
-    eav::{entity::EntityStore, portable, route::EavApiModule, schema::SchemaRegistry},
+    eav::{
+        entity::EntityStore,
+        portable::{self, ValidationReport},
+        route::EavApiModule,
+        schema::SchemaRegistry,
+    },
     fs::{FsEngine, TokenKeys, route::FsApiModule, s3::S3ClientConfig, store::FsStore},
     http::{ApiService, middleware::jwt::Claims},
     oidc::{OidcClient, OidcConfig, route::OidcApiModule},
@@ -147,6 +152,13 @@ enum EavAction {
         /// Rebuild only the entities that pin this schema id.
         #[arg(long)]
         schema: Option<String>,
+    },
+    /// Checks the pinned schemas, the unique claims, and the references.
+    Validate {
+        /// Path of the TOML config file. It provides `[s3]` and
+        /// `[database].prefix`.
+        #[arg(short, long)]
+        config: PathBuf,
     },
 }
 
@@ -316,6 +328,7 @@ fn eav_action_name(action: &EavAction) -> &'static str {
         EavAction::Export { .. } => "eav export",
         EavAction::Import { .. } => "eav import",
         EavAction::RebuildIndex { .. } => "eav rebuild-index",
+        EavAction::Validate { .. } => "eav validate",
     }
 }
 
@@ -364,7 +377,8 @@ async fn run_eav_command(action: EavAction) -> anyhow::Result<()> {
     let config = match &action {
         EavAction::Export { config, .. }
         | EavAction::Import { config, .. }
-        | EavAction::RebuildIndex { config, .. } => config,
+        | EavAction::RebuildIndex { config, .. }
+        | EavAction::Validate { config } => config,
     };
     let cfg = config::Config::try_from(config.as_path())?;
     let s3_cfg = s3_client_config(&cfg);
@@ -416,6 +430,11 @@ async fn run_eav_action(
                 "imported {} schema records, {} entity records, and {} rule records into {db_prefix}",
                 report.schemas, report.entities, report.rules
             );
+            let validation = portable::validate(&schemas, &entities, &rules).await?;
+            print_validation_report(&validation);
+            if !validation.is_ok() {
+                anyhow::bail!("restore validation failed");
+            }
         }
         EavAction::RebuildIndex { schema, .. } => {
             let report = portable::rebuild_indexes(&entities, schema.as_deref()).await?;
@@ -429,8 +448,41 @@ async fn run_eav_action(
                 report.name_markers
             );
         }
+        EavAction::Validate { .. } => {
+            let report = portable::validate(&schemas, &entities, &rules).await?;
+            print_validation_report(&report);
+            if !report.is_ok() {
+                anyhow::bail!("restore validation failed");
+            }
+        }
     }
     Ok(())
+}
+
+/// Prints the counts and the problems of one restore check.
+fn print_validation_report(report: &ValidationReport) {
+    println!(
+        "checked {} schemas, {} entities, and {} rules",
+        report.schemas, report.entities, report.rules
+    );
+    for issue in &report.missing_schemas {
+        println!(
+            "entity {} pins missing schema {} version {}",
+            issue.entity_id, issue.schema_id, issue.version
+        );
+    }
+    for issue in &report.dangling_refs {
+        println!(
+            "entity {} attribute {} references missing entity {}",
+            issue.entity_id, issue.attribute, issue.target
+        );
+    }
+    for issue in &report.unique_claim_issues {
+        println!("unique attribute {}: {}", issue.attribute, issue.detail);
+    }
+    for issue in &report.schema_conflicts {
+        println!("schema conflict: {issue}");
+    }
 }
 
 /// Returns `true` when this instance can serve writes.
@@ -1254,6 +1306,37 @@ force_path_style = true
         };
         assert_eq!(policy_action_name(&export), "policy export");
         assert_eq!(policy_action_name(&import), "policy import");
+    }
+
+    /// The EAV commands name themselves and use the prefixes of the server.
+    ///
+    /// A wrong prefix opens an empty store.
+    /// The command then reports no data instead of an error.
+    #[test]
+    fn each_eav_subcommand_names_itself_and_uses_the_server_prefixes() {
+        let export = EavAction::Export {
+            config: PathBuf::from("c.toml"),
+            out: PathBuf::from("b.json"),
+        };
+        let import = EavAction::Import {
+            config: PathBuf::from("c.toml"),
+            input: PathBuf::from("b.json"),
+        };
+        let rebuild = EavAction::RebuildIndex {
+            config: PathBuf::from("c.toml"),
+            schema: Some("person".to_string()),
+        };
+        let validate = EavAction::Validate {
+            config: PathBuf::from("c.toml"),
+        };
+        assert_eq!(eav_action_name(&export), "eav export");
+        assert_eq!(eav_action_name(&import), "eav import");
+        assert_eq!(eav_action_name(&rebuild), "eav rebuild-index");
+        assert_eq!(eav_action_name(&validate), "eav validate");
+
+        assert_eq!(eav_domain_prefix("oxkv", "schema"), "oxkv/eav/schema");
+        assert_eq!(eav_domain_prefix("/oxkv/", "entity"), "oxkv/eav/entity");
+        assert_eq!(eav_domain_prefix("", "rules"), "eav/rules");
     }
 
     /// Each EAV command claims the lease before it opens a store.
