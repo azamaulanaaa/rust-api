@@ -767,10 +767,10 @@ fn lease_refused_message(purpose: &str, db_prefix: &str) -> String {
 /// A `ttl_secs` of `0` disables the lease. That is the documented way to
 /// run one node. The flag that the function returns then never gets set.
 ///
-/// `purpose` names the caller in the failure message. Both policy
-/// subcommands pass their own name. The text "another writer holds
-/// `oxkv`" is hard to read while a backup runs. It is also hard to read
-/// while the server serves traffic.
+/// `purpose` names the caller in the failure message. The policy
+/// subcommands and `eav reset-cursor` pass their own name. The text "another
+/// writer holds `oxkv`" is hard to read while a backup runs. It is also hard
+/// to read while the server serves traffic.
 async fn claim_writer_lease(
     s3_cfg: &S3ClientConfig,
     db_prefix: &str,
