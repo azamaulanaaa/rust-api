@@ -833,7 +833,7 @@ impl SnapshotManager {
             }
         }
         writer
-            .set_bytes(
+            .put_bytes(
                 APPLIED_KEY,
                 &serde_json::to_vec(&head).map_err(|e| FsError::Internal(e.to_string()))?,
             )

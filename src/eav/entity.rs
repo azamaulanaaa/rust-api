@@ -2088,7 +2088,7 @@ impl EntityStore {
                 .map_err(EntityError::Store)?
                 .is_none()
             {
-                g.set_bytes(&backfill_marker, b"")
+                g.put_bytes(&backfill_marker, b"")
                     .await
                     .map_err(EntityError::Store)?;
             }
@@ -2245,9 +2245,9 @@ impl EntityStore {
         if entity.attributes.get(key) != Some(&AttributeValue::Timestamp(due_at)) {
             return Ok(false);
         }
-        g.set_bytes(&timer_marker_key(entity_id, key, due_at), &bytes)
+        g.put_bytes(&timer_marker_key(entity_id, key, due_at), &bytes)
             .await
-            .map(|_| true)
+            .map(|()| true)
             .map_err(EntityError::Store)
     }
 
@@ -2411,7 +2411,7 @@ impl EntityStore {
             .map_err(EntityError::Store)?
             .is_none()
         {
-            g.set_bytes(&marker, b"")
+            g.put_bytes(&marker, b"")
                 .await
                 .map_err(EntityError::Store)?;
         }
@@ -2520,7 +2520,7 @@ impl EntityStore {
             .map_err(EntityError::Store)?
             .is_none()
         {
-            g.set_bytes(&marker, b"")
+            g.put_bytes(&marker, b"")
                 .await
                 .map_err(EntityError::Store)?;
         }

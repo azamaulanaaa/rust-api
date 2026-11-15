@@ -411,6 +411,9 @@ mod tests {
         ) -> Result<Option<Vec<u8>>, oxkv::StoreError> {
             self.0.set_bytes(key, value).await
         }
+        async fn put_bytes(&self, key: &str, value: &[u8]) -> Result<(), oxkv::StoreError> {
+            oxkv::GetSet::put_bytes(&self.0, key, value).await
+        }
         async fn gets_bytes(
             &self,
             limit: Option<usize>,

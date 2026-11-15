@@ -375,7 +375,7 @@ impl FsStore {
         let key = Self::session_key(&s.id);
         let val = serde_json::to_vec(s).map_err(|e| FsError::Internal(e.to_string()))?;
         let g = self.inner.write().await;
-        g.set_bytes(&key, &val)
+        g.put_bytes(&key, &val)
             .await
             .map_err(|e| self.store_err(e))?;
         Ok(())
@@ -445,7 +445,7 @@ impl FsStore {
         let key = Self::multipart_key(&m.upload_id);
         let val = serde_json::to_vec(m).map_err(|e| FsError::Internal(e.to_string()))?;
         let g = self.inner.write().await;
-        g.set_bytes(&key, &val)
+        g.put_bytes(&key, &val)
             .await
             .map_err(|e| self.store_err(e))?;
         Ok(())
@@ -476,7 +476,7 @@ impl FsStore {
     pub async fn save_staged_part(&self, id: &str, idx: u64, data: Vec<u8>) -> Result<(), FsError> {
         let key = Self::staged_key(id, idx);
         let g = self.inner.write().await;
-        g.set_bytes(&key, &data)
+        g.put_bytes(&key, &data)
             .await
             .map_err(|e| self.store_err(e))?;
         Ok(())
@@ -493,7 +493,7 @@ impl FsStore {
         let key = Self::file_key(&rec.id);
         let val = serde_json::to_vec(rec).map_err(|e| FsError::Internal(e.to_string()))?;
         let g = self.inner.write().await;
-        g.set_bytes(&key, &val)
+        g.put_bytes(&key, &val)
             .await
             .map_err(|e| self.store_err(e))?;
         Ok(())
