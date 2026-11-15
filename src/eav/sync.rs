@@ -79,6 +79,7 @@ use crate::eav::entity::Entity;
 use crate::eav::entity_error::EntityError;
 use crate::eav::route::{
     ENTITIES, ENTITY_ROW, EavApiError, PageMode, PageQuery, can_read_entity, page_next_offset,
+    visible_cursor_page,
 };
 use crate::eav::runtime::EavRuntime;
 use crate::fs::error::FsError;
@@ -179,7 +180,9 @@ pub struct SnapshotPage {
     /// The id to resume after for the next page.
     ///
     /// The value is `Some` only in cursor mode.
-    /// The value is `None` when the scan is exhausted.
+    /// The value is the id of the last visible entity.
+    /// The value never names an entity that the caller cannot read.
+    /// The value is `None` when the scan is exhausted or the scan budget ends.
     pub next: Option<String>,
     /// The head of the change log at the time of the call.
     ///
@@ -535,6 +538,10 @@ pub(crate) async fn events(
 /// `next_offset` comes from the raw page length.
 /// A filtered page can then hold fewer items than the limit.
 /// A cursor query uses the entity marker family and returns `next`.
+/// The route reads at most `CURSOR_SCAN_BATCH` raw pages for one cursor page.
+/// The `next` value is the id of the last visible entity.
+/// The value never names an entity that the caller cannot read.
+/// A scan that finds no visible entity returns `next: null`.
 /// The first request of a paging sequence omits `head`.
 /// The route then returns the current feed head.
 /// Each later request sends that head and gets the same head.
@@ -562,16 +569,17 @@ pub(crate) async fn snapshot(
 
     match mode {
         PageMode::Cursor(after) => {
-            let (raw, next) = runtime
-                .entities()
-                .list_after(limit, after.as_deref())
-                .await?;
-            let mut items = Vec::with_capacity(raw.len());
-            for entity in raw {
-                if can_read_entity(&policy, &claims.sub, &entity.id).await? {
-                    items.push(entity);
+            let (items, next) = visible_cursor_page(&policy, &claims.sub, limit, after, |cursor| {
+                let runtime = runtime.clone();
+                async move {
+                    runtime
+                        .entities()
+                        .list_after(limit, cursor.as_deref())
+                        .await
+                        .map_err(EavApiError::from)
                 }
-            }
+            })
+            .await?;
             Ok(HttpResponse::Ok().json(SnapshotPage {
                 items,
                 next_offset: None,
@@ -1721,6 +1729,74 @@ mod tests {
         }
 
         assert_eq!(ids, vec!["e1", "e2", "e3"]);
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn a_row_grant_snapshot_pages_every_visible_entity_once() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        publish_task_schema(&fx).await?;
+        for id in ["e1", "e2", "e3", "e4", "e5"] {
+            create_entity(&fx, id).await?;
+        }
+        for id in ["e2", "e4"] {
+            grant_row_read(&fx, "carol", id).await?;
+        }
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("carol")?;
+
+        let mut ids = Vec::new();
+        let mut after: Option<String> = Some(String::new());
+        loop {
+            let uri = match &after {
+                Some(cursor) => format!("/eav/sync/snapshot?limit=1&after={cursor}"),
+                None => "/eav/sync/snapshot?limit=1".to_string(),
+            };
+            let res = get_route!(&app, &uri, &token).await;
+            assert_eq!(res.status(), http::StatusCode::OK, "{uri}");
+            let body: Value = actix_test::read_body_json(res).await;
+            for item in body["items"].as_array().expect("items") {
+                ids.push(item["id"].as_str().expect("id").to_string());
+            }
+            let next = body["next"].as_str().map(str::to_string);
+            if let Some(cursor) = &next {
+                assert!(
+                    cursor == "e2" || cursor == "e4",
+                    "the cursor named an unreadable entity: {cursor}"
+                );
+            }
+            match next {
+                Some(cursor) => after = Some(cursor),
+                None => break,
+            }
+        }
+
+        assert_eq!(ids, ["e2", "e4"]);
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn a_no_grant_snapshot_cursor_returns_no_entity_id() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        publish_task_schema(&fx).await?;
+        for id in ["e1", "e2", "e3"] {
+            create_entity(&fx, id).await?;
+        }
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("bob")?;
+
+        for uri in [
+            "/eav/sync/snapshot?limit=1&after=",
+            "/eav/sync/snapshot?limit=1&after=e1",
+        ] {
+            let res = get_route!(&app, uri, &token).await;
+            assert_eq!(res.status(), http::StatusCode::OK, "{uri}");
+            let body: Value = actix_test::read_body_json(res).await;
+            assert_eq!(body["items"].as_array().map(Vec::len), Some(0), "{uri}");
+            assert!(body["next"].is_null(), "{uri} leaked a cursor");
+        }
         Ok(())
     }
 
