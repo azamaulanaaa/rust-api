@@ -955,6 +955,45 @@ mod tests {
         assert_eq!(found, expected);
     }
 
+    #[tokio::test]
+    async fn reserve_reads_every_page_and_keeps_priority_order() {
+        let q = queue().await;
+        let mut ids: Vec<Uuid> = (0..=QUEUE_SCAN_PAGE).map(|_| Uuid::now_v7()).collect();
+        ids.sort_unstable();
+        let high_id = *ids.last().expect("the test needs one job");
+        {
+            let g = q.store.write().await;
+            let tx = g.begin_tx().unwrap();
+            for id in &ids {
+                let mut row = job("work");
+                row.id = *id;
+                if *id == high_id {
+                    row.priority = 100;
+                }
+                let stored = StoredJob {
+                    job: row,
+                    status: JobStatus::Queued,
+                };
+                let value = serde_json::to_vec(&stored).unwrap();
+                tx.set_bytes(&DurableQueue::job_key(*id), &value)
+                    .await
+                    .unwrap();
+                tx.set_bytes(&DurableQueue::queued_key(*id), b"")
+                    .await
+                    .unwrap();
+            }
+            tx.commit().await.unwrap();
+        }
+
+        let leased = q.reserve("w1", 1, Duration::from_secs(30)).await.unwrap();
+
+        assert_eq!(leased.len(), 1);
+        assert_eq!(
+            leased[0].job.id, high_id,
+            "the highest priority job must win even when its key is on the last page"
+        );
+    }
+
     async fn put_job(q: &DurableQueue, job: Job, status: JobStatus) {
         use oxkv::{Store as _, Transaction as _};
         let id = job.id;
