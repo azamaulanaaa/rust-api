@@ -3284,6 +3284,158 @@ impl EntityStore {
         }
         Ok(facts)
     }
+
+    /// Returns true when the store holds no entity row.
+    ///
+    /// The call reads the first key of the `entity:` family.
+    /// It writes no key.
+    pub(crate) async fn is_empty(&self) -> Result<bool, EntityError> {
+        let g = self.store.read().await;
+        let rows = g
+            .gets_keys(
+                Some(1),
+                Direction::Next,
+                (
+                    Some(ENTITY_PREFIX.to_string()),
+                    KeyPrefix::new(ENTITY_PREFIX).upper_bound(),
+                ),
+            )
+            .await
+            .map_err(EntityError::Store)?;
+        Ok(rows.is_empty())
+    }
+
+    /// Imports exact entity records into an empty store.
+    ///
+    /// The call validates every entity before it writes any key.
+    /// It writes the metadata, attribute, and index rows of one entity in one
+    /// transaction.
+    /// It keeps the version and the timestamps of each record.
+    /// It writes no event and no outbox row.
+    /// A dangling reference is allowed, because a restore check reports it
+    /// later.
+    pub(crate) async fn import_entities(&self, entities: &[Entity]) -> Result<usize, EntityError> {
+        let mut seen_ids = BTreeSet::new();
+        let mut seen_unique: BTreeSet<(String, String)> = BTreeSet::new();
+
+        let all_keys: BTreeSet<String> = entities
+            .iter()
+            .flat_map(|entity| entity.attributes.keys().cloned())
+            .collect();
+        let facts = {
+            let g = self.store.read().await;
+            self.name_facts(&*g, &all_keys).await?
+        };
+
+        for entity in entities {
+            self.validate_import_entity(entity, &facts, &mut seen_ids, &mut seen_unique)
+                .await?;
+        }
+
+        for entity in entities {
+            let _write = self.write_lock.lock().await;
+            let g = self.store.write().await;
+            let effective = self.resolve_import_refs(entity).await?;
+            let merged = merge_schemas(&effective)?;
+            let tx = g.begin_tx().map_err(EntityError::Store)?;
+            let facts = self.name_facts(&tx, &name_keys(entity, None)).await?;
+            check_unique_values(&tx, entity, &merged.attributes, &facts).await?;
+            let meta = meta_key(&entity.id);
+            let bytes = meta_bytes(entity)?;
+            if tx
+                .get_bytes(&meta)
+                .await
+                .map_err(EntityError::Store)?
+                .is_some()
+            {
+                return Err(EntityError::AlreadyExists(entity.id.clone()));
+            }
+            tx.set_bytes(&meta, &bytes)
+                .await
+                .map_err(EntityError::Store)?;
+            let mut state = WriteState::default();
+            put_entity_rows_except_meta(&tx, entity, &merged, &facts, &mut state, None).await?;
+            tx.commit().await.map_err(EntityError::Store)?;
+        }
+        Ok(entities.len())
+    }
+
+    /// Checks one entity record before an import writes it.
+    async fn validate_import_entity(
+        &self,
+        entity: &Entity,
+        facts: &NameFacts,
+        seen_ids: &mut BTreeSet<String>,
+        seen_unique: &mut BTreeSet<(String, String)>,
+    ) -> Result<(), EntityError> {
+        validate_name("entity id", &entity.id)?;
+        if entity.version == 0 {
+            return Err(EntityError::Invalid(format!(
+                "entity {} has version 0",
+                entity.id
+            )));
+        }
+        if !seen_ids.insert(entity.id.clone()) {
+            return Err(EntityError::Invalid(format!(
+                "entity {} has two records",
+                entity.id
+            )));
+        }
+        let effective = self.resolve_import_refs(entity).await?;
+        let merged = merge_schemas(&effective)?;
+        check_known(&entity.attributes, &merged.attributes)?;
+        validate_defaults(&merged.attributes)?;
+        check_types(&entity.attributes, &merged.attributes)?;
+        check_required(&entity.attributes, &merged.attributes)?;
+        for (name, value) in &entity.attributes {
+            if let AttributeValue::EntityRef(target) = value {
+                validate_name("entity id", target)?;
+            }
+            let unique = facts.unique.contains(name)
+                || merged
+                    .attributes
+                    .get(name)
+                    .is_some_and(|attribute| attribute.unique);
+            if unique {
+                let hash = value_hash(value)?;
+                if !seen_unique.insert((name.clone(), hash)) {
+                    return Err(EntityError::UniqueViolation(name.clone()));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolves the pinned schema versions of one import record.
+    async fn resolve_import_refs(
+        &self,
+        entity: &Entity,
+    ) -> Result<Vec<EffectiveSchema>, EntityError> {
+        let mut seen = BTreeSet::new();
+        let mut effective = Vec::with_capacity(entity.schemas.len());
+        for schema in &entity.schemas {
+            validate_name("schema id", &schema.id)?;
+            if !seen.insert((schema.id.clone(), schema.version)) {
+                return Err(EntityError::Invalid(format!(
+                    "entity {} pins schema {} twice",
+                    entity.id, schema.id
+                )));
+            }
+            let Some(flat) = self
+                .schemas
+                .effective(&schema.id, schema.version)
+                .await
+                .map_err(map_schema_error)?
+            else {
+                return Err(EntityError::Invalid(format!(
+                    "entity {} pins a missing schema version: {}@{}",
+                    entity.id, schema.id, schema.version
+                )));
+            };
+            effective.push(flat);
+        }
+        Ok(effective)
+    }
 }
 
 /// Returns the schema ids that apply to one entity.
