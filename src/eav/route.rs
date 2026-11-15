@@ -37,6 +37,7 @@ use crate::http::{
         jwt::{Claims, JwtClaimsMiddleware, Validated},
         no_cache::NoCache,
     },
+    path_config, query_config,
 };
 use crate::policy::row::RowAuthorizer;
 use crate::policy::{Action, Authorizer, PolicyError};
@@ -103,6 +104,8 @@ impl ApiModule for EavApiModule {
         let scope = web::scope(EAV_PREFIX)
             .app_data(runtime)
             .app_data(policy)
+            .app_data(query_config())
+            .app_data(path_config())
             .wrap(jwt)
             .wrap(NoCache)
             .service(publish_schema)
@@ -2817,6 +2820,38 @@ mod tests {
             .await;
             assert_eq!(res.status(), http::StatusCode::BAD_REQUEST, "{uri}");
             let body: crate::http::error::ErrorBody = actix_test::read_body_json(res).await;
+            assert_eq!(body.code.as_deref(), Some("invalid_request"), "{uri}");
+        }
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn malformed_query_and_path_values_answer_inside_the_envelope() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("bob")?;
+
+        for uri in [
+            "/eav/entities?limit=abc",
+            "/eav/sync/replica?chunk=x",
+            "/eav/schemas/invoice/versions/x",
+        ] {
+            let res = actix_test::call_service(
+                &app,
+                auth(actix_test::TestRequest::get().uri(uri), &token).to_request(),
+            )
+            .await;
+            assert_eq!(res.status(), http::StatusCode::BAD_REQUEST, "{uri}");
+            assert_eq!(
+                res.headers()
+                    .get(http::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok()),
+                Some("application/json"),
+                "{uri}"
+            );
+            let body: crate::http::error::ErrorBody = actix_test::read_body_json(res).await;
+            assert_eq!(body.error, "bad request", "{uri}");
             assert_eq!(body.code.as_deref(), Some("invalid_request"), "{uri}");
         }
         Ok(())
