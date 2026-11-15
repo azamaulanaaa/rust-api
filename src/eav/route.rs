@@ -9,6 +9,11 @@
 //!
 //! The module adds no actions and no business rules.
 //! It exposes only the stores that the runtime already owns.
+//!
+//! Every response on the scope sets `Cache-Control: no-store` and
+//! `Pragma: no-cache`.
+//! A cookie-authenticated request must not share a stored response.
+//! A shared proxy could otherwise serve one user's page to another user.
 
 // The route macros generate route-builder structs without doc comments.
 #![allow(missing_docs)]
@@ -28,7 +33,10 @@ use crate::eav::schema::{SchemaDef, SchemaDraft};
 use crate::http::{
     ApiModule,
     error::ApiError,
-    middleware::jwt::{Claims, JwtClaimsMiddleware, Validated},
+    middleware::{
+        jwt::{Claims, JwtClaimsMiddleware, Validated},
+        no_cache::NoCache,
+    },
 };
 use crate::policy::row::RowAuthorizer;
 use crate::policy::{Action, Authorizer, PolicyError};
@@ -102,6 +110,7 @@ impl ApiModule for EavApiModule {
             .app_data(runtime)
             .app_data(policy)
             .wrap(jwt)
+            .wrap(NoCache)
             .service(publish_schema)
             .service(list_schemas)
             .service(get_schema)

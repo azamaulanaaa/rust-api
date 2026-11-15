@@ -1888,6 +1888,41 @@ mod tests {
     }
 
     #[actix_web::test]
+    async fn an_eav_response_forbids_a_shared_cache() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        publish_task_schema(&fx).await?;
+        create_entity(&fx, "e1").await?;
+        grant_collection_read(&fx, "alice").await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+
+        let res = post_replica!(&app, &token).await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+
+        for res in [
+            get_route!(&app, "/eav/sync/snapshot", &token).await,
+            get_route!(&app, "/eav/sync/replica", &token).await,
+        ] {
+            assert_eq!(res.status(), http::StatusCode::OK);
+            assert_eq!(
+                res.headers()
+                    .get("cache-control")
+                    .and_then(|value| value.to_str().ok()),
+                Some("no-store"),
+                "a shared cache must not store an EAV response"
+            );
+            assert_eq!(
+                res.headers()
+                    .get("pragma")
+                    .and_then(|value| value.to_str().ok()),
+                Some("no-cache")
+            );
+        }
+        Ok(())
+    }
+
+    #[actix_web::test]
     async fn a_replica_build_stores_the_visible_entity_list() -> anyhow::Result<()> {
         let fx = fixture().await?;
         publish_task_schema(&fx).await?;
