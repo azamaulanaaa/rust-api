@@ -672,9 +672,10 @@ impl From<RuleError> for EavApiError {
     fn from(error: RuleError) -> Self {
         let kind = match &error {
             RuleError::NotFound(_) => Kind::NotFound,
-            RuleError::Invalid(_) | RuleError::ConditionDepth | RuleError::UnknownAction(_) => {
-                Kind::Invalid
-            }
+            RuleError::Invalid(_)
+            | RuleError::ConditionDepth
+            | RuleError::UnsupportedTrigger(_)
+            | RuleError::UnknownAction(_) => Kind::Invalid,
             RuleError::Store(_)
             | RuleError::Serialization(_)
             | RuleError::Action(_)
@@ -1717,6 +1718,11 @@ mod tests {
             ),
             (
                 EavApiError::from(RuleError::ConditionDepth),
+                400,
+                "invalid_request",
+            ),
+            (
+                EavApiError::from(RuleError::UnsupportedTrigger("schema_removed".into())),
                 400,
                 "invalid_request",
             ),

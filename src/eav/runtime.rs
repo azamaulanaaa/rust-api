@@ -440,18 +440,19 @@ impl EavRuntime {
     ///
     /// The call reads every time index key.
     /// For each key it reads at most `limit` due entities.
-    /// The call emits the timer event first.
-    /// It then retires the time index row and writes the fired marker in one
-    /// transaction.
-    /// A retire that returns `false` means the value changed after the read,
-    /// and the call does not count the timer as emitted.
+    /// The call writes the fired marker, removes the time row, and writes the
+    /// timer event to the outbox in one transaction.
+    /// It increments the pending outbox counter in that transaction.
+    /// The outbox relay then delivers the event in feed order.
+    /// A value that changed after the read returns no event, and the call
+    /// does not count the timer as emitted.
     /// When a fired marker already exists for a due value, the call retires
     /// the row without an event.
     /// That drain removes rows that fired before retirement existed, so an
     /// upgraded store recovers.
-    /// A failed retire returns the error.
+    /// A failed transaction returns the error and writes no row.
     /// The next pass then emits the same event again.
-    /// The event is already written, and a duplicate event is idempotent.
+    /// The event id is stable, and a duplicate event is idempotent.
     /// The rule engine execution marker stops a duplicate action.
     pub async fn fire_due_timers(&self, now: i64, limit: usize) -> anyhow::Result<usize> {
         let mut emitted = 0;
@@ -487,18 +488,14 @@ impl EavRuntime {
                         .context("retire the EAV timer row")?;
                     continue;
                 }
-                self.entities
+                let event = self
+                    .entities
                     .emit_timer(&entity, &key, due_at, now)
                     .await
                     .context("emit an EAV timer event")?;
-                let retired = self
-                    .entities
-                    .retire_timer(&entity.id, &key, due_at)
-                    .await
-                    .context("retire the EAV timer row")?;
-                // A false result means the value changed after the read.
-                // The event stays idempotent, and the next pass reads the new value.
-                emitted += usize::from(retired);
+                // A missing event means the value changed after the read.
+                // The next pass reads the new value.
+                emitted += usize::from(event.is_some());
             }
         }
         self.metrics.record_timer_due(due_count);
@@ -1067,7 +1064,7 @@ mod tests {
     /// A [`ChangeSink`] that accepts timer events and refuses other events.
     ///
     /// The outbox relay fails on the created entity event.
-    /// The timer pass can still append its event to the shared feed.
+    /// The timer event then waits in the outbox behind that row.
     struct TimerOnlyFeed {
         wal: Wal,
     }
@@ -1113,7 +1110,8 @@ mod tests {
     /// The entity store uses a feed that accepts timer events and refuses
     /// other events.
     /// The created entity leaves an outbox row, so the relay fails.
-    /// The timer pass can still append its event to the runtime WAL.
+    /// The timer pass writes its event to the same outbox but cannot deliver
+    /// it before the earlier entity row.
     async fn runtime_with_a_timer_only_feed() -> EavRuntime {
         let mut runtime = build_runtime(Vec::new()).await;
         let s3 = memory_s3();
@@ -1162,6 +1160,7 @@ mod tests {
     ///
     /// The create commits the outbox row and then reports the delivery
     /// error, so the row stays for the relay to find.
+    /// The entity store has the `invoice` schema and the `timer` schema.
     async fn runtime_with_a_flaky_outbox(failures: usize) -> (EavRuntime, Arc<AtomicUsize>) {
         let mut runtime = build_runtime(Vec::new()).await;
         let s3 = memory_s3();
@@ -1182,6 +1181,7 @@ mod tests {
         });
         let entities = EntityStore::new(store, schemas.clone()).with_change_sink(feed);
         schemas.publish(schema()).await.unwrap();
+        schemas.publish(timer_schema()).await.unwrap();
         runtime.entities = entities;
         (runtime, failed_appends)
     }
@@ -1474,7 +1474,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_failed_outbox_loop_does_not_stop_the_timer_loop() {
+    async fn a_failed_outbox_loop_keeps_the_timer_event_pending() {
         let runtime = runtime_with_a_timer_only_feed().await;
         assert!(!runtime.failed());
 
@@ -1484,7 +1484,7 @@ mod tests {
             .create(entity(), &WriteContext::new("tester"))
             .await
             .unwrap();
-        // The due timer entity makes the timer pass emit one event.
+        // The due timer entity writes its event to the outbox.
         let now = chrono::Utc::now().timestamp();
         runtime
             .entities()
@@ -1504,12 +1504,23 @@ mod tests {
         .expect("the outbox failure must set the loop flag");
 
         tokio::time::timeout(Duration::from_secs(2), async {
-            while runtime.wal().head().await.unwrap() == 0 {
+            while runtime.entities().outbox_count().await.unwrap() < 3 {
                 tokio::time::sleep(Duration::from_millis(2)).await;
             }
         })
         .await
-        .expect("the timer loop must still emit after the outbox failure");
+        .expect("the timer event must wait in the outbox");
+
+        // The timer event does not overtake the two pending entity events.
+        assert_eq!(runtime.wal().head().await.unwrap(), 0);
+        assert!(
+            runtime
+                .entities()
+                .is_timer_fired("t1", "due", now - 10)
+                .await
+                .unwrap(),
+            "the timer row must be retired"
+        );
 
         cancel.store(true, Ordering::SeqCst);
         tokio::time::timeout(Duration::from_secs(2), handle)
@@ -1654,6 +1665,52 @@ mod tests {
         assert_eq!(runtime.fire_due_timers(100, 100).await.unwrap(), 1);
         assert_eq!(runtime.fire_due_timers(100, 100).await.unwrap(), 0);
         assert_eq!(runtime.wal().head().await.unwrap(), 2);
+    }
+
+    /// A due timer waits behind an earlier pending entity event.
+    ///
+    /// The feed refuses the create append, so the entity event stays in the
+    /// outbox.
+    /// The timer pass writes its event to the same outbox.
+    /// The next flush delivers the entity event first and the timer event
+    /// second.
+    #[tokio::test]
+    async fn a_pending_entity_event_reaches_the_feed_before_a_due_timer() {
+        let (runtime, failed) = runtime_with_a_flaky_outbox(1).await;
+        let now = chrono::Utc::now().timestamp();
+        runtime
+            .entities()
+            .create(timer_entity("t1", now - 10), &WriteContext::new("tester"))
+            .await
+            .unwrap();
+
+        assert_eq!(failed.load(Ordering::SeqCst), 1);
+        assert_eq!(runtime.entities().outbox_count().await.unwrap(), 1);
+        assert_eq!(runtime.wal().head().await.unwrap(), 0);
+
+        assert_eq!(runtime.fire_due_timers(now, 100).await.unwrap(), 1);
+
+        assert_eq!(runtime.entities().outbox_count().await.unwrap(), 0);
+        let head = runtime.wal().head().await.unwrap();
+        let delivered: Vec<(String, EntityEventKind)> = runtime
+            .wal()
+            .range(1, head)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|entry| match entry.op {
+                WalOp::Entity { event } => Some((event.entity_id, event.kind)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            delivered,
+            vec![
+                ("t1".to_string(), EntityEventKind::Created),
+                ("t1".to_string(), EntityEventKind::Timer),
+            ],
+            "the entity event must reach the feed first"
+        );
     }
 
     #[tokio::test]
