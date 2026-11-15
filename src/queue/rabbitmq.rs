@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
-use super::{Job, JobId, JobStatus, LeasedJob, QueueError, RetryPolicy};
+use super::{Job, JobId, JobStatus, LeaseToken, LeasedJob, QueueError, RetryPolicy};
 
 /// RabbitMQ-backed queue.
 ///
@@ -46,7 +46,12 @@ impl super::JobQueue for RabbitMqQueue {
         ))
     }
 
-    async fn ack(&self, _job_id: JobId, _result: Option<Vec<u8>>) -> Result<(), QueueError> {
+    async fn ack(
+        &self,
+        _job_id: JobId,
+        _lease: &LeaseToken,
+        _result: Option<Vec<u8>>,
+    ) -> Result<(), QueueError> {
         Err(QueueError::Unsupported(
             "rabbitmq backend is not wired".to_string(),
         ))
@@ -55,6 +60,7 @@ impl super::JobQueue for RabbitMqQueue {
     async fn nack(
         &self,
         _job_id: JobId,
+        _lease: &LeaseToken,
         _error: &str,
         _retry: RetryPolicy,
     ) -> Result<(), QueueError> {
@@ -63,7 +69,12 @@ impl super::JobQueue for RabbitMqQueue {
         ))
     }
 
-    async fn extend_lease(&self, _job_id: JobId, _lease: Duration) -> Result<(), QueueError> {
+    async fn extend_lease(
+        &self,
+        _job_id: JobId,
+        _lease: &LeaseToken,
+        _extend: Duration,
+    ) -> Result<(), QueueError> {
         Err(QueueError::Unsupported(
             "rabbitmq backend is not wired".to_string(),
         ))

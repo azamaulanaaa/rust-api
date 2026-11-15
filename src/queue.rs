@@ -45,13 +45,26 @@ pub struct Job {
     pub headers: BTreeMap<String, String>,
 }
 
+/// Proof that a worker holds a lease on a job.
+///
+/// A queue operation that changes a leased job must carry the token that
+/// [`JobQueue::reserve`] returned. The backend rejects the call when the
+/// token does not match the current lease.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeaseToken {
+    /// Worker that holds the lease.
+    pub worker: String,
+    /// Lease expiry time, in unix seconds.
+    pub expires_at: i64,
+}
+
 /// A job that a worker has leased.
 #[derive(Debug, Clone)]
 pub struct LeasedJob {
     /// The leased job.
     pub job: Job,
-    /// Time at which the lease expires, in unix seconds.
-    pub lease_expires_at: i64,
+    /// Proof of the current lease.
+    pub lease: LeaseToken,
 }
 
 /// Status of a job in the queue.
@@ -145,13 +158,41 @@ pub trait JobQueue: Send + Sync {
     ) -> Result<Vec<LeasedJob>, QueueError>;
 
     /// Marks a job as done.
-    async fn ack(&self, job_id: JobId, result: Option<Vec<u8>>) -> Result<(), QueueError>;
+    ///
+    /// The call fails with [`QueueError::LeaseExpired`] or
+    /// [`QueueError::AlreadyLeased`] when `lease` is not the current token.
+    /// A failed call does not change the job.
+    async fn ack(
+        &self,
+        job_id: JobId,
+        lease: &LeaseToken,
+        result: Option<Vec<u8>>,
+    ) -> Result<(), QueueError>;
 
     /// Marks a job as failed.
-    async fn nack(&self, job_id: JobId, error: &str, retry: RetryPolicy) -> Result<(), QueueError>;
+    ///
+    /// The call fails with [`QueueError::LeaseExpired`] or
+    /// [`QueueError::AlreadyLeased`] when `lease` is not the current token.
+    /// A failed call does not change the job.
+    async fn nack(
+        &self,
+        job_id: JobId,
+        lease: &LeaseToken,
+        error: &str,
+        retry: RetryPolicy,
+    ) -> Result<(), QueueError>;
 
     /// Extends the lease of a job.
-    async fn extend_lease(&self, job_id: JobId, lease: Duration) -> Result<(), QueueError>;
+    ///
+    /// The call fails with [`QueueError::LeaseExpired`] or
+    /// [`QueueError::AlreadyLeased`] when `lease` is not the current token.
+    /// A failed call does not change the job.
+    async fn extend_lease(
+        &self,
+        job_id: JobId,
+        lease: &LeaseToken,
+        extend: Duration,
+    ) -> Result<(), QueueError>;
 
     /// Returns the status of a job.
     async fn status(&self, job_id: JobId) -> Result<JobStatus, QueueError>;
