@@ -74,7 +74,7 @@ impl super::JobQueue for RabbitMqQueue {
         _job_id: JobId,
         _lease: &LeaseToken,
         _extend: Duration,
-    ) -> Result<(), QueueError> {
+    ) -> Result<LeaseToken, QueueError> {
         Err(QueueError::Unsupported(
             "rabbitmq backend is not wired".to_string(),
         ))

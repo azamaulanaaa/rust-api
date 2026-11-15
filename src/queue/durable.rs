@@ -77,6 +77,11 @@ struct StoredJob {
     job: Job,
     /// Current status.
     status: JobStatus,
+    /// Generation of the current or last lease. The backend increments the
+    /// value on each reserve and each extension. An old token has a lower
+    /// value. Rows written before this field existed decode with `0`.
+    #[serde(default)]
+    lease_generation: u64,
 }
 
 /// Durable job queue backed by OxKV.
@@ -164,12 +169,13 @@ impl DurableQueue {
     /// Checks a lease token against the stored status.
     ///
     /// The function returns [`QueueError::AlreadyLeased`] when another worker
-    /// holds the job. It returns [`QueueError::LeaseExpired`] when the lease
-    /// is gone or its time has passed.
+    /// holds the job or the token has an old generation. It returns
+    /// [`QueueError::LeaseExpired`] when the lease is gone or its time has
+    /// passed.
     fn check_lease(sj: &StoredJob, lease: &LeaseToken) -> Result<(), QueueError> {
         match &sj.status {
             JobStatus::Leased { worker, expires_at } => {
-                if worker != &lease.worker || *expires_at != lease.expires_at {
+                if worker != &lease.worker || sj.lease_generation != lease.generation {
                     Err(QueueError::AlreadyLeased)
                 } else if *expires_at <= Self::now() {
                     Err(QueueError::LeaseExpired)
@@ -186,12 +192,13 @@ impl DurableQueue {
     /// The function reads the job row, checks the lease token, applies
     /// `update`, and writes the row and its status marker in one transaction.
     /// A token that does not match returns an error and changes nothing.
+    /// The function returns the updated row.
     async fn transition<F>(
         &self,
         job_id: JobId,
         lease: &LeaseToken,
         update: F,
-    ) -> Result<JobStatus, QueueError>
+    ) -> Result<StoredJob, QueueError>
     where
         F: FnOnce(&mut StoredJob),
     {
@@ -233,7 +240,7 @@ impl DurableQueue {
             Err(error) => return Err(QueueError::Store(error.to_string())),
         }
         drop(g);
-        Ok(sj.status)
+        Ok(sj)
     }
 
     /// Lists the job ids under one marker prefix.
@@ -532,6 +539,7 @@ impl super::JobQueue for DurableQueue {
         let sj = StoredJob {
             job: job.clone(),
             status: JobStatus::Queued,
+            lease_generation: 0,
         };
         let val = serde_json::to_vec(&sj).map_err(|e| QueueError::Store(e.to_string()))?;
         let g = self.store.write().await;
@@ -653,6 +661,8 @@ impl super::JobQueue for DurableQueue {
                 let _ = tx.rollback().await;
                 continue;
             }
+            sj.lease_generation = sj.lease_generation.saturating_add(1);
+            let generation = sj.lease_generation;
             sj.status = JobStatus::Leased {
                 worker: worker.to_string(),
                 expires_at: expiry,
@@ -675,7 +685,7 @@ impl super::JobQueue for DurableQueue {
                 job: sj.job,
                 lease: LeaseToken {
                     worker: worker.to_string(),
-                    expires_at: expiry,
+                    generation,
                 },
             });
         }
@@ -712,7 +722,7 @@ impl super::JobQueue for DurableQueue {
         retry: RetryPolicy,
     ) -> Result<(), QueueError> {
         let finished = Self::now();
-        let status = self
+        let updated = self
             .transition(job_id, lease, |sj| match retry {
                 RetryPolicy::NoRetry => {
                     sj.status = JobStatus::Failed {
@@ -734,7 +744,7 @@ impl super::JobQueue for DurableQueue {
                 }
             })
             .await?;
-        match status {
+        match updated.status {
             JobStatus::Dead { .. } => {
                 self.metrics.record_dead_lettered();
                 self.metrics.record_failed();
@@ -751,17 +761,22 @@ impl super::JobQueue for DurableQueue {
         job_id: JobId,
         lease: &LeaseToken,
         extend: Duration,
-    ) -> Result<(), QueueError> {
+    ) -> Result<LeaseToken, QueueError> {
         self.sweep_expired().await?;
         let new_expiry = Self::now() + extend.as_secs() as i64;
-        self.transition(job_id, lease, |sj| {
-            sj.status = JobStatus::Leased {
-                worker: lease.worker.clone(),
-                expires_at: new_expiry,
-            };
+        let updated = self
+            .transition(job_id, lease, |sj| {
+                sj.lease_generation = sj.lease_generation.saturating_add(1);
+                sj.status = JobStatus::Leased {
+                    worker: lease.worker.clone(),
+                    expires_at: new_expiry,
+                };
+            })
+            .await?;
+        Ok(LeaseToken {
+            worker: lease.worker.clone(),
+            generation: updated.lease_generation,
         })
-        .await?;
-        Ok(())
     }
 
     #[instrument(name = "queue.status", skip(self), fields(queue.backend = "durable", job.id = %job_id))]
@@ -924,10 +939,16 @@ mod tests {
     async fn a_current_lease_can_extend_a_lease() {
         let q = queue().await;
         let (_, current) = stale_and_current_lease(&q).await;
-        let before = current.lease.expires_at;
-        q.extend_lease(current.job.id, &current.lease, Duration::from_secs(60))
+        let before = match q.status(current.job.id).await.unwrap() {
+            JobStatus::Leased { expires_at, .. } => expires_at,
+            other => panic!("expected leased, got {:?}", other),
+        };
+        let renewed = q
+            .extend_lease(current.job.id, &current.lease, Duration::from_secs(60))
             .await
             .unwrap();
+        assert_eq!(renewed.worker, current.lease.worker);
+        assert!(renewed.generation > current.lease.generation);
         match q.status(current.job.id).await.unwrap() {
             JobStatus::Leased { worker, expires_at } => {
                 assert_eq!(worker, "w2");
@@ -935,6 +956,75 @@ mod tests {
             }
             other => panic!("expected leased, got {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn a_renewed_lease_can_ack_the_job() {
+        let q = queue().await;
+        q.enqueue(job("work")).await.unwrap();
+        let leased = q.reserve("w1", 10, Duration::from_secs(30)).await.unwrap();
+        let id = leased[0].job.id;
+        let renewed = q
+            .extend_lease(id, &leased[0].lease, Duration::from_secs(30))
+            .await
+            .unwrap();
+
+        q.ack(id, &renewed, Some(vec![5])).await.unwrap();
+
+        match q.status(id).await.unwrap() {
+            JobStatus::Succeeded { result, .. } => assert_eq!(result, Some(vec![5])),
+            other => panic!("expected succeeded, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn two_extensions_then_nack_succeeds() {
+        let q = queue().await;
+        q.enqueue(job("work")).await.unwrap();
+        let leased = q.reserve("w1", 10, Duration::from_secs(30)).await.unwrap();
+        let id = leased[0].job.id;
+        let second = q
+            .extend_lease(id, &leased[0].lease, Duration::from_secs(30))
+            .await
+            .unwrap();
+        let third = q
+            .extend_lease(id, &second, Duration::from_secs(30))
+            .await
+            .unwrap();
+
+        q.nack(id, &third, "boom", RetryPolicy::NoRetry)
+            .await
+            .unwrap();
+
+        match q.status(id).await.unwrap() {
+            JobStatus::Failed { error, .. } => assert_eq!(error, "boom"),
+            other => panic!("expected failed, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_token_from_before_an_extension_is_rejected() {
+        let q = queue().await;
+        q.enqueue(job("work")).await.unwrap();
+        let leased = q.reserve("w1", 10, Duration::from_secs(30)).await.unwrap();
+        let id = leased[0].job.id;
+        let old = leased[0].lease.clone();
+        let renewed = q
+            .extend_lease(id, &old, Duration::from_secs(30))
+            .await
+            .unwrap();
+
+        let error = q.ack(id, &old, Some(vec![1])).await.unwrap_err();
+        assert!(matches!(
+            error,
+            QueueError::AlreadyLeased | QueueError::LeaseExpired
+        ));
+        match q.status(id).await.unwrap() {
+            JobStatus::Leased { .. } => {}
+            other => panic!("expected leased, got {:?}", other),
+        }
+
+        q.ack(id, &renewed, Some(vec![1])).await.unwrap();
     }
 
     #[tokio::test]
@@ -1120,6 +1210,7 @@ mod tests {
                 let stored = StoredJob {
                     job: row,
                     status: JobStatus::Queued,
+                    lease_generation: 0,
                 };
                 let value = serde_json::to_vec(&stored).unwrap();
                 tx.set_bytes(&DurableQueue::job_key(*id), &value)
@@ -1144,7 +1235,11 @@ mod tests {
     async fn put_job(q: &DurableQueue, job: Job, status: JobStatus) {
         use oxkv::{Store as _, Transaction as _};
         let id = job.id;
-        let sj = StoredJob { job, status };
+        let sj = StoredJob {
+            job,
+            status,
+            lease_generation: 0,
+        };
         let val = serde_json::to_vec(&sj).unwrap();
         let g = q.store.write().await;
         let tx = g.begin_tx().unwrap();
@@ -1264,7 +1359,11 @@ mod tests {
         use oxkv::{Store as _, Transaction as _};
         let id = job.id;
         let marker = DurableQueue::status_key(&status, id);
-        let sj = StoredJob { job, status };
+        let sj = StoredJob {
+            job,
+            status,
+            lease_generation: 0,
+        };
         let val = serde_json::to_vec(&sj).unwrap();
         let g = q.store.write().await;
         let tx = g.begin_tx().unwrap();
