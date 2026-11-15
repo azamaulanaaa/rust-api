@@ -289,6 +289,17 @@ const EXECUTION_GC_BATCH: usize = 200;
 #[cfg(test)]
 const EXECUTION_GC_BATCH: usize = 2;
 
+/// The key that holds the last entity id of a committed rebuild page.
+const REBUILD_CURSOR_KEY: &str = "idx:rebuild:cursor";
+
+/// The largest number of entities that one rebuild page reads.
+#[cfg(not(test))]
+const REBUILD_PAGE: usize = 200;
+
+/// The largest number of entities that one rebuild page reads.
+#[cfg(test)]
+const REBUILD_PAGE: usize = 2;
+
 /// Maximum size of an entity id or an attribute name, in bytes.
 const MAX_NAME_BYTES: usize = 128;
 
@@ -440,6 +451,25 @@ pub struct MigrationReport {
     /// The id to resume after for the next page.
     /// `None` means the pass is complete.
     pub next: Option<String>,
+}
+
+/// The counts from one index rebuild.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RebuildReport {
+    /// The number of entity pages that the rebuild committed.
+    pub pages: usize,
+    /// The number of entities that the rebuild rewrote.
+    pub entities: usize,
+    /// The number of attribute index rows that the rebuild wrote.
+    pub attribute_rows: usize,
+    /// The number of unique claims that the rebuild wrote.
+    pub unique_claims: usize,
+    /// The number of time rows that the rebuild wrote.
+    pub time_rows: usize,
+    /// The number of name markers that the rebuild wrote.
+    pub name_markers: usize,
+    /// The entity id that a resumed run started after.
+    pub resumed_after: Option<String>,
 }
 
 /// The counts from one atomic schema migration batch.
@@ -3435,6 +3465,194 @@ impl EntityStore {
             effective.push(flat);
         }
         Ok(effective)
+    }
+
+    /// Rewrites every index row of the stored entities.
+    ///
+    /// The call first writes the name markers from the stored schema versions.
+    /// It then reads the entities in id order, one page at a time.
+    /// Each page rewrites the index rows in one transaction.
+    /// The call keeps a cursor after each page, so a later run resumes.
+    /// The cursor is removed after the last page.
+    /// A second run writes the same rows and changes no value.
+    /// With `schema`, the call rewrites only the entities that pin that schema.
+    pub(crate) async fn rebuild_indexes(
+        &self,
+        schema: Option<&str>,
+    ) -> Result<RebuildReport, EntityError> {
+        if let Some(schema) = schema {
+            validate_name("schema id", schema)?;
+        }
+        let mut report = RebuildReport::default();
+        self.backfill_entity_index().await?;
+
+        {
+            let _write = self.write_lock.lock().await;
+            let g = self.store.write().await;
+            let tx = g.begin_tx().map_err(EntityError::Store)?;
+            let mut markers = 0;
+            for def in self.schemas.versions().await.map_err(map_schema_error)? {
+                let Some(effective) = self
+                    .schemas
+                    .effective(&def.id, def.version)
+                    .await
+                    .map_err(map_schema_error)?
+                else {
+                    continue;
+                };
+                for (name, attribute) in &effective.attributes {
+                    if attribute.indexed {
+                        tx.set_bytes(&attr_key_index_key(name), b"")
+                            .await
+                            .map_err(EntityError::Store)?;
+                        markers += 1;
+                        if is_time_attribute(attribute) {
+                            tx.set_bytes(&time_key_index_key(name), b"")
+                                .await
+                                .map_err(EntityError::Store)?;
+                            markers += 1;
+                        }
+                    }
+                    if attribute.unique {
+                        tx.set_bytes(&unique_name_key(name), b"")
+                            .await
+                            .map_err(EntityError::Store)?;
+                        markers += 1;
+                    }
+                }
+            }
+            tx.commit().await.map_err(EntityError::Store)?;
+            report.name_markers = markers;
+        }
+
+        let resume = {
+            let g = self.store.read().await;
+            match g
+                .get_bytes(REBUILD_CURSOR_KEY)
+                .await
+                .map_err(EntityError::Store)?
+            {
+                Some(bytes) => serde_json::from_slice::<String>(&bytes).ok(),
+                None => None,
+            }
+        };
+        report.resumed_after = resume.clone();
+        let mut cursor = resume
+            .as_deref()
+            .map(|id| format!("{ENTITY_INDEX_PREFIX}{id}\0"))
+            .unwrap_or_else(|| ENTITY_INDEX_PREFIX.to_string());
+        let end = KeyPrefix::new(ENTITY_INDEX_PREFIX).upper_bound();
+
+        loop {
+            let page = {
+                let _write = self.write_lock.lock().await;
+                let g = self.store.write().await;
+                let rows = g
+                    .gets_keys(
+                        Some(REBUILD_PAGE),
+                        Direction::Next,
+                        (Some(cursor.clone()), end.clone()),
+                    )
+                    .await
+                    .map_err(EntityError::Store)?;
+                if rows.is_empty() {
+                    None
+                } else {
+                    let full = rows.len() == REBUILD_PAGE;
+                    let mut last_id = None;
+                    let tx = g.begin_tx().map_err(EntityError::Store)?;
+                    for key in &rows {
+                        let Some(id) = key.strip_prefix(ENTITY_INDEX_PREFIX) else {
+                            continue;
+                        };
+                        if id.is_empty() || id.contains(':') {
+                            continue;
+                        }
+                        last_id = Some(id.to_string());
+                        let Some(entity) = load_entity(&tx, id).await? else {
+                            continue;
+                        };
+                        if let Some(schema) = schema
+                            && !entity.schemas.iter().any(|pinned| pinned.id == schema)
+                        {
+                            continue;
+                        }
+                        let effective = self.resolve_refs(&entity.schemas).await?;
+                        let merged = merge_schemas(&effective)?;
+                        let facts = self.name_facts(&tx, &name_keys(&entity, None)).await?;
+                        let mut preserved = Vec::new();
+                        for (name, value) in &entity.attributes {
+                            let indexed = facts.indexed.contains(name)
+                                || merged
+                                    .attributes
+                                    .get(name)
+                                    .is_some_and(|attribute| attribute.indexed);
+                            if !indexed {
+                                continue;
+                            }
+                            if let AttributeValue::Timestamp(timestamp) = value {
+                                let key = time_index_key(name, *timestamp, &entity.id);
+                                if let Some(bytes) =
+                                    tx.get_bytes(&key).await.map_err(EntityError::Store)?
+                                {
+                                    preserved.push((key, bytes));
+                                }
+                                report.time_rows += 1;
+                            }
+                            report.attribute_rows += 1;
+                        }
+                        for name in entity.attributes.keys() {
+                            let unique = facts.unique.contains(name)
+                                || merged
+                                    .attributes
+                                    .get(name)
+                                    .is_some_and(|attribute| attribute.unique);
+                            if unique {
+                                report.unique_claims += 1;
+                            }
+                        }
+                        let mut state = WriteState::default();
+                        delete_mutable_rows(&tx, &entity, None, &merged, &facts, &mut state)
+                            .await?;
+                        delete_ref_rows(&tx, &entity, &merged).await?;
+                        put_entity_rows_except_meta(
+                            &tx, &entity, &merged, &facts, &mut state, None,
+                        )
+                        .await?;
+                        for (key, bytes) in preserved {
+                            tx.set_bytes(&key, &bytes)
+                                .await
+                                .map_err(EntityError::Store)?;
+                        }
+                        report.entities += 1;
+                    }
+                    tx.commit().await.map_err(EntityError::Store)?;
+                    report.pages += 1;
+                    if let Some(id) = &last_id {
+                        let bytes = serde_json::to_vec(id)
+                            .map_err(|e| EntityError::Internal(e.to_string()))?;
+                        g.put_bytes(REBUILD_CURSOR_KEY, &bytes)
+                            .await
+                            .map_err(EntityError::Store)?;
+                    }
+                    last_id.map(|id| (format!("{ENTITY_INDEX_PREFIX}{id}\0"), full))
+                }
+            };
+            let Some((next, full)) = page else {
+                break;
+            };
+            cursor = next;
+            if !full {
+                break;
+            }
+        }
+
+        let _write = self.write_lock.lock().await;
+        let g = self.store.write().await;
+        g.delete(REBUILD_CURSOR_KEY)
+            .await
+            .map_err(EntityError::Store)?;
+        Ok(report)
     }
 }
 

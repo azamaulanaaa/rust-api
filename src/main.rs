@@ -138,6 +138,16 @@ enum EavAction {
         #[arg(long = "in")]
         input: PathBuf,
     },
+    /// Rewrites the EAV index rows from the stored entities.
+    RebuildIndex {
+        /// Path of the TOML config file. It provides `[s3]` and
+        /// `[database].prefix`.
+        #[arg(short, long)]
+        config: PathBuf,
+        /// Rebuild only the entities that pin this schema id.
+        #[arg(long)]
+        schema: Option<String>,
+    },
 }
 
 /// Turns the `[s3]` section of the config into the [`S3ClientConfig`] that
@@ -305,6 +315,7 @@ fn eav_action_name(action: &EavAction) -> &'static str {
     match action {
         EavAction::Export { .. } => "eav export",
         EavAction::Import { .. } => "eav import",
+        EavAction::RebuildIndex { .. } => "eav rebuild-index",
     }
 }
 
@@ -351,7 +362,9 @@ async fn build_eav_stores(
 async fn run_eav_command(action: EavAction) -> anyhow::Result<()> {
     let purpose = eav_action_name(&action);
     let config = match &action {
-        EavAction::Export { config, .. } | EavAction::Import { config, .. } => config,
+        EavAction::Export { config, .. }
+        | EavAction::Import { config, .. }
+        | EavAction::RebuildIndex { config, .. } => config,
     };
     let cfg = config::Config::try_from(config.as_path())?;
     let s3_cfg = s3_client_config(&cfg);
@@ -402,6 +415,18 @@ async fn run_eav_action(
             println!(
                 "imported {} schema records, {} entity records, and {} rule records into {db_prefix}",
                 report.schemas, report.entities, report.rules
+            );
+        }
+        EavAction::RebuildIndex { schema, .. } => {
+            let report = portable::rebuild_indexes(&entities, schema.as_deref()).await?;
+            println!(
+                "rebuilt {} entities in {} pages: {} attribute rows, {} unique claims, {} time rows, and {} name markers",
+                report.entities,
+                report.pages,
+                report.attribute_rows,
+                report.unique_claims,
+                report.time_rows,
+                report.name_markers
             );
         }
     }

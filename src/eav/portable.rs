@@ -35,7 +35,7 @@ use std::io::{BufRead, Write};
 
 use serde::{Deserialize, Serialize};
 
-use crate::eav::entity::{Entity, EntityStore};
+use crate::eav::entity::{Entity, EntityStore, RebuildReport};
 use crate::eav::entity_error::EntityError;
 use crate::eav::error::SchemaError;
 use crate::eav::schema::{SchemaDef, SchemaRegistry};
@@ -247,6 +247,17 @@ pub async fn import<R: BufRead>(
     })
 }
 
+/// Rewrites every index row of the stored entities.
+///
+/// The call is idempotent and resumable.
+/// With `schema`, it rewrites only the entities that pin that schema.
+pub async fn rebuild_indexes(
+    entities: &EntityStore,
+    schema: Option<&str>,
+) -> Result<RebuildReport, EntityError> {
+    entities.rebuild_indexes(schema).await
+}
+
 /// Writes one line to `out`.
 fn write_line<W: Write>(out: &mut W, line: &Line) -> Result<(), PortableError> {
     serde_json::to_writer(&mut *out, line).map_err(PortableError::Encode)?;
@@ -409,7 +420,7 @@ mod tests {
     use crate::eav::schema::{AttributeDef, AttributeType, SchemaDraft};
     use crate::records::EntityEventKind;
     use crate::rules::rule::{ActionRef, Condition, RuleDraft, RuleTrigger};
-    use oxkv::OxKvStore;
+    use oxkv::{Direction, GetSet, OxKvStore};
 
     fn attr(name: &str, ty: AttributeType, indexed: bool, unique: bool) -> AttributeDef {
         AttributeDef {
@@ -444,6 +455,29 @@ mod tests {
             .iter()
             .map(|(name, value)| ((*name).to_string(), value.clone()))
             .collect()
+    }
+
+    fn row_snapshot(rows: Vec<oxkv::KeyValue>) -> Vec<(String, Vec<u8>)> {
+        rows.into_iter().map(|row| (row.key, row.value)).collect()
+    }
+
+    async fn index_rows(store: &OxKvStore) -> Vec<(String, Vec<u8>)> {
+        let rows = store
+            .gets_bytes(None, Direction::Next, (None, None))
+            .await
+            .expect("scan the entity store");
+        row_snapshot(
+            rows.into_iter()
+                .filter(|row| {
+                    row.key.starts_with("idx:attr:")
+                        || row.key.starts_with("idx:attr-key:")
+                        || row.key.starts_with("idx:unique:")
+                        || row.key.starts_with("idx:unique-key:")
+                        || row.key.starts_with("idx:time:")
+                        || row.key.starts_with("idx:time-key:")
+                })
+                .collect(),
+        )
     }
 
     #[tokio::test]
@@ -570,6 +604,80 @@ mod tests {
         let bob = target_entities.get("bob").await?.expect("bob is present");
         assert_eq!(bob.schemas[0].version, 2, "bob keeps his pinned version");
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_rebuild_restores_a_removed_index_row() -> anyhow::Result<()> {
+        let (schemas, entities, _rules, raw) = triple().await;
+        let mut schema = draft("item");
+        schema.attributes.insert(
+            "tag".to_string(),
+            attr("tag", AttributeType::String, true, false),
+        );
+        schema.attributes.insert(
+            "email".to_string(),
+            attr("email", AttributeType::String, false, true),
+        );
+        schema.attributes.insert(
+            "due".to_string(),
+            attr("due", AttributeType::Timestamp, true, false),
+        );
+        schemas.publish(schema).await?;
+
+        let ctx = WriteContext::new("test");
+        for (id, tag, email, due) in [
+            ("one", "red", "one@example.test", 100),
+            ("two", "blue", "two@example.test", 200),
+        ] {
+            entities
+                .create(
+                    EntityDraft {
+                        id: id.to_string(),
+                        schemas: vec!["item".to_string()],
+                        attributes: values(&[
+                            ("tag", AttributeValue::String(tag.to_string())),
+                            ("email", AttributeValue::String(email.to_string())),
+                            ("due", AttributeValue::Timestamp(due)),
+                        ]),
+                    },
+                    &ctx,
+                )
+                .await?;
+        }
+
+        let red = AttributeValue::String("red".to_string());
+        assert_eq!(entities.list_by_attribute("tag", &red).await?.len(), 1);
+
+        let rows = raw
+            .gets_keys(
+                Some(usize::MAX),
+                Direction::Next,
+                (
+                    Some("idx:attr:tag:".to_string()),
+                    oxkv::KeyPrefix::new("idx:attr:tag:").upper_bound(),
+                ),
+            )
+            .await?;
+        assert!(!rows.is_empty(), "the write must add an index row");
+        for key in rows {
+            raw.delete(&key).await?;
+        }
+        assert!(
+            entities.list_by_attribute("tag", &red).await?.is_empty(),
+            "the removed row must hide the entity"
+        );
+
+        let first = rebuild_indexes(&entities, None).await?;
+        assert_eq!(first.entities, 2);
+        assert_eq!(entities.list_by_attribute("tag", &red).await?.len(), 1);
+
+        let before = index_rows(&raw).await;
+        let second = rebuild_indexes(&entities, None).await?;
+        let after = index_rows(&raw).await;
+        assert_eq!(first.entities, second.entities);
+        assert_eq!(before, after, "a second rebuild must change no index row");
+        assert_eq!(entities.list_by_attribute("tag", &red).await?.len(), 1);
         Ok(())
     }
 }
