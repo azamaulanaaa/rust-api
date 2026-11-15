@@ -638,6 +638,16 @@ enum RevalidationFailure {
     Error(EntityError),
 }
 
+/// The dry-run result for one entity and one target schema version.
+enum DryRunOutcome {
+    /// The entity passes and does not pin the target version.
+    Migrated,
+    /// The entity passes and already pins the target version.
+    Unchanged,
+    /// The entity fails the target version.
+    Invalid(RevalidationIssue),
+}
+
 /// The name-level index facts for one write.
 ///
 /// A durable name marker is the fast path.
@@ -1938,6 +1948,10 @@ impl EntityStore {
     /// A store failure is an error and not an issue.
     /// The report holds the cursor for the next page.
     /// A missing target version is [`EntityError::UnknownSchema`].
+    /// When the target version marks an attribute unique, the call also
+    /// checks every entity that pins `schema_id`, so that a duplicate value
+    /// across two pages is visible. That pass ignores `limit` and costs one
+    /// scan of the schema entities.
     pub async fn revalidation_report(
         &self,
         schema_id: &str,
@@ -1957,44 +1971,138 @@ impl EntityStore {
         }
 
         let (entities, next) = self.list_by_schema_after(schema_id, limit, after).await?;
+        let outcomes = self
+            .dry_run_outcomes(schema_id, target_version, &entities)
+            .await?;
         let mut report = RevalidationReport {
             scanned: 0,
             compatible: 0,
             invalid: Vec::new(),
             next,
         };
-        let mut seen_unique: BTreeSet<(String, String)> = BTreeSet::new();
-        for entity in entities {
-            if !entity.schemas.iter().any(|schema| schema.id == schema_id) {
-                continue;
-            }
+        for (entity, outcome) in entities.iter().zip(outcomes) {
             report.scanned += 1;
-            match self
-                .revalidate_one(&entity, schema_id, target_version)
-                .await
-            {
-                Ok(revalidated) => {
-                    if let Some(issue) = note_unique_values(
-                        &revalidated.attributes,
-                        &revalidated.merged.attributes,
-                        &mut seen_unique,
-                    )? {
-                        report.invalid.push(InvalidEntity {
-                            entity_id: entity.id.clone(),
-                            issue,
-                        });
-                    } else {
-                        report.compatible += 1;
-                    }
-                }
-                Err(RevalidationFailure::Issue(issue)) => report.invalid.push(InvalidEntity {
+            match outcome {
+                DryRunOutcome::Migrated | DryRunOutcome::Unchanged => report.compatible += 1,
+                DryRunOutcome::Invalid(issue) => report.invalid.push(InvalidEntity {
                     entity_id: entity.id.clone(),
                     issue,
                 }),
-                Err(RevalidationFailure::Error(error)) => return Err(error),
             }
         }
         Ok(report)
+    }
+
+    /// Returns one dry-run result for each entity of one page.
+    ///
+    /// A target version with no unique attribute checks the page only.
+    /// A target version with a unique attribute checks every entity that
+    /// pins `schema_id` in id order, so that a duplicate value across two
+    /// pages is visible. That pass ignores `limit` and costs one scan of the
+    /// schema entities.
+    /// The call returns one result for each entity of `page`, in page order.
+    async fn dry_run_outcomes(
+        &self,
+        schema_id: &str,
+        target_version: u64,
+        page: &[Entity],
+    ) -> Result<Vec<DryRunOutcome>, EntityError> {
+        let mut seen_unique = BTreeSet::new();
+        if !self
+            .target_marks_a_unique_attribute(schema_id, target_version)
+            .await?
+        {
+            let mut outcomes = Vec::with_capacity(page.len());
+            for entity in page {
+                outcomes.push(
+                    self.dry_run_one(entity, schema_id, target_version, &mut seen_unique)
+                        .await?,
+                );
+            }
+            return Ok(outcomes);
+        }
+
+        let page_ids: BTreeSet<&str> = page.iter().map(|entity| entity.id.as_str()).collect();
+        let mut results: BTreeMap<String, DryRunOutcome> = BTreeMap::new();
+        for entity in self.list_by_schema(schema_id).await? {
+            if !entity.schemas.iter().any(|schema| schema.id == schema_id) {
+                continue;
+            }
+            let outcome = self
+                .dry_run_one(&entity, schema_id, target_version, &mut seen_unique)
+                .await?;
+            if page_ids.contains(entity.id.as_str()) {
+                results.insert(entity.id, outcome);
+            }
+        }
+        let mut outcomes = Vec::with_capacity(page.len());
+        for entity in page {
+            if let Some(outcome) = results.remove(&entity.id) {
+                outcomes.push(outcome);
+            } else {
+                // A concurrent write changed the schema markers between the
+                // page read and the full scan.
+                outcomes.push(
+                    self.dry_run_one(entity, schema_id, target_version, &mut seen_unique)
+                        .await?,
+                );
+            }
+        }
+        Ok(outcomes)
+    }
+
+    /// Checks one entity for a dry run.
+    ///
+    /// A duplicate unique value leaves `seen_unique` unchanged.
+    async fn dry_run_one(
+        &self,
+        entity: &Entity,
+        schema_id: &str,
+        target_version: u64,
+        seen_unique: &mut BTreeSet<(String, String, String)>,
+    ) -> Result<DryRunOutcome, EntityError> {
+        match self.revalidate_one(entity, schema_id, target_version).await {
+            Ok(revalidated) => {
+                if let Some(issue) = note_unique_values(
+                    &revalidated.attributes,
+                    &revalidated.merged.attributes,
+                    seen_unique,
+                )? {
+                    return Ok(DryRunOutcome::Invalid(issue));
+                }
+                if entity
+                    .schemas
+                    .iter()
+                    .any(|schema| schema.id == schema_id && schema.version == target_version)
+                {
+                    Ok(DryRunOutcome::Unchanged)
+                } else {
+                    Ok(DryRunOutcome::Migrated)
+                }
+            }
+            Err(RevalidationFailure::Issue(issue)) => Ok(DryRunOutcome::Invalid(issue)),
+            Err(RevalidationFailure::Error(error)) => Err(error),
+        }
+    }
+
+    /// True when the target version marks an attribute unique.
+    ///
+    /// The call reads the effective schema of the target version, so it also
+    /// sees a unique attribute on a parent schema.
+    async fn target_marks_a_unique_attribute(
+        &self,
+        schema_id: &str,
+        target_version: u64,
+    ) -> Result<bool, EntityError> {
+        let Some(effective) = self
+            .schemas
+            .effective(schema_id, target_version)
+            .await
+            .map_err(map_schema_error)?
+        else {
+            return Ok(false);
+        };
+        Ok(effective.attributes.values().any(|def| def.unique))
     }
 
     /// Applies one target schema version to compatible entities.
@@ -2019,6 +2127,10 @@ impl EntityStore {
     /// A missing target version is [`EntityError::UnknownSchema`].
     /// The report holds the cursor for the next page.
     /// A `limit` of 0 returns an empty report.
+    /// When the target version marks an attribute unique, a dry run also
+    /// checks every entity that pins `schema_id`, so that a duplicate value
+    /// across two pages is visible. That pass ignores `limit` and costs one
+    /// scan of the schema entities.
     pub async fn migrate_schema(
         &self,
         schema_id: &str,
@@ -2054,41 +2166,18 @@ impl EntityStore {
         let (entities, next) = self.list_by_schema_after(schema_id, limit, after).await?;
         report.next = next;
         if dry_run {
-            let mut seen_unique: BTreeSet<(String, String)> = BTreeSet::new();
-            for entity in entities {
-                if !entity.schemas.iter().any(|schema| schema.id == schema_id) {
-                    continue;
-                }
+            let outcomes = self
+                .dry_run_outcomes(schema_id, target_version, &entities)
+                .await?;
+            for (entity, outcome) in entities.iter().zip(outcomes) {
                 report.scanned += 1;
-                match self
-                    .revalidate_one(&entity, schema_id, target_version)
-                    .await
-                {
-                    Ok(revalidated) => {
-                        if let Some(issue) = note_unique_values(
-                            &revalidated.attributes,
-                            &revalidated.merged.attributes,
-                            &mut seen_unique,
-                        )? {
-                            report.invalid.push(InvalidEntity {
-                                entity_id: entity.id.clone(),
-                                issue,
-                            });
-                        } else if entity.schemas.iter().any(|schema| {
-                            schema.id == schema_id && schema.version == target_version
-                        }) {
-                            report.unchanged += 1;
-                        } else {
-                            report.migrated += 1;
-                        }
-                    }
-                    Err(RevalidationFailure::Issue(issue)) => {
-                        report.invalid.push(InvalidEntity {
-                            entity_id: entity.id.clone(),
-                            issue,
-                        });
-                    }
-                    Err(RevalidationFailure::Error(error)) => return Err(error),
+                match outcome {
+                    DryRunOutcome::Migrated => report.migrated += 1,
+                    DryRunOutcome::Unchanged => report.unchanged += 1,
+                    DryRunOutcome::Invalid(issue) => report.invalid.push(InvalidEntity {
+                        entity_id: entity.id.clone(),
+                        issue,
+                    }),
                 }
             }
             return Ok(report);
@@ -2132,7 +2221,7 @@ impl EntityStore {
         let _write = self.write_lock.lock().await;
         let mut result = MigrationBatchResult::default();
         let mut writes: Vec<SchemaMigrationWrite> = Vec::new();
-        let mut seen_unique: BTreeSet<(String, String)> = BTreeSet::new();
+        let mut seen_unique: BTreeSet<(String, String, String)> = BTreeSet::new();
 
         for entity in entities {
             let current = {
@@ -3744,21 +3833,22 @@ fn revalidation_failure(error: EntityError) -> RevalidationFailure {
 
 /// Records the unique values of one candidate entity.
 ///
-/// The call uses `seen` to detect a duplicate across one page.
+/// The call uses `seen` to detect a duplicate across one page or one dry-run
+/// pass.
 /// A duplicate leaves `seen` unchanged.
 fn note_unique_values(
     attributes: &BTreeMap<String, AttributeValue>,
     defs: &BTreeMap<String, AttributeDef>,
-    seen: &mut BTreeSet<(String, String)>,
+    seen: &mut BTreeSet<(String, String, String)>,
 ) -> Result<Option<RevalidationIssue>, EntityError> {
-    let mut values: Vec<(String, String)> = Vec::new();
+    let mut values: Vec<(String, String, String)> = Vec::new();
     for (key, value) in attributes {
         if !defs.get(key).is_some_and(|def| def.unique) {
             continue;
         }
-        values.push((key.clone(), value_hash(value)?));
+        values.push((key.clone(), value_hash(value)?, value_fingerprint(value)?));
     }
-    if let Some((key, _)) = values.iter().find(|value| seen.contains(*value)) {
+    if let Some((key, _, _)) = values.iter().find(|value| seen.contains(*value)) {
         return Ok(Some(RevalidationIssue::DuplicateUnique(key.clone())));
     }
     seen.extend(values);
@@ -9606,6 +9696,97 @@ mod tests {
             RevalidationIssue::MissingRequired("owner".to_string())
         );
         assert_eq!(store.get("e1").await.unwrap(), Some(created));
+    }
+
+    #[tokio::test]
+    async fn a_duplicate_unique_value_across_two_pages_fails_both_dry_runs_and_the_apply() {
+        let (store, registry, _raw) = new_store().await;
+        registry
+            .publish(schema(
+                "task",
+                &[],
+                vec![attr("tag", AttributeType::String)],
+            ))
+            .await
+            .unwrap();
+        for id in ["a", "b"] {
+            store
+                .create(draft(id, &["task"], vec![("tag", s("alpha"))]), &ctx())
+                .await
+                .unwrap();
+        }
+        registry
+            .publish(schema(
+                "task",
+                &[],
+                vec![full_attr(
+                    "tag",
+                    AttributeType::String,
+                    false,
+                    false,
+                    true,
+                    None,
+                )],
+            ))
+            .await
+            .unwrap();
+
+        let revalidation_first = store.revalidation_report("task", 2, 1, None).await.unwrap();
+        assert_eq!(revalidation_first.scanned, 1);
+        assert_eq!(revalidation_first.compatible, 1);
+        assert!(revalidation_first.invalid.is_empty());
+        let revalidation_second = store
+            .revalidation_report("task", 2, 1, revalidation_first.next.as_deref())
+            .await
+            .unwrap();
+        assert_eq!(revalidation_second.scanned, 1);
+        assert_eq!(revalidation_second.compatible, 0);
+        assert_eq!(revalidation_second.invalid.len(), 1);
+        assert_eq!(revalidation_second.invalid[0].entity_id, "b");
+        assert_eq!(
+            revalidation_second.invalid[0].issue,
+            RevalidationIssue::DuplicateUnique("tag".to_string())
+        );
+
+        let dry_first = store
+            .migrate_schema("task", 2, 1, None, true, &ctx())
+            .await
+            .unwrap();
+        assert_eq!(dry_first.scanned, 1);
+        assert_eq!(dry_first.migrated, 1);
+        assert!(dry_first.invalid.is_empty());
+        assert_eq!(dry_first.next.as_deref(), Some("a"));
+        let dry_second = store
+            .migrate_schema("task", 2, 1, dry_first.next.as_deref(), true, &ctx())
+            .await
+            .unwrap();
+        assert_eq!(dry_second.scanned, 1);
+        assert_eq!(dry_second.migrated, 0);
+        assert_eq!(dry_second.invalid.len(), 1);
+        assert_eq!(dry_second.invalid[0].entity_id, "b");
+        assert_eq!(
+            dry_second.invalid[0].issue,
+            RevalidationIssue::DuplicateUnique("tag".to_string())
+        );
+        assert_eq!(dry_second.invalid, revalidation_second.invalid);
+
+        let apply_first = store
+            .migrate_schema("task", 2, 1, None, false, &ctx())
+            .await
+            .unwrap();
+        assert_eq!(apply_first.scanned, 1);
+        assert_eq!(apply_first.migrated, 1);
+        assert!(apply_first.invalid.is_empty());
+        let apply_second = store
+            .migrate_schema("task", 2, 1, apply_first.next.as_deref(), false, &ctx())
+            .await
+            .unwrap();
+        assert_eq!(apply_second.scanned, 1);
+        assert_eq!(apply_second.migrated, 0);
+        assert_eq!(apply_second.invalid, dry_second.invalid);
+
+        assert_eq!(store.get("a").await.unwrap().unwrap().version, 2);
+        assert_eq!(store.get("b").await.unwrap().unwrap().version, 1);
     }
 
     #[tokio::test]
