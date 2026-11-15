@@ -195,6 +195,7 @@ async fn run_policy_command(action: PolicyAction) -> anyhow::Result<()> {
     };
     let s3_cfg = s3_client_config(&cfg);
     let db_prefix = cfg.database.prefix.trim_matches('/').to_string();
+    rust_api::db::configure_sst_cache_bytes(cfg.database.sst_cache_mb.saturating_mul(1024 * 1024));
 
     match action {
         PolicyAction::Export { .. } => export_policy(&s3_cfg, &db_prefix, &file).await,
@@ -287,6 +288,11 @@ fn readiness_state(
 /// Runs the HTTP listener until stopped.
 async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
     let config = config::Config::try_from(config_path)?;
+    // One SST cache serves every OxKV handle. Set its budget before the code
+    // builds the first handle.
+    rust_api::db::configure_sst_cache_bytes(
+        config.database.sst_cache_mb.saturating_mul(1024 * 1024),
+    );
     // Resolve every value that borrows `config`, before the code moves
     // parts of `config` into the configs of the modules below.
     let token_keys = resolve_token_keys(&config)?;
