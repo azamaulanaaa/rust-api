@@ -828,6 +828,7 @@ impl EntityStore {
         store: &S,
         prepared: &PreparedUpdate,
         ctx: &WriteContext,
+        guard_meta: bool,
     ) -> Result<Option<(String, Vec<u8>)>, EntityError>
     where
         S: TxCas + ?Sized + Sync,
@@ -853,10 +854,19 @@ impl EntityStore {
         delete_ref_rows(store, before, &prepared.merged).await?;
         let before_meta = meta_bytes(before)?;
         let after_meta = meta_bytes(after)?;
-        store
-            .compare_and_set(&meta_key(&after.id), Some(&before_meta), &after_meta)
-            .await
-            .map_err(EntityError::Store)?;
+        if guard_meta {
+            store
+                .compare_and_set(&meta_key(&after.id), Some(&before_meta), &after_meta)
+                .await
+                .map_err(EntityError::Store)?;
+        } else {
+            // A create earlier in the same plan already staged the row.
+            // Its precondition covers the committed state.
+            store
+                .set_bytes(&meta_key(&after.id), &after_meta)
+                .await
+                .map_err(EntityError::Store)?;
+        }
         put_entity_rows_except_meta(store, after, &prepared.merged).await?;
         Ok(outbox)
     }
@@ -1025,7 +1035,7 @@ impl EntityStore {
             let prepared = self
                 .prepare_update(&tx, id, expected_version, &patch)
                 .await?;
-            let outbox = self.stage_update(&tx, &prepared, ctx).await?;
+            let outbox = self.stage_update(&tx, &prepared, ctx, true).await?;
             if outbox.is_some() {
                 increment_outbox_pending(&tx, 1).await?;
             }
@@ -1198,6 +1208,7 @@ impl EntityStore {
             let mut changes = Vec::with_capacity(plan.len());
             let mut outbox_rows = Vec::new();
             let mut guarded_meta = BTreeSet::new();
+            let mut created_in_plan = BTreeSet::new();
             for effect in plan.effects() {
                 let (change, outbox) = match effect {
                     EntityEffect::Create {
@@ -1213,6 +1224,7 @@ impl EntityStore {
                             })
                             .await?;
                         let outbox = self.stage_create(&tx, &prepared, ctx).await?;
+                        created_in_plan.insert(prepared.entity.id.clone());
                         (
                             EntityChange {
                                 before: None,
@@ -1232,8 +1244,11 @@ impl EntityStore {
                         let prepared = self
                             .prepare_update(&tx, id, *expected_version, &patch)
                             .await?;
-                        let outbox = self.stage_update(&tx, &prepared, ctx).await?;
-                        guarded_meta.insert(meta_key(id));
+                        let guard_meta = !created_in_plan.contains(id);
+                        let outbox = self.stage_update(&tx, &prepared, ctx, guard_meta).await?;
+                        if guard_meta {
+                            guarded_meta.insert(meta_key(id));
+                        }
                         (
                             EntityChange {
                                 before: Some(prepared.before),
@@ -4170,9 +4185,12 @@ mod tests {
             .prepare_update(&second_tx, "e1", 1, &second_patch)
             .await
             .unwrap();
-        store.stage_update(&first_tx, &first, &ctx()).await.unwrap();
         store
-            .stage_update(&second_tx, &second, &ctx())
+            .stage_update(&first_tx, &first, &ctx(), true)
+            .await
+            .unwrap();
+        store
+            .stage_update(&second_tx, &second, &ctx(), true)
             .await
             .unwrap();
 
