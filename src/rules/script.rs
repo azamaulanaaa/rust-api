@@ -35,10 +35,16 @@
 //!
 //! The read capability set controls `get_entity` and both find methods.
 //! A denied `get_entity` returns `()`.
+//! A `get_entity` result holds only the attributes that the allowed pinned
+//! schemas define.
 //! A denied find returns the stable error `rule script read access denied`.
 //! The write capability set controls every staged write.
-//! A write outside the set returns the stable error
+//! A create must pin only schemas in the set.
+//! An update may set only the attributes that the pinned schemas in the set
+//! define.
+//! A write that breaks these rules returns the stable error
 //! `rule script write access denied`.
+//! A delete requires that the entity pins at least one schema in the set.
 //!
 //! The host has no function for HTTP, files, the clock, random values, or
 //! processes.
@@ -80,6 +86,8 @@ use thiserror::Error;
 use tokio::runtime::Handle;
 
 use crate::eav::entity::{AttributeValue, Entity, EntityStore};
+use crate::eav::entity_error::EntityError;
+use crate::eav::schema::{EffectiveSchema, SchemaRef};
 use crate::records::{EntityEvent, EntityEventKind};
 use crate::rules::effect::{EntityEffect, MAX_EFFECTS};
 use crate::rules::script_host::{ScriptCapabilities, ScriptHostError, ScriptReadHost};
@@ -334,6 +342,7 @@ impl ScriptHost {
     /// Stages one create.
     ///
     /// Every schema id must be in the write capability set.
+    /// Every attribute must be one that the schemas define.
     /// The call reads no entity and commits nothing.
     pub fn create_entity(
         &mut self,
@@ -350,6 +359,7 @@ impl ScriptHost {
             return Err(host_error(WRITE_DENIED_MESSAGE));
         }
         let attributes = attributes_from_map(&attributes)?;
+        self.require_create(&schemas, &attributes)?;
         self.stage(EntityEffect::Create {
             id: id.to_string(),
             schemas,
@@ -359,8 +369,8 @@ impl ScriptHost {
 
     /// Stages one update.
     ///
-    /// The call reads the entity to check that at least one pinned schema is in
-    /// the write capability set.
+    /// The call reads the entity to check that every attribute in the patch is
+    /// one that a pinned schema in the write capability set defines.
     /// The call commits nothing.
     pub fn update_entity(
         &mut self,
@@ -370,8 +380,8 @@ impl ScriptHost {
     ) -> Result<(), Box<EvalAltResult>> {
         let expected_version =
             u64::try_from(expected_version).map_err(|_| host_error(INVALID_ARGUMENT_MESSAGE))?;
-        self.require_write(id)?;
         let attributes = patch_from_map(&patch)?;
+        self.require_update(id, &attributes)?;
         self.stage(EntityEffect::Update {
             id: id.to_string(),
             expected_version,
@@ -419,25 +429,66 @@ impl ScriptHost {
         Ok(())
     }
 
+    /// Checks that a create writes only attributes of its schemas.
+    ///
+    /// The caller has already checked that every schema is in the write set.
+    /// The call reads the effective attributes of the schemas.
+    /// An attribute that no schema defines is a denied write.
+    fn require_create(
+        &self,
+        schemas: &[String],
+        attributes: &BTreeMap<String, AttributeValue>,
+    ) -> Result<(), Box<EvalAltResult>> {
+        let effective = self
+            .runtime
+            .block_on(self.entities.resolve_schemas(schemas))
+            .map_err(|error| self.map_write_schema_error(error))?;
+        let allowed = attribute_names(&effective);
+        if attributes.keys().any(|key| !allowed.contains(key)) {
+            return Err(host_error(WRITE_DENIED_MESSAGE));
+        }
+        Ok(())
+    }
+
+    /// Checks that a patch sets only attributes of the write set.
+    ///
+    /// The call keeps the pinned schemas that the write set allows.
+    /// It reads the effective attributes of those schemas.
+    /// An entity with no allowed pinned schema is a denied write.
+    /// A patch attribute that no allowed schema defines is a denied write.
+    /// The call reads committed state only.
+    fn require_update(
+        &self,
+        id: &str,
+        patch: &BTreeMap<String, Option<AttributeValue>>,
+    ) -> Result<(), Box<EvalAltResult>> {
+        let entity = self.load_for_write(id)?;
+        let pinned: Vec<SchemaRef> = entity
+            .schemas
+            .into_iter()
+            .filter(|schema| self.write.contains(&schema.id))
+            .collect();
+        if pinned.is_empty() {
+            return Err(host_error(WRITE_DENIED_MESSAGE));
+        }
+        let effective = self
+            .runtime
+            .block_on(self.entities.resolve_refs(&pinned))
+            .map_err(|error| self.map_write_schema_error(error))?;
+        let allowed = attribute_names(&effective);
+        if patch.keys().any(|key| !allowed.contains(key)) {
+            return Err(host_error(WRITE_DENIED_MESSAGE));
+        }
+        Ok(())
+    }
+
     /// Checks that the entity pins at least one schema in the write set.
     ///
     /// The call reads committed state only.
     /// A missing entity is a denied write, because no pinned schema can allow
     /// it.
     fn require_write(&self, id: &str) -> Result<(), Box<EvalAltResult>> {
-        let entity = match self.runtime.block_on(self.entities.get(id)) {
-            Ok(Some(entity)) => entity,
-            Ok(None) => return Err(host_error(WRITE_DENIED_MESSAGE)),
-            Err(error) => {
-                tracing::warn!(
-                    rule_id = %self.rule_id,
-                    event_id = %self.event_id,
-                    error = %error,
-                    "script host store read failed"
-                );
-                return Err(host_error(STORE_MESSAGE));
-            }
-        };
+        let entity = self.load_for_write(id)?;
         if entity
             .schemas
             .iter()
@@ -446,6 +497,47 @@ impl ScriptHost {
             Ok(())
         } else {
             Err(host_error(WRITE_DENIED_MESSAGE))
+        }
+    }
+
+    /// Loads one entity for a write check.
+    ///
+    /// A missing entity is a denied write.
+    /// A store failure is a stable store error.
+    fn load_for_write(&self, id: &str) -> Result<Entity, Box<EvalAltResult>> {
+        match self.runtime.block_on(self.entities.get(id)) {
+            Ok(Some(entity)) => Ok(entity),
+            Ok(None) => Err(host_error(WRITE_DENIED_MESSAGE)),
+            Err(error) => {
+                tracing::warn!(
+                    rule_id = %self.rule_id,
+                    event_id = %self.event_id,
+                    error = %error,
+                    "script host store read failed"
+                );
+                Err(host_error(STORE_MESSAGE))
+            }
+        }
+    }
+
+    /// Maps one schema read error from a write check to a stable Rhai error.
+    ///
+    /// An unknown schema is a denied write.
+    /// An invalid schema list is an invalid argument.
+    /// Any other error is a stable store error.
+    fn map_write_schema_error(&self, error: EntityError) -> Box<EvalAltResult> {
+        match error {
+            EntityError::UnknownSchema(_) => host_error(WRITE_DENIED_MESSAGE),
+            EntityError::Invalid(_) => host_error(INVALID_ARGUMENT_MESSAGE),
+            other => {
+                tracing::warn!(
+                    rule_id = %self.rule_id,
+                    event_id = %self.event_id,
+                    error = %other,
+                    "script host schema read failed"
+                );
+                host_error(STORE_MESSAGE)
+            }
         }
     }
 
@@ -761,6 +853,14 @@ fn patch_from_map(
     Ok(attributes)
 }
 
+/// Returns the attribute names that the effective schemas define.
+fn attribute_names(effective: &[EffectiveSchema]) -> BTreeSet<String> {
+    effective
+        .iter()
+        .flat_map(|schema| schema.attributes.keys().cloned())
+        .collect()
+}
+
 /// Converts one Rhai value into a plain JSON value.
 fn dynamic_to_json(value: &Dynamic) -> Option<serde_json::Value> {
     if value.is_unit() {
@@ -1023,6 +1123,27 @@ mod tests {
                             AttributeValue::String(status.to_string()),
                         ),
                         ("total".to_string(), AttributeValue::Integer(total)),
+                    ]),
+                },
+                &WriteContext::new("tester"),
+            )
+            .await
+            .unwrap();
+    }
+
+    /// Creates one entity that pins the `task` and `secret` schemas.
+    async fn create_task_and_secret(store: &EntityStore, id: &str, status: &str, code: &str) {
+        store
+            .create(
+                EntityDraft {
+                    id: id.to_string(),
+                    schemas: vec!["task".to_string(), "secret".to_string()],
+                    attributes: BTreeMap::from([
+                        (
+                            "status".to_string(),
+                            AttributeValue::String(status.to_string()),
+                        ),
+                        ("code".to_string(), AttributeValue::String(code.to_string())),
                     ]),
                 },
                 &WriteContext::new("tester"),
@@ -1564,6 +1685,73 @@ abs(height(20.0, 0.7, 9.81, 1.5, 100)) < 0.000000001"#,
             &subject,
             host,
             r#"host.update_entity("e1", 1, #{ status: "done" })"#,
+            &ev,
+            None,
+        )
+        .await;
+
+        assert_eq!(result, Err(ScriptError::WriteDenied));
+    }
+
+    #[tokio::test]
+    async fn an_update_of_an_attribute_outside_the_write_set_is_denied() {
+        let subject = engine();
+        let (host, store) = action_host(&["task", "secret"], &["task"]).await;
+        create_task_and_secret(&store, "e1", "open", "s1").await;
+        let ev = event(EntityEventKind::Created, Vec::new());
+
+        let result = eval_action(
+            &subject,
+            host,
+            r#"host.update_entity("e1", 1, #{ code: "s2" })"#,
+            &ev,
+            None,
+        )
+        .await;
+
+        assert_eq!(result, Err(ScriptError::WriteDenied));
+    }
+
+    #[tokio::test]
+    async fn an_update_of_an_allowed_attribute_on_a_shared_entity_is_staged() {
+        let subject = engine();
+        let (host, store) = action_host(&["task", "secret"], &["task"]).await;
+        create_task_and_secret(&store, "e1", "open", "s1").await;
+        let ev = event(EntityEventKind::Created, Vec::new());
+
+        let effects = eval_action(
+            &subject,
+            host,
+            r#"host.update_entity("e1", 1, #{ status: "done" })"#,
+            &ev,
+            None,
+        )
+        .await
+        .expect("the script must finish");
+
+        assert_eq!(
+            effects,
+            vec![EntityEffect::Update {
+                id: "e1".to_string(),
+                expected_version: 1,
+                attributes: BTreeMap::from([(
+                    "status".to_string(),
+                    Some(AttributeValue::String("done".to_string())),
+                )]),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_create_of_an_attribute_outside_the_write_set_is_denied() {
+        let subject = engine();
+        let (host, _store) = action_host(&["task"], &["task"]).await;
+        let ev = event(EntityEventKind::Created, Vec::new());
+
+        let result = eval_action(
+            &subject,
+            host,
+            r#"host.create_entity("new", ["task"], #{ code: "s1" })"#,
             &ev,
             None,
         )

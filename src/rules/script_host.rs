@@ -7,7 +7,7 @@
 //! Every method checks [`ScriptCapabilities`] before it reads data.
 //! A schema that is not in the set is denied.
 //! A denied schema returns `None` or [`ScriptHostError::Denied`].
-//! It never returns a partial entity.
+//! No result holds an attribute from a schema that the set does not allow.
 //!
 //! [`ScriptReadHost::get_entity`] returns one entity when at least one
 //! pinned schema id is allowed.
@@ -15,6 +15,7 @@
 //! { plain JSON values } }`.
 //! The `schemas` list holds only the pinned ids that the capability set
 //! allows.
+//! The attributes hold only the keys that those schemas define.
 //! The attributes use
 //! [`AttributeValue::as_json`](crate::eav::entity::AttributeValue::as_json),
 //! so they hold no storage type tag.
@@ -34,6 +35,7 @@ use thiserror::Error;
 
 use crate::eav::entity::{AttributeValue, Entity, EntityStore};
 use crate::eav::entity_error::EntityError;
+use crate::eav::schema::SchemaRef;
 use crate::rules::rule::validate_identifier;
 
 /// The largest number of ids that one find method returns.
@@ -137,27 +139,39 @@ impl ScriptReadHost {
     /// { plain JSON values } }`.
     /// The `schemas` list holds only the pinned ids that the capability set
     /// allows.
+    /// The attributes hold only the keys that those schemas define.
     /// The attributes use
     /// [`AttributeValue::as_json`](crate::eav::entity::AttributeValue::as_json).
     pub async fn get_entity(&self, id: &str) -> Result<Option<serde_json::Value>, ScriptHostError> {
         let Some(entity) = self.entities.get(id).await.map_err(map_entity_error)? else {
             return Ok(None);
         };
-        let schemas: Vec<String> = entity
+        let pinned: Vec<SchemaRef> = entity
             .schemas
             .iter()
             .filter(|schema| self.capabilities.allows(&schema.id))
-            .map(|schema| schema.id.clone())
+            .cloned()
             .collect();
-        if schemas.is_empty() {
+        if pinned.is_empty() {
             return Ok(None);
         }
 
+        let effective = self
+            .entities
+            .resolve_refs(&pinned)
+            .await
+            .map_err(map_entity_error)?;
+        let allowed: BTreeSet<String> = effective
+            .iter()
+            .flat_map(|schema| schema.attributes.keys().cloned())
+            .collect();
         let attributes: BTreeMap<String, serde_json::Value> = entity
             .attributes
             .iter()
+            .filter(|(key, _)| allowed.contains(*key))
             .map(|(key, value)| (key.clone(), value.as_json()))
             .collect();
+        let schemas: Vec<String> = pinned.into_iter().map(|schema| schema.id).collect();
         Ok(Some(serde_json::json!({
             "id": entity.id,
             "version": entity.version,
@@ -514,6 +528,52 @@ mod tests {
 
         assert_eq!(entity["id"], "shared");
         assert_eq!(entity["schemas"], serde_json::json!(["invoice"]));
+    }
+
+    #[tokio::test]
+    async fn get_entity_returns_only_the_attributes_of_allowed_schemas() {
+        let (host, store) = host_with(&["invoice"]).await;
+        create(
+            &store,
+            "shared",
+            &["invoice", "secret"],
+            vec![
+                ("title", text("shared")),
+                ("total", AttributeValue::Integer(3)),
+                ("code", text("s1")),
+            ],
+        )
+        .await;
+
+        let entity = host.get_entity("shared").await.unwrap().unwrap();
+
+        assert_eq!(
+            entity["attributes"],
+            serde_json::json!({"title": "shared", "total": 3})
+        );
+    }
+
+    #[tokio::test]
+    async fn get_entity_hides_the_attributes_of_a_denied_schema() {
+        let (host, store) = host_with(&["secret"]).await;
+        create(
+            &store,
+            "shared",
+            &["invoice", "secret"],
+            vec![
+                ("title", text("shared")),
+                ("total", AttributeValue::Integer(3)),
+                ("code", text("s1")),
+            ],
+        )
+        .await;
+
+        let entity = host.get_entity("shared").await.unwrap().unwrap();
+
+        assert_eq!(
+            entity["attributes"],
+            serde_json::json!({"title": "shared", "code": "s1"})
+        );
     }
 
     #[tokio::test]
