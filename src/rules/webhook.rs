@@ -6,6 +6,12 @@
 //! The queue retries a failed job.
 //! The queue idempotency key deduplicates one rule and one event.
 //! The receiver must deduplicate on the `X-Event-Id` header.
+//! The action signs each request when a signing secret exists.
+//! The `X-Signature` header signs the body only. This is the legacy scheme.
+//! The `X-Signature-V2` header signs `timestamp.body`.
+//! The `X-Signature-Timestamp` header carries the time in unix seconds.
+//! A receiver can reject a replay with [`WebhookSignatureVerifier`] and a
+//! replay window.
 //! The action adds no business logic.
 //!
 //! A strict host allowlist limits the destinations.
@@ -63,6 +69,13 @@ const TIMEOUT_SECS: u64 = 10;
 
 /// The maximum retry delay that a `Retry-After` header can set, in seconds.
 const MAX_RETRY_AFTER_SECS: u64 = 3600;
+
+/// The header that carries the legacy body-only signature.
+const SIGNATURE_HEADER: &str = "X-Signature";
+/// The header that carries the request time in unix seconds.
+const TIMESTAMP_HEADER: &str = "X-Signature-Timestamp";
+/// The header that signs the timestamp and the body.
+const SIGNATURE_V2_HEADER: &str = "X-Signature-V2";
 
 /// Records the result of one webhook delivery.
 ///
@@ -293,7 +306,8 @@ impl JobHandler for WebhookJobHandler {
     /// The call decodes the job body.
     /// It validates the URL again against the allowlist.
     /// It posts the body with the event, rule, and user-agent headers.
-    /// It adds the `X-Signature` header when a signing secret exists.
+    /// It adds the signature and timestamp headers when a signing secret
+    /// exists.
     /// A 2xx status is a success.
     /// Any other status or a network error returns an error.
     async fn handle(&self, job: &Job) -> Result<Option<Vec<u8>>, anyhow::Error> {
@@ -310,7 +324,8 @@ impl WebhookJobHandler {
     /// The call decodes the job body.
     /// It validates the URL again against the allowlist.
     /// It posts the body with the event, rule, and user-agent headers.
-    /// It adds the `X-Signature` header when a signing secret exists.
+    /// It adds the signature and timestamp headers when a signing secret
+    /// exists.
     /// A 2xx status is a success.
     /// Any other status or a network error returns an error.
     async fn deliver(&self, job: &Job) -> Result<Option<Vec<u8>>, anyhow::Error> {
@@ -401,6 +416,8 @@ struct AllowedHost {
 /// It rejects the request when any address is not public, unless the caller
 /// allows a private host.
 /// It signs the exact body bytes when a secret exists.
+/// It also signs `timestamp.body` and sends the timestamp, so a receiver can
+/// reject a replayed request.
 /// It returns a permanent [`JobError`] for a non-retryable status.
 /// It returns a retryable [`JobError`] for a temporary status.
 async fn send_webhook(
@@ -420,7 +437,14 @@ async fn send_webhook(
         .header(reqwest::header::USER_AGENT, "rust-api-eav")
         .body(body.to_vec());
     if let Some(secret) = signing_secret {
-        request = request.header("X-Signature", signature_header(secret, body)?);
+        let timestamp = chrono::Utc::now().timestamp().to_string();
+        request = request
+            .header(SIGNATURE_HEADER, signature_header(secret, body)?)
+            .header(TIMESTAMP_HEADER, timestamp.as_str())
+            .header(
+                SIGNATURE_V2_HEADER,
+                timestamped_signature(secret, &timestamp, body)?,
+            );
     }
     let response = request
         .send()
@@ -488,18 +512,145 @@ fn parse_retry_after(value: &str) -> Option<Duration> {
 /// Signs one body with HMAC-SHA256.
 ///
 /// The call returns the `sha256=<hex>` header value.
+/// This is the legacy `X-Signature` scheme. It does not cover the request
+/// time, so a receiver cannot detect a replay from this value alone.
 fn signature_header(secret: &[u8], body: &[u8]) -> Result<String, anyhow::Error> {
     let mut mac = Hmac::<Sha256>::new_from_slice(secret)
         .map_err(|_| anyhow::anyhow!("webhook signing secret is not valid"))?;
     mac.update(body);
-    let bytes = mac.finalize().into_bytes();
+    Ok(format_signature(&mac.finalize().into_bytes()))
+}
+
+/// Signs one timestamp and body with HMAC-SHA256.
+///
+/// The call returns the `sha256=<hex>` header value for the bytes
+/// `timestamp.body`.
+fn timestamped_signature(
+    secret: &[u8],
+    timestamp: &str,
+    body: &[u8],
+) -> Result<String, anyhow::Error> {
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret)
+        .map_err(|_| anyhow::anyhow!("webhook signing secret is not valid"))?;
+    mac.update(timestamp.as_bytes());
+    mac.update(b".");
+    mac.update(body);
+    Ok(format_signature(&mac.finalize().into_bytes()))
+}
+
+/// Formats one HMAC value as `sha256=<hex>`.
+fn format_signature(bytes: &[u8]) -> String {
     let mut header = String::with_capacity(7 + bytes.len() * 2);
     header.push_str("sha256=");
-    for byte in bytes.iter() {
+    for byte in bytes {
         use std::fmt::Write as _;
         let _ = write!(header, "{byte:02x}");
     }
-    Ok(header)
+    header
+}
+
+/// Checks the timestamped HMAC signature of one webhook request.
+///
+/// The verifier checks the `X-Signature-Timestamp` and `X-Signature-V2`
+/// headers of a request that the action sent. The signature covers
+/// `timestamp.body`. The verifier rejects a request when the timestamp is
+/// outside the replay window or the signature does not match.
+#[derive(Clone)]
+pub struct WebhookSignatureVerifier {
+    /// The shared signing secret.
+    secret: Vec<u8>,
+    /// The maximum distance between the request time and the current time.
+    replay_window: Duration,
+}
+
+impl std::fmt::Debug for WebhookSignatureVerifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WebhookSignatureVerifier")
+            .field("has_secret", &!self.secret.is_empty())
+            .field("replay_window", &self.replay_window)
+            .finish()
+    }
+}
+
+impl WebhookSignatureVerifier {
+    /// Creates a verifier for one signing secret and replay window.
+    ///
+    /// A request whose timestamp is more than `replay_window` away from the
+    /// current time is stale. A window of zero accepts only the same second.
+    pub fn new(secret: impl Into<Vec<u8>>, replay_window: Duration) -> Self {
+        Self {
+            secret: secret.into(),
+            replay_window,
+        }
+    }
+
+    /// Checks one request against the current time.
+    pub fn verify(
+        &self,
+        timestamp: &str,
+        body: &[u8],
+        signature: &str,
+    ) -> Result<(), anyhow::Error> {
+        self.verify_at(timestamp, body, signature, chrono::Utc::now().timestamp())
+    }
+
+    /// Checks one request at `now`, in unix seconds.
+    ///
+    /// The call rejects a timestamp that is not an integer.
+    /// It rejects a timestamp outside the replay window.
+    /// It rejects a signature that does not match `timestamp.body`.
+    pub fn verify_at(
+        &self,
+        timestamp: &str,
+        body: &[u8],
+        signature: &str,
+        now: i64,
+    ) -> Result<(), anyhow::Error> {
+        let parsed = timestamp
+            .parse::<i64>()
+            .map_err(|_| anyhow::anyhow!("webhook signature timestamp is not valid"))?;
+        let window = self.replay_window.as_secs();
+        if parsed.abs_diff(now) > window {
+            bail!("webhook signature timestamp is outside the replay window");
+        }
+        let raw = signature
+            .strip_prefix("sha256=")
+            .ok_or_else(|| anyhow::anyhow!("webhook signature is not valid"))?;
+        let provided = decode_hex(raw)?;
+        let mut mac = Hmac::<Sha256>::new_from_slice(&self.secret)
+            .map_err(|_| anyhow::anyhow!("webhook signing secret is not valid"))?;
+        mac.update(timestamp.as_bytes());
+        mac.update(b".");
+        mac.update(body);
+        mac.verify_slice(&provided)
+            .map_err(|_| anyhow::anyhow!("webhook signature does not match"))
+    }
+}
+
+/// Reads one hexadecimal string into bytes.
+fn decode_hex(raw: &str) -> Result<Vec<u8>, anyhow::Error> {
+    if !raw.len().is_multiple_of(2) {
+        bail!("webhook signature is not valid");
+    }
+    let mut out = Vec::with_capacity(raw.len() / 2);
+    for pair in raw.as_bytes().as_chunks::<2>().0 {
+        let high =
+            hex_value(pair[0]).ok_or_else(|| anyhow::anyhow!("webhook signature is not valid"))?;
+        let low =
+            hex_value(pair[1]).ok_or_else(|| anyhow::anyhow!("webhook signature is not valid"))?;
+        out.push((high << 4) | low);
+    }
+    Ok(out)
+}
+
+/// Returns the value of one hexadecimal digit.
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 /// Checks one URL against the allowlist.
@@ -678,19 +829,59 @@ async fn resolve_webhook_target(
     Ok((host, addresses))
 }
 
+/// The fixed settings of the webhook HTTP client.
+///
+/// The policy disables every proxy. A proxy resolves the host itself, so a
+/// proxy would bypass the address that the action pins.
+/// The policy also disables redirects and sets the request timeout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ClientPolicy {
+    /// Total time limit for one request.
+    timeout: Duration,
+    /// Follows a redirect when true.
+    follow_redirects: bool,
+    /// Uses a system or builder proxy when true.
+    system_proxy: bool,
+}
+
+impl ClientPolicy {
+    /// Returns the policy for the webhook path.
+    ///
+    /// The client uses no proxy, follows no redirect, and has a 10 second
+    /// timeout.
+    fn webhook() -> Self {
+        Self {
+            timeout: Duration::from_secs(TIMEOUT_SECS),
+            follow_redirects: false,
+            system_proxy: false,
+        }
+    }
+
+    /// Applies the policy to one client builder.
+    fn apply(self, builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+        let builder = builder.timeout(self.timeout);
+        let builder = if self.follow_redirects {
+            builder
+        } else {
+            builder.redirect(reqwest::redirect::Policy::none())
+        };
+        if self.system_proxy {
+            builder
+        } else {
+            builder.no_proxy()
+        }
+    }
+}
+
 /// Builds one HTTP client with a timeout, no redirects, and pinned addresses.
 ///
-/// The call disables system proxies.
-/// A system proxy resolves the host itself, so it bypasses the pinned address.
+/// The call applies [`ClientPolicy::webhook`].
+/// The policy disables system proxies and any proxy on the builder.
 /// The pinned address must stay the only target of the client.
 #[allow(clippy::expect_used)]
 fn build_client(host: &str, addresses: &[SocketAddr]) -> reqwest::Client {
-    reqwest::Client::builder()
-        .timeout(Duration::from_secs(TIMEOUT_SECS))
-        .redirect(reqwest::redirect::Policy::none())
-        // Disable system proxies. Reqwest enables them by default, and a proxy
-        // resolves the host itself. A proxy thus bypasses the pinned address.
-        .no_proxy()
+    ClientPolicy::webhook()
+        .apply(reqwest::Client::builder())
         .resolve_to_addrs(host, addresses)
         .build()
         .expect("webhook HTTP client must build")
@@ -1493,6 +1684,20 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some(expected.as_str())
         );
+        let timestamp = request
+            .headers
+            .get("x-signature-timestamp")
+            .and_then(|value| value.to_str().ok())
+            .expect("the request must carry a signature timestamp");
+        assert!(timestamp.parse::<i64>().is_ok());
+        let expected_v2 = timestamped_signature(&secret(), timestamp, &request.body).unwrap();
+        assert_eq!(
+            request
+                .headers
+                .get("x-signature-v2")
+                .and_then(|value| value.to_str().ok()),
+            Some(expected_v2.as_str())
+        );
         let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
         assert_eq!(body["rule_id"], "alpha");
         assert_eq!(body["event_id"], "evt-1");
@@ -1669,6 +1874,88 @@ mod tests {
         assert_eq!(
             header,
             "sha256=dc46983557fea127b43af721467eb9b3fde2338fe3e14f51952aa8478c13d355"
+        );
+    }
+
+    #[test]
+    fn a_fresh_timestamped_signature_verifies() {
+        let verifier = WebhookSignatureVerifier::new(secret(), Duration::from_secs(300));
+        let body = b"{\"event_id\":\"evt-1\"}";
+        let timestamp = "1700000000".to_string();
+        let signature = timestamped_signature(&secret(), &timestamp, body).unwrap();
+
+        verifier
+            .verify_at(&timestamp, body, &signature, 1_700_000_010)
+            .unwrap();
+    }
+
+    #[test]
+    fn a_stale_timestamped_signature_is_rejected() {
+        let verifier = WebhookSignatureVerifier::new(secret(), Duration::from_secs(60));
+        let body = b"{\"event_id\":\"evt-1\"}";
+        let timestamp = "1700000000".to_string();
+        let signature = timestamped_signature(&secret(), &timestamp, body).unwrap();
+
+        let error = verifier
+            .verify_at(&timestamp, body, &signature, 1_700_000_061)
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("replay window"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn a_tampered_timestamped_signature_is_rejected() {
+        let verifier = WebhookSignatureVerifier::new(secret(), Duration::from_secs(300));
+        let body = b"{\"event_id\":\"evt-1\"}";
+        let timestamp = "1700000000".to_string();
+        let signature = timestamped_signature(&secret(), &timestamp, body).unwrap();
+        let tampered = b"{\"event_id\":\"evt-2\"}";
+
+        let error = verifier
+            .verify_at(&timestamp, tampered, &signature, 1_700_000_000)
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("does not match"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_client_ignores_a_configured_proxy() {
+        let target = MockServer::start().await;
+        let proxy = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/pin"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&target)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&proxy)
+            .await;
+
+        assert!(!ClientPolicy::webhook().system_proxy);
+        let client = ClientPolicy::webhook()
+            .apply(reqwest::Client::builder().proxy(reqwest::Proxy::all(proxy.uri()).unwrap()))
+            .resolve_to_addrs("webhook.invalid", &[*target.address()])
+            .build()
+            .unwrap();
+
+        let response = client
+            .get("http://webhook.invalid/pin")
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+        assert_eq!(target.received_requests().await.unwrap().len(), 1);
+        assert!(
+            proxy.received_requests().await.unwrap().is_empty(),
+            "the client must not use a proxy"
         );
     }
 }
