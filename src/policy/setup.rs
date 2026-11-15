@@ -161,6 +161,8 @@ mod tests {
             PolicyEngine {
                 enforcer: fx.engine.enforcer.clone(),
                 feed: None,
+                outbox: fx.engine.outbox.clone(),
+                drain_lock: fx.engine.drain_lock.clone(),
                 latch: fx.engine.latch,
             },
             middleware,
@@ -269,6 +271,8 @@ mod tests {
         let engine_clone = PolicyEngine {
             enforcer: reopened.enforcer.clone(),
             feed: None,
+            outbox: reopened.outbox.clone(),
+            drain_lock: reopened.drain_lock.clone(),
             latch: reopened.latch,
         };
         let middleware =
