@@ -68,8 +68,9 @@
 //! the cursor is reset.
 //! The retention window must be longer than any replay window.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 
 use oxkv::{
     Direction, GetSet, KeyPrefix, KeyValue, OxKvStore, ScanExt as _, Store as _, StoreError,
@@ -125,6 +126,65 @@ const GC_BATCH: usize = 200;
 #[cfg(test)]
 const GC_BATCH: usize = 2;
 
+/// The largest number of event shapes that the match cache holds.
+const RULE_CACHE_CAPACITY: usize = 64;
+
+/// One bounded cache of match results.
+///
+/// The key is the event kind and the sorted event schema ids.
+/// A write increments `generation`. A read records the generation before it
+/// scans the store and inserts its result only when the generation did not
+/// move. A write therefore cannot leave a stale result in the cache.
+#[derive(Default)]
+struct RuleMatchCache {
+    /// The number of writes that changed a rule.
+    generation: u64,
+    /// The cached result for each event shape.
+    entries: HashMap<String, Arc<Vec<Rule>>>,
+    /// The insertion order, used to evict the oldest entry.
+    order: VecDeque<String>,
+    /// The number of cache hits in a test build.
+    #[cfg(test)]
+    hits: usize,
+    /// The number of cache misses in a test build.
+    #[cfg(test)]
+    misses: usize,
+}
+
+impl RuleMatchCache {
+    /// Returns the cached result for `key`.
+    fn get(&mut self, key: &str) -> Option<Arc<Vec<Rule>>> {
+        let result = self.entries.get(key).cloned();
+        #[cfg(test)]
+        if result.is_some() {
+            self.hits += 1;
+        } else {
+            self.misses += 1;
+        }
+        result
+    }
+
+    /// Adds one result and evicts the oldest entry when the cache is full.
+    fn insert(&mut self, key: String, rules: Arc<Vec<Rule>>) {
+        if self.entries.len() >= RULE_CACHE_CAPACITY
+            && !self.entries.contains_key(&key)
+            && let Some(old) = self.order.pop_front()
+        {
+            self.entries.remove(&old);
+        }
+        if self.entries.insert(key.clone(), rules).is_none() {
+            self.order.push_back(key);
+        }
+    }
+
+    /// Removes every result and moves the generation forward.
+    fn invalidate(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.entries.clear();
+        self.order.clear();
+    }
+}
+
 /// One entry that the engine failed by policy.
 ///
 /// The engine writes this row after `MAX_ENTRY_ATTEMPTS` failed attempts.
@@ -159,6 +219,8 @@ pub struct RuleStore {
     store: Arc<RwLock<OxKvStore>>,
     /// Serializes writes, so two callers cannot claim one version.
     publish_lock: Arc<Mutex<()>>,
+    /// The bounded cache of match results.
+    match_cache: Arc<StdMutex<RuleMatchCache>>,
     /// Largest execution-marker page that a cleanup read.
     ///
     /// The field exists only in a test build.
@@ -172,9 +234,34 @@ impl RuleStore {
         Self {
             store: Arc::new(RwLock::new(store)),
             publish_lock: Arc::new(Mutex::new(())),
+            match_cache: Arc::new(StdMutex::new(RuleMatchCache::default())),
             #[cfg(test)]
             gc_page_high_water: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
+    }
+
+    /// Locks the match cache and ignores a poisoned lock.
+    fn cache(&self) -> std::sync::MutexGuard<'_, RuleMatchCache> {
+        self.match_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Removes every cached match result after a rule change.
+    fn invalidate_match_cache(&self) {
+        self.cache().invalidate();
+    }
+
+    /// Returns the cache hit count in a test build.
+    #[cfg(test)]
+    pub(crate) fn cache_hits(&self) -> usize {
+        self.cache().hits
+    }
+
+    /// Returns the cache miss count in a test build.
+    #[cfg(test)]
+    pub(crate) fn cache_misses(&self) -> usize {
+        self.cache().misses
     }
 
     /// Adds one rule or replaces the rule with the same id.
@@ -202,6 +289,7 @@ impl RuleStore {
             }
             Err(error) => return Err(RuleError::Store(error)),
         }
+        self.invalidate_match_cache();
         Ok(rule)
     }
 
@@ -331,6 +419,7 @@ impl RuleStore {
         }
         tx.delete(&meta_key(id)).await.map_err(RuleError::Store)?;
         tx.commit().await.map_err(RuleError::Store)?;
+        self.invalidate_match_cache();
         Ok(true)
     }
 
@@ -355,6 +444,7 @@ impl RuleStore {
         rule.updated_at = chrono::Utc::now().timestamp();
         put_rule(&tx, &rule).await?;
         tx.commit().await.map_err(RuleError::Store)?;
+        self.invalidate_match_cache();
         Ok(rule)
     }
 
@@ -364,7 +454,18 @@ impl RuleStore {
     /// schema.
     /// The result is sorted by priority in descending order.
     /// Two rules with the same priority are sorted by id.
+    /// The call caches the result for one event kind and schema set.
+    /// A rule upsert, delete, or enable change clears the cache.
     pub async fn matching(&self, event: &EntityEvent) -> Result<Vec<Rule>, RuleError> {
+        let cache_key = match_cache_key(event);
+        let generation = {
+            let mut cache = self.cache();
+            if let Some(rules) = cache.get(&cache_key) {
+                return Ok((*rules).clone());
+            }
+            cache.generation
+        };
+
         let kind = event_kind_key(event.kind);
         let mut ids = BTreeSet::new();
         {
@@ -393,6 +494,11 @@ impl RuleStore {
             }
         }
         sort_rules(&mut rules);
+
+        let mut cache = self.cache();
+        if cache.generation == generation {
+            cache.insert(cache_key, Arc::new(rules.clone()));
+        }
         Ok(rules)
     }
 
@@ -713,6 +819,22 @@ fn event_kind_key(kind: EntityEventKind) -> &'static str {
         EntityEventKind::SchemaRemoved => "schema_removed",
         EntityEventKind::Timer => "timer",
     }
+}
+
+/// Returns the cache key for one event shape.
+///
+/// The key holds the event kind and the sorted, distinct schema ids.
+/// The schema order in the event does not change the match result, so the
+/// sort makes two equal schema sets share one entry.
+fn match_cache_key(event: &EntityEvent) -> String {
+    let mut schemas = event.schemas.clone();
+    schemas.sort();
+    schemas.dedup();
+    format!(
+        "{}\u{1f}{}",
+        event_kind_key(event.kind),
+        schemas.join("\u{1f}")
+    )
 }
 
 /// Returns every index key for one trigger and rule id.
@@ -1199,6 +1321,32 @@ mod tests {
             store.set_enabled("ghost", true).await,
             Err(RuleError::NotFound(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn matching_caches_results_and_invalidates_on_rule_changes() {
+        let store = new_store().await;
+        store.upsert(draft("alpha")).await.unwrap();
+        let created = event(EntityEventKind::Created, &["invoice"], &[]);
+
+        assert_eq!(store.matching(&created).await.unwrap().len(), 1);
+        assert_eq!(store.matching(&created).await.unwrap().len(), 1);
+        assert_eq!(store.cache_hits(), 1);
+        assert_eq!(store.cache_misses(), 1);
+
+        // An upsert clears the cache, so the new rule appears at once.
+        store.upsert(draft("beta")).await.unwrap();
+        assert_eq!(store.matching(&created).await.unwrap().len(), 2);
+
+        // A delete also clears the cache.
+        store.delete("beta").await.unwrap();
+        assert_eq!(store.matching(&created).await.unwrap().len(), 1);
+
+        // An enable change clears the cache.
+        store.set_enabled("alpha", false).await.unwrap();
+        assert!(store.matching(&created).await.unwrap().is_empty());
+        assert_eq!(store.cache_hits(), 1);
+        assert_eq!(store.cache_misses(), 4);
     }
 
     #[tokio::test]
