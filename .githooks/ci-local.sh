@@ -9,8 +9,8 @@ if ! REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null); then
 fi
 cd "$REPO_ROOT" || exit 1
 
-JOBS=(lint test coverage msrv doc release-config licenses advisories bans)
-DEFAULT_JOBS=(lint test msrv doc release-config licenses advisories bans)
+JOBS=(lint test coverage msrv doc release-config licenses advisories bans sources)
+DEFAULT_JOBS=(lint test msrv doc release-config licenses advisories bans sources)
 
 usage() {
     cat <<'EOF'
@@ -33,6 +33,7 @@ Jobs:
   licenses        Check dependency licences with cargo deny.
   advisories      Check advisories with cargo deny.
   bans            Check bans with cargo deny.
+  sources         Check dependency sources with cargo deny.
 
 With no job arguments, the script runs every job except coverage.
 Coverage is expensive. Name it, or pass --all, to run it.
@@ -98,8 +99,8 @@ job_test() {
 job_coverage() {
     require_tool cargo || { skip_job coverage "The cargo tool is not on PATH. Run mise install."; return 0; }
     require_tool cargo-llvm-cov || { skip_job coverage "The cargo-llvm-cov tool is not on PATH. Run mise install."; return 0; }
-    step "cargo llvm-cov --all-features --html --locked --output-dir target/llvm-cov"
-    cargo llvm-cov --all-features --html --locked --output-dir target/llvm-cov
+    step "cargo llvm-cov --all-features --html --locked --fail-under-lines 90 --output-dir target/llvm-cov"
+    cargo llvm-cov --all-features --html --locked --fail-under-lines 90 --output-dir target/llvm-cov
     echo "Coverage report: target/llvm-cov/html/index.html"
     echo "CI uploads this report as an artifact. This script keeps it in the target directory."
 }
@@ -160,6 +161,12 @@ job_bans() {
     require_tool cargo-deny || { skip_job bans "The cargo-deny tool is not on PATH. Run mise install."; return 0; }
     step "cargo deny check bans"
     cargo deny check bans
+}
+
+job_sources() {
+    require_tool cargo-deny || { skip_job sources "The cargo-deny tool is not on PATH. Run mise install."; return 0; }
+    step "cargo deny check sources"
+    cargo deny check sources
 }
 
 run_job() {

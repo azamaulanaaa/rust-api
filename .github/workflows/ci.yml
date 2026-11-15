@@ -49,7 +49,7 @@ jobs:
           components: llvm-tools-preview
           install: cargo-llvm-cov@0.9.1
       - name: Measure coverage
-        run: cargo llvm-cov --all-features --html --locked --output-dir target/llvm-cov
+        run: cargo llvm-cov --all-features --html --locked --fail-under-lines 90 --output-dir target/llvm-cov
       - name: Upload report
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -71,6 +71,16 @@ jobs:
           components: ''
       - run: cargo check --all-targets --all-features --locked
 
+  no-default-features:
+    name: No default features
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: ./.github/actions/setup-rust
+        with:
+          components: ''
+      - run: cargo check --all-targets --all-features --no-default-features --locked
+
   doc:
     name: Docs
     runs-on: ubuntu-latest
@@ -80,7 +90,7 @@ jobs:
         with:
           components: ''
       - name: Check rustdoc
-        run: cargo doc --no-deps --all-features
+        run: cargo doc --no-deps --all-features --locked
         env:
           RUSTDOCFLAGS: -D warnings
 
@@ -144,3 +154,15 @@ jobs:
           install: cargo-deny@0.20.2
       - name: Check wildcards and duplicate versions
         run: cargo deny check bans
+
+  sources:
+    name: Sources (cargo deny)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: ./.github/actions/setup-rust
+        with:
+          components: ''
+          install: cargo-deny@0.20.2
+      - name: Check dependency sources
+        run: cargo deny check sources

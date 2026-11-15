@@ -1070,49 +1070,13 @@ Casbin is vendored at `vendor/casbin` with one Rhai feature change. Casbin enabl
 
 The configuration module is part of the binary target. Run its tests with `cargo test --bin rust-api config`. A `cargo test --lib config` filter runs no configuration test.
 
-### Integration tests
+### Full-stack tests
 
-The fast tests run in-process. wiremock mocks the identity provider and S3, so they need no containers and no network. Run them with `mise run test`.
+This repository does not include a full-stack test harness. There is no `tests/integration.rs`, no `tests/contract.rs`, and no `docker-compose.test.yml`. The commands `cargo test --test integration` and `cargo test --test contract` fail because those targets do not exist.
 
-A separate harness runs against MinIO and a mock OIDC provider over the full HTTP stack:
+The in-process tests are the test suite. wiremock mocks the identity provider and S3, so they need no containers and no network. Run them with `mise run test`.
 
-```bash
-docker compose -f docker-compose.test.yml up -d
-cargo test --test integration -- --ignored
-docker compose -f docker-compose.test.yml down
-```
-
-The smoke tests cover boot and `/health`, login, `/setup/admin`, a real S3 upload and download, and a policy rule.
-
-### Contract tests
-
-Contract tests check behavior that wiremock cannot reproduce: JWKS rotation, lease compare-and-set, S3 multipart restart, and GC. They are env-gated and ignored by default.
-
-The suite needs a real OIDC provider that publishes a JWKS document, and an S3-compatible bucket. Set `CONTRACT_TESTS=1` plus `CONTRACT_IDP_ISSUER_URL`, `CONTRACT_IDP_CLIENT_ID`, `CONTRACT_IDP_CLIENT_SECRET`, `CONTRACT_S3_ENDPOINT`, `CONTRACT_S3_BUCKET`, `CONTRACT_S3_ACCESS_KEY_ID`, `CONTRACT_S3_SECRET_ACCESS_KEY`, and `CONTRACT_S3_REGION`. A test skips itself when a required variable is unset.
-
-```bash
-CONTRACT_TESTS=1 \
-CONTRACT_IDP_ISSUER_URL=https://idp.example.com \
-CONTRACT_IDP_CLIENT_ID=client-id \
-CONTRACT_IDP_CLIENT_SECRET=client-secret \
-CONTRACT_S3_ENDPOINT=https://s3.example.com \
-CONTRACT_S3_BUCKET=rust-api-contract \
-CONTRACT_S3_ACCESS_KEY_ID=access-key \
-CONTRACT_S3_SECRET_ACCESS_KEY=secret-key \
-CONTRACT_S3_REGION=us-east-1 \
-cargo test --test contract -- --ignored
-```
-
-Run one area with a name filter:
-
-```bash
-cargo test --test contract jwks -- --ignored
-cargo test --test contract lease -- --ignored
-cargo test --test contract multipart -- --ignored
-cargo test --test contract gc -- --ignored
-```
-
-Contract tests mutate real buckets. Use a dedicated bucket and clean it between runs.
+Test a deployment against a real identity provider and a real bucket before production. The operator owns that check.
 
 ### Releases
 
@@ -1120,10 +1084,23 @@ Contract tests mutate real buckets. Use a dedicated bucket and clean it between 
 
 ```bash
 mise run dist-plan     # print the artifact plan
-mise run dist-build    # build the archives into dist/
+mise run dist-build    # build the archives into target/distrib/
 ```
 
 The `cargo-dist` pin in `mise.toml` must track `cargo-dist-version` in `dist-workspace.toml`. The generated workflow is checked in at `.github/workflows/release.yml`. Run `dist init --ci=github` to regenerate it at the pinned version. That command overwrites the local edits in the file.
+
+The crate is distributed as a binary. `publish = false` in `Cargo.toml` keeps `cargo publish` from uploading a package that depends on the local path adapters.
+
+### Container image
+
+`Dockerfile` builds the `rust-api` binary in a Rust builder stage and copies it to a Debian slim runtime. The image runs as the unprivileged `rust-api` user. It copies `config.example.toml` to `/usr/share/rust-api/config.example.toml` as a reference. Mount the real config at `/etc/rust-api/config.toml`.
+
+```bash
+docker build -t rust-api:0.1.0 .
+docker run --rm -p 8080:8080 -v "$PWD/config.toml:/etc/rust-api/config.toml:ro" rust-api:0.1.0
+```
+
+`deploy/kubernetes.yaml` is a reference Deployment and Service. It wires `/health` to the liveness probe and `/ready` to the readiness probe. Set the image, the config, and the secrets for your cluster. This manifest is not tested against a live cluster.
 
 ## License
 

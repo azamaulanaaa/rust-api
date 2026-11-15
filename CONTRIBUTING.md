@@ -54,7 +54,7 @@ CI checks formatting with `cargo fmt --all --check`.
 Lint with clippy:
 
 ```bash
-cargo clippy --all-targets --all-features
+cargo clippy --all-targets --all-features --locked -- -D warnings
 ```
 
 CI runs clippy with `-D warnings`. unwrap and expect are denied in non-test code. The clippy config allows them in tests.
@@ -65,6 +65,7 @@ Check dependencies:
 mise run licenses
 mise run advisories
 mise run bans
+mise run sources
 ```
 
 These run cargo-deny. See `deny.toml` for the rules.
@@ -81,7 +82,7 @@ mise run hooks
 
 This command sets `core.hooksPath` to `.githooks` and marks the hook files executable.
 
-The `pre-commit` hook runs `mise run lint` when staged changes exist. The `pre-push` hook runs `.githooks/ci-local.sh` with the default jobs. The default jobs are lint, test, MSRV, docs, release config, licences, advisories, and bans.
+The `pre-commit` hook runs `mise run lint` when staged changes exist. The `pre-push` hook runs `.githooks/ci-local.sh` with the default jobs. The default jobs are lint, test, MSRV, docs, release config, licences, advisories, bans, and sources.
 
 Run one job on demand:
 
