@@ -4,7 +4,10 @@
 //! The store scales per user. Each `OxKvStore` uses its own key prefix,
 //! for example `oxkv/fs`, on the shared `ObjectStore`.
 
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use oxkv::{
     Direction, GetSet, KeyPrefix, KeyValue, OxKvStore, Store as _, StoreError, Transaction as _,
@@ -179,6 +182,11 @@ pub struct FsStore {
     /// A test that tripped it could not tell its own write from the write
     /// of another test.
     latch: &'static Latch,
+    /// Serializes the ref-count check of GC against `attach` and `detach`.
+    ///
+    /// Clones share one registry. The GC sweeper and the writers therefore
+    /// take the same mutex for one file.
+    file_locks: Arc<FileLocks>,
 }
 
 impl FsStore {
@@ -227,6 +235,7 @@ impl FsStore {
             mirror: None,
             primary: false,
             latch: crate::fencing::process_latch(),
+            file_locks: Arc::new(FileLocks::default()),
         }
     }
 
@@ -263,14 +272,11 @@ impl FsStore {
     /// The mirror wraps a clone of `s3_store`.
     /// The clone shares the session and the state, and it takes no new
     /// epoch.
-    /// The mirror warms one key at a time on a read miss.
-    /// On a miss it falls through to the durable core, so that it stays
-    /// correct.
-    /// Call [`refresh_mirror`](Self::refresh_mirror) before a bulk scan.
-    /// Then one incremental WAL replay converges the mirror, and the code
-    /// avoids one miss per key.
-    /// Set `RUST_LOG=debug` to measure this.
-    /// The engine logs the refresh counts.
+    /// A point read warms one key on a miss.
+    /// A miss reads through the durable core, so the read stays correct when
+    /// another handle wrote the key after the mirror was warmed.
+    /// A range scan refreshes the mirror before it reads.
+    /// Then the scan sees every row that this store wrote.
     pub async fn new_mirrored(s3_store: OxKvStore) -> Result<Self, FsError> {
         let mirror = CachedOxKvStore::open_with_mode(s3_store.clone(), WarmMode::Lazy)
             .await
@@ -280,6 +286,7 @@ impl FsStore {
             mirror: Some(mirror),
             primary: false,
             latch: crate::fencing::process_latch(),
+            file_locks: Arc::new(FileLocks::default()),
         })
     }
 
@@ -310,9 +317,18 @@ impl FsStore {
 
     /// Reads one key through the single shared handle.
     /// The function reads from the mirror first.
+    ///
+    /// A mirror hit comes from RAM.
+    /// A mirror miss is not proof that the key is absent, because every write
+    /// of this store goes to `inner`.
+    /// The function therefore reads `inner` on a miss, and it warms the
+    /// mirror with the value.
     async fn get_one(&self, key: &str) -> Result<Option<Vec<u8>>, FsError> {
         if let Some(mirror) = &self.mirror {
-            return mirror.get_bytes(key).await.map_err(FsError::from);
+            return mirror
+                .get_bytes_fallthrough(key)
+                .await
+                .map_err(FsError::from);
         }
         let g = self.inner.read().await;
         g.get_bytes(key).await.map_err(FsError::from)
@@ -324,12 +340,18 @@ impl FsStore {
     /// memory.
     /// Bounding the scan to a key prefix keeps the size of each scan
     /// proportional to its own key family, and not to the whole store.
+    ///
+    /// A mirrored store refreshes the mirror before the scan.
+    /// The mirror observes only the handles that write through it.
+    /// This store writes through `inner`, so a stale mirror would hide a row
+    /// that this store just wrote.
     async fn scan_prefix(&self, prefix: &str) -> Result<Vec<KeyValue>, FsError> {
         let cursor = (
             Some(prefix.to_string()),
             KeyPrefix::new(prefix).upper_bound(),
         );
         if let Some(mirror) = &self.mirror {
+            self.refresh_mirror().await?;
             return mirror
                 .gets_bytes(None, Direction::Next, cursor)
                 .await
@@ -343,12 +365,15 @@ impl FsStore {
 
     /// Scans a key range that stops at the end of the `prefix:` family and
     /// reads keys only.
+    ///
+    /// The scan takes the same refresh step as [`FsStore::scan_prefix`].
     async fn scan_keys_prefix(&self, prefix: &str) -> Result<Vec<String>, FsError> {
         let cursor = (
             Some(prefix.to_string()),
             KeyPrefix::new(prefix).upper_bound(),
         );
         if let Some(mirror) = &self.mirror {
+            self.refresh_mirror().await?;
             return mirror
                 .gets_keys(None, Direction::Next, cursor)
                 .await
@@ -555,12 +580,20 @@ impl FsStore {
     /// The transaction commits the relation marker and the ref-count update
     /// together.
     /// A crash can never leave one without the other.
+    ///
+    /// The function holds a claim on the per-file lock.
+    /// The GC sweeper takes the same lock across its ref-count check and its
+    /// delete.
+    /// An attach that commits first therefore wins, and the sweep skips the
+    /// file.
     pub async fn attach(
         &self,
         row_type: &str,
         row_id: &str,
         file_id: &str,
     ) -> Result<u32, FsError> {
+        let claim = self.file_lock(file_id);
+        let _held = claim.acquire().await;
         let rel = rel_key(row_type, row_id, file_id);
         let refs = refs_key(file_id);
         let g = self.inner.write().await;
@@ -578,7 +611,11 @@ impl FsStore {
             }
             let expected = tx.get_bytes(&refs).await.map_err(|e| self.store_err(e))?;
             let mut info = read_ref_info(&tx, file_id, self.latch, self.primary).await?;
-            info.count = info.count.saturating_add(1);
+            info.count = info.count.checked_add(1).ok_or_else(|| {
+                FsError::Store(format!(
+                    "ref count of file {file_id} is at the u32 limit, so it cannot grow"
+                ))
+            })?;
             info.orphan_since = None;
             let val = serde_json::to_vec(&info).map_err(|e| FsError::Internal(e.to_string()))?;
             tx.set_if_absent(&rel, b"1")
@@ -605,12 +642,15 @@ impl FsStore {
     /// Detaches a file from a row. The function is idempotent.
     ///
     /// The atomicity contract is the same as for [`FsStore::attach`].
+    /// The function holds the same per-file lock.
     pub async fn detach(
         &self,
         row_type: &str,
         row_id: &str,
         file_id: &str,
     ) -> Result<u32, FsError> {
+        let claim = self.file_lock(file_id);
+        let _held = claim.acquire().await;
         let rel = rel_key(row_type, row_id, file_id);
         let refs = refs_key(file_id);
         let g = self.inner.write().await;
@@ -859,6 +899,104 @@ impl FsStore {
     /// A key-ordered, paginated walk over the whole keyspace.
     pub(crate) fn pages(&self) -> KvPages {
         KvPages::new(self.kv_handle())
+    }
+
+    /// Claims the per-file lock that serializes GC against `attach` and
+    /// `detach`.
+    ///
+    /// The caller holds the claim across the ref-count check and the delete.
+    /// An attach that waits on the claim then runs after the delete, or
+    /// before the check.
+    /// In both orders no row points at bytes that are gone.
+    pub(crate) fn file_lock(&self, file_id: &str) -> FileLock {
+        self.file_locks.claim(file_id)
+    }
+}
+
+/// The per-file locks that serialize GC against `attach` and `detach`.
+///
+/// The map holds one entry for each file that a caller claims.
+/// An entry goes away when its last claim leaves, so the map does not grow
+/// with the files of the store.
+#[derive(Clone, Default)]
+pub(crate) struct FileLocks {
+    inner: Arc<Mutex<HashMap<String, Arc<FileEntry>>>>,
+}
+
+/// One file's mutex and the number of claims on it.
+struct FileEntry {
+    /// Held across the ref-count check and the delete of one file.
+    lock: tokio::sync::Mutex<()>,
+    /// The number of claims on `lock`, including a claim that still waits.
+    ///
+    /// The entry goes away only when this count reaches zero.
+    /// A claim that registered but has not run yet still owns the mutex.
+    /// If the entry vanished, the next caller would create a second mutex
+    /// for the same file.
+    claims: AtomicUsize,
+}
+
+impl FileLocks {
+    fn claim(&self, file_id: &str) -> FileLock {
+        let entry = {
+            let mut map = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let entry = Arc::clone(map.entry(file_id.to_string()).or_insert_with(|| {
+                Arc::new(FileEntry {
+                    lock: tokio::sync::Mutex::new(()),
+                    claims: AtomicUsize::new(0),
+                })
+            }));
+            entry.claims.fetch_add(1, Ordering::SeqCst);
+            entry
+        };
+        FileLock {
+            map: Arc::clone(&self.inner),
+            key: file_id.to_string(),
+            entry,
+        }
+    }
+}
+
+/// A claim on the lock of one file.
+///
+/// Drop the guard before the claim.
+/// The claim then cannot outlive the map entry of another holder.
+pub(crate) struct FileLock {
+    map: Arc<Mutex<HashMap<String, Arc<FileEntry>>>>,
+    key: String,
+    entry: Arc<FileEntry>,
+}
+
+impl FileLock {
+    /// Waits for exclusive access to the file.
+    pub(crate) async fn acquire(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.entry.lock.lock().await
+    }
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        // A poisoned map means that a holder panicked during registration.
+        // The code leaves the entry in place, and it does not remove the lock
+        // of another holder.
+        let Ok(mut map) = self.map.lock() else {
+            return;
+        };
+        if !map
+            .get(&self.key)
+            .is_some_and(|held| Arc::ptr_eq(held, &self.entry))
+        {
+            return;
+        }
+        // This runs under the map lock.
+        // A claim that registers now cannot then slip between the last claim
+        // that leaves and the entry that disappears.
+        if self.entry.claims.fetch_sub(1, Ordering::SeqCst) == 1 {
+            map.remove(&self.key);
+        }
     }
 }
 
@@ -1673,10 +1811,107 @@ mod tests {
         Ok(())
     }
 
+    /// A ref count at the `u32` limit refuses the attach instead of stalling.
+    ///
+    /// `saturating_add` kept the count at `u32::MAX` for ever.
+    /// A later detach then could not bring the count to `0`, so GC never
+    /// collected the file.
+    /// The attach now fails with a clear error, and the stored count stays
+    /// unchanged.
+    #[tokio::test]
+    async fn attach_rejects_a_ref_count_at_the_limit() -> anyhow::Result<()> {
+        let store = test_store().await;
+        let file_id = "overflow-file";
+        let refs = crate::fs::relation::refs_key(file_id);
+        let full = crate::fs::relation::RefInfo {
+            count: u32::MAX,
+            orphan_since: None,
+        };
+        store
+            .inner
+            .write()
+            .await
+            .set_bytes(&refs, &serde_json::to_vec(&full)?)
+            .await?;
+
+        let err = store
+            .attach("invoice", "1", file_id)
+            .await
+            .expect_err("an attach at the u32 limit must fail");
+        assert!(
+            err.detail().contains("u32 limit"),
+            "the error does not name the limit: {err:?}"
+        );
+        assert_eq!(store.get_ref_info(file_id).await?.count, u32::MAX);
+        Ok(())
+    }
+
     /// Clones the underlying handle for the mirror tests.
     /// The clone shares the session.
     async fn clone_handle(store: &FsStore) -> oxkv::OxKvStore {
         store.inner.read().await.clone()
+    }
+
+    /// A row that another handle writes after the warm must appear in a read.
+    ///
+    /// Every write of `FsStore` goes to `inner`.
+    /// The mirror observes only a handle that writes through it.
+    /// A warmed mirror therefore misses a new row, and the old read returned
+    /// `None` for it.
+    /// A point read falls through to `inner` on a miss.
+    /// A range scan refreshes the mirror before it reads.
+    #[tokio::test]
+    async fn mirrored_reads_see_a_row_written_after_the_warm() -> anyhow::Result<()> {
+        let plain = test_store().await;
+        let first = FileRecord {
+            id: "mirror-warm-1".to_string(),
+            name: "m.txt".to_string(),
+            mimetype: "text/plain".to_string(),
+            size: 5,
+            s3_key: "files/mirror-warm-1".to_string(),
+            owner_sub: "bob".to_string(),
+            created_at: 0,
+        };
+        plain.save_file(&first).await?;
+
+        let mirrored = FsStore::new_mirrored(clone_handle(&plain).await).await?;
+        assert!(mirrored.refresh_mirror().await? > 0);
+        assert!(mirrored.get_file("mirror-warm-1").await?.is_some());
+
+        // Both writes land after the mirror holds the full key set.
+        let second = FileRecord {
+            id: "mirror-warm-2".to_string(),
+            name: "w.txt".to_string(),
+            mimetype: "text/plain".to_string(),
+            size: 4,
+            s3_key: "files/mirror-warm-2".to_string(),
+            owner_sub: "bob".to_string(),
+            created_at: 0,
+        };
+        plain.save_file(&second).await?;
+        plain.attach("invoice", "8", "mirror-warm-2").await?;
+
+        // The point read falls through to `inner` on a miss.
+        assert_eq!(
+            mirrored
+                .get_file("mirror-warm-2")
+                .await?
+                .expect("the new row")
+                .name,
+            "w.txt"
+        );
+        // The range scan converges the mirror before it reads.
+        let listed = mirrored.list_files().await?.records;
+        assert!(
+            listed.iter().any(|r| r.id == "mirror-warm-2"),
+            "the scan missed a row that was written after the warm"
+        );
+        // The key-only scan takes the same path.
+        assert_eq!(
+            mirrored.rows_for_file("mirror-warm-2").await?,
+            vec![("invoice".to_string(), "8".to_string())]
+        );
+        Ok(())
     }
 
     #[tokio::test]

@@ -770,6 +770,31 @@ where
         self.has(key).await
     }
 
+    /// Reads `key` from memory, or from the durable core on a miss.
+    ///
+    /// A hit serves from memory with no I/O.
+    /// A miss reads the core and fills the mirror with the value.
+    /// Use this method when another handle writes the same keys.
+    /// A plain [`get_bytes`](GetSet::get_bytes) trusts a warmed mirror.
+    /// It therefore returns `None` for a key that another handle wrote after
+    /// the warm.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`StoreError`] when the mirror is poisoned, or when the core
+    /// read fails.
+    pub async fn get_bytes_fallthrough(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        self.reject_if_poisoned().await?;
+        if let Some(value) = self.mirror.get_bytes(key).await? {
+            return Ok(Some(value));
+        }
+        let value = self.inner.get_bytes(key).await?;
+        if let Some(raw) = &value {
+            self.mirror.put_bytes(key, raw).await?;
+        }
+        Ok(value)
+    }
+
     /// Scans memory in `direction`. Revalidates first when the bound
     /// elapsed.
     ///
