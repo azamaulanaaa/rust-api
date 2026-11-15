@@ -25,11 +25,15 @@
 //! - `idx:unique-key:{key}` is an empty name marker that records that some
 //!   schema version marks the attribute as unique. A schema publish writes
 //!   the marker. The marker is permanent.
-//! - `idx:unique:{key}:{hash}` is the claim for one unique value. The value
-//!   is the owning entity id. The key holds no entity id, so a write from
-//!   another handle conflicts at commit.
-//! - `idx:unique-c:{key}:{hash}:{entity_id}` is a claim for a value whose
-//!   hash collides with the primary claim.
+//! - `idx:unique-x:{key}:{hash}:{fingerprint}` is the claim for one exact
+//!   unique value. The value is the owning entity id. The key holds no entity
+//!   id, so a write from another handle conflicts at commit. The key holds
+//!   two hashes, so two values that share one hash use different keys.
+//! - `idx:unique:{key}:{hash}` is a legacy primary claim. A write still checks
+//!   it and releases it. No new claim uses this form.
+//! - `idx:unique-c:{key}:{hash}:{entity_id}` is a claim for a value that
+//!   shares both claim hashes with another value. A write still checks it and
+//!   releases it.
 //! - `idx:unique:{key}:{hash}:{entity_id}` is a legacy unique value marker.
 //!   A write still checks it and releases it. No new marker uses this form.
 //! - `idx:time:{key}:{encoded_ts}:{entity_id}` is a time marker.
@@ -49,6 +53,8 @@
 //!   include it.
 //!
 //! The `hash` is the lowercase SHA-256 hex of the canonical tagged JSON value.
+//! The `fingerprint` is the first 32 bytes of SHA-512 over the same bytes, as
+//! 64 lowercase hex digits.
 //! The `encoded_ts` is the timestamp XORed with the sign bit, as 16 hex digits.
 //! Lexicographic key order then equals numeric time order.
 //! A schema marker exists for the pinned schema and for each inherited schema.
@@ -159,7 +165,7 @@ use oxkv::{
     Transaction as _, TxCas,
 };
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha256, Sha512};
 use tokio::sync::{Mutex, RwLock};
 
 use crate::eav::MAX_PAGE_OFFSET;
@@ -249,13 +255,19 @@ const ATTR_INDEX_PREFIX: &str = "idx:attr:";
 /// Key prefix for the name marker of an indexed attribute.
 pub(crate) const ATTR_KEY_PREFIX: &str = "idx:attr-key:";
 
-/// Key prefix for unique value claims.
+/// Key prefix for legacy unique value claims.
 const UNIQUE_CLAIM_PREFIX: &str = "idx:unique:";
+
+/// Key prefix for exact unique value claims.
+///
+/// The prefix is separate from [`UNIQUE_CLAIM_PREFIX`], so a legacy claim
+/// scan cannot read a new claim as a legacy marker.
+const UNIQUE_EXACT_PREFIX: &str = "idx:unique-x:";
 
 /// Key prefix for the name marker of a unique attribute.
 pub(crate) const UNIQUE_KEY_PREFIX: &str = "idx:unique-key:";
 
-/// Key prefix for a unique claim that resolves a hash collision.
+/// Key prefix for a claim that resolves a double hash collision.
 const UNIQUE_EXTRA_PREFIX: &str = "idx:unique-c:";
 
 /// Key prefix for time index markers.
@@ -3783,7 +3795,8 @@ where
 /// An entity that holds the same value is idempotent.
 /// A claim that names another entity is a violation only when the exact
 /// stored value is the same.
-/// The call also checks the collision claims and the legacy markers.
+/// The call also checks the legacy primary claim, the collision claims, and
+/// the legacy markers.
 async fn check_unique<S>(
     store: &S,
     entity_id: &str,
@@ -3794,8 +3807,19 @@ where
     S: GetSet + ?Sized + Sync,
 {
     let hash = value_hash(value)?;
-    let claim = unique_claim_key(key, &hash);
+    let fingerprint = value_fingerprint(value)?;
+    let claim = unique_claim_key(key, &hash, &fingerprint);
     if let Some(bytes) = store.get_bytes(&claim).await.map_err(EntityError::Store)?
+        && let Some(owner) = claim_owner(&bytes)
+        && owner != entity_id
+    {
+        check_unique_owner(store, owner, key, value).await?;
+    }
+    let legacy_primary = unique_legacy_primary_key(key, &hash);
+    if let Some(bytes) = store
+        .get_bytes(&legacy_primary)
+        .await
+        .map_err(EntityError::Store)?
         && let Some(owner) = claim_owner(&bytes)
         && owner != entity_id
     {
@@ -3969,10 +3993,11 @@ where
 
 /// Stages the unique claim of one value.
 ///
-/// The call requires the claim to be absent at commit, so two handles that
-/// write the same value produce one success and one conflict.
+/// The call requires the primary claim to be absent at commit, so two handles
+/// that write the same exact value produce one success and one conflict.
 /// A claim key that this transaction released uses an unconditional write.
-/// A hash collision uses a second claim key that holds the entity id.
+/// A value that shares both claim hashes with another value uses a second
+/// claim key that holds the entity id.
 async fn claim_unique<S>(
     store: &S,
     entity: &Entity,
@@ -3984,7 +4009,8 @@ where
     S: TxCas + ?Sized,
 {
     let hash = value_hash(value)?;
-    let claim = unique_claim_key(key, &hash);
+    let fingerprint = value_fingerprint(value)?;
+    let claim = unique_claim_key(key, &hash, &fingerprint);
     let owner = entity.id.as_bytes();
     let current = store.get_bytes(&claim).await.map_err(EntityError::Store)?;
     match current.as_deref().and_then(claim_owner) {
@@ -4012,6 +4038,8 @@ where
             }
         }
         Some(owner_id) => {
+            // Two different values can share both claim hashes only with two
+            // deliberate collisions. The exact-value check keeps them apart.
             check_unique_owner(store, owner_id, key, value).await?;
             let extra = unique_extra_key(key, &hash, &entity.id);
             if state.released_claims.contains(&extra) {
@@ -4253,7 +4281,8 @@ where
 
 /// Releases the unique claim of one value.
 ///
-/// The call deletes the primary claim only when this entity owns it.
+/// The call deletes the exact claim and the legacy primary claim only when
+/// this entity owns them.
 /// It deletes the collision claim and the legacy marker of this entity.
 /// The transaction remembers each deleted claim key, so a later claim in the
 /// same plan writes it without a guard.
@@ -4268,7 +4297,8 @@ where
     S: GetSet + ?Sized,
 {
     let hash = value_hash(value)?;
-    let claim = unique_claim_key(key, &hash);
+    let fingerprint = value_fingerprint(value)?;
+    let claim = unique_claim_key(key, &hash, &fingerprint);
     let owned = store
         .get_bytes(&claim)
         .await
@@ -4279,6 +4309,21 @@ where
     if owned {
         store.delete(&claim).await.map_err(EntityError::Store)?;
         state.released_claims.insert(claim);
+    }
+    let legacy_primary = unique_legacy_primary_key(key, &hash);
+    let legacy_owned = store
+        .get_bytes(&legacy_primary)
+        .await
+        .map_err(EntityError::Store)?
+        .as_deref()
+        .and_then(claim_owner)
+        == Some(entity_id);
+    if legacy_owned {
+        store
+            .delete(&legacy_primary)
+            .await
+            .map_err(EntityError::Store)?;
+        state.released_claims.insert(legacy_primary);
     }
     let extra = unique_extra_key(key, &hash, entity_id);
     if store
@@ -4515,15 +4560,22 @@ pub(crate) fn unique_name_key(key: &str) -> String {
     format!("{UNIQUE_KEY_PREFIX}{key}")
 }
 
-/// The claim key for one unique attribute value.
+/// The exact claim key for one unique attribute value.
 ///
-/// The key holds no entity id, so two writers of one value contend for one
-/// key.
-fn unique_claim_key(key: &str, hash: &str) -> String {
+/// The key holds two hashes of the canonical value, so two values that share
+/// one hash use different keys.
+/// The key holds no entity id, so two writers of one exact value contend for
+/// one key.
+fn unique_claim_key(key: &str, hash: &str, fingerprint: &str) -> String {
+    format!("{UNIQUE_EXACT_PREFIX}{key}:{hash}:{fingerprint}")
+}
+
+/// The legacy primary claim key for one unique attribute value.
+fn unique_legacy_primary_key(key: &str, hash: &str) -> String {
     format!("{UNIQUE_CLAIM_PREFIX}{key}:{hash}")
 }
 
-/// The claim key for one hash collision and entity.
+/// The claim key for one double hash collision and entity.
 fn unique_extra_key(key: &str, hash: &str, entity_id: &str) -> String {
     format!("{UNIQUE_EXTRA_PREFIX}{key}:{hash}:{entity_id}")
 }
@@ -4654,14 +4706,69 @@ fn is_time_attribute(def: &AttributeDef) -> bool {
 /// Returns the lowercase SHA-256 hex of the canonical tagged JSON value.
 fn value_hash(value: &AttributeValue) -> Result<String, EntityError> {
     let bytes = serde_json::to_vec(value).map_err(|e| EntityError::Internal(e.to_string()))?;
-    let digest = Sha256::digest(&bytes);
+    #[cfg(test)]
+    if let Some(hash) = forced_value_hash(&bytes) {
+        return Ok(hash);
+    }
+    Ok(hex_digest(&Sha256::digest(&bytes)))
+}
+
+/// Returns the first 32 bytes of SHA-512 of the canonical tagged JSON value,
+/// as lowercase hex.
+///
+/// The fingerprint is independent from [`value_hash`].
+/// The unique claim key holds both hashes, so two values that share one hash
+/// still use different claim keys.
+fn value_fingerprint(value: &AttributeValue) -> Result<String, EntityError> {
+    let bytes = serde_json::to_vec(value).map_err(|e| EntityError::Internal(e.to_string()))?;
+    let digest = Sha512::digest(&bytes);
+    let first = &digest[..32];
+    Ok(hex_digest(first))
+}
+
+/// Returns the lowercase hex form of a digest.
+fn hex_digest(digest: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(64);
+    let mut out = String::with_capacity(digest.len() * 2);
     for byte in digest {
         out.push(HEX[(byte >> 4) as usize] as char);
         out.push(HEX[(byte & 0x0f) as usize] as char);
     }
-    Ok(out)
+    out
+}
+
+// The test-only SHA-256 overrides of one thread.
+#[cfg(test)]
+thread_local! {
+    /// Maps canonical value bytes to a forced SHA-256 hash.
+    static FORCED_VALUE_HASHES: std::cell::RefCell<BTreeMap<Vec<u8>, String>> =
+        const { std::cell::RefCell::new(BTreeMap::new()) };
+}
+/// Forces one SHA-256 hash for each value in a test.
+///
+/// The test uses the helper to inject two values that share one hash without
+/// a real SHA-256 collision.
+#[cfg(test)]
+fn force_equal_value_hash(values: &[&AttributeValue], hash: &str) {
+    FORCED_VALUE_HASHES.with(|overrides| {
+        let mut overrides = overrides.borrow_mut();
+        for value in values {
+            let bytes = serde_json::to_vec(value).unwrap();
+            overrides.insert(bytes, hash.to_string());
+        }
+    });
+}
+
+/// Reads a forced SHA-256 hash for one canonical value in a test.
+#[cfg(test)]
+fn forced_value_hash(bytes: &[u8]) -> Option<String> {
+    FORCED_VALUE_HASHES.with(|overrides| overrides.borrow().get(bytes).cloned())
+}
+
+/// Clears every forced SHA-256 hash of one thread in a test.
+#[cfg(test)]
+fn clear_forced_value_hashes() {
+    FORCED_VALUE_HASHES.with(|overrides| overrides.borrow_mut().clear());
 }
 
 /// Maps a schema registry error into an entity error.
@@ -6852,6 +6959,7 @@ mod tests {
             .await
             .unwrap();
         let old_hash = value_hash(&s("a@example.com")).unwrap();
+        let old_fingerprint = value_fingerprint(&s("a@example.com")).unwrap();
         // Simulate a collision: `b` also claims the hash of the value of `a`.
         // The exact value of `b` is different, so the claim does not block a
         // different value.
@@ -6868,7 +6976,7 @@ mod tests {
             .await;
         assert!(matches!(duplicate, Err(EntityError::UniqueViolation(key)) if key == "email"));
         let claim_a = raw
-            .get_bytes(&unique_claim_key("email", &old_hash))
+            .get_bytes(&unique_claim_key("email", &old_hash, &old_fingerprint))
             .await
             .unwrap();
         assert_eq!(claim_a.as_deref(), Some(b"a".as_slice()));
@@ -6893,12 +7001,13 @@ mod tests {
             .unwrap();
 
         let new_hash = value_hash(&s("new@example.com")).unwrap();
+        let new_fingerprint = value_fingerprint(&s("new@example.com")).unwrap();
         let claim_new = raw
-            .get_bytes(&unique_claim_key("email", &new_hash))
+            .get_bytes(&unique_claim_key("email", &new_hash, &new_fingerprint))
             .await
             .unwrap();
         let claim_old = raw
-            .get_bytes(&unique_claim_key("email", &old_hash))
+            .get_bytes(&unique_claim_key("email", &old_hash, &old_fingerprint))
             .await
             .unwrap();
         let extra_b = raw
@@ -6908,6 +7017,12 @@ mod tests {
         assert_eq!(claim_new.as_deref(), Some(b"a".as_slice()));
         assert_eq!(claim_old.as_deref(), Some(b"c".as_slice()));
         assert_eq!(extra_b.as_deref(), Some(b"b".as_slice()));
+        assert!(
+            raw.get_bytes(&unique_legacy_primary_key("email", &old_hash))
+                .await
+                .unwrap()
+                .is_none()
+        );
 
         let result = store
             .create(
@@ -7098,6 +7213,87 @@ mod tests {
             )
             .await;
         assert!(matches!(result, Err(EntityError::UniqueViolation(_))));
+    }
+
+    #[tokio::test]
+    async fn two_values_that_share_a_hash_keep_separate_unique_claims() {
+        let (store, registry, raw) = new_store().await;
+        registry
+            .publish(schema(
+                "person",
+                &[],
+                vec![full_attr(
+                    "email",
+                    AttributeType::String,
+                    false,
+                    false,
+                    true,
+                    None,
+                )],
+            ))
+            .await
+            .unwrap();
+        let first = s("a@example.com");
+        let second = s("b@example.com");
+        let forced = "0".repeat(64);
+        clear_forced_value_hashes();
+        force_equal_value_hash(&[&first, &second], &forced);
+
+        store
+            .create(
+                draft("e1", &["person"], vec![("email", first.clone())]),
+                &ctx(),
+            )
+            .await
+            .unwrap();
+        store
+            .create(
+                draft("e2", &["person"], vec![("email", second.clone())]),
+                &ctx(),
+            )
+            .await
+            .unwrap();
+
+        let first_hash = value_hash(&first).unwrap();
+        let second_hash = value_hash(&second).unwrap();
+        let first_fingerprint = value_fingerprint(&first).unwrap();
+        let second_fingerprint = value_fingerprint(&second).unwrap();
+        assert_eq!(first_hash, forced);
+        assert_eq!(second_hash, forced);
+        assert_ne!(first_fingerprint, second_fingerprint);
+        assert_eq!(
+            raw.get_bytes(&unique_claim_key("email", &first_hash, &first_fingerprint))
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(b"e1".as_slice())
+        );
+        assert_eq!(
+            raw.get_bytes(&unique_claim_key(
+                "email",
+                &second_hash,
+                &second_fingerprint
+            ))
+            .await
+            .unwrap()
+            .as_deref(),
+            Some(b"e2".as_slice())
+        );
+        assert!(
+            raw.get_bytes(&unique_legacy_primary_key("email", &forced))
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        for value in [first, second] {
+            let duplicate = store
+                .create(draft("e3", &["person"], vec![("email", value)]), &ctx())
+                .await;
+            assert!(matches!(duplicate, Err(EntityError::UniqueViolation(key)) if key == "email"));
+        }
+        assert!(store.get("e3").await.unwrap().is_none());
+        clear_forced_value_hashes();
     }
 
     #[tokio::test]
