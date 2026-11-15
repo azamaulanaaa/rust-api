@@ -133,8 +133,9 @@ pub fn docs_routes(cfg: &mut web::ServiceConfig, expose: bool) {
 /// without a trailing slash. The function always allows credentials. The
 /// `auth_token` cookie and the `Authorization` bearer header work across
 /// origins. The function exposes the `ETag`, range, `Date`, and server-time
-/// headers. The `/sync/db/*` conditional polls and the `/fs` ranged downloads
-/// work from the browser. A browser client can also read `X-Server-Time-Ms`.
+/// headers, and the four `X-Replica-*` headers. The `/sync/db/*` conditional
+/// polls and the `/fs` ranged downloads work from the browser. A browser client
+/// can also read `X-Server-Time-Ms` and the replica page headers.
 pub fn cors(allowed_origins: &[String]) -> actix_cors::Cors {
     use actix_web::http::header;
     let mut cors = actix_cors::Cors::default()
@@ -157,6 +158,12 @@ pub fn cors(allowed_origins: &[String]) -> actix_cors::Cors {
             header::DATE,
         ])
         .expose_headers(vec![middleware::server_time::SERVER_TIME_HEADER])
+        .expose_headers(vec![
+            header::HeaderName::from_static("x-replica-head"),
+            header::HeaderName::from_static("x-replica-generation"),
+            header::HeaderName::from_static("x-replica-chunk"),
+            header::HeaderName::from_static("x-replica-chunks"),
+        ])
         .supports_credentials()
         .max_age(3600);
     for origin in allowed_origins {
@@ -692,10 +699,10 @@ mod tests {
         }
     }
 
-    /// CORS lets a browser read the server-time header and the `Date`
-    /// fallback.
+    /// CORS lets a browser read the server-time header, the `Date` fallback,
+    /// and the replica page headers.
     #[actix_web::test]
-    async fn cors_exposes_server_time_and_date() {
+    async fn cors_exposes_server_time_date_and_replica_headers() {
         let service = ApiService::new().with_cors_origins(vec!["https://app.example.com".into()]);
         let app = served!(service);
         let res = test::call_service(
@@ -711,7 +718,14 @@ mod tests {
             .get("access-control-expose-headers")
             .and_then(|v| v.to_str().ok())
             .expect("CORS expose header");
-        for name in ["x-server-time-ms", "date"] {
+        for name in [
+            "x-server-time-ms",
+            "date",
+            "x-replica-head",
+            "x-replica-generation",
+            "x-replica-chunk",
+            "x-replica-chunks",
+        ] {
             assert!(
                 exposed
                     .split(',')
