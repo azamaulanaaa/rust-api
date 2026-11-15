@@ -77,7 +77,11 @@ pub enum JobStatus {
     Leased {
         /// Worker that holds the lease.
         worker: String,
-        /// Lease expiry time, in unix seconds.
+        /// Lease expiry time, in unix milliseconds.
+        ///
+        /// The value has millisecond precision, so a lease below one second
+        /// keeps its full duration. All other times in this type use unix
+        /// seconds.
         expires_at: i64,
     },
     /// The job finished well.
@@ -284,6 +288,20 @@ pub mod durable;
 pub mod worker;
 
 pub use metrics::QueueMetrics;
+
+/// Converts a lease duration to milliseconds for storage.
+///
+/// The call rounds a non-zero duration up to the next millisecond.
+/// A zero duration stays zero, so the lease expires at once.
+pub(crate) fn lease_millis(duration: Duration) -> i64 {
+    let millis = duration.as_millis();
+    let millis = if duration.subsec_nanos().is_multiple_of(1_000_000) {
+        millis
+    } else {
+        millis.saturating_add(1)
+    };
+    i64::try_from(millis).unwrap_or(i64::MAX)
+}
 
 #[cfg(feature = "queue-rabbitmq")]
 pub mod rabbitmq;
