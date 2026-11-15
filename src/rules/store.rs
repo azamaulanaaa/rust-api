@@ -15,7 +15,8 @@
 //! The engine keeps two more key families:
 //!
 //! - `rule-attempt:{seq}:{event_id}` holds a JSON `u32` attempt count.
-//! - `rule-dead:{seq}:{event_id}` holds one [`RuleDeadLetter`] as JSON.
+//! - `rule-dead:{seq}:{event_id}:{rule_id}` holds one [`RuleDeadLetter`]
+//!   as JSON.
 //!
 //! # Writes
 //!
@@ -135,6 +136,11 @@ pub struct RuleDeadLetter {
     pub seq: u64,
     /// The id of the failed event.
     pub event_id: String,
+    /// The id of the failed rule.
+    ///
+    /// An old row has no rule id and decodes as an empty string.
+    #[serde(default)]
+    pub rule_id: String,
     /// The number of failed attempts.
     pub attempts: u32,
     /// The sanitized error text.
@@ -514,13 +520,13 @@ impl RuleStore {
 
     /// Writes one dead-letter row.
     ///
-    /// The key is `rule-dead:{seq}:{event_id}`.
+    /// The key is `rule-dead:{seq}:{event_id}:{rule_id}`.
     /// The value holds a [`RuleDeadLetter`] as JSON.
     pub(crate) async fn write_dead_letter(&self, dead: &RuleDeadLetter) -> Result<(), RuleError> {
         let bytes = serde_json::to_vec(dead)
             .map_err(|error| RuleError::Serialization(error.to_string()))?;
         let g = self.store.write().await;
-        g.put_bytes(&dead_key(dead.seq, &dead.event_id), &bytes)
+        g.put_bytes(&dead_key(dead.seq, &dead.event_id, &dead.rule_id), &bytes)
             .await
             .map_err(RuleError::Store)
     }
@@ -835,8 +841,8 @@ fn attempt_key(seq: u64, event_id: &str) -> String {
 }
 
 /// The key that holds one dead-letter row.
-fn dead_key(seq: u64, event_id: &str) -> String {
-    format!("{DEAD_PREFIX}{seq}:{event_id}")
+fn dead_key(seq: u64, event_id: &str, rule_id: &str) -> String {
+    format!("{DEAD_PREFIX}{seq}:{event_id}:{rule_id}")
 }
 
 /// Sorts rules by priority in descending order and then by id.
@@ -1261,6 +1267,7 @@ mod tests {
         RuleDeadLetter {
             seq,
             event_id: event_id.to_string(),
+            rule_id: "alpha".to_string(),
             attempts: 5,
             error: "rule action failed: record".to_string(),
             at,
@@ -1331,6 +1338,23 @@ mod tests {
 
         store.clear_entry_attempts(1, "evt-1").await.unwrap();
         assert_eq!(store.entry_attempts(1, "evt-1").await.unwrap(), 0);
+    }
+
+    /// An old dead-letter row has no rule id and decodes as an empty string.
+    #[test]
+    fn an_old_dead_letter_without_a_rule_id_decodes() {
+        let stored = serde_json::json!({
+            "seq": 1,
+            "event_id": "evt-1",
+            "attempts": 5,
+            "error": "rule action failed: record",
+            "at": 10
+        });
+
+        let entry: RuleDeadLetter = serde_json::from_value(stored).expect("old row parses");
+
+        assert_eq!(entry.rule_id, "");
+        assert_eq!(entry.seq, 1);
     }
 
     #[tokio::test]
