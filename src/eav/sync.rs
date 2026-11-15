@@ -74,6 +74,7 @@ use actix_web::{
     post, web,
 };
 use serde::Serialize;
+use std::time::Instant;
 
 use crate::eav::entity::Entity;
 use crate::eav::entity_error::EntityError;
@@ -674,6 +675,22 @@ fn replica_entity_limit(runtime: &EavRuntime) -> usize {
 #[utoipa::path(post, path = "/eav/sync/replica", tag = "eav", responses((status = 200, body = ReplicaBuildResponse), (status = 400, body = crate::http::error::ErrorBody), (status = 401, body = crate::http::error::ErrorBody), (status = 409, body = crate::http::error::ErrorBody), (status = 500, body = crate::http::error::ErrorBody)))]
 #[post("/sync/replica")]
 pub(crate) async fn build_replica(
+    runtime: web::Data<EavRuntime>,
+    policy: web::Data<Authorizer>,
+    claims: Validated<Claims>,
+) -> Result<HttpResponse, EavApiError> {
+    let started = Instant::now();
+    let metrics = runtime.metrics().clone();
+    let result = build_replica_inner(runtime, policy, claims).await;
+    match &result {
+        Ok(_) => metrics.record_replica_build(started.elapsed()),
+        Err(_) => metrics.record_replica_build_failure(),
+    }
+    result
+}
+
+/// Builds a stored replica for the caller.
+async fn build_replica_inner(
     runtime: web::Data<EavRuntime>,
     policy: web::Data<Authorizer>,
     claims: Validated<Claims>,
