@@ -241,7 +241,11 @@ pub struct RulePageQuery {
     #[serde(default)]
     pub offset: Option<usize>,
     /// Rejected. The rule list supports offset paging only.
+    ///
+    /// The field stays for the `400` check. The OpenAPI document does not
+    /// advertise it.
     #[serde(default)]
+    #[param(ignore)]
     pub after: Option<String>,
 }
 
@@ -1325,7 +1329,17 @@ async fn delete_rule(
     Ok(HttpResponse::NoContent().finish())
 }
 
-#[utoipa::path(post, path = "/eav/rules/{id}/enabled", tag = "eav", params(("id" = String, Path)), request_body = RuleEnabledRequest, responses((status=200, body=crate::rules::rule::Rule), (status=400, body=crate::http::error::ErrorBody), (status=401, body=crate::http::error::ErrorBody), (status=403, body=crate::http::error::ErrorBody), (status=404, body=crate::http::error::ErrorBody), (status=500, body=crate::http::error::ErrorBody)))]
+/// Enables or disables one rule.
+///
+/// The caller needs `write` on `eav_rules`.
+/// The route repeats the capability checks of the create route on the stored
+/// rule.
+/// A non-empty `read` list also needs `read` on `eav_entities`.
+/// A non-empty `write` list also needs `write` on `eav_entities`.
+/// A caller can then not enable a rule that it could not create.
+/// The toggle uses the stored version as a compare-and-set guard.
+/// A concurrent write to the same rule returns `409`.
+#[utoipa::path(post, path = "/eav/rules/{id}/enabled", tag = "eav", params(("id" = String, Path)), request_body = RuleEnabledRequest, responses((status=200, body=crate::rules::rule::Rule), (status=400, body=crate::http::error::ErrorBody), (status=401, body=crate::http::error::ErrorBody), (status=403, body=crate::http::error::ErrorBody), (status=404, body=crate::http::error::ErrorBody), (status=409, body=crate::http::error::ErrorBody), (status=500, body=crate::http::error::ErrorBody)))]
 #[post("/rules/{id}/enabled")]
 async fn set_rule_enabled(
     runtime: web::Data<EavRuntime>,
@@ -1336,7 +1350,21 @@ async fn set_rule_enabled(
 ) -> Result<HttpResponse, EavApiError> {
     require_management(&policy, &claims.sub, RULES, Action::Write).await?;
     let id = path.into_inner();
-    let rule = runtime.rules().set_enabled(&id, body.enabled).await?;
+    let rule = runtime
+        .rules()
+        .get(&id)
+        .await?
+        .ok_or_else(EavApiError::not_found)?;
+    if !rule.capabilities.read.is_empty() {
+        require_management(&policy, &claims.sub, ENTITIES, Action::Read).await?;
+    }
+    if !rule.capabilities.write.is_empty() {
+        require_management(&policy, &claims.sub, ENTITIES, Action::Write).await?;
+    }
+    let rule = runtime
+        .rules()
+        .set_enabled_version(&id, body.enabled, Some(rule.version))
+        .await?;
     Ok(HttpResponse::Ok().json(rule))
 }
 
@@ -3038,6 +3066,74 @@ mod tests {
             assert!(body["items"].is_null(), "{uri} returned a page");
         }
         Ok(())
+    }
+
+    #[actix_web::test]
+    async fn a_caller_without_entity_grants_cannot_enable_a_broad_rule() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        assert!(fx.engine.claim_superadmin("alice").await?);
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+
+        let mut body = rule_body();
+        body["enabled"] = json!(false);
+        body["capabilities"] = json!({"read": ["task"], "write": []});
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::post()
+                    .uri("/eav/rules")
+                    .set_json(body),
+                &fx.token("alice")?,
+            )
+            .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::CREATED);
+
+        fx.engine
+            .add_rule("bob".into(), "eav_rules".into(), Action::Write)
+            .await?;
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::post()
+                    .uri("/eav/rules/alpha/enabled")
+                    .set_json(json!({"enabled": true})),
+                &fx.token("bob")?,
+            )
+            .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::FORBIDDEN);
+
+        let stored = fx.runtime.rules().get("alpha").await?.expect("rule exists");
+        assert!(!stored.enabled, "the refused caller changed the rule");
+        Ok(())
+    }
+
+    #[test]
+    fn the_rule_list_does_not_advertise_a_cursor() {
+        let spec: Value =
+            serde_json::from_str(&ApiDoc::openapi().to_json().expect("spec serializes"))
+                .expect("spec is JSON");
+        let parameters = spec["paths"]["/eav/rules"]["get"]["parameters"]
+            .as_array()
+            .expect("parameters");
+
+        assert!(
+            !parameters
+                .iter()
+                .any(|parameter| parameter["name"] == "after"),
+            "the rule list advertises a cursor: {parameters:?}"
+        );
+        assert!(
+            parameters
+                .iter()
+                .any(|parameter| parameter["name"] == "offset"),
+            "the rule list lost its offset parameter: {parameters:?}"
+        );
     }
 
     #[actix_web::test]
