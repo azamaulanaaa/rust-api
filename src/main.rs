@@ -22,13 +22,19 @@ use clap::{Parser, Subcommand};
 use url::Url;
 
 use rust_api::{
-    eav::route::EavApiModule,
+    eav::{
+        entity::EntityStore,
+        portable::{self, ValidationReport},
+        route::EavApiModule,
+        schema::SchemaRegistry,
+    },
     fs::{FsEngine, TokenKeys, route::FsApiModule, s3::S3ClientConfig, store::FsStore},
     http::{ApiService, middleware::jwt::Claims},
     oidc::{OidcClient, OidcConfig, route::OidcApiModule},
     policy::{PolicyEngine, admin, route::PolicyApiModule, setup::SetupApiModule},
     queue::{QueueWorker, durable::DurableQueue},
     rules::builtin::{LogAction, NoopAction},
+    rules::store::RuleStore,
     rules::webhook::WebhookAction,
     sync::{route::SyncApiModule, snapshot::SnapshotManager, wal::Wal},
     telemetry,
@@ -61,7 +67,7 @@ enum Command {
         #[command(subcommand)]
         action: PolicyAction,
     },
-    /// Operator recovery tools for the EAV stores.
+    /// Operator recovery and data management tools for the EAV stores.
     Eav {
         #[command(subcommand)]
         action: EavAction,
@@ -115,7 +121,7 @@ enum PolicyAction {
     },
 }
 
-/// Actions that recover the EAV stores.
+/// Actions that manage or recover the EAV stores. The store must be S3.
 #[derive(Subcommand, Debug)]
 enum EavAction {
     /// Sets the durable rule cursor to an earlier feed sequence.
@@ -132,6 +138,43 @@ enum EavAction {
         /// The value must be at or below the feed head.
         #[arg(long)]
         to: u64,
+    },
+    /// Writes every stored schema, entity, and rule to a JSON file.
+    Export {
+        /// Path of the TOML config file. It provides `[s3]` and
+        /// `[database].prefix`.
+        #[arg(short, long)]
+        config: PathBuf,
+        /// Path of the output JSON file.
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Reads a JSON file into an empty EAV prefix and checks the restore.
+    Import {
+        /// Path of the TOML config file. It provides `[s3]` and
+        /// `[database].prefix`.
+        #[arg(short, long)]
+        config: PathBuf,
+        /// Path of the input JSON file.
+        #[arg(long = "in")]
+        input: PathBuf,
+    },
+    /// Rewrites the EAV index rows from the stored entities.
+    RebuildIndex {
+        /// Path of the TOML config file. It provides `[s3]` and
+        /// `[database].prefix`.
+        #[arg(short, long)]
+        config: PathBuf,
+        /// Rebuild only the entities that pin this schema id.
+        #[arg(long)]
+        schema: Option<String>,
+    },
+    /// Checks the pinned schemas, the unique claims, and the references.
+    Validate {
+        /// Path of the TOML config file. It provides `[s3]` and
+        /// `[database].prefix`.
+        #[arg(short, long)]
+        config: PathBuf,
     },
 }
 
@@ -252,11 +295,38 @@ async fn run_policy_command(action: PolicyAction) -> anyhow::Result<()> {
     }
 }
 
-/// Runs one EAV recovery command.
+/// Runs one EAV command.
 async fn run_eav_command(action: EavAction) -> anyhow::Result<()> {
-    match action {
-        EavAction::ResetCursor { config, to } => reset_eav_cursor(&config, to).await,
+    if let EavAction::ResetCursor { config, to } = &action {
+        return reset_eav_cursor(config, *to).await;
     }
+
+    let purpose = eav_action_name(&action);
+    let config = match &action {
+        EavAction::ResetCursor { config, .. }
+        | EavAction::Export { config, .. }
+        | EavAction::Import { config, .. }
+        | EavAction::RebuildIndex { config, .. }
+        | EavAction::Validate { config } => config,
+    };
+    let cfg = config::Config::try_from(config.as_path())?;
+    let s3_cfg = s3_client_config(&cfg);
+    let db_prefix = cfg.database.prefix.trim_matches('/').to_string();
+
+    let (_lost, guard) = claim_writer_lease(
+        &s3_cfg,
+        &db_prefix,
+        cfg.database.writer_lease_ttl_secs,
+        purpose,
+    )
+    .await?;
+
+    let result = run_eav_action(&action, &s3_cfg, &db_prefix).await;
+
+    if let Some(guard) = guard {
+        guard.release().await;
+    }
+    result
 }
 
 /// Refuses a cursor above the feed head.
@@ -372,6 +442,140 @@ async fn import_policy(
         report.rules_added, report.groups_added, report.duplicates, db_prefix
     );
     Ok(())
+}
+
+/// One line that names the action which asks for the lease.
+fn eav_action_name(action: &EavAction) -> &'static str {
+    match action {
+        EavAction::ResetCursor { .. } => "eav reset-cursor",
+        EavAction::Export { .. } => "eav export",
+        EavAction::Import { .. } => "eav import",
+        EavAction::RebuildIndex { .. } => "eav rebuild-index",
+        EavAction::Validate { .. } => "eav validate",
+    }
+}
+
+/// Returns the store prefix for one EAV domain.
+///
+/// An empty root omits the leading slash.
+/// The server uses the same layout.
+fn eav_domain_prefix(db_prefix: &str, domain: &str) -> String {
+    let root = db_prefix.trim_matches('/');
+    if root.is_empty() {
+        format!("eav/{domain}")
+    } else {
+        format!("{root}/eav/{domain}")
+    }
+}
+
+/// Builds the three EAV stores at the prefixes of the server.
+async fn build_eav_stores(
+    s3_cfg: &S3ClientConfig,
+    db_prefix: &str,
+) -> anyhow::Result<(SchemaRegistry, EntityStore, RuleStore)> {
+    let schema_store =
+        rust_api::db::build_s3_store(s3_cfg, &eav_domain_prefix(db_prefix, "schema"))
+            .await
+            .context("build the EAV schema store")?;
+    let entity_store =
+        rust_api::db::build_s3_store(s3_cfg, &eav_domain_prefix(db_prefix, "entity"))
+            .await
+            .context("build the EAV entity store")?;
+    let rule_store = rust_api::db::build_s3_store(s3_cfg, &eav_domain_prefix(db_prefix, "rules"))
+        .await
+        .context("build the EAV rule store")?;
+    let schemas = SchemaRegistry::new(schema_store);
+    let entities = EntityStore::new(entity_store, schemas.clone());
+    let rules = RuleStore::new(rule_store);
+    Ok((schemas, entities, rules))
+}
+
+/// Builds the stores and runs the selected `eav` action.
+async fn run_eav_action(
+    action: &EavAction,
+    s3_cfg: &S3ClientConfig,
+    db_prefix: &str,
+) -> anyhow::Result<()> {
+    let (schemas, entities, rules) = build_eav_stores(s3_cfg, db_prefix).await?;
+    match action {
+        EavAction::ResetCursor { to, .. } => {
+            reset_eav_cursor_with_store(s3_cfg, db_prefix, *to).await?;
+        }
+        EavAction::Export { out, .. } => {
+            let file =
+                std::fs::File::create(out).with_context(|| format!("create {}", out.display()))?;
+            let mut writer = std::io::BufWriter::new(file);
+            let report = portable::export(&schemas, &entities, &rules, &mut writer).await?;
+            println!(
+                "exported {} schema records, {} entity records, and {} rule records to {}",
+                report.schemas,
+                report.entities,
+                report.rules,
+                out.display()
+            );
+        }
+        EavAction::Import { input, .. } => {
+            let file =
+                std::fs::File::open(input).with_context(|| format!("read {}", input.display()))?;
+            let reader = std::io::BufReader::new(file);
+            let report = portable::import(&schemas, &entities, &rules, reader).await?;
+            println!(
+                "imported {} schema records, {} entity records, and {} rule records into {db_prefix}",
+                report.schemas, report.entities, report.rules
+            );
+            let validation = portable::validate(&schemas, &entities, &rules).await?;
+            print_validation_report(&validation);
+            if !validation.is_ok() {
+                anyhow::bail!("restore validation failed");
+            }
+        }
+        EavAction::RebuildIndex { schema, .. } => {
+            let report = portable::rebuild_indexes(&entities, schema.as_deref()).await?;
+            println!(
+                "rebuilt {} entities in {} pages: {} attribute rows, {} unique claims, {} time rows, and {} name markers",
+                report.entities,
+                report.pages,
+                report.attribute_rows,
+                report.unique_claims,
+                report.time_rows,
+                report.name_markers
+            );
+        }
+        EavAction::Validate { .. } => {
+            let report = portable::validate(&schemas, &entities, &rules).await?;
+            print_validation_report(&report);
+            if !report.is_ok() {
+                anyhow::bail!("restore validation failed");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Prints the counts and the problems of one restore check.
+fn print_validation_report(report: &ValidationReport) {
+    println!(
+        "checked {} schemas, {} entities, and {} rules",
+        report.schemas, report.entities, report.rules
+    );
+    for issue in &report.missing_schemas {
+        println!(
+            "entity {} pins missing schema {} version {}",
+            issue.entity_id, issue.schema_id, issue.version
+        );
+    }
+    for issue in &report.dangling_refs {
+        println!(
+            "entity {} attribute {} references missing entity {}",
+            issue.entity_id, issue.attribute, issue.target
+        );
+    }
+    for issue in &report.unique_claim_issues {
+        println!("unique attribute {}: {}", issue.attribute, issue.detail);
+    }
+    for issue in &report.schema_conflicts {
+        println!("schema conflict: {issue}");
+    }
 }
 
 /// Returns `true` when this instance can serve writes.
@@ -1351,6 +1555,64 @@ force_path_style = true
         assert!(
             !helper.contains("claim_writer_lease("),
             "the claim belongs once, in reset_eav_cursor, before any store",
+        );
+    }
+
+    /// The EAV commands name themselves and use the prefixes of the server.
+    ///
+    /// A wrong prefix opens an empty store.
+    /// The command then reports no data instead of an error.
+    #[test]
+    fn each_eav_subcommand_names_itself_and_uses_the_server_prefixes() {
+        let export = EavAction::Export {
+            config: PathBuf::from("c.toml"),
+            out: PathBuf::from("b.json"),
+        };
+        let import = EavAction::Import {
+            config: PathBuf::from("c.toml"),
+            input: PathBuf::from("b.json"),
+        };
+        let rebuild = EavAction::RebuildIndex {
+            config: PathBuf::from("c.toml"),
+            schema: Some("person".to_string()),
+        };
+        let validate = EavAction::Validate {
+            config: PathBuf::from("c.toml"),
+        };
+        assert_eq!(eav_action_name(&export), "eav export");
+        assert_eq!(eav_action_name(&import), "eav import");
+        assert_eq!(eav_action_name(&rebuild), "eav rebuild-index");
+        assert_eq!(eav_action_name(&validate), "eav validate");
+
+        assert_eq!(eav_domain_prefix("oxkv", "schema"), "oxkv/eav/schema");
+        assert_eq!(eav_domain_prefix("/oxkv/", "entity"), "oxkv/eav/entity");
+        assert_eq!(eav_domain_prefix("", "rules"), "eav/rules");
+    }
+
+    /// Each EAV command claims the lease before it opens a store.
+    ///
+    /// Building an `OxKvStore` takes an epoch.
+    /// A claim after that point already fenced the live writer.
+    #[test]
+    fn each_eav_command_claims_the_lease_before_a_store() {
+        let src = std::fs::read_to_string("src/main.rs").expect("readable");
+        let body = src
+            .split_once("async fn run_eav_command")
+            .expect("run_eav_command exists")
+            .1
+            .split_once("\nasync fn ")
+            .expect("run_eav_command is terminated by the next fn")
+            .0;
+        let claim = body
+            .find("claim_writer_lease(")
+            .expect("the EAV command claims the writer lease");
+        let dispatch = body
+            .find("run_eav_action(")
+            .expect("the EAV command dispatches an action");
+        assert!(
+            claim < dispatch,
+            "the lease is claimed at offset {claim} but the action runs at \
+             {dispatch}: a claim after a store build already fenced the writer",
         );
     }
 }
