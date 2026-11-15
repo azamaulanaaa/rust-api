@@ -862,7 +862,10 @@ async fn get_effective_schema(
     Ok(HttpResponse::Ok().json(schema))
 }
 
-#[utoipa::path(get, path = "/eav/schemas/{id}/children", tag = "eav", params(("id" = String, Path)), responses((status=200, body=Vec<String>), (status=401, body=crate::http::error::ErrorBody), (status=403, body=crate::http::error::ErrorBody), (status=500, body=crate::http::error::ErrorBody)))]
+/// Lists the direct child schema ids.
+///
+/// An unknown schema id returns `404`.
+#[utoipa::path(get, path = "/eav/schemas/{id}/children", tag = "eav", params(("id" = String, Path)), responses((status=200, body=Vec<String>), (status=401, body=crate::http::error::ErrorBody), (status=403, body=crate::http::error::ErrorBody), (status=404, body=crate::http::error::ErrorBody), (status=500, body=crate::http::error::ErrorBody)))]
 #[get("/schemas/{id}/children")]
 async fn list_schema_children(
     runtime: web::Data<EavRuntime>,
@@ -872,6 +875,9 @@ async fn list_schema_children(
 ) -> Result<HttpResponse, EavApiError> {
     require_management(&policy, &claims.sub, SCHEMAS, Action::Read).await?;
     let id = path.into_inner();
+    if !runtime.schemas().exists(&id).await? {
+        return Err(EavApiError::not_found());
+    }
     let children = runtime.schemas().children(&id).await?;
     Ok(HttpResponse::Ok().json(children))
 }
@@ -3989,6 +3995,43 @@ mod tests {
             .expect("entity exists");
         assert_eq!(entity.version, 1);
         assert_eq!(entity.schemas[0].version, 1);
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn schema_children_is_404_for_an_unknown_schema() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        assert!(fx.engine.claim_superadmin("alice").await?);
+        publish_task_schema(&fx).await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::get().uri("/eav/schemas/absent/children"),
+                &token,
+            )
+            .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::NOT_FOUND);
+        let body: crate::http::error::ErrorBody = actix_test::read_body_json(res).await;
+        assert_eq!(body.code.as_deref(), Some("not_found"));
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::get().uri("/eav/schemas/task/children"),
+                &token,
+            )
+            .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let children: Vec<Value> = actix_test::read_body_json(res).await;
+        assert!(children.is_empty());
         Ok(())
     }
 
