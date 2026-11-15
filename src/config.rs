@@ -514,6 +514,15 @@ pub struct DatabaseConfig {
     /// `"oxkv"`. The default is `"oxkv"`.
     #[serde(default = "default_db_prefix")]
     pub prefix: String,
+    /// Size of the shared SST block cache, in MiB.
+    ///
+    /// One cache serves every OxKV handle in the process. The default is 128
+    /// MiB. A value of `0` disables SST caching.
+    ///
+    /// The server sets the value before it builds the first handle. A later
+    /// change has no effect on the handles that are open.
+    #[serde(default = "default_sst_cache_mb")]
+    pub sst_cache_mb: usize,
     /// Mirrors the master fs store in RAM for replica rebuilds.
     ///
     /// This setting is a prototype. When the field is true, the snapshot
@@ -546,6 +555,10 @@ pub struct DatabaseConfig {
 
 fn default_db_prefix() -> String {
     "oxkv".to_string()
+}
+
+fn default_sst_cache_mb() -> usize {
+    128
 }
 
 fn default_writer_lease_ttl_secs() -> u64 {
