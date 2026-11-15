@@ -21,13 +21,14 @@ use clap::{Parser, Subcommand};
 use url::Url;
 
 use rust_api::{
-    eav::route::EavApiModule,
+    eav::{entity::EntityStore, portable, route::EavApiModule, schema::SchemaRegistry},
     fs::{FsEngine, TokenKeys, route::FsApiModule, s3::S3ClientConfig, store::FsStore},
     http::{ApiService, middleware::jwt::Claims},
     oidc::{OidcClient, OidcConfig, route::OidcApiModule},
     policy::{PolicyEngine, admin, route::PolicyApiModule, setup::SetupApiModule},
     queue::{QueueWorker, durable::DurableQueue},
     rules::builtin::{LogAction, NoopAction},
+    rules::store::RuleStore,
     rules::webhook::WebhookAction,
     sync::{route::SyncApiModule, snapshot::SnapshotManager, wal::Wal},
     telemetry,
@@ -59,6 +60,11 @@ enum Command {
     Policy {
         #[command(subcommand)]
         action: PolicyAction,
+    },
+    /// Export, import, rebuild, or validate EAV data.
+    Eav {
+        #[command(subcommand)]
+        action: EavAction,
     },
 }
 
@@ -109,6 +115,31 @@ enum PolicyAction {
     },
 }
 
+/// Actions that manage the EAV store. The store must be S3.
+#[derive(Subcommand, Debug)]
+enum EavAction {
+    /// Writes every stored schema, entity, and rule to a JSON file.
+    Export {
+        /// Path of the TOML config file. It provides `[s3]` and
+        /// `[database].prefix`.
+        #[arg(short, long)]
+        config: PathBuf,
+        /// Path of the output JSON file.
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Reads a JSON file into an empty EAV prefix and checks the restore.
+    Import {
+        /// Path of the TOML config file. It provides `[s3]` and
+        /// `[database].prefix`.
+        #[arg(short, long)]
+        config: PathBuf,
+        /// Path of the input JSON file.
+        #[arg(long = "in")]
+        input: PathBuf,
+    },
+}
+
 /// Turns the `[s3]` section of the config into the [`S3ClientConfig`] that
 /// the engine and the store factory use.
 ///
@@ -148,6 +179,7 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Serve { config, verbose } => serve(&config, verbose).await,
         Command::Policy { action } => run_policy_command(action).await,
+        Command::Eav { action } => run_eav_command(action).await,
     }
 }
 
@@ -265,6 +297,114 @@ async fn import_policy(
         "imported {} rules and {} group memberships ({} duplicates skipped) into {}",
         report.rules_added, report.groups_added, report.duplicates, db_prefix
     );
+    Ok(())
+}
+
+/// One line that names the action which asks for the lease.
+fn eav_action_name(action: &EavAction) -> &'static str {
+    match action {
+        EavAction::Export { .. } => "eav export",
+        EavAction::Import { .. } => "eav import",
+    }
+}
+
+/// Returns the store prefix for one EAV domain.
+///
+/// An empty root omits the leading slash.
+/// The server uses the same layout.
+fn eav_domain_prefix(db_prefix: &str, domain: &str) -> String {
+    let root = db_prefix.trim_matches('/');
+    if root.is_empty() {
+        format!("eav/{domain}")
+    } else {
+        format!("{root}/eav/{domain}")
+    }
+}
+
+/// Builds the three EAV stores at the prefixes of the server.
+async fn build_eav_stores(
+    s3_cfg: &S3ClientConfig,
+    db_prefix: &str,
+) -> anyhow::Result<(SchemaRegistry, EntityStore, RuleStore)> {
+    let schema_store =
+        rust_api::db::build_s3_store(s3_cfg, &eav_domain_prefix(db_prefix, "schema"))
+            .await
+            .context("build the EAV schema store")?;
+    let entity_store =
+        rust_api::db::build_s3_store(s3_cfg, &eav_domain_prefix(db_prefix, "entity"))
+            .await
+            .context("build the EAV entity store")?;
+    let rule_store = rust_api::db::build_s3_store(s3_cfg, &eav_domain_prefix(db_prefix, "rules"))
+        .await
+        .context("build the EAV rule store")?;
+    let schemas = SchemaRegistry::new(schema_store);
+    let entities = EntityStore::new(entity_store, schemas.clone());
+    let rules = RuleStore::new(rule_store);
+    Ok((schemas, entities, rules))
+}
+
+/// Runs one `eav` subcommand on the configured prefix.
+///
+/// The command claims the writer lease before it opens a store.
+/// A live server holds the prefix, and the claim then refuses.
+/// The command gives the lease back after the work.
+async fn run_eav_command(action: EavAction) -> anyhow::Result<()> {
+    let purpose = eav_action_name(&action);
+    let config = match &action {
+        EavAction::Export { config, .. } | EavAction::Import { config, .. } => config,
+    };
+    let cfg = config::Config::try_from(config.as_path())?;
+    let s3_cfg = s3_client_config(&cfg);
+    let db_prefix = cfg.database.prefix.trim_matches('/').to_string();
+
+    let (_lost, guard) = claim_writer_lease(
+        &s3_cfg,
+        &db_prefix,
+        cfg.database.writer_lease_ttl_secs,
+        purpose,
+    )
+    .await?;
+
+    let result = run_eav_action(&action, &s3_cfg, &db_prefix).await;
+
+    if let Some(guard) = guard {
+        guard.release().await;
+    }
+    result
+}
+
+/// Builds the stores and runs the selected `eav` action.
+async fn run_eav_action(
+    action: &EavAction,
+    s3_cfg: &S3ClientConfig,
+    db_prefix: &str,
+) -> anyhow::Result<()> {
+    let (schemas, entities, rules) = build_eav_stores(s3_cfg, db_prefix).await?;
+    match action {
+        EavAction::Export { out, .. } => {
+            let file =
+                std::fs::File::create(out).with_context(|| format!("create {}", out.display()))?;
+            let mut writer = std::io::BufWriter::new(file);
+            let report = portable::export(&schemas, &entities, &rules, &mut writer).await?;
+            println!(
+                "exported {} schema records, {} entity records, and {} rule records to {}",
+                report.schemas,
+                report.entities,
+                report.rules,
+                out.display()
+            );
+        }
+        EavAction::Import { input, .. } => {
+            let file =
+                std::fs::File::open(input).with_context(|| format!("read {}", input.display()))?;
+            let reader = std::io::BufReader::new(file);
+            let report = portable::import(&schemas, &entities, &rules, reader).await?;
+            println!(
+                "imported {} schema records, {} entity records, and {} rule records into {db_prefix}",
+                report.schemas, report.entities, report.rules
+            );
+        }
+    }
     Ok(())
 }
 
@@ -1089,5 +1229,32 @@ force_path_style = true
         };
         assert_eq!(policy_action_name(&export), "policy export");
         assert_eq!(policy_action_name(&import), "policy import");
+    }
+
+    /// Each EAV command claims the lease before it opens a store.
+    ///
+    /// Building an `OxKvStore` takes an epoch.
+    /// A claim after that point already fenced the live writer.
+    #[test]
+    fn each_eav_command_claims_the_lease_before_a_store() {
+        let src = std::fs::read_to_string("src/main.rs").expect("readable");
+        let body = src
+            .split_once("async fn run_eav_command")
+            .expect("run_eav_command exists")
+            .1
+            .split_once("\nasync fn ")
+            .expect("run_eav_command is terminated by the next fn")
+            .0;
+        let claim = body
+            .find("claim_writer_lease(")
+            .expect("the EAV command claims the writer lease");
+        let dispatch = body
+            .find("run_eav_action(")
+            .expect("the EAV command dispatches an action");
+        assert!(
+            claim < dispatch,
+            "the lease is claimed at offset {claim} but the action runs at \
+             {dispatch}: a claim after a store build already fenced the writer",
+        );
     }
 }

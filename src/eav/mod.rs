@@ -42,6 +42,9 @@ pub mod error;
 /// Metrics helpers for the EAV runtime.
 pub mod metrics;
 
+/// Portable export, import, index rebuild, and restore checks.
+pub mod portable;
+
 /// Stored per-user entity replicas.
 pub mod replica;
 

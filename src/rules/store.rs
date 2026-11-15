@@ -701,6 +701,102 @@ impl RuleStore {
         self.gc_page_high_water
             .load(std::sync::atomic::Ordering::Relaxed)
     }
+
+    /// Returns true when the store holds no rule row.
+    ///
+    /// The call reads the first key of the `rule:meta:` family.
+    /// It writes no key.
+    pub(crate) async fn is_empty(&self) -> Result<bool, RuleError> {
+        let g = self.store.read().await;
+        let rows = g
+            .gets_keys(
+                Some(1),
+                Direction::Next,
+                (
+                    Some(META_PREFIX.to_string()),
+                    KeyPrefix::new(META_PREFIX).upper_bound(),
+                ),
+            )
+            .await
+            .map_err(RuleError::Store)?;
+        Ok(rows.is_empty())
+    }
+
+    /// Imports exact rule records into an empty store.
+    ///
+    /// The call validates every rule before it writes any key.
+    /// It writes the rule rows and the index markers in one transaction.
+    /// It returns the keys that it wrote, so a failed import can remove them.
+    /// The call rejects a rule id that the store already holds.
+    pub(crate) async fn import_rules(&self, rules: &[Rule]) -> Result<Vec<String>, RuleError> {
+        let mut seen = BTreeSet::new();
+        for rule in rules {
+            let draft = RuleDraft {
+                id: rule.id.clone(),
+                name: rule.name.clone(),
+                enabled: rule.enabled,
+                priority: rule.priority,
+                trigger: rule.trigger.clone(),
+                condition: rule.condition.clone(),
+                action: rule.action.clone(),
+                capabilities: rule.capabilities.clone(),
+            };
+            draft.validate()?;
+            if rule.version == 0 {
+                return Err(RuleError::Invalid(format!(
+                    "rule {} has version 0",
+                    rule.id
+                )));
+            }
+            if !seen.insert(rule.id.clone()) {
+                return Err(RuleError::Invalid(format!(
+                    "rule {} has two records",
+                    rule.id
+                )));
+            }
+        }
+
+        let _publish = self.publish_lock.lock().await;
+        let g = self.store.write().await;
+        let tx = g.begin_tx().map_err(RuleError::Store)?;
+        let mut keys = Vec::new();
+        for rule in rules {
+            if load_rule(&tx, &rule.id).await?.is_some() {
+                return Err(RuleError::Invalid(format!(
+                    "rule {} already exists in the target prefix",
+                    rule.id
+                )));
+            }
+        }
+        for rule in rules {
+            let key = meta_key(&rule.id);
+            let bytes = serde_json::to_vec(rule)
+                .map_err(|error| RuleError::Serialization(error.to_string()))?;
+            tx.set_bytes(&key, &bytes).await.map_err(RuleError::Store)?;
+            keys.push(key);
+            for key in index_keys(&rule.trigger, &rule.id) {
+                tx.set_bytes(&key, b"").await.map_err(RuleError::Store)?;
+                keys.push(key);
+            }
+        }
+        tx.commit().await.map_err(RuleError::Store)?;
+        Ok(keys)
+    }
+
+    /// Removes the keys that [`import_rules`](Self::import_rules) wrote.
+    ///
+    /// The call runs after a later import step failed.
+    /// It is safe only when the target prefix was empty before the import.
+    pub(crate) async fn remove_import_keys(&self, keys: &[String]) -> Result<(), RuleError> {
+        let _publish = self.publish_lock.lock().await;
+        let g = self.store.write().await;
+        let tx = g.begin_tx().map_err(RuleError::Store)?;
+        for key in keys {
+            tx.delete(key).await.map_err(RuleError::Store)?;
+        }
+        tx.commit().await.map_err(RuleError::Store)?;
+        Ok(())
+    }
 }
 
 /// Returns the stable lowercase key of one event kind.

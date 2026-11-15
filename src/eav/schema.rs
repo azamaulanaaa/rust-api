@@ -25,7 +25,7 @@
 //! Eviction costs one reload and never changes the result, because a schema
 //! version is immutable.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use oxkv::{
@@ -486,6 +486,115 @@ impl SchemaRegistry {
         Ok((out, next))
     }
 
+    /// Lists every stored schema version, sorted by id and version.
+    ///
+    /// The call scans the `schema:version:` family.
+    /// A portable export uses the result, because a latest-only list leaves
+    /// out the versions that an entity can pin.
+    pub async fn versions(&self) -> Result<Vec<SchemaDef>, SchemaError> {
+        let g = self.store.read().await;
+        let rows = scan_prefix(&*g, VERSION_PREFIX).await?;
+        let mut defs = Vec::with_capacity(rows.len());
+        for row in rows {
+            let def: SchemaDef = serde_json::from_slice(&row.value)
+                .map_err(|e| SchemaError::Internal(e.to_string()))?;
+            defs.push(def);
+        }
+        defs.sort_by(|a, b| (a.id.as_str(), a.version).cmp(&(b.id.as_str(), b.version)));
+        Ok(defs)
+    }
+
+    /// Imports exact schema versions into an empty store.
+    ///
+    /// The call validates every version before it writes any key.
+    /// It writes the version rows, the head rows, the child markers, and the
+    /// name markers in one transaction.
+    /// It returns the keys that it wrote, so a failed import can remove them.
+    /// The call rejects a schema id that the store already holds.
+    pub(crate) async fn import_versions(
+        &self,
+        defs: &[SchemaDef],
+    ) -> Result<Vec<String>, SchemaError> {
+        validate_import_versions(defs)?;
+
+        let _publish = self.publish_lock.lock().await;
+        let g = self.store.write().await;
+        for def in defs {
+            if read_head(&*g, &def.id).await?.is_some() {
+                return Err(SchemaError::Invalid(format!(
+                    "schema {} already exists in the target prefix",
+                    def.id
+                )));
+            }
+        }
+
+        let tx = g.begin_tx().map_err(SchemaError::Store)?;
+        let mut keys = Vec::new();
+        for def in defs {
+            let key = version_key(&def.id, def.version);
+            let bytes =
+                serde_json::to_vec(def).map_err(|e| SchemaError::Internal(e.to_string()))?;
+            tx.set_bytes(&key, &bytes)
+                .await
+                .map_err(SchemaError::Store)?;
+            keys.push(key);
+            for parent in &def.extends {
+                let key = child_key(&parent.id, &def.id);
+                tx.set_bytes(&key, b"").await.map_err(SchemaError::Store)?;
+                keys.push(key);
+            }
+        }
+
+        let mut heads: BTreeMap<String, u64> = BTreeMap::new();
+        for def in defs {
+            let effective = flatten(&tx, def).await?;
+            for (name, attribute) in &effective.attributes {
+                if attribute.indexed {
+                    let key = format!("{ATTR_KEY_PREFIX}{name}");
+                    tx.set_bytes(&key, b"").await.map_err(SchemaError::Store)?;
+                    keys.push(key);
+                }
+                if attribute.unique {
+                    let key = format!("{UNIQUE_KEY_PREFIX}{name}");
+                    tx.set_bytes(&key, b"").await.map_err(SchemaError::Store)?;
+                    keys.push(key);
+                }
+            }
+            heads
+                .entry(def.id.clone())
+                .and_modify(|version| *version = (*version).max(def.version))
+                .or_insert(def.version);
+        }
+        for (id, version) in heads {
+            let key = head_key(&id);
+            let bytes =
+                serde_json::to_vec(&version).map_err(|e| SchemaError::Internal(e.to_string()))?;
+            tx.set_bytes(&key, &bytes)
+                .await
+                .map_err(SchemaError::Store)?;
+            keys.push(key);
+        }
+        tx.commit().await.map_err(SchemaError::Store)?;
+        self.cache.write().await.clear();
+        Ok(keys)
+    }
+
+    /// Removes the keys that [`import_versions`](Self::import_versions) wrote.
+    ///
+    /// The call runs after a later import step failed.
+    /// It is safe only when the target prefix was empty before the import.
+    pub(crate) async fn remove_import_keys(&self, keys: &[String]) -> Result<(), SchemaError> {
+        let _publish = self.publish_lock.lock().await;
+        let g = self.store.write().await;
+        let tx = g.begin_tx().map_err(SchemaError::Store)?;
+        for key in keys {
+            tx.delete(key).await.map_err(SchemaError::Store)?;
+        }
+        tx.commit().await.map_err(SchemaError::Store)?;
+        self.cache.write().await.clear();
+        Ok(())
+    }
+
     /// Reads one schema version with all inherited attributes flattened.
     ///
     /// The call returns `None` when the version does not exist.
@@ -914,6 +1023,61 @@ fn validate_draft(draft: &SchemaDraft) -> Result<(), SchemaError> {
             ));
         }
         validate_default(def)?;
+    }
+    Ok(())
+}
+
+/// Checks a set of exact schema versions before an import writes them.
+///
+/// Each id must have the versions `1..=max` and no gaps.
+/// Each parent reference must name a version in the same set.
+/// Each draft must pass the publish check.
+fn validate_import_versions(defs: &[SchemaDef]) -> Result<(), SchemaError> {
+    let mut versions: BTreeMap<&str, BTreeSet<u64>> = BTreeMap::new();
+    for def in defs {
+        if def.version == 0 {
+            return Err(SchemaError::Invalid(format!(
+                "schema {} has version 0",
+                def.id
+            )));
+        }
+        let draft = SchemaDraft {
+            id: def.id.clone(),
+            extends: def.extends.iter().map(|parent| parent.id.clone()).collect(),
+            attributes: def.attributes.clone(),
+        };
+        validate_draft(&draft)?;
+        if !versions.entry(&def.id).or_default().insert(def.version) {
+            return Err(SchemaError::Invalid(format!(
+                "schema {} has two records for version {}",
+                def.id, def.version
+            )));
+        }
+    }
+
+    for (id, found) in &versions {
+        let max = found.iter().next_back().copied().unwrap_or(0);
+        for version in 1..=max {
+            if !found.contains(&version) {
+                return Err(SchemaError::Invalid(format!(
+                    "schema {id} is missing version {version}"
+                )));
+            }
+        }
+    }
+
+    for def in defs {
+        for parent in &def.extends {
+            let found = versions
+                .get(parent.id.as_str())
+                .is_some_and(|versions| versions.contains(&parent.version));
+            if !found {
+                return Err(SchemaError::Invalid(format!(
+                    "schema {} pins a parent version that is not in the import: {}@{}",
+                    def.id, parent.id, parent.version
+                )));
+            }
+        }
     }
     Ok(())
 }
