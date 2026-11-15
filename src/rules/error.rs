@@ -26,6 +26,9 @@ pub enum RuleError {
     /// The condition tree is deeper than 16 levels.
     #[error("rule condition depth exceeds 16")]
     ConditionDepth,
+    /// The trigger names an event that no code path emits.
+    #[error("rule trigger event is not accepted: {0}")]
+    UnsupportedTrigger(String),
     /// The rule names an action that the engine does not know.
     #[error("unknown action: {0}")]
     UnknownAction(String),
