@@ -23,7 +23,7 @@ data:
     prefix = "oxkv"
     # One SST cache serves every OxKV handle in this process. The cache is
     # bounded at 128 MiB, so the handle count does not multiply the memory
-    # budget.
+    # budget. 0 disables SST caching.
     sst_cache_mb = 128
 
     [s3]
@@ -31,8 +31,9 @@ data:
     region = "us-east-1"
 
     [limits]
-    # A full GET /eav/sync/replica above 8 MiB returns 400. The client must use
-    # ?chunk=N. The build itself is capped at 64 MiB.
+    # A full GET /eav/sync/replica above 8 MiB returns 400 with code
+    # "replica_too_large". The client must use ?chunk=N. The build itself is
+    # capped at 64 MiB. The default 0 disables this gate.
     max_full_replica_bytes = 8388608
 ---
 apiVersion: apps/v1
@@ -116,9 +117,11 @@ spec:
               # One shared SST cache is bounded at 128 MiB (sst_cache_mb).
               # The remaining ~384 MiB holds the allocator, the memtables,
               # request buffers, and one replica build capped at 64 MiB.
-              # The limit is not raised. Before the cache was shared, each
-              # handle could hold a 256 MB cache, and several handles did not
-              # fit this limit.
+              # A 256 MiB cache on each handle can exceed this limit, so keep
+              # the shared cache size in step with this memory limit. The limit
+              # is not raised. Before the cache was shared, each handle could
+              # hold a 256 MB cache, and several handles did not fit this
+              # limit.
               memory: 512Mi
           securityContext:
             allowPrivilegeEscalation: false

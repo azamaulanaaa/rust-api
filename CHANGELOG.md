@@ -32,6 +32,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Transaction-level conditional writes for entity versions, schema publish, rule upsert, replica head and generation, file relation ref-counts, WAL sequence, and policy rule claims.
 - Policy export through a read-only follower, so export does not fence the writer.
 - Entity-attribute-value (EAV) subsystem with versioned schemas, validated entities, attribute and unique indexes, rule conditions and script actions, timers, a change feed, and per-user chunked replicas.
+- Exact-value unique claims with a SHA-256 hash and a SHA-512 fingerprint, so a deliberate hash collision does not create a false duplicate.
+- Portable EAV export, import, resumable index rebuild, and restore validation through `eav export`, `eav import`, `eav rebuild-index`, and `eav validate`.
+- `eav reset-cursor` operator command for the durable rule cursor.
+- Dead-letter browse and retry routes, and an entity referrers route.
+- EAV metrics for entity writes, deletes, conflicts, dead letters, feed lag, outbox age, and replica builds.
+- One bounded SST cache shared across OxKV handles, with a process-wide size from `[database].sst_cache_mb`.
+- Timestamped webhook signature and a replay verifier for receivers.
+- Bounded rule-match cache with invalidation on upsert, delete, and enable.
 
 ### Changed
 
@@ -61,3 +69,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - EAV loop failures are tracked per loop, clear after a successful pass, and shutdown waits for all four loops.
 - A queue lease token carries a generation, a batch renews each reserved lease, and completion is recorded only after an ack.
 - Webhook delivery disables system proxies, matches a no-port allowlist entry to the scheme default port, and classifies retryable responses.
+- A unique claim keys on the exact value, so a deliberate SHA-256 collision does not create a false duplicate.
+- A migration dry run checks unique values across every entity that pins the target schema, and its metadata write uses compare-and-set with `409` on a concurrent update.
+- `list_by_schema_page` enforces the offset cap at the store layer.
+- A timer event goes through the outbox, and the fired marker, time-row delete, pending counter, and outbox row commit in one transaction.
+- An unrelated update keeps the stored time-row causation, and a timestamp change writes the new cause.
+- A `schema_removed` rule trigger returns `400`, and a stored rule whose only trigger is `schema_removed` stays inert.
+- A condition script applies the rule read set and runs on a blocking thread.
+- The rule runner reports progress after a cursor advance, a dead-letter move, or a healthy caught-up poll, and the runtime clears its failure flag only on that signal.
+- The snapshot cursor scans raw pages until the visible page fills, so a sparse grant set reaches every visible row.
+- Malformed query and path values return the standard error envelope.
+- `GET /eav/rules` hides `after` from OpenAPI and still returns `400` for it.
+- A rule enable uses compare-and-set, repeats the author grants, and returns `409` for a stale toggle or upsert.
+- A queue lease expiry uses unix milliseconds, and a sub-second lease keeps its full duration.
+- `queue.lease_lost` counts a rejected ack, nack, or extend, and `queue.failed` counts job failures.
+- The durable queue keeps a due index and sweeps at most 256 due entries.
+- A webhook signs `X-Signature-Timestamp` and `X-Signature-V2` over `timestamp.body`, and the legacy `X-Signature` stays body-only.
+- The log action redacts secret-like parameter keys and URL user information and query values.
+- A full replica read above `[limits].max_full_replica_bytes` returns `400`.
+- A WAL range read uses one scan and keeps sequence order.

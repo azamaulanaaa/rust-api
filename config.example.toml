@@ -55,7 +55,8 @@ prefix = "oxkv"
 
 # Size of the shared SST block cache, in MiB. One cache serves every OxKV
 # handle in the process, so the handle count does not multiply this budget.
-# 0 disables SST caching. Default: 128.
+# 0 disables SST caching. The server sets the size before it builds the first
+# handle, so a later change has no effect on an open handle. Default: 128.
 # sst_cache_mb = 128
 
 # Prototype: keep a lazily-warmed in-RAM mirror of the master fs store.
@@ -140,9 +141,10 @@ sample_ratio = 1.0
 # Concurrent downloads of /sync/db/{object}. 0 disables the gate. Default: 0.
 # max_concurrent_downloads = 0
 
-# Largest stored EAV replica, in bytes, that one full
-# GET /eav/sync/replica read may load. A larger replica must be read in chunk
-# mode with ?chunk=N. 0 disables the gate. Default: 0.
+# Largest stored EAV replica, in bytes, that one full GET /eav/sync/replica
+# read may load. A larger replica returns 400 with code "replica_too_large".
+# The client must then read chunks with ?chunk=N. A read at the limit is
+# allowed. 0 disables the gate. Default: 0.
 # max_full_replica_bytes = 0
 
 [eav]
