@@ -669,7 +669,7 @@ A client that reads a replica must follow these rules. The client owns them. The
 - Three top-level names change under one name: `manifest.json`, `ownership.json`, and `probe/canary`. Revalidate each with `If-None-Match`. Each response carries `Cache-Control: no-cache`.
 - The `e{epoch}/sst/*`, `e{epoch}/wal/*`, and `e{epoch}/blob/*` classes are immutable. Cache them with `public, max-age=31536000, immutable`.
 - Only these exact names are mutable. A key that merely ends in `manifest.json` is not.
-- `oxkv` 0.12 has no reader pin. Re-open the reader or re-read the manifest when a client needs a view that matches a moment in time. A client can also snapshot the keys itself.
+- `oxkv` 0.12 has no reader pin. Re-open the reader or re-read the manifest when a client needs a view that matches a moment in time. A caller that needs a fixed view can call `StoreExt::snapshot()`. The call returns a stable read-only view. It copies the whole store into memory and does not block writers.
 - `/sync/db/{object}` streams with `Content-Length`. A large SST segment does not need to fit in the server heap.
 
 ## Configuration
@@ -837,7 +837,9 @@ rust-api policy import --config config.toml --input backup.json
 
 Both commands take `--config`, which provides `[s3]` and `[database].prefix`. An import skips rules that already exist. Every entry passes the same validator as a live API write. An import appends its rules to the WAL, so replicas replay them.
 
-Both commands claim the writer lease before they open a store. If a live server holds the lease, the command fails and names the holder. Stop the server first, or wait for the lease to expire.
+`policy export` reads through a read-only follower. The reader takes no epoch and writes no `ownership.json`, so an export does not fence a running writer and does not claim the lease.
+
+`policy import` writes, so it claims the writer lease before it opens a store. If a live server holds the lease, the import fails and names the holder. Stop the server first, or wait for the lease to expire.
 
 ### Garbage collection
 
