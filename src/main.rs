@@ -162,25 +162,23 @@ fn policy_action_name(action: &PolicyAction) -> &'static str {
 
 /// Runs `policy export` or `policy import` on the configured prefix.
 ///
-/// Both subcommands build an `OxKvStore`. Building a store does a CAS bump
-/// on `ownership.json` and takes an epoch. The server does the same
-/// operation at startup. So the command *fences* a running server. The
-/// server finds out at its next write to the policy. That write fails
-/// with `StoreError::Fenced`. The write calls `note_primary_loss`, which
-/// sets a latch that nothing clears. Then `/ready`, which checks
+/// `policy import` writes to the prefix. It builds an `OxKvStore`, which does
+/// a CAS bump on `ownership.json` and takes an epoch. The server does the same
+/// operation at startup. So the import *fences* a running server. The server
+/// finds out at its next write to the policy. That write fails with
+/// `StoreError::Fenced`. The write calls `note_primary_loss`, which sets a
+/// latch that nothing clears. Then `/ready`, which checks
 /// `!fencing::primary_loss()`, returns 503. The instance stays out of the
-/// rotation. So a backup that finished with status 0 took the primary
-/// out of service.
+/// rotation.
 ///
-/// The README warns about this for `import`. It says nothing about
-/// `export`. That is the worse half. The `export` command only reads. It
-/// looks like the safe direction of the documented backup procedure.
+/// So `import` claims the writer lease first. It does so before it builds any
+/// store, in the same way as `serve`. When a live server holds the lease, the
+/// command refuses. The message then names the prefix and the instance. That
+/// replaces a quiet displacement of a healthy writer.
 ///
-/// So both subcommands claim the writer lease first. They do it before
-/// they build any store, in the same way as `serve`. When a live server
-/// holds the lease, the command refuses. The message then names the prefix
-/// and the instance. That replaces a quiet displacement of a healthy
-/// writer.
+/// `policy export` only reads. It uses `build_s3_reader`, which opens an
+/// `OxKvReader`. A reader takes no epoch and writes no `ownership.json`. So an
+/// export does not fence the writer, and it does not need the lease.
 async fn run_policy_command(action: PolicyAction) -> anyhow::Result<()> {
     let purpose = policy_action_name(&action);
     // Both values appear before the match that takes the action. So
@@ -198,36 +196,41 @@ async fn run_policy_command(action: PolicyAction) -> anyhow::Result<()> {
     let s3_cfg = s3_client_config(&cfg);
     let db_prefix = cfg.database.prefix.trim_matches('/').to_string();
 
-    // This happens BEFORE the code builds any store. Opening a store
-    // takes an epoch. So a check after that point would already have
-    // fenced the process that holds the lease. No renewer task starts here.
-    // This process ends soon. The function below gives the lease straight
-    // back.
-    let (_lost, guard) = claim_writer_lease(
-        &s3_cfg,
-        &db_prefix,
-        cfg.database.writer_lease_ttl_secs,
-        purpose,
-    )
-    .await?;
-
-    let result = match action {
+    match action {
         PolicyAction::Export { .. } => export_policy(&s3_cfg, &db_prefix, &file).await,
-        PolicyAction::Import { .. } => import_policy(&s3_cfg, &db_prefix, &file).await,
-    };
+        PolicyAction::Import { .. } => {
+            // This happens BEFORE the code builds any store. Opening a store
+            // takes an epoch. So a check after that point would already have
+            // fenced the process that holds the lease. No renewer task starts
+            // here. This process ends soon. The guard below gives the lease
+            // straight back.
+            let (_lost, guard) = claim_writer_lease(
+                &s3_cfg,
+                &db_prefix,
+                cfg.database.writer_lease_ttl_secs,
+                purpose,
+            )
+            .await?;
 
-    // Give the prefix back, even when the work failed. Otherwise a
-    // failed export makes the next one wait out the TTL.
-    if let Some(guard) = guard {
-        guard.release().await;
+            let result = import_policy(&s3_cfg, &db_prefix, &file).await;
+
+            // Give the prefix back, even when the work failed. Otherwise a
+            // failed import makes the next one wait out the TTL.
+            if let Some(guard) = guard {
+                guard.release().await;
+            }
+            result
+        }
     }
-    result
 }
 
 /// Writes every stored policy rule to `out` as JSON.
+///
+/// The function reads through `build_s3_reader`. The reader takes no epoch.
+/// So an export against a live prefix does not fence the server.
 async fn export_policy(s3_cfg: &S3ClientConfig, db_prefix: &str, out: &Path) -> anyhow::Result<()> {
-    let store = rust_api::db::build_s3_store(s3_cfg, &domain_prefix(db_prefix, "policy")).await?;
-    let dump = admin::export_s3(store).await?;
+    let reader = rust_api::db::build_s3_reader(s3_cfg, &domain_prefix(db_prefix, "policy")).await?;
+    let dump = admin::export_s3(reader).await?;
     std::fs::write(
         out,
         serde_json::to_vec_pretty(&dump).context("serialize policy dump")?,
@@ -243,6 +246,9 @@ async fn export_policy(s3_cfg: &S3ClientConfig, db_prefix: &str, out: &Path) -> 
 
 /// Loads the policy rules from `input` into the store. The function announces
 /// them on the change feed, so that the replicas that run converge.
+///
+/// The function builds a writer store. `run_policy_command` claims the writer
+/// lease before it calls this function, so a live server is not fenced.
 async fn import_policy(
     s3_cfg: &S3ClientConfig,
     db_prefix: &str,
@@ -928,34 +934,24 @@ force_path_style = true
         );
     }
 
-    /// Both policy subcommands must claim the writer lease before they open a
-    /// store.
+    /// `policy import` claims the lease. `policy export` reads through a
+    /// reader.
     ///
     /// Building an `OxKvStore` does a CAS bump on `ownership.json` and takes
-    /// an epoch. That is what `serve` does at startup. So either subcommand
-    /// against a prefix that is live *fences the server*. The server finds
-    /// out at its next write to the policy. The write fails with
-    /// `StoreError::Fenced`. The server then sets `note_primary_loss` and
-    /// never clears it. The check of `/ready` uses
-    /// `!fencing::primary_loss()`. So a successful `policy export` takes the
-    /// instance out of service for good. The `export` command only reads.
-    /// That is why the problem was not found. It looks like the safe
-    /// direction of the documented backup procedure. The README warns only
-    /// about `import`.
+    /// an epoch. An import writes, so it still claims the writer lease before
+    /// the first store build. An export reads through `build_s3_reader`. A
+    /// reader takes no epoch, so it cannot fence the writer. So an export does
+    /// not claim the lease.
     ///
-    /// The test reads the source. It does not call the command. The failure
-    /// needs a second live `OxKvStore` over one prefix, and it needs a
-    /// network. The *order* of the steps is what matters. The claim must come
-    /// before the first `build_s3_store`. A check after that point means that
-    /// the process which held the lease was already fenced. The test checks
-    /// both parts. The claim must be there. The claim must come before every
-    /// store build in the function.
+    /// The test reads the source. It does not call the command. The *order*
+    /// of the steps is what matters. For import, the claim must come before
+    /// the first `build_s3_store`. A check after that point means that the
+    /// process which held the lease was already fenced.
     #[test]
-    fn both_policy_subcommands_claim_the_lease_before_opening_a_store() {
+    fn import_claims_the_lease_and_export_uses_a_reader() {
         let src = std::fs::read_to_string("src/main.rs").expect("readable");
 
-        // Take only the body of `run_policy_command`. Both subcommands call
-        // that function. So one check covers both.
+        // Take only the body of `run_policy_command`.
         let body = src
             .split_once("async fn run_policy_command")
             .expect("run_policy_command exists")
@@ -964,45 +960,74 @@ force_path_style = true
             .expect("run_policy_command is terminated by the next fn")
             .0;
 
-        let claim = body
+        // The last `PolicyAction::Import` is the match arm. The earlier one
+        // selects the input path.
+        let import_at = body
+            .rfind("PolicyAction::Import")
+            .expect("run_policy_command dispatches import");
+        let import_arm = &body[import_at..];
+        let claim = import_arm
             .find("claim_writer_lease(")
-            .expect("the policy path must claim the writer lease");
-        // The store builds live in the helpers that this function calls.
-        // So "before any store" means "before the call to a helper".
-        let dispatch = ["export_policy(", "import_policy("]
-            .iter()
-            .filter_map(|name| body.find(name).map(|at| (name, at)))
-            .min_by_key(|(_, at)| *at)
-            .expect("run_policy_command dispatches to a helper that opens a store");
+            .expect("import must claim the writer lease");
+        // The store builds live in the helper that this arm calls. So
+        // "before any store" means "before the call to the helper".
+        let dispatch = import_arm
+            .find("import_policy(")
+            .expect("the import arm calls import_policy");
         assert!(
-            claim < dispatch.1,
-            "the lease is claimed at offset {claim} but `{}` runs at {}: \
-             checking after opening a store means the live writer is \
-             already fenced",
-            dispatch.0,
-            dispatch.1,
+            claim < dispatch,
+            "the lease is claimed at offset {claim} but `import_policy` runs \
+             at {dispatch}: checking after opening a store means the live \
+             writer is already fenced",
         );
 
-        // Each helper must also really open a store. Otherwise the claim
-        // guards nothing.
-        for helper in ["async fn export_policy", "async fn import_policy"] {
-            let body = src
-                .split_once(helper)
-                .expect("helper exists")
-                .1
-                .split_once("\nasync fn ")
-                .expect("helper is terminated by the next fn")
-                .0;
-            assert!(
-                body.contains("build_s3_store("),
-                "{helper} opens no store, so it cannot fence anything",
-            );
-            assert!(
-                !body.contains("claim_writer_lease("),
-                "{helper} claims the lease itself; the claim belongs once, \
-                 in run_policy_command, before any store is opened",
-            );
-        }
+        // The export arm starts at the last `PolicyAction::Export` and ends
+        // at the import arm.
+        let export_at = body
+            .rfind("PolicyAction::Export")
+            .expect("run_policy_command dispatches export");
+        let export_arm = &body[export_at..import_at];
+        assert!(
+            !export_arm.contains("claim_writer_lease("),
+            "export must not claim the writer lease: an OxKvReader takes no \
+             epoch and cannot fence the writer",
+        );
+
+        // The export helper must open a reader, not a writer.
+        let export_body = src
+            .split_once("async fn export_policy")
+            .expect("export_policy exists")
+            .1
+            .split_once("\nasync fn ")
+            .expect("export_policy is terminated by the next fn")
+            .0;
+        assert!(
+            export_body.contains("build_s3_reader("),
+            "export_policy must read through build_s3_reader",
+        );
+        assert!(
+            !export_body.contains("build_s3_store("),
+            "export_policy must not open a writer store, because that fences \
+             a live server",
+        );
+
+        // The import helper must still open a writer store.
+        let import_body = src
+            .split_once("async fn import_policy")
+            .expect("import_policy exists")
+            .1
+            .split_once("\nasync fn ")
+            .expect("import_policy is terminated by the next fn")
+            .0;
+        assert!(
+            import_body.contains("build_s3_store("),
+            "import_policy opens no writer store, so the lease guards nothing",
+        );
+        assert!(
+            !import_body.contains("claim_writer_lease("),
+            "import_policy claims the lease itself; the claim belongs once, \
+             in run_policy_command, before any store is opened",
+        );
     }
 
     /// A refusal must name the prefix. It must also say what to do about it.
@@ -1015,8 +1040,8 @@ force_path_style = true
     /// one message for the operator.
     #[test]
     fn a_refused_policy_command_says_which_prefix_and_what_to_stop() {
-        let message = lease_refused_message("policy export", "prod/data");
-        assert!(message.contains("policy export"), "{message}");
+        let message = lease_refused_message("policy import", "prod/data");
+        assert!(message.contains("policy import"), "{message}");
         assert!(message.contains("prod/data"), "{message}");
         assert!(
             message.contains("fences"),
