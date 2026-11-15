@@ -161,6 +161,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use oxkv::{
     Direction, GetSet, KeyPrefix, KeyValue, OxKvStore, ScanExt as _, Store as _, StoreError,
@@ -173,6 +174,7 @@ use tokio::sync::{Mutex, RwLock};
 use crate::eav::MAX_PAGE_OFFSET;
 use crate::eav::entity_error::EntityError;
 use crate::eav::error::SchemaError;
+use crate::eav::metrics::EavMetrics;
 use crate::eav::schema::{AttributeDef, AttributeType, EffectiveSchema, SchemaRef, SchemaRegistry};
 use crate::records::{AttributeChange, ChangeSink, EntityEvent, EntityEventKind, WalOp};
 use crate::rules::effect::{EffectPlan, EntityEffect};
@@ -571,6 +573,8 @@ pub struct EntityStore {
     /// The check is on by default.
     /// A host can turn it off for a store that holds legacy references.
     check_entity_refs: bool,
+    /// The runtime metrics that the store records.
+    metrics: EavMetrics,
     /// The number of outbox row deletes to fail in a test.
     #[cfg(test)]
     outbox_delete_failures: Arc<std::sync::atomic::AtomicUsize>,
@@ -693,6 +697,7 @@ impl EntityStore {
             flush_lock: Arc::new(Mutex::new(())),
             feed: None,
             check_entity_refs: true,
+            metrics: EavMetrics::global(),
             #[cfg(test)]
             outbox_delete_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
@@ -807,6 +812,32 @@ impl EntityStore {
     pub fn with_entity_ref_check(mut self, check: bool) -> Self {
         self.check_entity_refs = check;
         self
+    }
+
+    /// Replaces the runtime metrics in a test.
+    #[cfg(test)]
+    pub(crate) fn with_metrics(mut self, metrics: EavMetrics) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
+    /// Records one successful write or delete.
+    fn record_change(&self, writes: u64, deletes: u64) {
+        if writes > 0 {
+            self.metrics.record_entity_writes(writes);
+        }
+        if deletes > 0 {
+            self.metrics.record_entity_deletes(deletes);
+        }
+    }
+
+    /// Records a version or unique conflict.
+    fn record_failure(&self, error: &EntityError) {
+        match error {
+            EntityError::VersionConflict => self.metrics.record_entity_version_conflict(),
+            EntityError::UniqueViolation(_) => self.metrics.record_entity_unique_conflict(),
+            _ => {}
+        }
     }
 
     /// Checks every `EntityRef` value in one write.
@@ -1223,6 +1254,20 @@ impl EntityStore {
         draft: EntityDraft,
         ctx: &WriteContext,
     ) -> Result<EntityChange, EntityError> {
+        let result = self.create_inner(draft, ctx).await;
+        match &result {
+            Ok(_) => self.record_change(1, 0),
+            Err(error) => self.record_failure(error),
+        }
+        result
+    }
+
+    /// Creates an entity and returns the change.
+    async fn create_inner(
+        &self,
+        draft: EntityDraft,
+        ctx: &WriteContext,
+    ) -> Result<EntityChange, EntityError> {
         let prepared = self.prepare_create(draft).await?;
         let pending = {
             let _write = self.write_lock.lock().await;
@@ -1284,6 +1329,22 @@ impl EntityStore {
     /// A feed failure after the commit leaves the outbox row for the relay.
     /// The call still returns success.
     pub async fn update(
+        &self,
+        id: &str,
+        expected_version: u64,
+        patch: EntityPatch,
+        ctx: &WriteContext,
+    ) -> Result<EntityChange, EntityError> {
+        let result = self.update_inner(id, expected_version, patch, ctx).await;
+        match &result {
+            Ok(_) => self.record_change(1, 0),
+            Err(error) => self.record_failure(error),
+        }
+        result
+    }
+
+    /// Updates the attributes of one entity and returns the change.
+    async fn update_inner(
         &self,
         id: &str,
         expected_version: u64,
@@ -1352,6 +1413,22 @@ impl EntityStore {
     /// A feed failure after the commit leaves the outbox row for the relay.
     /// The call still returns success.
     pub async fn delete(
+        &self,
+        id: &str,
+        expected_version: u64,
+        force: bool,
+        ctx: &WriteContext,
+    ) -> Result<EntityChange, EntityError> {
+        let result = self.delete_inner(id, expected_version, force, ctx).await;
+        match &result {
+            Ok(_) => self.record_change(0, 1),
+            Err(error) => self.record_failure(error),
+        }
+        result
+    }
+
+    /// Deletes one entity and returns the change.
+    async fn delete_inner(
         &self,
         id: &str,
         expected_version: u64,
@@ -1463,6 +1540,34 @@ impl EntityStore {
     /// A flush failure leaves the rows for the relay.
     /// The call returns the changes in plan order.
     pub async fn apply_effects_with_marker(
+        &self,
+        plan: &EffectPlan,
+        ctx: &WriteContext,
+        marker: Option<(&str, &[u8])>,
+    ) -> Result<Vec<EntityChange>, EntityError> {
+        let writes = plan
+            .effects()
+            .iter()
+            .filter(|effect| !matches!(effect, EntityEffect::Delete { .. }))
+            .count() as u64;
+        let deletes = plan
+            .effects()
+            .iter()
+            .filter(|effect| matches!(effect, EntityEffect::Delete { .. }))
+            .count() as u64;
+        let result = self
+            .apply_effects_with_marker_inner(plan, ctx, marker)
+            .await;
+        match &result {
+            Ok(_) => self.record_change(writes, deletes),
+            Err(error) => self.record_failure(error),
+        }
+        result
+    }
+
+    /// Applies an effect plan and an optional execution marker as one atomic
+    /// write.
+    async fn apply_effects_with_marker_inner(
         &self,
         plan: &EffectPlan,
         ctx: &WriteContext,
@@ -1784,6 +1889,25 @@ impl EntityStore {
     pub async fn outbox_count(&self) -> Result<usize, EntityError> {
         let count = self.ensure_outbox_pending().await?;
         Ok(usize::try_from(count).unwrap_or(usize::MAX))
+    }
+
+    /// Returns the age of the oldest pending outbox row.
+    ///
+    /// The call reads one bounded page of the outbox family in key order.
+    /// It returns `None` when no pending row exists.
+    /// The event id orders the keys, so the first page holds the oldest rows
+    /// for the events that this process writes.
+    /// A row that does not decode is skipped.
+    pub async fn outbox_pending_age(&self) -> Result<Option<Duration>, EntityError> {
+        let g = self.store.read().await;
+        let rows = scan_prefix_bounded(&*g, OUTBOX_PREFIX, OUTBOX_FLUSH_BATCH).await?;
+        let now = chrono::Utc::now().timestamp();
+        let oldest = rows
+            .iter()
+            .filter_map(|row| serde_json::from_slice::<EntityEvent>(&row.value).ok())
+            .map(|event| event.occurred_at)
+            .min();
+        Ok(oldest.map(|at| Duration::from_secs(now.saturating_sub(at).max(0) as u64)))
     }
 
     /// Returns the pending outbox count and backfills the key when absent.
@@ -5068,6 +5192,7 @@ pub(crate) fn validate_name(kind: &str, value: &str) -> Result<(), EntityError> 
 mod tests {
     use super::*;
     use crate::db::{build_test_store, test_prefix};
+    use crate::eav::metrics::test_support::MetricCapture;
     use crate::eav::schema::SchemaDraft;
     use std::sync::atomic::Ordering;
 
@@ -5077,6 +5202,57 @@ mod tests {
         let raw = build_test_store(&test_prefix("eav-store")).await;
         let store = EntityStore::new(raw.clone(), registry.clone());
         (store, registry, raw)
+    }
+
+    /// A committed write, a delete, and each conflict kind increment one
+    /// counter.
+    #[tokio::test]
+    async fn the_store_records_write_delete_and_conflict_counters() {
+        let (store, registry, _raw) = new_store().await;
+        let (metrics, capture) = MetricCapture::new();
+        let store = store.with_metrics(metrics);
+        registry
+            .publish(schema(
+                "person",
+                &[],
+                vec![
+                    attr("name", AttributeType::String),
+                    full_attr("email", AttributeType::String, false, true, true, None),
+                ],
+            ))
+            .await
+            .unwrap();
+
+        let first = draft(
+            "p1",
+            &["person"],
+            vec![("name", s("Alice")), ("email", s("a@example.com"))],
+        );
+        store.create(first, &ctx()).await.unwrap();
+        let duplicate = draft(
+            "p2",
+            &["person"],
+            vec![("name", s("Bob")), ("email", s("a@example.com"))],
+        );
+        let error = store.create(duplicate, &ctx()).await.unwrap_err();
+        assert!(matches!(error, EntityError::UniqueViolation(_)));
+
+        let error = store
+            .update("p1", 9, patch(vec![("name", Some(s("Alice Two")))]), &ctx())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, EntityError::VersionConflict));
+
+        store
+            .update("p1", 1, patch(vec![("name", Some(s("Alice Two")))]), &ctx())
+            .await
+            .unwrap();
+        store.delete("p1", 2, false, &ctx()).await.unwrap();
+
+        assert_eq!(capture.counter("eav.entity.writes"), 2);
+        assert_eq!(capture.counter("eav.entity.deletes"), 1);
+        assert_eq!(capture.counter("eav.entity.version_conflicts"), 1);
+        assert_eq!(capture.counter("eav.entity.unique_conflicts"), 1);
     }
 
     fn attr(name: &str, ty: AttributeType) -> AttributeDef {
@@ -8205,6 +8381,39 @@ mod tests {
         feed.set_failing(false);
         assert_eq!(store.flush_outbox().await.unwrap(), 3);
         assert_eq!(store.outbox_count().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn outbox_pending_age_reports_the_oldest_row() {
+        let (store, registry, raw) = new_store().await;
+        registry
+            .publish(schema("person", &[], vec![]))
+            .await
+            .unwrap();
+        let feed = Arc::new(RecordingFeed::new());
+        feed.set_failing(true);
+        let store = store.with_change_sink(feed);
+        store
+            .create(draft("e1", &["person"], vec![]), &ctx())
+            .await
+            .unwrap();
+
+        let keys = outbox_keys(&raw).await;
+        assert_eq!(keys.len(), 1);
+        let mut event: EntityEvent =
+            serde_json::from_slice(&raw.get_bytes(&keys[0]).await.unwrap().expect("outbox row"))
+                .unwrap();
+        event.occurred_at = chrono::Utc::now().timestamp() - 120;
+        raw.set_bytes(&keys[0], &serde_json::to_vec(&event).unwrap())
+            .await
+            .unwrap();
+
+        let age = store
+            .outbox_pending_age()
+            .await
+            .unwrap()
+            .expect("a pending row has an age");
+        assert!(age.as_secs() >= 120, "oldest row age was {age:?}");
     }
 
     #[tokio::test]

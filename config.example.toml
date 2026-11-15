@@ -53,6 +53,11 @@ issuer_url = "https://idp.example.com"
 # Object prefix inside the S3 bucket for OxKV keys. Default: "oxkv".
 prefix = "oxkv"
 
+# Size of the shared SST block cache, in MiB. One cache serves every OxKV
+# handle in the process, so the handle count does not multiply this budget.
+# 0 disables SST caching. Default: 128.
+# sst_cache_mb = 128
+
 # Prototype: keep a lazily-warmed in-RAM mirror of the master fs store.
 # Costs one master key set in RAM; safe only with a single writer.
 # Default: false.
@@ -134,6 +139,11 @@ sample_ratio = 1.0
 
 # Concurrent downloads of /sync/db/{object}. 0 disables the gate. Default: 0.
 # max_concurrent_downloads = 0
+
+# Largest stored EAV replica, in bytes, that one full
+# GET /eav/sync/replica read may load. A larger replica must be read in chunk
+# mode with ?chunk=N. 0 disables the gate. Default: 0.
+# max_full_replica_bytes = 0
 
 [eav]
 # Pause in milliseconds between outbox flushes. Must be above 0.
