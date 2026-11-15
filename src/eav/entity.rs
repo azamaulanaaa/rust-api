@@ -586,6 +586,10 @@ pub struct EntityStore {
     /// test.
     #[cfg(test)]
     delete_prepare_hook: Arc<std::sync::Mutex<Option<BackfillPageHook>>>,
+    /// A hook that runs after a migration prepares and before it commits in a
+    /// test.
+    #[cfg(test)]
+    migration_commit_hook: Arc<std::sync::Mutex<Option<BackfillPageHook>>>,
 }
 
 /// One create after validation.
@@ -697,6 +701,8 @@ impl EntityStore {
             backfill_page_hook: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
             delete_prepare_hook: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            migration_commit_hook: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -761,6 +767,34 @@ impl EntityStore {
             .backfill_page_hook
             .lock()
             .expect("backfill page hook lock") = hook;
+    }
+
+    /// Runs the hook that stands in for a write between a migration prepare
+    /// and the commit.
+    #[cfg(test)]
+    async fn run_migration_commit_hook(&self) {
+        let hook = self
+            .migration_commit_hook
+            .lock()
+            .expect("migration commit hook lock")
+            .clone();
+        if let Some(hook) = hook {
+            hook().await;
+        }
+    }
+
+    /// Runs the hook that stands in for a write between a migration prepare
+    /// and the commit.
+    #[cfg(not(test))]
+    async fn run_migration_commit_hook(&self) {}
+
+    /// Sets the test hook that runs before a migration commit.
+    #[cfg(test)]
+    fn set_migration_commit_hook(&self, hook: Option<BackfillPageHook>) {
+        *self
+            .migration_commit_hook
+            .lock()
+            .expect("migration commit hook lock") = hook;
     }
 
     /// Sets whether a write checks that every `EntityRef` target exists.
@@ -2123,6 +2157,8 @@ impl EntityStore {
     /// A duplicate unique value marks the entity as invalid.
     /// A dangling reference marks the entity as invalid.
     /// A stale entity version aborts the batch with no write.
+    /// A concurrent update aborts the batch with
+    /// [`EntityError::VersionConflict`] and no write.
     /// A store error aborts the batch with no write.
     /// A missing target version is [`EntityError::UnknownSchema`].
     /// The report holds the cursor for the next page.
@@ -2209,6 +2245,9 @@ impl EntityStore {
     /// rows of the target schema.
     /// It writes the metadata row and the outbox row in the same transaction,
     /// or it writes no row.
+    /// The metadata write is a compare-and-set on the reloaded metadata row,
+    /// so a concurrent update between the reload and the commit fails the
+    /// batch with [`EntityError::VersionConflict`].
     /// The call flushes the outbox one time after the commit.
     /// A feed failure after the commit leaves the outbox rows for the relay.
     async fn apply_schema_migration_batch(
@@ -2319,6 +2358,8 @@ impl EntityStore {
             return Ok(result);
         }
 
+        self.run_migration_commit_hook().await;
+
         let pending = writes.iter().any(|write| write.outbox.is_some());
         let outbox_rows = writes.iter().filter(|write| write.outbox.is_some()).count();
         {
@@ -2350,7 +2391,7 @@ impl EntityStore {
                         .await
                         .map_err(EntityError::Store)?;
                 }
-                put_meta_row(&tx, &write.entity).await?;
+                put_meta_row(&tx, &write.before, &write.entity).await?;
                 put_entity_rows_except_meta(
                     &tx,
                     &write.entity,
@@ -2364,7 +2405,13 @@ impl EntityStore {
                     tx.set_bytes(key, bytes).await.map_err(EntityError::Store)?;
                 }
             }
-            tx.commit().await.map_err(EntityError::Store)?;
+            match tx.commit().await {
+                Ok(()) => {}
+                Err(StoreError::TxConflict { key, .. }) => {
+                    return Err(conflict_error(&state, &key));
+                }
+                Err(error) => return Err(EntityError::Store(error)),
+            }
         }
         drop(_write);
         if pending && let Err(error) = self.flush_after_commit().await {
@@ -3987,18 +4034,21 @@ fn meta_bytes(entity: &Entity) -> Result<Vec<u8>, EntityError> {
     serde_json::to_vec(&meta).map_err(|e| EntityError::Internal(e.to_string()))
 }
 
-/// Writes the metadata row of one entity.
+/// Replaces the metadata row of one entity with a compare-and-set.
 ///
+/// The expected value is the metadata row of `before`.
+/// A concurrent update changes that row, so the commit fails with a version
+/// conflict.
 /// The call changes no attribute row and no index row.
-async fn put_meta_row<S>(store: &S, entity: &Entity) -> Result<(), EntityError>
+async fn put_meta_row<S>(store: &S, before: &Entity, after: &Entity) -> Result<(), EntityError>
 where
-    S: GetSet + ?Sized,
+    S: TxCas + ?Sized,
 {
-    let meta_bytes = meta_bytes(entity)?;
+    let expected = meta_bytes(before)?;
+    let bytes = meta_bytes(after)?;
     store
-        .set_bytes(&meta_key(&entity.id), &meta_bytes)
+        .compare_and_set(&meta_key(&after.id), Some(&expected), &bytes)
         .await
-        .map(|_| ())
         .map_err(EntityError::Store)
 }
 
@@ -10030,6 +10080,55 @@ mod tests {
         assert_eq!(entity.version, 2);
         assert_eq!(entity.schemas[0].version, 1);
         assert_eq!(entity.attributes["title"], s("two"));
+    }
+
+    #[tokio::test]
+    async fn a_concurrent_update_between_the_migration_read_and_commit_is_a_version_conflict() {
+        let (store, registry, raw) = new_store().await;
+        registry
+            .publish(schema(
+                "task",
+                &[],
+                vec![attr("title", AttributeType::String)],
+            ))
+            .await
+            .unwrap();
+        store
+            .create(draft("e1", &["task"], vec![("title", s("one"))]), &ctx())
+            .await
+            .unwrap();
+        registry
+            .publish(schema(
+                "task",
+                &[],
+                vec![
+                    attr("title", AttributeType::String),
+                    attr("note", AttributeType::String),
+                ],
+            ))
+            .await
+            .unwrap();
+        let other = EntityStore::new(raw.clone(), registry.clone());
+        store.set_migration_commit_hook(Some(Arc::new(move || {
+            let other = other.clone();
+            Box::pin(async move {
+                other
+                    .update("e1", 1, patch(vec![("title", Some(s("two")))]), &ctx())
+                    .await
+                    .unwrap();
+            })
+        })));
+
+        let result = store
+            .migrate_schema("task", 2, 100, None, false, &ctx())
+            .await;
+
+        assert!(matches!(result, Err(EntityError::VersionConflict)));
+        let entity = store.get("e1").await.unwrap().unwrap();
+        assert_eq!(entity.version, 2);
+        assert_eq!(entity.schemas[0].version, 1);
+        assert_eq!(entity.attributes["title"], s("two"));
+        assert!(!entity.attributes.contains_key("note"));
     }
 
     #[tokio::test]
