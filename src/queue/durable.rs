@@ -32,8 +32,8 @@
 //! # Terminal retention
 //!
 //! A dead, succeeded, or failed row stays in the store for 7 days. The
-//! sweep deletes the row and its marker after that time. A fresh terminal
-//! row stays, so `status` returns it.
+//! sweep deletes the row, its marker, and its idempotency row after that
+//! time. A fresh terminal row stays, so `status` returns it.
 
 #[cfg(test)]
 use std::collections::BTreeMap;
@@ -49,7 +49,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, instrument};
 use uuid::Uuid;
 
-use super::{Job, JobId, JobStatus, LeasedJob, QueueError, QueueMetrics, RetryPolicy};
+use super::{Job, JobId, JobStatus, LeaseToken, LeasedJob, QueueError, QueueMetrics, RetryPolicy};
 
 /// Prefix of a job row.
 const JOB_PREFIX: &str = "job:";
@@ -96,6 +96,9 @@ struct StoredJob {
 ///
 /// Each transition writes the row and the marker in one transaction. A
 /// failed read or write returns [`QueueError::Store`].
+///
+/// `ack`, `nack`, and `extend_lease` check the lease token under a
+/// compare-and-set on the job row. A stale token does not change the job.
 pub struct DurableQueue {
     store: Arc<RwLock<oxkv::OxKvStore>>,
     metrics: QueueMetrics,
@@ -156,6 +159,81 @@ impl DurableQueue {
     /// Returns the marker key for a status that has one.
     fn status_key(status: &JobStatus, id: JobId) -> Option<String> {
         Self::status_prefix(status).map(|prefix| format!("{prefix}{id}"))
+    }
+
+    /// Checks a lease token against the stored status.
+    ///
+    /// The function returns [`QueueError::AlreadyLeased`] when another worker
+    /// holds the job. It returns [`QueueError::LeaseExpired`] when the lease
+    /// is gone or its time has passed.
+    fn check_lease(sj: &StoredJob, lease: &LeaseToken) -> Result<(), QueueError> {
+        match &sj.status {
+            JobStatus::Leased { worker, expires_at } => {
+                if worker != &lease.worker || *expires_at != lease.expires_at {
+                    Err(QueueError::AlreadyLeased)
+                } else if *expires_at <= Self::now() {
+                    Err(QueueError::LeaseExpired)
+                } else {
+                    Ok(())
+                }
+            }
+            _ => Err(QueueError::LeaseExpired),
+        }
+    }
+
+    /// Applies one change to a leased job under a compare-and-set.
+    ///
+    /// The function reads the job row, checks the lease token, applies
+    /// `update`, and writes the row and its status marker in one transaction.
+    /// A token that does not match returns an error and changes nothing.
+    async fn transition<F>(
+        &self,
+        job_id: JobId,
+        lease: &LeaseToken,
+        update: F,
+    ) -> Result<JobStatus, QueueError>
+    where
+        F: FnOnce(&mut StoredJob),
+    {
+        let key = Self::job_key(job_id);
+        let g = self.store.write().await;
+        let tx = g.begin_tx().map_err(|e| QueueError::Store(e.to_string()))?;
+        let bytes = tx
+            .get_bytes(&key)
+            .await
+            .map_err(|e| QueueError::Store(e.to_string()))?
+            .ok_or(QueueError::NotFound(job_id))?;
+        let mut sj = serde_json::from_slice::<StoredJob>(&bytes)
+            .map_err(|e| QueueError::Store(e.to_string()))?;
+        Self::check_lease(&sj, lease)?;
+        update(&mut sj);
+        let val = serde_json::to_vec(&sj).map_err(|e| QueueError::Store(e.to_string()))?;
+        tx.compare_and_set(&key, Some(&bytes), &val)
+            .await
+            .map_err(|e| QueueError::Store(e.to_string()))?;
+        for marker in [
+            Self::queued_key(job_id),
+            Self::leased_key(job_id),
+            Self::dead_key(job_id),
+            Self::succeeded_key(job_id),
+            Self::failed_key(job_id),
+        ] {
+            tx.delete(&marker)
+                .await
+                .map_err(|e| QueueError::Store(e.to_string()))?;
+        }
+        if let Some(marker) = Self::status_key(&sj.status, job_id) {
+            tx.set_bytes(&marker, b"")
+                .await
+                .map_err(|e| QueueError::Store(e.to_string()))?;
+        }
+        match tx.commit().await {
+            Ok(()) => {}
+            Err(StoreError::TxConflict { .. }) => return Err(QueueError::AlreadyLeased),
+            Err(error) => return Err(QueueError::Store(error.to_string())),
+        }
+        drop(g);
+        Ok(sj.status)
     }
 
     /// Lists the job ids under one marker prefix.
@@ -274,7 +352,19 @@ impl DurableQueue {
             let is_leased = matches!(sj.status, JobStatus::Leased { .. });
             if expired {
                 let mut new_sj = sj;
-                new_sj.status = JobStatus::Queued;
+                let attempt = new_sj.job.attempt.saturating_add(1);
+                new_sj.job.attempt = attempt;
+                new_sj.job.scheduled_at = now;
+                if attempt >= new_sj.job.max_attempts {
+                    new_sj.status = JobStatus::Dead {
+                        error: "lease expired".to_string(),
+                        finished_at: now,
+                    };
+                } else {
+                    new_sj.status = JobStatus::Queued;
+                }
+                let marker = Self::status_key(&new_sj.status, id)
+                    .ok_or_else(|| QueueError::Store("status has no marker".to_string()))?;
                 let val =
                     serde_json::to_vec(&new_sj).map_err(|e| QueueError::Store(e.to_string()))?;
                 tx.set_bytes(&key, &val)
@@ -283,7 +373,7 @@ impl DurableQueue {
                 tx.delete(&Self::leased_key(id))
                     .await
                     .map_err(|e| QueueError::Store(e.to_string()))?;
-                tx.set_bytes(&Self::queued_key(id), b"")
+                tx.set_bytes(&marker, b"")
                     .await
                     .map_err(|e| QueueError::Store(e.to_string()))?;
                 tx.commit()
@@ -352,6 +442,11 @@ impl DurableQueue {
                 tx.delete(&marker)
                     .await
                     .map_err(|e| QueueError::Store(e.to_string()))?;
+                if let Some(idempotency_key) = &sj.job.idempotency_key {
+                    tx.delete(&Self::idempotency_key(idempotency_key))
+                        .await
+                        .map_err(|e| QueueError::Store(e.to_string()))?;
+                }
                 tx.commit()
                     .await
                     .map_err(|e| QueueError::Store(e.to_string()))?;
@@ -578,7 +673,10 @@ impl super::JobQueue for DurableQueue {
             drop(g);
             out.push(LeasedJob {
                 job: sj.job,
-                lease_expires_at: expiry,
+                lease: LeaseToken {
+                    worker: worker.to_string(),
+                    expires_at: expiry,
+                },
             });
         }
         self.metrics.record_reserved(out.len() as u64);
@@ -586,180 +684,83 @@ impl super::JobQueue for DurableQueue {
     }
 
     #[instrument(name = "queue.ack", skip(self, result), fields(queue.backend = "durable", job.id = %job_id))]
-    async fn ack(&self, job_id: JobId, result: Option<Vec<u8>>) -> Result<(), QueueError> {
+    async fn ack(
+        &self,
+        job_id: JobId,
+        lease: &LeaseToken,
+        result: Option<Vec<u8>>,
+    ) -> Result<(), QueueError> {
         // Keep the `Succeeded` row. The `status` query reads it.
-        let mut sj = self.load(job_id).await?;
         let finished = Self::now();
-        sj.status = JobStatus::Succeeded {
-            result: result.clone(),
-            finished_at: finished,
-        };
-        let val = serde_json::to_vec(&sj).map_err(|e| QueueError::Store(e.to_string()))?;
-        let g = self.store.write().await;
-        let tx = g.begin_tx().map_err(|e| QueueError::Store(e.to_string()))?;
-        tx.set_bytes(&Self::job_key(job_id), &val)
-            .await
-            .map_err(|e| QueueError::Store(e.to_string()))?;
-        tx.delete(&Self::queued_key(job_id))
-            .await
-            .map_err(|e| QueueError::Store(e.to_string()))?;
-        tx.delete(&Self::leased_key(job_id))
-            .await
-            .map_err(|e| QueueError::Store(e.to_string()))?;
-        tx.delete(&Self::dead_key(job_id))
-            .await
-            .map_err(|e| QueueError::Store(e.to_string()))?;
-        tx.delete(&Self::failed_key(job_id))
-            .await
-            .map_err(|e| QueueError::Store(e.to_string()))?;
-        tx.set_bytes(&Self::succeeded_key(job_id), b"")
-            .await
-            .map_err(|e| QueueError::Store(e.to_string()))?;
-        tx.commit()
-            .await
-            .map_err(|e| QueueError::Store(e.to_string()))?;
-        drop(g);
+        self.transition(job_id, lease, |sj| {
+            sj.status = JobStatus::Succeeded {
+                result: result.clone(),
+                finished_at: finished,
+            };
+        })
+        .await?;
         self.metrics.record_completed();
         Ok(())
     }
 
     #[instrument(name = "queue.nack", skip(self), fields(queue.backend = "durable", job.id = %job_id, error = %error))]
-    async fn nack(&self, job_id: JobId, error: &str, retry: RetryPolicy) -> Result<(), QueueError> {
-        let mut sj = self.load(job_id).await?;
+    async fn nack(
+        &self,
+        job_id: JobId,
+        lease: &LeaseToken,
+        error: &str,
+        retry: RetryPolicy,
+    ) -> Result<(), QueueError> {
         let finished = Self::now();
-        match retry {
-            RetryPolicy::NoRetry => {
-                sj.status = JobStatus::Failed {
-                    error: error.to_string(),
-                    finished_at: finished,
-                };
-                let val = serde_json::to_vec(&sj).map_err(|e| QueueError::Store(e.to_string()))?;
-                let g = self.store.write().await;
-                let tx = g.begin_tx().map_err(|e| QueueError::Store(e.to_string()))?;
-                tx.set_bytes(&Self::job_key(job_id), &val)
-                    .await
-                    .map_err(|e| QueueError::Store(e.to_string()))?;
-                tx.delete(&Self::queued_key(job_id))
-                    .await
-                    .map_err(|e| QueueError::Store(e.to_string()))?;
-                tx.delete(&Self::leased_key(job_id))
-                    .await
-                    .map_err(|e| QueueError::Store(e.to_string()))?;
-                tx.delete(&Self::dead_key(job_id))
-                    .await
-                    .map_err(|e| QueueError::Store(e.to_string()))?;
-                tx.delete(&Self::succeeded_key(job_id))
-                    .await
-                    .map_err(|e| QueueError::Store(e.to_string()))?;
-                tx.set_bytes(&Self::failed_key(job_id), b"")
-                    .await
-                    .map_err(|e| QueueError::Store(e.to_string()))?;
-                tx.commit()
-                    .await
-                    .map_err(|e| QueueError::Store(e.to_string()))?;
-                drop(g);
-                self.metrics.record_failed();
-            }
-            RetryPolicy::Retry { delay } => {
-                if sj.job.attempt.saturating_add(1) >= sj.job.max_attempts {
-                    sj.status = JobStatus::Dead {
+        let status = self
+            .transition(job_id, lease, |sj| match retry {
+                RetryPolicy::NoRetry => {
+                    sj.status = JobStatus::Failed {
                         error: error.to_string(),
                         finished_at: finished,
                     };
-                    let val =
-                        serde_json::to_vec(&sj).map_err(|e| QueueError::Store(e.to_string()))?;
-                    let g = self.store.write().await;
-                    let tx = g.begin_tx().map_err(|e| QueueError::Store(e.to_string()))?;
-                    tx.set_bytes(&Self::job_key(job_id), &val)
-                        .await
-                        .map_err(|e| QueueError::Store(e.to_string()))?;
-                    tx.delete(&Self::queued_key(job_id))
-                        .await
-                        .map_err(|e| QueueError::Store(e.to_string()))?;
-                    tx.delete(&Self::leased_key(job_id))
-                        .await
-                        .map_err(|e| QueueError::Store(e.to_string()))?;
-                    tx.delete(&Self::succeeded_key(job_id))
-                        .await
-                        .map_err(|e| QueueError::Store(e.to_string()))?;
-                    tx.delete(&Self::failed_key(job_id))
-                        .await
-                        .map_err(|e| QueueError::Store(e.to_string()))?;
-                    tx.set_bytes(&Self::dead_key(job_id), b"")
-                        .await
-                        .map_err(|e| QueueError::Store(e.to_string()))?;
-                    tx.commit()
-                        .await
-                        .map_err(|e| QueueError::Store(e.to_string()))?;
-                    drop(g);
-                    self.metrics.record_dead_lettered();
-                    self.metrics.record_failed();
-                } else {
-                    sj.job.attempt = sj.job.attempt.saturating_add(1);
-                    sj.job.scheduled_at = finished + delay.as_secs() as i64;
-                    sj.status = JobStatus::Queued;
-                    let val =
-                        serde_json::to_vec(&sj).map_err(|e| QueueError::Store(e.to_string()))?;
-                    let g = self.store.write().await;
-                    let tx = g.begin_tx().map_err(|e| QueueError::Store(e.to_string()))?;
-                    tx.set_bytes(&Self::job_key(job_id), &val)
-                        .await
-                        .map_err(|e| QueueError::Store(e.to_string()))?;
-                    tx.delete(&Self::leased_key(job_id))
-                        .await
-                        .map_err(|e| QueueError::Store(e.to_string()))?;
-                    tx.delete(&Self::dead_key(job_id))
-                        .await
-                        .map_err(|e| QueueError::Store(e.to_string()))?;
-                    tx.delete(&Self::succeeded_key(job_id))
-                        .await
-                        .map_err(|e| QueueError::Store(e.to_string()))?;
-                    tx.delete(&Self::failed_key(job_id))
-                        .await
-                        .map_err(|e| QueueError::Store(e.to_string()))?;
-                    tx.set_bytes(&Self::queued_key(job_id), b"")
-                        .await
-                        .map_err(|e| QueueError::Store(e.to_string()))?;
-                    tx.commit()
-                        .await
-                        .map_err(|e| QueueError::Store(e.to_string()))?;
-                    drop(g);
-                    self.metrics.record_failed();
                 }
+                RetryPolicy::Retry { delay } => {
+                    if sj.job.attempt.saturating_add(1) >= sj.job.max_attempts {
+                        sj.status = JobStatus::Dead {
+                            error: error.to_string(),
+                            finished_at: finished,
+                        };
+                    } else {
+                        sj.job.attempt = sj.job.attempt.saturating_add(1);
+                        sj.job.scheduled_at = finished + delay.as_secs() as i64;
+                        sj.status = JobStatus::Queued;
+                    }
+                }
+            })
+            .await?;
+        match status {
+            JobStatus::Dead { .. } => {
+                self.metrics.record_dead_lettered();
+                self.metrics.record_failed();
             }
+            JobStatus::Failed { .. } | JobStatus::Queued => self.metrics.record_failed(),
+            JobStatus::Succeeded { .. } | JobStatus::Leased { .. } => {}
         }
         Ok(())
     }
 
     #[instrument(name = "queue.extend_lease", skip(self), fields(queue.backend = "durable", job.id = %job_id))]
-    async fn extend_lease(&self, job_id: JobId, lease: Duration) -> Result<(), QueueError> {
+    async fn extend_lease(
+        &self,
+        job_id: JobId,
+        lease: &LeaseToken,
+        extend: Duration,
+    ) -> Result<(), QueueError> {
         self.sweep_expired().await?;
-        let mut sj = self.load(job_id).await?;
-        let now = Self::now();
-        match &sj.status {
-            JobStatus::Leased { expires_at, worker } => {
-                if *expires_at <= now {
-                    return Err(QueueError::LeaseExpired);
-                }
-                let worker = worker.clone();
-                let new_expiry = now + lease.as_secs() as i64;
-                sj.status = JobStatus::Leased {
-                    worker,
-                    expires_at: new_expiry,
-                };
-                let val = serde_json::to_vec(&sj).map_err(|e| QueueError::Store(e.to_string()))?;
-                let g = self.store.write().await;
-                let tx = g.begin_tx().map_err(|e| QueueError::Store(e.to_string()))?;
-                tx.set_bytes(&Self::job_key(job_id), &val)
-                    .await
-                    .map_err(|e| QueueError::Store(e.to_string()))?;
-                tx.commit()
-                    .await
-                    .map_err(|e| QueueError::Store(e.to_string()))?;
-                drop(g);
-            }
-            _ => return Err(QueueError::AlreadyLeased),
-        }
+        let new_expiry = Self::now() + extend.as_secs() as i64;
+        self.transition(job_id, lease, |sj| {
+            sj.status = JobStatus::Leased {
+                worker: lease.worker.clone(),
+                expires_at: new_expiry,
+            };
+        })
+        .await?;
         Ok(())
     }
 
@@ -823,6 +824,119 @@ mod tests {
         }
     }
 
+    /// Reserves one job with an expired lease, then reserves it again.
+    async fn stale_and_current_lease(q: &DurableQueue) -> (LeasedJob, LeasedJob) {
+        q.enqueue(job("work")).await.unwrap();
+        let mut first = q.reserve("w1", 10, Duration::from_secs(0)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let mut second = q.reserve("w2", 10, Duration::from_secs(30)).await.unwrap();
+        (first.pop().unwrap(), second.pop().unwrap())
+    }
+
+    #[tokio::test]
+    async fn a_stale_lease_cannot_ack_a_job() {
+        let q = queue().await;
+        let (stale, current) = stale_and_current_lease(&q).await;
+        let error = q
+            .ack(stale.job.id, &stale.lease, Some(vec![1]))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            QueueError::AlreadyLeased | QueueError::LeaseExpired
+        ));
+        match q.status(current.job.id).await.unwrap() {
+            JobStatus::Leased { worker, .. } => assert_eq!(worker, "w2"),
+            other => panic!("expected leased, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_current_lease_can_ack_a_job() {
+        let q = queue().await;
+        let (_, current) = stale_and_current_lease(&q).await;
+        q.ack(current.job.id, &current.lease, Some(vec![9]))
+            .await
+            .unwrap();
+        match q.status(current.job.id).await.unwrap() {
+            JobStatus::Succeeded { result, .. } => assert_eq!(result, Some(vec![9])),
+            other => panic!("expected succeeded, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stale_lease_cannot_nack_a_job() {
+        let q = queue().await;
+        let (stale, current) = stale_and_current_lease(&q).await;
+        let error = q
+            .nack(stale.job.id, &stale.lease, "boom", RetryPolicy::NoRetry)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            QueueError::AlreadyLeased | QueueError::LeaseExpired
+        ));
+        match q.status(current.job.id).await.unwrap() {
+            JobStatus::Leased { worker, .. } => assert_eq!(worker, "w2"),
+            other => panic!("expected leased, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_current_lease_can_nack_a_job() {
+        let q = queue().await;
+        let (_, current) = stale_and_current_lease(&q).await;
+        q.nack(
+            current.job.id,
+            &current.lease,
+            "boom",
+            RetryPolicy::Retry {
+                delay: Duration::from_secs(0),
+            },
+        )
+        .await
+        .unwrap();
+        match q.status(current.job.id).await.unwrap() {
+            JobStatus::Queued => {}
+            other => panic!("expected queued, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stale_lease_cannot_extend_a_lease() {
+        let q = queue().await;
+        let (stale, current) = stale_and_current_lease(&q).await;
+        let error = q
+            .extend_lease(stale.job.id, &stale.lease, Duration::from_secs(30))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            QueueError::AlreadyLeased | QueueError::LeaseExpired
+        ));
+        match q.status(current.job.id).await.unwrap() {
+            JobStatus::Leased { worker, .. } => assert_eq!(worker, "w2"),
+            other => panic!("expected leased, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_current_lease_can_extend_a_lease() {
+        let q = queue().await;
+        let (_, current) = stale_and_current_lease(&q).await;
+        let before = current.lease.expires_at;
+        q.extend_lease(current.job.id, &current.lease, Duration::from_secs(60))
+            .await
+            .unwrap();
+        match q.status(current.job.id).await.unwrap() {
+            JobStatus::Leased { worker, expires_at } => {
+                assert_eq!(worker, "w2");
+                assert!(expires_at > before);
+            }
+            other => panic!("expected leased, got {:?}", other),
+        }
+    }
+
     #[tokio::test]
     async fn ack_marks_the_job_succeeded() {
         let q = queue().await;
@@ -830,7 +944,9 @@ mod tests {
         let id = j.id;
         q.enqueue(j).await.unwrap();
         let leased = q.reserve("w1", 10, Duration::from_secs(30)).await.unwrap();
-        q.ack(leased[0].job.id, Some(vec![9])).await.unwrap();
+        q.ack(leased[0].job.id, &leased[0].lease, Some(vec![9]))
+            .await
+            .unwrap();
         match q.status(id).await.unwrap() {
             JobStatus::Succeeded { result, .. } => assert_eq!(result, Some(vec![9])),
             other => panic!("expected succeeded, got {:?}", other),
@@ -844,6 +960,7 @@ mod tests {
         let leased = q.reserve("w1", 10, Duration::from_secs(30)).await.unwrap();
         q.nack(
             leased[0].job.id,
+            &leased[0].lease,
             "boom",
             RetryPolicy::Retry {
                 delay: Duration::from_secs(0),
@@ -866,6 +983,7 @@ mod tests {
         let leased = q.reserve("w1", 10, Duration::from_secs(30)).await.unwrap();
         q.nack(
             leased[0].job.id,
+            &leased[0].lease,
             "boom",
             RetryPolicy::Retry {
                 delay: Duration::from_secs(0),
@@ -887,6 +1005,35 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(10)).await;
         let leased = q.reserve("w2", 10, Duration::from_secs(30)).await.unwrap();
         assert_eq!(leased.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_expired_lease_counts_as_an_attempt() {
+        let q = queue().await;
+        let j = job("work");
+        let id = j.id;
+        q.enqueue(j).await.unwrap();
+        let _ = q.reserve("w1", 10, Duration::from_secs(0)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let leased = q.reserve("w2", 10, Duration::from_secs(30)).await.unwrap();
+        assert_eq!(leased.len(), 1);
+        assert_eq!(leased[0].job.id, id);
+        assert_eq!(leased[0].job.attempt, 1);
+    }
+
+    #[tokio::test]
+    async fn an_expired_lease_dead_letters_at_the_attempt_limit() {
+        let q = queue().await;
+        let mut j = job("work");
+        j.max_attempts = 1;
+        let id = j.id;
+        q.enqueue(j).await.unwrap();
+        let _ = q.reserve("w1", 10, Duration::from_secs(0)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        match q.status(id).await.unwrap() {
+            JobStatus::Dead { .. } => {}
+            other => panic!("expected dead, got {:?}", other),
+        }
     }
 
     #[tokio::test]
@@ -1130,6 +1277,48 @@ mod tests {
         tx.commit().await.unwrap();
     }
 
+    async fn put_idempotency(q: &DurableQueue, key: &str, id: Uuid) {
+        use oxkv::{Store as _, Transaction as _};
+        let g = q.store.write().await;
+        let tx = g.begin_tx().unwrap();
+        tx.set_bytes(
+            &DurableQueue::idempotency_key(key),
+            id.to_string().as_bytes(),
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_purge_removes_the_idempotency_row() {
+        let q = queue().await;
+        let now = DurableQueue::now();
+        let mut old = job("old");
+        old.idempotency_key = Some("purge-key".to_string());
+        let old_id = old.id;
+        put_indexed_job(
+            &q,
+            old,
+            JobStatus::Succeeded {
+                result: None,
+                finished_at: now - TERMINAL_RETENTION_SECS - 1,
+            },
+        )
+        .await;
+        put_idempotency(&q, "purge-key", old_id).await;
+
+        q.sweep_expired().await.unwrap();
+
+        assert!(!has_key(&q, &DurableQueue::idempotency_key("purge-key")).await);
+        let mut fresh = job("fresh");
+        fresh.idempotency_key = Some("purge-key".to_string());
+        let fresh_id = fresh.id;
+        let got = q.enqueue(fresh).await.unwrap();
+        assert_eq!(got, fresh_id);
+        assert!(has_key(&q, &DurableQueue::queued_key(fresh_id)).await);
+    }
+
     #[tokio::test]
     async fn status_markers_follow_enqueue_reserve_and_ack() {
         let q = queue().await;
@@ -1144,7 +1333,7 @@ mod tests {
         assert!(!has_key(&q, &DurableQueue::queued_key(id)).await);
         assert!(has_key(&q, &DurableQueue::leased_key(id)).await);
 
-        q.ack(id, Some(vec![7])).await.unwrap();
+        q.ack(id, &leased[0].lease, Some(vec![7])).await.unwrap();
         assert!(!has_key(&q, &DurableQueue::queued_key(id)).await);
         assert!(!has_key(&q, &DurableQueue::leased_key(id)).await);
         assert!(!has_key(&q, &DurableQueue::dead_key(id)).await);
@@ -1164,7 +1353,9 @@ mod tests {
         q.enqueue(j).await.unwrap();
         let leased = q.reserve("w1", 10, Duration::from_secs(30)).await.unwrap();
         assert_eq!(leased.len(), 1);
-        q.nack(id, "boom", RetryPolicy::NoRetry).await.unwrap();
+        q.nack(id, &leased[0].lease, "boom", RetryPolicy::NoRetry)
+            .await
+            .unwrap();
         assert!(!has_key(&q, &DurableQueue::queued_key(id)).await);
         assert!(!has_key(&q, &DurableQueue::leased_key(id)).await);
         assert!(!has_key(&q, &DurableQueue::dead_key(id)).await);
@@ -1186,6 +1377,7 @@ mod tests {
         assert_eq!(leased.len(), 1);
         q.nack(
             id,
+            &leased[0].lease,
             "boom",
             RetryPolicy::Retry {
                 delay: Duration::from_secs(0),
@@ -1209,6 +1401,7 @@ mod tests {
         assert_eq!(leased.len(), 1);
         q.nack(
             id,
+            &leased[0].lease,
             "boom",
             RetryPolicy::Retry {
                 delay: Duration::from_secs(0),

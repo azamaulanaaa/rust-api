@@ -160,6 +160,7 @@ impl QueueWorker {
 
     async fn process(&self, leased: LeasedJob) {
         let job = leased.job;
+        let lease = leased.lease;
         let job_id = job.id;
         let job_kind = job.kind.clone();
         let start = Instant::now();
@@ -180,7 +181,7 @@ impl QueueWorker {
         let Some(handler) = handler else {
             let _ = self
                 .queue
-                .nack(job_id, "no handler for kind", RetryPolicy::NoRetry)
+                .nack(job_id, &lease, "no handler for kind", RetryPolicy::NoRetry)
                 .await;
             self.metrics.record_failed();
             self.metrics
@@ -193,15 +194,16 @@ impl QueueWorker {
         let ext_handle = {
             let queue = Arc::clone(&self.queue);
             let cancel = ext_cancel.clone();
-            let lease = self.lease;
+            let lease_duration = self.lease;
+            let token = lease.clone();
             let id = job_id;
             tokio::spawn(async move {
-                while !cancel.is_cancelled() {
-                    tokio::time::sleep(lease / 3).await;
-                    if cancel.is_cancelled() {
-                        break;
+                loop {
+                    tokio::select! {
+                        _ = cancel.cancelled() => break,
+                        _ = tokio::time::sleep(lease_duration / 3) => {}
                     }
-                    let _ = queue.extend_lease(id, lease).await;
+                    let _ = queue.extend_lease(id, &token, lease_duration).await;
                 }
             })
         };
@@ -224,7 +226,7 @@ impl QueueWorker {
                 let delay = retry_delay(job.attempt, self.retry_base, self.retry_max);
                 if let Err(e) = self
                     .queue
-                    .nack(job_id, &message, RetryPolicy::Retry { delay })
+                    .nack(job_id, &lease, &message, RetryPolicy::Retry { delay })
                     .await
                 {
                     warn!(error = %e, "queue nack failed");
@@ -240,7 +242,7 @@ impl QueueWorker {
         let elapsed = start.elapsed().as_secs_f64();
         match result {
             Ok(res) => {
-                if let Err(e) = self.queue.ack(job_id, res).await {
+                if let Err(e) = self.queue.ack(job_id, &lease, res).await {
                     warn!(error = %e, "queue ack failed");
                 }
                 self.metrics.record_completed();
@@ -250,7 +252,7 @@ impl QueueWorker {
                 let delay = retry_delay(job.attempt, self.retry_base, self.retry_max);
                 let _ = self
                     .queue
-                    .nack(job_id, &e.to_string(), RetryPolicy::Retry { delay })
+                    .nack(job_id, &lease, &e.to_string(), RetryPolicy::Retry { delay })
                     .await;
                 self.metrics.record_failed();
             }
@@ -414,7 +416,7 @@ mod tests {
             vec![Arc::clone(&handler) as Arc<dyn JobHandler>],
             "worker-1".to_string(),
         )
-        .with_lease(Duration::from_millis(30))
+        .with_lease(Duration::from_secs(30))
         .with_poll_interval(Duration::from_millis(1))
         .with_retry_base(Duration::ZERO)
         .with_retry_max(Duration::ZERO);
@@ -448,7 +450,7 @@ mod tests {
             vec![Arc::clone(&handler) as Arc<dyn JobHandler>],
             "worker-1".to_string(),
         )
-        .with_lease(Duration::from_millis(30))
+        .with_lease(Duration::from_secs(30))
         .with_retry_base(Duration::ZERO)
         .with_retry_max(Duration::ZERO);
         let job = test_job("flaky", 0, 3);
@@ -456,7 +458,7 @@ mod tests {
         queue.enqueue(job).await.unwrap();
 
         let leased = queue
-            .reserve("worker-1", 1, Duration::from_millis(30))
+            .reserve("worker-1", 1, Duration::from_secs(30))
             .await
             .unwrap();
         worker.process(leased.into_iter().next().unwrap()).await;
@@ -464,7 +466,7 @@ mod tests {
         let status = queue.status(id).await.unwrap();
         assert!(matches!(status, JobStatus::Queued), "got {status:?}");
         let leased = queue
-            .reserve("worker-1", 1, Duration::from_millis(30))
+            .reserve("worker-1", 1, Duration::from_secs(30))
             .await
             .unwrap();
         assert_eq!(leased.len(), 1);
@@ -483,7 +485,7 @@ mod tests {
             ],
             "worker-1".to_string(),
         )
-        .with_lease(Duration::from_millis(30))
+        .with_lease(Duration::from_secs(30))
         .with_poll_interval(Duration::from_millis(1))
         .with_retry_base(Duration::ZERO)
         .with_retry_max(Duration::ZERO);
@@ -519,13 +521,13 @@ mod tests {
             vec![Arc::new(OkHandler) as Arc<dyn JobHandler>],
             "worker-1".to_string(),
         )
-        .with_lease(Duration::from_millis(30));
+        .with_lease(Duration::from_secs(30));
         let job = test_job("ok", 0, 3);
         let id = job.id;
         queue.enqueue(job).await.unwrap();
 
         let leased = queue
-            .reserve("worker-1", 1, Duration::from_millis(30))
+            .reserve("worker-1", 1, Duration::from_secs(30))
             .await
             .unwrap();
         worker.process(leased.into_iter().next().unwrap()).await;
@@ -544,7 +546,7 @@ mod tests {
             vec![Arc::new(ErrHandler) as Arc<dyn JobHandler>],
             "worker-1".to_string(),
         )
-        .with_lease(Duration::from_millis(30))
+        .with_lease(Duration::from_secs(30))
         .with_retry_base(Duration::ZERO)
         .with_retry_max(Duration::ZERO);
         let job = test_job("fail", 0, 3);
@@ -552,7 +554,7 @@ mod tests {
         queue.enqueue(job).await.unwrap();
 
         let leased = queue
-            .reserve("worker-1", 1, Duration::from_millis(30))
+            .reserve("worker-1", 1, Duration::from_secs(30))
             .await
             .unwrap();
         worker.process(leased.into_iter().next().unwrap()).await;
@@ -560,7 +562,7 @@ mod tests {
         let status = queue.status(id).await.unwrap();
         assert!(matches!(status, JobStatus::Queued), "got {status:?}");
         let leased = queue
-            .reserve("worker-1", 1, Duration::from_millis(30))
+            .reserve("worker-1", 1, Duration::from_secs(30))
             .await
             .unwrap();
         assert_eq!(leased.len(), 1);
