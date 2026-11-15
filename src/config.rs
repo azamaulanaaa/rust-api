@@ -590,7 +590,7 @@ pub struct HttpConfig {
 
 /// Cost limits for requests whose work a single request does not bound.
 ///
-/// Both limits default to off, which means `0`, not to a number that the
+/// Every limit defaults to off, which means `0`, not to a number that the
 /// crate guesses. A default limit is a default outage. If the limit is too
 /// low, a valid burst gets 429 responses. If the limit is too high, it does
 /// not limit anything. The values that a deployment needs depend on its
@@ -617,6 +617,15 @@ pub struct LimitsConfig {
     /// an allowed rate can still run at the same time.
     #[serde(default)]
     pub max_concurrent_downloads: usize,
+
+    /// Largest stored EAV replica, in bytes, that one full `GET
+    /// /eav/sync/replica` read may load. A value of `0` disables the gate.
+    ///
+    /// A full read decodes and filters every stored chunk in one request. A
+    /// client above the limit must read the replica in chunk mode with
+    /// `?chunk=N`.
+    #[serde(default)]
+    pub max_full_replica_bytes: usize,
 }
 
 impl LimitsConfig {

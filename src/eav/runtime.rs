@@ -275,6 +275,10 @@ pub struct EavRuntime {
     wal: Wal,
     /// The OpenTelemetry instruments for the runtime.
     metrics: EavMetrics,
+    /// The byte limit for one full replica read.
+    ///
+    /// Zero disables the gate.
+    full_replica_byte_limit: usize,
     /// The failure flag of each background loop.
     ///
     /// The flags start clear.
@@ -347,6 +351,7 @@ impl EavRuntime {
             engine,
             wal,
             metrics,
+            full_replica_byte_limit: 0,
             failed: Arc::new(LoopFailures::default()),
             #[cfg(test)]
             runtime_test: RuntimeTestHooks::default(),
@@ -394,6 +399,31 @@ impl EavRuntime {
     /// Returns the runtime metrics.
     pub fn metrics(&self) -> &EavMetrics {
         &self.metrics
+    }
+
+    /// Replaces the runtime metrics in a test.
+    #[cfg(test)]
+    pub(crate) fn with_metrics(mut self, metrics: EavMetrics) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
+    /// Sets the byte limit for one full replica read.
+    ///
+    /// A full read with no `chunk` parameter rejects a stored replica above
+    /// this size with `400`.
+    /// The client must then read the replica in chunk mode.
+    /// A value of `0` disables the gate.
+    pub fn with_full_replica_limit(mut self, bytes: usize) -> Self {
+        self.full_replica_byte_limit = bytes;
+        self
+    }
+
+    /// Returns the byte limit for one full replica read.
+    ///
+    /// Zero means that the gate is disabled.
+    pub fn full_replica_byte_limit(&self) -> usize {
+        self.full_replica_byte_limit
     }
 
     /// Returns `true` while any background loop is failed.
@@ -713,6 +743,10 @@ impl EavRuntime {
                     if let Ok(pending) = self.entities.outbox_count().await {
                         self.metrics.record_outbox_pending(pending as u64);
                     }
+                    if let Ok(age) = self.entities.outbox_pending_age().await {
+                        self.metrics
+                            .record_outbox_pending_age(age.unwrap_or_default());
+                    }
                 }
                 Err(error) => {
                     self.metrics.record_outbox_failure();
@@ -759,10 +793,6 @@ impl EavRuntime {
                 _ = ticker.tick() => {
                     if !cancel.is_cancelled() {
                         self.mark_loop_ok(LoopSlot::RuleRunner);
-                    }
-                    if let Ok(age) = self.entities.outbox_pending_age().await {
-                        self.metrics
-                            .record_outbox_pending_age(age.unwrap_or_default());
                     }
                 }
             }

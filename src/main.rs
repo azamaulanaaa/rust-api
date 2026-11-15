@@ -432,6 +432,7 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
     )
     .await
     .context("build the EAV runtime")?;
+    let runtime = runtime.with_full_replica_limit(config.limits.max_full_replica_bytes);
     let eav_api_module = EavApiModule::new(
         runtime.clone(),
         policy_engine.authorizer(),
