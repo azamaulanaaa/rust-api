@@ -25,6 +25,8 @@
 //! It checks a literal address and the scheme without a DNS lookup.
 //! The action pins the resolved address to the HTTP client.
 //! A second DNS answer cannot change the target.
+//! The client disables system proxies. A proxy resolves the host itself, so a
+//! proxy would bypass the pinned address.
 //! The client keeps the original host name for TLS certificate validation.
 //! The allowlist and the disabled redirects limit the destinations.
 //! A compromised allowlisted host remains trusted.
@@ -677,11 +679,18 @@ async fn resolve_webhook_target(
 }
 
 /// Builds one HTTP client with a timeout, no redirects, and pinned addresses.
+///
+/// The call disables system proxies.
+/// A system proxy resolves the host itself, so it bypasses the pinned address.
+/// The pinned address must stay the only target of the client.
 #[allow(clippy::expect_used)]
 fn build_client(host: &str, addresses: &[SocketAddr]) -> reqwest::Client {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(TIMEOUT_SECS))
         .redirect(reqwest::redirect::Policy::none())
+        // Disable system proxies. Reqwest enables them by default, and a proxy
+        // resolves the host itself. A proxy thus bypasses the pinned address.
+        .no_proxy()
         .resolve_to_addrs(host, addresses)
         .build()
         .expect("webhook HTTP client must build")
@@ -1627,6 +1636,26 @@ mod tests {
             Some(Duration::from_secs(MAX_RETRY_AFTER_SECS))
         );
         assert_eq!(parse_retry_after("not a date"), None);
+    }
+
+    #[tokio::test]
+    async fn the_pinned_client_uses_the_resolved_address() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/pin"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let client = build_client("webhook.invalid", &[*server.address()]);
+
+        let response = client
+            .get("http://webhook.invalid/pin")
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 
     #[test]
