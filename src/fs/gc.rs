@@ -191,6 +191,19 @@ pub async fn sweep_once(engine: &FsEngine) -> Result<usize, crate::fs::error::Fs
         // safe direction here. The orphan byte pass uses `f.s3_key`. This
         // row does not affect that key, so skipping the file leaks the file
         // instead of losing it.
+        //
+        // The code takes the per-file lock before it reads the ref count.
+        // `FsStore::attach` and `FsStore::detach` take the same lock.
+        // An attach that commits while this pass waits therefore wins. The
+        // read below sees its count, and the pass skips the file.
+        // Without the lock an attach can commit between the read and the
+        // delete. The delete then removes the bytes of a file that a row
+        // already references.
+        let file_lock = engine.store.file_lock(&f.id);
+        let _held = file_lock.acquire().await;
+        // The code re-reads the count under the lock.
+        // The listing is a snapshot, and an attach may have run since the
+        // code took it.
         let info = match engine.store.get_ref_info(&f.id).await {
             Ok(info) => info,
             Err(e) => {
@@ -206,25 +219,12 @@ pub async fn sweep_once(engine: &FsEngine) -> Result<usize, crate::fs::error::Fs
             continue;
         }
         tracing::info!("fs gc expiring file {} (age {}s)", f.id, now - age);
-        // The code retains the item on failure, as it does for sessions
-        // above. The code measures the age from `orphan_since` when the file
-        // was attached and later detached. The code uses `created_at` for a
-        // file that was never referenced. Unlike a session, there is no
-        // record method that the code can call, because the timestamp is on
+        // The code measures the age from `orphan_since` when the file was
+        // attached and later detached. The code uses `created_at` for a file
+        // that was never referenced. Unlike a session, there is no record
+        // method that the code can call, because the timestamp is on
         // `RefInfo`, not on `FileRecord`.
-        if engine
-            .s3
-            .delete_object(&engine.bucket, &f.s3_key)
-            .await
-            .map_err(|e| {
-                tracing::warn!("gc delete {} failed: {e}", f.id);
-                e
-            })
-            .is_err()
-        {
-            tracing::warn!("fs gc keeping file {} for retry", f.id);
-            continue;
-        }
+        //
         // The code announces before the row goes, and not after. The row is
         // the only record that says that this deletion still has to happen.
         // After the row is gone, no future sweep can find the file to
@@ -238,10 +238,8 @@ pub async fn sweep_once(engine: &FsEngine) -> Result<usize, crate::fs::error::Fs
         // that is already gone.
         //
         // A failed announce retains the file. The code does not propagate the
-        // error. The bytes are already gone at this point. Therefore
-        // propagating would leave the exact state that cannot be retried, as
-        // described above. It would also abort the rest of the sweep for one
-        // file.
+        // error. It also keeps the bytes, because the row still points at
+        // them. Propagating would abort the rest of the sweep for one file.
         if let Err(e) = engine
             .announce(crate::records::WalOp::FileDelete {
                 file_id: f.id.clone(),
@@ -254,7 +252,25 @@ pub async fn sweep_once(engine: &FsEngine) -> Result<usize, crate::fs::error::Fs
             );
             continue;
         }
+        // The row, its ref count, and its relation markers go in one
+        // transaction. The bytes go last.
+        // This order keeps one invariant: no row points at bytes that are
+        // gone. A failed byte delete leaves an object that no row references.
+        // The orphan-byte pass removes that object after the TTL.
+        // The old order deleted the bytes first. A failed row delete then
+        // left a row that answered 404 forever.
         engine.store.delete_file(&f.id).await?;
+        if let Err(e) = engine.s3.delete_object(&engine.bucket, &f.s3_key).await {
+            // The metadata is gone, so this sweep cannot retry the object.
+            // The orphan-byte pass lists `files/` and deletes an aged key
+            // that no row references.
+            tracing::warn!("gc delete {} failed: {e}", f.id);
+            tracing::warn!(
+                "fs gc left the bytes of file {} to the orphan-byte pass",
+                f.id
+            );
+            continue;
+        }
         cleaned += 1;
     }
 
@@ -1077,6 +1093,95 @@ mod tests {
         Ok(())
     }
 
+    /// The sweeper must not delete a file that an attach claimed first.
+    ///
+    /// The sweep reads `RefInfo`, tests `count == 0`, and then deletes the
+    /// row and the bytes.
+    /// `FsStore::attach` can commit a new reference in that window.
+    /// The old order deleted the bytes first, so a surviving row then pointed
+    /// at an object that was gone.
+    ///
+    /// The per-file lock closes the window.
+    /// The sweep and the attach take the same mutex, and the sweep re-reads
+    /// the count under it.
+    ///
+    /// The test holds the lock, so that both callers queue on it in a known
+    /// order.
+    /// The attach queues first, and the sweep queues second.
+    /// The mutex serves a claim in the order that it arrives.
+    /// The attach therefore commits, and the sweep then reads count 1.
+    /// The row and the bytes must both survive.
+    #[tokio::test]
+    async fn attach_that_commits_first_keeps_the_file_and_its_bytes() -> anyhow::Result<()> {
+        let engine = make_engine().await;
+        let file = FileRecord {
+            id: "claim-wins".into(),
+            name: "w.txt".into(),
+            mimetype: "text/plain".into(),
+            size: 4,
+            s3_key: "files/claim-wins".into(),
+            owner_sub: "alice".into(),
+            created_at: chrono::Utc::now().timestamp() - TTL_SECS - 3600,
+        };
+        engine.store.save_file(&file).await?;
+        engine
+            .s3
+            .put_object(
+                "test-bucket",
+                &file.s3_key,
+                Bytes::from_static(b"data"),
+                None,
+                None,
+            )
+            .await?;
+
+        let held = engine.store.file_lock(&file.id);
+        let guard = held.acquire().await;
+
+        let file_id = file.id.clone();
+        let attacher_engine = engine.clone();
+        let mut attacher =
+            tokio::spawn(
+                async move { attacher_engine.store.attach("invoice", "1", &file_id).await },
+            );
+        // A timeout means that the attach waits for the file lock.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), &mut attacher)
+                .await
+                .is_err(),
+            "the attach did not wait for the file lock"
+        );
+
+        let sweeper_engine = engine.clone();
+        let mut sweeper = tokio::spawn(async move { sweep_once(&sweeper_engine).await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), &mut sweeper)
+                .await
+                .is_err(),
+            "the sweep did not wait for the file lock"
+        );
+
+        // The guard goes before the claim, as at the production call sites.
+        drop(guard);
+        drop(held);
+
+        assert_eq!(attacher.await.expect("attach task")?, 1);
+        assert_eq!(sweeper.await.expect("sweep task")?, 0);
+        assert!(
+            engine.store.get_file(&file.id).await?.is_some(),
+            "the sweep deleted a file that an attach had just claimed"
+        );
+        assert!(
+            engine
+                .s3
+                .get_object("test-bucket", &file.s3_key)
+                .await
+                .is_ok(),
+            "the sweep deleted the bytes of a file that an attach had just claimed"
+        );
+        Ok(())
+    }
+
     /// The sweeper must not delete an in-flight part fold, and the file
     /// that follows the fold must not commit without bytes.
     ///
@@ -1267,12 +1372,18 @@ mod tests {
                 created_at: chrono::Utc::now().timestamp() - TTL_SECS - 10,
             })
             .await?;
-        // An S3 failure keeps the sessions and the files for the next sweep.
-        // The code does not leak bytes that no record points at.
+        // An S3 failure keeps the session for the next sweep.
+        // The file row goes before its bytes, so the row is already gone.
+        // The object is then unreferenced, and the orphan-byte pass reclaims
+        // it after the TTL.
+        // The code does not leave a row that points at bytes that are gone.
         let cleaned = sweep_once(&engine).await?;
         assert_eq!(cleaned, 0);
         assert!(engine.store.get_session("old-fail").await?.is_some());
-        assert!(engine.store.get_file("old-fail-file").await?.is_some());
+        assert!(
+            engine.store.get_file("old-fail-file").await?.is_none(),
+            "the row must go before the bytes"
+        );
         Ok(())
     }
 
