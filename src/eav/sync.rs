@@ -173,6 +173,7 @@ pub struct SnapshotPage {
     ///
     /// The value comes from the raw page length, not from `items`.
     /// A filtered page can then hold fewer items than the limit.
+    /// The value is `None` when the next offset would pass the cap.
     /// Continue while `next_offset` is `Some`.
     pub next_offset: Option<usize>,
     /// The id to resume after for the next page.
