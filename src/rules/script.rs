@@ -59,6 +59,23 @@
 //! A condition that calls `host.get_entity` fails with an unknown-variable
 //! error.
 //!
+//! # Condition read boundary
+//!
+//! A condition script obeys the read capability set of its rule, as an action
+//! script does.
+//! It sees the event metadata and the entity identity fields:
+//! `event.event_id`, `event.entity_id`, `event.kind`, `event.schemas`,
+//! `event.correlation_id`, `event.causation_id`, `entity.id`,
+//! `entity.version`, and `entity.schemas`.
+//! It sees only the entity attributes that the allowed pinned schemas define.
+//! It sees only the `event.changed` entries for allowed attribute keys.
+//! An empty read set grants no attribute.
+//! With an empty read set, `entity.attributes` is empty and `event.changed`
+//! is empty.
+//! The identity fields stay visible, so a condition can test the entity id,
+//! the event id, the event kind, the entity version, and the schemas.
+//! The rule engine evaluates a condition script on a blocking thread.
+//!
 //! [`ScriptEngine`] holds one Rhai engine and a bounded compiled-AST cache.
 //! The cache is a speed aid, not a correctness requirement.
 //! A cache miss or a cache clear only costs one compile.
@@ -310,54 +327,18 @@ impl ScriptHost {
     /// It also reads the allowed schema ids of `event`.
     /// The result holds the keys that those schemas define.
     /// A missing schema gives an empty set for that source.
+    /// An empty read set gives an empty set.
     fn visible_attribute_keys(
         &self,
         entity: Option<&Entity>,
         event: &EntityEvent,
     ) -> Result<BTreeSet<String>, ScriptError> {
-        let mut keys = BTreeSet::new();
-        if let Some(entity) = entity {
-            let pinned: Vec<SchemaRef> = entity
-                .schemas
-                .iter()
-                .filter(|schema| self.read.allows(&schema.id))
-                .cloned()
-                .collect();
-            if !pinned.is_empty() {
-                match self.runtime.block_on(self.entities.resolve_refs(&pinned)) {
-                    Ok(effective) => keys.extend(
-                        effective
-                            .iter()
-                            .flat_map(|schema| schema.attributes.keys().cloned()),
-                    ),
-                    Err(EntityError::UnknownSchema(_))
-                    | Err(EntityError::Invalid(_))
-                    | Err(EntityError::Internal(_)) => {}
-                    Err(_) => return Err(ScriptError::Runtime),
-                }
-            }
-        }
-        let schemas: Vec<String> = event
-            .schemas
-            .iter()
-            .filter(|id| self.read.allows(id))
-            .cloned()
-            .collect();
-        if !schemas.is_empty() {
-            match self
-                .runtime
-                .block_on(self.entities.resolve_schemas(&schemas))
-            {
-                Ok(effective) => keys.extend(
-                    effective
-                        .iter()
-                        .flat_map(|schema| schema.attributes.keys().cloned()),
-                ),
-                Err(EntityError::UnknownSchema(_)) | Err(EntityError::Invalid(_)) => {}
-                Err(_) => return Err(ScriptError::Runtime),
-            }
-        }
-        Ok(keys)
+        self.runtime.block_on(visible_attribute_keys(
+            &self.entities,
+            &self.read,
+            entity,
+            event,
+        ))
     }
 
     /// Returns the ids that match one schema and one indexed attribute.
@@ -653,6 +634,9 @@ pub struct ScriptEngine {
     /// [`ScriptEngine::new`] always uses [`WALL_TIME_GUARD`].
     /// A unit test can set another value with `with_wall_guard`.
     wall_guard: Duration,
+    /// A test hook that runs before one condition evaluation.
+    #[cfg(test)]
+    probe: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl ScriptEngine {
@@ -713,6 +697,8 @@ impl ScriptEngine {
             cache: Arc::new(Mutex::new(HashMap::new())),
             enabled,
             wall_guard: WALL_TIME_GUARD,
+            #[cfg(test)]
+            probe: None,
         }
     }
 
@@ -725,6 +711,23 @@ impl ScriptEngine {
     fn with_wall_guard(mut self, guard: Duration) -> Self {
         self.wall_guard = guard;
         self
+    }
+
+    /// Installs a hook that runs before one condition evaluation.
+    ///
+    /// A test uses this method to find the thread that runs the script.
+    #[cfg(test)]
+    pub(crate) fn with_probe(mut self, probe: Arc<dyn Fn() + Send + Sync>) -> Self {
+        self.probe = Some(probe);
+        self
+    }
+
+    /// Calls the test probe when one is installed.
+    fn call_probe(&self) {
+        #[cfg(test)]
+        if let Some(probe) = &self.probe {
+            probe();
+        }
     }
 
     /// Returns true when the server enables condition scripts.
@@ -745,13 +748,22 @@ impl ScriptEngine {
     /// Evaluates a script and returns its boolean result.
     ///
     /// The call compiles the script on a cache miss.
+    /// `visible` holds the attribute keys that the read set allows.
+    /// A `None` set keeps every attribute and every change.
+    /// The rule engine always passes the allowed key set.
     /// A result that is not a boolean returns [`ScriptError::ReturnType`].
     /// Any script failure returns a sanitized [`ScriptError`].
-    pub fn eval_bool(&self, source: &str, ctx: &ScriptContext<'_>) -> Result<bool, ScriptError> {
+    pub fn eval_bool(
+        &self,
+        source: &str,
+        ctx: &ScriptContext<'_>,
+        visible: Option<&BTreeSet<String>>,
+    ) -> Result<bool, ScriptError> {
+        self.call_probe();
         let ast = self.ast_for(source)?;
         let mut scope = Scope::new();
-        scope.push_constant("event", event_map(ctx.event, None));
-        scope.push_constant("entity", entity_value(ctx.entity, None));
+        scope.push_constant("event", event_map(ctx.event, visible));
+        scope.push_constant("entity", entity_value(ctx.entity, visible));
         scope.push_constant("now", ctx.now);
 
         EVAL_DEADLINE.with(|deadline| deadline.set(Some(Instant::now() + self.wall_guard)));
@@ -941,6 +953,63 @@ fn attribute_names(effective: &[EffectiveSchema]) -> BTreeSet<String> {
         .iter()
         .flat_map(|schema| schema.attributes.keys().cloned())
         .collect()
+}
+
+/// Returns the attribute keys that one read set allows.
+///
+/// The call reads the allowed pinned schemas of `entity`.
+/// It also reads the allowed schema ids of `event`.
+/// The result holds the keys that those schemas define.
+/// A missing schema gives no key for that source.
+/// An empty read set gives an empty set.
+/// The condition and the action paths use this function, so both apply the
+/// same boundary.
+pub(crate) async fn visible_attribute_keys(
+    entities: &EntityStore,
+    read: &ScriptCapabilities,
+    entity: Option<&Entity>,
+    event: &EntityEvent,
+) -> Result<BTreeSet<String>, ScriptError> {
+    let mut keys = BTreeSet::new();
+    if let Some(entity) = entity {
+        let pinned: Vec<SchemaRef> = entity
+            .schemas
+            .iter()
+            .filter(|schema| read.allows(&schema.id))
+            .cloned()
+            .collect();
+        if !pinned.is_empty() {
+            match entities.resolve_refs(&pinned).await {
+                Ok(effective) => keys.extend(
+                    effective
+                        .iter()
+                        .flat_map(|schema| schema.attributes.keys().cloned()),
+                ),
+                Err(EntityError::UnknownSchema(_))
+                | Err(EntityError::Invalid(_))
+                | Err(EntityError::Internal(_)) => {}
+                Err(_) => return Err(ScriptError::Runtime),
+            }
+        }
+    }
+    let schemas: Vec<String> = event
+        .schemas
+        .iter()
+        .filter(|id| read.allows(id))
+        .cloned()
+        .collect();
+    if !schemas.is_empty() {
+        match entities.resolve_schemas(&schemas).await {
+            Ok(effective) => keys.extend(
+                effective
+                    .iter()
+                    .flat_map(|schema| schema.attributes.keys().cloned()),
+            ),
+            Err(EntityError::UnknownSchema(_)) | Err(EntityError::Invalid(_)) => {}
+            Err(_) => return Err(ScriptError::Runtime),
+        }
+    }
+    Ok(keys)
 }
 
 /// Converts one Rhai value into a plain JSON value.
@@ -1306,6 +1375,16 @@ mod tests {
         }
     }
 
+    impl ScriptEngine {
+        /// Evaluates one condition script with every attribute visible.
+        ///
+        /// A unit test uses this helper when it does not test the read
+        /// boundary.
+        fn eval_all(&self, source: &str, ctx: &ScriptContext<'_>) -> Result<bool, ScriptError> {
+            self.eval_bool(source, ctx, None)
+        }
+    }
+
     #[test]
     fn a_script_returns_true_and_false_on_the_inputs() {
         let subject = engine();
@@ -1317,14 +1396,14 @@ mod tests {
         let ctx = context(&ev, Some(&item));
 
         assert_eq!(
-            subject.eval_bool(
+            subject.eval_all(
                 r#"event.kind == "updated" && entity.attributes.status == "urgent""#,
                 &ctx
             ),
             Ok(true)
         );
         assert_eq!(
-            subject.eval_bool(
+            subject.eval_all(
                 r#"event.kind == "updated" && entity.attributes.status == "normal""#,
                 &ctx
             ),
@@ -1346,14 +1425,14 @@ mod tests {
         let ctx = context(&ev, None);
 
         assert_eq!(
-            subject.eval_bool(
+            subject.eval_all(
                 r#"event.changed[0].key == "status" && event.changed[0].before == "normal" && event.changed[0].after == "urgent""#,
                 &ctx
             ),
             Ok(true)
         );
         assert_eq!(
-            subject.eval_bool(r#"event.kind == "deleted""#, &ctx),
+            subject.eval_all(r#"event.kind == "deleted""#, &ctx),
             Ok(false)
         );
     }
@@ -1372,7 +1451,7 @@ mod tests {
         let ctx = context(&ev, Some(&item));
 
         assert_eq!(
-            subject.eval_bool(
+            subject.eval_all(
                 "entity.attributes.meta.priority == 2 && entity.attributes.due == 1700000000",
                 &ctx
             ),
@@ -1387,7 +1466,7 @@ mod tests {
         let ctx = context(&ev, None);
 
         assert_eq!(
-            subject.eval_bool(r#"entity == () && event.kind == "deleted""#, &ctx),
+            subject.eval_all(r#"entity == () && event.kind == "deleted""#, &ctx),
             Ok(true)
         );
     }
@@ -1405,7 +1484,7 @@ mod tests {
         let ctx = context(&ev, None);
 
         assert_eq!(
-            subject.eval_bool("let x = 0; while true { x += 1; } true", &ctx),
+            subject.eval_all("let x = 0; while true { x += 1; } true", &ctx),
             Err(ScriptError::Budget)
         );
     }
@@ -1417,7 +1496,7 @@ mod tests {
         let ctx = context(&ev, None);
 
         assert_eq!(
-            subject.eval_bool("fn f(n) { f(n + 1) } f(0)", &ctx),
+            subject.eval_all("fn f(n) { f(n + 1) } f(0)", &ctx),
             Err(ScriptError::Budget)
         );
     }
@@ -1429,7 +1508,7 @@ mod tests {
         let ctx = context(&ev, None);
 
         assert_eq!(
-            subject.eval_bool(
+            subject.eval_all(
                 r#"let s = "x"; while s.len() < 270000 { s += s; } true"#,
                 &ctx
             ),
@@ -1444,7 +1523,7 @@ mod tests {
         let ctx = context(&ev, None);
 
         assert_eq!(
-            subject.eval_bool("let a = []; while true { a.push(1); } true", &ctx),
+            subject.eval_all("let a = []; while true { a.push(1); } true", &ctx),
             Err(ScriptError::Budget)
         );
     }
@@ -1456,7 +1535,7 @@ mod tests {
         let ctx = context(&ev, None);
 
         assert_eq!(
-            subject.eval_bool(
+            subject.eval_all(
                 "fn area(width, height) { width * height } area(6, 7) == 42 && area(3, 5) == 15",
                 &ctx
             ),
@@ -1471,7 +1550,7 @@ mod tests {
         let ctx = context(&ev, None);
 
         assert_eq!(
-            subject.eval_bool(
+            subject.eval_all(
                 r#"let s = sin(0.5);
 let c = cos(0.5);
 let r = sqrt(2.0);
@@ -1493,7 +1572,7 @@ abs(s - 0.479425538604203) < 0.000000001
         let ctx = context(&ev, None);
 
         assert_eq!(
-            subject.eval_bool(
+            subject.eval_all(
                 r#"fn tax_cents(income_cents) {
     let brackets = [
         #{ cap: 1_100_000, rate: 10 },
@@ -1528,7 +1607,7 @@ tax_cents(3_000_000) == 528_000 && tax_cents(5_000_000) == 1_043_000"#,
         let ctx = context(&ev, None);
 
         assert_eq!(
-            subject.eval_bool(
+            subject.eval_all(
                 r#"fn height(v0, angle, g, h0, steps) {
     let vy = v0 * sin(angle);
     let flight = (vy + sqrt(vy * vy + 2.0 * g * h0)) / g;
@@ -1558,7 +1637,7 @@ abs(height(20.0, 0.7, 9.81, 1.5, 100)) < 0.000000001"#,
         let ctx = context(&ev, None);
 
         assert_eq!(
-            subject.eval_bool(
+            subject.eval_all(
                 "let a = []; let total = 0; for i in 0..1000 { a.push(i); total += i; } a.len() == 1000 && total == 499500",
                 &ctx
             ),
@@ -1579,7 +1658,7 @@ abs(height(20.0, 0.7, 9.81, 1.5, 100)) < 0.000000001"#,
         let ctx = context(&ev, None);
 
         assert_eq!(
-            subject.eval_bool(
+            subject.eval_all(
                 "let total = 0; for i in 0..100 { total += i; } total == 4950",
                 &ctx
             ),
@@ -1594,7 +1673,7 @@ abs(height(20.0, 0.7, 9.81, 1.5, 100)) < 0.000000001"#,
         let ctx = context(&ev, None);
 
         assert_eq!(
-            subject.eval_bool("let i = 0; while i < 300000 { i += 1; } true", &ctx),
+            subject.eval_all("let i = 0; while i < 300000 { i += 1; } true", &ctx),
             Err(ScriptError::Budget)
         );
     }
@@ -1613,7 +1692,7 @@ abs(height(20.0, 0.7, 9.81, 1.5, 100)) < 0.000000001"#,
         let ev = event(EntityEventKind::Created, Vec::new());
         let ctx = context(&ev, None);
 
-        assert_eq!(subject.eval_bool("42", &ctx), Err(ScriptError::ReturnType));
+        assert_eq!(subject.eval_all("42", &ctx), Err(ScriptError::ReturnType));
     }
 
     #[test]
@@ -1623,11 +1702,11 @@ abs(height(20.0, 0.7, 9.81, 1.5, 100)) < 0.000000001"#,
         let ctx = context(&ev, None);
 
         assert_eq!(
-            subject.eval_bool(r#"eval("true")"#, &ctx),
+            subject.eval_all(r#"eval("true")"#, &ctx),
             Err(ScriptError::Compile)
         );
         assert_eq!(
-            subject.eval_bool(r#"import "other" as other; true"#, &ctx),
+            subject.eval_all(r#"import "other" as other; true"#, &ctx),
             Err(ScriptError::Compile)
         );
     }
@@ -1639,15 +1718,15 @@ abs(height(20.0, 0.7, 9.81, 1.5, 100)) < 0.000000001"#,
         let ctx = context(&ev, None);
 
         assert_eq!(
-            subject.eval_bool("timestamp()", &ctx),
+            subject.eval_all("timestamp()", &ctx),
             Err(ScriptError::Runtime)
         );
         assert_eq!(
-            subject.eval_bool("sleep(1); true", &ctx),
+            subject.eval_all("sleep(1); true", &ctx),
             Err(ScriptError::Runtime)
         );
         assert_eq!(
-            subject.eval_bool("rand(); true", &ctx),
+            subject.eval_all("rand(); true", &ctx),
             Err(ScriptError::Runtime)
         );
     }
@@ -1659,7 +1738,7 @@ abs(height(20.0, 0.7, 9.81, 1.5, 100)) < 0.000000001"#,
         let ctx = context(&ev, None);
 
         assert_eq!(subject.compile("true"), Err(ScriptError::Disabled));
-        assert_eq!(subject.eval_bool("true", &ctx), Err(ScriptError::Disabled));
+        assert_eq!(subject.eval_all("true", &ctx), Err(ScriptError::Disabled));
     }
 
     #[test]
@@ -1673,9 +1752,9 @@ abs(height(20.0, 0.7, 9.81, 1.5, 100)) < 0.000000001"#,
         let ctx = context(&ev, Some(&item));
         let source = r#"event.kind == "updated" && entity.attributes.status == "urgent""#;
 
-        assert_eq!(subject.eval_bool(source, &ctx), Ok(true));
+        assert_eq!(subject.eval_all(source, &ctx), Ok(true));
         assert_eq!(subject.cache_len(), 1);
-        assert_eq!(subject.eval_bool(source, &ctx), Ok(true));
+        assert_eq!(subject.eval_all(source, &ctx), Ok(true));
         assert_eq!(subject.cache_len(), 1);
     }
 
@@ -2002,7 +2081,7 @@ abs(height(20.0, 0.7, 9.81, 1.5, 100)) < 0.000000001"#,
         let ev = event(EntityEventKind::Created, Vec::new());
         let ctx = context(&ev, None);
 
-        let result = subject.eval_bool(r#"host.get_entity("e1") == ()"#, &ctx);
+        let result = subject.eval_all(r#"host.get_entity("e1") == ()"#, &ctx);
 
         assert_eq!(result, Err(ScriptError::Runtime));
     }

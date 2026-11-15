@@ -52,11 +52,30 @@
 //! [the script engine](crate::rules::script::ScriptEngine).
 //! A script error is a rule error.
 //! A stored script fails when the server disables scripts.
+//!
+//! A condition script obeys the read capability set of its rule, as an action
+//! script does.
+//! It sees only the entity attributes that the allowed pinned schemas define.
+//! It sees only the `event.changed` entries for allowed attribute keys.
+//! It keeps the entity identity fields: `id`, `version`, and `schemas`.
+//! It also keeps the event metadata fields: `event_id`, `entity_id`, `kind`,
+//! `schemas`, `correlation_id`, and `causation_id`.
+//! An empty read set grants no attribute, so `entity.attributes` is empty and
+//! `event.changed` is empty.
+//! The engine evaluates a condition script on a blocking thread, as it does
+//! for an action script.
+//! The operation and wall-time limits still apply.
+//!
+//! [`RuleEngine::run_with_progress`] sends one health signal after a real
+//! cursor advance and after one healthy idle poll.
+//! A caller can clear a failure flag only after this signal.
+//! A runner that makes no progress sends no signal.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures_util::future::BoxFuture;
 use tokio::sync::Mutex;
 
 use crate::CancelToken;
@@ -69,7 +88,7 @@ use crate::rules::error::RuleError;
 use crate::rules::rule::{Condition, Rule, validate_identifier};
 use crate::rules::script::{
     MAX_SOURCE_BYTES, SCRIPT_ACTION_KIND, ScriptActionContext, ScriptContext, ScriptEngine,
-    ScriptError, ScriptHost,
+    ScriptError, ScriptHost, visible_attribute_keys,
 };
 use crate::rules::store::{RuleDeadLetter, RuleStore};
 use crate::sync::wal::Wal;
@@ -139,6 +158,35 @@ pub trait RuleObserver: Send + Sync {
 
     /// Records one action failure.
     fn on_action_failure(&self);
+}
+
+/// Receives the health signal from [`RuleEngine::run_with_progress`].
+///
+/// The engine calls [`RuleProgress::record`] after it advances the cursor and
+/// after one healthy idle poll.
+/// A caller clears a failure flag only after this call.
+/// A runner that makes no progress records nothing.
+pub trait RuleProgress: Send + Sync {
+    /// Records one real cursor advance or one healthy idle poll.
+    fn record(&self);
+}
+
+/// A [`RuleProgress`] that records nothing.
+///
+/// [`RuleEngine::run`] uses this value.
+pub struct NoProgress;
+
+impl RuleProgress for NoProgress {
+    fn record(&self) {}
+}
+
+impl<F> RuleProgress for F
+where
+    F: Fn() + Send + Sync,
+{
+    fn record(&self) {
+        self();
+    }
 }
 
 /// One rule that failed during one pass.
@@ -475,7 +523,7 @@ impl RuleEngine {
         if marker_exists {
             return Ok(ExecutionOutcome::AlreadyExecuted);
         }
-        if !self.eval_condition(&rule.condition, event, entity)? {
+        if !self.eval_condition(rule, event, entity).await? {
             return Ok(ExecutionOutcome::ConditionFalse);
         }
         if rule.action.kind == SCRIPT_ACTION_KIND {
@@ -505,13 +553,15 @@ impl RuleEngine {
 
     /// Evaluates one condition tree, including every nested script.
     ///
-    /// A script condition runs through
-    /// [`ScriptEngine::eval_bool`].
-    /// Every other condition runs through [`Condition::eval`].
+    /// A script condition runs on a blocking thread through
+    /// [`ScriptEngine::eval_bool`], so a script cannot block the async reactor.
+    /// The call computes the visible attribute keys from the rule read set.
+    /// It returns an empty set when the rule grants no read access.
+    /// A tree with no script condition reads no schema.
     /// A script error stops the rule and returns the sanitized error.
-    fn eval_condition(
+    async fn eval_condition(
         &self,
-        condition: &Condition,
+        rule: &Rule,
         event: &EntityEvent,
         entity: Option<&Entity>,
     ) -> Result<bool, RuleError> {
@@ -520,39 +570,72 @@ impl RuleEngine {
             entity,
             now: chrono::Utc::now().timestamp(),
         };
-        self.eval_condition_with(condition, &ctx)
+        let visible = if has_script_condition(&rule.condition) {
+            let read = rule.capabilities.to_script_capabilities()?;
+            Some(
+                visible_attribute_keys(&self.entities, &read, entity, event)
+                    .await
+                    .map_err(RuleError::Script)?,
+            )
+        } else {
+            None
+        };
+        self.eval_condition_with(&rule.condition, &ctx, visible.as_ref())
+            .await
     }
 
     /// Evaluates one condition node against one script context.
-    fn eval_condition_with(
-        &self,
-        condition: &Condition,
-        ctx: &ScriptContext<'_>,
-    ) -> Result<bool, RuleError> {
-        match condition {
-            Condition::Script { source } => self
-                .script
-                .eval_bool(source, ctx)
-                .map_err(RuleError::Script),
-            Condition::All(children) => {
-                for child in children {
-                    if !self.eval_condition_with(child, ctx)? {
-                        return Ok(false);
-                    }
+    ///
+    /// A script node clones the entity and the event, because the blocking
+    /// task must own its data.
+    /// Every other node reads the borrowed context.
+    fn eval_condition_with<'a>(
+        &'a self,
+        condition: &'a Condition,
+        ctx: &'a ScriptContext<'a>,
+        visible: Option<&'a BTreeSet<String>>,
+    ) -> BoxFuture<'a, Result<bool, RuleError>> {
+        Box::pin(async move {
+            match condition {
+                Condition::Script { source } => {
+                    let script = self.script.clone();
+                    let source = source.clone();
+                    let event = ctx.event.clone();
+                    let entity = ctx.entity.cloned();
+                    let now = ctx.now;
+                    let visible = visible.cloned();
+                    tokio::task::spawn_blocking(move || {
+                        let ctx = ScriptContext {
+                            event: &event,
+                            entity: entity.as_ref(),
+                            now,
+                        };
+                        script.eval_bool(&source, &ctx, visible.as_ref())
+                    })
+                    .await
+                    .map_err(|_| RuleError::Script(ScriptError::Runtime))?
+                    .map_err(RuleError::Script)
                 }
-                Ok(true)
-            }
-            Condition::Any(children) => {
-                for child in children {
-                    if self.eval_condition_with(child, ctx)? {
-                        return Ok(true);
+                Condition::All(children) => {
+                    for child in children {
+                        if !self.eval_condition_with(child, ctx, visible).await? {
+                            return Ok(false);
+                        }
                     }
+                    Ok(true)
                 }
-                Ok(false)
+                Condition::Any(children) => {
+                    for child in children {
+                        if self.eval_condition_with(child, ctx, visible).await? {
+                            return Ok(true);
+                        }
+                    }
+                    Ok(false)
+                }
+                Condition::Not(child) => Ok(!self.eval_condition_with(child, ctx, visible).await?),
+                other => Ok(other.eval(ctx.entity, ctx.event)),
             }
-            Condition::Not(child) => Ok(!self.eval_condition_with(child, ctx)?),
-            other => Ok(other.eval(ctx.entity, ctx.event)),
-        }
+        })
     }
 
     /// Runs one script action and commits its effects with the marker.
@@ -664,11 +747,37 @@ impl RuleEngine {
     /// An action must still be idempotent.
     /// A dead-lettered entry is failed by policy and stays visible in the
     /// dead-letter rows.
+    ///
+    /// # Progress signal
+    ///
+    /// [`RuleEngine::run`] records no progress.
+    /// [`RuleEngine::run_with_progress`] calls [`RuleProgress::record`] after
+    /// each real cursor advance and after one healthy idle poll.
+    /// A failed entry below the attempt limit records no progress.
+    /// A dead-lettered entry records progress after it moves the cursor.
     pub async fn run<C: CancelToken>(
         &self,
         wal: &Wal,
         cancel: C,
         poll_interval: Duration,
+    ) -> Result<(), RuleError> {
+        self.run_with_progress(wal, cancel, poll_interval, &NoProgress)
+            .await
+    }
+
+    /// Tails the change feed and records a health signal for each real step.
+    ///
+    /// The call behaves as [`RuleEngine::run`] does.
+    /// It also calls [`RuleProgress::record`] after each cursor advance and
+    /// after one healthy idle poll.
+    /// The call records no signal when a failed entry stops the run below the
+    /// attempt limit.
+    pub async fn run_with_progress<C: CancelToken, P: RuleProgress + ?Sized>(
+        &self,
+        wal: &Wal,
+        cancel: C,
+        poll_interval: Duration,
+        progress: &P,
     ) -> Result<(), RuleError> {
         let mut cursor = self.rules.cursor().await?;
         // The number of successful entries since the last cursor write.
@@ -742,6 +851,7 @@ impl RuleEngine {
                                 );
                                 cursor = entry.seq;
                                 pending = 0;
+                                progress.record();
                                 continue;
                             }
                             Err(error) => {
@@ -782,12 +892,14 @@ impl RuleEngine {
                                 );
                                 cursor = entry.seq;
                                 pending = 0;
+                                progress.record();
                                 continue;
                             }
                         }
                     }
                     cursor = entry.seq;
                     pending += 1;
+                    progress.record();
                     if pending >= CURSOR_BATCH_SIZE {
                         self.rules.set_cursor(cursor).await?;
                         pending = 0;
@@ -801,8 +913,25 @@ impl RuleEngine {
                 self.rules.set_cursor(cursor).await?;
                 pending = 0;
             }
+            // A caught-up feed is healthy: the engine read the head and found
+            // the cursor equal to it.
+            progress.record();
             tokio::time::sleep(poll_interval).await;
         }
+    }
+}
+
+/// True when one condition tree holds a script node.
+///
+/// The engine reads no schema for a tree with no script node.
+fn has_script_condition(condition: &Condition) -> bool {
+    match condition {
+        Condition::Script { .. } => true,
+        Condition::All(children) | Condition::Any(children) => {
+            children.iter().any(has_script_condition)
+        }
+        Condition::Not(child) => has_script_condition(child),
+        _ => false,
     }
 }
 
@@ -855,7 +984,7 @@ mod tests {
     use crate::db::{build_test_store, test_prefix};
     use crate::eav::entity::{AttributeValue, Entity, EntityDraft, WriteContext};
     use crate::eav::schema::{AttributeDef, AttributeType, SchemaDraft, SchemaRegistry};
-    use crate::records::{ChangeSink, EntityEventKind};
+    use crate::records::{AttributeChange, ChangeSink, EntityEventKind};
     use crate::rules::rule::{ActionRef, CompareOp, Condition, RuleDraft, RuleTrigger};
     use crate::rules::script::{MAX_SOURCE_BYTES, ScriptError};
     use oxkv::{GetSet as _, Hooks as _, KeyPrefix, OxKvStore, ScanExt as _};
@@ -1072,10 +1201,30 @@ mod tests {
         }
     }
 
+    /// Returns the `secret` schema for the read-boundary tests.
+    fn secret_schema() -> SchemaDraft {
+        SchemaDraft {
+            id: "secret".to_string(),
+            extends: Vec::new(),
+            attributes: BTreeMap::from([(
+                "code".to_string(),
+                AttributeDef {
+                    name: "code".to_string(),
+                    ty: AttributeType::String,
+                    required: false,
+                    indexed: false,
+                    unique: false,
+                    default: None,
+                },
+            )]),
+        }
+    }
+
     async fn stores() -> TestStores {
         let registry =
             SchemaRegistry::new(build_test_store(&test_prefix("rules-engine-schema")).await);
         registry.publish(schema()).await.unwrap();
+        registry.publish(secret_schema()).await.unwrap();
         let raw = build_test_store(&test_prefix("rules-engine")).await;
         TestStores {
             rules: RuleStore::new(raw.clone()),
@@ -1091,6 +1240,7 @@ mod tests {
         let registry =
             SchemaRegistry::new(build_test_store(&test_prefix("rules-engine-schema")).await);
         registry.publish(schema()).await.unwrap();
+        registry.publish(secret_schema()).await.unwrap();
         let rule_raw = build_test_store(&test_prefix("rules-engine-rules")).await;
         let entity_raw = build_test_store(&test_prefix("rules-engine-entities")).await;
         (
@@ -1119,6 +1269,27 @@ mod tests {
                         "total".to_string(),
                         AttributeValue::Integer(total),
                     )]),
+                },
+                &WriteContext::new("tester"),
+            )
+            .await
+            .unwrap()
+            .after
+            .unwrap()
+    }
+
+    /// Creates one entity that pins the allowed `invoice` and the denied
+    /// `secret` schema.
+    async fn make_invoice_and_secret(entities: &EntityStore, id: &str) -> Entity {
+        entities
+            .create(
+                EntityDraft {
+                    id: id.to_string(),
+                    schemas: vec!["invoice".to_string(), "secret".to_string()],
+                    attributes: BTreeMap::from([
+                        ("total".to_string(), AttributeValue::Integer(10)),
+                        ("code".to_string(), AttributeValue::String("s1".to_string())),
+                    ]),
                 },
                 &WriteContext::new("tester"),
             )
@@ -1885,6 +2056,89 @@ mod tests {
         assert_eq!(stores.rules.cursor().await.unwrap(), 1);
     }
 
+    /// An idle run records one health signal on each poll.
+    #[tokio::test]
+    async fn an_idle_run_records_a_health_signal() {
+        let stores = stores().await;
+        let engine = engine(&stores, Vec::new());
+        let wal = test_wal().await;
+        let signals = Arc::new(AtomicUsize::new(0));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let handle = tokio::spawn({
+            let engine = engine.clone();
+            let wal = wal.clone();
+            let cancel = cancel.clone();
+            let signals = signals.clone();
+            async move {
+                let record = move || {
+                    signals.fetch_add(1, Ordering::SeqCst);
+                };
+                engine
+                    .run_with_progress(&wal, cancel, Duration::from_millis(5), &record)
+                    .await
+            }
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while signals.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("an idle poll must record a health signal");
+
+        cancel.store(true, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    /// A real cursor advance records one progress signal.
+    #[tokio::test]
+    async fn a_cursor_advance_records_a_progress_signal() {
+        let stores = stores().await;
+        let engine = engine(&stores, Vec::new());
+        let wal = test_wal().await;
+        wal.append(WalOp::Attach {
+            row_type: "invoice".to_string(),
+            row_id: "1".to_string(),
+            file_id: "f1".to_string(),
+        })
+        .await
+        .unwrap();
+        let signals = Arc::new(AtomicUsize::new(0));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let handle = tokio::spawn({
+            let engine = engine.clone();
+            let wal = wal.clone();
+            let cancel = cancel.clone();
+            let signals = signals.clone();
+            async move {
+                let record = move || {
+                    signals.fetch_add(1, Ordering::SeqCst);
+                };
+                engine
+                    .run_with_progress(&wal, cancel, Duration::from_millis(5), &record)
+                    .await
+            }
+        });
+
+        wait_for_cursor(&stores.rules, 1).await;
+        assert!(
+            signals.load(Ordering::SeqCst) > 0,
+            "a cursor advance must record a progress signal"
+        );
+
+        cancel.store(true, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn run_leaves_the_cursor_on_the_failed_entry() {
         let stores = stores().await;
@@ -2467,6 +2721,7 @@ mod tests {
         make_entity(&stores.entities).await;
 
         let mut scripted = draft("scripted", "record");
+        scripted.capabilities.read = vec!["invoice".to_string()];
         scripted.condition = Condition::Script {
             source: r#"event.kind == "created" && entity.attributes.total == 10"#.to_string(),
         };
@@ -2580,6 +2835,131 @@ mod tests {
         assert_eq!(executions[0].outcome, ExecutionOutcome::ConditionFalse);
         assert!(recorder.records().is_empty());
         assert!(!stores.rules.is_executed("alpha", "evt-1").await.unwrap());
+    }
+
+    /// A condition script applies the read set of its rule.
+    ///
+    /// The entity pins the allowed `invoice` schema and the denied `secret`
+    /// schema.
+    /// The condition sees `total` and not `code`.
+    /// It sees the `total` change and not the `code` change.
+    #[tokio::test]
+    async fn a_condition_script_reads_only_the_allowed_attributes_and_changes() {
+        let stores = stores().await;
+        let recorder = Arc::new(RecordingAction::new("record"));
+        let subject = engine(&stores, vec![recorder.clone()]).with_script_enabled(true);
+        make_invoice_and_secret(&stores.entities, "e1").await;
+        let mut rule = draft("alpha", "record");
+        rule.trigger.events = vec![EntityEventKind::Updated];
+        rule.capabilities.read = vec!["invoice".to_string()];
+        rule.condition = Condition::Script {
+            source: r#"
+                entity.attributes.total == 10
+                    && entity.attributes.code == ()
+                    && event.changed.len() == 1
+                    && event.changed[0].key == "total"
+            "#
+            .to_string(),
+        };
+        stores.rules.upsert(rule).await.unwrap();
+        let mut updated = event(EntityEventKind::Updated);
+        updated.schemas = vec!["invoice".to_string(), "secret".to_string()];
+        updated.changed = vec![
+            AttributeChange {
+                key: "total".to_string(),
+                old: Some(serde_json::json!(5)),
+                new: Some(serde_json::json!(10)),
+            },
+            AttributeChange {
+                key: "code".to_string(),
+                old: Some(serde_json::json!("s0")),
+                new: Some(serde_json::json!("s1")),
+            },
+        ];
+
+        let executions = subject.process(&updated).await.unwrap();
+
+        assert_eq!(executions[0].outcome, ExecutionOutcome::Executed);
+    }
+
+    /// A condition with no read grants sees only the identity fields.
+    ///
+    /// The trigger entity stays visible through `id`, `version`, and
+    /// `schemas`.
+    /// Every attribute and every change stays hidden.
+    #[tokio::test]
+    async fn a_condition_script_with_no_read_grants_sees_only_identity_fields() {
+        let stores = stores().await;
+        let recorder = Arc::new(RecordingAction::new("record"));
+        let subject = engine(&stores, vec![recorder.clone()]).with_script_enabled(true);
+        make_invoice_and_secret(&stores.entities, "e1").await;
+        let mut rule = draft("alpha", "record");
+        rule.trigger.events = vec![EntityEventKind::Updated];
+        rule.condition = Condition::Script {
+            source: r#"
+                entity.id == "e1"
+                    && entity.version.to_int() == 1
+                    && entity.schemas.len() == 2
+                    && entity.attributes.len() == 0
+                    && event.entity_id == "e1"
+                    && event.kind == "updated"
+                    && event.changed.len() == 0
+            "#
+            .to_string(),
+        };
+        stores.rules.upsert(rule).await.unwrap();
+        let mut updated = event(EntityEventKind::Updated);
+        updated.schemas = vec!["invoice".to_string(), "secret".to_string()];
+        updated.changed = vec![AttributeChange {
+            key: "total".to_string(),
+            old: Some(serde_json::json!(5)),
+            new: Some(serde_json::json!(10)),
+        }];
+
+        let executions = subject.process(&updated).await.unwrap();
+
+        assert_eq!(executions[0].outcome, ExecutionOutcome::Executed);
+    }
+
+    /// The engine evaluates a condition script on a blocking thread.
+    ///
+    /// The probe records the evaluation thread.
+    /// A different thread runs the script, so the script cannot block the
+    /// async reactor.
+    #[tokio::test]
+    async fn a_condition_script_runs_on_a_blocking_thread() {
+        let stores = stores().await;
+        let recorder = Arc::new(RecordingAction::new("record"));
+        let mut subject = engine(&stores, vec![recorder.clone()]).with_script_enabled(true);
+        let caller = std::thread::current().id();
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let seen_for_probe = seen.clone();
+        subject.script = subject.script.with_probe(Arc::new(move || {
+            *seen_for_probe.lock().unwrap() = Some(std::thread::current().id());
+        }));
+        make_entity(&stores.entities).await;
+        let mut rule = draft("alpha", "record");
+        rule.condition = Condition::Script {
+            source: "true".to_string(),
+        };
+        stores.rules.upsert(rule).await.unwrap();
+
+        let executions = subject
+            .process(&event(EntityEventKind::Created))
+            .await
+            .unwrap();
+
+        assert_eq!(executions[0].outcome, ExecutionOutcome::Executed);
+        let evaluated = *seen.lock().unwrap();
+        assert!(
+            evaluated.is_some(),
+            "the probe must see the condition evaluation"
+        );
+        assert_ne!(
+            evaluated,
+            Some(caller),
+            "the condition script must run on a blocking thread"
+        );
     }
 
     #[tokio::test]
