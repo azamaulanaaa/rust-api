@@ -41,6 +41,10 @@ In scope:
 - S3 file storage and multipart uploads.
 - Secret handling for capability tokens and OIDC client secrets.
 - Single-writer lease and fencing.
+- EAV schema and entity API, including schema defaults, entity validation, unique and index facts, and version checks.
+- EAV rule scripts, including the Rhai sandbox, its operation limits, and its read and write capability sets.
+- EAV webhook egress, including the host allowlist, DNS resolution and address pinning, disabled system proxies, and HMAC signing.
+- EAV replica authorization, including the build-time grant filter and the read-time grant filter.
 
 Out of scope:
 

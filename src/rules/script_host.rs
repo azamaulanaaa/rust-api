@@ -220,11 +220,12 @@ impl ScriptReadHost {
     /// Returns the ids of the entities with an indexed attribute value.
     ///
     /// The call requires the `schema` capability.
+    /// It requires that `schema` defines and indexes `key`.
     /// It reads the attribute index and keeps only entities that pin
     /// `schema`.
     /// The result is in id order and holds at most `limit` ids.
     /// The call never scans the whole entity family.
-    /// A key that no applied schema indexes returns
+    /// A key that `schema` does not define or index returns
     /// [`ScriptHostError::Invalid`] with the stable message
     /// `attribute is not indexed`.
     /// A `limit` of 0 or a `limit` above [`MAX_FIND_RESULTS`] is an error.
@@ -237,6 +238,7 @@ impl ScriptReadHost {
     ) -> Result<Vec<String>, ScriptHostError> {
         check_limit(limit)?;
         require_capability(&self.capabilities, schema)?;
+        self.require_indexed_key(schema, key).await?;
 
         let mut ids = BTreeSet::new();
         for candidate in attribute_candidates(value) {
@@ -271,6 +273,34 @@ impl ScriptReadHost {
             _ => Err(ScriptHostError::Invalid(
                 BOTH_OR_NEITHER_MESSAGE.to_string(),
             )),
+        }
+    }
+
+    /// Returns an error unless `schema` defines and indexes `key`.
+    ///
+    /// The call reads the latest version of `schema`.
+    /// An inherited attribute counts as a definition of `schema`.
+    /// A missing key or a key without an index returns
+    /// [`ScriptHostError::Invalid`] with the stable message
+    /// `attribute is not indexed`.
+    async fn require_indexed_key(&self, schema: &str, key: &str) -> Result<(), ScriptHostError> {
+        let effective = match self.entities.resolve_schemas(&[schema.to_string()]).await {
+            Ok(effective) => effective,
+            Err(EntityError::UnknownSchema(_)) | Err(EntityError::Invalid(_)) => {
+                return Err(ScriptHostError::Invalid(NOT_INDEXED_MESSAGE.to_string()));
+            }
+            Err(error) => return Err(map_entity_error(error)),
+        };
+        let indexed = effective.iter().any(|schema| {
+            schema
+                .attributes
+                .get(key)
+                .is_some_and(|definition| definition.indexed)
+        });
+        if indexed {
+            Ok(())
+        } else {
+            Err(ScriptHostError::Invalid(NOT_INDEXED_MESSAGE.to_string()))
         }
     }
 
@@ -646,6 +676,39 @@ mod tests {
         assert_eq!(
             error,
             ScriptHostError::Invalid("attribute is not indexed".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn find_by_attribute_requires_the_requested_schema_to_index_the_key() {
+        let (host, store) = host_with(&["invoice"]).await;
+        create(
+            &store,
+            "shared",
+            &["invoice", "secret"],
+            vec![("title", text("shared")), ("code", text("x"))],
+        )
+        .await;
+
+        let error = host
+            .find_by_attribute("invoice", "code", &serde_json::json!("x"), 10)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            ScriptHostError::Invalid("attribute is not indexed".to_string())
+        );
+        assert_eq!(
+            host.find(
+                "invoice",
+                Some("title"),
+                Some(&serde_json::json!("shared")),
+                10
+            )
+            .await
+            .unwrap(),
+            vec!["shared"]
         );
     }
 

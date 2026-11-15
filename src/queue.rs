@@ -48,14 +48,15 @@ pub struct Job {
 /// Proof that a worker holds a lease on a job.
 ///
 /// A queue operation that changes a leased job must carry the token that
-/// [`JobQueue::reserve`] returned. The backend rejects the call when the
-/// token does not match the current lease.
+/// [`JobQueue::reserve`] or [`JobQueue::extend_lease`] returned. The backend
+/// rejects the call when the token does not match the current lease.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LeaseToken {
     /// Worker that holds the lease.
     pub worker: String,
-    /// Lease expiry time, in unix seconds.
-    pub expires_at: i64,
+    /// Lease generation. The backend increments the value on each reserve
+    /// and each extension. An old token has a lower value.
+    pub generation: u64,
 }
 
 /// A job that a worker has leased.
@@ -112,6 +113,71 @@ pub enum RetryPolicy {
         /// Delay before the job may run again.
         delay: Duration,
     },
+}
+
+/// Retry decision that a [`JobError`] carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobRetry {
+    /// Do not retry the job.
+    NoRetry,
+    /// Retry the job after the given delay.
+    RetryAfter(Duration),
+    /// Retry the job with the worker retry schedule.
+    RetryDefault,
+}
+
+/// A job error that carries the retry decision.
+///
+/// A handler returns this error to control the next action of the worker.
+/// The worker maps [`JobRetry::NoRetry`] to [`RetryPolicy::NoRetry`].
+/// It maps [`JobRetry::RetryAfter`] to [`RetryPolicy::Retry`] with the same
+/// delay.
+/// It maps [`JobRetry::RetryDefault`] to the worker retry schedule.
+/// An error without this type uses the worker retry schedule.
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+pub struct JobError {
+    /// The error text.
+    message: String,
+    /// The retry decision.
+    retry: JobRetry,
+}
+
+impl JobError {
+    /// Creates an error for a permanent failure.
+    ///
+    /// The worker does not retry the job.
+    pub fn permanent(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            retry: JobRetry::NoRetry,
+        }
+    }
+
+    /// Creates an error for a temporary failure.
+    ///
+    /// The worker uses its own retry schedule.
+    pub fn retryable(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            retry: JobRetry::RetryDefault,
+        }
+    }
+
+    /// Creates an error for a temporary failure with a delay.
+    ///
+    /// The worker retries the job after `delay`.
+    pub fn retry_after(message: impl Into<String>, delay: Duration) -> Self {
+        Self {
+            message: message.into(),
+            retry: JobRetry::RetryAfter(delay),
+        }
+    }
+
+    /// Returns the retry decision.
+    pub fn retry(&self) -> JobRetry {
+        self.retry
+    }
 }
 
 /// Error returned by queue operations.
@@ -182,17 +248,18 @@ pub trait JobQueue: Send + Sync {
         retry: RetryPolicy,
     ) -> Result<(), QueueError>;
 
-    /// Extends the lease of a job.
+    /// Extends the lease of a job and returns the new token.
     ///
-    /// The call fails with [`QueueError::LeaseExpired`] or
-    /// [`QueueError::AlreadyLeased`] when `lease` is not the current token.
-    /// A failed call does not change the job.
+    /// The old token is not valid after this call. The call fails with
+    /// [`QueueError::LeaseExpired`] or [`QueueError::AlreadyLeased`] when
+    /// `lease` is not the current token. A failed call does not change the
+    /// job.
     async fn extend_lease(
         &self,
         job_id: JobId,
         lease: &LeaseToken,
         extend: Duration,
-    ) -> Result<(), QueueError>;
+    ) -> Result<LeaseToken, QueueError>;
 
     /// Returns the status of a job.
     async fn status(&self, job_id: JobId) -> Result<JobStatus, QueueError>;
