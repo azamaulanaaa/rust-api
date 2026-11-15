@@ -417,6 +417,33 @@ impl RuleStore {
             .map_err(RuleError::Store)
     }
 
+    /// Resets the durable change-feed cursor and reports the old and new
+    /// sequence.
+    ///
+    /// The call reads the stored cursor first.
+    /// A missing cursor is 0.
+    /// The call then writes `seq`.
+    /// The return value is `(old, new)`.
+    ///
+    /// The caller must stop the writer that owns the prefix first.
+    /// A reset behind the writer replays feed entries.
+    /// Use this call only for operator recovery.
+    pub async fn reset_cursor(&self, seq: u64) -> Result<(u64, u64), RuleError> {
+        let _publish = self.publish_lock.lock().await;
+        let g = self.store.write().await;
+        let old = match g.get_bytes(CURSOR_KEY).await.map_err(RuleError::Store)? {
+            Some(bytes) => serde_json::from_slice(&bytes)
+                .map_err(|error| RuleError::Serialization(error.to_string()))?,
+            None => 0,
+        };
+        let bytes = serde_json::to_vec(&seq)
+            .map_err(|error| RuleError::Serialization(error.to_string()))?;
+        g.put_bytes(CURSOR_KEY, &bytes)
+            .await
+            .map_err(RuleError::Store)?;
+        Ok((old, seq))
+    }
+
     /// Returns the key of one execution marker.
     ///
     /// The key is `rule:exec:{rule_id}:{event_id}`.
@@ -1377,6 +1404,27 @@ mod tests {
         let seqs: Vec<u64> = dead.into_iter().map(|entry| entry.seq).collect();
 
         assert_eq!(seqs, vec![3, 2, 1]);
+    }
+
+    #[tokio::test]
+    async fn reset_cursor_reports_the_old_and_new_sequence() {
+        let store = new_store().await;
+        store.set_cursor(9).await.unwrap();
+
+        let (old, new) = store.reset_cursor(3).await.unwrap();
+
+        assert_eq!((old, new), (9, 3));
+        assert_eq!(store.cursor().await.unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn reset_cursor_uses_zero_for_a_missing_cursor() {
+        let store = new_store().await;
+
+        let (old, new) = store.reset_cursor(4).await.unwrap();
+
+        assert_eq!((old, new), (0, 4));
+        assert_eq!(store.cursor().await.unwrap(), 4);
     }
 
     #[tokio::test]

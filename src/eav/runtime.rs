@@ -319,7 +319,7 @@ impl EavRuntime {
         let entity_store = build_s3_store(s3, &domain_prefix(db_prefix, "entity"))
             .await
             .context("build the EAV entity store")?;
-        let rule_store = build_s3_store(s3, &domain_prefix(db_prefix, "rules"))
+        let rule_store = build_s3_store(s3, &rule_store_prefix(db_prefix))
             .await
             .context("build the EAV rule store")?;
         let replica_store = build_s3_store(s3, &domain_prefix(db_prefix, "replica"))
@@ -885,6 +885,14 @@ fn domain_prefix(db_prefix: &str, domain: &str) -> String {
     } else {
         format!("{root}/eav/{domain}")
     }
+}
+
+/// Returns the rule-store prefix under one `[database].prefix`.
+///
+/// The server and the operator commands use this function.
+/// The rule cursor and the dead-letter rows then live under one prefix.
+pub fn rule_store_prefix(db_prefix: &str) -> String {
+    domain_prefix(db_prefix, "rules")
 }
 
 #[cfg(test)]
