@@ -12,11 +12,12 @@
 //! The client follows no redirects.
 //! The action resolves the URL host before each request.
 //! It rejects a host when any address is not global.
-//! The rejected IPv4 ranges are loopback, private, link-local, carrier-grade
-//! NAT, IETF assignment, 6to4 relay, benchmarking, documentation, and
-//! reserved.
-//! The rejected IPv6 ranges are loopback, link-local, unique-local, 6to4,
-//! Teredo, NAT64, documentation, discard-only, and ORCHID.
+//! The rejected IPv4 ranges are the current network, loopback, private,
+//! link-local, carrier-grade NAT, IETF assignment, 6to4 relay, benchmarking,
+//! documentation, multicast, and reserved.
+//! The rejected IPv6 ranges are loopback, unspecified, link-local,
+//! unique-local, 6to4, Teredo, NAT64, benchmarking, documentation,
+//! segment routing, discard-only, and ORCHID.
 //! An operator can permit a private address with
 //! `[eav].webhook_allow_private_hosts`.
 //! Rule validation also rejects a URL that the delivery path would reject
@@ -24,6 +25,8 @@
 //! It checks a literal address and the scheme without a DNS lookup.
 //! The action pins the resolved address to the HTTP client.
 //! A second DNS answer cannot change the target.
+//! The client disables system proxies. A proxy resolves the host itself, so a
+//! proxy would bypass the pinned address.
 //! The client keeps the original host name for TLS certificate validation.
 //! The allowlist and the disabled redirects limit the destinations.
 //! A compromised allowlisted host remains trusted.
@@ -42,7 +45,7 @@ use sha2::Sha256;
 use url::Url;
 
 use crate::eav::metrics::EavMetrics;
-use crate::queue::{Job, JobHandler, JobQueue};
+use crate::queue::{Job, JobError, JobHandler, JobQueue};
 use crate::records::{AttributeChange, EntityEventKind};
 use crate::rules::action::{ActionContext, RuleAction};
 
@@ -57,6 +60,9 @@ const MAX_URL_BYTES: usize = 2048;
 
 /// The request timeout in seconds.
 const TIMEOUT_SECS: u64 = 10;
+
+/// The maximum retry delay that a `Retry-After` header can set, in seconds.
+const MAX_RETRY_AFTER_SECS: u64 = 3600;
 
 /// Records the result of one webhook delivery.
 ///
@@ -105,6 +111,7 @@ impl WebhookAction {
     /// Creates the action from the allowed host entries.
     ///
     /// Each entry is a host or a `host:port` pair.
+    /// A host entry matches only the default port of the URL scheme.
     /// An empty list rejects every webhook rule.
     /// The direct mode uses no queue and no signing secret.
     /// The action rejects a private address by default.
@@ -267,6 +274,7 @@ impl WebhookJobHandler {
     /// Adds the parsed allowlist entries.
     ///
     /// Each entry is a host or a `host:port` pair.
+    /// A host entry matches only the default port of the URL scheme.
     /// An empty list rejects every webhook job.
     fn with_allowed_hosts(mut self, allowed_hosts: Vec<AllowedHost>) -> Self {
         self.allowed_hosts = allowed_hosts;
@@ -379,7 +387,10 @@ struct WebhookJobPayload {
 struct AllowedHost {
     /// The host in lowercase, without brackets.
     host: String,
-    /// The optional port. `None` matches any port.
+    /// The optional port.
+    ///
+    /// `None` matches only the default port of the URL scheme.
+    /// `Some` matches only that port.
     port: Option<u16>,
 }
 
@@ -390,7 +401,8 @@ struct AllowedHost {
 /// It rejects the request when any address is not public, unless the caller
 /// allows a private host.
 /// It signs the exact body bytes when a secret exists.
-/// It returns an error for any status that is not 2xx.
+/// It returns a permanent [`JobError`] for a non-retryable status.
+/// It returns a retryable [`JobError`] for a temporary status.
 async fn send_webhook(
     url: Url,
     body: &[u8],
@@ -415,12 +427,62 @@ async fn send_webhook(
         .await
         .map_err(|_| anyhow::anyhow!("webhook request failed"))?;
     if !response.status().is_success() {
-        return Err(anyhow::anyhow!(
-            "webhook returned status {}",
-            response.status().as_u16()
-        ));
+        let status = response.status();
+        let retry_after = retry_after(&response);
+        return Err(classify_response(status, retry_after).into());
     }
     Ok(())
+}
+
+/// Returns the retry decision for one non-2xx response.
+///
+/// The call retries `408`, `425`, `429`, and `503`.
+/// A retry for `429` or `503` uses the `Retry-After` delay when it exists.
+/// The call retries every other `5xx` status.
+/// The call does not retry every other status.
+fn classify_response(status: reqwest::StatusCode, retry_after: Option<Duration>) -> JobError {
+    let message = format!("webhook returned status {}", status.as_u16());
+    match status.as_u16() {
+        429 | 503 => match retry_after {
+            Some(delay) => JobError::retry_after(message, delay),
+            None => JobError::retryable(message),
+        },
+        408 | 425 => JobError::retryable(message),
+        code if (500..600).contains(&code) => JobError::retryable(message),
+        _ => JobError::permanent(message),
+    }
+}
+
+/// Reads the `Retry-After` header as a delay.
+///
+/// The call accepts the delta-seconds form and the HTTP-date form.
+/// It caps the delay at [`MAX_RETRY_AFTER_SECS`].
+/// It returns `None` for a missing or an invalid value.
+fn retry_after(response: &reqwest::Response) -> Option<Duration> {
+    let value = response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?;
+    parse_retry_after(value)
+}
+
+/// Parses one `Retry-After` value as a delay.
+///
+/// The call accepts the delta-seconds form and the HTTP-date form.
+/// It caps the delay at [`MAX_RETRY_AFTER_SECS`].
+/// It returns `None` for an invalid value.
+fn parse_retry_after(value: &str) -> Option<Duration> {
+    let value = value.trim();
+    let seconds = match value.parse::<u64>() {
+        Ok(seconds) => seconds,
+        Err(_) => {
+            let date = chrono::DateTime::parse_from_rfc2822(value).ok()?;
+            let now = chrono::Utc::now().timestamp();
+            date.timestamp().saturating_sub(now).max(0) as u64
+        }
+    };
+    Some(Duration::from_secs(seconds.min(MAX_RETRY_AFTER_SECS)))
 }
 
 /// Signs one body with HMAC-SHA256.
@@ -474,22 +536,39 @@ fn validate_url(
     if url.scheme() == "http" && !is_loopback(&host) {
         bail!("webhook URL must use https for this host");
     }
-    if !allows(allowed_hosts, &host, url.port_or_known_default()) {
+    if !allows(
+        allowed_hosts,
+        &host,
+        url.port_or_known_default(),
+        url.scheme(),
+    ) {
         bail!("webhook host is not allowed");
     }
     Ok(())
 }
 
 /// Returns true when the URL host and port are in the allowlist.
-fn allows(allowed_hosts: &[AllowedHost], host: &str, port: Option<u16>) -> bool {
+///
+/// An entry with no port matches only the default port of `scheme`.
+fn allows(allowed_hosts: &[AllowedHost], host: &str, port: Option<u16>, scheme: &str) -> bool {
     let host = normalize_host(host);
+    let default_port = default_port_for_scheme(scheme);
     allowed_hosts.iter().any(|allowed| {
         allowed.host == host
             && match allowed.port {
-                None => true,
+                None => port == default_port,
                 Some(expected) => port == Some(expected),
             }
     })
+}
+
+/// Returns the default port for one URL scheme.
+fn default_port_for_scheme(scheme: &str) -> Option<u16> {
+    match scheme {
+        "http" => Some(80),
+        "https" => Some(443),
+        _ => None,
+    }
 }
 
 /// Parses one allowlist entry as a host or a `host:port` pair.
@@ -600,11 +679,18 @@ async fn resolve_webhook_target(
 }
 
 /// Builds one HTTP client with a timeout, no redirects, and pinned addresses.
+///
+/// The call disables system proxies.
+/// A system proxy resolves the host itself, so it bypasses the pinned address.
+/// The pinned address must stay the only target of the client.
 #[allow(clippy::expect_used)]
 fn build_client(host: &str, addresses: &[SocketAddr]) -> reqwest::Client {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(TIMEOUT_SECS))
         .redirect(reqwest::redirect::Policy::none())
+        // Disable system proxies. Reqwest enables them by default, and a proxy
+        // resolves the host itself. A proxy thus bypasses the pinned address.
+        .no_proxy()
         .resolve_to_addrs(host, addresses)
         .build()
         .expect("webhook HTTP client must build")
@@ -613,7 +699,7 @@ fn build_client(host: &str, addresses: &[SocketAddr]) -> reqwest::Client {
 /// Returns true when one address is global.
 ///
 /// The call checks an IPv4-mapped IPv6 address as an IPv4 address.
-/// The call rejects every non-global range in the two functions below.
+/// It rejects every network in the two tables below.
 fn is_public_ip(address: IpAddr) -> bool {
     match address {
         IpAddr::V4(address) => is_public_ipv4(address),
@@ -626,81 +712,90 @@ fn is_public_ip(address: IpAddr) -> bool {
     }
 }
 
+/// The IPv4 networks that are not global.
+const NON_GLOBAL_IPV4: &[(Ipv4Addr, u8)] = &[
+    (Ipv4Addr::new(0, 0, 0, 0), 8),  // 0.0.0.0/8 is the current network.
+    (Ipv4Addr::new(10, 0, 0, 0), 8), // 10.0.0.0/8 is private.
+    (Ipv4Addr::new(100, 64, 0, 0), 10), // 100.64.0.0/10 is carrier-grade NAT.
+    (Ipv4Addr::new(127, 0, 0, 0), 8), // 127.0.0.0/8 is loopback.
+    (Ipv4Addr::new(169, 254, 0, 0), 16), // 169.254.0.0/16 is link-local.
+    (Ipv4Addr::new(172, 16, 0, 0), 12), // 172.16.0.0/12 is private.
+    (Ipv4Addr::new(192, 0, 0, 0), 24), // 192.0.0.0/24 is an IETF assignment.
+    (Ipv4Addr::new(192, 0, 2, 0), 24), // 192.0.2.0/24 is TEST-NET-1.
+    (Ipv4Addr::new(192, 88, 99, 0), 24), // 192.88.99.0/24 is a 6to4 relay.
+    (Ipv4Addr::new(192, 168, 0, 0), 16), // 192.168.0.0/16 is private.
+    (Ipv4Addr::new(198, 18, 0, 0), 15), // 198.18.0.0/15 is benchmarking.
+    (Ipv4Addr::new(198, 51, 100, 0), 24), // 198.51.100.0/24 is TEST-NET-2.
+    (Ipv4Addr::new(203, 0, 113, 0), 24), // 203.0.113.0/24 is TEST-NET-3.
+    (Ipv4Addr::new(224, 0, 0, 0), 4), // 224.0.0.0/4 is multicast.
+    (Ipv4Addr::new(240, 0, 0, 0), 4), // 240.0.0.0/4 is reserved.
+];
+
 /// Returns true when one IPv4 address is global.
 ///
-/// The call rejects loopback, private, link-local, unspecified, broadcast,
-/// and multicast addresses.
-/// It also rejects the ranges below.
+/// The call rejects every network in [`NON_GLOBAL_IPV4`].
 fn is_public_ipv4(address: Ipv4Addr) -> bool {
-    let octets = address.octets();
-    let first = octets[0];
-    let second = octets[1];
-    let third = octets[2];
-    !(address.is_loopback()
-        || address.is_private()
-        || address.is_link_local()
-        || address.is_unspecified()
-        || address.is_broadcast()
-        || address.is_multicast()
-        // 100.64.0.0/10 is carrier-grade NAT.
-        || (first == 100 && (64..=127).contains(&second))
-        // 192.0.0.0/24 is an IETF assignment.
-        || (first == 192 && second == 0 && third == 0)
-        // 192.88.99.0/24 is the 6to4 relay anycast range.
-        || (first == 192 && second == 88 && third == 99)
-        // 198.18.0.0/15 is the benchmarking range.
-        || (first == 198 && (18..=19).contains(&second))
-        // 192.0.2.0/24 is TEST-NET-1 documentation.
-        || (first == 192 && second == 0 && third == 2)
-        // 198.51.100.0/24 is TEST-NET-2 documentation.
-        || (first == 198 && second == 51 && third == 100)
-        // 203.0.113.0/24 is TEST-NET-3 documentation.
-        || (first == 203 && second == 0 && third == 113)
-        // 240.0.0.0/4 is reserved.
-        || first >= 240)
+    !NON_GLOBAL_IPV4
+        .iter()
+        .any(|(network, prefix)| in_ipv4_network(address, *network, *prefix))
 }
+
+/// Returns true when one IPv4 address is in one network.
+fn in_ipv4_network(address: Ipv4Addr, network: Ipv4Addr, prefix: u8) -> bool {
+    if prefix == 0 {
+        return true;
+    }
+    let mask = u32::MAX << (32 - u32::from(prefix));
+    (u32::from(address) & mask) == (u32::from(network) & mask)
+}
+
+/// The IPv6 networks that are not global.
+const NON_GLOBAL_IPV6: &[(Ipv6Addr, u8)] = &[
+    (Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0), 128), // ::/128 is unspecified.
+    (Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1), 128), // ::1/128 is loopback.
+    (Ipv6Addr::new(0x0064, 0xff9b, 0, 0, 0, 0, 0, 0), 96), // 64:ff9b::/96 is NAT64.
+    (Ipv6Addr::new(0x0064, 0xff9b, 1, 0, 0, 0, 0, 0), 48), // 64:ff9b:1::/48 is local NAT64.
+    (Ipv6Addr::new(0x0100, 0, 0, 0, 0, 0, 0, 0), 64), // 100::/64 is discard-only.
+    (Ipv6Addr::new(0x2001, 0, 0, 0, 0, 0, 0, 0), 32), // 2001::/32 is Teredo.
+    (Ipv6Addr::new(0x2001, 0x0002, 0, 0, 0, 0, 0, 0), 48), // 2001:2::/48 is benchmarking.
+    (Ipv6Addr::new(0x2001, 0x0010, 0, 0, 0, 0, 0, 0), 28), // 2001:10::/28 is ORCHIDv1.
+    (Ipv6Addr::new(0x2001, 0x0020, 0, 0, 0, 0, 0, 0), 28), // 2001:20::/28 is ORCHIDv2.
+    (Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 0), 32), // 2001:db8::/32 is documentation.
+    (Ipv6Addr::new(0x2002, 0, 0, 0, 0, 0, 0, 0), 16), // 2002::/16 is 6to4.
+    (Ipv6Addr::new(0x3fff, 0, 0, 0, 0, 0, 0, 0), 20), // 3fff::/20 is documentation.
+    (Ipv6Addr::new(0x5f00, 0, 0, 0, 0, 0, 0, 0), 16), // 5f00::/16 is segment routing.
+    (Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 0), 7), // fc00::/7 is unique-local.
+    (Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0), 10), // fe80::/10 is link-local.
+    (Ipv6Addr::new(0xff00, 0, 0, 0, 0, 0, 0, 0), 8), // ff00::/8 is multicast.
+];
 
 /// Returns true when one IPv6 address is global.
 ///
-/// The call rejects loopback, unspecified, multicast, link-local, and
-/// unique-local addresses.
-/// It also rejects the ranges below.
+/// The call rejects every network in [`NON_GLOBAL_IPV6`].
 fn is_public_ipv6(address: Ipv6Addr) -> bool {
-    let segments = address.segments();
-    !(address.is_loopback()
-        || address.is_unspecified()
-        || address.is_multicast()
-        || address.is_unicast_link_local()
-        || address.is_unique_local()
-        // 2002::/16 is the 6to4 range.
-        || segments[0] == 0x2002
-        // 2001::/32 is the Teredo range.
-        || (segments[0] == 0x2001 && segments[1] == 0)
-        // 64:ff9b::/96 is the NAT64 range.
-        || (segments[0] == 0x0064
-            && segments[1] == 0xff9b
-            && segments[2] == 0
-            && segments[3] == 0
-            && segments[4] == 0
-            && segments[5] == 0)
-        // 2001:db8::/32 is the documentation range.
-        || (segments[0] == 0x2001 && segments[1] == 0x0db8)
-        // 100::/64 is the discard-only range.
-        || (segments[0] == 0x0100
-            && segments[1] == 0
-            && segments[2] == 0
-            && segments[3] == 0)
-        // 2001:10::/28 and 2001:20::/28 are the ORCHID ranges.
-        || (segments[0] == 0x2001 && (segments[1] >> 4 == 0x001 || segments[1] >> 4 == 0x002)))
+    !NON_GLOBAL_IPV6
+        .iter()
+        .any(|(network, prefix)| in_ipv6_network(address, *network, *prefix))
+}
+
+/// Returns true when one IPv6 address is in one network.
+fn in_ipv6_network(address: Ipv6Addr, network: Ipv6Addr, prefix: u8) -> bool {
+    if prefix == 0 {
+        return true;
+    }
+    let mask = u128::MAX << (128 - u32::from(prefix));
+    (u128::from(address) & mask) == (u128::from(network) & mask)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::net::Ipv6Addr;
     use std::sync::Arc;
     use std::time::Duration;
 
     use serde_json::json;
+    use tokio_util::sync::CancellationToken;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -708,7 +803,7 @@ mod tests {
     use crate::db::{build_test_store, test_prefix};
     use crate::eav::entity::EntityStore;
     use crate::eav::schema::SchemaRegistry;
-    use crate::queue::{JobQueue, MemoryQueue};
+    use crate::queue::{JobQueue, JobStatus, MemoryQueue, QueueWorker};
     use crate::records::{AttributeChange, EntityEvent};
     use crate::rules::engine::RuleEngine;
     use crate::rules::rule::{ActionRef, Condition, Rule, RuleCapabilities, RuleTrigger};
@@ -776,6 +871,71 @@ mod tests {
         b"0123456789abcdef0123456789abcdef".to_vec()
     }
 
+    /// Builds one queued webhook job for a test server.
+    fn webhook_job(server: &MockServer) -> Job {
+        let envelope = WebhookJobPayload {
+            url: format!("{}/hook", server.uri()),
+            body: json!({"event_id": "evt-1", "rule_id": "alpha"}),
+        };
+        Job {
+            id: uuid::Uuid::now_v7(),
+            kind: JOB_KIND.to_string(),
+            payload: serde_json::to_vec(&envelope).unwrap(),
+            priority: 0,
+            attempt: 0,
+            max_attempts: 5,
+            created_at: 0,
+            scheduled_at: 0,
+            idempotency_key: None,
+            headers: BTreeMap::new(),
+        }
+    }
+
+    /// Starts one worker for the webhook handler.
+    fn start_worker(
+        queue: Arc<MemoryQueue>,
+        handler: WebhookJobHandler,
+    ) -> (CancellationToken, tokio::task::JoinHandle<()>) {
+        let worker = QueueWorker::new(
+            queue as Arc<dyn JobQueue>,
+            vec![Arc::new(handler) as Arc<dyn JobHandler>],
+            "worker-1".to_string(),
+        )
+        .with_poll_interval(Duration::from_millis(1))
+        .with_retry_base(Duration::from_secs(60))
+        .with_retry_max(Duration::from_secs(60));
+        let cancel = CancellationToken::new();
+        let token = cancel.clone();
+        let handle = tokio::spawn(async move { worker.run(token).await });
+        (cancel, handle)
+    }
+
+    /// Waits until the mock server receives `count` requests.
+    async fn wait_for_requests(server: &MockServer, count: usize) {
+        for _ in 0..2000 {
+            if server.received_requests().await.unwrap().len() >= count {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        panic!("the mock server did not receive {count} requests");
+    }
+
+    /// Waits until a job reaches the expected status.
+    async fn wait_for_status<F>(queue: &MemoryQueue, id: uuid::Uuid, ready: F) -> JobStatus
+    where
+        F: Fn(&JobStatus) -> bool,
+    {
+        for _ in 0..2000 {
+            let status = queue.status(id).await.unwrap();
+            if ready(&status) {
+                return status;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        panic!("the job did not reach the expected status");
+    }
+
     #[test]
     fn validate_rejects_bad_parameters() {
         let action = WebhookAction::new(vec!["example.com".to_string()]);
@@ -802,16 +962,38 @@ mod tests {
         let action = WebhookAction::new(vec![
             "example.com".to_string(),
             "api.example.com:8443".to_string(),
-            "127.0.0.1".to_string(),
+            "127.0.0.1:8080".to_string(),
         ])
         .allow_private_hosts(true);
         for params in [
             json!({"url": "https://example.com/hook"}),
-            json!({"url": "https://example.com:9443/hook"}),
             json!({"url": "https://api.example.com:8443/hook"}),
             json!({"url": "http://127.0.0.1:8080/hook"}),
         ] {
             assert!(action.validate(&params).is_ok(), "{params}");
+        }
+    }
+
+    #[test]
+    fn a_host_entry_matches_only_the_default_port() {
+        let cases = [
+            ("example.com", "https://example.com/hook", true),
+            ("example.com", "https://example.com:443/hook", true),
+            ("example.com", "https://example.com:8443/hook", false),
+            ("127.0.0.1", "http://127.0.0.1/hook", true),
+            ("127.0.0.1", "http://127.0.0.1:8080/hook", false),
+            ("127.0.0.1", "https://127.0.0.1/hook", true),
+            ("127.0.0.1:8080", "http://127.0.0.1:8080/hook", true),
+            ("127.0.0.1:8080", "http://127.0.0.1/hook", false),
+        ];
+        for (entry, url, expected) in cases {
+            let action = WebhookAction::new(vec![entry.to_string()]).allow_private_hosts(true);
+            let result = action.validate(&json!({ "url": url }));
+            assert_eq!(
+                result.is_ok(),
+                expected,
+                "entry {entry} and url {url}: {result:?}"
+            );
         }
     }
 
@@ -932,14 +1114,16 @@ mod tests {
     #[test]
     fn the_address_classifier_rejects_new_non_global_ipv4_ranges() {
         let rejected_ipv4 = [
-            "100.64.0.1",   // Carrier-grade NAT.
-            "192.0.0.1",    // IETF assignment.
-            "192.88.99.1",  // 6to4 relay.
-            "198.18.0.1",   // Benchmarking.
-            "192.0.2.1",    // Documentation.
-            "198.51.100.1", // Documentation.
-            "203.0.113.1",  // Documentation.
-            "240.0.0.1",    // Reserved.
+            "0.0.0.1",       // Current network.
+            "0.255.255.255", // Current network.
+            "100.64.0.1",    // Carrier-grade NAT.
+            "192.0.0.1",     // IETF assignment.
+            "192.88.99.1",   // 6to4 relay.
+            "198.18.0.1",    // Benchmarking.
+            "192.0.2.1",     // Documentation.
+            "198.51.100.1",  // Documentation.
+            "203.0.113.1",   // Documentation.
+            "240.0.0.1",     // Reserved.
         ];
         for raw in rejected_ipv4 {
             let address: Ipv4Addr = raw.parse().unwrap();
@@ -950,17 +1134,39 @@ mod tests {
     #[test]
     fn the_address_classifier_rejects_new_non_global_ipv6_ranges() {
         let rejected_ipv6 = [
-            "2002::1",     // 6to4.
-            "2001::1",     // Teredo.
-            "64:ff9b::1",  // NAT64.
-            "2001:db8::1", // Documentation.
-            "100::1",      // Discard-only.
-            "2001:10::1",  // ORCHIDv1.
-            "2001:20::1",  // ORCHIDv2.
+            "2002::1",      // 6to4.
+            "2001::1",      // Teredo.
+            "64:ff9b::1",   // NAT64.
+            "64:ff9b:1::1", // Local NAT64.
+            "2001:db8::1",  // Documentation.
+            "100::1",       // Discard-only.
+            "2001:10::1",   // ORCHIDv1.
+            "2001:20::1",   // ORCHIDv2.
+            "2001:2::1",    // Benchmarking.
+            "3fff::1",      // Documentation.
+            "5f00::1",      // Segment routing.
         ];
         for raw in rejected_ipv6 {
             let address: Ipv6Addr = raw.parse().unwrap();
             assert!(!is_public_ip(address.into()), "{raw}");
+        }
+    }
+
+    #[test]
+    fn the_address_classifier_accepts_addresses_next_to_the_ranges() {
+        for raw in ["1.0.0.0", "8.8.8.8", "1.1.1.1"] {
+            let address: Ipv4Addr = raw.parse().unwrap();
+            assert!(is_public_ip(address.into()), "{raw}");
+        }
+
+        for raw in [
+            "2001:4860:4860::8888",
+            "2606:4700:4700::1111",
+            "4000::1",
+            "6000::1",
+        ] {
+            let address: Ipv6Addr = raw.parse().unwrap();
+            assert!(is_public_ip(address.into()), "{raw}");
         }
     }
 
@@ -1316,6 +1522,144 @@ mod tests {
             .unwrap();
 
         assert!(handler.handle(&leased[0].job).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_400_response_fails_the_job_with_one_attempt() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/hook"))
+            .respond_with(ResponseTemplate::new(400))
+            .mount(&server)
+            .await;
+        let queue = Arc::new(MemoryQueue::new());
+        let action =
+            WebhookAction::new(vec![server.address().to_string()]).allow_private_hosts(true);
+        let job = webhook_job(&server);
+        let id = job.id;
+        queue.enqueue(job).await.unwrap();
+        let (cancel, run) = start_worker(queue.clone(), action.job_handler());
+
+        wait_for_requests(&server, 1).await;
+        let status = wait_for_status(&queue, id, |s| matches!(s, JobStatus::Failed { .. })).await;
+        cancel.cancel();
+        run.await.unwrap();
+
+        assert!(matches!(status, JobStatus::Failed { .. }), "got {status:?}");
+        assert!(
+            queue
+                .reserve("probe", 1, Duration::from_secs(30))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_429_response_queues_a_retry_with_the_retry_after_delay() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/hook"))
+            .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "2"))
+            .mount(&server)
+            .await;
+        let queue = Arc::new(MemoryQueue::new());
+        let action =
+            WebhookAction::new(vec![server.address().to_string()]).allow_private_hosts(true);
+        let job = webhook_job(&server);
+        let id = job.id;
+        queue.enqueue(job).await.unwrap();
+        let (cancel, run) = start_worker(queue.clone(), action.job_handler());
+
+        wait_for_requests(&server, 1).await;
+        let status = wait_for_status(&queue, id, |s| matches!(s, JobStatus::Queued)).await;
+        cancel.cancel();
+        run.await.unwrap();
+
+        assert!(matches!(status, JobStatus::Queued), "got {status:?}");
+        assert!(
+            queue
+                .reserve("probe", 1, Duration::from_secs(30))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        tokio::time::sleep(Duration::from_millis(2100)).await;
+        let leased = queue
+            .reserve("probe", 1, Duration::from_secs(30))
+            .await
+            .unwrap();
+        assert_eq!(leased.len(), 1);
+        assert_eq!(leased[0].job.attempt, 1);
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_500_response_queues_a_retry() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/hook"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let queue = Arc::new(MemoryQueue::new());
+        let action =
+            WebhookAction::new(vec![server.address().to_string()]).allow_private_hosts(true);
+        let job = webhook_job(&server);
+        let id = job.id;
+        queue.enqueue(job).await.unwrap();
+        let (cancel, run) = start_worker(queue.clone(), action.job_handler());
+
+        wait_for_requests(&server, 1).await;
+        let status = wait_for_status(&queue, id, |s| matches!(s, JobStatus::Queued)).await;
+        cancel.cancel();
+        run.await.unwrap();
+
+        assert!(matches!(status, JobStatus::Queued), "got {status:?}");
+        assert!(
+            queue
+                .reserve("probe", 1, Duration::from_secs(30))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn the_retry_after_parser_reads_and_caps_the_delay() {
+        assert_eq!(parse_retry_after("2"), Some(Duration::from_secs(2)));
+        assert_eq!(parse_retry_after("0"), Some(Duration::ZERO));
+        assert_eq!(
+            parse_retry_after("99999"),
+            Some(Duration::from_secs(MAX_RETRY_AFTER_SECS))
+        );
+        assert_eq!(
+            parse_retry_after("Sun, 06 Nov 1994 08:49:37 GMT"),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(parse_retry_after("not a date"), None);
+    }
+
+    #[tokio::test]
+    async fn the_pinned_client_uses_the_resolved_address() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/pin"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let client = build_client("webhook.invalid", &[*server.address()]);
+
+        let response = client
+            .get("http://webhook.invalid/pin")
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 
     #[test]

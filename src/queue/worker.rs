@@ -333,10 +333,21 @@ impl QueueWorker {
             },
             Err(e) => {
                 warn!(error = %e, job_id = %job_id, "job failed");
-                let delay = retry_delay(job.attempt, self.retry_base, self.retry_max);
+                let policy = match e.downcast_ref::<super::JobError>() {
+                    Some(error) => match error.retry() {
+                        super::JobRetry::NoRetry => RetryPolicy::NoRetry,
+                        super::JobRetry::RetryAfter(delay) => RetryPolicy::Retry { delay },
+                        super::JobRetry::RetryDefault => RetryPolicy::Retry {
+                            delay: retry_delay(job.attempt, self.retry_base, self.retry_max),
+                        },
+                    },
+                    None => RetryPolicy::Retry {
+                        delay: retry_delay(job.attempt, self.retry_base, self.retry_max),
+                    },
+                };
                 if let Err(nack_error) = self
                     .queue
-                    .nack(job_id, &lease, &e.to_string(), RetryPolicy::Retry { delay })
+                    .nack(job_id, &lease, &e.to_string(), policy)
                     .await
                 {
                     warn!(error = %nack_error, job_id = %job_id, "queue nack failed; the lease was lost");
@@ -529,6 +540,37 @@ mod tests {
 
         async fn status(&self, job_id: JobId) -> Result<JobStatus, QueueError> {
             self.inner.status(job_id).await
+        }
+    }
+
+    /// Handler that returns a permanent job error.
+    struct PermanentErrHandler;
+
+    #[async_trait]
+    impl JobHandler for PermanentErrHandler {
+        fn kind(&self) -> &'static str {
+            "permanent"
+        }
+
+        async fn handle(&self, _job: &Job) -> Result<Option<Vec<u8>>, anyhow::Error> {
+            Err(crate::queue::JobError::permanent("permanent failure").into())
+        }
+    }
+
+    /// Handler that returns a retry job error with a delay.
+    struct RetryAfterErrHandler;
+
+    #[async_trait]
+    impl JobHandler for RetryAfterErrHandler {
+        fn kind(&self) -> &'static str {
+            "retry-after"
+        }
+
+        async fn handle(&self, _job: &Job) -> Result<Option<Vec<u8>>, anyhow::Error> {
+            Err(
+                crate::queue::JobError::retry_after("temporary failure", Duration::from_secs(60))
+                    .into(),
+            )
         }
     }
 
@@ -910,6 +952,68 @@ mod tests {
         assert!(
             matches!(status, JobStatus::Leased { .. }),
             "a rejected ack must not mark the job done, got {status:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_permanent_job_error_is_not_retried() {
+        let queue = Arc::new(MemoryQueue::new());
+        let worker = QueueWorker::new(
+            Arc::clone(&queue) as Arc<dyn JobQueue>,
+            vec![Arc::new(PermanentErrHandler) as Arc<dyn JobHandler>],
+            "worker-1".to_string(),
+        )
+        .with_lease(Duration::from_secs(30));
+        let job = test_job("permanent", 0, 5);
+        let id = job.id;
+        queue.enqueue(job).await.unwrap();
+
+        let leased = queue
+            .reserve("worker-1", 1, Duration::from_secs(30))
+            .await
+            .unwrap();
+        process_one(&worker, leased).await;
+
+        let status = queue.status(id).await.unwrap();
+        assert!(matches!(status, JobStatus::Failed { .. }), "got {status:?}");
+        assert!(
+            queue
+                .reserve("probe", 1, Duration::from_secs(30))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_retry_after_job_error_uses_the_delay() {
+        let queue = Arc::new(MemoryQueue::new());
+        let worker = QueueWorker::new(
+            Arc::clone(&queue) as Arc<dyn JobQueue>,
+            vec![Arc::new(RetryAfterErrHandler) as Arc<dyn JobHandler>],
+            "worker-1".to_string(),
+        )
+        .with_lease(Duration::from_secs(30))
+        .with_retry_base(Duration::ZERO)
+        .with_retry_max(Duration::ZERO);
+        let job = test_job("retry-after", 0, 5);
+        let id = job.id;
+        queue.enqueue(job).await.unwrap();
+
+        let leased = queue
+            .reserve("worker-1", 1, Duration::from_secs(30))
+            .await
+            .unwrap();
+        process_one(&worker, leased).await;
+
+        let status = queue.status(id).await.unwrap();
+        assert!(matches!(status, JobStatus::Queued), "got {status:?}");
+        assert!(
+            queue
+                .reserve("probe", 1, Duration::from_secs(30))
+                .await
+                .unwrap()
+                .is_empty()
         );
     }
 
