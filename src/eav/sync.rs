@@ -538,15 +538,16 @@ pub(crate) async fn events(
 /// The route then returns the current feed head.
 /// Each later request sends that head and gets the same head.
 /// A head above the current feed head returns `409`.
-/// A matching `If-None-Match` returns `304` with no body.
-#[utoipa::path(get, path = "/eav/sync/snapshot", tag = "eav", params(SnapshotQuery), responses((status = 200, body = SnapshotPage), (status = 304, description = "not modified"), (status = 400, body = crate::http::error::ErrorBody), (status = 401, body = crate::http::error::ErrorBody), (status = 409, body = crate::http::error::ErrorBody), (status = 500, body = crate::http::error::ErrorBody)))]
+/// The route sets no `ETag` and ignores `If-None-Match`.
+/// The response depends on the current grants and on the page, so it has no
+/// stable validator.
+#[utoipa::path(get, path = "/eav/sync/snapshot", tag = "eav", params(SnapshotQuery), responses((status = 200, body = SnapshotPage), (status = 400, body = crate::http::error::ErrorBody), (status = 401, body = crate::http::error::ErrorBody), (status = 409, body = crate::http::error::ErrorBody), (status = 500, body = crate::http::error::ErrorBody)))]
 #[get("/sync/snapshot")]
 pub(crate) async fn snapshot(
     runtime: web::Data<EavRuntime>,
     policy: web::Data<Authorizer>,
     claims: Validated<Claims>,
     query: web::Query<SnapshotQuery>,
-    req: HttpRequest,
 ) -> Result<HttpResponse, EavApiError> {
     let (limit, mode, pinned) = query.into_inner().resolve()?;
     let current = runtime.wal().head().await.map_err(internal)?;
@@ -557,17 +558,6 @@ pub(crate) async fn snapshot(
         Some(head) => head,
         None => current,
     };
-    let etag = status_etag(head);
-    if let Some(header) = req
-        .headers()
-        .get(IF_NONE_MATCH)
-        .and_then(|value| value.to_str().ok())
-        && etag_matches(header, &etag)
-    {
-        return Ok(HttpResponse::NotModified()
-            .insert_header((ETAG, etag))
-            .finish());
-    }
 
     match mode {
         PageMode::Cursor(after) => {
@@ -581,14 +571,12 @@ pub(crate) async fn snapshot(
                     items.push(entity);
                 }
             }
-            Ok(HttpResponse::Ok()
-                .insert_header((ETAG, etag))
-                .json(SnapshotPage {
-                    items,
-                    next_offset: None,
-                    next,
-                    head,
-                }))
+            Ok(HttpResponse::Ok().json(SnapshotPage {
+                items,
+                next_offset: None,
+                next,
+                head,
+            }))
         }
         PageMode::Offset(offset) => {
             let raw = runtime.entities().list_page(limit, offset).await?;
@@ -600,14 +588,12 @@ pub(crate) async fn snapshot(
                 }
             }
             let next_offset = page_next_offset(offset, raw_len, limit);
-            Ok(HttpResponse::Ok()
-                .insert_header((ETAG, etag))
-                .json(SnapshotPage {
-                    items,
-                    next_offset,
-                    next: None,
-                    head,
-                }))
+            Ok(HttpResponse::Ok().json(SnapshotPage {
+                items,
+                next_offset,
+                next: None,
+                head,
+            }))
         }
     }
 }
@@ -1598,13 +1584,7 @@ mod tests {
 
         let res = get_route!(&app, "/eav/sync/snapshot", &fx.token("alice")?).await;
         assert_eq!(res.status(), http::StatusCode::OK);
-        let etag = res
-            .headers()
-            .get(ETAG)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or_default()
-            .to_string();
-        assert_eq!(etag, format!("\"{head}\""));
+        assert!(res.headers().get(ETAG).is_none(), "snapshot sets no ETag");
         let body: Value = actix_test::read_body_json(res).await;
         let items = body["items"].as_array().expect("items");
         assert_eq!(items.len(), 2);
@@ -1779,7 +1759,7 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn a_matching_snapshot_if_none_match_returns_304() -> anyhow::Result<()> {
+    async fn a_snapshot_ignores_if_none_match_and_a_revocation_is_fresh() -> anyhow::Result<()> {
         let fx = fixture().await?;
         publish_task_schema(&fx).await?;
         create_entity(&fx, "e1").await?;
@@ -1787,6 +1767,9 @@ mod tests {
         let head = fx.runtime.wal().head().await?;
         let module = fx.module().await?;
         let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+
+        revoke_collection_read(&fx).await?;
 
         let res = actix_test::call_service(
             &app,
@@ -1794,14 +1777,19 @@ mod tests {
                 actix_test::TestRequest::get()
                     .uri("/eav/sync/snapshot")
                     .insert_header((IF_NONE_MATCH, format!("\"{head}\""))),
-                &fx.token("alice")?,
+                &token,
             )
             .to_request(),
         )
         .await;
-        assert_eq!(res.status(), http::StatusCode::NOT_MODIFIED);
-        let body = actix_test::read_body(res).await;
-        assert!(body.is_empty());
+        assert_eq!(res.status(), http::StatusCode::OK);
+        assert!(res.headers().get(ETAG).is_none(), "snapshot sets no ETag");
+        let body: Value = actix_test::read_body_json(res).await;
+        assert_eq!(
+            body["items"].as_array().map(Vec::len),
+            Some(0),
+            "a revoked grant must not return stale data"
+        );
         Ok(())
     }
 
