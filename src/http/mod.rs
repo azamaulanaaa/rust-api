@@ -112,6 +112,20 @@ pub fn health_routes(cfg: &mut web::ServiceConfig) {
     cfg.service(health::ready);
 }
 
+/// Mounts the OpenAPI document and the Swagger UI when `expose` is true.
+///
+/// The routes are off by default. `/openapi.json` and `/swagger-ui/*` answer
+/// without authentication, so a deployment that does not need them must not
+/// serve them. Set `[http].expose_docs = true` to turn them on.
+///
+/// The `wired_app!` macro and [`ApiService::configure_docs`] call this
+/// function. The served app and a host app then apply the same rule.
+pub fn docs_routes(cfg: &mut web::ServiceConfig, expose: bool) {
+    if expose {
+        docs::config(cfg);
+    }
+}
+
 /// Builds the CORS middleware for browser clients.
 ///
 /// An empty `allowed_origins` disables CORS responses. Only same-origin
@@ -227,7 +241,7 @@ fn register_modules(
 }
 
 /// Expands the full application wiring at the call site:
-/// `wired_app!(&modules, &readiness, &cors_origins)`.
+/// `wired_app!(&modules, &readiness, &cors_origins, &bucket, expose_docs)`.
 ///
 /// The code is a macro, not a function, for one specific reason. The
 /// actix-web `App` type has no nameable public type. A function can
@@ -244,7 +258,7 @@ fn register_modules(
 /// therefore unreachable. A startup panic is better than a module that is
 /// hidden without a message.
 macro_rules! wired_app {
-    ($modules:expr, $readiness:expr, $cors_origins:expr, $bucket:expr) => {{
+    ($modules:expr, $readiness:expr, $cors_origins:expr, $bucket:expr, $expose_docs:expr) => {{
         apply_limits(App::new())
             .wrap(cors($cors_origins))
             .wrap(middleware::request_id::RequestIdMiddleware)
@@ -258,6 +272,10 @@ macro_rules! wired_app {
             // the limiter installed but inactive. It costs one atomic load
             // for each request.
             .wrap(crate::limits::RateLimit::new($bucket.clone()))
+            // The security headers sit inside the server time and outside
+            // the rate limiter. Every response then carries both headers,
+            // including a refusal from the rate limiter.
+            .wrap(middleware::security_headers::SecurityHeaders)
             // Outermost, so every response carries the server time. This
             // includes refusals from the rate limiter and errors from the
             // handlers below.
@@ -273,7 +291,7 @@ macro_rules! wired_app {
             // matters. Any catch-all scope that is mounted before them can
             // hide them. A `web::scope("")` around the spec routes used to
             // do exactly this.
-            .configure(docs::config)
+            .configure(|cfg| docs_routes(cfg, $expose_docs))
     }};
 }
 
@@ -310,6 +328,8 @@ pub struct ApiService {
     modules: Vec<Box<dyn ApiModule>>,
     readiness: Option<health::ReadyCheck>,
     cors_origins: Vec<String>,
+    /// Serves `/openapi.json` and `/swagger-ui/*` when the value is true.
+    expose_docs: bool,
     /// Request-rate bucket, keyed by peer address. Disabled at `0`.
     bucket: crate::limits::TokenBucket,
 }
@@ -327,8 +347,24 @@ impl ApiService {
             modules: Vec::new(),
             readiness: None,
             cors_origins: Vec::new(),
+            expose_docs: false,
             bucket: crate::limits::TokenBucket::new(0, 0),
         }
+    }
+
+    /// Sets whether the service serves `/openapi.json` and `/swagger-ui/*`.
+    ///
+    /// The default is `false`. Both routes answer without authentication, so
+    /// a deployment turns them on only when it needs them. Pass
+    /// `config.http.expose_docs`.
+    pub fn with_docs(mut self, expose: bool) -> Self {
+        self.expose_docs = expose;
+        self
+    }
+
+    /// Returns `true` when the service serves the API docs.
+    pub fn expose_docs(&self) -> bool {
+        self.expose_docs
     }
 
     /// Sets the browser origins that CORS allows. An empty list allows
@@ -380,8 +416,9 @@ impl ApiService {
     /// [`actix_web::middleware::Compress`],
     /// [`RequestTracingMiddleware`](middleware::request_tracing::RequestTracingMiddleware),
     /// and [`BearerTokenMiddleware`](middleware::bearer_token::BearerTokenMiddleware).
-    /// Add [`apply_limits`], [`health_routes`], and [`docs::config`] as
-    /// well. The result is exactly what `start` serves.
+    /// Add [`apply_limits`] and [`health_routes`] as well. Then call
+    /// [`configure_docs`](Self::configure_docs). The result is exactly what
+    /// `start` serves.
     ///
     /// The method fails with [`DuplicateRoutePrefix`] if two registered
     /// modules declare the same [`ApiModule::prefix`]. The check runs before
@@ -400,6 +437,16 @@ impl ApiService {
         Ok(())
     }
 
+    /// Mounts the OpenAPI document and the Swagger UI when
+    /// [`expose_docs`](Self::expose_docs) is true.
+    ///
+    /// Call this method after [`configure`](Self::configure). A catch-all
+    /// mount registered earlier can hide the API modules. [`start`](Self::start)
+    /// uses the same rule through [`docs_routes`].
+    pub fn configure_docs(&self, cfg: &mut web::ServiceConfig) {
+        docs_routes(cfg, self.expose_docs);
+    }
+
     /// Binds the composed application to `addr`. The method serves the
     /// application until a shutdown signal arrives (Ctrl-C or SIGTERM). The
     /// method then drains the connections within the shutdown timeout. It
@@ -414,14 +461,16 @@ impl ApiService {
         let readiness = self.readiness.clone();
         let cors_origins = self.cors_origins.clone();
         let bucket = self.bucket.clone();
+        let expose_docs = self.expose_docs;
 
-        let server =
-            HttpServer::new(move || wired_app!(&modules, &readiness, &cors_origins, &bucket))
-                .shutdown_timeout(SHUTDOWN_TIMEOUT_SECS)
-                .client_request_timeout(CLIENT_TIMEOUT)
-                .client_disconnect_timeout(CLIENT_TIMEOUT)
-                .bind(addr)?
-                .run();
+        let server = HttpServer::new(move || {
+            wired_app!(&modules, &readiness, &cors_origins, &bucket, expose_docs)
+        })
+        .shutdown_timeout(SHUTDOWN_TIMEOUT_SECS)
+        .client_request_timeout(CLIENT_TIMEOUT)
+        .client_disconnect_timeout(CLIENT_TIMEOUT)
+        .bind(addr)?
+        .run();
         let handle = server.handle();
         tokio::spawn(async move {
             shutdown_signal().await;
@@ -487,7 +536,8 @@ mod tests {
                 &$service.modules,
                 &$service.readiness,
                 &$service.cors_origins,
-                &$service.bucket
+                &$service.bucket,
+                $service.expose_docs
             ))
             .await
         }};
@@ -509,13 +559,51 @@ mod tests {
         assert_eq!(res.status(), 200);
         assert_eq!(test::read_body(res).await, "pong");
 
-        // The same wiring mounts the OpenAPI document.
+        // The same wiring mounts the OpenAPI document only on request. The
+        // routes are off by default.
         let res = test::call_service(
             &app,
             test::TestRequest::get().uri("/openapi.json").to_request(),
         )
         .await;
+        assert_eq!(res.status(), 404);
+    }
+
+    /// The docs routes are unauthenticated. The service serves them only
+    /// when the deployment asks for them.
+    #[actix_web::test]
+    async fn docs_routes_appear_only_when_enabled() {
+        let service = ApiService::new();
+        let app = served!(service);
+        let res = test::call_service(
+            &app,
+            test::TestRequest::get().uri("/openapi.json").to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), 404, "the default must not serve the docs");
+
+        let service = ApiService::new().with_docs(true);
+        assert!(service.expose_docs());
+        let app = served!(service);
+        let res = test::call_service(
+            &app,
+            test::TestRequest::get().uri("/openapi.json").to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), 200, "expose_docs = true must serve the docs");
+        // Swagger UI must work next to the API modules.
+        let res = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/swagger-ui/swagger-initializer.js")
+                .to_request(),
+        )
+        .await;
         assert_eq!(res.status(), 200);
+        assert!(
+            res.headers().get("content-security-policy").is_none(),
+            "the API policy must not break Swagger UI"
+        );
     }
 
     #[actix_web::test]
@@ -642,7 +730,8 @@ mod tests {
         let app = test::init_service(
             apply_limits(App::new())
                 .configure(health_routes)
-                .configure(|cfg| service.configure(cfg).expect("no prefix collision")),
+                .configure(|cfg| service.configure(cfg).expect("no prefix collision"))
+                .configure(|cfg| service.configure_docs(cfg)),
         )
         .await;
         for uri in ["/health", "/ping"] {
@@ -650,6 +739,34 @@ mod tests {
                 test::call_service(&app, test::TestRequest::get().uri(uri).to_request()).await;
             assert_eq!(res.status(), 200, "{uri} missing from the configured app");
         }
+        let res = test::call_service(
+            &app,
+            test::TestRequest::get().uri("/openapi.json").to_request(),
+        )
+        .await;
+        assert_eq!(
+            res.status(),
+            404,
+            "the configured app must follow the docs flag"
+        );
+
+        // The same host path with the flag on must serve the document.
+        let service = ApiService::new()
+            .with_docs(true)
+            .register_module(Box::new(PingModule));
+        let app = test::init_service(
+            apply_limits(App::new())
+                .configure(health_routes)
+                .configure(|cfg| service.configure(cfg).expect("no prefix collision"))
+                .configure(|cfg| service.configure_docs(cfg)),
+        )
+        .await;
+        let res = test::call_service(
+            &app,
+            test::TestRequest::get().uri("/openapi.json").to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), 200);
     }
 
     /// A module set that mounts two modules on the same prefix is a
@@ -719,7 +836,9 @@ mod tests {
     /// asserted that the paths were *mounted*. This test asserts it.
     #[actix_web::test]
     async fn spec_routes_do_not_shadow_module_routes() {
-        let service = ApiService::new().register_module(Box::new(PingModule));
+        let service = ApiService::new()
+            .with_docs(true)
+            .register_module(Box::new(PingModule));
         let app = served!(service);
         for uri in ["/ping", "/ping/deep", "/openapi.json"] {
             let res =

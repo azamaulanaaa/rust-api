@@ -527,12 +527,19 @@ fn default_writer_lease_ttl_secs() -> u64 {
 /// origin. Each origin must be an `http(s)` URL without a trailing slash.
 /// Credentials are always allowed, so that the `auth_token` cookie and the
 /// `Authorization` bearer header work across origins.
+///
+/// The OpenAPI document and the Swagger UI are off by default. Both routes
+/// answer without authentication. Set [`expose_docs`](Self::expose_docs)
+/// only when the deployment needs them.
 #[derive(Deserialize, Debug, Default, Clone)]
 pub struct HttpConfig {
     /// Browser origins that CORS allows, for example
     /// `["https://app.example.com"]`.
     #[serde(default)]
     pub allowed_origins: Vec<String>,
+    /// Serves `/openapi.json` and `/swagger-ui/*`. The default is `false`.
+    #[serde(default)]
+    pub expose_docs: bool,
 }
 
 /// Cost limits for requests whose work a single request does not bound.
@@ -930,6 +937,7 @@ mod tests {
         assert!(cfg.eav.check_entity_refs);
         assert!(!cfg.eav.webhook_allow_private_hosts);
         assert_eq!(cfg.eav.max_causation_depth, 8);
+        assert!(!cfg.http.expose_docs);
     }
 
     #[test]
@@ -1236,6 +1244,24 @@ mod tests {
             "region = \"us-east-1\"\n[http]\nallowed_origins = [\"not a url\"]",
         ));
         assert!(err.contains("http.allowed_origins"), "unexpected: {err}");
+    }
+
+    /// The docs routes answer without authentication. A deployment gets them
+    /// only when it sets the flag.
+    #[test]
+    fn http_expose_docs_defaults_to_false() {
+        let cfg = parse(&minimal_toml()).expect("should parse");
+        assert!(
+            !cfg.http.expose_docs,
+            "the docs must be off by default, because they need no authentication"
+        );
+
+        let toml = minimal_toml().replace(
+            "region = \"us-east-1\"",
+            "region = \"us-east-1\"\n[http]\nexpose_docs = true",
+        );
+        let cfg = parse(&toml).expect("should parse");
+        assert!(cfg.http.expose_docs);
     }
 
     /// The same TOML gives the same config on two runs.
