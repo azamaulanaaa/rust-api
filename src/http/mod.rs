@@ -124,7 +124,9 @@ pub fn health_routes(cfg: &mut web::ServiceConfig) {
 pub fn cors(allowed_origins: &[String]) -> actix_cors::Cors {
     use actix_web::http::header;
     let mut cors = actix_cors::Cors::default()
-        .allowed_methods(vec!["GET", "POST", "PUT", "DELETE", "OPTIONS"])
+        .allowed_methods(vec![
+            "GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS",
+        ])
         .allowed_headers(vec![
             header::AUTHORIZATION,
             header::CONTENT_TYPE,
@@ -250,11 +252,11 @@ macro_rules! wired_app {
             .wrap(middleware::request_tracing::RequestTracingMiddleware)
             .wrap(middleware::bearer_token::BearerTokenMiddleware)
             // Outermost, so it also limits the routes that a limiter keyed on
-            // the subject cannot reach. These routes are `/auth/login`, which
-            // makes an outbound call to the identity provider, and `/health`,
-            // which a load balancer polls often. A zero limit leaves the
-            // limiter installed but inactive. It costs one atomic load for
-            // each request.
+            // the subject cannot reach. One example is `/auth/login`, which
+            // makes an outbound call to the identity provider. The health
+            // probes are exempt inside the middleware. A zero limit leaves
+            // the limiter installed but inactive. It costs one atomic load
+            // for each request.
             .wrap(crate::limits::RateLimit::new($bucket.clone()))
             // Outermost, so every response carries the server time. This
             // includes refusals from the rate limiter and errors from the
@@ -435,7 +437,12 @@ impl ApiService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use actix_web::{HttpResponse, http::StatusCode, http::header::CONTENT_TYPE, post, test, web};
+    use actix_web::{
+        HttpResponse,
+        http::header::CONTENT_TYPE,
+        http::{Method, StatusCode},
+        post, test, web,
+    };
 
     /// A module that exists only to prove the composition root mounts what
     /// it is given, in a *scope*. Every real module uses this shape.
@@ -546,16 +553,18 @@ mod tests {
     /// This includes the rate limiter, which replies without a handler.
     #[actix_web::test]
     async fn composed_responses_carry_server_time() {
-        let service = ApiService::new().with_rate_limit(crate::limits::TokenBucket::new(1, 1));
+        let service = ApiService::new()
+            .register_module(Box::new(PingModule))
+            .with_rate_limit(crate::limits::TokenBucket::new(1, 1));
         let app = served!(service);
 
         let first =
-            test::call_service(&app, test::TestRequest::get().uri("/health").to_request()).await;
+            test::call_service(&app, test::TestRequest::get().uri("/ping").to_request()).await;
         assert_eq!(first.status(), 200);
         assert!(first.headers().contains_key("x-server-time-ms"));
 
         let second =
-            test::call_service(&app, test::TestRequest::get().uri("/health").to_request()).await;
+            test::call_service(&app, test::TestRequest::get().uri("/ping").to_request()).await;
         assert_eq!(second.status(), 429);
         assert!(
             second.headers().contains_key("x-server-time-ms"),
@@ -570,6 +579,29 @@ mod tests {
             test::call_service(&app, test::TestRequest::get().uri("/missing").to_request()).await;
         assert_eq!(missing.status(), 404);
         assert!(missing.headers().contains_key("x-server-time-ms"));
+    }
+
+    /// A full bucket cannot refuse a health probe. A refused probe tells the
+    /// load balancer that the instance is down.
+    #[actix_web::test]
+    async fn health_probes_bypass_the_rate_limiter() {
+        // Capacity zero with a positive refill rate refuses every request.
+        // The bucket is active, so the exemption is the only reason that
+        // the probes answer.
+        let service = ApiService::new()
+            .register_module(Box::new(PingModule))
+            .with_rate_limit(crate::limits::TokenBucket::new(0, 1));
+        let app = served!(service);
+
+        let refused =
+            test::call_service(&app, test::TestRequest::get().uri("/ping").to_request()).await;
+        assert_eq!(refused.status(), 429, "control: the bucket is active");
+
+        for uri in ["/health", "/ready"] {
+            let res =
+                test::call_service(&app, test::TestRequest::get().uri(uri).to_request()).await;
+            assert_eq!(res.status(), 200, "{uri} must bypass the rate limiter");
+        }
     }
 
     /// CORS lets a browser read the server-time header and the `Date`
@@ -838,5 +870,46 @@ mod tests {
         )
         .await;
         assert!(res.headers().get("access-control-allow-origin").is_none());
+    }
+
+    /// A browser preflight accepts `PATCH` and `HEAD`. The documented
+    /// `PATCH /eav/entities/{id}` route fails without them.
+    #[actix_web::test]
+    async fn cors_preflight_allows_patch_and_head() {
+        let svc = test::init_service(
+            App::new()
+                .wrap(cors(&["https://app.example.com".to_string()]))
+                .route("/eav/entities/1", web::get().to(HttpResponse::Ok)),
+        )
+        .await;
+
+        for method in ["PATCH", "HEAD"] {
+            let res = test::call_service(
+                &svc,
+                test::TestRequest::default()
+                    .method(Method::OPTIONS)
+                    .uri("/eav/entities/1")
+                    .insert_header(("Origin", "https://app.example.com"))
+                    .insert_header(("Access-Control-Request-Method", method))
+                    .to_request(),
+            )
+            .await;
+            assert!(
+                res.status().is_success(),
+                "the preflight for {method} failed with {}",
+                res.status()
+            );
+            let allowed = res
+                .headers()
+                .get("access-control-allow-methods")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default();
+            assert!(
+                allowed
+                    .split(',')
+                    .any(|entry| entry.trim().eq_ignore_ascii_case(method)),
+                "{method} is missing from the allowed methods: {allowed}"
+            );
+        }
     }
 }

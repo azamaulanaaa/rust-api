@@ -80,6 +80,8 @@ thiserror = "2.0"
 criterion = { version = "0.5", features = ["async_tokio"] }
 rsa = "0.9"
 wiremock = "0.6"
+# The dependency-probe test pauses and advances the clock.
+tokio = { version = "1", features = ["test-util"] }
 
 [[bench]]
 name = "eav"

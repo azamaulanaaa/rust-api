@@ -336,6 +336,14 @@ pub fn peer_key(addr: Option<std::net::SocketAddr>) -> String {
     }
 }
 
+/// Returns `true` when the route is a health probe.
+///
+/// The probes are exempt from the rate limiter. A load balancer polls them
+/// often, and a refused probe would take the instance out of service.
+fn is_health_probe(path: &str) -> bool {
+    matches!(path, "/health" | "/ready")
+}
+
 /// Rejects a request with the uniform error body when a limit is reached.
 pub fn too_many(what: &str) -> HttpResponse {
     tracing::warn!("rate limited: {what}");
@@ -397,9 +405,10 @@ where
 /// Actix middleware that applies a [`TokenBucket`] before the handler runs.
 ///
 /// The middleware is the outermost one. So it also covers the routes that no
-/// limiter keyed on the subject could reach. Examples are `/auth/login`,
-/// which makes an outgoing round trip to the identity provider, and
-/// `/health`, which a load balancer polls often.
+/// limiter keyed on the subject could reach. An example is `/auth/login`,
+/// which makes an outgoing round trip to the identity provider. The health
+/// probes `/health` and `/ready` are exempt, because a refused probe takes
+/// the instance out of service.
 pub struct RateLimit {
     bucket: TokenBucket,
 }
@@ -455,6 +464,13 @@ where
 
     fn call(&self, req: ServiceRequest) -> Self::Future {
         let service = std::rc::Rc::clone(&self.service);
+        // The health probes bypass the bucket. A refused probe tells the load
+        // balancer that the instance is down, and the instance cannot answer
+        // again.
+        if is_health_probe(req.path()) {
+            let fut = service.call(req);
+            return Box::pin(async move { fut.await.map(ServiceResponse::map_into_left_body) });
+        }
         // The cap of `MAX_TRACKED_PEERS` at insert is what bounds the map.
         // The idle sweep only reclaims memory early. So the sweep runs once
         // every `IDLE_SWEEP_EVERY` requests, instead of on every request. If
