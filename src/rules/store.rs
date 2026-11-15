@@ -193,15 +193,7 @@ impl RuleStore {
         let g = self.store.write().await;
         let tx = g.begin_tx().map_err(RuleError::Store)?;
         let rule = self.stage_upsert(&tx, draft).await?;
-        match tx.commit().await {
-            Ok(()) => {}
-            Err(StoreError::TxConflict { key, .. }) if key == meta_key(&rule.id) => {
-                return Err(RuleError::Invalid(
-                    "rule changed during the write".to_string(),
-                ));
-            }
-            Err(error) => return Err(RuleError::Store(error)),
-        }
+        map_rule_commit(&rule.id, tx.commit().await)?;
         Ok(rule)
     }
 
@@ -338,23 +330,81 @@ impl RuleStore {
     ///
     /// The call changes the stored rule only.
     /// It does not change the index.
+    /// The rule row uses a compare-and-set against the row that the call
+    /// read.
+    /// A concurrent upsert, delete, or toggle fails at commit and writes
+    /// nothing.
     pub async fn set_enabled(&self, id: &str, enabled: bool) -> Result<Rule, RuleError> {
+        self.set_enabled_version(id, enabled, None).await
+    }
+
+    /// Sets the enabled flag of one rule when its version matches.
+    ///
+    /// The call changes the stored rule only.
+    /// It does not change the index.
+    /// The rule row uses a compare-and-set against the row that the call
+    /// read.
+    /// A concurrent upsert, delete, or toggle fails at commit and writes
+    /// nothing.
+    /// A `expected_version` that differs from the stored version returns a
+    /// version conflict.
+    pub async fn set_enabled_version(
+        &self,
+        id: &str,
+        enabled: bool,
+        expected_version: Option<u64>,
+    ) -> Result<Rule, RuleError> {
         validate_identifier("rule id", id)?;
 
         let _publish = self.publish_lock.lock().await;
         let g = self.store.write().await;
         let tx = g.begin_tx().map_err(RuleError::Store)?;
-        let Some(mut rule) = load_rule(&tx, id).await? else {
+        let rule = self
+            .stage_set_enabled(&tx, id, enabled, expected_version)
+            .await?;
+        map_rule_commit(id, tx.commit().await)?;
+        Ok(rule)
+    }
+
+    /// Stages one enable write in `tx`.
+    ///
+    /// The call reads the previous row and uses it as the compare-and-set
+    /// precondition.
+    ///
+    /// A `expected_version` that differs from the stored version returns a
+    /// version conflict before the write.
+    async fn stage_set_enabled<S>(
+        &self,
+        tx: &S,
+        id: &str,
+        enabled: bool,
+        expected_version: Option<u64>,
+    ) -> Result<Rule, RuleError>
+    where
+        S: TxCas + ?Sized,
+    {
+        let key = meta_key(id);
+        let Some(previous) = tx.get_bytes(&key).await.map_err(RuleError::Store)? else {
             return Err(RuleError::NotFound(id.to_string()));
         };
+        let mut rule: Rule = serde_json::from_slice(&previous)
+            .map_err(|error| RuleError::Serialization(error.to_string()))?;
+        if let Some(expected) = expected_version
+            && rule.version != expected
+        {
+            return Err(RuleError::VersionConflict);
+        }
         rule.enabled = enabled;
         rule.version = rule
             .version
             .checked_add(1)
             .ok_or_else(|| RuleError::Invalid("rule version overflow".to_string()))?;
         rule.updated_at = chrono::Utc::now().timestamp();
-        put_rule(&tx, &rule).await?;
-        tx.commit().await.map_err(RuleError::Store)?;
+        let bytes = serde_json::to_vec(&rule)
+            .map_err(|error| RuleError::Serialization(error.to_string()))?;
+        tx.compare_and_set(&key, Some(&previous), &bytes)
+            .await
+            .map_err(RuleError::Store)?;
         Ok(rule)
     }
 
@@ -727,18 +777,18 @@ fn index_keys(trigger: &RuleTrigger, rule_id: &str) -> Vec<String> {
     keys
 }
 
-/// Writes one rule row.
-async fn put_rule<S>(store: &S, rule: &Rule) -> Result<(), RuleError>
-where
-    S: GetSet + ?Sized,
-{
-    let bytes =
-        serde_json::to_vec(rule).map_err(|error| RuleError::Serialization(error.to_string()))?;
-    store
-        .set_bytes(&meta_key(&rule.id), &bytes)
-        .await
-        .map(|_| ())
-        .map_err(RuleError::Store)
+/// Maps one rule-row commit result to a rule error.
+///
+/// A conflict on the rule row is a version conflict. It is retryable.
+/// A conflict on another key is a store error.
+fn map_rule_commit(id: &str, result: Result<(), StoreError>) -> Result<(), RuleError> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(StoreError::TxConflict { key, .. }) if key == meta_key(id) => {
+            Err(RuleError::VersionConflict)
+        }
+        Err(error) => Err(RuleError::Store(error)),
+    }
 }
 
 /// Reads one rule row.
@@ -993,6 +1043,70 @@ mod tests {
 
         assert!(matches!(error, StoreError::TxConflict { .. }));
         assert_eq!(store.get("alpha").await.unwrap().unwrap().version, 1);
+    }
+
+    #[tokio::test]
+    async fn a_conflicting_upsert_is_a_version_conflict() {
+        let (store, raw) = store_with_raw().await;
+        let first_tx = raw.begin_tx().unwrap();
+        let second_tx = raw.begin_tx().unwrap();
+        let first = store.stage_upsert(&first_tx, draft("alpha")).await.unwrap();
+        let second = store
+            .stage_upsert(&second_tx, draft("alpha"))
+            .await
+            .unwrap();
+        assert_eq!(first.version, 1);
+        assert_eq!(second.version, 1);
+
+        first_tx.commit().await.unwrap();
+        let error = map_rule_commit(&second.id, second_tx.commit().await).unwrap_err();
+
+        assert!(matches!(error, RuleError::VersionConflict));
+        assert_eq!(store.get("alpha").await.unwrap().unwrap().version, 1);
+    }
+
+    #[tokio::test]
+    async fn a_concurrent_enable_toggle_is_a_version_conflict() {
+        let (store, raw) = store_with_raw().await;
+        let saved = store.upsert(draft("alpha")).await.unwrap();
+        assert!(saved.enabled);
+
+        let first_tx = raw.begin_tx().unwrap();
+        let second_tx = raw.begin_tx().unwrap();
+        let first = store
+            .stage_set_enabled(&first_tx, "alpha", false, None)
+            .await
+            .unwrap();
+        let second = store
+            .stage_set_enabled(&second_tx, "alpha", true, None)
+            .await
+            .unwrap();
+        assert_eq!(first.version, 2);
+        assert_eq!(second.version, 2);
+
+        first_tx.commit().await.unwrap();
+        let error = map_rule_commit("alpha", second_tx.commit().await).unwrap_err();
+
+        assert!(matches!(error, RuleError::VersionConflict));
+        let stored = store.get("alpha").await.unwrap().expect("rule exists");
+        assert!(!stored.enabled, "the failed toggle changed the rule");
+        assert_eq!(stored.version, 2);
+    }
+
+    #[tokio::test]
+    async fn a_stale_enable_version_is_a_version_conflict() {
+        let store = new_store().await;
+        let saved = store.upsert(draft("alpha")).await.unwrap();
+
+        let error = store
+            .set_enabled_version("alpha", false, Some(saved.version + 1))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, RuleError::VersionConflict));
+        let stored = store.get("alpha").await.unwrap().expect("rule exists");
+        assert!(stored.enabled, "the refused toggle changed the rule");
+        assert_eq!(stored.version, saved.version);
     }
 
     #[tokio::test]

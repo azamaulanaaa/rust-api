@@ -37,6 +37,7 @@ use crate::http::{
         jwt::{Claims, JwtClaimsMiddleware, Validated},
         no_cache::NoCache,
     },
+    path_config, query_config,
 };
 use crate::policy::row::RowAuthorizer;
 use crate::policy::{Action, Authorizer, PolicyError};
@@ -58,12 +59,6 @@ pub(crate) const ENTITY_ROW: &str = "entity";
 const DEFAULT_PAGE_LIMIT: usize = 50;
 /// The maximum page size of a list route.
 const MAX_PAGE_LIMIT: usize = 200;
-/// The maximum count of raw pages that one cursor page reads.
-///
-/// The route checks a grant on each row.
-/// A raw page can hold no visible row.
-/// The route then reads the next raw page, up to this count.
-const CURSOR_SCAN_BATCH: usize = 4;
 /// The default count of entities that a revalidation checks.
 const DEFAULT_REVALIDATE_LIMIT: usize = 100;
 /// The maximum count of entities that a revalidation checks.
@@ -109,6 +104,8 @@ impl ApiModule for EavApiModule {
         let scope = web::scope(EAV_PREFIX)
             .app_data(runtime)
             .app_data(policy)
+            .app_data(query_config())
+            .app_data(path_config())
             .wrap(jwt)
             .wrap(NoCache)
             .service(publish_schema)
@@ -244,7 +241,11 @@ pub struct RulePageQuery {
     #[serde(default)]
     pub offset: Option<usize>,
     /// Rejected. The rule list supports offset paging only.
+    ///
+    /// The field stays for the `400` check. The OpenAPI document does not
+    /// advertise it.
     #[serde(default)]
+    #[param(ignore)]
     pub after: Option<String>,
 }
 
@@ -425,7 +426,7 @@ pub struct EntityQueryPage {
     /// The entity id to pass as `after` for the next page.
     /// The value is the id of the last visible entity.
     /// The value never names an entity that the caller cannot read.
-    /// `None` means that the scan is exhausted or the scan budget ends.
+    /// `None` means that the scan is exhausted.
     pub next: Option<String>,
 }
 
@@ -676,6 +677,7 @@ impl From<RuleError> for EavApiError {
             | RuleError::ConditionDepth
             | RuleError::UnsupportedTrigger(_)
             | RuleError::UnknownAction(_) => Kind::Invalid,
+            RuleError::VersionConflict => Kind::Conflict,
             RuleError::Store(_)
             | RuleError::Serialization(_)
             | RuleError::Action(_)
@@ -757,12 +759,14 @@ pub(crate) async fn can_read_entity(
 
 /// Reads one cursor page and keeps only the entities that the caller can read.
 ///
-/// The call reads at most [`CURSOR_SCAN_BATCH`] raw pages.
-/// It stops when the visible page is full or the raw scan ends.
+/// The call reads raw pages until the visible page is full or the raw scan
+/// ends.
+/// A raw page can hold only rows that the caller cannot read, so a fixed raw
+/// page budget could miss a later visible row.
 /// The returned cursor is the id of the last visible entity.
 /// A raw cursor stays inside this function, so `next` never names a row that
 /// the caller cannot read.
-/// A budget that ends with no visible entity returns `None`.
+/// A scan with no visible entity returns `None`.
 /// The caller then sees no id of an unreadable row.
 pub(crate) async fn visible_cursor_page<F, Fut>(
     policy: &Authorizer,
@@ -777,7 +781,7 @@ where
 {
     let mut items: Vec<Entity> = Vec::with_capacity(limit);
     let mut cursor = after;
-    for _ in 0..CURSOR_SCAN_BATCH {
+    loop {
         let (raw, raw_next) = fetch(cursor).await?;
         let raw_len = raw.len();
         for (position, entity) in raw.into_iter().enumerate() {
@@ -797,7 +801,6 @@ where
             None => return Ok((items, None)),
         }
     }
-    Ok((items, None))
 }
 
 #[utoipa::path(post, path = "/eav/schemas", tag = "eav", request_body = SchemaDraft, responses((status=201, body=crate::eav::schema::SchemaDef), (status=400, body=crate::http::error::ErrorBody), (status=401, body=crate::http::error::ErrorBody), (status=403, body=crate::http::error::ErrorBody), (status=500, body=crate::http::error::ErrorBody)))]
@@ -1078,7 +1081,7 @@ async fn list_entities(
 /// A row grant exposes only that entity.
 /// The handler filters each result with `can_read_entity`.
 /// A caller with no grant receives an empty page, not `403`.
-/// The route reads at most `CURSOR_SCAN_BATCH` raw pages.
+/// The route reads raw pages until the page is full or the results end.
 /// The route then returns the cursor of the last visible entity.
 /// The cursor never names a row that the caller cannot read.
 /// A scan that finds no visible row returns `next: null`.
@@ -1248,9 +1251,9 @@ async fn list_schema_entities(
 /// the listed schemas.
 /// The capability ids do not need a schema that exists. A rule can be saved
 /// before its schema.
-/// The enable route does not change the capability lists, so it does not
-/// repeat these checks.
-#[utoipa::path(post, path = "/eav/rules", tag = "eav", request_body = RuleDraft, responses((status=201, body=crate::rules::rule::Rule), (status=400, body=crate::http::error::ErrorBody), (status=401, body=crate::http::error::ErrorBody), (status=403, body=crate::http::error::ErrorBody), (status=500, body=crate::http::error::ErrorBody)))]
+/// The enable route repeats these capability checks on the stored rule.
+/// A concurrent write to the same rule returns `409`.
+#[utoipa::path(post, path = "/eav/rules", tag = "eav", request_body = RuleDraft, responses((status=201, body=crate::rules::rule::Rule), (status=400, body=crate::http::error::ErrorBody), (status=401, body=crate::http::error::ErrorBody), (status=403, body=crate::http::error::ErrorBody), (status=409, body=crate::http::error::ErrorBody), (status=500, body=crate::http::error::ErrorBody)))]
 #[post("/rules")]
 async fn upsert_rule(
     runtime: web::Data<EavRuntime>,
@@ -1328,7 +1331,17 @@ async fn delete_rule(
     Ok(HttpResponse::NoContent().finish())
 }
 
-#[utoipa::path(post, path = "/eav/rules/{id}/enabled", tag = "eav", params(("id" = String, Path)), request_body = RuleEnabledRequest, responses((status=200, body=crate::rules::rule::Rule), (status=400, body=crate::http::error::ErrorBody), (status=401, body=crate::http::error::ErrorBody), (status=403, body=crate::http::error::ErrorBody), (status=404, body=crate::http::error::ErrorBody), (status=500, body=crate::http::error::ErrorBody)))]
+/// Enables or disables one rule.
+///
+/// The caller needs `write` on `eav_rules`.
+/// The route repeats the capability checks of the create route on the stored
+/// rule.
+/// A non-empty `read` list also needs `read` on `eav_entities`.
+/// A non-empty `write` list also needs `write` on `eav_entities`.
+/// A caller can then not enable a rule that it could not create.
+/// The toggle uses the stored version as a compare-and-set guard.
+/// A concurrent write to the same rule returns `409`.
+#[utoipa::path(post, path = "/eav/rules/{id}/enabled", tag = "eav", params(("id" = String, Path)), request_body = RuleEnabledRequest, responses((status=200, body=crate::rules::rule::Rule), (status=400, body=crate::http::error::ErrorBody), (status=401, body=crate::http::error::ErrorBody), (status=403, body=crate::http::error::ErrorBody), (status=404, body=crate::http::error::ErrorBody), (status=409, body=crate::http::error::ErrorBody), (status=500, body=crate::http::error::ErrorBody)))]
 #[post("/rules/{id}/enabled")]
 async fn set_rule_enabled(
     runtime: web::Data<EavRuntime>,
@@ -1339,7 +1352,21 @@ async fn set_rule_enabled(
 ) -> Result<HttpResponse, EavApiError> {
     require_management(&policy, &claims.sub, RULES, Action::Write).await?;
     let id = path.into_inner();
-    let rule = runtime.rules().set_enabled(&id, body.enabled).await?;
+    let rule = runtime
+        .rules()
+        .get(&id)
+        .await?
+        .ok_or_else(EavApiError::not_found)?;
+    if !rule.capabilities.read.is_empty() {
+        require_management(&policy, &claims.sub, ENTITIES, Action::Read).await?;
+    }
+    if !rule.capabilities.write.is_empty() {
+        require_management(&policy, &claims.sub, ENTITIES, Action::Write).await?;
+    }
+    let rule = runtime
+        .rules()
+        .set_enabled_version(&id, body.enabled, Some(rule.version))
+        .await?;
     Ok(HttpResponse::Ok().json(rule))
 }
 
@@ -1725,6 +1752,11 @@ mod tests {
                 EavApiError::from(RuleError::UnsupportedTrigger("schema_removed".into())),
                 400,
                 "invalid_request",
+            ),
+            (
+                EavApiError::from(RuleError::VersionConflict),
+                409,
+                "conflict",
             ),
             (
                 EavApiError::from(PolicyError::AccessDenied),
@@ -2834,6 +2866,38 @@ mod tests {
     }
 
     #[actix_web::test]
+    async fn malformed_query_and_path_values_answer_inside_the_envelope() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("bob")?;
+
+        for uri in [
+            "/eav/entities?limit=abc",
+            "/eav/sync/replica?chunk=x",
+            "/eav/schemas/invoice/versions/x",
+        ] {
+            let res = actix_test::call_service(
+                &app,
+                auth(actix_test::TestRequest::get().uri(uri), &token).to_request(),
+            )
+            .await;
+            assert_eq!(res.status(), http::StatusCode::BAD_REQUEST, "{uri}");
+            assert_eq!(
+                res.headers()
+                    .get(http::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok()),
+                Some("application/json"),
+                "{uri}"
+            );
+            let body: crate::http::error::ErrorBody = actix_test::read_body_json(res).await;
+            assert_eq!(body.error, "bad request", "{uri}");
+            assert_eq!(body.code.as_deref(), Some("invalid_request"), "{uri}");
+        }
+        Ok(())
+    }
+
+    #[actix_web::test]
     async fn an_offset_at_the_maximum_returns_an_empty_page() -> anyhow::Result<()> {
         let fx = fixture().await?;
         assert!(fx.engine.claim_superadmin("alice").await?);
@@ -3014,6 +3078,74 @@ mod tests {
             assert!(body["items"].is_null(), "{uri} returned a page");
         }
         Ok(())
+    }
+
+    #[actix_web::test]
+    async fn a_caller_without_entity_grants_cannot_enable_a_broad_rule() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        assert!(fx.engine.claim_superadmin("alice").await?);
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+
+        let mut body = rule_body();
+        body["enabled"] = json!(false);
+        body["capabilities"] = json!({"read": ["task"], "write": []});
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::post()
+                    .uri("/eav/rules")
+                    .set_json(body),
+                &fx.token("alice")?,
+            )
+            .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::CREATED);
+
+        fx.engine
+            .add_rule("bob".into(), "eav_rules".into(), Action::Write)
+            .await?;
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::post()
+                    .uri("/eav/rules/alpha/enabled")
+                    .set_json(json!({"enabled": true})),
+                &fx.token("bob")?,
+            )
+            .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::FORBIDDEN);
+
+        let stored = fx.runtime.rules().get("alpha").await?.expect("rule exists");
+        assert!(!stored.enabled, "the refused caller changed the rule");
+        Ok(())
+    }
+
+    #[test]
+    fn the_rule_list_does_not_advertise_a_cursor() {
+        let spec: Value =
+            serde_json::from_str(&ApiDoc::openapi().to_json().expect("spec serializes"))
+                .expect("spec is JSON");
+        let parameters = spec["paths"]["/eav/rules"]["get"]["parameters"]
+            .as_array()
+            .expect("parameters");
+
+        assert!(
+            !parameters
+                .iter()
+                .any(|parameter| parameter["name"] == "after"),
+            "the rule list advertises a cursor: {parameters:?}"
+        );
+        assert!(
+            parameters
+                .iter()
+                .any(|parameter| parameter["name"] == "offset"),
+            "the rule list lost its offset parameter: {parameters:?}"
+        );
     }
 
     #[actix_web::test]
