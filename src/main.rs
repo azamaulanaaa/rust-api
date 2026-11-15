@@ -272,7 +272,8 @@ async fn import_policy(
 ///
 /// The policy lock, the lease, the fencing state, and the dependency health
 /// keep their existing behaviour.
-/// `eav_failed` is `true` when the EAV runtime stopped after an error.
+/// `eav_failed` is `true` while any EAV background loop is failed.
+/// Readiness stays false until a later pass succeeds.
 fn readiness_state(
     policy_unlocked: bool,
     lease_lost: bool,
@@ -431,7 +432,7 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
         oidc_api_module.middleware(),
     );
     let eav_handle = runtime.spawn(cancel.clone(), eav_config);
-    let eav_failure_latch = runtime.failure_latch();
+    let eav_failures = runtime.loop_failures();
 
     // Applications append their own reactive services here. The starter kit
     // ships none, so the list stays empty. Each entry implements
@@ -525,11 +526,11 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
     // single-writer lease is lost. A lost lease means that a successor now
     // owns the prefix. This process must stop taking traffic. The startup of
     // the server already checks S3, OIDC, JWKS, and the lease. The check also
-    // fails when the EAV failure latch is set.
+    // fails when an EAV background loop is failed.
     let readiness: rust_api::http::health::ReadyCheck = Arc::new({
         let policy_engine = policy_engine.clone();
         let dependency_health = dependency_health.clone();
-        let eav_failure_latch = eav_failure_latch.clone();
+        let eav_failures = eav_failures.clone();
         move || {
             // Five separate reasons mean that this instance cannot serve
             // writes. Any one of them is enough to take it out of the
@@ -546,14 +547,14 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
             //   `fencing` reports it on its own.
             // - An external dependency (S3 or OIDC) failed its last
             //   background probe.
-            // - The EAV runtime stopped after an error, so entity events no
-            //   longer flow.
+            // - An EAV background loop is failed. Entity events may not flow.
+            //   Readiness stays false until a pass succeeds.
             readiness_state(
                 policy_engine.is_unlocked(),
                 lease_lost.load(std::sync::atomic::Ordering::Relaxed),
                 rust_api::fencing::primary_loss(),
                 dependency_health.is_healthy(),
-                eav_failure_latch.load(std::sync::atomic::Ordering::Relaxed),
+                eav_failures.failed(),
             )
         }
     });
@@ -771,12 +772,12 @@ force_path_style = true
         assert_eq!(domain_prefix("oxkv", "wal"), "oxkv/wal");
     }
 
-    /// A dead EAV runtime takes the instance out of the rotation.
+    /// A failed EAV loop takes the instance out of the rotation.
     ///
-    /// The test reads a shared latch, so it covers the same path that the
-    /// readiness closure uses. The latch is always part of the check.
+    /// The test reads a shared flag, so it covers the same path that the
+    /// readiness closure uses. The EAV flag is always part of the check.
     #[test]
-    fn a_dead_eav_runtime_makes_the_instance_not_ready() {
+    fn a_failed_eav_loop_makes_the_instance_not_ready() {
         use std::sync::atomic::{AtomicBool, Ordering};
 
         let latch = Arc::new(AtomicBool::new(false));
