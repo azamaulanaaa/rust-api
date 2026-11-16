@@ -7,12 +7,12 @@
 //! The lines appear in this order:
 //!
 //! 1. One `header` line with the format number.
-//! 2. Zero or more `schema` lines. Each line holds one [`SchemaDef`].
+//! 2. Zero or more `schema` lines. Each line holds one [`SchemaDef`](crate::eav::schema::SchemaDef).
 //! 3. Zero or more `entity` lines. Each line holds one [`Entity`].
-//! 4. Zero or more `rule` lines. Each line holds one [`Rule`].
+//! 4. Zero or more `rule` lines. Each line holds one [`Rule`](crate::rules::rule::Rule).
 //! 5. One `end` line with the record counts.
 //!
-//! The format number is [`FORMAT_VERSION`].
+//! The format number is [`FORMAT_VERSION`](crate::eav::portable::FORMAT_VERSION).
 //! A schema line keeps the exact version and the pinned parent versions.
 //! An entity line keeps the exact version, the pinned schema versions, and the
 //! timestamps.
@@ -33,7 +33,7 @@
 //!
 //! # Restore checks
 //!
-//! [`validate`] reads the stored data and reports these problems:
+//! [`validate`](crate::eav::portable::validate) reads the stored data and reports these problems:
 //!
 //! - An entity pins a schema version that is absent.
 //! - A unique claim is missing, stale, or shared.
