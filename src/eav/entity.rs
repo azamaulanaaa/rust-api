@@ -120,7 +120,7 @@
 //! A write checks the name markers, so a schema that does not set the flag
 //! still participates when another schema sets it.
 //! A query checks the latest schema version instead of the name marker, so a
-//! removed index returns [`EntityError::NotIndexed`](crate::eav::entity_error::EntityError::NotIndexed).
+//! removed index returns [`EntityError::NotIndexed`].
 //! A query also accepts a key when a stored row for that key still exists.
 //! An entity that pins an older version that indexes the name stays
 //! queryable.
