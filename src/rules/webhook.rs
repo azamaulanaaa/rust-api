@@ -10,7 +10,7 @@
 //! The `X-Signature` header signs the body only. This is the legacy scheme.
 //! The `X-Signature-V2` header signs `timestamp.body`.
 //! The `X-Signature-Timestamp` header carries the time in unix seconds.
-//! A receiver can reject a replay with [`WebhookSignatureVerifier`] and a
+//! A receiver can reject a replay with [`WebhookSignatureVerifier`](crate::rules::webhook::WebhookSignatureVerifier) and a
 //! replay window.
 //! The action adds no business logic.
 //!
