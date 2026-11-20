@@ -108,3 +108,25 @@ jsonwebtoken and openidconnect via elliptic-curve. No patched version is \
 available within the current dependency constraints; RSA/ECDSA verification uses \
 public keys and does not perform secret-dependent operations on attacker input.
 """
+
+[[advisories.ignore]]
+id = "RUSTSEC-2026-0542"
+reason = """
+humantime is unmaintained. All versions are affected. The advisory offers no \
+safe upgrade. The path is oxkv-s3 0.12.1 -> object_store 0.12.5 -> humantime \
+2.4.0. The vendored oxkv-s3 adapter exposes object_store types in its public \
+API. That fact pins object_store at 0.12.5. The migration cost is a port of both \
+the adapter and the S3 builder to a newer object_store. Review this entry when \
+that port lands.
+"""
+
+[[advisories.ignore]]
+id = "RUSTSEC-2026-0543"
+reason = """
+chrono is unmaintained. All versions are affected. The advisory offers no safe \
+upgrade. Two paths reach it. oauth2 and openidconnect use it for token time \
+handling. object_store 0.12.5 uses it for metadata timestamps. The advisory \
+suggests jiff and time as alternatives. The migration cost is a change to the \
+OIDC client and to the vendored oxkv-s3 adapter and S3 builder. Review this \
+entry when those paths move off chrono.
+"""
