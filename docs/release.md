@@ -6,6 +6,20 @@ version 0.32.0 packages and publishes the release. The dist configuration is
 in [`dist-workspace.toml`](../dist-workspace.toml). The generated workflow is
 [`.github/workflows/release.yml`](../.github/workflows/release.yml).
 
+## Quick start
+
+Run these commands on `main`:
+
+```bash
+cog bump --dry-run --auto
+make release
+```
+
+The first command shows the next version and changes nothing. The second
+updates `CHANGELOG.md`, creates a version commit, and creates a tag with
+the `v` prefix. It also prints the dist artifact plan. See
+[Version and changelog](#version-and-changelog) for the full steps.
+
 ## Version and changelog
 
 Run this command on `main` when CI passes:

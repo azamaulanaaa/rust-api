@@ -44,6 +44,17 @@ For a remote run, the server image must provide the Rust toolchain and the
 check tools. See [the smolvm document](smolvm.md) for the environment
 variables, the API flow, the local pack, preflight, and verify steps.
 
+Each checkout gets an owner token. The token is the first 12 hex
+characters of the SHA-256 of the canonical checkout path. Resource names
+carry it: `smolvm-build-<owner>-<hash>`, `smolvm-run-<owner>-*`,
+`smolvm-remote-<owner>-*`, and `smolvm-ci-<owner>-<key>.qcow2`. With a
+remote address, `make smolvm-clean` deletes only resources with this
+owner token. It prints the plan and asks one time. `--dry-run` prints
+the plan only. `--yes`, `-y`, or `SMOLVM_CLEAN_ASSUME_YES=1` skips the
+prompt. A non-interactive run without a skip flag stops with an error.
+A moved checkout gets a new token, so its old resources become foreign
+and are reported, not deleted.
+
 ## Hooks
 
 The hooks live in `.githook/`. Run `make hooks` to set `core.hooksPath` to
@@ -65,7 +76,8 @@ Run `make help` to list every target. The main targets are:
 - `make smolvm` runs the checks in a smolvm microVM, local or remote.
 - `make smolvm-exec ARGS='...'` runs one command in the microVM, local or
   remote.
-- `make smolvm-clean` removes cached packs and dangling machines.
+- `make smolvm-clean` removes this checkout's cached packs and dangling
+  machines after confirmation. Pass `ARGS='--dry-run'` or `ARGS='--yes'`.
 - `make check-<area>` runs one check script. The areas include `bash`,
   `cargo`, `clippy`, `rustfmt`, `coverage`, `msrv`, `no-default-features`,
   `doc`, `release-config`, `cargo-deny-advisories`, `cargo-deny-bans`,
@@ -123,6 +135,14 @@ in the repository settings on GitHub, not in the repository files.
 - Write deterministic output.
 - Print a result line. Print tool output when a check fails.
 - Exit non-zero when a check fails.
+
+## Compatibility and limits
+
+Live remote runs verified the API calls and remote exec against
+`smolvm serve` v1.35.4 and v1.33.0. The full `make ci` run over HTTP is
+not verified yet. Live remote runs used `make smolvm-exec`, which uses
+the same remote flow with one guest command. Check the remote path on
+your server before you rely on it for a full check run.
 
 ## Troubleshooting
 

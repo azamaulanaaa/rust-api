@@ -28,6 +28,36 @@ x86_64 with KVM and smolvm 1.35.1. Read the
 [Verification status](#verification-status) section for the
 boundary of that verification.
 
+## Quick start
+
+Run these commands in order:
+
+```bash
+make smolvm-preflight
+make smolvm-verify
+make smolvm
+```
+
+The first command checks the host. The second checks the isolation.
+The third runs the checks in the sandbox.
+
+Run one command in the sandbox:
+
+```bash
+make smolvm-exec ARGS='which mise && mise --version'
+```
+
+Build the pack ahead of time. Remove stale machines and packs:
+
+```bash
+make smolvm-pack
+make smolvm-clean
+```
+
+See [Targets](#targets) for every command. See
+[Compatibility and limits](#compatibility-and-limits) for the tested
+versions and the paths that are not verified.
+
 ## The model
 
 The sandbox follows the guide's isolation pattern with one change:
@@ -503,7 +533,7 @@ off and read the rest later.
 The client chooses the `execId` before the first start. The id uses 8
 to 64 characters of `A-Z`, `a-z`, `0-9`, `_` and `-`. This repository
 builds the id from the machine name and a purpose tag, for example
-`smolvm-remote-<pid>-<random>-guest`. A start that repeats an `execId`
+`smolvm-remote-<owner>-<pid>-<random>-guest`. A start that repeats an `execId`
 returns the session that the first start made. The command does not run
 twice. On a retried start the client sends the same `execId`.
 
@@ -608,11 +638,14 @@ around the floor.
 Set `SMOLVM_SERVE_CACHE=1` to ask the server for a cache disk. The
 default is `1`. Set `0` to turn the feature off. The create body then
 gains `cacheDisk` with `mountPath` `/cache` and a base named
-`smolvm-ci-<key>.qcow2`. The `<key>` is the same SHA-256 that the local
-pack cache uses. A change to `mise.toml`, one `smol/*.smolfile`,
-`smol/pack-build.sh`, or `smol/init.sh` names a new base. Base names
-are immutable on the server, so one repository state owns one base
-name.
+`smolvm-ci-<owner>-<key>.qcow2`. The `<owner>` is the first 12 hex
+characters of the SHA-256 of the canonical checkout path. Two checkout
+paths get different tokens. The same path gives the same token on every
+run. The `<key>` is the same SHA-256 that the local pack cache uses. A
+change to `mise.toml`, one `smol/*.smolfile`, `smol/pack-build.sh`, or
+`smol/init.sh` names a new base. Base names are immutable on the
+server, so one repository state owns one base name. Another checkout
+has different names, so it cannot delete or overwrite this base.
 
 The machine reads the base through its own copy-on-write layer mounted
 at `/cache`. `smol/init.sh` puts the apt archives, the mise download
@@ -641,12 +674,12 @@ On a POSIX server, run this command:
 ```
 
 Set `SMOLVM_SERVE_CACHE_SEED` to another bare file name. An empty
-value turns the seed attempt off. The seed name does not use the
-`smolvm-ci-` prefix, so the clean step never deletes it.
+value turns the seed attempt off. The seed name has no owner token, so
+the clean step never derives it.
 
 The create sequence with caching on:
 
-1. Try the create with the content base `smolvm-ci-<key>.qcow2`.
+1. Try the create with the content base `smolvm-ci-<owner>-<key>.qcow2`.
 2. On HTTP 400 with `cannot stat cache base` in the server message,
     try the create once with the seed base. One warning names the seed.
 3. When the seed attempt also fails, create once without `cacheDisk`.
@@ -668,12 +701,14 @@ again. A provisioning change must change the hash to build a new base.
 Edit `mise.toml` or `smol/init.sh` for that.
 
 The clean step: `make smolvm-clean` deletes the cache bases it can
-name, `DELETE /api/v1/cache-bases/{base}`. The serve API has no list
-route for bases, so only the names derived from the current repository
-state are known. Bases of older repository states keep their names.
-Remove those by hand on the server. The seed base always stays. When
-the seed name matches a derivable name, the client prints one `note:`
-line and skips it. See [Verification status](#verification-status).
+name, `DELETE /api/v1/cache-bases/{base}`. The current names carry the
+owner token, so only this checkout's base for the current repository
+state and for the default resource values are known. The serve API has
+no list route for bases. A base of another checkout or another
+repository state is not derivable. Remove such a base by hand on the
+server after you check its owner. The seed base always stays. When the
+seed name matches a derivable name, the client prints one `note:` line
+and skips it. See [Verification status](#verification-status).
 
 #### Local data upload
 
@@ -848,11 +883,12 @@ below in that case. If a provisioning step fails, the build also
 prints the guest disk usage before it exits. The output names `/`,
 `/root/.cache/mise`, and `/root/.local/share/mise`.
 
-If a build machine ever dangles anyway, `make smolvm-clean` removes
-it. The target deletes only the `smolvm-build-*` and `smolvm-run-*`
-machines. It then removes `.cache/smolvm/`, which covers the possible
-partial artifacts: the stub `ci-<key>` and the sidecar
-`ci-<key>.smolmachine`. See [Clean the sandbox](#clean-the-sandbox).
+If a build machine ever dangles anyway, `make smolvm-clean` removes it.
+The target deletes only the `smolvm-build-<owner>-*` and
+`smolvm-run-<owner>-*` machines of this checkout. It then removes
+`.cache/smolvm/`, which covers the possible partial artifacts: the stub
+`ci-<key>` and the sidecar `ci-<key>.smolmachine`. See
+[Clean the sandbox](#clean-the-sandbox).
 
 The pack cache key covers `mise.toml`, `smol/pack-build.sh`,
 `smol/init.sh`, and every `smol/*.smolfile`. The init script holds the
@@ -1035,48 +1071,71 @@ a concern.
 
 ## Clean the sandbox
 
-`make smolvm-clean` does two things, in this order:
+`make smolvm-clean` removes the cache and the machines of this checkout.
+It builds the full plan first. Then it asks one time for confirmation.
 
-1. It deletes the dangling sandbox machines. Only machines whose names
-    match `smolvm-build-*` (a failed or interrupted pack build) or
-    `smolvm-run-*` (the older run path) are deleted. The delete runs
-    with `--force --cascade`. Machines with every other name stay
-    untouched.
-2. It removes the `.cache/smolvm/` directory. This removes the
-    executable stub and the sidecar `.smolmachine` files.
+The owner token is the first 12 hex characters of the SHA-256 of the
+canonical checkout path. Every resource name carries it:
 
-When `SMOLVM_ADDR` has a value, the target also cleans the server.
-It calls `GET /api/v1/machines` and deletes each machine whose name
-begins with `smolvm-remote-`. It prints one `deleted=<name>` line per
-machine. It does not delete other names. A failed delete prints
-`delete_failed=<name>` on stderr and does not stop the run. The client
-does not need `jq`. The script parses the JSON with grep and sed. The
-token stays out of the output.
+- `smolvm-build-<owner>-<hash16>` for a local pack build machine.
+- `smolvm-run-<owner>-*` for the older run path.
+- `smolvm-remote-<owner>-<pid>-<random>` for a remote worker.
+- `smolvm-ci-<owner>-<key>.qcow2` for a remote cache base.
 
-The target also removes the remote cache bases it can name. It calls
-`DELETE /api/v1/cache-bases/{base}` for the base of the current
-repository state and for the base of the default resource values. It
-prints one `cache_base_removed=<name>` line per call that succeeds. The
-serve API lists no cache bases, so bases of older repository states are
-not derivable. Remove those by hand on the server. The seed base always
-stays. When the seed name matches a derivable name, the target prints
-one `note:` line and never sends the delete.
+Two checkout paths get different tokens. The same path gives the same
+token on every run. A moved checkout gets a new token. Its old resources
+become foreign. The target reports them and does not delete them.
 
-When `smolvm` is not on `PATH`, the script prints `smolvm=not_found`
-and a note that the machine cleanup was skipped. The cache removal
-still runs. The exit code is 0. Listing machines reads state. It does
-not boot a machine. It is safe on a host with no accelerator.
+The plan covers four groups:
 
-The script prints one `deleted=<name>` line per deleted machine. It
-prints `kept=<N>` with the count of machines with other names. When a
-delete fails, it prints `delete_failed=<name>` to stderr and continues
-with the next machine. The exit code stays 0. When the cache is
-missing, it prints `cache_absent=.cache/smolvm`. When it removed the
+1. The local machines `smolvm-build-<owner>-*` and
+    `smolvm-run-<owner>-*`.
+2. The remote machines `smolvm-remote-<owner>-*` when `SMOLVM_ADDR` has
+    a value.
+3. The remote cache bases `smolvm-ci-<owner>-<key>.qcow2` for the
+    current repository state and for the default resource values.
+4. The `.cache/smolvm/` directory.
+
+The script prints one `plan_machine=`, `plan_remote_machine=`,
+`plan_cache_base=`, or `plan_cache=` line per planned item. It prints
+`kept=<N>` with the count of machines that stay. It prints one `note:`
+line for an untagged legacy machine and for a seed base that must stay.
+
+The options:
+
+- `--dry-run` prints the plan and deletes nothing. Exit 0.
+- `--yes` and `-y` skip the prompt.
+- `SMOLVM_CLEAN_ASSUME_YES=1` skips the prompt.
+
+Without a skip flag, the target reads one answer from stdin. It deletes
+only for `y` or `yes`, in any letter case. Any other answer prints
+`clean_cancelled=1`, deletes nothing, and exits 0. When stdin is not a
+terminal and no skip flag is set, the target prints an error, deletes
+nothing, and exits 1. An empty plan needs no answer.
+
+Make passes arguments through. Run `make smolvm-clean ARGS='--dry-run'`
+or `make smolvm-clean ARGS='--yes'`. A run with no arguments still asks.
+
+On a delete, the target prints one `deleted=<name>` line per machine and
+one `cache_base_removed=<name>` line per cache base. A failed delete
+prints `delete_failed=<name>` or `cache_base_delete_failed=<name>` on
+stderr and does not stop the run. The exit code stays 0. When the cache
+is missing, it prints `cache_absent=.cache/smolvm`. When it removed the
 cache, it prints `cache_removed=.cache/smolvm`.
 
-The cleanup is idempotent. Run it as often as you want. It never
-deletes a machine that has another name. A shared host with other
-machines is safe.
+When `smolvm` is not on `PATH`, the script prints `smolvm=not_found`
+and a note that the local machine cleanup was skipped. Listing machines
+reads state. It does not boot a machine.
+
+The serve API lists no cache bases. A base of another repository state
+is not derivable even when it has the owner token. Remove such a base by
+hand on the server after you check its owner.
+
+The cleanup is idempotent. Run it as often as you want. A machine of
+another checkout stays, because its name has another owner token. An
+untagged legacy machine also stays. The target never adds a flag that
+deletes foreign or legacy resources. Remove such a resource by hand
+after you check its owner.
 
 ## Run a command in the sandbox
 
@@ -1143,10 +1202,13 @@ The last example fails. The mount is read-only.
 - `make smolvm-pack` builds the cached pack. It exits 0 without
   building when smolvm or the accelerator is missing. It exits non-zero
   when `SMOLVM_ADDR` has a value. Unset the variable first.
-- `make smolvm-clean` removes the dangling `smolvm-build-*` and
-  `smolvm-run-*` machines. Then it removes `.cache/smolvm/`. With a
-  remote address it also deletes `smolvm-remote-*` machines on the
-  server. See [Clean the sandbox](#clean-the-sandbox).
+- `make smolvm-clean` removes the `smolvm-build-<owner>-*` and
+  `smolvm-run-<owner>-*` machines of this checkout and then
+  `.cache/smolvm/`. With a remote address it also deletes the
+  `smolvm-remote-<owner>-*` machines and the
+  `smolvm-ci-<owner>-<key>.qcow2` cache bases. It prints the plan and
+  asks one time. Use `ARGS='--dry-run'` or `ARGS='--yes'`. See
+  [Clean the sandbox](#clean-the-sandbox).
 - `make smolvm-exec` runs one command inside the sandbox. See
   [Run a command in the sandbox](#run-a-command-in-the-sandbox).
 - `make smolvm-preflight` probes the host and prints key=value
@@ -1251,6 +1313,34 @@ CLI reference.
     for correctness, but a slow guest can fail the first
     `machine exec` if the agent is not up yet. Retry the build if it
     fails at the first step.
+
+## Compatibility and limits
+
+Local runs used Linux x86_64 with KVM and smolvm 1.35.1. The pack
+build, the full check run in the microVM, `smolvm-exec` exit-code
+propagation, and `smolvm-clean` ran on that host.
+
+Remote runs used `smolvm serve` v1.35.4 and v1.33.0. The session flow
+on v1.35.4 ran start, read, stdin, local-directory upload, and delete.
+The v1.33.0 server has no session routes. Those runs used the stream
+and buffered paths.
+
+These paths are not verified:
+
+- A successful cache publish, the content base, and a warm init. The
+  tested Windows server attached a seed base and refused every
+  publish. Each run paid full provisioning.
+- The full `make ci` run over HTTP. Live remote runs used
+  `make smolvm-exec`.
+- Remote cleanup of a real cache base.
+- The isolation check on a KVM host. `make smolvm-verify` has not
+  printed `result=isolation_held` there.
+- macOS on Apple Silicon. The detection exists, but the path is
+  untested.
+
+The 0.5.2 serve API spec is the floor. A server of that generation
+lacks the `/execs` routes and the cache-base routes. The probe selects
+the path that your server supports.
 
 ## Git hooks and GitHub Actions
 

@@ -1121,6 +1121,12 @@ Build, test, lint, documentation, and commit rules are in [CONTRIBUTING.md](CONT
 
 The hooks in `.githook/` call `scripts/ci.sh`. By default, the checks use a `smolvm serve` server when `SMOLVM_ADDR` is set, a local microVM when smolvm and the accelerator are available, and the host with a warning otherwise. Set `SMOLVM_ENABLED=1` to enforce smolvm. The run then exits 3 when neither a remote server nor a local microVM is available. See [the smolvm document](docs/smolvm.md) for the modes, environment variables, and API flow.
 
+`make smolvm-clean` removes the cached packs and the dangling machines of this checkout. Every resource name carries an owner token from the canonical checkout path: `smolvm-build-<owner>-<hash>`, `smolvm-run-<owner>-*`, and `smolvm-remote-<owner>-*`. With a remote address it also deletes `smolvm-ci-<owner>-<key>.qcow2` cache bases on the server. The target prints the plan and asks one time. Use `ARGS='--dry-run'` to print the plan only, or `ARGS='--yes'` to skip the prompt. Set `SMOLVM_CLEAN_ASSUME_YES=1` to skip the prompt too. A non-interactive run without a skip flag stops with an error. Machines and bases of another checkout stay. A moved checkout gets a new token, so its old resources become foreign and are reported, not deleted.
+
+#### Compatibility and limits
+
+Local runs used Linux x86_64 with KVM and smolvm 1.35.1. Remote session flows, a streamed stdin, and a local-directory upload ran against `smolvm serve` v1.35.4. The streamed exec path ran against v1.33.0. Check each version against your server before you rely on a feature. The full `make ci` run over HTTP is not verified. Live remote runs used `make smolvm-exec`. See [the smolvm document](docs/smolvm.md#compatibility-and-limits) for the full list.
+
 ### Vendored dependencies
 
 Casbin is vendored at `vendor/casbin` with one Rhai feature change. Casbin enables Rhai features that remove the operation limits, function calls, and 64-bit integers that the condition script engine needs. See [vendor/casbin/PATCH.md](vendor/casbin/PATCH.md) for the exact change and the update procedure.
