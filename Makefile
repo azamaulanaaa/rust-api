@@ -1,7 +1,7 @@
 SHELL := bash
 .DEFAULT_GOAL := help
 
-.PHONY: help ci smolvm smolvm-pack smolvm-clean smolvm-exec smolvm-preflight smolvm-verify check-jactionlint check-bash check-cargo check-clippy check-cargo-deny-advisories check-cargo-deny-bans check-cargo-deny-licenses check-cargo-deny-sources check-commits check-dclint check-dockerfmt check-editorconfig check-gitleaks check-hadolint check-markdown check-mise check-rustfmt check-shfmt check-zizmor format format-rustfmt format-shfmt format-dockerfmt format-dclint hooks release
+.PHONY: help ci smolvm smolvm-pack smolvm-clean smolvm-exec smolvm-preflight smolvm-verify check-jactionlint check-bash check-cargo check-clippy check-coverage check-msrv check-no-default-features check-doc check-release-config check-cargo-deny-advisories check-cargo-deny-bans check-cargo-deny-licenses check-cargo-deny-sources check-commits check-dclint check-dockerfmt check-editorconfig check-gitleaks check-hadolint check-markdown check-mise check-rustfmt check-shfmt check-zizmor format format-rustfmt format-shfmt format-dockerfmt format-dclint hooks release
 
 help: ## Show this help.
 	@echo "Targets:"
@@ -39,6 +39,21 @@ check-cargo: ## Check the Rust test suite when cargo is available.
 
 check-clippy: ## Check the Rust code with clippy when cargo is available.
 	scripts/check-clippy.sh
+
+check-coverage: ## Check Rust coverage with a line floor.
+	scripts/check-coverage.sh
+
+check-msrv: ## Check the Rust code against the declared MSRV.
+	scripts/check-msrv.sh
+
+check-no-default-features: ## Check the Rust code without default features.
+	scripts/check-no-default-features.sh
+
+check-doc: ## Check the Rust docs with warnings denied.
+	scripts/check-doc.sh
+
+check-release-config: ## Check that the release workflow gates publishing on CI.
+	scripts/check-release-config.sh
 
 check-cargo-deny-advisories: ## Check Rust advisories when cargo is available.
 	scripts/check-cargo-deny-advisories.sh
@@ -104,5 +119,6 @@ hooks: ## Install the git hooks in .githook.
 	git config core.hooksPath .githook
 	chmod +x .githook/commit-msg .githook/pre-commit .githook/pre-push
 
-release: ## Bump the version and update the changelog.
+release: ## Bump the version with cog and show the dist plan.
 	cog bump --auto
+	dist plan --output-format=human

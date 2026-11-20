@@ -19,5 +19,6 @@ if [[ ! -f Cargo.toml ]]; then
   exit 0
 fi
 
-cargo test
+cargo test --all-targets --all-features --locked
+cargo test --doc --locked
 echo "checked Rust tests"

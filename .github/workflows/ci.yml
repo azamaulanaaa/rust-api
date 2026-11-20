@@ -84,6 +84,22 @@ jobs:
           - name: cargo-deny-sources
             install_args: "rust cargo-deny"
             script: scripts/check-cargo-deny-sources.sh
+          - name: coverage
+            install_args: "rust cargo-llvm-cov"
+            script: scripts/check-coverage.sh
+          # The msrv version must match rust-version in Cargo.toml.
+          - name: msrv
+            install_args: "rust@1.89"
+            script: scripts/check-msrv.sh
+          - name: no-default-features
+            install_args: rust
+            script: scripts/check-no-default-features.sh
+          - name: doc
+            install_args: rust
+            script: scripts/check-doc.sh
+          - name: release-config
+            install_args: "rust cargo:cargo-dist"
+            script: scripts/check-release-config.sh
     steps:
       - name: Check out the repository
         if: matrix.name != 'commits'
@@ -112,6 +128,13 @@ jobs:
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - name: Run the check
         run: ${{ matrix.script }}
+      - name: Upload coverage report
+        if: matrix.name == 'coverage'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: coverage-html
+          path: target/llvm-cov/html
+          retention-days: 7
 
   pr-title:
     name: PR title
