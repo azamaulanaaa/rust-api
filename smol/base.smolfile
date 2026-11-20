@@ -1,0 +1,23 @@
+# Base machine for the check sandbox.
+# The pack build installs mise and the tools from mise.toml into this
+# machine with explicit commands. Do not add provisioning commands to
+# [dev].init. The pack build bakes the result into a cached artifact.
+# The repository is mounted at /workspace at run time. It is not baked in.
+# This file is a template. The build replaces __SMOLVM_CPUS__ with the
+# value of SMOLVM_CPUS and __SMOLVM_MEMORY_MB__ with the value of
+# SMOLVM_MEMORY_MB. The defaults are 1 CPU and 512 MiB of memory.
+image = "debian:stable-slim"
+workdir = "/workspace"
+cpus = __SMOLVM_CPUS__
+memory = __SMOLVM_MEMORY_MB__
+storage = 2
+overlay = 4
+net = true
+
+# The artifact table caps the packed machine at the same CPU and memory
+# values as the top-level fields. The pack build also passes --cpus and
+# --mem to smolvm pack create. The flags apply to pack create with
+# --from-vm. The table applies when a pack is created from this Smolfile.
+[artifact]
+cpus = __SMOLVM_CPUS__
+memory = __SMOLVM_MEMORY_MB__

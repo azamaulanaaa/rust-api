@@ -1,168 +1,183 @@
-name: CI
+name: Checks
+
+on:
+  push:
+    branches:
+      - main
+      - 'feature/**'
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    # Run every Monday at 03:00 UTC.
+    - cron: '0 3 * * 1'
 
 permissions:
   contents: read
 
-on:
-  push:
-    branches: [main]
-  pull_request:
-  workflow_call:
-
-env:
-  CARGO_TERM_COLOR: always
-
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  lint:
-    name: Lint (fmt & clippy)
-    runs-on: ubuntu-latest
+  check:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    container:
+      image: jdxcode/mise@sha256:05360b08fb68ace24d4814adaa6f36371584f6931782ead4891872049667af5a # jdxcode/mise:2026.11.8-debian
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Add a check with one entry below. Set name to the check name.
+          # Set install_args to the tools that mise installs. Set script to
+          # the check script path. Use install_args: '' when the check needs
+          # no tool.
+          - name: mise
+            install_args: ''
+            script: scripts/check-mise.sh
+          - name: jactionlint
+            install_args: jactionlint
+            script: scripts/check-jactionlint.sh
+          - name: bash
+            install_args: shellcheck
+            script: scripts/check-bash.sh
+          - name: shfmt
+            install_args: shfmt
+            script: scripts/check-shfmt.sh
+          - name: commits
+            install_args: cocogitto
+            script: scripts/check-commits.sh
+          - name: markdown
+            install_args: "node npm:markdownlint-cli2"
+            script: scripts/check-markdown.sh
+          - name: hadolint
+            install_args: hadolint
+            script: scripts/check-hadolint.sh
+          - name: dockerfmt
+            install_args: github:reteps/dockerfmt
+            script: scripts/check-dockerfmt.sh
+          - name: dclint
+            install_args: "node npm:dclint"
+            script: scripts/check-dclint.sh
+          - name: zizmor
+            install_args: zizmor
+            script: scripts/check-zizmor.sh
+          - name: cargo
+            install_args: rust
+            script: scripts/check-cargo.sh
+          - name: clippy
+            install_args: rust
+            script: scripts/check-clippy.sh
+          - name: rustfmt
+            install_args: rust
+            script: scripts/check-rustfmt.sh
+          - name: cargo-deny-advisories
+            install_args: "rust cargo-deny"
+            script: scripts/check-cargo-deny-advisories.sh
+          - name: cargo-deny-bans
+            install_args: "rust cargo-deny"
+            script: scripts/check-cargo-deny-bans.sh
+          - name: cargo-deny-licenses
+            install_args: "rust cargo-deny"
+            script: scripts/check-cargo-deny-licenses.sh
+          - name: cargo-deny-sources
+            install_args: "rust cargo-deny"
+            script: scripts/check-cargo-deny-sources.sh
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: ./.github/actions/setup-rust
-      - name: Check formatting
-        run: cargo fmt --all --check
-      - name: Clippy
-        run: cargo clippy --all-targets --all-features --locked -- -D warnings
-
-  test:
-    name: Test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: ./.github/actions/setup-rust
+      - name: Check out the repository
+        if: matrix.name != 'commits'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          components: ''
-      - run: cargo test --all-targets --all-features --locked
-      - run: cargo test --doc --locked
-
-  coverage:
-    name: Coverage
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: ./.github/actions/setup-rust
+          persist-credentials: false
+      - name: Check out the repository with full history
+        if: matrix.name == 'commits'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          components: llvm-tools-preview
-          install: cargo-llvm-cov@0.9.1
-      - name: Measure coverage
-        run: cargo llvm-cov --all-features --html --locked --fail-under-lines 90 --output-dir target/llvm-cov
-      - name: Upload report
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: coverage-html
-          path: target/llvm-cov/html
-          retention-days: 7
-
-  msrv:
-    name: MSRV
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - name: Read the declared floor
-        id: floor
-        run: echo "version=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml | head -1)" >> "$GITHUB_OUTPUT"
-      - uses: ./.github/actions/setup-rust
-        with:
-          toolchain: ${{ steps.floor.outputs.version }}
-          components: ''
-      - run: cargo check --all-targets --all-features --locked
-
-  no-default-features:
-    name: No default features
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: ./.github/actions/setup-rust
-        with:
-          components: ''
-      - run: cargo check --all-targets --all-features --no-default-features --locked
-
-  doc:
-    name: Docs
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: ./.github/actions/setup-rust
-        with:
-          components: ''
-      - name: Check rustdoc
-        run: cargo doc --no-deps --all-features --locked
-        env:
-          RUSTDOCFLAGS: -D warnings
-
-  release-config:
-    name: Release config
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: ./.github/actions/setup-rust
-        with:
-          components: ''
-          install: cargo-dist@0.32.0
-      - name: The release workflow still gates publishing on CI
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install a C toolchain for Rust checks
+        if: contains(matrix.install_args, 'rust')
         run: |
-          set -eu
-          workflow=.github/workflows/release.yml
-          if ! grep -q 'uses: ./.github/workflows/ci.yml' "$workflow"; then
-            echo "::error::$workflow no longer calls ci.yml; re-apply the 'checks' job"
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential
+      - name: Install tools with cache
+        if: matrix.install_args != ''
+        uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
+        with:
+          cache: true
+          version: "2026.11.8"
+          install_args: ${{ matrix.install_args }}
+      - name: Trust the checkout directory
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: Run the check
+        run: ${{ matrix.script }}
+
+  pr-title:
+    name: PR title
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    container:
+      image: jdxcode/mise@sha256:05360b08fb68ace24d4814adaa6f36371584f6931782ead4891872049667af5a # jdxcode/mise:2026.11.8-debian
+    timeout-minutes: 10
+    steps:
+      - name: Check the pull request title
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          regex='^(feat|fix|docs|test|refactor|perf|build|ci|chore)(\([a-z0-9._/-]+\))?!?: .+$'
+          if [[ ! "$PR_TITLE" =~ $regex ]]; then
+            echo "error: Write the pull request title in the commit format." >&2
             exit 1
           fi
-          if ! grep -A4 'build-local-artifacts:' "$workflow" | grep -q '^ *- checks$'; then
-            echo "::error::$workflow no longer waits for checks before building; re-apply it to build-local-artifacts needs"
-            exit 1
-          fi
-          echo "release workflow is gated on CI"
-      - name: The release plan resolves
-        run: dist plan --output-format=human > /dev/null
 
-  licenses:
-    name: Licences (cargo deny)
-    runs-on: ubuntu-latest
+  gitleaks:
+    name: gitleaks
+    runs-on: ubuntu-24.04
+    container:
+      image: jdxcode/mise@sha256:05360b08fb68ace24d4814adaa6f36371584f6931782ead4891872049667af5a # jdxcode/mise:2026.11.8-debian
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: ./.github/actions/setup-rust
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          components: ''
-          install: cargo-deny@0.20.2
-      - name: Check dependency licences
-        run: cargo deny check licenses
+          persist-credentials: false
+      - name: Trust the checkout directory
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: Install gitleaks
+        run: mise install gitleaks
+      - name: Scan the repository for secrets
+        run: scripts/check-gitleaks.sh
 
-  advisories:
-    name: Advisories (cargo deny)
-    runs-on: ubuntu-latest
+  editorconfig:
+    name: editorconfig
+    runs-on: ubuntu-24.04
+    container:
+      image: jdxcode/mise@sha256:05360b08fb68ace24d4814adaa6f36371584f6931782ead4891872049667af5a # jdxcode/mise:2026.11.8-debian
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: ./.github/actions/setup-rust
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          components: ''
-          install: cargo-deny@0.20.2
-      - name: Check advisories (vulns / yanks)
-        run: cargo deny check advisories
+          persist-credentials: false
+      - name: Trust the checkout directory
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: Install editorconfig-checker
+        run: mise install editorconfig-checker
+      - name: Check the files against EditorConfig rules
+        run: scripts/check-editorconfig.sh
 
-  bans:
-    name: Bans (cargo deny)
-    runs-on: ubuntu-latest
+  dependency-review:
+    name: dependency-review
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: ./.github/actions/setup-rust
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          components: ''
-          install: cargo-deny@0.20.2
-      - name: Check wildcards and duplicate versions
-        run: cargo deny check bans
-
-  sources:
-    name: Sources (cargo deny)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: ./.github/actions/setup-rust
-        with:
-          components: ''
-          install: cargo-deny@0.20.2
-      - name: Check dependency sources
-        run: cargo deny check sources
+          persist-credentials: false
+      - name: Review the dependency changes
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0

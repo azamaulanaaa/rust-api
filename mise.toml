@@ -1,101 +1,20 @@
+# mise installs local development dependencies only.
+# Git hooks and make do not use mise.
+
 [tools]
-rust = { version = "stable", components = "rust-analyzer" }
-zig = "latest"
-"cargo:cargo-llvm-cov" = "latest"
-"cargo:cargo-deny" = "latest"
-"cargo:cargo-dist" = "0.32.0"
-"cargo:cargo-zigbuild" = "latest"
-
-[tasks.hooks]
-run = [
-  "git config core.hooksPath .githooks",
-  "chmod +x .githooks/pre-commit .githooks/pre-push .githooks/ci-local.sh",
-]
-description = "Install the git hooks in this repository"
-
-[tasks.build]
-run = "cargo-zigbuild build --all-targets --all-features"
-
-[tasks.run]
-run = "cargo-zigbuild run"
-
-[tasks.test]
-run = [
-  "cargo-zigbuild test --all-targets --all-features",
-  "cargo test --doc",
-]
-
-[tasks.cov]
-run = "cargo llvm-cov --all-features --summary-only --fail-under-lines 90"
-description = "Print a coverage summary for the test suite"
-
-[tasks.cov-html]
-run = "cargo llvm-cov --all-features --html --open"
-description = "Write an HTML coverage report and open it"
-
-[tasks.fmt]
-run = "cargo fmt --all --check"
-
-[tasks.clippy]
-run = "cargo clippy --all-targets --all-features --locked -- -D warnings"
-
-[tasks.lint]
-depends = ["fmt", "clippy"]
-
-[tasks.licenses]
-run = "cargo deny check licenses"
-description = "Every locked dependency's licence must be compatible with MIT OR Apache-2.0"
-
-[tasks.advisories]
-run = "cargo deny check advisories"
-description = "Known vulnerabilities and yanked releases in the resolved graph"
-
-[tasks.bans]
-run = "cargo deny check bans"
-description = "Wildcard dependencies and duplicate versions"
-
-[tasks.sources]
-run = "cargo deny check sources"
-description = "Every dependency comes from a known registry or a git source"
-
-[tasks.deps]
-depends = ["licenses", "advisories", "bans", "sources"]
-
-[tasks.msrv-install]
-run = '''
-floor=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-if rustup run "$floor" rustc --version >/dev/null 2>&1; then
-  echo "Rust $floor is already installed"
-  exit 0
-fi
-rustup toolchain install "$floor" --profile minimal --no-self-update --force
-'''
-description = "Install the Rust version declared by Cargo.toml"
-
-[tasks.msrv]
-run = '''
-floor=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-echo "building against the declared floor: $floor"
-cargo "+$floor" check --all-targets --all-features --locked
-'''
-description = "Build against the declared minimum supported Rust version"
-
-[tasks.doc]
-run = "cargo doc --no-deps --all-features"
-env = { RUSTDOCFLAGS = "-D warnings" }
-
-[tasks.check]
-depends = ["lint", "test", "deps", "msrv", "doc", "dist-check"]
-description = "Run every check CI runs"
-
-[tasks.dist-plan]
-run = "dist plan"
-description = "List the artifacts a release would produce, without building"
-
-[tasks.dist-check]
-run = "dist plan --output-format=human > /dev/null"
-description = "Check that the release plan resolves"
-
-[tasks.dist-build]
-run = "dist build --artifacts=local --target=\"$(rustc -vV | sed -n 's/^host: //p')\""
-description = "Build the release archive for this machine into target/distrib"
+cargo-deny = "0"
+cocogitto = "7"
+editorconfig-checker = "4"
+"github:reteps/dockerfmt" = "0"
+gitleaks = "8"
+hadolint = "2"
+jactionlint = "2"
+make = "4"
+# The npm tools need the Node.js runtime.
+node = "24"
+"npm:dclint" = "3"
+"npm:markdownlint-cli2" = "0"
+rust = "stable"
+shellcheck = "0"
+shfmt = "3"
+zizmor = "1"
