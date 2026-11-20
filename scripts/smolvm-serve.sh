@@ -273,14 +273,17 @@ serve_cache_seed_resolve() {
 }
 
 # Compute the cache base name for one repository state.
-# The key is the same SHA-256 that the local pack cache uses. A change
-# to mise.toml, one smol file, the pack build, or the init script names
-# a new base. Base names stay immutable on the server.
+# The name carries the owner token of the checkout and the key that the
+# local pack cache uses. A change to mise.toml, one smol file, the pack
+# build, or the init script names a new base. Base names stay immutable
+# on the server.
 serve_cache_base_name() {
   local repo_root="$1"
+  local owner
   local key
+  owner="$(smolvm_resources_owner_token "$repo_root")" || return 1
   key="$(cd "$repo_root" && smolvm_resources_hash_lines | sha256sum | cut -d' ' -f1)" || return 1
-  printf 'smolvm-ci-%s.qcow2' "$key"
+  printf 'smolvm-ci-%s-%s.qcow2' "$owner" "$key"
 }
 
 # Build one create body.
@@ -1579,7 +1582,11 @@ serve_run_remote() {
 
   repo_root="$(git rev-parse --show-toplevel)"
 
-  local worker="smolvm-remote-$$-${RANDOM}"
+  local owner
+  if ! owner="$(smolvm_resources_owner_token "$repo_root")"; then
+    return 1
+  fi
+  local worker="smolvm-remote-${owner}-$$-${RANDOM}"
   local tarball
   tarball="$(mktemp "${TMPDIR:-/tmp}/smolvm-worktree.XXXXXX.tar.gz")" || return 1
 

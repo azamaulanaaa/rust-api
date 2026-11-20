@@ -16,8 +16,8 @@ smolvm: ## Run the checks inside a smolvm microVM, local or remote.
 smolvm-pack: ## Build the cached smolvm pack for the microVM.
 	smol/pack-build.sh
 
-smolvm-clean: ## Remove the cached smolvm packs and delete dangling smolvm machines.
-	scripts/smolvm-clean.sh
+smolvm-clean: ## Remove this checkout's smolvm cache and machines after confirmation (ARGS='...').
+	scripts/smolvm-clean.sh $(ARGS)
 
 smolvm-exec: ## Run a command inside the microVM, local or remote (ARGS='...').
 	@scripts/smolvm-exec.sh "$(ARGS)"

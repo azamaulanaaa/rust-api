@@ -29,6 +29,36 @@ smolvm_resources_resolve() {
   SMOLVM_MEMORY_MB_VALUE="$memory_mb"
 }
 
+# Print the owner token for one repository root.
+# The token is the first 12 hex characters of the SHA-256 of the
+# canonical path. Two checkouts get different tokens. The same path
+# gives the same token on every run.
+smolvm_resources_owner_token() {
+  local repo_root="$1"
+  local canonical
+  local digest
+
+  if [[ -z "$repo_root" ]]; then
+    echo "error: the repository root is empty." >&2
+    return 1
+  fi
+  if ! canonical="$(cd -- "$repo_root" 2>/dev/null && pwd -P)"; then
+    echo "error: the repository root cannot be resolved: ${repo_root}" >&2
+    return 1
+  fi
+
+  if command -v sha256sum >/dev/null 2>&1; then
+    digest="$(printf '%s' "$canonical" | sha256sum)" || return 1
+  elif command -v shasum >/dev/null 2>&1; then
+    digest="$(printf '%s' "$canonical" | shasum -a 256)" || return 1
+  else
+    echo "error: no SHA-256 tool is on PATH. Install sha256sum or shasum." >&2
+    return 1
+  fi
+
+  printf '%s\n' "${digest:0:12}"
+}
+
 # Print the sha256sum lines that form the pack cache key.
 # Add the resource values when they differ from the defaults.
 # A pack built for one resource setting is then not reused for another.
