@@ -42,7 +42,7 @@ if [[ -z "${cmd//[[:space:]]/}" ]]; then
   exit 2
 fi
 
-if [[ -n "${SMOLVM_SERVE_ADDR:-}" ]]; then
+if [[ -n "${SMOLVM_ADDR:-}" ]]; then
   # Run the command in a machine on the remote server. Never use the host.
   # The auto mode streams a piped local stdin to the guest command.
   # shellcheck source=scripts/smolvm-serve.sh

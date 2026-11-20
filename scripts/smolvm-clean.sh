@@ -96,7 +96,7 @@ else
   fi
 fi
 
-if [[ -n "${SMOLVM_SERVE_ADDR:-}" ]]; then
+if [[ -n "${SMOLVM_ADDR:-}" ]]; then
   # shellcheck source=scripts/smolvm-serve.sh
   source "$script_dir/smolvm-serve.sh"
   if serve_init; then

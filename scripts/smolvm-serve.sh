@@ -60,10 +60,10 @@ json_escape() {
 
 # Report whether the remote path is active.
 serve_remote_enabled() {
-  [[ -n "${SMOLVM_SERVE_ADDR:-}" ]]
+  [[ -n "${SMOLVM_ADDR:-}" ]]
 }
 
-# Resolve SMOLVM_SERVE_ADDR into curl connection options and a base URL.
+# Resolve SMOLVM_ADDR into curl connection options and a base URL.
 # Accept a URL with a scheme, a bare host:port value, or a socket path.
 serve_init() {
   if ! command -v curl >/dev/null 2>&1; then
@@ -76,7 +76,7 @@ serve_init() {
     return 1
   fi
 
-  local address="${SMOLVM_SERVE_ADDR:-}"
+  local address="${SMOLVM_ADDR:-}"
   case "$address" in
   unix://*)
     SERVE_CURL_CONNECT=(--unix-socket "${address#unix://}")
@@ -95,7 +95,7 @@ serve_init() {
     SERVE_BASE="http://${address%/}"
     ;;
   *)
-    echo "error: SMOLVM_SERVE_ADDR has an unsupported value." >&2
+    echo "error: SMOLVM_ADDR has an unsupported value." >&2
     echo "error: Use a URL, a host:port value, or a socket path." >&2
     return 1
     ;;
@@ -189,7 +189,7 @@ serve_api_error() {
   if [[ "$status" =~ ^[1-5][0-9][0-9]$ ]]; then
     echo "error: the server answered HTTP ${status}." >&2
   else
-    echo "error: the server did not answer. Check SMOLVM_SERVE_ADDR and the network." >&2
+    echo "error: the server did not answer. Check SMOLVM_ADDR and the network." >&2
   fi
   local message
   message="$(serve_json_string_field "$body" error)"

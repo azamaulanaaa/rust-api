@@ -1119,7 +1119,7 @@ Build, test, lint, documentation, and commit rules are in [CONTRIBUTING.md](CONT
 
 ### Checks
 
-The hooks in `.githook/` call `scripts/ci.sh`. By default, the checks use a `smolvm serve` server when `SMOLVM_SERVE_ADDR` is set, a local microVM when smolvm and the accelerator are available, and the host with a warning otherwise. Set `SMOLVM_ENABLED=1` to enforce smolvm. The run then exits 3 when neither a remote server nor a local microVM is available. See [the smolvm document](docs/smolvm.md) for the modes, environment variables, and API flow.
+The hooks in `.githook/` call `scripts/ci.sh`. By default, the checks use a `smolvm serve` server when `SMOLVM_ADDR` is set, a local microVM when smolvm and the accelerator are available, and the host with a warning otherwise. Set `SMOLVM_ENABLED=1` to enforce smolvm. The run then exits 3 when neither a remote server nor a local microVM is available. See [the smolvm document](docs/smolvm.md) for the modes, environment variables, and API flow.
 
 ### Vendored dependencies
 

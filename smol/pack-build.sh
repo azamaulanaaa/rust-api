@@ -3,13 +3,13 @@
 # The pack holds the debian base image, mise, and the tools from
 # mise.toml. smol/init.sh provisions the guest. The repository is
 # mounted at run time. It is not baked in. The build refuses to run
-# when SMOLVM_SERVE_ADDR is set.
+# when SMOLVM_ADDR is set.
 # CPU and memory come from SMOLVM_CPUS and SMOLVM_MEMORY_MB.
 # Exit 0 without a pack when smolvm or the host accelerator is not available.
 set -euo pipefail
 
-if [[ -n "${SMOLVM_SERVE_ADDR:-}" ]]; then
-  echo "error: smolvm-pack does not run when SMOLVM_SERVE_ADDR is set. Unset the variable to build a local pack." >&2
+if [[ -n "${SMOLVM_ADDR:-}" ]]; then
+  echo "error: smolvm-pack does not run when you set SMOLVM_ADDR. Unset the variable to build a local pack." >&2
   exit 1
 fi
 

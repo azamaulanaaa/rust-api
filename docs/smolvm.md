@@ -7,7 +7,7 @@ repository is mounted at `/workspace` in the guest. The mount is
 read-only. The guest kernel enforces the read-only mount. The
 repository is not copied and it is not cloned.
 
-Set `SMOLVM_SERVE_ADDR` to send the checks to a `smolvm serve` endpoint on
+Set `SMOLVM_ADDR` to send the checks to a `smolvm serve` endpoint on
 another host. The guest command is the same. See
 [Remote mode](#remote-mode).
 
@@ -218,14 +218,14 @@ before the checks run, `scripts/ci.sh` reads `SMOLVM_ENABLED`:
 1. `SMOLVM_ENABLED=0` skips the detection. The script runs the checks
     on the host. The script prints no warning. The microVM sets this
     value in the guest command, so the checks do not recurse.
-2. `SMOLVM_ENABLED=1` enforces smolvm. When `SMOLVM_SERVE_ADDR` has a
+2. `SMOLVM_ENABLED=1` enforces smolvm. When `SMOLVM_ADDR` has a
     value, the script `exec`s `scripts/smolvm.sh` for the remote path.
     When `smolvm` is on `PATH` and the host accelerator works, it
     `exec`s `scripts/smolvm.sh` for a local microVM. Otherwise it
     prints the enforced-mode error on stderr and exits 3. The checks
     do not run on the host.
 3. An unset variable or any other value selects auto mode. When
-    `SMOLVM_SERVE_ADDR` has a value, the script uses the remote path.
+    `SMOLVM_ADDR` has a value, the script uses the remote path.
     When `smolvm` and the accelerator work, it uses a local microVM.
     Otherwise it prints the loud warning and runs the checks on the
     host.
@@ -237,7 +237,7 @@ with Apple Silicon it needs `kern.hv_support=1`.
 
 1. If `SMOLVM_ENABLED=0`, it runs the checks on the host. The
     checks do not recurse.
-2. If `SMOLVM_SERVE_ADDR` has a value, it calls the remote REST
+2. If `SMOLVM_ADDR` has a value, it calls the remote REST
     path. See [Remote mode](#remote-mode). That path is strict.
 3. Else it detects `smolvm` and the host accelerator. If either is
     missing and `SMOLVM_ENABLED=1`, it prints the enforced-mode
@@ -289,18 +289,18 @@ smolvm is not on PATH, or the host accelerator is unavailable.
 The checks did not run.
 Install smolvm on the host.
 Give the host a working accelerator.
-Alternatively, set SMOLVM_SERVE_ADDR to use a remote smolvm server.
+Alternatively, set SMOLVM_ADDR to use a remote smolvm server.
 See docs/smolvm.md for the requirements.
 ```
 
 Exit code 3 makes CI fail when smolvm is unavailable. The error says
 that the checks did not run. Install smolvm and fix the accelerator.
-You can also set `SMOLVM_SERVE_ADDR` for a remote run. Then run the
+You can also set `SMOLVM_ADDR` for a remote run. Then run the
 checks again.
 
 ## Remote mode
 
-Set `SMOLVM_SERVE_ADDR` to run the checks on a remote host. The scripts
+Set `SMOLVM_ADDR` to run the checks on a remote host. The scripts
 call a `smolvm serve` HTTP endpoint with `curl`. The local CLI is not used.
 No new runtime is added. The repository is not baked into a machine image.
 
@@ -323,7 +323,7 @@ database.
 
 ### Environment variables
 
-- `SMOLVM_SERVE_ADDR` sets the server address. Use a full URL such as
+- `SMOLVM_ADDR` sets the server address. Use a full URL such as
   `http://127.0.0.1:8080` or `https://host:8443`. Use a bare `host:port`
   value to get an `http://` prefix. Use a socket path such as
   `/run/smolvm.sock` or a `unix://` value for a Unix socket.
@@ -368,7 +368,7 @@ build machine. The scripts stop when either value is not a positive
 integer. A change to either value builds a new pack. Remote mode does
 not use the pack, but it sends both values in the create body.
 
-When `SMOLVM_SERVE_ADDR` is set, the scripts need a reachable server. They
+When `SMOLVM_ADDR` is set, the scripts need a reachable server. They
 require a successful remote run. They never run the checks or the user
 command on the host. If a call fails, they print an error and exit non-zero.
 
@@ -376,7 +376,7 @@ The remote path prints two warnings on stderr. The first warning says
 that the local pack cache is not used. The second warning says what the
 init script downloads: the tools on every run when the cache is off, or
 the tools only when the cache base is missing when the cache is on.
-`make smolvm-pack` refuses to run while `SMOLVM_SERVE_ADDR` has
+`make smolvm-pack` refuses to run while `SMOLVM_ADDR` has
 a value. Unset the variable before you build a local pack.
 
 ### API flow
@@ -1045,7 +1045,7 @@ a concern.
 2. It removes the `.cache/smolvm/` directory. This removes the
     executable stub and the sidecar `.smolmachine` files.
 
-When `SMOLVM_SERVE_ADDR` has a value, the target also cleans the server.
+When `SMOLVM_ADDR` has a value, the target also cleans the server.
 It calls `GET /api/v1/machines` and deletes each machine whose name
 begins with `smolvm-remote-`. It prints one `deleted=<name>` line per
 machine. It does not delete other names. A failed delete prints
@@ -1090,7 +1090,7 @@ defaults to `10m`. Override it with
 `SMOLVM_TIMEOUT`. `SMOLVM_ENABLED=0` and `SMOLVM_GUEST=1` are set for the
 command. A `bash scripts/ci.sh` inside it takes the native path.
 
-With `SMOLVM_SERVE_ADDR` set, the command runs on a remote server. The
+With `SMOLVM_ADDR` set, the command runs on a remote server. The
 remote path prints `exec=<command>` first. It then prints the guest output.
 The exit trap deletes the machine. See [Remote mode](#remote-mode).
 
@@ -1113,7 +1113,7 @@ command's exit code is the exit code of the script.
 
 There is no host fallback. If `smolvm` is missing or the host
 accelerator is unavailable, the script prints the loud warning to
-stderr, does not run the command, and exits 1. If `SMOLVM_SERVE_ADDR` is
+stderr, does not run the command, and exits 1. If `SMOLVM_ADDR` is
 set and the server fails, the script prints an error and exits non-zero.
 The command is not run on the host under any circumstances. This is on
 purpose. A command that must not touch the host never runs by accident.
@@ -1131,18 +1131,18 @@ The last example fails. The mount is read-only.
 ## Targets
 
 - `make ci` runs the checks. It uses a remote machine when
-  `SMOLVM_SERVE_ADDR` has a value. It uses a local machine when smolvm and
+  `SMOLVM_ADDR` has a value. It uses a local machine when smolvm and
   the accelerator are available. Otherwise it runs on the host with a
   loud warning. With `SMOLVM_ENABLED=1` it exits 3 instead of running the
   checks on the host.
 - `make smolvm` runs the checks inside smolvm. It uses the remote path
-  when `SMOLVM_SERVE_ADDR` has a value. Without a usable local setup and
+  when `SMOLVM_ADDR` has a value. Without a usable local setup and
   without a remote address it prints the loud warning in auto mode and
   runs the host checks. With `SMOLVM_ENABLED=1` it prints the error and
   exits 3.
 - `make smolvm-pack` builds the cached pack. It exits 0 without
   building when smolvm or the accelerator is missing. It exits non-zero
-  when `SMOLVM_SERVE_ADDR` has a value. Unset the variable first.
+  when `SMOLVM_ADDR` has a value. Unset the variable first.
 - `make smolvm-clean` removes the dangling `smolvm-build-*` and
   `smolvm-run-*` machines. Then it removes `.cache/smolvm/`. With a
   remote address it also deletes `smolvm-remote-*` machines on the
@@ -1168,7 +1168,7 @@ The last example fails. The mount is read-only.
   microVM or on a remote server. When smolvm and the accelerator are
   missing and no remote address exists, the scripts print an error on
   stderr and exit 3. The checks do not run on the host. Install smolvm
-  and fix the accelerator. You can also set `SMOLVM_SERVE_ADDR` for a
+  and fix the accelerator. You can also set `SMOLVM_ADDR` for a
   remote run.
 - An unset variable or any other value selects auto mode. A remote
   address sends the checks to a server. Without a remote address, smolvm

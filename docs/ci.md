@@ -24,7 +24,7 @@ start the check pipeline. `scripts/check-mise.sh` uses `mise` only to check
 `scripts/ci.sh` follows the smolvm mode cascade. It uses the first available
 path:
 
-1. With `SMOLVM_SERVE_ADDR` set, it sends the checks to that `smolvm serve`
+1. With `SMOLVM_ADDR` set, it sends the checks to that `smolvm serve`
    server. The helper uploads the working tree and runs the checks in a
    machine on the server.
 2. With `smolvm` on PATH and a working accelerator, it runs the checks in a
@@ -129,7 +129,7 @@ in the repository settings on GitHub, not in the repository files.
 ### The checks print exit code 3
 
 `SMOLVM_ENABLED=1` is set, but no server address and no local microVM are
-available. Set `SMOLVM_SERVE_ADDR`, or install smolvm with a working
+available. Set `SMOLVM_ADDR`, or install smolvm with a working
 accelerator. Otherwise unset `SMOLVM_ENABLED` for the host fallback.
 
 ### A Rust check skips a tool

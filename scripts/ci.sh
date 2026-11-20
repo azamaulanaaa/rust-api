@@ -46,14 +46,14 @@ smolvm is not on PATH, or the host accelerator is unavailable.
 The checks did not run.
 Install smolvm on the host.
 Give the host a working accelerator.
-Alternatively, set SMOLVM_SERVE_ADDR to use a remote smolvm server.
+Alternatively, set SMOLVM_ADDR to use a remote smolvm server.
 See docs/smolvm.md for the requirements.
 EOF
 }
 
 smolvm_mode="${SMOLVM_ENABLED:-}"
 if [[ "$smolvm_mode" != "0" ]]; then
-  if [[ -n "${SMOLVM_SERVE_ADDR:-}" ]]; then
+  if [[ -n "${SMOLVM_ADDR:-}" ]]; then
     exec scripts/smolvm.sh
   fi
   if host_accel_ok; then

@@ -72,7 +72,7 @@ These run cargo-deny. See `deny.toml` for the rules.
 
 ## Local CI
 
-By default, checks use a `smolvm serve` server when `SMOLVM_SERVE_ADDR` is set, a local microVM when smolvm and the accelerator are available, and the host otherwise. The host path prints a warning first. Set `SMOLVM_ENABLED=1` to enforce smolvm. The run then exits 3 when neither a remote server nor a local microVM is available. The checks do not run on the host in that mode. See [the smolvm document](docs/smolvm.md) for setup.
+By default, checks use a `smolvm serve` server when `SMOLVM_ADDR` is set, a local microVM when smolvm and the accelerator are available, and the host otherwise. The host path prints a warning first. Set `SMOLVM_ENABLED=1` to enforce smolvm. The run then exits 3 when neither a remote server nor a local microVM is available. The checks do not run on the host in that mode. See [the smolvm document](docs/smolvm.md) for setup.
 
 Install the hooks:
 

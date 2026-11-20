@@ -40,7 +40,7 @@ smolvm is not on PATH, or the host accelerator is unavailable.
 The checks did not run.
 Install smolvm on the host.
 Give the host a working accelerator.
-Alternatively, set SMOLVM_SERVE_ADDR to use a remote smolvm server.
+Alternatively, set SMOLVM_ADDR to use a remote smolvm server.
 See docs/smolvm.md for the requirements.
 EOF
 }
@@ -69,7 +69,7 @@ if [[ "${SMOLVM_ENABLED:-}" == "0" ]]; then
   exec scripts/ci.sh
 fi
 
-if [[ -n "${SMOLVM_SERVE_ADDR:-}" ]]; then
+if [[ -n "${SMOLVM_ADDR:-}" ]]; then
   # Run the checks in a machine on the remote server. Never use the host.
   # The checks path never sends the local stdin.
   # shellcheck source=scripts/smolvm-serve.sh
