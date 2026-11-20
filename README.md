@@ -1117,6 +1117,10 @@ cargo bench --bench eav -- --quick
 
 Build, test, lint, documentation, and commit rules are in [CONTRIBUTING.md](CONTRIBUTING.md). This section covers the test suites and releases. See [Performance](#performance) for the benchmark suite.
 
+### Checks
+
+The hooks in `.githook/` call `scripts/ci.sh`. By default, the checks use a `smolvm serve` server when `SMOLVM_SERVE_ADDR` is set, a local microVM when smolvm and the accelerator are available, and the host with a warning otherwise. Set `SMOLVM_ENABLED=1` to enforce smolvm. The run then exits 3 when neither a remote server nor a local microVM is available. See [the smolvm document](docs/smolvm.md) for the modes, environment variables, and API flow.
+
 ### Vendored dependencies
 
 Casbin is vendored at `vendor/casbin` with one Rhai feature change. Casbin enables Rhai features that remove the operation limits, function calls, and 64-bit integers that the condition script engine needs. See [vendor/casbin/PATCH.md](vendor/casbin/PATCH.md) for the exact change and the update procedure.

@@ -1,153 +1,97 @@
 # Release workflow
 
-This document describes the release workflow. The repository uses
-[`Cocogitto`](https://docs.cocogitto.io/) to check commits, write the
-changelog, and bump the version. The command name is `cog`.
+This repository uses two tools for a release. Cocogitto (`cog`) prepares the
+version and the changelog. [cargo-dist](https://opensource.axo.dev/cargo-dist/)
+version 0.32.0 packages and publishes the release. The dist configuration is
+in [`dist-workspace.toml`](../dist-workspace.toml). The generated workflow is
+[`.github/workflows/release.yml`](../.github/workflows/release.yml).
 
-## Commit format
+## Version and changelog
 
-Write every commit subject in this form:
-
-```text
-<type>(<scope>): <description>
-```
-
-`<type>` is one of these values: `feat`, `fix`, `docs`, `test`,
-`refactor`, `perf`, `build`, `ci`, `chore`.
-
-`<scope>` is optional. Use a short name for the changed area, for
-example `ci` or `hooks`. `<description>` is a short sentence in the
-imperative mood. Do not end the subject with a period.
-
-A commit that breaks compatibility adds `!` before the colon:
-
-```text
-feat(api)!: remove the old flag
-```
-
-A `BREAKING CHANGE:` footer also marks a breaking change.
-
-## Enforcement
-
-The repository enforces the commit format in three places:
-
-- `.githook/commit-msg` runs `cog verify --file` on the message before
-  Git creates the commit. A bad message stops the commit.
-- `scripts/check-commits.sh` runs `cog check` from `scripts/ci.sh`.
-  `make ci` and both Git hooks run this script.
-- `.githook/pre-push` runs `scripts/ci.sh` before each push. A bad
-  commit in the history stops the push.
-
-Do not use `--no-verify` to skip these checks. The
-[check pipeline](ci.md) describes the scripts.
-
-## Changelog
-
-`cog bump` generates `CHANGELOG.md`. Do not edit the file by hand. The
-Markdown check skips this file. The file has no entry until the first
-release.
-
-## Versioning
-
-`cog` selects the next version from the commit types:
-
-- `fix` bumps PATCH.
-- `feat` bumps MINOR.
-- `!` or `BREAKING CHANGE:` bumps MAJOR.
-
-Tags have the `v` prefix, for example `v1.2.3`.
-
-`cog bump --auto` never jumps from `0.y.z` to `1.0.0`. The `0.y.z`
-series marks a version before the first stable release.
-
-## Make a release
-
-Run the release on the `main` branch. `cog.toml` permits a bump on that
-branch only. Run this command:
+Run this command on `main` when CI passes:
 
 ```bash
 make release
 ```
 
-The target runs `cog bump --auto`. The command has three steps:
+The target runs two commands:
 
-1. It updates `CHANGELOG.md`.
-2. It creates a version commit.
-3. It creates a tag with the `v` prefix.
+1. `cog bump --auto` writes `CHANGELOG.md`, creates the version commit, and
+   creates a version tag that matches `v*`, for example `v1.2.3`.
+2. `dist plan --output-format=human` prints the artifact plan for that
+   version.
 
-No CI release job exists. The release runs on the local machine.
+Cog also checks commit messages. `.githook/commit-msg` runs `cog verify`.
+`scripts/check-commits.sh` runs `cog check` in CI. Do not edit `CHANGELOG.md`
+by hand. Cog generates the file.
 
-## Optional GitHub Release
+## The release flow
 
-A GitHub Release is optional. The local `make release` flow stays the
-default. It updates the changelog, creates the version commit, and creates
-the tag. It does not create a GitHub Release.
+Push the tag that cog created. A tag that matches `v*` triggers
+`.github/workflows/release.yml`. A pull request also runs the plan step, but
+it does not publish artifacts. The workflow follows these steps:
 
-The workflow `.github/workflows/release.yml` creates the release. It runs
-only when you opt in. To opt in, push the version tag to GitHub. The tag
-must match `v*`, for example `v1.2.3`. Push the tag that `make release`
-created:
+1. The `checks` job calls `ci.yml`. Every publishing job waits for this job.
+   A commit that fails CI cannot release.
+2. The `plan` job runs `dist host` for a tag or `dist plan` for a pull
+   request. It writes the dist manifest and the release targets.
+3. The `build-local-artifacts` job builds the platform archives. It waits for
+   `checks` and `plan`.
+4. The `build-global-artifacts` job builds the global artifacts, such as
+   checksums.
+5. The `host` job uploads the artifacts and creates the GitHub Release.
+6. The `announce` job announces the release.
+
+## The checks gate
+
+The `checks` job in `release.yml` uses `./.github/workflows/ci.yml`. The
+`build-local-artifacts` job lists `checks` in its `needs`. The
+`release-config` job in `ci.yml` checks both lines. A workflow that drops
+either line fails that job. Do not push a tag for a commit that fails CI.
+
+## Run dist locally
+
+Use the mise tasks:
+
+```bash
+mise run dist-plan     # print the artifact plan
+mise run dist-check    # check that the plan resolves
+mise run dist-build    # build the archives into target/distrib/
+```
+
+`mise run dist-build` builds for this machine only. The release workflow
+builds every configured target. The `cargo-dist` pin in `mise.toml` must
+track `cargo-dist-version` in `dist-workspace.toml`.
+
+## Regenerate the workflow
+
+Run this command at the pinned version:
+
+```bash
+dist generate
+```
+
+The command overwrites `release.yml`. The file is generated, so apply the two
+local edits again after every regeneration:
+
+1. Add the `checks` job that calls `./.github/workflows/ci.yml`.
+2. Add `checks` to the `needs` of `build-local-artifacts`.
+
+The comments at the top of `release.yml` describe both edits. The
+`release-config` job fails when an edit is missing. Do not edit the generated
+parts of the file.
+
+## Publish
+
+1. Confirm CI passes on `main`.
+2. Run `make release`. Cog writes the changelog, creates the version commit,
+   and creates the `v*` tag.
+3. Push the tag:
 
 ```bash
 git push origin v1.2.3
 ```
 
-The workflow then creates a GitHub Release for that tag. It uses the
-changelog section for that version as the release notes. If the changelog
-has no section for the version, the workflow uses the tag name as the
-release title.
-
-To stay local, do not push the tag. The workflow does not run. No GitHub
-Release is created.
-
-## Dry run
-
-Run this command on the `main` branch to see the next version:
-
-```bash
-cog bump --dry-run --auto
-```
-
-The command prints the next version and changes nothing. It does not
-write the changelog, create a commit, or create a tag.
-
-## First release
-
-The repository has no tag. Select the first version before the first
-release. Run one of these commands:
-
-```bash
-cog bump --version 1.0.0
-cog bump --version 0.1.0
-```
-
-The maintainer decides the first version. Use `1.0.0` when the public
-interface is stable. Use `0.1.0` when the interface can change.
-
-## Troubleshooting
-
-### `cog` is not on `PATH`
-
-The `cog` command must be on `PATH`. The check prints this message when
-the tool is absent:
-
-```text
-error: cog is not on PATH. Install cocogitto first.
-```
-
-### The commit hook rejects a message
-
-The commit hook runs `cog verify`. Read the error. Write the message in
-the commit format. Run this command to correct the last commit:
-
-```bash
-git commit --amend
-```
-
-Do not use `--no-verify`.
-
-### The Markdown check skips `CHANGELOG.md`
-
-`cog bump` generates the file. The file format can disagree with the
-Markdown rules. `scripts/check-markdown.sh` skips the file on purpose.
-Do not add the file to the check.
+The workflow builds the archives and creates the GitHub Release. It uses the
+generated announcement title and body. The checks gate stops the release when
+CI fails.

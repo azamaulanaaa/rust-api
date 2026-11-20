@@ -72,60 +72,37 @@ These run cargo-deny. See `deny.toml` for the rules.
 
 ## Local CI
 
-The repository ships git hooks that mirror the CI workflow.
+By default, checks use a `smolvm serve` server when `SMOLVM_SERVE_ADDR` is set, a local microVM when smolvm and the accelerator are available, and the host otherwise. The host path prints a warning first. Set `SMOLVM_ENABLED=1` to enforce smolvm. The run then exits 3 when neither a remote server nor a local microVM is available. The checks do not run on the host in that mode. See [the smolvm document](docs/smolvm.md) for setup.
 
 Install the hooks:
 
 ```bash
-mise run hooks
+make hooks
 ```
 
-This command sets `core.hooksPath` to `.githooks` and marks the hook files executable.
+This command sets `core.hooksPath` to `.githook` and marks the hook files executable.
 
-The `pre-commit` hook runs `mise run lint` when staged changes exist. The `pre-push` hook runs `.githooks/ci-local.sh` with the default jobs. The default jobs are lint, test, MSRV, docs, release config, licences, advisories, bans, and sources.
+The `pre-commit` hook calls `scripts/ci.sh` before each commit. The `pre-push` hook calls `scripts/ci.sh` before each push. The `commit-msg` hook checks the commit message with cocogitto.
 
-Run one job on demand:
+Use `git --no-verify` only when you must bypass a hook. GitHub Actions still runs CI on a push.
+
+Run all checks with the mode cascade:
 
 ```bash
-.githooks/ci-local.sh lint
+make ci
+# or
+scripts/ci.sh
 ```
 
-Run several jobs:
+Run one check on demand:
 
 ```bash
-.githooks/ci-local.sh lint test doc
+make check-clippy
+make check-cargo
+make check-rustfmt
 ```
 
-Run every job, including coverage:
-
-```bash
-.githooks/ci-local.sh --all
-```
-
-Run coverage only:
-
-```bash
-.githooks/ci-local.sh coverage
-```
-
-List the job names or show the help:
-
-```bash
-.githooks/ci-local.sh --list
-.githooks/ci-local.sh --help
-```
-
-The script skips a job when a required tool is missing. The warning names the tool and the install command. Run `mise install` to install the tools. The script also skips the MSRV job when the declared toolchain is not installed or is incomplete. It does not download the toolchain. Run `mise run msrv-install` to install it.
-
-Set `CI_LOCAL_STRICT=1` to turn every skip into a failure:
-
-```bash
-CI_LOCAL_STRICT=1 .githooks/ci-local.sh
-```
-
-Set `CI_LOCAL_SKIP=1` to skip the `pre-push` hook for one push. Use `git push --no-verify` to bypass the hook.
-
-The hooks are local. A push with `--no-verify` still runs CI on GitHub.
+Some Rust checks skip when `cargo` is absent. For a remote run, the server image must provide Rust, cargo, and `cargo-deny`. For a local microVM, `smol/pack-build.sh` installs the tools in the pack.
 
 ## Documentation
 
@@ -156,7 +133,7 @@ One logical change per commit. Keep the subject under 72 characters. Use the bod
 ## Pull requests
 
 1. Fork the repository and create a branch from `main`.
-2. Run `mise run check` before you push. It runs lint, tests, deps, MSRV, docs, and the dist check.
+2. Run `make ci` with your smolvm mode set. The `pre-push` hook runs the checks before the push.
 3. Open the pull request against `main`.
 4. Describe the change, the motivation, and the testing done.
 5. Update documentation when behavior changes.
