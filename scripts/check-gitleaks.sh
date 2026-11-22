@@ -40,6 +40,7 @@ cp --parents -t "$scan" -- "${files[@]}"
 
 if (
   cd "$scan"
+  export MISE_TRUSTED_CONFIG_PATHS="$scan"
   gitleaks detect --no-git --source . --no-banner --no-color \
     --log-level error --redact --report-format json --report-path "$report"
 ); then
