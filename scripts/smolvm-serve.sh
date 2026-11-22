@@ -281,7 +281,7 @@ serve_cache_base_name() {
   local repo_root="$1"
   local owner
   local key
-  owner="$(smolvm_resources_owner_token "$repo_root")" || return 1
+  owner="$(smolvm_resources_owner_resolve "$repo_root" 1)" || return 1
   key="$(cd "$repo_root" && smolvm_resources_hash_lines | sha256sum | cut -d' ' -f1)" || return 1
   printf 'smolvm-ci-%s-%s.qcow2' "$owner" "$key"
 }
@@ -1583,7 +1583,7 @@ serve_run_remote() {
   repo_root="$(git rev-parse --show-toplevel)"
 
   local owner
-  if ! owner="$(smolvm_resources_owner_token "$repo_root")"; then
+  if ! owner="$(smolvm_resources_owner_resolve "$repo_root" 1)"; then
     return 1
   fi
   local worker="smolvm-remote-${owner}-$$-${RANDOM}"

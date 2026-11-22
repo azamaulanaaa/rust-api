@@ -74,6 +74,7 @@ else
     ln -sf "${cache_dir}/bin/mise" /usr/local/bin/mise
   fi
 fi
+
 run_step "mise tools install" 'cd /workspace && mise install'
 
 # The local pack build keeps its image small. The remote cache path

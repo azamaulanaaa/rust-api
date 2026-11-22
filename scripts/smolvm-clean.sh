@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # Remove this checkout's smolvm cache and dangling machines.
-# A resource belongs to this checkout when its name carries the owner
-# token. The token comes from the canonical repository path. Machines
-# and cache bases of another checkout stay. The cleanup is idempotent.
-# The script builds the full plan before it asks for confirmation.
+# A resource belongs to this checkout when its name carries the owner.
+# Local mode uses the path token when SMOLVM_OWNER is empty. Remote mode
+# requires SMOLVM_OWNER and stops before any call when it is empty.
+# Machines and cache bases of another owner stay. The cleanup is
+# idempotent. The script builds the full plan before it asks for
+# confirmation.
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -37,7 +39,15 @@ if [[ -z "$root" ]]; then
 fi
 cd "$root"
 
-owner="$(smolvm_resources_owner_token "$PWD")" || exit 1
+remote=0
+if [[ -n "${SMOLVM_ADDR:-}" ]]; then
+  remote=1
+fi
+
+# Resolve the owner before any planning. A remote command stops here
+# when SMOLVM_OWNER is empty. No local cache removal happens after a
+# failure.
+owner="$(smolvm_resources_owner_resolve "$PWD" "$remote")" || exit 1
 
 # Print the names of the remote machines made by this tool.
 # Parse the JSON list with grep and sed. No jq is needed.
@@ -92,9 +102,11 @@ for item in data:
   smolvm machine ls -q 2>/dev/null
 }
 
-# Report whether a name has no owner token.
-# A 12-hex token after the family prefix marks another owner.
-# An older name has no such token.
+# Report whether a name looks like an older name with no owner token.
+# A 12-hex token after the family prefix is one owner form. A custom
+# SMOLVM_OWNER value is another form.
+# The result only selects an informational note. It never selects a
+# deletion.
 legacy_name() {
   local name="$1"
   local family=""
@@ -128,7 +140,7 @@ else
       smolvm-build-* | smolvm-run-*)
         kept=$((kept + 1))
         if legacy_name "$name"; then
-          echo "note: machine ${name} has no owner token. It stays." >&2
+          echo "note: machine ${name} does not match owner=${owner}. It stays." >&2
         fi
         ;;
       *)
@@ -141,7 +153,7 @@ else
   fi
 fi
 
-if [[ -n "${SMOLVM_ADDR:-}" ]]; then
+if ((remote == 1)); then
   # shellcheck source=scripts/smolvm-serve.sh
   source "$script_dir/smolvm-serve.sh"
   if serve_init; then
@@ -155,7 +167,7 @@ if [[ -n "${SMOLVM_ADDR:-}" ]]; then
         *)
           kept=$((kept + 1))
           if legacy_name "$name"; then
-            echo "note: machine ${name} has no owner token. It stays." >&2
+            echo "note: machine ${name} does not match owner=${owner}. It stays." >&2
           fi
           ;;
         esac
@@ -205,6 +217,7 @@ if [[ -e "$cache" ]]; then
   plan_cache=1
 fi
 
+echo "owner=${owner}"
 echo "kept=${kept}"
 
 print_plan() {

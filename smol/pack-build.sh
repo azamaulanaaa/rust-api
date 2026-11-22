@@ -84,7 +84,7 @@ fi
 
 mkdir -p "$pack_dir"
 
-owner="$(smolvm_resources_owner_token "$PWD")" || exit 1
+owner="$(smolvm_resources_owner_resolve "$PWD" 0)" || exit 1
 build_name="smolvm-build-${owner}-${hash:0:16}"
 smolfile_dir=""
 

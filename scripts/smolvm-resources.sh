@@ -29,10 +29,11 @@ smolvm_resources_resolve() {
   SMOLVM_MEMORY_MB_VALUE="$memory_mb"
 }
 
-# Print the owner token for one repository root.
+# Print the local fallback owner token for one repository root.
 # The token is the first 12 hex characters of the SHA-256 of the
 # canonical path. Two checkouts get different tokens. The same path
-# gives the same token on every run.
+# gives the same token on every run. Use this function in local mode
+# only.
 smolvm_resources_owner_token() {
   local repo_root="$1"
   local canonical
@@ -57,6 +58,36 @@ smolvm_resources_owner_token() {
   fi
 
   printf '%s\n' "${digest:0:12}"
+}
+
+# Print the owner name for one repository root.
+# Use SMOLVM_OWNER when it has a value. Validate the value first.
+# Use the path token when SMOLVM_OWNER is empty and the required flag
+# is 0. Stop with an error when SMOLVM_OWNER is empty and the required
+# flag is 1.
+smolvm_resources_owner_resolve() {
+  local repo_root="$1"
+  local required="$2"
+  local owner="${SMOLVM_OWNER-}"
+
+  if [[ -n "$owner" ]]; then
+    if [[ ! "$owner" =~ ^[a-z0-9][a-z0-9_-]{0,15}$ ]]; then
+      echo "error: SMOLVM_OWNER is not valid: ${owner}" >&2
+      echo "error: Use lowercase letters, digits, hyphen, and underscore. Start with a letter or a digit. Use at most 16 characters." >&2
+      return 1
+    fi
+    printf '%s\n' "$owner"
+    return 0
+  fi
+
+  if [[ "$required" == "1" ]]; then
+    echo "error: SMOLVM_OWNER is empty." >&2
+    echo "error: Set SMOLVM_OWNER to a unique name for this repository before you use a shared server." >&2
+    echo "error: Example: SMOLVM_OWNER=my-repo" >&2
+    return 1
+  fi
+
+  smolvm_resources_owner_token "$repo_root"
 }
 
 # Print the sha256sum lines that form the pack cache key.
