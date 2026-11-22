@@ -1730,7 +1730,7 @@ mod tests {
     #[test]
     fn the_webhook_secret_environment_override_wins() {
         let file_secret = "file-secret-0123456789abcdef01234567";
-        let env_secret = "env-secret-0123456789abcdef012345678";
+        let env_secret = "env-secret-aaaaaaaaaaaaaaaaaaaaa";
         let toml = minimal_toml().replace(
             "region = \"us-east-1\"",
             &format!("region = \"us-east-1\"\n[eav]\nwebhook_signing_secret = {file_secret:?}"),
