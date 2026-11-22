@@ -85,7 +85,8 @@ Run `make help` to list every target. The main targets are:
 - `make format` runs every `scripts/format-*.sh` script in name order.
 - `make hooks` installs the Git hooks.
 
-The template also provides the `make smolvm-pack`, `make smolvm-preflight`, and `make smolvm-verify` targets. See [the smolvm document](smolvm.md).
+The template also provides the `make smolvm-pack`, `make smolvm-preflight`, and
+`make smolvm-verify` targets. See [the smolvm document](smolvm.md).
 
 ## GitHub Actions
 

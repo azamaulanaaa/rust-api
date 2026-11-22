@@ -1,14 +1,21 @@
 # rust-api
 
-A business-logic-free starter kit for REST APIs on [Actix Web](https://actix.rs/). It provides OIDC authentication, JWT sessions, Casbin authorization, S3-backed file uploads, and per-user sync replicas. Applications implement `ApiModule` and compose their own API surface on the shared plumbing.
+A business-logic-free starter kit for REST APIs on [Actix
+Web](https://actix.rs/). It provides OIDC authentication, JWT sessions, Casbin
+authorization, S3-backed file uploads, and per-user sync replicas. Applications
+implement `ApiModule` and compose their own API surface on the shared plumbing.
 
-For module documentation, run `cargo doc --no-deps --open`. Start with [`http`](src/http/mod.rs), [`oidc`](src/oidc/mod.rs), [`policy`](src/policy/mod.rs), [`fs`](src/fs/mod.rs), and [`sync`](src/sync/mod.rs).
+For module documentation, run `cargo doc --no-deps --open`. Start with
+[`http`](src/http/mod.rs), [`oidc`](src/oidc/mod.rs),
+[`policy`](src/policy/mod.rs), [`fs`](src/fs/mod.rs), and
+[`sync`](src/sync/mod.rs).
 
 ## At a glance
 
 - Log in with any OIDC provider. Use a session cookie or a bearer token.
 - Authorize with Casbin rules and groups. Bootstrap one superadmin.
-- Upload multipart files to S3, attach them to business rows, and let hourly GC remove orphans.
+- Upload multipart files to S3, attach them to business rows, and let hourly GC
+  remove orphans.
 - Serve each user a filtered replica and sync it with ETags.
 - Run one writer safely with a lease, fencing, and readiness probes.
 - Generate a typed client from the OpenAPI 3.1 document.
@@ -17,7 +24,7 @@ For module documentation, run `cargo doc --no-deps --open`. Start with [`http`](
 ## Contents
 
 | Section | What it covers |
-|---|---|
+| --- | --- |
 | [Quickstart](#quickstart) | Zero to a working API call |
 | [Concepts](#concepts) | Modules, auth, files, sync, EAV, rules, queues, and hooks |
 | [API reference](#api-reference) | Endpoints, errors, OpenAPI, versioning, renewal |
@@ -31,13 +38,15 @@ For module documentation, run `cargo doc --no-deps --open`. Start with [`http`](
 
 ## Quickstart
 
-This quickstart takes about five minutes. It assumes you have an S3-compatible bucket and an OIDC provider.
+This quickstart takes about five minutes. It assumes you have an S3-compatible
+bucket and an OIDC provider.
 
 ### Prerequisites
 
 - Rust 1.89 or newer. `mise install` installs the declared toolchain.
 - An S3-compatible bucket. AWS S3, MinIO, and Cloudflare R2 work.
-- An OIDC provider. Keycloak, Entra ID, and Auth0 work. Register a client and set the redirect URI to `http://localhost:8080/auth/callback`.
+- An OIDC provider. Keycloak, Entra ID, and Auth0 work. Register a client and
+  set the redirect URI to `http://localhost:8080/auth/callback`.
 
 ### Configure
 
@@ -61,11 +70,17 @@ bucket = "my-bucket"
 region = "us-east-1"
 ```
 
-Replace `client_secret`, `issuer_url`, `setup_token`, `bucket`, and `region`. For MinIO or R2, add `endpoint_url` and set `force_path_style = true` under `[s3]`.
+Replace `client_secret`, `issuer_url`, `setup_token`, `bucket`, and `region`.
+For MinIO or R2, add `endpoint_url` and set `force_path_style = true` under
+`[s3]`.
 
-You can keep secrets out of the file. Set `RUST_API_CLIENT_SECRET`, `RUST_API_SETUP_TOKEN`, `RUST_API_S3_ACCESS_KEY_ID`, `RUST_API_S3_SECRET_ACCESS_KEY`, and `RUST_API_EAV_WEBHOOK_SIGNING_SECRET` instead. A non-empty environment value wins over the file.
+You can keep secrets out of the file. Set `RUST_API_CLIENT_SECRET`,
+`RUST_API_SETUP_TOKEN`, `RUST_API_S3_ACCESS_KEY_ID`,
+`RUST_API_S3_SECRET_ACCESS_KEY`, and `RUST_API_EAV_WEBHOOK_SIGNING_SECRET`
+instead. A non-empty environment value wins over the file.
 
-The database prefix defaults to `oxkv`. See [Configuration](#configuration) and [config.example.toml](config.example.toml) for every field.
+The database prefix defaults to `oxkv`. See [Configuration](#configuration) and
+[config.example.toml](config.example.toml) for every field.
 
 ### Run
 
@@ -82,7 +97,10 @@ curl http://localhost:8080/ready
 
 ### Sign in
 
-Open `http://localhost:8080/auth/login` in a browser. Sign in at the provider. The callback returns an `AuthResponse` JSON body and sets the `auth_token` cookie. Copy the `token` value. When the login has a `return_to` parameter, the callback returns `302` to that relative path instead.
+Open `http://localhost:8080/auth/login` in a browser. Sign in at the provider.
+The callback returns an `AuthResponse` JSON body and sets the `auth_token`
+cookie. Copy the `token` value. When the login has a `return_to` parameter, the
+callback returns `302` to that relative path instead.
 
 ### Bootstrap the first admin
 
@@ -94,7 +112,10 @@ curl -X POST http://localhost:8080/setup/admin \
   -H "Authorization: Bearer <token>"
 ```
 
-The call returns `201` and grants the caller the `superadmin` role. Later calls return `409`. The route requires `[authorization].setup_token` and compares the header in constant time. When the value is unset, the route is absent and returns `404`.
+The call returns `201` and grants the caller the `superadmin` role. Later calls
+return `409`. The route requires `[authorization].setup_token` and compares the
+header in constant time. When the value is unset, the route is absent and
+returns `404`.
 
 ### Make the first call
 
@@ -113,61 +134,107 @@ curl http://localhost:8080/policy/rules \
 
 ### Modules and composition
 
-An `ApiModule` owns exactly one route prefix. `ApiService` registers modules and refuses a set that mounts one prefix twice, before it registers anything. Actix matches a scope by its whole prefix, so a second module on the same prefix would otherwise be silently unreachable.
+An `ApiModule` owns exactly one route prefix. `ApiService` registers modules and
+refuses a set that mounts one prefix twice, before it registers anything. Actix
+matches a scope by its whole prefix, so a second module on the same prefix would
+otherwise be silently unreachable.
 
-Each module brings its own middleware. Modules that need a subject require validated JWT claims. The global stack covers bearer extraction, JWT validation, request tracing, body limits, CORS, and rate limiting.
+Each module brings its own middleware. Modules that need a subject require
+validated JWT claims. The global stack covers bearer extraction, JWT validation,
+request tracing, body limits, CORS, and rate limiting.
 
-`ApiService` also owns the listener. To keep your own listener, configure an `App` yourself. See [Extending the server](#extending-the-server).
+`ApiService` also owns the listener. To keep your own listener, configure an
+`App` yourself. See [Extending the server](#extending-the-server).
 
-| Module | Role |
-|---|---|
-| `http` | `ApiService`, `ApiModule`, middleware, errors, CORS, health, body limits, validation, OpenAPI mount |
-| `oidc` | OIDC client and `/auth/*`: login, callback, refresh, logout, me |
-| `policy` | Casbin engine, S3 adapter, `/policy/*`, `/setup/admin`, row authorizer, policy export/import |
-| `fs` | Multipart uploads, temp files, relations, capability tokens, garbage collection |
-| `sync` | Replica manager, WAL, `/sync/*` |
-| `records` | Change-feed types: `FileRecord`, `WalOp`, `ChangeSink` |
-| `eav` | Versioned EAV schemas, entity store, change feed, per-user replicas, `/eav/*` |
-| `rules` | Rule store, runner, built-in actions, webhook delivery |
-| `queue` | Queue traits, memory and durable backends, worker, RabbitMQ seam |
-| `reactive` | Extension point for store hooks and background services |
-| `audit` | `AuditEvent`, `AuditSink`, and a tracing sink |
-| `retry` | Exponential-backoff helper for transient failures |
-| `db` | S3-backed `OxKvStore` factory |
-| `lease`, `fencing` | Single-writer lease and lost-epoch latch |
-| `limits`, `telemetry` | Rate and concurrency limits, and OTLP setup |
-| `docs`, `config` | OpenAPI document and binary configuration loader |
+- Module: `http`; Role: `ApiService`, `ApiModule`, middleware, errors, CORS,
+  health, body limits, validation, OpenAPI mount
+- Module: `oidc`; Role: OIDC client and `/auth/*`: login, callback, refresh,
+  logout, me
+- Module: `policy`; Role: Casbin engine, S3 adapter, `/policy/*`,
+  `/setup/admin`, row authorizer, policy export/import
+- Module: `fs`; Role: Multipart uploads, temp files, relations, capability
+  tokens, garbage collection
+- Module: `sync`; Role: Replica manager, WAL, `/sync/*`
+- Module: `records`; Role: Change-feed types: `FileRecord`, `WalOp`,
+  `ChangeSink`
+- Module: `eav`; Role: Versioned EAV schemas, entity store, change feed,
+  per-user replicas, `/eav/*`
+- Module: `rules`; Role: Rule store, runner, built-in actions, webhook delivery
+- Module: `queue`; Role: Queue traits, memory and durable backends, worker,
+  RabbitMQ seam
+- Module: `reactive`; Role: Extension point for store hooks and background
+  services
+- Module: `audit`; Role: `AuditEvent`, `AuditSink`, and a tracing sink
+- Module: `retry`; Role: Exponential-backoff helper for transient failures
+- Module: `db`; Role: S3-backed `OxKvStore` factory
+- Module: `lease`, `fencing`; Role: Single-writer lease and lost-epoch latch
+- Module: `limits`, `telemetry`; Role: Rate and concurrency limits, and OTLP
+  setup
+- Module: `docs`, `config`; Role: OpenAPI document and binary configuration
+  loader
 
 ### Authentication and sessions
 
-`GET /auth/login` starts the OIDC authorization-code flow with PKCE, CSRF state, and a nonce. It accepts an optional `return_to` query parameter. The value must be a relative path that starts with one `/`. The route rejects absolute URLs, protocol-relative values (`//`), values with a scheme or a host, and values with a backslash. An invalid value returns `400` and does not start the provider redirect. A valid value is stored in the `oidc_return_to` cookie: `HttpOnly`, `SameSite=Lax`, `Path=/`, five-minute lifetime, and `Secure` on HTTPS. The provider redirects to `/auth/callback`.
+`GET /auth/login` starts the OIDC authorization-code flow with PKCE, CSRF state,
+and a nonce. It accepts an optional `return_to` query parameter. The value must
+be a relative path that starts with one `/`. The route rejects absolute URLs,
+protocol-relative values (`//`), values with a scheme or a host, and values with
+a backslash. An invalid value returns `400` and does not start the provider
+redirect. A valid value is stored in the `oidc_return_to` cookie: `HttpOnly`,
+`SameSite=Lax`, `Path=/`, five-minute lifetime, and `Secure` on HTTPS. The
+provider redirects to `/auth/callback`.
 
-The callback validates the response, clears `oidc_csrf`, `oidc_nonce`, `oidc_pkce`, and `oidc_return_to` on every outcome, and sets the session cookies:
+The callback validates the response, clears `oidc_csrf`, `oidc_nonce`,
+`oidc_pkce`, and `oidc_return_to` on every outcome, and sets the session
+cookies:
 
-- `auth_token`: the ID token. `HttpOnly`, `SameSite=Lax`, `Secure` on HTTPS, seven-day lifetime.
-- `refresh_token`: present only when the provider issues one. `HttpOnly`, `SameSite=Lax`, 30-day lifetime.
+- `auth_token`: the ID token. `HttpOnly`, `SameSite=Lax`, `Secure` on HTTPS,
+  seven-day lifetime.
+- `refresh_token`: present only when the provider issues one. `HttpOnly`,
+  `SameSite=Lax`, 30-day lifetime.
 
-Without `oidc_return_to`, the callback returns the token in its JSON body, so a SPA can keep it in memory. With `oidc_return_to`, the callback always returns `302` to the relative path. On failure it adds an `error` query parameter without an overwrite of an existing parameter and keeps the fragment. The stable error codes are:
+Without `oidc_return_to`, the callback returns the token in its JSON body, so a
+SPA can keep it in memory. With `oidc_return_to`, the callback always returns
+`302` to the relative path. On failure it adds an `error` query parameter
+without an overwrite of an existing parameter and keeps the fragment. The stable
+error codes are:
 
-| Code | Condition | JSON status |
-|---|---|---|
-| `security_cookies_missing` | The OIDC security cookies are absent or expired. | `400` |
-| `invalid_state` | `state` does not match the CSRF cookie. | `401` |
-| `authentication_failed` | The code exchange failed, the provider sent no ID token, or the ID token is invalid. | `401` |
-| `access_denied` | The provider returned `error=access_denied`. | `403` |
-| `internal_error` | An unexpected callback failure occurred. | `500` |
+- Code: `security_cookies_missing`; Condition: The OIDC security cookies are
+  absent or expired.; JSON status: `400`
+- Code: `invalid_state`; Condition: `state` does not match the CSRF cookie.;
+  JSON status: `401`
+- Code: `authentication_failed`; Condition: The code exchange failed, the
+  provider sent no ID token, or the ID token is invalid.; JSON status: `401`
+- Code: `access_denied`; Condition: The provider returned
+  `error=access_denied`.; JSON status: `403`
+- Code: `internal_error`; Condition: An unexpected callback failure occurred.;
+  JSON status: `500`
 
-Provider detail stays in the server log. It does not go into the `Location` header. A new code is a contract change.
+Provider detail stays in the server log. It does not go into the `Location`
+header. A new code is a contract change.
 
-Protected routes accept `Authorization: Bearer <token>` or the `auth_token` cookie. The header wins when both are present. An expired or invalid cookie does not block `/auth/*`. The request continues as anonymous, the protected handler returns `401`, and the response clears the stale cookie.
+Protected routes accept `Authorization: Bearer <token>` or the `auth_token`
+cookie. The header wins when both are present. An expired or invalid cookie does
+not block `/auth/*`. The request continues as anonymous, the protected handler
+returns `401`, and the response clears the stale cookie.
 
 `GET /auth/me` returns `sub`, `iss`, `aud`, and `exp`. Use it as the session guard.
 
-`POST /auth/logout` clears `auth_token` and `refresh_token` and always returns `204`. An anonymous request and a failed revocation still return `204`. When the provider advertises a revocation endpoint, logout starts a best-effort RFC 7009 revocation of the refresh token and does not wait for the result. A revocation failure is logged. A refresh request that is already in flight can still set a new `auth_token` after logout.
+`POST /auth/logout` clears `auth_token` and `refresh_token` and always returns
+`204`. An anonymous request and a failed revocation still return `204`. When the
+provider advertises a revocation endpoint, logout starts a best-effort RFC 7009
+revocation of the refresh token and does not wait for the result. A revocation
+failure is logged. A refresh request that is already in flight can still set a
+new `auth_token` after logout.
 
 #### Same-site cookie limit
 
-`SameSite=Lax` cookies do not work for a SPA on a different registrable domain. The browser does not send the cookie on a cross-site `fetch`, and the SPA cannot read the `HttpOnly` callback cookie. The SPA and the API must be same-site. A different subdomain on the same registrable domain is same-site. A different registrable domain is not. A SPA on a different registrable domain must use the bearer token. There is no cross-site token handoff.
+`SameSite=Lax` cookies do not work for a SPA on a different registrable domain.
+The browser does not send the cookie on a cross-site `fetch`, and the SPA cannot
+read the `HttpOnly` callback cookie. The SPA and the API must be same-site. A
+different subdomain on the same registrable domain is same-site. A different
+registrable domain is not. A SPA on a different registrable domain must use the
+bearer token. There is no cross-site token handoff.
 
 See module `oidc` and module `http::middleware` in the rustdoc.
 
@@ -181,91 +248,199 @@ g = _, _                 # user belongs to group
 m = g(r.sub, p.sub) && r.obj == p.obj && r.act == p.act
 ```
 
-A request is allowed when the subject holds a matching `p` rule, directly or through a group. Grant permissions to groups, then manage membership through `/policy/groups`.
+A request is allowed when the subject holds a matching `p` rule, directly or
+through a group. Grant permissions to groups, then manage membership through
+`/policy/groups`.
 
-A fresh policy store has no roles. `POST /setup/admin` grants the first caller the `superadmin` role and the rules that role needs. The caller must send `X-Setup-Token` with the value of `[authorization].setup_token`. Later calls return `409`. The route is absent when the secret is unset.
+A fresh policy store has no roles. `POST /setup/admin` grants the first caller
+the `superadmin` role and the rules that role needs. The caller must send
+`X-Setup-Token` with the value of `[authorization].setup_token`. Later calls
+return `409`. The route is absent when the secret is unset.
 
-Business rows authorize as `{type}:{id}` objects through `RowAuthorizer`. Files do not use a coarse `fs` gate. A file delegates to the rows it is attached to. See module `policy` in the rustdoc.
+Business rows authorize as `{type}:{id}` objects through `RowAuthorizer`. Files
+do not use a coarse `fs` gate. A file delegates to the rows it is attached to.
+See module `policy` in the rustdoc.
 
 ### Files and uploads
 
-An upload starts as a temp file owned by the caller. The upload session and its parts live in the `fs` store. Multipart state survives a restart, so `upload_part`, `complete`, `cancel`, and GC keep working.
+An upload starts as a temp file owned by the caller. The upload session and its
+parts live in the `fs` store. Multipart state survives a restart, so
+`upload_part`, `complete`, `cancel`, and GC keep working.
 
-`attach(row_type, row_id, file_id, caller)` requires `write` on the row. It adds a relation and increments the file reference count. `detach` decrements the count and marks the file as an orphan when the count reaches zero. Reads and deletes allow the temp owner, or a row that grants `read` or `delete`. Editing a row detaches the old file and attaches the new one. The old S3 object then becomes an orphan, and GC removes it after 24 hours.
+`attach(row_type, row_id, file_id, caller)` requires `write` on the row. It adds
+a relation and increments the file reference count. `detach` decrements the
+count and marks the file as an orphan when the count reaches zero. Reads and
+deletes allow the temp owner, or a row that grants `read` or `delete`. Editing a
+row detaches the old file and attaches the new one. The old S3 object then
+becomes an orphan, and GC removes it after 24 hours.
 
 Upload size limits apply at `init`, before the client sends any data:
 
-| Field | Limit |
-|---|---|
-| `part_size` | Multiple of 1 KiB, at most 512 KiB |
-| `file_total_parts` | 1 for a single-part upload, otherwise at most 10,000 |
-| Single-part `file_size` | At most 10 MiB, and equal to `part_size` |
-| Multipart `file_total_parts` | `ceil(file_size / part_size)` |
-| Multipart `file_size` | `(file_total_parts - 1) × part_size < file_size ≤ file_total_parts × part_size` |
-| Multipart part lengths | Every part except the last part has `part_size` bytes. The last part has `file_size - (file_total_parts - 1) × part_size` bytes. |
-| Maximum multipart upload | About 4.9 GiB |
+- Field: `part_size`; Limit: Multiple of 1 KiB, at most 512 KiB
+- Field: `file_total_parts`; Limit: 1 for a single-part upload, otherwise at
+  most 10,000
+- Field: Single-part `file_size`; Limit: At most 10 MiB, and equal to
+  `part_size`
+- Field: Multipart `file_total_parts`; Limit: `ceil(file_size / part_size)`
+- Field: Multipart `file_size`; Limit: `(file_total_parts - 1) × part_size <
+  file_size ≤ file_total_parts × part_size`
+- Field: Multipart part lengths; Limit: Every part except the last part has
+  `part_size` bytes. The last part has `file_size - (file_total_parts - 1) ×
+  part_size` bytes.
+- Field: Maximum multipart upload; Limit: About 4.9 GiB
 
-Capability tokens are a short-lived HMAC JWT for direct file delegation. `FsEngine::mint_token` and `verify_token` are available to applications. The `/fs/*` routes authenticate with the OIDC JWT and do not consume capability tokens.
+Capability tokens are a short-lived HMAC JWT for direct file delegation.
+`FsEngine::mint_token` and `verify_token` are available to applications. The
+`/fs/*` routes authenticate with the OIDC JWT and do not consume capability
+tokens.
 
 ### Sync replicas
 
-The master store and the WAL are the only write path. Each user owns one replica prefix, `{db}/u/{sha256-hex(sub)}/`, that holds the files and relations the user can read.
+The master store and the WAL are the only write path. Each user owns one replica
+prefix, `{db}/u/{sha256-hex(sub)}/`, that holds the files and relations the user
+can read.
 
-| Route | Behavior |
-|---|---|
-| `GET /sync/status` | Returns `prefix`, `applied_seq`, and `head` with an `ETag`. Repeat polls get `304`. Never builds. |
-| `POST /sync/sync` | Advances the replica. Small deltas replay inline. A full rebuild is queued and returns `pending: true` with the old coverage. |
-| `GET /sync/db/{object}` | Streams one replica object with the backend `ETag` and `If-None-Match` support. |
+- Route: `GET /sync/status`; Behavior: Returns `prefix`, `applied_seq`, and
+  `head` with an `ETag`. Repeat polls get `304`. Never builds.
+- Route: `POST /sync/sync`; Behavior: Advances the replica. Small deltas replay
+  inline. A full rebuild is queued and returns `pending: true` with the old
+  coverage.
+- Route: `GET /sync/db/{object}`; Behavior: Streams one replica object with the
+  backend `ETag` and `If-None-Match` support.
 
-`applied_seq` is null before the first build. Clients poll `/sync/status` until `applied_seq` reaches `head`. If a `POST /sync/sync` returned `pending: true`, repeat that call until it returns `pending: false`. `pending` is on the sync response, not the status response.
+`applied_seq` is null before the first build. Clients poll `/sync/status` until
+`applied_seq` reaches `head`. If a `POST /sync/sync` returned `pending: true`,
+repeat that call until it returns `pending: false`. `pending` is on the sync
+response, not the status response.
 
-Replica builds are in-process. A host application that mounts `/sync` must spawn `sync::snapshot::BuildPool`. Without it, a queued rebuild stays pending forever.
+Replica builds are in-process. A host application that mounts `/sync` must spawn
+`sync::snapshot::BuildPool`. Without it, a queued rebuild stays pending forever.
 
 See module `sync::snapshot` in the rustdoc for build and replay internals.
 
 ### Change feed, events, jobs, audit, and reactive hooks
 
-`FsEngine` and `PolicyEngine` announce every committed mutation to the shared change feed. A logging failure fails the mutation, so the feed cannot silently miss a write. Replicas consume the feed. The vocabulary lives in `records`. The durable implementation is `sync::wal::Wal`. A WAL range read uses one range scan. It returns every entry in sequence order.
+`FsEngine` and `PolicyEngine` announce every committed mutation to the shared
+change feed. A logging failure fails the mutation, so the feed cannot silently
+miss a write. Replicas consume the feed. The vocabulary lives in `records`. The
+durable implementation is `sync::wal::Wal`. A WAL range read uses one range
+scan. It returns every entry in sequence order.
 
-The job queue lives in `src/queue.rs`. It provides `MemoryQueue` for tests, `DurableQueue` over an OxKV handle, and `QueueWorker`, which reserves jobs, dispatches by `kind`, acknowledges success, and retries or dead-letters failures. Delivery is at least once, so handlers must be idempotent.
+The job queue lives in `src/queue.rs`. It provides `MemoryQueue` for tests,
+`DurableQueue` over an OxKV handle, and `QueueWorker`, which reserves jobs,
+dispatches by `kind`, acknowledges success, and retries or dead-letters
+failures. Delivery is at least once, so handlers must be idempotent.
 
-A lease token carries a worker and a generation. Reserve increments the generation. Each lease extension increments it again. A renewal returns a new token. The worker uses the latest token for ack and nack. The worker starts one renewal task for each reserved job at reserve time. The worker records a completion only after a successful ack. A failed ack leaves the job leased, so the queue can run it again. A lease expiry is a Unix time in milliseconds. A sub-second lease keeps its full duration. A rejected ack, nack, or extension increments `queue.lease_lost`. A job failure increments `queue.failed`. The durable queue keeps a due index and sweeps at most 256 due entries. A timer can drive the full maintenance sweep with `DurableQueue::spawn_expiry_sweeper`. `RabbitMqQueue` is a feature-gated seam behind `queue-rabbitmq`. The broker wiring is not implemented, and its operations return an unsupported error. Other metrics cover depth, enqueue, reserve, completion, dead-letter, and processing time. See `examples/job_queue.rs`.
+A lease token carries a worker and a generation. Reserve increments the
+generation. Each lease extension increments it again. A renewal returns a new
+token. The worker uses the latest token for ack and nack. The worker starts one
+renewal task for each reserved job at reserve time. The worker records a
+completion only after a successful ack. A failed ack leaves the job leased, so
+the queue can run it again. A lease expiry is a Unix time in milliseconds. A
+sub-second lease keeps its full duration. A rejected ack, nack, or extension
+increments `queue.lease_lost`. A job failure increments `queue.failed`. The
+durable queue keeps a due index and sweeps at most 256 due entries. A timer can
+drive the full maintenance sweep with `DurableQueue::spawn_expiry_sweeper`.
+`RabbitMqQueue` is a feature-gated seam behind `queue-rabbitmq`. The broker
+wiring is not implemented, and its operations return an unsupported error. Other
+metrics cover depth, enqueue, reserve, completion, dead-letter, and processing
+time. See `examples/job_queue.rs`.
 
-`reactive::ReactiveService` gives an application a place to attach `oxkv` hooks and run background work. `register` runs once at startup and must stay cheap. `run` ends when the cancellation token fires. Hooks are read-only, run on the writer path, and their watch channels are bounded and lossy. See `examples/reactive_service.rs` and module `reactive`.
+`reactive::ReactiveService` gives an application a place to attach `oxkv` hooks
+and run background work. `register` runs once at startup and must stay cheap.
+`run` ends when the cancellation token fires. Hooks are read-only, run on the
+writer path, and their watch channels are bounded and lossy. See
+`examples/reactive_service.rs` and module `reactive`.
 
-`audit::AuditEvent` and `audit::AuditSink` record mutations. `TracingAuditSink` writes each event at info level. The binary does not install a sink. `retry::retry_with_backoff` retries transient failures with exponential backoff.
+`audit::AuditEvent` and `audit::AuditSink` record mutations. `TracingAuditSink`
+writes each event at info level. The binary does not install a sink.
+`retry::retry_with_backoff` retries transient failures with exponential backoff.
 
-The crate does not ship HTTP request idempotency-key storage or soft delete. If an application adds them, replay the stored response for a repeated idempotency key, and reject a different payload with the same key as a conflict. Detach files when a row is soft-deleted, and keep the tombstone TTL and the 24-hour orphan TTL ordered, so a restore does not find the bytes already collected.
+The crate does not ship HTTP request idempotency-key storage or soft delete. If
+an application adds them, replay the stored response for a repeated idempotency
+key, and reject a different payload with the same key as a conflict. Detach
+files when a row is soft-deleted, and keep the tombstone TTL and the 24-hour
+orphan TTL ordered, so a restore does not find the bytes already collected.
 
 ### Entity-attribute-value (EAV)
 
 The `eav` module supplies generic entity storage. It adds no business rules.
 
-The schema registry stores immutable schema versions. A schema can extend other schemas. The registry flattens the inheritance chain into one effective schema for each version. A child attribute can override an inherited attribute of the same type. A different type is a conflict. An inheritance path is limited to 16 schemas.
+The schema registry stores immutable schema versions. A schema can extend other
+schemas. The registry flattens the inheritance chain into one effective schema
+for each version. A child attribute can override an inherited attribute of the
+same type. A different type is a conflict. An inheritance path is limited to 16
+schemas.
 
-A publish validates every default against its declared type. A publish also rejects a non-finite float default. A wrong default returns `400` and writes no schema version.
+A publish validates every default against its declared type. A publish also
+rejects a non-finite float default. A wrong default returns `400` and writes no
+schema version.
 
-The entity store keeps validated entities with typed attributes. An entity pins one or more exact schema versions. The store checks every attribute against the merged effective schema. It keeps schema, attribute, and unique indexes. A create or an update rejects NaN and infinity. The error returns `400` and changes nothing.
+The entity store keeps validated entities with typed attributes. An entity pins
+one or more exact schema versions. The store checks every attribute against the
+merged effective schema. It keeps schema, attribute, and unique indexes. A
+create or an update rejects NaN and infinity. The error returns `400` and
+changes nothing.
 
-The attribute index and the unique constraint key on the attribute name only. They do not include a schema id. The name applies across every schema that uses it. A unique value blocks a second entity in any schema with that attribute name. A unique claim uses the exact value. The claim key holds a SHA-256 hash and a SHA-512 fingerprint of the canonical value. The fingerprint is the first 32 bytes of SHA-512 over the same bytes. A write compares the stored exact value before it reports a conflict. A deliberate SHA-256 collision therefore does not create a false duplicate. A publish writes a permanent unique name marker. The marker keeps the name unique after a newer schema removes the `unique` flag. Use a distinct name when two schemas must not share the domain.
+The attribute index and the unique constraint key on the attribute name only.
+They do not include a schema id. The name applies across every schema that uses
+it. A unique value blocks a second entity in any schema with that attribute
+name. A unique claim uses the exact value. The claim key holds a SHA-256 hash
+and a SHA-512 fingerprint of the canonical value. The fingerprint is the first
+32 bytes of SHA-512 over the same bytes. A write compares the stored exact value
+before it reports a conflict. A deliberate SHA-256 collision therefore does not
+create a false duplicate. A publish writes a permanent unique name marker. The
+marker keeps the name unique after a newer schema removes the `unique` flag. Use
+a distinct name when two schemas must not share the domain.
 
-An `EntityRef` attribute holds the id of another entity. A write validates the target id and requires that the target exists. A self-reference is valid. The check reads one row for each distinct target. Set `check_entity_refs = false` to keep the id validation and skip the existence read. The store keeps a reverse reference index. A delete counts the distinct entities that reference the target. A target with references returns `409` with code `conflict` and changes nothing. Set `force=true` to delete the target and leave the references dangling. A self-reference does not block the delete. An old store gets the reverse markers one time at the first delete. A writer can learn whether an entity id exists.
+An `EntityRef` attribute holds the id of another entity. A write validates the
+target id and requires that the target exists. A self-reference is valid. The
+check reads one row for each distinct target. Set `check_entity_refs = false` to
+keep the id validation and skip the existence read. The store keeps a reverse
+reference index. A delete counts the distinct entities that reference the
+target. A target with references returns `409` with code `conflict` and changes
+nothing. Set `force=true` to delete the target and leave the references
+dangling. A self-reference does not block the delete. An old store gets the
+reverse markers one time at the first delete. A writer can learn whether an
+entity id exists.
 
-| Status | Code | Condition |
-|---|---|---|
-| `404` | `not_found` | The entity does not exist. |
-| `409` | `conflict` | `expected_version` does not match the stored version. |
-| `409` | `conflict` | Another entity references the target and `force` is false. |
+- Status: `404`; Code: `not_found`; Condition: The entity does not exist.
+- Status: `409`; Code: `conflict`; Condition: `expected_version` does not match
+  the stored version.
+- Status: `409`; Code: `conflict`; Condition: Another entity references the
+  target and `force` is false.
 
-A patch value of `null` removes an attribute. The removal of an optional defaulted attribute stays removed. The removal of a required defaulted attribute returns `400` with the missing attribute.
+A patch value of `null` removes an attribute. The removal of an optional
+defaulted attribute stays removed. The removal of a required defaulted attribute
+returns `400` with the missing attribute.
 
-A delete checks `expected_version` again at commit. A concurrent update that commits first returns `409`. An effect plan accepts update-after-update and delete-then-create for one id. A plan rejects delete-then-update and delete-then-delete with `400`.
+A delete checks `expected_version` again at commit. A concurrent update that
+commits first returns `409`. An effect plan accepts update-after-update and
+delete-then-create for one id. A plan rejects delete-then-update and
+delete-then-delete with `400`.
 
-The `/eav` management API covers schemas, entities, and rules. List routes use paging. `limit` defaults to 50 and cannot exceed 200. `offset` defaults to 0 and cannot exceed 1000. A larger offset returns `400`. A full page omits `next_offset` when the next offset would pass the cap. Use cursor paging with `after` to page deeper. `list_by_schema_page` enforces the offset cap at the store layer. A direct call with an offset above 1000 returns an invalid-input error. `GET /eav/rules` supports offset paging only, so an `after` cursor on that route returns `400`. The OpenAPI document does not advertise `after` on that route. `GET /eav/schemas/{id}/entities` returns `404` for an unknown schema id. A known schema returns the normal entity page.
+The `/eav` management API covers schemas, entities, and rules. List routes use
+paging. `limit` defaults to 50 and cannot exceed 200. `offset` defaults to 0 and
+cannot exceed 1000. A larger offset returns `400`. A full page omits
+`next_offset` when the next offset would pass the cap. Use cursor paging with
+`after` to page deeper. `list_by_schema_page` enforces the offset cap at the
+store layer. A direct call with an offset above 1000 returns an invalid-input
+error. `GET /eav/rules` supports offset paging only, so an `after` cursor on
+that route returns `400`. The OpenAPI document does not advertise `after` on
+that route. `GET /eav/schemas/{id}/entities` returns `404` for an unknown schema
+id. A known schema returns the normal entity page.
 
-`GET /eav/entities` needs `read` on `eav_entities`. `POST /eav/entities/query` has no collection check. It filters each row with the row grant and returns only the entities that the caller can read. A caller with no grant gets an empty page from query, not `403`.
+`GET /eav/entities` needs `read` on `eav_entities`. `POST /eav/entities/query`
+has no collection check. It filters each row with the row grant and returns only
+the entities that the caller can read. A caller with no grant gets an empty page
+from query, not `403`.
 
-`POST /eav/entities/query` finds entities by an indexed attribute value. `limit` defaults to 50 and is in the range 1 to 200. An empty `after` starts at the first page. The response returns the next cursor in `next`. An attribute that no current schema indexes returns `400`. A query also accepts a name with a stored index row. An entity that pins an older version that indexes the name stays queryable.
+`POST /eav/entities/query` finds entities by an indexed attribute value. `limit`
+defaults to 50 and is in the range 1 to 200. An empty `after` starts at the
+first page. The response returns the next cursor in `next`. An attribute that no
+current schema indexes returns `400`. A query also accepts a name with a stored
+index row. An entity that pins an older version that indexes the name stays
+queryable.
 
 ```sh
 curl -sS -X POST http://localhost:8080/eav/entities/query \
@@ -279,17 +454,79 @@ curl -sS -X POST http://localhost:8080/eav/entities/query \
   }'
 ```
 
-Schema evolution has three steps. `GET /eav/schemas/{id}/diff` reports added, removed, and changed attributes and marks breaking changes. `POST /eav/schemas/{id}/revalidate` checks stored entities against a target version without a write. `POST /eav/schemas/{id}/migrate` repins stored entities to a target version. A migration is a dry run unless `dry_run` is false. A dry run needs `read` on `eav_schemas` and `eav_entities`. A real run needs `write` on both objects.
+Schema evolution has three steps. `GET /eav/schemas/{id}/diff` reports added,
+removed, and changed attributes and marks breaking changes. `POST
+/eav/schemas/{id}/revalidate` checks stored entities against a target version
+without a write. `POST /eav/schemas/{id}/migrate` repins stored entities to a
+target version. A migration is a dry run unless `dry_run` is false. A dry run
+needs `read` on `eav_schemas` and `eav_entities`. A real run needs `write` on
+both objects.
 
-A dry run reads the requested page. When the target version marks an attribute unique, the dry run also scans every entity that pins the target schema. That scan ignores the page limit. It costs one full scan of the schema entities. The scan detects a duplicate value across two pages.
+A dry run reads the requested page. When the target version marks an attribute
+unique, the dry run also scans every entity that pins the target schema. That
+scan ignores the page limit. It costs one full scan of the schema entities. The
+scan detects a duplicate value across two pages.
 
-Revalidate and migration apply the schema defaults before they check an entity. They check unique values and references in the same way. The diff uses the same default rules to mark a breaking change. A migration applies the defaults before it writes the entity and its index rows. A migration writes the entity and its index rows in one transaction. It writes the metadata row with a compare-and-set. A concurrent update returns `409` with code `conflict`, and the batch changes nothing. An invalid entity returns in the `invalid` list and stays unchanged.
+Revalidate and migration apply the schema defaults before they check an entity.
+They check unique values and references in the same way. The diff uses the same
+default rules to mark a breaking change. A migration applies the defaults before
+it writes the entity and its index rows. A migration writes the entity and its
+index rows in one transaction. It writes the metadata row with a
+compare-and-set. A concurrent update returns `409` with code `conflict`, and the
+batch changes nothing. An invalid entity returns in the `invalid` list and stays
+unchanged.
 
-`GET /eav/sync/snapshot` accepts an optional `head`. The first page returns the current feed head. A later page sends that head and gets the same value. A head above the feed head returns `409` with code `conflict`. The route sets no `ETag` and ignores `If-None-Match`. The response `next` cursor is the id of the last visible row. The route reads raw pages until the visible page is full or the entity list ends. A sparse grant set therefore reaches every visible row. A caller with no grant gets `next: null`. The pinned head does not pin the page data. A write after the head can appear on a later page. The client must apply the events after the pinned head idempotently. Every `/eav` response sets `Cache-Control: no-store` and `Pragma: no-cache`.
+`GET /eav/sync/snapshot` accepts an optional `head`. The first page returns the
+current feed head. A later page sends that head and gets the same value. A head
+above the feed head returns `409` with code `conflict`. The route sets no `ETag`
+and ignores `If-None-Match`. The response `next` cursor is the id of the last
+visible row. The route reads raw pages until the visible page is full or the
+entity list ends. A sparse grant set therefore reaches every visible row. A
+caller with no grant gets `next: null`. The pinned head does not pin the page
+data. A write after the head can appear on a later page. The client must apply
+the events after the pinned head idempotently. Every `/eav` response sets
+`Cache-Control: no-store` and `Pragma: no-cache`.
 
-The entity store writes one change event to an outbox row in the same transaction as the entity data. A background relay flushes the outbox to the shared change feed. Delivery is at least once, so a consumer must be idempotent. Clients read the feed through `/eav/sync/events` and load the initial state through `/eav/sync/snapshot`.
+The entity store writes one change event to an outbox row in the same
+transaction as the entity data. A background relay flushes the outbox to the
+shared change feed. Delivery is at least once, so a consumer must be idempotent.
+Clients read the feed through `/eav/sync/events` and load the initial state
+through `/eav/sync/snapshot`.
 
-The module also stores one per-user entity replica. `POST /eav/sync/replica` builds a head-anchored snapshot of the entities that the caller can read, in ordered chunks. The build reads the feed head first. It then pages the entities. The build holds at most 100,000 visible entities and 64 MiB of serialized chunk data. A build that exceeds either cap stops the entity scan, returns `400`, and writes no snapshot. The stored replica stays unchanged. A change that commits after the head can appear in the snapshot. The client applies the feed events after the returned `head`. An apply must be idempotent and version-aware. Each build increments the stored generation, including a rebuild at the same head. The build response returns the new `generation`. `GET /eav/sync/replica` returns the full snapshot as one JSON array. This full read is for compatibility. It sets `X-Replica-Head` and `X-Replica-Generation`. A full read above `[limits].max_full_replica_bytes` returns `400` with code `replica_too_large`. The client must then read chunks. A read at the limit is allowed. The default `0` disables the gate. `GET /eav/sync/replica?chunk=N` returns one stored chunk. The chunk response sets `X-Replica-Head`, `X-Replica-Generation`, `X-Replica-Chunk`, and `X-Replica-Chunks`, and its body carries `generation`. An empty replica returns chunk 0 with `chunks: 0`, empty `items`, and `next: null`. Read chunks from 0 until `next` is null. A client that pages chunks must compare the generation across the pages. The client must restart at chunk 0 when the generation changes, because the pages then come from two different builds. The build filters with the grants at build time. Each read filters again with the current grants. The snapshot gives no authorization cache, so a policy change takes effect on the next read. The read sets no `ETag` and ignores `If-None-Match`. The response depends on the current grants, so it has no stable validator. `DELETE /eav/sync/replica` removes the stored replica of the caller. The reset removes the snapshot, the chunks, the manifest, the generation, and the head in one transaction. A reset returns `204` when a replica existed. A reset returns `404` when the caller has no replica. The caller needs no management grant, because a user owns their replica. After a WAL reset, call the reset route, then build a new replica. This replica differs from the file replica under `/sync`. The `/sync` replica mirrors file records and relations as prefix-scoped store objects. The EAV replica is a chunked JSON snapshot in the EAV replica store. It is not an incremental store.
+The module also stores one per-user entity replica. `POST /eav/sync/replica`
+builds a head-anchored snapshot of the entities that the caller can read, in
+ordered chunks. The build reads the feed head first. It then pages the entities.
+The build holds at most 100,000 visible entities and 64 MiB of serialized chunk
+data. A build that exceeds either cap stops the entity scan, returns `400`, and
+writes no snapshot. The stored replica stays unchanged. A change that commits
+after the head can appear in the snapshot. The client applies the feed events
+after the returned `head`. An apply must be idempotent and version-aware. Each
+build increments the stored generation, including a rebuild at the same head.
+The build response returns the new `generation`. `GET /eav/sync/replica` returns
+the full snapshot as one JSON array. This full read is for compatibility. It
+sets `X-Replica-Head` and `X-Replica-Generation`. A full read above
+`[limits].max_full_replica_bytes` returns `400` with code `replica_too_large`.
+The client must then read chunks. A read at the limit is allowed. The default
+`0` disables the gate. `GET /eav/sync/replica?chunk=N` returns one stored chunk.
+The chunk response sets `X-Replica-Head`, `X-Replica-Generation`,
+`X-Replica-Chunk`, and `X-Replica-Chunks`, and its body carries `generation`. An
+empty replica returns chunk 0 with `chunks: 0`, empty `items`, and `next: null`.
+Read chunks from 0 until `next` is null. A client that pages chunks must compare
+the generation across the pages. The client must restart at chunk 0 when the
+generation changes, because the pages then come from two different builds. The
+build filters with the grants at build time. Each read filters again with the
+current grants. The snapshot gives no authorization cache, so a policy change
+takes effect on the next read. The read sets no `ETag` and ignores
+`If-None-Match`. The response depends on the current grants, so it has no stable
+validator. `DELETE /eav/sync/replica` removes the stored replica of the caller.
+The reset removes the snapshot, the chunks, the manifest, the generation, and
+the head in one transaction. A reset returns `204` when a replica existed. A
+reset returns `404` when the caller has no replica. The caller needs no
+management grant, because a user owns their replica. After a WAL reset, call the
+reset route, then build a new replica. This replica differs from the file
+replica under `/sync`. The `/sync` replica mirrors file records and relations as
+prefix-scoped store objects. The EAV replica is a chunked JSON snapshot in the
+EAV replica store. It is not an incremental store.
 
 ```bash
 curl -s -H "Authorization: Bearer $TOKEN" \
@@ -304,7 +541,10 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 
 The `rules` module runs actions for entity events. It adds no business rules.
 
-A rule has a trigger, a condition, and an action reference. The trigger selects event kinds and schemas. The condition tests entity state and the changed attributes. A condition tree is limited to 16 levels. The action reference names one registered action and holds its parameters.
+A rule has a trigger, a condition, and an action reference. The trigger selects
+event kinds and schemas. The condition tests entity state and the changed
+attributes. A condition tree is limited to 16 levels. The action reference names
+one registered action and holds its parameters.
 
 A rule also declares the schema ids that its script may read and write:
 
@@ -312,31 +552,60 @@ A rule also declares the schema ids that its script may read and write:
 "capabilities": { "read": ["task"], "write": ["task"] }
 ```
 
-An empty list grants no access. Each list holds at most 32 ids. A list cannot contain a duplicate. An id does not need a schema that exists, so you can create a rule before its schema.
+An empty list grants no access. Each list holds at most 32 ids. A list cannot
+contain a duplicate. An id does not need a schema that exists, so you can create
+a rule before its schema.
 
-Authorization has two levels. The author needs `read` on `eav_entities` for a non-empty `read` list. The author needs `write` on `eav_entities` for a non-empty `write` list. The rule then narrows that collection grant to the listed schemas. The create and replace route checks these grants. The enable route repeats the check on the stored rule. A caller without the entity grants therefore cannot enable a rule with a broad read or write list. There are no per-schema grants, so the collection grant is the author-level boundary.
+Authorization has two levels. The author needs `read` on `eav_entities` for a
+non-empty `read` list. The author needs `write` on `eav_entities` for a
+non-empty `write` list. The rule then narrows that collection grant to the
+listed schemas. The create and replace route checks these grants. The enable
+route repeats the check on the stored rule. A caller without the entity grants
+therefore cannot enable a rule with a broad read or write list. There are no
+per-schema grants, so the collection grant is the author-level boundary.
 
-The durable rule store lives on OxKV and keeps an index for each trigger event and schema pair. The runner tails the shared change feed and runs the matching enabled rules in priority order. The matcher keeps a bounded cache of 64 event shapes. An upsert, a delete, and an enable change invalidate that cache.
+The durable rule store lives on OxKV and keeps an index for each trigger event
+and schema pair. The runner tails the shared change feed and runs the matching
+enabled rules in priority order. The matcher keeps a bounded cache of 64 event
+shapes. An upsert, a delete, and an enable change invalidate that cache.
 
 #### Condition scripts
 
-A `Script` condition is a sandboxed Rhai expression that returns a boolean. The server enables scripts with `[eav].script_enabled`. The default is `false`. When the value is `false`, the server rejects a script at save time and a stored script fails at run time. A nested `Script` condition runs at every level of `All`, `Any`, and `Not`. The engine evaluates a condition script on a blocking thread. A script error stops that rule and returns an error.
+A `Script` condition is a sandboxed Rhai expression that returns a boolean. The
+server enables scripts with `[eav].script_enabled`. The default is `false`. When
+the value is `false`, the server rejects a script at save time and a stored
+script fails at run time. A nested `Script` condition runs at every level of
+`All`, `Any`, and `Not`. The engine evaluates a condition script on a blocking
+thread. A script error stops that rule and returns an error.
 
 A script reads three values:
 
-- `event`: a map with `event_id`, `entity_id`, `kind`, `schemas`, `changed`, `correlation_id`, and `causation_id`. `kind` is one of `created`, `updated`, `deleted`, `schema_applied`, or `timer`. The type also defines `schema_removed`, but no code path emits it today. A rule trigger cannot name `schema_removed`, and the route returns `400` for that trigger. A stored rule whose only trigger is `schema_removed` matches no event. `changed` holds `{key, before, after}` maps.
-- `entity`: `()` when the entity is absent, or a map with `id`, `version`, `schemas`, and `attributes`. The attribute values are plain JSON.
+- `event`: a map with `event_id`, `entity_id`, `kind`, `schemas`, `changed`,
+  `correlation_id`, and `causation_id`. `kind` is one of `created`, `updated`,
+  `deleted`, `schema_applied`, or `timer`. The type also defines
+  `schema_removed`, but no code path emits it today. A rule trigger cannot name
+  `schema_removed`, and the route returns `400` for that trigger. A stored rule
+  whose only trigger is `schema_removed` matches no event. `changed` holds
+  `{key, before, after}` maps.
+- `entity`: `()` when the entity is absent, or a map with `id`, `version`,
+  `schemas`, and `attributes`. The attribute values are plain JSON.
 - `now`: the current Unix time in seconds.
 
 ```rhai
 event.kind == "updated" && entity.attributes.status == "urgent"
 ```
 
-The engine limits the source to 64 KiB. One evaluation has at most 250,000 operations, 64 call levels, a 256 KiB string, a 10,000 element array, and a 10,000 entry map. A 200 ms wall-time guard is a last-resort safety net. The operation limit is the deterministic budget.
+The engine limits the source to 64 KiB. One evaluation has at most 250,000
+operations, 64 call levels, a 256 KiB string, a 10,000 element array, and a
+10,000 entry map. A 200 ms wall-time guard is a last-resort safety net. The
+operation limit is the deterministic budget.
 
-The math functions include `sin`, `cos`, `tan`, `sqrt`, `pow` via `**`, `floor`, `round`, `min`, and `max`.
+The math functions include `sin`, `cos`, `tan`, `sqrt`, `pow` via `**`, `floor`,
+`round`, `min`, and `max`.
 
-Use integer minor units for money. Rhai has `f64` and no decimal type, so a float cannot hold an exact amount. Add the rounding step to the integer calculation:
+Use integer minor units for money. Rhai has `f64` and no decimal type, so a
+float cannot hold an exact amount. Add the rounding step to the integer
+calculation:
 
 ```rhai
 fn tax_cents(income) {
@@ -349,9 +618,11 @@ fn tax_cents(income) {
 tax_cents(5_000_000) == 1_043_000
 ```
 
-A script is deterministic. It cannot read the clock or use random values. The server injects `now` in seconds.
+A script is deterministic. It cannot read the clock or use random values. The
+server injects `now` in seconds.
 
-A rule script blocks the rule runner for its duration. Keep a script short. Use a durable job for a heavy simulation.
+A rule script blocks the rule runner for its duration. Keep a script short. Use
+a durable job for a heavy simulation.
 
 ```rhai
 fn height(v0, angle, g, h0, steps) {
@@ -368,21 +639,34 @@ fn height(v0, angle, g, h0, steps) {
 abs(height(20.0, 0.7, 9.81, 1.5, 100)) < 0.000000001
 ```
 
-A condition script cannot read the store, write, call the network, read the clock, use random values, load files, or evaluate more code. The engine disables `eval` and `import`. It replaces `print` and `debug` with no-ops, so a script cannot flood stdout or the log. The compiled-script cache holds at most 256 entries. It is a speed aid only.
+A condition script cannot read the store, write, call the network, read the
+clock, use random values, load files, or evaluate more code. The engine disables
+`eval` and `import`. It replaces `print` and `debug` with no-ops, so a script
+cannot flood stdout or the log. The compiled-script cache holds at most 256
+entries. It is a speed aid only.
 
-A condition script applies the read set of its rule, as an action script does. It sees only the attributes that the allowed pinned schemas define. It sees only the `event.changed` entries for allowed attribute keys. It keeps `entity.id`, `entity.version`, `entity.schemas`, and the event metadata. An empty read set hides every attribute and every change. The rule engine always passes the allowed key set.
+A condition script applies the read set of its rule, as an action script does.
+It sees only the attributes that the allowed pinned schemas define. It sees only
+the `event.changed` entries for allowed attribute keys. It keeps `entity.id`,
+`entity.version`, `entity.schemas`, and the event metadata. An empty read set
+hides every attribute and every change. The rule engine always passes the
+allowed key set.
 
 #### Script actions
 
-An action of kind `script` runs a sandboxed Rhai script against the entity store. The action parameters hold the source:
+An action of kind `script` runs a sandboxed Rhai script against the entity
+store. The action parameters hold the source:
 
 ```json
 { "kind": "script", "params": { "source": "<rhai>" } }
 ```
 
-The source must be a non-empty string of at most 64 KiB. It must compile. An unknown parameter key is invalid. The error never repeats the source.
+The source must be a non-empty string of at most 64 KiB. It must compile. An
+unknown parameter key is invalid. The error never repeats the source.
 
-The script gets the same `event`, `entity`, and `now` values as a condition script, plus a `host` value. The host reads entities and stages create, update, and delete effects. Nothing commits during the script.
+The script gets the same `event`, `entity`, and `now` values as a condition
+script, plus a `host` value. The host reads entities and stages create, update,
+and delete effects. Nothing commits during the script.
 
 ```rhai
 let t = host.get_entity("task-1");
@@ -394,124 +678,288 @@ if t != () {
 The host methods are:
 
 - `host.get_entity(id)` returns a map or `()`.
-- `host.find(schema, key, value, limit)` returns an array of ids. The schema must define and index `key`. A key without an index returns the stable error `attribute is not indexed`.
+- `host.find(schema, key, value, limit)` returns an array of ids. The schema
+  must define and index `key`. A key without an index returns the stable error
+  `attribute is not indexed`.
 - `host.find_by_schema(schema, limit)` returns an array of ids.
 - `host.create_entity(id, schemas, attributes)` stages a create.
 - `host.update_entity(id, expected_version, patch)` stages an update.
 - `host.delete_entity(id, expected_version)` stages a delete.
 
-A `()` value in an update patch removes the attribute. Any other patch value sets the attribute.
+A `()` value in an update patch removes the attribute. Any other patch value
+sets the attribute.
 
-One evaluation makes at most 200 host read calls and stages at most 100 effects. The operation, call-depth, string, array, map, and source limits still apply. Reads see committed state only. A write that the script stages does not appear in a later read.
+One evaluation makes at most 200 host read calls and stages at most 100 effects.
+The operation, call-depth, string, array, map, and source limits still apply.
+Reads see committed state only. A write that the script stages does not appear
+in a later read.
 
-A script action sees only the attributes and change values that its read set allows. The action `entity` value and `event.changed` list are filtered. A denied `get_entity` returns `()`.
+A script action sees only the attributes and change values that its read set
+allows. The action `entity` value and `event.changed` list are filtered. A
+denied `get_entity` returns `()`.
 
-The `read` capability list controls the read methods. A denied `get_entity` returns `()`. A denied find returns the stable error `rule script read access denied`. The `write` capability list controls every staged write. A create needs every schema in the write set. An update or a delete needs at least one pinned schema in the write set. A write outside the set returns the stable error `rule script write access denied`.
+The `read` capability list controls the read methods. A denied `get_entity`
+returns `()`. A denied find returns the stable error `rule script read access
+denied`. The `write` capability list controls every staged write. A create needs
+every schema in the write set. An update or a delete needs at least one pinned
+schema in the write set. A write outside the set returns the stable error `rule
+script write access denied`.
 
-After the script returns, the engine applies the staged effects and the execution marker in one transaction. The marker lives in the entity store. The replay check reads the same store. A script error or an effect error writes no marker and no effect. A successful script with no effects still writes the marker. The script path does not call `mark_executed` a second time.
+After the script returns, the engine applies the staged effects and the
+execution marker in one transaction. The marker lives in the entity store. The
+replay check reads the same store. A script error or an effect error writes no
+marker and no effect. A successful script with no effects still writes the
+marker. The script path does not call `mark_executed` a second time.
 
-The host has no function for HTTP, files, the clock, random values, or processes. A script that calls an unknown function fails at evaluation. A condition script has no `host` value.
+The host has no function for HTTP, files, the clock, random values, or
+processes. A script that calls an unknown function fails at evaluation. A
+condition script has no `host` value.
 
 | Action | Effect |
-|---|---|
+| --- | --- |
 | `noop` | Changes no state. Use it in tests and dry runs. |
 | `log` | Writes one log line with the rule and event identifiers. |
 | `webhook` | Posts one JSON event to an allowlisted host. |
 | `script` | Runs a sandboxed Rhai script against the entity store. |
 
-The webhook action uses a strict host allowlist. Each entry is a host or a `host:port` pair. An entry without a port matches only the default port of the URL scheme. That is port 80 for `http` and port 443 for `https`. A non-default port needs `host:port`. The client follows no redirects and disables system proxies. A proxy resolves the host itself and would bypass the pinned address. The client accepts `http` only for a loopback host.
+The webhook action uses a strict host allowlist. Each entry is a host or a
+`host:port` pair. An entry without a port matches only the default port of the
+URL scheme. That is port 80 for `http` and port 443 for `https`. A non-default
+port needs `host:port`. The client follows no redirects and disables system
+proxies. A proxy resolves the host itself and would bypass the pinned address.
+The client accepts `http` only for a loopback host.
 
-Rule validation rejects a URL that the delivery path would reject for a static reason. It rejects a non-public literal address unless `webhook_allow_private_hosts` is `true`. It rejects `http` for a non-loopback host. Validation does not do a DNS lookup. Before each request, the action resolves the host and rejects an address that is not global unless `webhook_allow_private_hosts` is `true`. The rejected IPv4 ranges are the current network, loopback, private, link-local, carrier-grade NAT, IETF assignment, 6to4 relay, benchmarking, documentation, multicast, and reserved. The rejected IPv6 ranges are loopback, unspecified, link-local, unique-local, 6to4, Teredo, NAT64, benchmarking, documentation, segment routing, discard-only, and ORCHID.
+Rule validation rejects a URL that the delivery path would reject for a static
+reason. It rejects a non-public literal address unless
+`webhook_allow_private_hosts` is `true`. It rejects `http` for a non-loopback
+host. Validation does not do a DNS lookup. Before each request, the action
+resolves the host and rejects an address that is not global unless
+`webhook_allow_private_hosts` is `true`. The rejected IPv4 ranges are the
+current network, loopback, private, link-local, carrier-grade NAT, IETF
+assignment, 6to4 relay, benchmarking, documentation, multicast, and reserved.
+The rejected IPv6 ranges are loopback, unspecified, link-local, unique-local,
+6to4, Teredo, NAT64, benchmarking, documentation, segment routing, discard-only,
+and ORCHID.
 
-The action pins the resolved address to the HTTP client, and the URL keeps the host name for TLS certificate validation. When a signing secret is set, the action sends three headers. `X-Signature` holds the legacy HMAC-SHA256 over the exact body bytes. `X-Signature-Timestamp` holds the request time in Unix seconds. `X-Signature-V2` holds the HMAC-SHA256 over `timestamp.body`. A receiver uses `WebhookSignatureVerifier` with a replay window to reject a stale or replayed request. The action can send directly or enqueue a durable `webhook.deliver` job.
+The action pins the resolved address to the HTTP client, and the URL keeps the
+host name for TLS certificate validation. When a signing secret is set, the
+action sends three headers. `X-Signature` holds the legacy HMAC-SHA256 over the
+exact body bytes. `X-Signature-Timestamp` holds the request time in Unix
+seconds. `X-Signature-V2` holds the HMAC-SHA256 over `timestamp.body`. A
+receiver uses `WebhookSignatureVerifier` with a replay window to reject a stale
+or replayed request. The action can send directly or enqueue a durable
+`webhook.deliver` job.
 
-A 2xx response succeeds. `408`, `425`, `429`, and every `5xx` response retry. A retry for `429` or `503` uses `Retry-After` when the header exists. The delay is capped at 3600 seconds. Other `4xx` and `3xx` responses do not retry. In the queue, a non-retryable response fails the job after one attempt. Only a retryable failure can exhaust `webhook_max_attempts` and become a dead letter. The job idempotency key deduplicates one rule and one event. The receiver must deduplicate on the `X-Event-Id` header.
+A 2xx response succeeds. `408`, `425`, `429`, and every `5xx` response retry. A
+retry for `429` or `503` uses `Retry-After` when the header exists. The delay is
+capped at 3600 seconds. Other `4xx` and `3xx` responses do not retry. In the
+queue, a non-retryable response fails the job after one attempt. Only a
+retryable failure can exhaust `webhook_max_attempts` and become a dead letter.
+The job idempotency key deduplicates one rule and one event. The receiver must
+deduplicate on the `X-Event-Id` header.
 
-The runtime also processes timers. A timestamp attribute with an index forms a time index. Each pass emits one timer event for each due timestamp value. A timer event goes through the outbox. The fired marker, the time-row delete, the pending counter, and the outbox row commit in one transaction. A pending entity event therefore reaches the feed before a due timer event. A fired marker stops a duplicate event for the same entity, key, and value. A new timestamp value allows a new timer event. A timer event carries the causation id and the depth of the write that set the timestamp. Its depth is one more than the stored depth. An unrelated update keeps the stored time-row cause. A timestamp change writes the new cause. A self-rescheduling timer chain stops at `max_causation_depth`.
+The runtime also processes timers. A timestamp attribute with an index forms a
+time index. Each pass emits one timer event for each due timestamp value. A
+timer event goes through the outbox. The fired marker, the time-row delete, the
+pending counter, and the outbox row commit in one transaction. A pending entity
+event therefore reaches the feed before a due timer event. A fired marker stops
+a duplicate event for the same entity, key, and value. A new timestamp value
+allows a new timer event. A timer event carries the causation id and the depth
+of the write that set the timestamp. Its depth is one more than the stored
+depth. An unrelated update keeps the stored time-row cause. A timestamp change
+writes the new cause. A self-rescheduling timer chain stops at
+`max_causation_depth`.
 
-Delivery is at least once, so every action must be idempotent. A successful action writes one execution marker for the rule and event. A later delivery skips that pair. A failed action writes no marker, so a retry can run it again. A failed rule does not suppress later rules in the same pass. After the retry budget, the engine writes one dead-letter row for each failed rule. The row carries `rule_id`. The runtime deletes markers after `execution_retention_secs`. The cleanup removes rule-store markers and entity-store script markers.
+Delivery is at least once, so every action must be idempotent. A successful
+action writes one execution marker for the rule and event. A later delivery
+skips that pair. A failed action writes no marker, so a retry can run it again.
+A failed rule does not suppress later rules in the same pass. After the retry
+budget, the engine writes one dead-letter row for each failed rule. The row
+carries `rule_id`. The runtime deletes markers after `execution_retention_secs`.
+The cleanup removes rule-store markers and entity-store script markers.
 
-An action can write an entity, and that write can start another rule. The causation depth stops such a chain. Set `[eav].max_causation_depth` to a value from 1 to 64. The default is 8. The maximum is inclusive. An event above the maximum runs no action and writes no marker.
+An action can write an entity, and that write can start another rule. The
+causation depth stops such a chain. Set `[eav].max_causation_depth` to a value
+from 1 to 64. The default is 8. The maximum is inclusive. An event above the
+maximum runs no action and writes no marker.
 
-The rule runner reports progress after a real cursor advance, a dead-letter move, or a healthy caught-up poll. The runtime clears the failure flag of the rule runner only after that signal. A runner that polls without progress stays failed.
+The rule runner reports progress after a real cursor advance, a dead-letter
+move, or a healthy caught-up poll. The runtime clears the failure flag of the
+rule runner only after that signal. A runner that polls without progress stays
+failed.
 
-Metrics cover entity writes and deletes (`eav.entity.writes`, `eav.entity.deletes`), entity conflicts (`eav.entity.version_conflicts`, `eav.entity.unique_conflicts`), the outbox (`eav.outbox.flushed`, `eav.outbox.failed`, `eav.outbox.pending`, `eav.outbox.pending_age`, `eav.outbox.flush_duration`), rules (`eav.rules.executed`, `eav.rules.failed`, `eav.rules.dead_lettered`, `eav.feed.lag`), timers (`eav.timers.fired`, `eav.timers.failed`, `eav.timers.due`, `eav.timer.pass_duration`), webhook delivery (`eav.webhook.delivered`, `eav.webhook.failed`, `eav.webhook.delivery_duration`), and replica builds (`eav.replica.builds`, `eav.replica.build_failures`, `eav.replica.build_duration`). The pending gauge also records on the outbox failure path, so a failed flush leaves a current value. The dead-letter counter is `eav.rules.dead_lettered`.
+Metrics cover entity writes and deletes (`eav.entity.writes`,
+`eav.entity.deletes`), entity conflicts (`eav.entity.version_conflicts`,
+`eav.entity.unique_conflicts`), the outbox (`eav.outbox.flushed`,
+`eav.outbox.failed`, `eav.outbox.pending`, `eav.outbox.pending_age`,
+`eav.outbox.flush_duration`), rules (`eav.rules.executed`, `eav.rules.failed`,
+`eav.rules.dead_lettered`, `eav.feed.lag`), timers (`eav.timers.fired`,
+`eav.timers.failed`, `eav.timers.due`, `eav.timer.pass_duration`), webhook
+delivery (`eav.webhook.delivered`, `eav.webhook.failed`,
+`eav.webhook.delivery_duration`), and replica builds (`eav.replica.builds`,
+`eav.replica.build_failures`, `eav.replica.build_duration`). The pending gauge
+also records on the outbox failure path, so a failed flush leaves a current
+value. The dead-letter counter is `eav.rules.dead_lettered`.
 
 ## API reference
 
 ### Endpoints
 
-`session` means a valid bearer token or the `auth_token` cookie. Every `/eav` response carries `Cache-Control: no-store` and `Pragma: no-cache`.
+`session` means a valid bearer token or the `auth_token` cookie. Every `/eav`
+response carries `Cache-Control: no-store` and `Pragma: no-cache`.
 
-| Method | Path | Description | Auth |
-|---|---|---|---|
-| GET | `/health` | Liveness probe. Always `200`. | none |
-| GET | `/ready` | Readiness probe: policy lock, writer lease, fencing, dependency probes, and EAV loop failures | none |
-| GET | `/auth/login` | Start OIDC login. Accepts an optional relative `return_to` and redirects to the provider | none |
-| GET | `/auth/callback` | OIDC callback. Returns JSON, or `302` to `return_to` | none |
-| GET | `/auth/me` | Session probe: `sub`, `iss`, `aud`, `exp` | session |
-| POST | `/auth/logout` | Clear `auth_token` and `refresh_token`; best-effort revocation. Always `204`. | none |
-| POST | `/auth/refresh` | Renew the session from the `refresh_token` cookie | refresh cookie |
-| POST | `/setup/admin` | One-time bootstrap: grant the caller `superadmin`. Requires `X-Setup-Token`. Absent when no secret is configured. | session |
-| GET | `/policy/rules` | List policy rules | session |
-| POST | `/policy/rules` | Add a policy rule | session |
-| DELETE | `/policy/rules` | Remove a policy rule | session |
-| GET | `/policy/groups` | List groups with member counts | session |
-| DELETE | `/policy/groups/{group_name}` | Delete a group and its memberships | session |
-| GET | `/policy/groups/{user_id}` | List the groups of a user | session |
-| GET | `/policy/groups/{group_name}/users` | List the users of a group | session |
-| POST | `/policy/groups` | Assign a user to a group | session |
-| DELETE | `/policy/groups/{group_name}/users/{user_id}` | Remove a user from a group | session |
-| GET | `/policy/users` | List subjects with their groups | session |
-| POST | `/fs/uploads` | Start a multipart upload, owned by the caller | session |
-| PUT | `/fs/uploads/{id}/parts/{idx}` | Upload one part as raw bytes | session |
-| POST | `/fs/uploads/{id}/complete` | Complete the upload and assemble the parts | session |
-| DELETE | `/fs/uploads/{id}` | Cancel an upload | session |
-| GET | `/fs/uploads/{id}` | Upload progress | session |
-| GET | `/fs/files/{id}/meta` | File metadata | session |
-| GET | `/fs/files/{id}` | Download content. Supports `Range`, `206`, and `416`. | session |
-| DELETE | `/fs/files/{id}` | Delete a file | session |
-| GET | `/sync/status` | Replica pointer and coverage `ETag` | session |
-| POST | `/sync/sync` | Advance the replica toward the WAL head | session |
-| GET | `/sync/db/{object}` | One replica object with `ETag` and `If-None-Match` | session |
-| POST | `/eav/schemas` | Publish a new immutable schema version | session |
-| GET | `/eav/schemas` | Paged list of the latest schema version per schema | session |
-| GET | `/eav/schemas/{id}` | Get the latest version of a schema | session |
-| GET | `/eav/schemas/{id}/versions/{version}` | Get one exact schema version | session |
-| GET | `/eav/schemas/{id}/effective/{version}` | Get one version with inherited attributes flattened | session |
-| GET | `/eav/schemas/{id}/children` | List the schemas whose latest version extends this schema. An unknown schema returns `404`. | session |
-| GET | `/eav/schemas/{id}/diff` | Compare two effective schema versions with `from` and `to` | session |
-| POST | `/eav/schemas/{id}/revalidate` | Check stored entities against a target version without a write | session |
-| POST | `/eav/schemas/{id}/migrate` | Repin stored entities to a target version. The default is a dry run. A dry run needs read on schemas and entities. A real run needs write on both. A concurrent update returns `409`. | session |
-| POST | `/eav/entities` | Create one validated entity | session |
-| GET | `/eav/entities` | Paged list of entities. Needs collection read on `eav_entities`. | session |
-| POST | `/eav/entities/query` | Paged query of entities by an indexed attribute value. Filters each row with the row grant. A caller with no grant gets an empty page, not `403`. | session |
-| GET | `/eav/entities/{id}/referrers` | Paged list of distinct entity ids that reference the target. Needs a row grant or the collection read grant on the target. Filters each source id with the row grant. A stale marker stays visible. An unknown target returns `404`. | session |
-| GET | `/eav/entities/{id}` | Get one entity | session |
-| PATCH | `/eav/entities/{id}` | Update attributes with an expected version | session |
-| DELETE | `/eav/entities/{id}` | Delete one entity with `expected_version`, or a referenced entity with `force=true` | session |
-| GET | `/eav/schemas/{id}/entities` | Paged list of the entities that pin a schema. An unknown schema returns `404`. | session |
-| POST | `/eav/rules` | Create or replace one rule. Repeats the author grants. A stale version returns `409`. | session |
-| GET | `/eav/rules` | Paged list of rules. Offset paging only. An `after` value returns `400` and is not in the OpenAPI document. | session |
-| GET | `/eav/rules/{id}` | Get one rule | session |
-| DELETE | `/eav/rules/{id}` | Delete one rule | session |
-| POST | `/eav/rules/{id}/enabled` | Enable or disable one rule. Repeats the author grants on the stored rule. A stale toggle returns `409`. | session |
-| GET | `/eav/rules/dead-letters` | Paged list of dead-letter rows, newest first. Needs read on `eav_rules`. | session |
-| POST | `/eav/rules/dead-letters/{seq}/{event_id}/{rule_id}/retry` | Re-run one rule dead-letter row and delete it on success. Needs write on `eav_rules`. | session |
-| POST | `/eav/rules/dead-letters/{seq}/{event_id}/retry` | Re-run one entry-level dead-letter row. Needs write on `eav_rules`. | session |
-| GET | `/eav/sync/status` | Entity change feed head with `ETag` | session |
-| GET | `/eav/sync/events` | Entity events after a `since` cursor | session |
-| GET | `/eav/sync/snapshot` | One page of entity state for an offline client. Accepts an optional pinned `head`. A head above the feed head returns `409`. | session |
-| POST | `/eav/sync/replica` | Build and store the caller's entity replica | session |
-| DELETE | `/eav/sync/replica` | Remove the caller's stored replica. A reset returns `204`, or `404` when no replica exists. | session |
-| GET | `/eav/sync/replica` | Read the stored replica as a JSON array with the current grants, or one chunk object with `?chunk=N`. A full read above `max_full_replica_bytes` returns `400` with code `replica_too_large`. An empty replica returns chunk 0 with `chunks: 0`. | session |
-| GET | `/eav/sync/replica/status` | Change feed head and stored replica head | session |
-| GET | `/openapi.json` | OpenAPI 3.1 document. Only with `[http].expose_docs = true`. | none |
-| GET | `/swagger-ui/` | Swagger UI for the document. Only with `[http].expose_docs = true`. | none |
+- Method: GET; Path: `/health`; Description: Liveness probe. Always `200`.;
+  Auth: none
+- Method: GET; Path: `/ready`; Description: Readiness probe: policy lock, writer
+  lease, fencing, dependency probes, and EAV loop failures; Auth: none
+- Method: GET; Path: `/auth/login`; Description: Start OIDC login. Accepts an
+  optional relative `return_to` and redirects to the provider; Auth: none
+- Method: GET; Path: `/auth/callback`; Description: OIDC callback. Returns JSON,
+  or `302` to `return_to`; Auth: none
+- Method: GET; Path: `/auth/me`; Description: Session probe: `sub`, `iss`,
+  `aud`, `exp`; Auth: session
+- Method: POST; Path: `/auth/logout`; Description: Clear `auth_token` and
+  `refresh_token`; best-effort revocation. Always `204`.; Auth: none
+- Method: POST; Path: `/auth/refresh`; Description: Renew the session from the
+  `refresh_token` cookie; Auth: refresh cookie
+- Method: POST; Path: `/setup/admin`; Description: One-time bootstrap: grant the
+  caller `superadmin`. Requires `X-Setup-Token`. Absent when no secret is
+  configured.; Auth: session
+- Method: GET; Path: `/policy/rules`; Description: List policy rules; Auth:
+  session
+- Method: POST; Path: `/policy/rules`; Description: Add a policy rule; Auth:
+  session
+- Method: DELETE; Path: `/policy/rules`; Description: Remove a policy rule;
+  Auth: session
+- Method: GET; Path: `/policy/groups`; Description: List groups with member
+  counts; Auth: session
+- Method: DELETE; Path: `/policy/groups/{group_name}`; Description: Delete a
+  group and its memberships; Auth: session
+- Method: GET; Path: `/policy/groups/{user_id}`; Description: List the groups of
+  a user; Auth: session
+- Method: GET; Path: `/policy/groups/{group_name}/users`; Description: List the
+  users of a group; Auth: session
+- Method: POST; Path: `/policy/groups`; Description: Assign a user to a group;
+  Auth: session
+- Method: DELETE; Path: `/policy/groups/{group_name}/users/{user_id}`;
+  Description: Remove a user from a group; Auth: session
+- Method: GET; Path: `/policy/users`; Description: List subjects with their
+  groups; Auth: session
+- Method: POST; Path: `/fs/uploads`; Description: Start a multipart upload,
+  owned by the caller; Auth: session
+- Method: PUT; Path: `/fs/uploads/{id}/parts/{idx}`; Description: Upload one
+  part as raw bytes; Auth: session
+- Method: POST; Path: `/fs/uploads/{id}/complete`; Description: Complete the
+  upload and assemble the parts; Auth: session
+- Method: DELETE; Path: `/fs/uploads/{id}`; Description: Cancel an upload; Auth:
+  session
+- Method: GET; Path: `/fs/uploads/{id}`; Description: Upload progress; Auth:
+  session
+- Method: GET; Path: `/fs/files/{id}/meta`; Description: File metadata; Auth:
+  session
+- Method: GET; Path: `/fs/files/{id}`; Description: Download content. Supports
+  `Range`, `206`, and `416`.; Auth: session
+- Method: DELETE; Path: `/fs/files/{id}`; Description: Delete a file; Auth:
+  session
+- Method: GET; Path: `/sync/status`; Description: Replica pointer and coverage
+  `ETag`; Auth: session
+- Method: POST; Path: `/sync/sync`; Description: Advance the replica toward the
+  WAL head; Auth: session
+- Method: GET; Path: `/sync/db/{object}`; Description: One replica object with
+  `ETag` and `If-None-Match`; Auth: session
+- Method: POST; Path: `/eav/schemas`; Description: Publish a new immutable
+  schema version; Auth: session
+- Method: GET; Path: `/eav/schemas`; Description: Paged list of the latest
+  schema version per schema; Auth: session
+- Method: GET; Path: `/eav/schemas/{id}`; Description: Get the latest version of
+  a schema; Auth: session
+- Method: GET; Path: `/eav/schemas/{id}/versions/{version}`; Description: Get
+  one exact schema version; Auth: session
+- Method: GET; Path: `/eav/schemas/{id}/effective/{version}`; Description: Get
+  one version with inherited attributes flattened; Auth: session
+- Method: GET; Path: `/eav/schemas/{id}/children`; Description: List the schemas
+  whose latest version extends this schema. An unknown schema returns `404`.;
+  Auth: session
+- Method: GET; Path: `/eav/schemas/{id}/diff`; Description: Compare two
+  effective schema versions with `from` and `to`; Auth: session
+- Method: POST; Path: `/eav/schemas/{id}/revalidate`; Description: Check stored
+  entities against a target version without a write; Auth: session
+- Method: POST; Path: `/eav/schemas/{id}/migrate`; Description: Repin stored
+  entities to a target version. The default is a dry run. A dry run needs read
+  on schemas and entities. A real run needs write on both. A concurrent update
+  returns `409`.; Auth: session
+- Method: POST; Path: `/eav/entities`; Description: Create one validated entity;
+  Auth: session
+- Method: GET; Path: `/eav/entities`; Description: Paged list of entities. Needs
+  collection read on `eav_entities`.; Auth: session
+- Method: POST; Path: `/eav/entities/query`; Description: Paged query of
+  entities by an indexed attribute value. Filters each row with the row grant. A
+  caller with no grant gets an empty page, not `403`.; Auth: session
+- Method: GET; Path: `/eav/entities/{id}/referrers`; Description: Paged list of
+  distinct entity ids that reference the target. Needs a row grant or the
+  collection read grant on the target. Filters each source id with the row
+  grant. A stale marker stays visible. An unknown target returns `404`.; Auth:
+  session
+- Method: GET; Path: `/eav/entities/{id}`; Description: Get one entity; Auth:
+  session
+- Method: PATCH; Path: `/eav/entities/{id}`; Description: Update attributes with
+  an expected version; Auth: session
+- Method: DELETE; Path: `/eav/entities/{id}`; Description: Delete one entity
+  with `expected_version`, or a referenced entity with `force=true`; Auth:
+  session
+- Method: GET; Path: `/eav/schemas/{id}/entities`; Description: Paged list of
+  the entities that pin a schema. An unknown schema returns `404`.; Auth:
+  session
+- Method: POST; Path: `/eav/rules`; Description: Create or replace one rule.
+  Repeats the author grants. A stale version returns `409`.; Auth: session
+- Method: GET; Path: `/eav/rules`; Description: Paged list of rules. Offset
+  paging only. An `after` value returns `400` and is not in the OpenAPI
+  document.; Auth: session
+- Method: GET; Path: `/eav/rules/{id}`; Description: Get one rule; Auth: session
+- Method: DELETE; Path: `/eav/rules/{id}`; Description: Delete one rule; Auth:
+  session
+- Method: POST; Path: `/eav/rules/{id}/enabled`; Description: Enable or disable
+  one rule. Repeats the author grants on the stored rule. A stale toggle returns
+  `409`.; Auth: session
+- Method: GET; Path: `/eav/rules/dead-letters`; Description: Paged list of
+  dead-letter rows, newest first. Needs read on `eav_rules`.; Auth: session
+- Method: POST; Path:
+  `/eav/rules/dead-letters/{seq}/{event_id}/{rule_id}/retry`; Description:
+  Re-run one rule dead-letter row and delete it on success. Needs write on
+  `eav_rules`.; Auth: session
+- Method: POST; Path: `/eav/rules/dead-letters/{seq}/{event_id}/retry`;
+  Description: Re-run one entry-level dead-letter row. Needs write on
+  `eav_rules`.; Auth: session
+- Method: GET; Path: `/eav/sync/status`; Description: Entity change feed head
+  with `ETag`; Auth: session
+- Method: GET; Path: `/eav/sync/events`; Description: Entity events after a
+  `since` cursor; Auth: session
+- Method: GET; Path: `/eav/sync/snapshot`; Description: One page of entity state
+  for an offline client. Accepts an optional pinned `head`. A head above the
+  feed head returns `409`.; Auth: session
+- Method: POST; Path: `/eav/sync/replica`; Description: Build and store the
+  caller's entity replica; Auth: session
+- Method: DELETE; Path: `/eav/sync/replica`; Description: Remove the caller's
+  stored replica. A reset returns `204`, or `404` when no replica exists.; Auth:
+  session
+- Method: GET; Path: `/eav/sync/replica`; Description: Read the stored replica
+  as a JSON array with the current grants, or one chunk object with `?chunk=N`.
+  A full read above `max_full_replica_bytes` returns `400` with code
+  `replica_too_large`. An empty replica returns chunk 0 with `chunks: 0`.; Auth:
+  session
+- Method: GET; Path: `/eav/sync/replica/status`; Description: Change feed head
+  and stored replica head; Auth: session
+- Method: GET; Path: `/openapi.json`; Description: OpenAPI 3.1 document. Only
+  with `[http].expose_docs = true`.; Auth: none
+- Method: GET; Path: `/swagger-ui/`; Description: Swagger UI for the document.
+  Only with `[http].expose_docs = true`.; Auth: none
 
 ### Auth and errors
 
-Missing or invalid credentials return `401`. A valid subject without permission returns `403`. `/policy/*` requires Casbin permissions in addition to a valid token: `rules` with `read` or `write` for rule endpoints, and `user_groups` with `read` or `write` for group and user endpoints.
+Missing or invalid credentials return `401`. A valid subject without permission
+returns `403`. `/policy/*` requires Casbin permissions in addition to a valid
+token: `rules` with `read` or `write` for rule endpoints, and `user_groups` with
+`read` or `write` for group and user endpoints.
 
 Errors use one body shape:
 
@@ -525,13 +973,25 @@ The optional `code` and `details` fields extend the body:
 {"error": "bad request", "code": "invalid_request", "details": {"field": "name"}}
 ```
 
-A client can ignore both optional fields. The `error` field is always present. The server logs the cause and never serializes it. A malformed JSON body also uses this envelope. A malformed query value or path segment uses the same envelope. The server returns `400` with code `invalid_request`, logs the extractor message, and does not send that message to the client.
+A client can ignore both optional fields. The `error` field is always present.
+The server logs the cause and never serializes it. A malformed JSON body also
+uses this envelope. A malformed query value or path segment uses the same
+envelope. The server returns `400` with code `invalid_request`, logs the
+extractor message, and does not send that message to the client.
 
-Some routes answer outside the envelope. `/auth/login` redirects to the provider. `/auth/callback` returns an `AuthResponse`, or a `302` when the request has `oidc_return_to`. `/auth/refresh` returns an `AuthResponse`, because the SPA reads the token from it. `/openapi.json` and `/swagger-ui/*` return documents when `[http].expose_docs = true`.
+Some routes answer outside the envelope. `/auth/login` redirects to the
+provider. `/auth/callback` returns an `AuthResponse`, or a `302` when the
+request has `oidc_return_to`. `/auth/refresh` returns an `AuthResponse`, because
+the SPA reads the token from it. `/openapi.json` and `/swagger-ui/*` return
+documents when `[http].expose_docs = true`.
 
 ### OpenAPI and client generation
 
-Every API route is in the OpenAPI document at `/openapi.json`, with Swagger UI at `/swagger-ui/`. The server does not mount these routes by default. Both routes answer without authentication, so a production deployment leaves them off. Set `[http].expose_docs = true` to mount them. Generate a client from that document instead of hand-writing request shapes.
+Every API route is in the OpenAPI document at `/openapi.json`, with Swagger UI
+at `/swagger-ui/`. The server does not mount these routes by default. Both
+routes answer without authentication, so a production deployment leaves them
+off. Set `[http].expose_docs = true` to mount them. Generate a client from that
+document instead of hand-writing request shapes.
 
 ```bash
 # TypeScript
@@ -555,89 +1015,168 @@ curl -s http://localhost:8080/openapi.json -o openapi.json
 cargo progenitor -i openapi.json -o rust-api-client -n rust-api-client -v 0.1.0
 ```
 
-Set the client base URL to `public_address`. Send a bearer token or the session cookie on protected calls.
+Set the client base URL to `public_address`. Send a bearer token or the session
+cookie on protected calls.
 
-The examples above need `[http].expose_docs = true` in the config of the server that serves the document.
+The examples above need `[http].expose_docs = true` in the config of the server
+that serves the document.
 
-The test `spec_covers_all_served_routes` checks a hand-maintained route list against the document. Add each new route to that list. The `fs` route test checks the reverse for its own paths. Composition tests build the served application in-process and check that the routes answer.
+The test `spec_covers_all_served_routes` checks a hand-maintained route list
+against the document. Add each new route to that list. The `fs` route test
+checks the reverse for its own paths. Composition tests build the served
+application in-process and check that the routes answer.
 
 ### API versioning
 
-The API is unversioned. Every route uses its bare path, and the OpenAPI document describes that same surface.
+The API is unversioned. Every route uses its bare path, and the OpenAPI document
+describes that same surface.
 
-The `/v1` prefix is deferred until a breaking change exists. At that point, mount the new contract under `/v1` and keep the unversioned routes serving the previous contract for a deprecation window. Publish the window end date in the changelog and the OpenAPI document. Remove the unversioned routes after the window closes. No client migration is needed before that change.
+The `/v1` prefix is deferred until a breaking change exists. At that point,
+mount the new contract under `/v1` and keep the unversioned routes serving the
+previous contract for a deprecation window. Publish the window end date in the
+changelog and the OpenAPI document. Remove the unversioned routes after the
+window closes. No client migration is needed before that change.
 
 ### Session renewal
 
-`POST /auth/refresh` reads the `refresh_token` cookie and calls the provider refresh grant. On success it returns `200` with an `AuthResponse`, sets a new `auth_token` cookie for seven days, and sets a rotated `refresh_token` cookie when the provider sends one. A missing cookie or a rejected refresh returns `401` with an `AuthResponse`.
+`POST /auth/refresh` reads the `refresh_token` cookie and calls the provider
+refresh grant. On success it returns `200` with an `AuthResponse`, sets a new
+`auth_token` cookie for seven days, and sets a rotated `refresh_token` cookie
+when the provider sends one. A missing cookie or a rejected refresh returns
+`401` with an `AuthResponse`.
 
-The login flow requests the `offline_access` scope, so the provider can issue a refresh token. If it does not, the client must run `/auth/login` again when the ID token expires. Call `/auth/refresh` before `exp` from `/auth/me`. If the call fails, redirect to login. `POST /auth/logout` clears the `refresh_token` cookie, so a later refresh returns `401`.
+The login flow requests the `offline_access` scope, so the provider can issue a
+refresh token. If it does not, the client must run `/auth/login` again when the
+ID token expires. Call `/auth/refresh` before `exp` from `/auth/me`. If the call
+fails, redirect to login. `POST /auth/logout` clears the `refresh_token` cookie,
+so a later refresh returns `401`.
 
 ## Client integration
 
-`X-Server-Time-Ms` is on every response. The value is an integer UTC timestamp in milliseconds. Use it for server-authoritative time. Use the standard `Date` header when the new header is absent.
+`X-Server-Time-Ms` is on every response. The value is an integer UTC timestamp
+in milliseconds. Use it for server-authoritative time. Use the standard `Date`
+header when the new header is absent.
 
 ### SPA client contract
 
-The routes in this section are the contract for a generic browser client. The client does not call `/policy/*` or `/setup/*`. These routes are stable for external SPA clients.
+The routes in this section are the contract for a generic browser client. The
+client does not call `/policy/*` or `/setup/*`. These routes are stable for
+external SPA clients.
 
-All requests send `credentials: "include"`. The `auth_token` cookie is the primary credential. A client can also send `Authorization: Bearer <token>` from memory. The `SameSite=Lax` cookies require the SPA and the API to be same-site. See [Same-site cookie limit](#same-site-cookie-limit).
+All requests send `credentials: "include"`. The `auth_token` cookie is the
+primary credential. A client can also send `Authorization: Bearer <token>` from
+memory. The `SameSite=Lax` cookies require the SPA and the API to be same-site.
+See [Same-site cookie limit](#same-site-cookie-limit).
 
-| Area | Routes |
-|---|---|
-| Authentication | `GET /auth/login`, `GET /auth/callback`, `GET /auth/me`, `POST /auth/refresh`, `POST /auth/logout` |
-| Replica sync | `GET /sync/status`, `POST /sync/sync`, `GET /sync/db/manifest.json`, `GET /sync/db/{object}` |
-| File transport | `/fs/uploads*`, `/fs/files*` |
+- Area: Authentication; Routes: `GET /auth/login`, `GET /auth/callback`, `GET
+  /auth/me`, `POST /auth/refresh`, `POST /auth/logout`
+- Area: Replica sync; Routes: `GET /sync/status`, `POST /sync/sync`, `GET
+  /sync/db/manifest.json`, `GET /sync/db/{object}`
+- Area: File transport; Routes: `/fs/uploads*`, `/fs/files*`
 
 #### Authentication
 
-- `GET /auth/login` is a browser navigation. It accepts an optional relative `return_to` path. The callback sets the session cookies. With `return_to`, the callback returns `302` to that path. Without it, the callback returns an `AuthResponse` JSON body. A failed callback adds an `error` code to the redirect.
-- `GET /auth/me` returns `200` with `{ "sub", "iss", "aud", "exp" }`. A `401` means no session.
-- `POST /auth/refresh` returns `200` with a new `auth_token` cookie and an `AuthResponse` body. The client reads `success` and `token`. A rejected refresh returns `401`.
-- `POST /auth/logout` clears `auth_token` and `refresh_token` and returns `204`. The server starts a best-effort provider revocation of the refresh token.
+- `GET /auth/login` is a browser navigation. It accepts an optional relative
+  `return_to` path. The callback sets the session cookies. With `return_to`, the
+  callback returns `302` to that path. Without it, the callback returns an
+  `AuthResponse` JSON body. A failed callback adds an `error` code to the
+  redirect.
+- `GET /auth/me` returns `200` with `{ "sub", "iss", "aud", "exp" }`. A `401`
+  means no session.
+- `POST /auth/refresh` returns `200` with a new `auth_token` cookie and an
+  `AuthResponse` body. The client reads `success` and `token`. A rejected
+  refresh returns `401`.
+- `POST /auth/logout` clears `auth_token` and `refresh_token` and returns `204`.
+  The server starts a best-effort provider revocation of the refresh token.
 
 #### Replica sync
 
-- `GET /sync/status` sends `If-None-Match` when a cached `ETag` exists. A `200` returns `{ "prefix", "applied_seq", "head" }` and an `ETag`. A `304` means the cache is still valid.
-- `POST /sync/sync` returns `{ "applied_seq", "pending" }`. The client repeats the call while `pending` is `true`, then reads `/sync/status` for the current head.
-- `GET /sync/db/manifest.json` returns the oxkv manifest with `version`, `epoch`, `wal`, and `sst`. The client keeps the `sst` and `wal` order. It does not sort, filter, or deduplicate entries. It sends `If-None-Match` and accepts `304`.
-- `GET /sync/db/{object}` returns bytes with `ETag` and `Content-Length`. The client sends `If-None-Match` and accepts `304`. It URL-encodes each path segment and keeps the `/` separators.
+- `GET /sync/status` sends `If-None-Match` when a cached `ETag` exists. A `200`
+  returns `{ "prefix", "applied_seq", "head" }` and an `ETag`. A `304` means the
+  cache is still valid.
+- `POST /sync/sync` returns `{ "applied_seq", "pending" }`. The client repeats
+  the call while `pending` is `true`, then reads `/sync/status` for the current
+  head.
+- `GET /sync/db/manifest.json` returns the oxkv manifest with `version`,
+  `epoch`, `wal`, and `sst`. The client keeps the `sst` and `wal` order. It does
+  not sort, filter, or deduplicate entries. It sends `If-None-Match` and accepts
+  `304`.
+- `GET /sync/db/{object}` returns bytes with `ETag` and `Content-Length`. The
+  client sends `If-None-Match` and accepts `304`. It URL-encodes each path
+  segment and keeps the `/` separators.
 
-The client caches status and manifest `ETag` values. A `304` without a cached value is an error.
+The client caches status and manifest `ETag` values. A `304` without a cached
+value is an error.
 
 #### File transport
 
-- `POST /fs/uploads` takes `{ "file_size", "part_size", "file_total_parts" }` and returns `{ "file_id" }`.
-- `PUT /fs/uploads/{id}/parts/{index}` sends the part as raw `application/octet-stream` bytes. It does not use `multipart/form-data`.
-- `POST /fs/uploads/{id}/complete` takes `{ "name", "mimetype" }`. The client ignores the response body and then reads `GET /fs/files/{id}/meta`.
+- `POST /fs/uploads` takes `{ "file_size", "part_size", "file_total_parts" }`
+  and returns `{ "file_id" }`.
+- `PUT /fs/uploads/{id}/parts/{index}` sends the part as raw
+  `application/octet-stream` bytes. It does not use `multipart/form-data`.
+- `POST /fs/uploads/{id}/complete` takes `{ "name", "mimetype" }`. The client
+  ignores the response body and then reads `GET /fs/files/{id}/meta`.
 - `DELETE /fs/uploads/{id}` cancels the upload.
-- `GET /fs/uploads/{id}` returns `{ "file_id", "file_size", "part_size", "total_parts", "uploaded_parts", "percent" }`. `uploaded_parts` is a list of part indices.
-- `GET /fs/files/{id}/meta` returns `{ "id", "name", "mimetype", "size" }`. A `404` means the file is absent.
-- `GET /fs/files/{id}` supports `Range` and returns `416` for a range outside the file.
+- `GET /fs/uploads/{id}` returns `{ "file_id", "file_size", "part_size",
+  "total_parts", "uploaded_parts", "percent" }`. `uploaded_parts` is a list of
+  part indices.
+- `GET /fs/files/{id}/meta` returns `{ "id", "name", "mimetype", "size" }`. A
+  `404` means the file is absent.
+- `GET /fs/files/{id}` supports `Range` and returns `416` for a range outside
+  the file.
 - `DELETE /fs/files/{id}` removes the file.
 
-The client validates the part size and part count before the upload starts. It sets `file_total_parts` to `ceil(file_size / part_size)`. Every part except the last part has `part_size` bytes. The last part has `file_size - (file_total_parts - 1) × part_size` bytes. The client does not pad the last part. A padded last part returns `400`.
+The client validates the part size and part count before the upload starts. It
+sets `file_total_parts` to `ceil(file_size / part_size)`. Every part except the
+last part has `part_size` bytes. The last part has `file_size -
+(file_total_parts - 1) × part_size` bytes. The client does not pad the last
+part. A padded last part returns `400`.
 
-Example: `file_size = 2500`, `part_size = 1024`, and `file_total_parts = 3`. Part 0 and part 1 have 1024 bytes. Part 2 has 452 bytes.
+Example: `file_size = 2500`, `part_size = 1024`, and `file_total_parts = 3`.
+Part 0 and part 1 have 1024 bytes. Part 2 has 452 bytes.
 
 #### Errors and CORS
 
-Errors use the envelope in [Auth and errors](#auth-and-errors). The client reads `error`, and the optional `code` and `details` fields. A missing `code` or `details` is safe. The client treats `401` as unauthenticated, `403` as forbidden, `404` as absent, `416` as a bad range, and `5xx` or network failures as retryable. An empty or non-JSON body uses a generic message.
+Errors use the envelope in [Auth and errors](#auth-and-errors). The client reads
+`error`, and the optional `code` and `details` fields. A missing `code` or
+`details` is safe. The client treats `401` as unauthenticated, `403` as
+forbidden, `404` as absent, `416` as a bad range, and `5xx` or network failures
+as retryable. An empty or non-JSON body uses a generic message.
 
-For a cross-origin deployment, add the frontend origin to `[http].allowed_origins` or `RUST_API_ALLOWED_ORIGINS`. Credentials are allowed. CORS exposes `ETag`, `Content-Range`, `Accept-Ranges`, `Date`, `X-Server-Time-Ms`, `X-Replica-Head`, `X-Replica-Generation`, `X-Replica-Chunk`, and `X-Replica-Chunks`. The local frontend origin is `http://localhost:5173`.
+For a cross-origin deployment, add the frontend origin to
+`[http].allowed_origins` or `RUST_API_ALLOWED_ORIGINS`. Credentials are allowed.
+CORS exposes `ETag`, `Content-Range`, `Accept-Ranges`, `Date`,
+`X-Server-Time-Ms`, `X-Replica-Head`, `X-Replica-Generation`, `X-Replica-Chunk`,
+and `X-Replica-Chunks`. The local frontend origin is `http://localhost:5173`.
 
-Every response carries `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, and `Referrer-Policy: no-referrer`. An API response also carries `Content-Security-Policy: default-src 'none'; frame-ancestors 'none'`. The OpenAPI document and the Swagger UI omit the policy, because Swagger UI needs its own scripts and styles. A request that uses HTTPS also gets `Strict-Transport-Security: max-age=31536000; includeSubDomains`.
+Every response carries `X-Content-Type-Options: nosniff`, `X-Frame-Options:
+DENY`, and `Referrer-Policy: no-referrer`. An API response also carries
+`Content-Security-Policy: default-src 'none'; frame-ancestors 'none'`. The
+OpenAPI document and the Swagger UI omit the policy, because Swagger UI needs
+its own scripts and styles. A request that uses HTTPS also gets
+`Strict-Transport-Security: max-age=31536000; includeSubDomains`.
 
-Every response under `/auth/*` carries `Cache-Control: no-store` and `Pragma: no-cache`. Every `/eav` response carries the same two headers. A shared proxy must not store a login redirect, a session response, or an EAV page.
+Every response under `/auth/*` carries `Cache-Control: no-store` and `Pragma:
+no-cache`. Every `/eav` response carries the same two headers. A shared proxy
+must not store a login redirect, a session response, or an EAV page.
 
 ### SPA and PWA flow
 
-1. Send the browser to `GET /auth/login?return_to=<encoded path>`. The callback returns `302` to that path and sets the cookies. Without `return_to`, read the token from the callback JSON body.
-2. Call `GET /auth/me` on app load. `200` means the session works. `401` means the session expired. Call `POST /auth/refresh` before `exp`. If refresh fails, redirect to login.
-3. Poll `GET /sync/status` with `If-None-Match`. `304` means nothing changed. `200` returns `prefix`, `applied_seq`, `head`, and a new `ETag`.
-4. When `applied_seq < head`, call `POST /sync/sync`. If it returns `pending: true`, repeat the call until `pending` is false. Poll `/sync/status` between calls when you need the current coverage.
-5. Read `GET /sync/db/manifest.json`, then fetch the objects it lists. Revalidate mutable names.
-6. Download files with `GET /fs/files/{id}`. Use `GET /fs/files/{id}/meta` when metadata is needed.
+1. Send the browser to `GET /auth/login?return_to=<encoded path>`. The callback
+   returns `302` to that path and sets the cookies. Without `return_to`, read
+   the token from the callback JSON body.
+2. Call `GET /auth/me` on app load. `200` means the session works. `401` means
+   the session expired. Call `POST /auth/refresh` before `exp`. If refresh
+   fails, redirect to login.
+3. Poll `GET /sync/status` with `If-None-Match`. `304` means nothing changed.
+   `200` returns `prefix`, `applied_seq`, `head`, and a new `ETag`.
+4. When `applied_seq < head`, call `POST /sync/sync`. If it returns `pending:
+   true`, repeat the call until `pending` is false. Poll `/sync/status` between
+   calls when you need the current coverage.
+5. Read `GET /sync/db/manifest.json`, then fetch the objects it lists.
+   Revalidate mutable names.
+6. Download files with `GET /fs/files/{id}`. Use `GET /fs/files/{id}/meta` when
+   metadata is needed.
 
 ### TypeScript example
 
@@ -696,25 +1235,42 @@ const fileRes = await fetch(`${base}/fs/files/${fileId}`, {
 
 ### Sync client contract
 
-A client that reads a replica must follow these rules. The client owns them. The server streams the bytes unchanged and does not enforce them.
+A client that reads a replica must follow these rules. The client owns them. The
+server streams the bytes unchanged and does not enforce them.
 
 - The `sst` array in `manifest.json` is oldest first. The order is load-bearing.
-- Never sort, reorder, filter, deduplicate, or rewrite `sst` entries, by key range or by `seq`.
-- Within one key, the last entry whose range covers the key holds the newest record. A reverse walk stops at the first segment that holds the key.
-- A tombstone means the key does not exist. A record newer than every segment is not in the `sst` array.
-- Replay the `wal` list into an overlay and read the overlay first. The `sst` array alone never yields the current value.
-- `seq` is the recoverable form of the order. A manifest written before the field existed decodes with `seq = 0`.
-- Three top-level names change under one name: `manifest.json`, `ownership.json`, and `probe/canary`. Revalidate each with `If-None-Match`. Each response carries `Cache-Control: no-cache`.
-- The `e{epoch}/sst/*`, `e{epoch}/wal/*`, and `e{epoch}/blob/*` classes are immutable. Cache them with `public, max-age=31536000, immutable`.
-- Only these exact names are mutable. A key that merely ends in `manifest.json` is not.
-- `oxkv` 0.12 has no reader pin. Re-open the reader or re-read the manifest when a client needs a view that matches a moment in time. A caller that needs a fixed view can call `StoreExt::snapshot()`. The call returns a stable read-only view. It copies the whole store into memory and does not block writers.
-- `/sync/db/{object}` streams with `Content-Length`. A large SST segment does not need to fit in the server heap.
+- Never sort, reorder, filter, deduplicate, or rewrite `sst` entries, by key
+  range or by `seq`.
+- Within one key, the last entry whose range covers the key holds the newest
+  record. A reverse walk stops at the first segment that holds the key.
+- A tombstone means the key does not exist. A record newer than every segment is
+  not in the `sst` array.
+- Replay the `wal` list into an overlay and read the overlay first. The `sst`
+  array alone never yields the current value.
+- `seq` is the recoverable form of the order. A manifest written before the
+  field existed decodes with `seq = 0`.
+- Three top-level names change under one name: `manifest.json`,
+  `ownership.json`, and `probe/canary`. Revalidate each with `If-None-Match`.
+  Each response carries `Cache-Control: no-cache`.
+- The `e{epoch}/sst/*`, `e{epoch}/wal/*`, and `e{epoch}/blob/*` classes are
+  immutable. Cache them with `public, max-age=31536000, immutable`.
+- Only these exact names are mutable. A key that merely ends in `manifest.json`
+  is not.
+- `oxkv` 0.12 has no reader pin. Re-open the reader or re-read the manifest when
+  a client needs a view that matches a moment in time. A caller that needs a
+  fixed view can call `StoreExt::snapshot()`. The call returns a stable
+  read-only view. It copies the whole store into memory and does not block
+  writers.
+- `/sync/db/{object}` streams with `Content-Length`. A large SST segment does
+  not need to fit in the server heap.
 
 ## Configuration
 
 The server reads one TOML file. Pass it with `--config`.
 
-[config.example.toml](config.example.toml) is the full annotated reference. Module `config` in the rustdoc describes field semantics and validation. The minimal file is in [Configure](#configure).
+[config.example.toml](config.example.toml) is the full annotated reference.
+Module `config` in the rustdoc describes field semantics and validation. The
+minimal file is in [Configure](#configure).
 
 Optional sections:
 
@@ -738,24 +1294,36 @@ rate_burst = 120
 max_concurrent_downloads = 16
 ```
 
-The `[database]` section is required. Its fields default to `prefix = "oxkv"`, `sst_cache_mb = 128`, `writer_lease_ttl_secs = 60`, and `mirror_master = false`. `mirror_master` is a prototype for replica rebuild scans. Use it only with one writer.
+The `[database]` section is required. Its fields default to `prefix = "oxkv"`,
+`sst_cache_mb = 128`, `writer_lease_ttl_secs = 60`, and `mirror_master = false`.
+`mirror_master` is a prototype for replica rebuild scans. Use it only with one
+writer.
 
-`sst_cache_mb` sets one process-wide SST block cache. One cache serves every OxKV handle, so the handle count does not multiply the memory budget. `0` disables SST caching. The server sets the size before it builds the first handle. A later change has no effect on an open handle.
+`sst_cache_mb` sets one process-wide SST block cache. One cache serves every
+OxKV handle, so the handle count does not multiply the memory budget. `0`
+disables SST caching. The server sets the size before it builds the first
+handle. A later change has no effect on an open handle.
 
-Every store uses the one `[s3].bucket`, under `[database].prefix`: `policy`, `fs`, `wal`, and the per-user replicas. The server keeps no local database file.
+Every store uses the one `[s3].bucket`, under `[database].prefix`: `policy`,
+`fs`, `wal`, and the per-user replicas. The server keeps no local database file.
 
-For local development without S3, set `[s3].backend = "memory"`. The server disables the writer lease for that backend and logs a warning.
+For local development without S3, set `[s3].backend = "memory"`. The server
+disables the writer lease for that backend and logs a warning.
 
-The OTLP transport follows the cargo feature. The default `otlp-http` needs an HTTP endpoint such as `http://localhost:4318/v1/traces`. `otlp-grpc` needs a gRPC address such as `http://localhost:4317`.
+The OTLP transport follows the cargo feature. The default `otlp-http` needs an
+HTTP endpoint such as `http://localhost:4318/v1/traces`. `otlp-grpc` needs a
+gRPC address such as `http://localhost:4317`.
 
-To rotate a capability key, move the current `secret` to `previous_secret` and deploy a new `secret`. Tokens under either key verify until the five-minute token TTL expires.
+To rotate a capability key, move the current `secret` to `previous_secret` and
+deploy a new `secret`. Tokens under either key verify until the five-minute
+token TTL expires.
 
 ### Environment overrides
 
 A variable that is present and not empty wins over the file.
 
 | Variable | Overrides |
-|---|---|
+| --- | --- |
 | `RUST_API_CLIENT_SECRET` | `authorization.client_secret` |
 | `RUST_API_SETUP_TOKEN` | `authorization.setup_token` |
 | `RUST_API_S3_ACCESS_KEY_ID` | `s3.access_key_id` |
@@ -768,68 +1336,121 @@ A variable that is present and not empty wins over the file.
 
 ### Limits
 
-All limits default to off (`0`). Choose values for your egress budget and client poll interval. A default limit would be a default outage.
+All limits default to off (`0`). Choose values for your egress budget and client
+poll interval. A default limit would be a default outage.
 
-| Key | Default | Effect |
-|---|---|---|
-| `rate_per_minute` | `0` | Token bucket per peer address, applied to every route. Refusals are `429`. |
-| `rate_burst` | `0` | Burst capacity. `0` uses `rate_per_minute`. |
-| `max_concurrent_downloads` | `0` | Concurrent `GET /sync/db/{object}` requests. |
-| `max_full_replica_bytes` | `0` | Largest stored EAV replica that one full `GET /eav/sync/replica` read may load. A larger replica returns `400` with code `replica_too_large`. `0` disables the gate. |
+- Key: `rate_per_minute`; Default: `0`; Effect: Token bucket per peer address,
+  applied to every route. Refusals are `429`.
+- Key: `rate_burst`; Default: `0`; Effect: Burst capacity. `0` uses
+  `rate_per_minute`.
+- Key: `max_concurrent_downloads`; Default: `0`; Effect: Concurrent `GET
+  /sync/db/{object}` requests.
+- Key: `max_full_replica_bytes`; Default: `0`; Effect: Largest stored EAV
+  replica that one full `GET /eav/sync/replica` read may load. A larger replica
+  returns `400` with code `replica_too_large`. `0` disables the gate.
 
-`max_concurrent_downloads` is the control that matters. One replica object can be a multi-hundred-megabyte SST read. A rate limit does not bound concurrent reads. The response body holds the permit, so a client that stops reading keeps its slot until it disconnects.
+`max_concurrent_downloads` is the control that matters. One replica object can
+be a multi-hundred-megabyte SST read. A rate limit does not bound concurrent
+reads. The response body holds the permit, so a client that stops reading keeps
+its slot until it disconnects.
 
-The rate limiter keys on the peer address, not the subject. Clients behind one NAT share a budget. See module `limits` in the rustdoc.
+The rate limiter keys on the peer address, not the subject. Clients behind one
+NAT share a budget. See module `limits` in the rustdoc.
 
 ### EAV and rules
 
-The `[eav]` section controls the EAV runtime and the webhook action. The EAV module is always on. To omit it, remove its wiring in `src/main.rs` and rebuild.
+The `[eav]` section controls the EAV runtime and the webhook action. The EAV
+module is always on. To omit it, remove its wiring in `src/main.rs` and rebuild.
 
-| Key | Default | Effect |
-|---|---|---|
-| `outbox_interval_ms` | `1000` | Pause between entity outbox flushes. |
-| `rule_poll_interval_ms` | `200` | Pause between rule runner polls. |
-| `gc_interval_ms` | `3600000` | Pause between execution marker cleanups in the rule store and the entity store. |
-| `execution_retention_secs` | `2592000` | Retention window for execution markers. A value below `604800` (7 days) logs a warning. |
-| `timer_interval_ms` | `1000` | Pause between due timer passes. |
-| `timer_batch` | `100` | Largest number of due entities read for each time index key. |
-| `max_causation_depth` | `8` | Maximum causation depth for a rule chain, from 1 to 64. The maximum is inclusive. |
-| `script_enabled` | `false` | Enables sandboxed Rhai condition scripts. A disabled server rejects a script at save time. |
-| `check_entity_refs` | `true` | Checks that each `EntityRef` target exists on a write. With `false`, a write still validates the target form. |
-| `webhook_allowed_hosts` | empty | Hosts that a webhook rule can call. Each entry is a host or a `host:port` pair. An entry without a port matches only the default port of the URL scheme. |
-| `webhook_signing_secret` | none | Optional HMAC-SHA256 secret of at least 32 bytes. When set, adds the `X-Signature` header. |
-| `webhook_max_attempts` | `5` | Maximum delivery attempts for one webhook job, from 1 to 20. |
-| `webhook_allow_private_hosts` | `false` | Allows webhook delivery to a non-global address. The action still resolves and pins the address. |
+- Key: `outbox_interval_ms`; Default: `1000`; Effect: Pause between entity
+  outbox flushes.
+- Key: `rule_poll_interval_ms`; Default: `200`; Effect: Pause between rule
+  runner polls.
+- Key: `gc_interval_ms`; Default: `3600000`; Effect: Pause between execution
+  marker cleanups in the rule store and the entity store.
+- Key: `execution_retention_secs`; Default: `2592000`; Effect: Retention window
+  for execution markers. A value below `604800` (7 days) logs a warning.
+- Key: `timer_interval_ms`; Default: `1000`; Effect: Pause between due timer
+  passes.
+- Key: `timer_batch`; Default: `100`; Effect: Largest number of due entities
+  read for each time index key.
+- Key: `max_causation_depth`; Default: `8`; Effect: Maximum causation depth for
+  a rule chain, from 1 to 64. The maximum is inclusive.
+- Key: `script_enabled`; Default: `false`; Effect: Enables sandboxed Rhai
+  condition scripts. A disabled server rejects a script at save time.
+- Key: `check_entity_refs`; Default: `true`; Effect: Checks that each
+  `EntityRef` target exists on a write. With `false`, a write still validates
+  the target form.
+- Key: `webhook_allowed_hosts`; Default: empty; Effect: Hosts that a webhook
+  rule can call. Each entry is a host or a `host:port` pair. An entry without a
+  port matches only the default port of the URL scheme.
+- Key: `webhook_signing_secret`; Default: none; Effect: Optional HMAC-SHA256
+  secret of at least 32 bytes. When set, adds the `X-Signature` header.
+- Key: `webhook_max_attempts`; Default: `5`; Effect: Maximum delivery attempts
+  for one webhook job, from 1 to 20.
+- Key: `webhook_allow_private_hosts`; Default: `false`; Effect: Allows webhook
+  delivery to a non-global address. The action still resolves and pins the
+  address.
 
-`execution_retention_secs` must stay above zero. The server logs a warning when the value is below 604800 seconds (7 days). A shorter window can delete an execution marker before a rule replay reads it, so the action can run twice. The server does not reject the value. The default is 2592000 seconds (30 days). The cleanup removes rule-store markers and entity-store script markers.
+`execution_retention_secs` must stay above zero. The server logs a warning when
+the value is below 604800 seconds (7 days). A shorter window can delete an
+execution marker before a rule replay reads it, so the action can run twice. The
+server does not reject the value. The default is 2592000 seconds (30 days). The
+cleanup removes rule-store markers and entity-store script markers.
 
-The webhook allowlist is empty by default. Every webhook rule is rejected until an operator adds a host. An entry without a port matches only port 80 for `http` and port 443 for `https`. A non-default port needs `host:port`. A webhook job that uses all of its attempts is dead-lettered. A non-retryable response fails the job after one attempt and does not reach the dead-letter path.
+The webhook allowlist is empty by default. Every webhook rule is rejected until
+an operator adds a host. An entry without a port matches only port 80 for `http`
+and port 443 for `https`. A non-default port needs `host:port`. A webhook job
+that uses all of its attempts is dead-lettered. A non-retryable response fails
+the job after one attempt and does not reach the dead-letter path.
 
-The webhook action resolves the host before each request. It rejects the request when any resolved address is not global. The client disables system proxies, because a proxy would bypass the pinned address. The rejected IPv4 ranges include the current network, loopback, private, link-local, carrier-grade NAT, IETF assignment, 6to4 relay, benchmarking, documentation, multicast, and reserved ranges. The rejected IPv6 ranges include loopback, unspecified, link-local, unique-local, 6to4, Teredo, NAT64, benchmarking, documentation, segment routing, discard-only, and ORCHID ranges. Rule validation applies the static part of this rule without a DNS lookup. The action pins the resolved address to the HTTP client, so a second DNS answer cannot change the target. The URL keeps the host name, so TLS certificate validation stays in effect. Set `webhook_allow_private_hosts = true` only for an intentional internal webhook.
+The webhook action resolves the host before each request. It rejects the request
+when any resolved address is not global. The client disables system proxies,
+because a proxy would bypass the pinned address. The rejected IPv4 ranges
+include the current network, loopback, private, link-local, carrier-grade NAT,
+IETF assignment, 6to4 relay, benchmarking, documentation, multicast, and
+reserved ranges. The rejected IPv6 ranges include loopback, unspecified,
+link-local, unique-local, 6to4, Teredo, NAT64, benchmarking, documentation,
+segment routing, discard-only, and ORCHID ranges. Rule validation applies the
+static part of this rule without a DNS lookup. The action pins the resolved
+address to the HTTP client, so a second DNS answer cannot change the target. The
+URL keeps the host name, so TLS certificate validation stays in effect. Set
+`webhook_allow_private_hosts = true` only for an intentional internal webhook.
 
 ## Operations
 
 ### Single-writer lease and fencing
 
-The server claims a lease on `[database].prefix` before it opens any store. The lease covers the policy, file, WAL, and replica stores.
+The server claims a lease on `[database].prefix` before it opens any store. The
+lease covers the policy, file, WAL, and replica stores.
 
-| Situation | What happens |
-|---|---|
-| A second process starts while the lease is live | It refuses to start and names the holder, pid, and wait time. |
-| The predecessor crashed | The lease goes stale after `writer_lease_ttl_secs`. The next start takes over and logs the displacement. |
-| The predecessor stalls past the TTL | The successor takes over. The predecessor logs an error and `/ready` returns `503`. |
-| The server shuts down cleanly | It releases the lease, so a rolling restart hands over without a TTL wait. |
-| The lease record cannot be parsed | The server refuses to start. It never overwrites the record. |
+- Situation: A second process starts while the lease is live; What happens: It
+  refuses to start and names the holder, pid, and wait time.
+- Situation: The predecessor crashed; What happens: The lease goes stale after
+  `writer_lease_ttl_secs`. The next start takes over and logs the displacement.
+- Situation: The predecessor stalls past the TTL; What happens: The successor
+  takes over. The predecessor logs an error and `/ready` returns `503`.
+- Situation: The server shuts down cleanly; What happens: It releases the lease,
+  so a rolling restart hands over without a TTL wait.
+- Situation: The lease record cannot be parsed; What happens: The server refuses
+  to start. It never overwrites the record.
 
-The lease renews at one third of the TTL. Set the TTL above the worst pause between renewals, such as a long GC pause or a slow S3 round trip. Set `writer_lease_ttl_secs = 0` only where exactly one process can reach the bucket. The server logs a warning when enforcement is off.
+The lease renews at one third of the TTL. Set the TTL above the worst pause
+between renewals, such as a long GC pause or a slow S3 round trip. Set
+`writer_lease_ttl_secs = 0` only where exactly one process can reach the bucket.
+The server logs a warning when enforcement is off.
 
-If a primary prefix is fenced anyway, the process latches the loss and `/ready` returns `503`. The server does not exit. The first failure logs one error line that names the prefix. A fenced replica does not latch, because losing a build race is routine.
+If a primary prefix is fenced anyway, the process latches the loss and `/ready`
+returns `503`. The server does not exit. The first failure logs one error line
+that names the prefix. A fenced replica does not latch, because losing a build
+race is routine.
 
 See modules `lease` and `fencing` in the rustdoc for the protocol.
 
 ### Readiness and health
 
-`GET /health` is liveness and always returns `200`. `GET /ready` returns `503` for any of these conditions:
+`GET /health` is liveness and always returns `200`. `GET /ready` returns `503`
+for any of these conditions:
 
 - A writer holds the policy lock.
 - The server lost the writer lease.
@@ -837,27 +1458,56 @@ See modules `lease` and `fencing` in the rustdoc for the protocol.
 - The last background probe of S3 or OIDC failed.
 - An EAV background loop is failed.
 
-Each EAV background loop runs under a supervisor. The failure state is per loop. A failed pass sets the flag of that loop. A later successful pass clears it. `/ready` returns `503` while any loop flag is set. Readiness recovers when every loop has succeeded since its last failure. The runtime keeps retrying. A loop panic sets its flag, and the supervisor retries after a backoff delay from 1 second up to 60 seconds. The other loops keep running. Shutdown waits for all four loops to stop. Read the `EAV background loop failed` log entry when a loop does not recover.
+Each EAV background loop runs under a supervisor. The failure state is per loop.
+A failed pass sets the flag of that loop. A later successful pass clears it.
+`/ready` returns `503` while any loop flag is set. Readiness recovers when every
+loop has succeeded since its last failure. The runtime keeps retrying. A loop
+panic sets its flag, and the supervisor retries after a backoff delay from 1
+second up to 60 seconds. The other loops keep running. Shutdown waits for all
+four loops to stop. Read the `EAV background loop failed` log entry when a loop
+does not recover.
 
-Wire `/ready` to a Kubernetes readiness probe or a load balancer health check. A route that nothing reads does not remove the instance from rotation. This matters most for fencing, because no client sees that error.
+Wire `/ready` to a Kubernetes readiness probe or a load balancer health check. A
+route that nothing reads does not remove the instance from rotation. This
+matters most for fencing, because no client sees that error.
 
 ### Backups and restore
 
-`policy export` backs up policy rules only. It writes every `p` and `g` rule to JSON. It does not contain file metadata, the change feed, or file bytes. Restoring only policy onto a fresh bucket gives working authorization and an empty filesystem. That looks like total data loss.
+`policy export` backs up policy rules only. It writes every `p` and `g` rule to
+JSON. It does not contain file metadata, the change feed, or file bytes.
+Restoring only policy onto a fresh bucket gives working authorization and an
+empty filesystem. That looks like total data loss.
 
-Stop the writer before you copy the prefix. As an alternative, take an atomic object-store snapshot of the whole prefix. Do not copy `manifest.json` and WAL objects from a live writer. That copy can mix two points in time. A restore needs one point in time. For EAV data, `eav export` and `eav import` move schemas, entities, and rules without a raw prefix copy. Both commands claim the writer lease.
+Stop the writer before you copy the prefix. As an alternative, take an atomic
+object-store snapshot of the whole prefix. Do not copy `manifest.json` and WAL
+objects from a live writer. That copy can mix two points in time. A restore
+needs one point in time. For EAV data, `eav export` and `eav import` move
+schemas, entities, and rules without a raw prefix copy. Both commands claim the
+writer lease.
 
-| What | Where it lives | How to restore it |
-|---|---|---|
-| Policy rules | `{db}/policy` | `rust-api policy import` (see [Policy export and import](#policy-export-and-import)). The import is idempotent. |
-| File metadata and relations | `{db}/fs` | Copy the prefix objects back. Use S3 bucket versioning, or copy prefixes between buckets. |
-| EAV schemas, entities, and rules | `{db}/eav/schema`, `{db}/eav/entity`, `{db}/eav/rules` | `rust-api eav export` writes one JSON file. `rust-api eav import` reads it into an empty prefix and validates the restore. A raw prefix copy also works when the writer is stopped. |
-| EAV webhook queue | `{db}/eav-queue` | Copy the prefix objects back. The store holds the durable webhook job queue. |
-| EAV replicas | `{db}/eav/replica` | Copy the prefix objects back. The store holds the per-user chunked snapshots. |
-| Change feed | `{db}/wal` | Nothing. It is a replay log. A fresh prefix replays from zero. |
-| File bytes | User buckets | Your own S3 lifecycle rules. |
+- What: Policy rules; Where it lives: `{db}/policy`; How to restore it:
+  `rust-api policy import` (see [Policy export and
+  import](#policy-export-and-import)). The import is idempotent.
+- What: File metadata and relations; Where it lives: `{db}/fs`; How to restore
+  it: Copy the prefix objects back. Use S3 bucket versioning, or copy prefixes
+  between buckets.
+- What: EAV schemas, entities, and rules; Where it lives: `{db}/eav/schema`,
+  `{db}/eav/entity`, `{db}/eav/rules`; How to restore it: `rust-api eav export`
+  writes one JSON file. `rust-api eav import` reads it into an empty prefix and
+  validates the restore. A raw prefix copy also works when the writer is
+  stopped.
+- What: EAV webhook queue; Where it lives: `{db}/eav-queue`; How to restore it:
+  Copy the prefix objects back. The store holds the durable webhook job queue.
+- What: EAV replicas; Where it lives: `{db}/eav/replica`; How to restore it:
+  Copy the prefix objects back. The store holds the per-user chunked snapshots.
+- What: Change feed; Where it lives: `{db}/wal`; How to restore it: Nothing. It
+  is a replay log. A fresh prefix replays from zero.
+- What: File bytes; Where it lives: User buckets; How to restore it: Your own S3
+  lifecycle rules.
 
-Restore the policy, the EAV stores, and the WAL together, from one point in time. When the queue is enabled, include the durable webhook job queue. Restore them in this order:
+Restore the policy, the EAV stores, and the WAL together, from one point in
+time. When the queue is enabled, include the durable webhook job queue. Restore
+them in this order:
 
 1. Policy
 2. EAV schemas, entities, and rules (`eav import`)
@@ -865,9 +1515,15 @@ Restore the policy, the EAV stores, and the WAL together, from one point in time
 4. EAV replicas
 5. WAL
 
-The rule store holds the cursor into the WAL. `eav export` does not write the cursor, so an import starts the rule cursor at zero. A raw prefix copy keeps the cursor. Use a raw rule-store copy when you must keep the cursor, and restore the WAL with that copy. If you restore the rule store without the WAL, reset the rule cursor and the stored replica heads. A reset feed with an old replica head needs `DELETE /eav/sync/replica`, then a new build.
+The rule store holds the cursor into the WAL. `eav export` does not write the
+cursor, so an import starts the rule cursor at zero. A raw prefix copy keeps the
+cursor. Use a raw rule-store copy when you must keep the cursor, and restore the
+WAL with that copy. If you restore the rule store without the WAL, reset the
+rule cursor and the stored replica heads. A reset feed with an old replica head
+needs `DELETE /eav/sync/replica`, then a new build.
 
-There is no automated backup job and no restore drill in this repository. Rehearse both.
+There is no automated backup job and no restore drill in this repository.
+Rehearse both.
 
 ### Policy export and import
 
@@ -876,11 +1532,18 @@ rust-api policy export --config config.toml --out backup.json
 rust-api policy import --config config.toml --input backup.json
 ```
 
-Both commands take `--config`, which provides `[s3]` and `[database].prefix`. An import skips rules that already exist. Every entry passes the same validator as a live API write. An import appends its rules to the WAL, so replicas replay them.
+Both commands take `--config`, which provides `[s3]` and `[database].prefix`. An
+import skips rules that already exist. Every entry passes the same validator as
+a live API write. An import appends its rules to the WAL, so replicas replay
+them.
 
-`policy export` reads through a read-only follower. The reader takes no epoch and writes no `ownership.json`, so an export does not fence a running writer and does not claim the lease.
+`policy export` reads through a read-only follower. The reader takes no epoch
+and writes no `ownership.json`, so an export does not fence a running writer and
+does not claim the lease.
 
-`policy import` writes, so it claims the writer lease before it opens a store. If a live server holds the lease, the import fails and names the holder. Stop the server first, or wait for the lease to expire.
+`policy import` writes, so it claims the writer lease before it opens a store.
+If a live server holds the lease, the import fails and names the holder. Stop
+the server first, or wait for the lease to expire.
 
 ### EAV export, import, and recovery
 
@@ -892,56 +1555,92 @@ rust-api eav validate --config config.toml
 rust-api eav reset-cursor --config config.toml --to 42
 ```
 
-Every EAV command claims the writer lease before it opens a store. A live server fails the command and the message names the holder. Stop the server first, or wait for the lease to expire.
+Every EAV command claims the writer lease before it opens a store. A live server
+fails the command and the message names the holder. Stop the server first, or
+wait for the lease to expire.
 
-`eav export` writes one JSON line for each schema, entity, and rule. A header line carries format number 1, and an end line carries the record counts. The file keeps exact schema versions, pinned versions, entity versions, and timestamps.
+`eav export` writes one JSON line for each schema, entity, and rule. A header
+line carries format number 1, and an end line carries the record counts. The
+file keeps exact schema versions, pinned versions, entity versions, and
+timestamps.
 
-`eav import` accepts an empty EAV prefix only. It checks every record before it writes a key. It writes the schemas, then the rules, then the entities. A rule failure removes the schema keys. An entity failure removes the schema and rule keys. Entity rows that a failure leaves behind stay, because each entity commits alone. The import writes no event and no outbox row. The command then runs the restore check and exits non-zero when the check fails.
+`eav import` accepts an empty EAV prefix only. It checks every record before it
+writes a key. It writes the schemas, then the rules, then the entities. A rule
+failure removes the schema keys. An entity failure removes the schema and rule
+keys. Entity rows that a failure leaves behind stay, because each entity commits
+alone. The import writes no event and no outbox row. The command then runs the
+restore check and exits non-zero when the check fails.
 
-`eav rebuild-index` rewrites the index rows from the stored entities. It reads 200 entities in one page and keeps a cursor after each page. A stopped run resumes after the cursor. The command removes the cursor after the last page. `--schema` limits the rebuild to the entities that pin one schema.
+`eav rebuild-index` rewrites the index rows from the stored entities. It reads
+200 entities in one page and keeps a cursor after each page. A stopped run
+resumes after the cursor. The command removes the cursor after the last page.
+`--schema` limits the rebuild to the entities that pin one schema.
 
-`eav validate` checks the pinned schema versions, the unique claims, and the references. It writes no key. It exits `0` when the check finds no problem. Any problem exits non-zero.
+`eav validate` checks the pinned schema versions, the unique claims, and the
+references. It writes no key. It exits `0` when the check finds no problem. Any
+problem exits non-zero.
 
-`eav reset-cursor --to N` sets the durable rule cursor to `N`. The value must be at or below the feed head. The command prints the old and new values. A reset behind the cursor replays feed entries. Execution markers stop a duplicate action inside the retention window.
+`eav reset-cursor --to N` sets the durable rule cursor to `N`. The value must be
+at or below the feed head. The command prints the old and new values. A reset
+behind the cursor replays feed entries. Execution markers stop a duplicate
+action inside the retention window.
 
 ### Garbage collection
 
-The sweeper runs every hour and reclaims two separate scopes. The scopes hold different objects and never overlap.
+The sweeper runs every hour and reclaims two separate scopes. The scopes hold
+different objects and never overlap.
 
-| Scope | Reaps | Rule | On failure |
-|---|---|---|---|
-| Application bytes | Objects under `files/{id}` | No upload session and no file row reference the object, and it is older than 24 hours. A metadata decode failure skips the whole pass. | A failed delete keeps the item for the next sweep. |
-| Store WAL | `e{6+ digits}/wal/{8 digits}.log` objects under the store prefix | The manifest does not list the object. A failed manifest compare-and-swap can strand one. | A failed list or delete shortens the pass. A fenced store deletes nothing. |
+- Scope: Application bytes; Reaps: Objects under `files/{id}`; Rule: No upload
+  session and no file row reference the object, and it is older than 24 hours. A
+  metadata decode failure skips the whole pass.; On failure: A failed delete
+  keeps the item for the next sweep.
+- Scope: Store WAL; Reaps: `e{6+ digits}/wal/{8 digits}.log` objects under the
+  store prefix; Rule: The manifest does not list the object. A failed manifest
+  compare-and-swap can strand one.; On failure: A failed list or delete shortens
+  the pass. A fenced store deletes nothing.
 
-The sweep returns the count of application items it removed. The store pass logs its own count. A store-pass failure is a warning, because it deletes only unreachable objects and a failure costs storage, not data.
+The sweep returns the count of application items it removed. The store pass logs
+its own count. A store-pass failure is a warning, because it deletes only
+unreachable objects and a failure costs storage, not data.
 
 ### Telemetry and logging
 
-Console logging is always on. `RUST_LOG` sets the filter. Without it, `--verbose` selects debug and the default selects info.
+Console logging is always on. `RUST_LOG` sets the filter. Without it,
+`--verbose` selects debug and the default selects info.
 
 ```bash
 RUST_LOG=debug cargo run -- serve --config config.toml
 ```
 
-When `observability.otlp_endpoint` is set, the server exports one span per request and batch-exports metrics. A span carries the method, route template, status code, and latency. A `5xx` marks the span as an error. W3C Trace Context propagates inbound `traceparent` headers.
+When `observability.otlp_endpoint` is set, the server exports one span per
+request and batch-exports metrics. A span carries the method, route template,
+status code, and latency. A `5xx` marks the span as an error. W3C Trace Context
+propagates inbound `traceparent` headers.
 
-Verify the exporter once against a real collector. A misconfigured exporter fails silently. For example:
+Verify the exporter once against a real collector. A misconfigured exporter
+fails silently. For example:
 
 ```bash
 docker run -p 4317:4317 -p 4318:4318 grafana/otel-lgtm
 ```
 
-Use port 4317 with the `otlp-grpc` feature and port 4318 with the default `otlp-http` feature.
+Use port 4317 with the `otlp-grpc` feature and port 4318 with the default
+`otlp-http` feature.
 
 ### Production checklist
 
 - [ ] Set `[limits].rate_per_minute` and `rate_burst` for your client traffic.
-- [ ] Set `[limits].max_concurrent_downloads`. A rate limit does not bound large SST reads.
-- [ ] Put a reverse proxy or WAF in front of the binary. Throttle `/auth/*`, `/setup/*`, and `/policy/*` per IP. Keep `/fs` and `/sync` reads generous.
+- [ ] Set `[limits].max_concurrent_downloads`. A rate limit does not bound large
+  SST reads.
+- [ ] Put a reverse proxy or WAF in front of the binary. Throttle `/auth/*`,
+  `/setup/*`, and `/policy/*` per IP. Keep `/fs` and `/sync` reads generous.
 - [ ] Never expose the binary directly to the internet without that layer.
-- [ ] Keep `[http].expose_docs = false` unless the deployment needs the unauthenticated docs routes.
-- [ ] Set `[database].writer_lease_ttl_secs` above the worst pause between renewals. Use `0` only for a single process.
-- [ ] Configure `[capability].secret` or `RUST_API_CAPABILITY_SECRET`, so capability tokens survive a restart.
+- [ ] Keep `[http].expose_docs = false` unless the deployment needs the
+  unauthenticated docs routes.
+- [ ] Set `[database].writer_lease_ttl_secs` above the worst pause between
+  renewals. Use `0` only for a single process.
+- [ ] Configure `[capability].secret` or `RUST_API_CAPABILITY_SECRET`, so
+  capability tokens survive a restart.
 - [ ] Wire `/ready` to a probe that drains traffic.
 
 Example nginx limits:
@@ -970,7 +1669,11 @@ Tune the rates to your provider latency and admin headcount.
 
 ### Migration from Redb
 
-Versions before `988873c` kept every domain in one local Redb file named by `[database].path`. The current version removed that key. It stores policy, file metadata, the change feed, and replicas as prefix-scoped objects under `[database].prefix`. The server does not read old `*.redb` files and provides no automatic migration.
+Versions before `988873c` kept every domain in one local Redb file named by
+`[database].path`. The current version removed that key. It stores policy, file
+metadata, the change feed, and replicas as prefix-scoped objects under
+`[database].prefix`. The server does not read old `*.redb` files and provides no
+automatic migration.
 
 Old shape:
 
@@ -999,32 +1702,52 @@ Only `[database]` changes. `[s3]` was already required for file bytes.
 Manual steps:
 
 1. Export the old policy rules with the old binary:
+
     ```bash
     rust-api policy export --store /var/lib/rust-api/policy.redb --out policy-backup.json
     ```
-    The export contains every `p` and `g` rule. It does not contain file metadata, relations, or the change feed.
+
+    The export contains every `p` and `g` rule. It does not contain file
+    metadata, relations, or the change feed.
 2. Stop the old server.
 3. Update the configuration. Pick a fresh `[database].prefix`.
 4. Import the rules into the new prefix:
+
     ```bash
     rust-api policy import --config config.toml --input policy-backup.json
     ```
-    The import creates the policy store and appends the rules to the WAL, so replicas replay them. It is idempotent.
-5. Start the new server. It creates the other stores under the new prefix.
-6. If you have no export, skip step 4. After step 5, log in, call `POST /setup/admin` once, then recreate rules and group memberships.
-7. File metadata does not migrate. Old file records and relations have no import path. File bytes already in S3 stay in their buckets, but the new server has no metadata for them. Re-upload the files, or let the hourly GC remove the orphan bytes after 24 hours.
-8. The change feed starts at zero. Replicas rebuild from the current master state.
-9. Keep the old `*.redb` and `*.redb.fs` files until the new deployment works. Remove them after that.
 
-The new binary ignores a leftover `[database].path` key and uses `[database].prefix`. It never opens the old file. Treat the upgrade as a fresh data plane plus an import of policy rules.
+    The import creates the policy store and appends the rules to the WAL, so
+    replicas replay them. It is idempotent.
+5. Start the new server. It creates the other stores under the new prefix.
+6. If you have no export, skip step 4. After step 5, log in, call `POST
+   /setup/admin` once, then recreate rules and group memberships.
+7. File metadata does not migrate. Old file records and relations have no import
+   path. File bytes already in S3 stay in their buckets, but the new server has
+   no metadata for them. Re-upload the files, or let the hourly GC remove the
+   orphan bytes after 24 hours.
+8. The change feed starts at zero. Replicas rebuild from the current master state.
+9. Keep the old `*.redb` and `*.redb.fs` files until the new deployment works.
+   Remove them after that.
+
+The new binary ignores a leftover `[database].path` key and uses
+`[database].prefix`. It never opens the old file. Treat the upgrade as a fresh
+data plane plus an import of policy rules.
 
 ### Security advisories
 
-`mise run advisories` passes because `deny.toml` contains documented suppressions for six advisories. An advisory outside that list fails the check. `lib::tests::every_ignore_is_justified` fails an entry without a substantive reason. Re-examine the list when `oxkv`, `actix-web`, or `casbin` moves.
+`mise run advisories` passes because `deny.toml` contains documented
+suppressions for six advisories. An advisory outside that list fails the check.
+`lib::tests::every_ignore_is_justified` fails an entry without a substantive
+reason. Re-examine the list when `oxkv`, `actix-web`, or `casbin` moves.
 
-One suppression is reachable: `h2` 0.3 is compiled in because actix-web enables HTTP/2, and no actix-web release can take the fix yet. Terminate HTTP/2 in front of this process, or bound memory. The others are low exposure, unmaintained, or have no patched version.
+One suppression is reachable: `h2` 0.3 is compiled in because actix-web enables
+HTTP/2, and no actix-web release can take the fix yet. Terminate HTTP/2 in front
+of this process, or bound memory. The others are low exposure, unmaintained, or
+have no patched version.
 
-See [deny.toml](deny.toml) for each reason and [SECURITY.md](SECURITY.md) for the reporting policy.
+See [deny.toml](deny.toml) for each reason and [SECURITY.md](SECURITY.md) for
+the reporting policy.
 
 ## Extending the server
 
@@ -1048,18 +1771,25 @@ impl ApiModule for MyModule {
 }
 ```
 
-A module owns one prefix. `ApiService` refuses a duplicate prefix before it registers anything. Handlers extract validated claims with `Validated<C>`, which returns `401` when claims are absent.
+A module owns one prefix. `ApiService` refuses a duplicate prefix before it
+registers anything. Handlers extract validated claims with `Validated<C>`, which
+returns `401` when claims are absent.
 
 Examples:
 
-- [examples/sample_module.rs](examples/sample_module.rs): a complete module. Build with `cargo build --example sample_module`.
+- [examples/sample_module.rs](examples/sample_module.rs): a complete module.
+  Build with `cargo build --example sample_module`.
 - [examples/job_queue.rs](examples/job_queue.rs): a memory queue and worker.
-- [examples/reactive_service.rs](examples/reactive_service.rs): a reactive service with an `oxkv` observer.
-- [examples/eav_service.rs](examples/eav_service.rs): schema publish, entity create and update, an indexed query, and cursor paging. Run with `cargo run --example eav_service`.
+- [examples/reactive_service.rs](examples/reactive_service.rs): a reactive
+  service with an `oxkv` observer.
+- [examples/eav_service.rs](examples/eav_service.rs): schema publish, entity
+  create and update, an indexed query, and cursor paging. Run with `cargo run
+  --example eav_service`.
 
 ### Mount inside your own server
 
-`ApiService::start` owns the listener. To keep your own listener, apply the same global stack yourself:
+`ApiService::start` owns the listener. To keep your own listener, apply the same
+global stack yourself:
 
 ```rust
 use std::sync::Arc;
@@ -1093,13 +1823,25 @@ HttpServer::new(move || {
 .await?;
 ```
 
-`svc.configure` returns `Result<_, DuplicateRoutePrefix>`. The actix configure closure returns `()`, so handle the error at that point. Build one `App` per worker, as `HttpServer::new` does here. Call `svc.configure_docs` last. It follows the docs flag that `with_docs` set. A catch-all mount registered earlier can shadow your modules.
+`svc.configure` returns `Result<_, DuplicateRoutePrefix>`. The actix configure
+closure returns `()`, so handle the error at that point. Build one `App` per
+worker, as `HttpServer::new` does here. Call `svc.configure_docs` last. It
+follows the docs flag that `with_docs` set. A catch-all mount registered earlier
+can shadow your modules.
 
 ## Performance
 
-The EAV benchmarks cover six hot paths: entity create, entity read, entity list paging, indexed attribute query, cached effective schema, and outbox count. Each group uses an in-memory scratch store and a fixed seed. The suite needs no S3 bucket and no network. The benchmark target is `benches/eav.rs`. Run every new benchmark through `cargo bench --bench eav`.
+The EAV benchmarks cover six hot paths: entity create, entity read, entity list
+paging, indexed attribute query, cached effective schema, and outbox count. Each
+group uses an in-memory scratch store and a fixed seed. The suite needs no S3
+bucket and no network. The benchmark target is `benches/eav.rs`. Run every new
+benchmark through `cargo bench --bench eav`.
 
-One bounded SST block cache serves every OxKV handle in the process. The default size is 128 MiB. The cache size does not grow with the handle count. `deploy/kubernetes.yaml` sets `sst_cache_mb = 128` and keeps a 512 MiB container limit. The remainder holds the allocator, the memtables, request buffers, and one replica build capped at 64 MiB.
+One bounded SST block cache serves every OxKV handle in the process. The default
+size is 128 MiB. The cache size does not grow with the handle count.
+`deploy/kubernetes.yaml` sets `sst_cache_mb = 128` and keeps a 512 MiB container
+limit. The remainder holds the allocator, the memtables, request buffers, and
+one replica build capped at 64 MiB.
 
 Run the full suite:
 
@@ -1115,57 +1857,106 @@ cargo bench --bench eav -- --quick
 
 ## Development
 
-Build, test, lint, documentation, and commit rules are in [CONTRIBUTING.md](CONTRIBUTING.md). This section covers the test suites and releases. See [Performance](#performance) for the benchmark suite.
+Build, test, lint, documentation, and commit rules are in
+[CONTRIBUTING.md](CONTRIBUTING.md). This section covers the test suites and
+releases. See [Performance](#performance) for the benchmark suite.
 
 ### Checks
 
-The hooks in `.githook/` call `scripts/ci.sh`. By default, the checks use a `smolvm serve` server when `SMOLVM_ADDR` is set, a local microVM when smolvm and the accelerator are available, and the host with a warning otherwise. Set `SMOLVM_ENABLED=1` to enforce smolvm. The run then exits 3 when neither a remote server nor a local microVM is available. See [the smolvm document](docs/smolvm.md) for the modes, environment variables, and API flow.
+The hooks in `.githook/` call `scripts/ci.sh`. By default, the checks use a
+`smolvm serve` server when `SMOLVM_ADDR` is set, a local microVM when smolvm and
+the accelerator are available, and the host with a warning otherwise. Set
+`SMOLVM_ENABLED=1` to enforce smolvm. The run then exits 3 when neither a remote
+server nor a local microVM is available. See [the smolvm
+document](docs/smolvm.md) for the modes, environment variables, and API flow.
 
-`make smolvm-clean` removes the cached packs and the dangling machines of this checkout. Every resource name carries an owner token from the canonical checkout path: `smolvm-build-<owner>-<hash>`, `smolvm-run-<owner>-*`, and `smolvm-remote-<owner>-*`. With a remote address it also deletes `smolvm-ci-<owner>-<key>.qcow2` cache bases on the server. The target prints the plan and asks one time. Use `ARGS='--dry-run'` to print the plan only, or `ARGS='--yes'` to skip the prompt. Set `SMOLVM_CLEAN_ASSUME_YES=1` to skip the prompt too. A non-interactive run without a skip flag stops with an error. Machines and bases of another checkout stay. A moved checkout gets a new token, so its old resources become foreign and are reported, not deleted.
+`make smolvm-clean` removes the cached packs and the dangling machines of this
+checkout. Every resource name carries an owner token from the canonical checkout
+path: `smolvm-build-<owner>-<hash>`, `smolvm-run-<owner>-*`, and
+`smolvm-remote-<owner>-*`. With a remote address it also deletes
+`smolvm-ci-<owner>-<key>.qcow2` cache bases on the server. The target prints the
+plan and asks one time. Use `ARGS='--dry-run'` to print the plan only, or
+`ARGS='--yes'` to skip the prompt. Set `SMOLVM_CLEAN_ASSUME_YES=1` to skip the
+prompt too. A non-interactive run without a skip flag stops with an error.
+Machines and bases of another checkout stay. A moved checkout gets a new token,
+so its old resources become foreign and are reported, not deleted.
 
 #### Compatibility and limits
 
-Local runs used Linux x86_64 with KVM and smolvm 1.35.1. Remote session flows, a streamed stdin, and a local-directory upload ran against `smolvm serve` v1.35.4. The streamed exec path ran against v1.33.0. Check each version against your server before you rely on a feature. The full `make ci` run over HTTP is not verified. Live remote runs used `make smolvm-exec`. See [the smolvm document](docs/smolvm.md#compatibility-and-limits) for the full list.
+Local runs used Linux x86_64 with KVM and smolvm 1.35.1. Remote session flows, a
+streamed stdin, and a local-directory upload ran against `smolvm serve` v1.35.4.
+The streamed exec path ran against v1.33.0. Check each version against your
+server before you rely on a feature. The full `make ci` run over HTTP is not
+verified. Live remote runs used `make smolvm-exec`. See [the smolvm
+document](docs/smolvm.md#compatibility-and-limits) for the full list.
 
 ### Vendored dependencies
 
-Casbin is vendored at `vendor/casbin` with one Rhai feature change. Casbin enables Rhai features that remove the operation limits, function calls, and 64-bit integers that the condition script engine needs. See [vendor/casbin/PATCH.md](vendor/casbin/PATCH.md) for the exact change and the update procedure.
+Casbin is vendored at `vendor/casbin` with one Rhai feature change. Casbin
+enables Rhai features that remove the operation limits, function calls, and
+64-bit integers that the condition script engine needs. See
+[vendor/casbin/PATCH.md](vendor/casbin/PATCH.md) for the exact change and the
+update procedure.
 
 ### Configuration tests
 
-The configuration module is part of the binary target. Run its tests with `cargo test --bin rust-api config`. A `cargo test --lib config` filter runs no configuration test.
+The configuration module is part of the binary target. Run its tests with `cargo
+test --bin rust-api config`. A `cargo test --lib config` filter runs no
+configuration test.
 
 ### Full-stack tests
 
-This repository does not include a full-stack test harness. There is no `tests/integration.rs`, no `tests/contract.rs`, and no `docker-compose.test.yml`. The commands `cargo test --test integration` and `cargo test --test contract` fail because those targets do not exist.
+This repository does not include a full-stack test harness. There is no
+`tests/integration.rs`, no `tests/contract.rs`, and no
+`docker-compose.test.yml`. The commands `cargo test --test integration` and
+`cargo test --test contract` fail because those targets do not exist.
 
-The in-process tests are the test suite. wiremock mocks the identity provider and S3, so they need no containers and no network. Run them with `mise run test`.
+The in-process tests are the test suite. wiremock mocks the identity provider
+and S3, so they need no containers and no network. Run them with `mise run
+test`.
 
-Test a deployment against a real identity provider and a real bucket before production. The operator owns that check.
+Test a deployment against a real identity provider and a real bucket before
+production. The operator owns that check.
 
 ### Releases
 
-[cargo-dist](https://opensource.axo.dev/cargo-dist/) builds the release archives. Its configuration is in `dist-workspace.toml` at version 0.32.0, with `ci = "github"` and no installers. Targets are `aarch64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu`, and `x86_64-pc-windows-msvc`.
+[cargo-dist](https://opensource.axo.dev/cargo-dist/) builds the release
+archives. Its configuration is in `dist-workspace.toml` at version 0.32.0, with
+`ci = "github"` and no installers. Targets are `aarch64-unknown-linux-gnu`,
+`x86_64-unknown-linux-gnu`, and `x86_64-pc-windows-msvc`.
 
 ```bash
 mise run dist-plan     # print the artifact plan
 mise run dist-build    # build the archives into target/distrib/
 ```
 
-The `cargo-dist` pin in `mise.toml` must track `cargo-dist-version` in `dist-workspace.toml`. The generated workflow is checked in at `.github/workflows/release.yml`. Run `dist init --ci=github` to regenerate it at the pinned version. That command overwrites the local edits in the file.
+The `cargo-dist` pin in `mise.toml` must track `cargo-dist-version` in
+`dist-workspace.toml`. The generated workflow is checked in at
+`.github/workflows/release.yml`. Run `dist init --ci=github` to regenerate it at
+the pinned version. That command overwrites the local edits in the file.
 
-The crate is distributed as a binary. `publish = false` in `Cargo.toml` keeps `cargo publish` from uploading a package that depends on the local path adapters.
+The crate is distributed as a binary. `publish = false` in `Cargo.toml` keeps
+`cargo publish` from uploading a package that depends on the local path
+adapters.
 
 ### Container image
 
-`Dockerfile` builds the `rust-api` binary in a Rust builder stage and copies it to a Debian slim runtime. The image runs as the unprivileged `rust-api` user. It copies `config.example.toml` to `/usr/share/rust-api/config.example.toml` as a reference. Mount the real config at `/etc/rust-api/config.toml`.
+`Dockerfile` builds the `rust-api` binary in a Rust builder stage and copies it
+to a Debian slim runtime. The image runs as the unprivileged `rust-api` user. It
+copies `config.example.toml` to `/usr/share/rust-api/config.example.toml` as a
+reference. Mount the real config at `/etc/rust-api/config.toml`.
 
 ```bash
 docker build -t rust-api:0.1.0 .
-docker run --rm -p 8080:8080 -v "$PWD/config.toml:/etc/rust-api/config.toml:ro" rust-api:0.1.0
+docker run --rm -p 8080:8080 \
+  -v "$PWD/config.toml:/etc/rust-api/config.toml:ro" \
+  rust-api:0.1.0
 ```
 
-`deploy/kubernetes.yaml` is a reference Deployment and Service. It wires `/health` to the liveness probe and `/ready` to the readiness probe. Set the image, the config, and the secrets for your cluster. This manifest is not tested against a live cluster.
+`deploy/kubernetes.yaml` is a reference Deployment and Service. It wires
+`/health` to the liveness probe and `/ready` to the readiness probe. Set the
+image, the config, and the secrets for your cluster. This manifest is not tested
+against a live cluster.
 
 ## License
 
@@ -1176,4 +1967,6 @@ Licensed under either of
 
 at your option.
 
-Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the work by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in the work by you, as defined in the Apache-2.0 license, shall be
+dual licensed as above, without any additional terms or conditions.
