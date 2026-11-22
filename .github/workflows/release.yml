@@ -33,8 +33,10 @@
 # ---------------------------------------------------------------------------
 
 name: Release
+# Keep write access on the jobs that create or upload the release.
+# Every other job inherits read-only access from this block.
 permissions:
-  "contents": "write"
+  "contents": "read"
 
 # This task will run whenever you push a git tag that looks like a version
 # like "1.0.0", "v0.1.0-prerelease.1", "my-app/0.1.0", "releases/v1.0.0", etc.
@@ -73,6 +75,9 @@ jobs:
   # Run 'dist plan' (or host) to determine what tasks we need to do
   plan:
     runs-on: "ubuntu-22.04"
+    # This job creates the GitHub release, so it needs write access.
+    permissions:
+      "contents": "write"
     outputs:
       val: ${{ steps.plan.outputs.manifest }}
       tag: ${{ !github.event.pull_request && github.ref_name || '' }}
@@ -88,8 +93,12 @@ jobs:
       - name: Install dist
         # we specify bash to get pipefail; it guards against the `curl` command
         # failing. otherwise `sh` won't catch that `curl` returned non-0
+        # cargo-dist publishes no checksum for this installer script.
+        # The dist cache steps below depend on the layout that this script creates.
+        # Replacing it with mise would break the generated workflow.
+        # Accept this one generated install.
         shell: bash
-        run: "curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.32.0/cargo-dist-installer.sh | sh"
+        run: "curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.32.0/cargo-dist-installer.sh | sh" # jactionlint ignore=unverified-download
       - name: Cache dist
         uses: actions/upload-artifact@v7
         with:
@@ -101,8 +110,16 @@ jobs:
       # (PRs run on the *source* but secrets are usually on the *target* -- that's *good*
       # but also really annoying to build CI around when it needs secrets to work right.)
       - id: plan
+        env:
+          # A tag name can hold shell syntax. Pass it through the environment
+          # and quote it in the script below.
+          RELEASE_TAG: ${{ !github.event.pull_request && github.ref_name || '' }}
         run: |
-          dist ${{ (!github.event.pull_request && format('host --steps=create --tag={0}', github.ref_name)) || 'plan' }} --output-format=json > plan-dist-manifest.json
+          if [ -n "$RELEASE_TAG" ]; then
+            dist host --steps=create --tag="$RELEASE_TAG" --output-format=json > plan-dist-manifest.json
+          else
+            dist plan --output-format=json > plan-dist-manifest.json
+          fi
           echo "dist ran successfully"
           cat plan-dist-manifest.json
           echo "manifest=$(jq -c "." plan-dist-manifest.json)" >> "$GITHUB_OUTPUT"
@@ -148,10 +165,13 @@ jobs:
           submodules: recursive
       - name: Install Rust non-interactively if not already installed
         if: ${{ matrix.container }}
-        run: |
+        # rustup publishes no checksum for this shell script.
+        # The dist-selected container has no mise, so this installer is practical.
+        # Accept this one generated install.
+        run: | # jactionlint ignore=unverified-download
           if ! command -v cargo > /dev/null 2>&1; then
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-            echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           fi
       - name: Install dist
         run: ${{ matrix.install_dist.run }}
@@ -178,9 +198,11 @@ jobs:
         shell: bash
         run: |
           # Parse out what we just built and upload it to scratch storage
-          echo "paths<<EOF" >> "$GITHUB_OUTPUT"
-          dist print-upload-files-from-manifest --manifest dist-manifest.json >> "$GITHUB_OUTPUT"
-          echo "EOF" >> "$GITHUB_OUTPUT"
+          {
+            echo "paths<<EOF"
+            dist print-upload-files-from-manifest --manifest dist-manifest.json
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
 
           cp dist-manifest.json "$BUILD_MANIFEST_NAME"
       - name: "Upload artifacts"
@@ -225,9 +247,11 @@ jobs:
           echo "dist ran successfully"
 
           # Parse out what we just built and upload it to scratch storage
-          echo "paths<<EOF" >> "$GITHUB_OUTPUT"
-          jq --raw-output ".upload_files[]" dist-manifest.json >> "$GITHUB_OUTPUT"
-          echo "EOF" >> "$GITHUB_OUTPUT"
+          {
+            echo "paths<<EOF"
+            jq --raw-output ".upload_files[]" dist-manifest.json
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
 
           cp dist-manifest.json "$BUILD_MANIFEST_NAME"
       - name: "Upload artifacts"
@@ -245,6 +269,9 @@ jobs:
       - build-global-artifacts
     # Only run if we're "publishing", and only if plan, local and global didn't fail (skipped is fine)
     if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') }}
+    # This job uploads artifacts and creates the GitHub release.
+    permissions:
+      "contents": "write"
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     runs-on: "ubuntu-22.04"
@@ -300,9 +327,13 @@ jobs:
           RELEASE_COMMIT: "${{ github.sha }}"
         run: |
           # Write and read notes from a file to avoid quoting breaking things
-          echo "$ANNOUNCEMENT_BODY" > $RUNNER_TEMP/notes.txt
+          echo "$ANNOUNCEMENT_BODY" > "$RUNNER_TEMP/notes.txt"
 
-          gh release create "${{ needs.plan.outputs.tag }}" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
+          prerelease_flag=()
+          if [ -n "$PRERELEASE_FLAG" ]; then
+            prerelease_flag=(--prerelease)
+          fi
+          gh release create "${{ needs.plan.outputs.tag }}" --target "$RELEASE_COMMIT" "${prerelease_flag[@]}" --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
 
   announce:
     needs:
