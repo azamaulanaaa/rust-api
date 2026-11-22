@@ -1218,20 +1218,33 @@ mod tests {
                 failures: std::sync::atomic::AtomicUsize::new(failures),
             }
         }
+
+        /// Decrements the failure count once and reports whether it succeeded.
+        fn take_failure(&self) -> bool {
+            use std::sync::atomic::Ordering;
+
+            let mut current = self.failures.load(Ordering::SeqCst);
+            loop {
+                if current == 0 {
+                    return false;
+                }
+                match self.failures.compare_exchange(
+                    current,
+                    current - 1,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                ) {
+                    Ok(_) => return true,
+                    Err(actual) => current = actual,
+                }
+            }
+        }
     }
 
     #[async_trait::async_trait]
     impl ChangeSink for FlakySink {
         async fn append(&self, op: crate::records::WalOp) -> anyhow::Result<()> {
-            use std::sync::atomic::Ordering;
-
-            if self
-                .failures
-                .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
-                    left.checked_sub(1)
-                })
-                .is_ok()
-            {
+            if self.take_failure() {
                 return Err(anyhow::anyhow!("injected change feed failure"));
             }
             self.wal.append(op).await.map(|_| ())
