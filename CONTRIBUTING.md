@@ -155,7 +155,7 @@ body to explain why, not what.
 
 1. Fork the repository and create a branch from `main`.
 2. Run `make ci` with your smolvm mode set. The `pre-push` hook runs the checks
-   before the push.
+    before the push.
 3. Open the pull request against `main`.
 4. Describe the change, the motivation, and the testing done.
 5. Update documentation when behavior changes.

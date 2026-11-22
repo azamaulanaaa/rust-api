@@ -1163,20 +1163,20 @@ must not store a login redirect, a session response, or an EAV page.
 ### SPA and PWA flow
 
 1. Send the browser to `GET /auth/login?return_to=<encoded path>`. The callback
-   returns `302` to that path and sets the cookies. Without `return_to`, read
-   the token from the callback JSON body.
+    returns `302` to that path and sets the cookies. Without `return_to`, read
+    the token from the callback JSON body.
 2. Call `GET /auth/me` on app load. `200` means the session works. `401` means
-   the session expired. Call `POST /auth/refresh` before `exp`. If refresh
-   fails, redirect to login.
+    the session expired. Call `POST /auth/refresh` before `exp`. If refresh
+    fails, redirect to login.
 3. Poll `GET /sync/status` with `If-None-Match`. `304` means nothing changed.
-   `200` returns `prefix`, `applied_seq`, `head`, and a new `ETag`.
+    `200` returns `prefix`, `applied_seq`, `head`, and a new `ETag`.
 4. When `applied_seq < head`, call `POST /sync/sync`. If it returns `pending:
-   true`, repeat the call until `pending` is false. Poll `/sync/status` between
-   calls when you need the current coverage.
+    true`, repeat the call until `pending` is false. Poll `/sync/status` between
+    calls when you need the current coverage.
 5. Read `GET /sync/db/manifest.json`, then fetch the objects it lists.
-   Revalidate mutable names.
+    Revalidate mutable names.
 6. Download files with `GET /fs/files/{id}`. Use `GET /fs/files/{id}/meta` when
-   metadata is needed.
+    metadata is needed.
 
 ### TypeScript example
 
@@ -1721,14 +1721,14 @@ Manual steps:
     replicas replay them. It is idempotent.
 5. Start the new server. It creates the other stores under the new prefix.
 6. If you have no export, skip step 4. After step 5, log in, call `POST
-   /setup/admin` once, then recreate rules and group memberships.
+    /setup/admin` once, then recreate rules and group memberships.
 7. File metadata does not migrate. Old file records and relations have no import
-   path. File bytes already in S3 stay in their buckets, but the new server has
-   no metadata for them. Re-upload the files, or let the hourly GC remove the
-   orphan bytes after 24 hours.
+    path. File bytes already in S3 stay in their buckets, but the new server has
+    no metadata for them. Re-upload the files, or let the hourly GC remove the
+    orphan bytes after 24 hours.
 8. The change feed starts at zero. Replicas rebuild from the current master state.
 9. Keep the old `*.redb` and `*.redb.fs` files until the new deployment works.
-   Remove them after that.
+    Remove them after that.
 
 The new binary ignores a leftover `[database].path` key and uses
 `[database].prefix`. It never opens the old file. Treat the upgrade as a fresh

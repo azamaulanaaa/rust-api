@@ -107,23 +107,23 @@ using an RwLock like so: `let e = Arc::new(RwLock::new(e));`.
 1. [**ACL (Access Control List)**](https://en.wikipedia.org/wiki/Access_control_list)
 2. **ACL with [superuser](https://en.wikipedia.org/wiki/Superuser)**
 3. **ACL without users**: especially useful for systems that don't have
-   authentication or user log-ins.
+    authentication or user log-ins.
 4. **ACL without resources**: some scenarios may target for a type of resources
-   instead of an individual resource by using permissions like
-   ``write-article``, ``read-log``. It doesn't control the access to a specific
-   article or log.
+    instead of an individual resource by using permissions like
+    ``write-article``, ``read-log``. It doesn't control the access to a specific
+    article or log.
 5. **[RBAC (Role-Based Access Control)](https://en.wikipedia.org/wiki/Role-based_access_control)**
 6. **RBAC with resource roles**: both users and resources can have roles (or
-   groups) at the same time.
+    groups) at the same time.
 7. **RBAC with domains/tenants**: users can have different role sets for
-   different domains/tenants.
+    different domains/tenants.
 8. **[ABAC (Attribute-Based Access
-   Control)](https://en.wikipedia.org/wiki/Attribute-Based_Access_Control)**:
-   syntax sugar like ``resource.Owner`` can be used to get the attribute for a
-   resource.
+    Control)](https://en.wikipedia.org/wiki/Attribute-Based_Access_Control)**:
+    syntax sugar like ``resource.Owner`` can be used to get the attribute for a
+    resource.
 9. **[RESTful](https://en.wikipedia.org/wiki/Representational_state_transfer)**:
-   supports paths like ``/res/*``, ``/res/:id`` and HTTP methods like ``GET``,
-   ``POST``, ``PUT``, ``DELETE``.
+    supports paths like ``/res/*``, ``/res/:id`` and HTTP methods like ``GET``,
+    ``POST``, ``PUT``, ``DELETE``.
 10. **Deny-override**: both allow and deny authorizations are supported, deny
     overrides the allow.
 11. **Priority**: the policy rules can be prioritized like firewall rules.
@@ -174,22 +174,22 @@ It means:
 What casbin-rs does:
 
 1. enforce the policy in the classic ``{subject, object, action}`` form or a
-   customized form as you defined, both allow and deny authorizations are
-   supported.
+    customized form as you defined, both allow and deny authorizations are
+    supported.
 2. handle the storage of the access control model and its policy.
 3. manage the role-user mappings and role-role mappings (aka role hierarchy in RBAC).
 4. support built-in superuser like ``root`` or ``administrator``. A superuser
-   can do anything without explict permissions.
+    can do anything without explict permissions.
 5. multiple built-in operators to support the rule matching. For example,
-   ``keyMatch`` can map a resource key ``/foo/bar`` to the pattern ``/foo*``.
+    ``keyMatch`` can map a resource key ``/foo/bar`` to the pattern ``/foo*``.
 
 What casbin-rs does NOT do:
 
 1. authentication (aka verify ``username`` and ``password`` when a user logs in)
 2. manage the list of users or roles. I believe it's more convenient for the
-   project itself to manage these entities. Users usually have their passwords,
-   and casbin-rs is not designed as a password container. However, casbin-rs
-   stores the user-role mapping for the RBAC scenario.
+    project itself to manage these entities. Users usually have their passwords,
+    and casbin-rs is not designed as a password container. However, casbin-rs
+    stores the user-role mapping for the RBAC scenario.
 
 ## Documentation
 
