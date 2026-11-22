@@ -6,6 +6,14 @@ set -euo pipefail
 # Exit code 3 means the run cannot use smolvm in enforced mode.
 readonly SMOLVM_ENFORCED_RC=3
 
+# Choose the mise directory that holds the shims in this guest. An exec
+# shell can skip the login profile, and a restarted cache machine can
+# restore a profile from before the cache disk was attached. Select the
+# directory by the shim that is present, then export the data directory
+# and the shim PATH so every check resolves the installed tools.
+# shellcheck disable=SC2016
+readonly GUEST_CI_CMD='cd /workspace && mise_dir=/cache/mise-data; [ -x "$mise_dir/shims/shellcheck" ] || mise_dir="$HOME/.local/share/mise"; export MISE_DATA_DIR="$mise_dir"; export PATH="$mise_dir/shims:$PATH"; SMOLVM_ENABLED=0 SMOLVM_GUEST=1 bash scripts/ci.sh'
+
 if ! command -v git >/dev/null 2>&1; then
   echo "error: git is not on PATH. Install git first." >&2
   exit 1
@@ -74,7 +82,7 @@ if [[ -n "${SMOLVM_ADDR:-}" ]]; then
   # The checks path never sends the local stdin.
   # shellcheck source=scripts/smolvm-serve.sh
   source "$script_dir/smolvm-serve.sh"
-  serve_run_remote 'cd /workspace && SMOLVM_ENABLED=0 SMOLVM_GUEST=1 bash scripts/ci.sh' none || exit $?
+  serve_run_remote "$GUEST_CI_CMD" none || exit $?
   exit "$SERVE_GUEST_RC"
 fi
 
@@ -111,7 +119,6 @@ fi
 # smolvm v1.20.2 and later. The exit code of the checks propagates.
 rc=0
 smolvm machine run --from "$pack" --timeout "${SMOLVM_TIMEOUT:-10m}" \
-  -v "$PWD":/workspace:ro -- bash -lc \
-  'cd /workspace && SMOLVM_ENABLED=0 SMOLVM_GUEST=1 bash scripts/ci.sh' || rc=$?
+  -v "$PWD":/workspace:ro -- bash -lc "$GUEST_CI_CMD" || rc=$?
 
 exit "$rc"

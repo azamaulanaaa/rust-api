@@ -86,9 +86,12 @@ fi
 run_step "git safe directory" 'git config --global --add safe.directory /workspace'
 
 # The profile file covers login shells. The links cover other shell shapes.
+# Export the data directory with the shim PATH. A shim resolves against the
+# active data directory, so a check shell must use the one this machine
+# provisioned when a cache disk is mounted.
 # shellcheck disable=SC2016
 run_step "mise PATH setup" \
-  'shim_dir="${MISE_DATA_DIR:-$HOME/.local/share/mise}/shims"; mkdir -p /etc/profile.d; printf "export PATH=\"%s:\$PATH\"\n" "$shim_dir" > /etc/profile.d/mise.sh'
+  'mise_home="${MISE_DATA_DIR:-$HOME/.local/share/mise}"; mkdir -p /etc/profile.d; printf "export MISE_DATA_DIR=\"%s\"\nexport PATH=\"%s/shims:\$PATH\"\n" "$mise_home" "$mise_home" > /etc/profile.d/mise.sh'
 # shellcheck disable=SC2016
 run_step "mise shim links" \
   'shim_dir="${MISE_DATA_DIR:-$HOME/.local/share/mise}/shims"; for shim in "$shim_dir"/*; do [ -e "$shim" ] || continue; ln -sf "$shim" "/usr/local/bin/$(basename "$shim")"; done'

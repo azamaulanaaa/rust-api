@@ -285,6 +285,9 @@ with Apple Silicon it needs `kern.hv_support=1`.
     missing. It calls `smol/pack-build.sh` for the build.
 6. It runs `smolvm machine run --from <pack> --timeout 10m -v
     "$PWD":/workspace:ro -- bash -lc 'cd /workspace &&
+    mise_dir=/cache/mise-data; [ -x "$mise_dir/shims/shellcheck" ] ||
+    mise_dir="$HOME/.local/share/mise"; export
+    MISE_DATA_DIR="$mise_dir"; export PATH="$mise_dir/shims:$PATH";
     SMOLVM_ENABLED=0 SMOLVM_GUEST=1 bash scripts/ci.sh'`. The VM is
     discarded on exit. No persistent machine is created. The
     `--timeout` value comes from `SMOLVM_TIMEOUT` and defaults to
@@ -462,8 +465,10 @@ source it. One run follows these steps:
     command.
 11. Call `DELETE /api/v1/machines/<name>` to delete the machine.
 
-Both modes use the same guest command. It is
-`cd /workspace && SMOLVM_ENABLED=0 SMOLVM_GUEST=1 bash scripts/ci.sh`.
+Both modes use the same guest command. It selects the mise directory
+that holds the shims, then exports `MISE_DATA_DIR` and PATH before it
+runs `scripts/ci.sh`. The checks find the tools even when the exec path
+skips the login profile or a restarted machine restores an older one.
 For `make smolvm-exec` the command runs with the same two variables.
 
 An exec call returns HTTP 200 when the guest command fails. The helper
@@ -857,7 +862,7 @@ a property of the local pack machine.
 5. Runs `mise cache clear` to remove the download cache from the
     pack. The installed tools are not removed.
 6. Adds `safe.directory /workspace` to the root git configuration.
-7. Adds the mise shims to the login shell PATH through
+7. Adds the mise shims and `MISE_DATA_DIR` to the login shell through
     `/etc/profile.d/mise.sh`. It also links the shims into
     `/usr/local/bin` so non-login shells find the tools.
 8. Stops the machine.
@@ -1285,9 +1290,10 @@ CLI reference.
     Whether the `[artifact]` table is honored for `--from-vm` packs is
     not confirmed.
 5. The mise shims are added to `/etc/profile.d/mise.sh` for login
-    shells and linked into `/usr/local/bin` for other shells. The
-    checks pass inside the guest, so the tools resolve on `bash -lc`,
-    which sources `/etc/profile`.
+    shells and linked into `/usr/local/bin` for other shells. The file
+    also exports `MISE_DATA_DIR`. The guest command does not rely on
+    the file. It selects the shim directory that is present and exports
+    the matching data directory and PATH.
 6. `/dev/kvm` exists and is readable is used as the Linux KVM check.
     This does not prove that the kernel allows a VM to start. A host
     in a restricted container can read `/dev/kvm` and still fail to run
