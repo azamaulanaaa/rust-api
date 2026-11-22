@@ -39,15 +39,15 @@ It uses 64-bit integers for Unix timestamps.
 
 1. Take the `Cargo.toml` from the new upstream release.
 2. Remove `unchecked`, `only_i32`, `no_function`, and `no_float` from the
-   `rhai` features.
+    `rhai` features.
 3. Keep `sync`, `no_optimize`, `no_module`, and `serde`.
 4. Copy the upstream `src` directory, `LICENSE`, and `README.md`.
 5. Update the version in this file and in `Cargo.toml`.
 6. Run the full gate:
-   - `cargo fmt --all --check`
-   - `cargo clippy --all-targets --all-features --locked -- -D warnings`
-   - `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features --locked`
-   - `cargo test --locked`
+    - `cargo fmt --all --check`
+    - `cargo clippy --all-targets --all-features --locked -- -D warnings`
+    - `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features --locked`
+    - `cargo test --locked`
 7. Check that the script budget tests and the script function tests pass.
 
 ## Temporary status

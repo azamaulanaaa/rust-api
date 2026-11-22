@@ -25,11 +25,11 @@ start the check pipeline. `scripts/check-mise.sh` uses `mise` only to check
 path:
 
 1. With `SMOLVM_ADDR` set, it sends the checks to that `smolvm serve`
-   server. The helper uploads the working tree and runs the checks in a
-   machine on the server.
+    server. The helper uploads the working tree and runs the checks in a
+    machine on the server.
 2. With `smolvm` on PATH and a working accelerator, it runs the checks in a
-   local microVM. On Linux the accelerator is `/dev/kvm`. On macOS with
-   Apple Silicon it is `kern.hv_support=1`.
+    local microVM. On Linux the accelerator is `/dev/kvm`. On macOS with
+    Apple Silicon it is `kern.hv_support=1`.
 3. Otherwise it prints a warning on stderr and runs the checks on the host.
 
 `SMOLVM_ENABLED=1` enforces smolvm. The checks must run in the local microVM
@@ -115,15 +115,15 @@ in the repository settings on GitHub, not in the repository files.
 1. Create `scripts/check-<area>.sh` and make it executable.
 2. Start with a shebang, a short comment, and `set -euo pipefail`.
 3. Check each required command with `command -v`. Print an error on stderr
-   when a tool is missing. Exit non-zero.
+    when a tool is missing. Exit non-zero.
 4. Change to the repository root with `git rev-parse --show-toplevel`.
 5. Collect files from `git`. Include tracked and untracked files. Exclude
-   ignored files.
+    ignored files.
 6. Run the tool in read-only mode. Print one short result line.
 7. Add the tool to [`mise.toml`](../mise.toml) when it is a development
-   dependency.
+    dependency.
 8. Run `make ci`. `scripts/ci.sh` finds the new file automatically. The file
-   name sets the run order.
+    name sets the run order.
 9. Add the check to the matrix in `ci.yml` when GitHub Actions must run it.
 
 ## Rules for a check script

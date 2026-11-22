@@ -999,17 +999,17 @@ Only `[database]` changes. `[s3]` was already required for file bytes.
 Manual steps:
 
 1. Export the old policy rules with the old binary:
-   ```bash
-   rust-api policy export --store /var/lib/rust-api/policy.redb --out policy-backup.json
-   ```
-   The export contains every `p` and `g` rule. It does not contain file metadata, relations, or the change feed.
+    ```bash
+    rust-api policy export --store /var/lib/rust-api/policy.redb --out policy-backup.json
+    ```
+    The export contains every `p` and `g` rule. It does not contain file metadata, relations, or the change feed.
 2. Stop the old server.
 3. Update the configuration. Pick a fresh `[database].prefix`.
 4. Import the rules into the new prefix:
-   ```bash
-   rust-api policy import --config config.toml --input policy-backup.json
-   ```
-   The import creates the policy store and appends the rules to the WAL, so replicas replay them. It is idempotent.
+    ```bash
+    rust-api policy import --config config.toml --input policy-backup.json
+    ```
+    The import creates the policy store and appends the rules to the WAL, so replicas replay them. It is idempotent.
 5. Start the new server. It creates the other stores under the new prefix.
 6. If you have no export, skip step 4. After step 5, log in, call `POST /setup/admin` once, then recreate rules and group memberships.
 7. File metadata does not migrate. Old file records and relations have no import path. File bytes already in S3 stay in their buckets, but the new server has no metadata for them. Re-upload the files, or let the hourly GC remove the orphan bytes after 24 hours.

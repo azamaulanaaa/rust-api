@@ -154,7 +154,7 @@ What casbin-rs does:
 What casbin-rs does NOT do:
 
 1. authentication (aka verify ``username`` and ``password`` when a user logs in)
-2. manage the list of users or roles. I believe it's more convenient for the project itself to manage these entities. Users usually have their passwords, and casbin-rs is not designed as a password container. However, casbin-rs stores the user-role mapping for the RBAC scenario. 
+2. manage the list of users or roles. I believe it's more convenient for the project itself to manage these entities. Users usually have their passwords, and casbin-rs is not designed as a password container. However, casbin-rs stores the user-role mapping for the RBAC scenario.
 
 ## Documentation
 
@@ -184,7 +184,7 @@ We also provide a web-based UI for model management and policy management:
 ## Policy persistence
 
 * https://casbin.org/docs/adapters
-* There also is [example code on how to preload an existing policy into an adapter](https://github.com/casbin-rs/examples/blob/master/actix-middleware-example/src/main.rs#L73). 
+* There also is [example code on how to preload an existing policy into an adapter](https://github.com/casbin-rs/examples/blob/master/actix-middleware-example/src/main.rs#L73).
 
 ## Role manager
 
@@ -216,7 +216,7 @@ https://casbin.org/docs/adopters
 
 ## Contributors
 
-This project exists thanks to all the people who contribute. 
+This project exists thanks to all the people who contribute.
 <a href="https://github.com/casbin/casbin-rs/graphs/contributors"><img src="https://opencollective.com/casbin-rs/contributors.svg?width=890&button=false" /></a>
 
 ## Star History

@@ -199,7 +199,7 @@ pub fn dynamic_to_str(d: &Dynamic) -> Cow<'_, str> {
     }
 }
 
-/// key_match determines whether key1 matches the pattern of key2 (similar to RESTful path), key2 can contain *  
+/// key_match determines whether key1 matches the pattern of key2 (similar to RESTful path), key2 can contain *
 /// For example, "/foo/bar" matches "/foo/*"
 pub fn key_match(key1: &str, key2: &str) -> bool {
     if let Some(i) = key2.find('*') {
@@ -212,8 +212,8 @@ pub fn key_match(key1: &str, key2: &str) -> bool {
     }
 }
 
-/// key_get returns the matched part  
-/// For example, "/foo/bar/foo" matches "/foo/*"  
+/// key_get returns the matched part
+/// For example, "/foo/bar/foo" matches "/foo/*"
 /// "bar/foo" will be returned.
 pub fn key_get(key1: &str, key2: &str) -> String {
     if let Some(i) = key2.find('*') {
@@ -224,7 +224,7 @@ pub fn key_get(key1: &str, key2: &str) -> String {
     "".to_string()
 }
 
-/// key_match2 determines whether key1 matches the pattern of key2 (similar to RESTful path), key2 can contain a *  
+/// key_match2 determines whether key1 matches the pattern of key2 (similar to RESTful path), key2 can contain a *
 /// For example, "/foo/bar" matches "/foo/*", "/resource1" matches "/:resource"
 pub fn key_match2(key1: &str, key2: &str) -> bool {
     let mut key2: Cow<str> = if key2.contains("/*") {
@@ -238,8 +238,8 @@ pub fn key_match2(key1: &str, key2: &str) -> bool {
     regex_match(key1, &format!("^{}$", key2))
 }
 
-/// key_get2 returns value matched pattern  
-/// For example, "/resource1" matches "/:resource"  
+/// key_get2 returns value matched pattern
+/// For example, "/resource1" matches "/:resource"
 /// if the pathVar == "resource", then "resource1" will be returned.
 pub fn key_get2(key1: &str, key2: &str, path_var: &str) -> String {
     let key2: Cow<str> = if key2.contains("/*") {
@@ -267,7 +267,7 @@ pub fn key_get2(key1: &str, key2: &str, path_var: &str) -> String {
     "".to_string()
 }
 
-/// key_match3 determines whether key1 matches the pattern of key2 (similar to RESTful path), key2 can contain a *  
+/// key_match3 determines whether key1 matches the pattern of key2 (similar to RESTful path), key2 can contain a *
 /// For example, "/foo/bar" matches "/foo/*", "/resource1" matches "/{resource}"
 pub fn key_match3(key1: &str, key2: &str) -> bool {
     let mut key2: Cow<str> = if key2.contains("/*") {
@@ -281,8 +281,8 @@ pub fn key_match3(key1: &str, key2: &str) -> bool {
     regex_match(key1, &format!("^{}$", key2))
 }
 
-/// key_get3 returns value matched pattern  
-/// For example, "project/proj_project1_admin/" matches "project/proj_{project}_admin/"  
+/// key_get3 returns value matched pattern
+/// For example, "project/proj_project1_admin/" matches "project/proj_{project}_admin/"
 /// if the pathVar == "project", then "project1" will be returned.
 pub fn key_get3(key1: &str, key2: &str, path_var: &str) -> String {
     let key2: Cow<str> = if key2.contains("/*") {
@@ -313,8 +313,8 @@ pub fn key_get3(key1: &str, key2: &str, path_var: &str) -> String {
     "".to_string()
 }
 
-/// KeyMatch4 determines whether key1 matches the pattern of key2 (similar to RESTful path), key2 can contain a *.  
-/// Besides what KeyMatch3 does, KeyMatch4 can also match repeated patterns:  
+/// KeyMatch4 determines whether key1 matches the pattern of key2 (similar to RESTful path), key2 can contain a *.
+/// Besides what KeyMatch3 does, KeyMatch4 can also match repeated patterns:
 ///   - "/parent/123/child/123" matches "/parent/{id}/child/{id}"
 ///   - "/parent/123/child/456" does not match "/parent/{id}/child/{id}"
 ///
@@ -360,8 +360,8 @@ pub fn key_match4(key1: &str, key2: &str) -> bool {
     }
 }
 
-/// KeyMatch5 determines whether key1 matches the pattern of key2 (similar to RESTful path), key2 can contain a *  
-/// For example,  
+/// KeyMatch5 determines whether key1 matches the pattern of key2 (similar to RESTful path), key2 can contain a *
+/// For example,
 ///   - "/foo/bar?status=1&type=2" matches "/foo/bar"
 ///   - "/parent/child1" and "/parent/child1" matches "/parent/*"
 ///   - "/parent/child1?status=1" matches "/parent/*".

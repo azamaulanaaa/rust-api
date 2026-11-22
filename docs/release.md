@@ -31,9 +31,9 @@ make release
 The target runs two commands:
 
 1. `cog bump --auto` writes `CHANGELOG.md`, creates the version commit, and
-   creates a version tag that matches `v*`, for example `v1.2.3`.
+    creates a version tag that matches `v*`, for example `v1.2.3`.
 2. `dist plan --output-format=human` prints the artifact plan for that
-   version.
+    version.
 
 Cog also checks commit messages. `.githook/commit-msg` runs `cog verify`.
 `scripts/check-commits.sh` runs `cog check` in CI. Do not edit `CHANGELOG.md`
@@ -46,13 +46,13 @@ Push the tag that cog created. A tag that matches `v*` triggers
 it does not publish artifacts. The workflow follows these steps:
 
 1. The `checks` job calls `ci.yml`. Every publishing job waits for this job.
-   A commit that fails CI cannot release.
+    A commit that fails CI cannot release.
 2. The `plan` job runs `dist host` for a tag or `dist plan` for a pull
-   request. It writes the dist manifest and the release targets.
+    request. It writes the dist manifest and the release targets.
 3. The `build-local-artifacts` job builds the platform archives. It waits for
-   `checks` and `plan`.
+    `checks` and `plan`.
 4. The `build-global-artifacts` job builds the global artifacts, such as
-   checksums.
+    checksums.
 5. The `host` job uploads the artifacts and creates the GitHub Release.
 6. The `announce` job announces the release.
 
@@ -99,7 +99,7 @@ parts of the file.
 
 1. Confirm CI passes on `main`.
 2. Run `make release`. Cog writes the changelog, creates the version commit,
-   and creates the `v*` tag.
+    and creates the `v*` tag.
 3. Push the tag:
 
 ```bash
