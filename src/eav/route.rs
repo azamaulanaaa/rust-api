@@ -1385,7 +1385,10 @@ async fn list_schema_entities(
 /// Creates or replaces one rule.
 ///
 /// The caller needs `write` on `eav_rules`.
-/// A non-empty `read` list also needs `read` on `eav_entities`.
+/// A rule that observes entity data also needs `read` on `eav_entities`.
+/// A rule observes entity data when its `read` list is not empty, when its
+/// action is not a script, or when its condition tests an attribute.
+/// A `noop` action observes no entity data.
 /// A non-empty `write` list also needs `write` on `eav_entities`.
 /// The author needs the collection grant, and the rule narrows that grant to
 /// the listed schemas.
@@ -1403,16 +1406,19 @@ async fn upsert_rule(
 ) -> Result<HttpResponse, EavApiError> {
     require_management(&policy, &claims.sub, RULES, Action::Write).await?;
     let draft = body.into_inner();
-    if !draft.capabilities.read.is_empty() {
+    runtime
+        .engine()
+        .validate_action(&draft.action.kind, &draft.action.params)?;
+    runtime.engine().validate_condition(&draft.condition)?;
+    if runtime
+        .engine()
+        .observes_entity_data(&draft.capabilities, &draft.action, &draft.condition)
+    {
         require_management(&policy, &claims.sub, ENTITIES, Action::Read).await?;
     }
     if !draft.capabilities.write.is_empty() {
         require_management(&policy, &claims.sub, ENTITIES, Action::Write).await?;
     }
-    runtime
-        .engine()
-        .validate_action(&draft.action.kind, &draft.action.params)?;
-    runtime.engine().validate_condition(&draft.condition)?;
     let rule = runtime.rules().upsert(draft).await?;
     Ok(HttpResponse::Created().json(rule))
 }
@@ -1557,7 +1563,10 @@ async fn delete_rule(
 /// The caller needs `write` on `eav_rules`.
 /// The route repeats the capability checks of the create route on the stored
 /// rule.
-/// A non-empty `read` list also needs `read` on `eav_entities`.
+/// A rule that observes entity data also needs `read` on `eav_entities`.
+/// A rule observes entity data when its `read` list is not empty, when its
+/// action is not a script, or when its condition tests an attribute.
+/// A `noop` action observes no entity data.
 /// A non-empty `write` list also needs `write` on `eav_entities`.
 /// A caller can then not enable a rule that it could not create.
 /// The toggle uses the stored version as a compare-and-set guard.
@@ -1578,7 +1587,10 @@ async fn set_rule_enabled(
         .get(&id)
         .await?
         .ok_or_else(EavApiError::not_found)?;
-    if !rule.capabilities.read.is_empty() {
+    if runtime
+        .engine()
+        .observes_entity_data(&rule.capabilities, &rule.action, &rule.condition)
+    {
         require_management(&policy, &claims.sub, ENTITIES, Action::Read).await?;
     }
     if !rule.capabilities.write.is_empty() {
@@ -1747,6 +1759,7 @@ mod tests {
             wal,
             vec![
                 Arc::new(NoopAction),
+                Arc::new(crate::rules::builtin::NoopAction),
                 Arc::new(
                     WebhookAction::new(vec![server.address().to_string()])
                         .allow_private_hosts(true),
@@ -3356,6 +3369,161 @@ mod tests {
         let mut body = rule_body();
         body["enabled"] = json!(false);
         body["capabilities"] = json!({"read": ["task"], "write": []});
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::post()
+                    .uri("/eav/rules")
+                    .set_json(body),
+                &fx.token("alice")?,
+            )
+            .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::CREATED);
+
+        fx.engine
+            .add_rule("bob".into(), "eav_rules".into(), Action::Write)
+            .await?;
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::post()
+                    .uri("/eav/rules/alpha/enabled")
+                    .set_json(json!({"enabled": true})),
+                &fx.token("bob")?,
+            )
+            .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::FORBIDDEN);
+
+        let stored = fx.runtime.rules().get("alpha").await?.expect("rule exists");
+        assert!(!stored.enabled, "the refused caller changed the rule");
+        Ok(())
+    }
+
+    /// A caller needs the entity read grant for a webhook rule.
+    ///
+    /// The rule holds an empty `read` list.
+    /// The webhook action can observe the event and the entity.
+    /// The route refuses the rule and stores nothing.
+    #[actix_web::test]
+    async fn a_webhook_rule_without_an_entity_read_grant_is_403() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        fx.engine
+            .add_rule("bob".into(), "eav_rules".into(), Action::Write)
+            .await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::post()
+                    .uri("/eav/rules")
+                    .set_json(rule_body_with_params(
+                        "webhook",
+                        json!({"url": format!("{}/hook", fx.server.uri())}),
+                    )),
+                &fx.token("bob")?,
+            )
+            .to_request(),
+        )
+        .await;
+
+        assert_eq!(res.status(), http::StatusCode::FORBIDDEN);
+        assert!(fx.runtime.rules().list_page(50, 0).await?.is_empty());
+        Ok(())
+    }
+
+    /// A noop rule with no data condition needs no entity read grant.
+    ///
+    /// The noop action reads no entity data.
+    /// The condition is `Always`.
+    /// A caller with only the rules write grant can create the rule.
+    #[actix_web::test]
+    async fn a_noop_rule_without_data_access_needs_no_entity_read_grant() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        fx.engine
+            .add_rule("bob".into(), "eav_rules".into(), Action::Write)
+            .await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::post()
+                    .uri("/eav/rules")
+                    .set_json(rule_body_with_action("noop")),
+                &fx.token("bob")?,
+            )
+            .to_request(),
+        )
+        .await;
+
+        assert_eq!(res.status(), http::StatusCode::CREATED);
+        let stored = fx.runtime.rules().get("alpha").await?.expect("rule exists");
+        assert_eq!(stored.action.kind, "noop");
+        Ok(())
+    }
+
+    /// A caller needs the entity read grant for a data condition.
+    ///
+    /// The rule holds an empty `read` list, a script action, and a `Compare`
+    /// condition.
+    /// A script action obeys the read set, but the condition can observe an
+    /// attribute value.
+    /// The route refuses the rule and stores nothing.
+    #[actix_web::test]
+    async fn a_data_condition_without_an_entity_read_grant_is_403() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        fx.engine
+            .add_rule("bob".into(), "eav_rules".into(), Action::Write)
+            .await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let mut body = rule_body_with_params("script", json!({"source": "let value = 1;"}));
+        body["condition"] = json!({
+            "Compare": { "key": "code", "op": "Eq", "value": "s1" }
+        });
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::post()
+                    .uri("/eav/rules")
+                    .set_json(body),
+                &fx.token("bob")?,
+            )
+            .to_request(),
+        )
+        .await;
+
+        assert_eq!(res.status(), http::StatusCode::FORBIDDEN);
+        assert!(fx.runtime.rules().list_page(50, 0).await?.is_empty());
+        Ok(())
+    }
+
+    /// The enable route checks a data condition on the stored rule.
+    ///
+    /// The stored rule holds an empty `read` list, a script action, and a
+    /// `Compare` condition.
+    /// A caller with only the rules write grant cannot enable it.
+    /// The refused caller leaves the rule disabled.
+    #[actix_web::test]
+    async fn a_caller_without_entity_read_cannot_enable_a_data_condition() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        assert!(fx.engine.claim_superadmin("alice").await?);
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let mut body = rule_body_with_params("script", json!({"source": "let value = 1;"}));
+        body["enabled"] = json!(false);
+        body["condition"] = json!({
+            "Compare": { "key": "code", "op": "Eq", "value": "s1" }
+        });
         let res = actix_test::call_service(
             &app,
             auth(

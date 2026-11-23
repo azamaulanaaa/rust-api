@@ -549,7 +549,7 @@ event kinds and schemas. The condition tests entity state and the changed
 attributes. A condition tree is limited to 16 levels. The action reference names
 one registered action and holds its parameters.
 
-A rule also declares the schema ids that its script may read and write:
+A rule also declares the schema ids that it may read and write:
 
 ```json
 "capabilities": { "read": ["task"], "write": ["task"] }
@@ -560,12 +560,19 @@ contain a duplicate. An id does not need a schema that exists, so you can create
 a rule before its schema.
 
 Authorization has two levels. The author needs `read` on `eav_entities` for a
-non-empty `read` list. The author needs `write` on `eav_entities` for a
-non-empty `write` list. The rule then narrows that collection grant to the
-listed schemas. The create and replace route checks these grants. The enable
-route repeats the check on the stored rule. A caller without the entity grants
+non-empty `read` list, for a non-script action, or for a condition that tests
+an attribute. The author needs `write` on `eav_entities` for a non-empty
+`write` list. The rule then narrows that collection grant to the listed
+schemas. The create and replace route checks these grants. The enable route
+repeats the check on the stored rule. A caller without the entity grants
 therefore cannot enable a rule with a broad read or write list. There are no
 per-schema grants, so the collection grant is the author-level boundary.
+
+The engine applies the `read` list to every observation. A non-script action
+and a non-script condition see only the allowed attributes, the allowed
+changes, and the allowed snapshot keys. A rule with an empty `read` list sees
+no attribute value, but it still runs. A `noop` action reads no entity data,
+so a `noop` rule with no data condition does not need the `read` grant.
 
 The durable rule store lives on OxKV and keeps an index for each trigger event
 and schema pair. The runner tails the shared change feed and runs the matching

@@ -51,6 +51,7 @@ use crate::fs::s3::S3ClientConfig;
 use crate::rules::action::RuleAction;
 use crate::rules::engine::RuleEngine;
 use crate::rules::store::RuleStore;
+use crate::sleep_unless_cancelled;
 use crate::sync::wal::Wal;
 
 /// The first backoff delay after a background loop fails.
@@ -65,11 +66,6 @@ const LOOP_BACKOFF_BASE: Duration = Duration::from_millis(10);
 
 /// The largest backoff delay after a background loop fails.
 const LOOP_BACKOFF_MAX: Duration = Duration::from_secs(60);
-
-/// The longest single sleep in a backoff wait.
-///
-/// A shorter slice lets a cancelled runtime stop before the full delay ends.
-const BACKOFF_SLICE: Duration = Duration::from_millis(25);
 
 /// One supervised background loop.
 ///
@@ -743,7 +739,8 @@ impl EavRuntime {
     /// Flushes the entity outbox until `cancel` fires.
     ///
     /// The call sleeps for `interval` between flushes.
-    /// It checks cancellation after each sleep and before each flush.
+    /// The sleep stops when the token fires.
+    /// It checks cancellation before each flush.
     async fn run_outbox<C: CancelToken>(
         &self,
         cancel: C,
@@ -753,8 +750,7 @@ impl EavRuntime {
             if cancel.is_cancelled() {
                 return Ok(());
             }
-            tokio::time::sleep(interval).await;
-            if cancel.is_cancelled() {
+            if sleep_unless_cancelled(&cancel, interval).await {
                 return Ok(());
             }
             let started = Instant::now();
@@ -864,6 +860,7 @@ impl EavRuntime {
     /// Deletes old execution markers until `cancel` fires.
     ///
     /// The call sleeps for `interval` between passes.
+    /// The sleep stops when the token fires.
     /// It deletes the markers older than `retention`.
     /// A failed cleanup returns the error to the supervisor, which sets the
     /// failure flag of the marker cleanup and restarts the loop after a
@@ -882,8 +879,7 @@ impl EavRuntime {
             if cancel.is_cancelled() {
                 return Ok(());
             }
-            tokio::time::sleep(interval).await;
-            if cancel.is_cancelled() {
+            if sleep_unless_cancelled(&cancel, interval).await {
                 return Ok(());
             }
             let older_than = chrono::Utc::now().timestamp().saturating_sub(retention);
@@ -902,6 +898,7 @@ impl EavRuntime {
     /// Fires the due timers until `cancel` fires.
     ///
     /// The call sleeps for `interval` between passes.
+    /// The sleep stops when the token fires.
     /// A failed pass returns the error to the supervisor, which sets the
     /// failure flag of the timer pass and restarts the loop after a backoff
     /// delay.
@@ -919,8 +916,7 @@ impl EavRuntime {
             if cancel.is_cancelled() {
                 return Ok(());
             }
-            tokio::time::sleep(interval).await;
-            if cancel.is_cancelled() {
+            if sleep_unless_cancelled(&cancel, interval).await {
                 return Ok(());
             }
             let now = chrono::Utc::now().timestamp();
@@ -951,24 +947,6 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     } else {
         "non-string panic payload".to_string()
     }
-}
-
-/// Waits for `delay` in short slices and stops when `cancel` fires.
-///
-/// The call checks `cancel` before each slice and after the last slice.
-/// It returns `true` when the token is cancelled.
-/// A zero delay does not sleep and checks the token one time.
-async fn sleep_unless_cancelled<C: CancelToken>(cancel: &C, delay: Duration) -> bool {
-    let mut remaining = delay;
-    while !remaining.is_zero() {
-        if cancel.is_cancelled() {
-            return true;
-        }
-        let slice = remaining.min(BACKOFF_SLICE);
-        tokio::time::sleep(slice).await;
-        remaining = remaining.saturating_sub(slice);
-    }
-    cancel.is_cancelled()
 }
 
 /// Returns `duration`, or one second when it is zero.
@@ -2260,6 +2238,39 @@ mod tests {
         assert!(!cancelled);
         assert!(started.elapsed() >= Duration::from_millis(20));
         assert!(!sleep_unless_cancelled(&cancel, Duration::ZERO).await);
+    }
+
+    /// A long cleanup interval does not delay a cancelled runtime.
+    ///
+    /// The test uses paused time and one hour as the interval.
+    /// The token fires at once.
+    /// A cancellation-aware sleep ends the loop after one short slice.
+    #[tokio::test(start_paused = true)]
+    async fn a_marker_cleanup_with_a_long_interval_stops_on_cancellation() {
+        let runtime = build_runtime(Vec::new()).await;
+        let cancel = CancellationToken::new();
+        let handle = tokio::spawn({
+            let runtime = runtime.clone();
+            let cancel = cancel.clone();
+            async move {
+                runtime
+                    .run_execution_gc(
+                        cancel,
+                        Duration::from_secs(3_600),
+                        Duration::from_secs(2_592_000),
+                    )
+                    .await
+            }
+        });
+        tokio::task::yield_now().await;
+        cancel.cancel();
+
+        let result = tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("the cleanup loop must stop after cancellation");
+        result
+            .expect("the cleanup task must not panic")
+            .expect("a normal cancellation must return Ok");
     }
 
     #[tokio::test]
