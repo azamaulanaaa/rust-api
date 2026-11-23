@@ -313,26 +313,30 @@ fn register_modules(
 macro_rules! wired_app {
     ($modules:expr, $readiness:expr, $cors_origins:expr, $bucket:expr, $expose_docs:expr) => {{
         apply_limits(App::new())
-            .wrap(cors($cors_origins))
             .wrap(middleware::request_id::RequestIdMiddleware)
             .wrap(actix_web::middleware::Compress::default())
             .wrap(middleware::request_tracing::RequestTracingMiddleware)
             .wrap(middleware::bearer_token::BearerTokenMiddleware)
-            // Outermost, so it also limits the routes that a limiter keyed on
-            // the subject cannot reach. One example is `/auth/login`, which
-            // makes an outbound call to the identity provider. The health
-            // probes are exempt inside the middleware. A zero limit leaves
-            // the limiter installed but inactive. It costs one atomic load
-            // for each request.
+            // The limiter sits inside CORS. A preflight is then answered
+            // before the limiter can spend a token. See the CORS comment
+            // below.
             .wrap(crate::limits::RateLimit::new($bucket.clone()))
             // The security headers sit inside the server time and outside
             // the rate limiter. Every response then carries both headers,
             // including a refusal from the rate limiter.
             .wrap(middleware::security_headers::SecurityHeaders)
-            // Outermost, so every response carries the server time. This
-            // includes refusals from the rate limiter and errors from the
-            // handlers below.
+            // Every response that the chain builds carries the server time.
+            // This includes refusals from the rate limiter and errors from
+            // the handlers below.
             .wrap(middleware::server_time::ServerTimeMiddleware)
+            // CORS is the outermost layer. actix applies the last `.wrap` as
+            // the outermost one. In the other order the CORS layer sees only
+            // the responses of the layers inside it. A `429` from the rate
+            // limiter then goes out without `Access-Control-Allow-Origin`,
+            // and a browser reports a network error instead of the real
+            // refusal. A preflight is also answered here, before the
+            // limiter, so it does not spend a token.
+            .wrap(cors($cors_origins))
             .configure(health_routes)
             .configure(|cfg| {
                 if let Err(e) = check_prefixes($modules) {
@@ -721,6 +725,89 @@ mod tests {
             test::call_service(&app, test::TestRequest::get().uri("/missing").to_request()).await;
         assert_eq!(missing.status(), 404);
         assert!(missing.headers().contains_key("x-server-time-ms"));
+    }
+
+    /// A browser must be able to read a rate-limit refusal. Without the CORS
+    /// header the browser reports a network error, and the client cannot tell
+    /// a limit from an outage.
+    #[actix_web::test]
+    async fn a_rate_limit_refusal_carries_the_cors_origin() {
+        let service = ApiService::new()
+            .register_module(Box::new(PingModule))
+            .with_cors_origins(vec!["https://app.example.com".to_string()])
+            .with_rate_limit(crate::limits::TokenBucket::new(1, 1));
+        let app = served!(service);
+
+        let request = || {
+            test::TestRequest::get()
+                .uri("/ping")
+                .insert_header(("Origin", "https://app.example.com"))
+                .to_request()
+        };
+
+        let first = test::call_service(&app, request()).await;
+        assert_eq!(first.status(), 200);
+
+        let refused = test::call_service(&app, request()).await;
+        assert_eq!(refused.status(), 429);
+        assert_eq!(
+            refused
+                .headers()
+                .get("access-control-allow-origin")
+                .and_then(|value| value.to_str().ok()),
+            Some("https://app.example.com"),
+            "a 429 from the rate limiter must carry the CORS origin"
+        );
+    }
+
+    /// A preflight is not a request for the resource. It must not spend a
+    /// token, or a browser with a full bucket cannot send the real request.
+    #[actix_web::test]
+    async fn a_cors_preflight_does_not_spend_a_rate_limit_token() {
+        let service = ApiService::new()
+            .register_module(Box::new(PingModule))
+            .with_cors_origins(vec!["https://app.example.com".to_string()])
+            .with_rate_limit(crate::limits::TokenBucket::new(1, 1));
+        let app = served!(service);
+
+        let preflight = test::call_service(
+            &app,
+            test::TestRequest::default()
+                .method(Method::OPTIONS)
+                .uri("/ping")
+                .insert_header(("Origin", "https://app.example.com"))
+                .insert_header(("Access-Control-Request-Method", "GET"))
+                .to_request(),
+        )
+        .await;
+        assert!(
+            preflight.status().is_success(),
+            "the preflight failed with {}",
+            preflight.status()
+        );
+        assert_eq!(
+            preflight
+                .headers()
+                .get("access-control-allow-origin")
+                .and_then(|value| value.to_str().ok()),
+            Some("https://app.example.com")
+        );
+
+        // The one token is still there, so the first real request succeeds.
+        let request = || {
+            test::TestRequest::get()
+                .uri("/ping")
+                .insert_header(("Origin", "https://app.example.com"))
+                .to_request()
+        };
+        let first = test::call_service(&app, request()).await;
+        assert_eq!(
+            first.status(),
+            200,
+            "the preflight must not spend the only token"
+        );
+        let second = test::call_service(&app, request()).await;
+        assert_eq!(second.status(), 429);
     }
 
     /// A full bucket cannot refuse a health probe. A refused probe tells the
