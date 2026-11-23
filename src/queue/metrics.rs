@@ -5,6 +5,7 @@ use opentelemetry::global;
 use opentelemetry::metrics::{Counter, Gauge, Histogram, Meter};
 
 /// Holds the OpenTelemetry instruments for one queue backend.
+#[derive(Debug)]
 pub struct QueueMetrics {
     backend: &'static str,
     enqueued: Counter<u64>,
@@ -21,6 +22,9 @@ pub struct QueueMetrics {
     /// Number of calls to [`QueueMetrics::record_lease_lost`] in this process.
     #[cfg(test)]
     lease_lost_total: std::sync::atomic::AtomicU64,
+    /// Last depth that this handle recorded. The field exists for tests.
+    #[cfg(test)]
+    depth_value: std::sync::atomic::AtomicU64,
 }
 
 impl QueueMetrics {
@@ -41,6 +45,8 @@ impl QueueMetrics {
             failed_total: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             lease_lost_total: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            depth_value: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -107,6 +113,15 @@ impl QueueMetrics {
     pub fn record_depth(&self, depth: u64) {
         let attrs = [KeyValue::new("queue.backend", self.backend)];
         self.depth.record(depth, &attrs);
+        #[cfg(test)]
+        self.depth_value
+            .store(depth, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Returns the depth that this handle last recorded. The method exists for tests.
+    #[cfg(test)]
+    pub(crate) fn depth_value(&self) -> u64 {
+        self.depth_value.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Records processing duration in seconds.

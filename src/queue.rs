@@ -69,6 +69,7 @@ pub struct LeasedJob {
 }
 
 /// Status of a job in the queue.
+#[non_exhaustive]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum JobStatus {
     /// The job is waiting to run.
@@ -108,6 +109,7 @@ pub enum JobStatus {
 }
 
 /// Retry instruction passed to [`JobQueue::nack`].
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub enum RetryPolicy {
     /// Do not retry the job.
@@ -120,6 +122,7 @@ pub enum RetryPolicy {
 }
 
 /// Retry decision that a [`JobError`] carries.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobRetry {
     /// Do not retry the job.
@@ -185,11 +188,12 @@ impl JobError {
 }
 
 /// Error returned by queue operations.
+#[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 pub enum QueueError {
     /// Underlying store failure.
     #[error("queue store error: {0}")]
-    Store(String),
+    Store(#[source] Box<dyn std::error::Error + Send + Sync>),
     /// The job does not exist.
     #[error("queue job not found: {0}")]
     NotFound(JobId),
@@ -213,13 +217,39 @@ pub enum QueueError {
     Io(String),
 }
 
+/// Error text that has no upstream cause.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct QueueMessage(String);
+
+impl QueueError {
+    /// Wraps a store error so callers can read its source.
+    pub(crate) fn store(error: impl std::error::Error + Send + Sync + 'static) -> Self {
+        Self::Store(Box::new(error))
+    }
+
+    /// Wraps store error text that has no upstream cause.
+    pub(crate) fn store_message(message: impl Into<String>) -> Self {
+        Self::Store(Box::new(QueueMessage(message.into())))
+    }
+}
+
 /// Contract for a job queue backend.
 #[async_trait]
 pub trait JobQueue: Send + Sync {
     /// Adds a job. Returns its id.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`QueueError::Invalid`] when `max_attempts` is zero.
+    /// Returns [`QueueError::Store`] when the backend write fails.
     async fn enqueue(&self, job: Job) -> Result<JobId, QueueError>;
 
     /// Reserves up to `limit` jobs for `worker`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`QueueError::Store`] when a backend read or write fails.
     async fn reserve(
         &self,
         worker: &str,
@@ -232,6 +262,13 @@ pub trait JobQueue: Send + Sync {
     /// The call fails with [`QueueError::LeaseExpired`] or
     /// [`QueueError::AlreadyLeased`] when `lease` is not the current token.
     /// A failed call does not change the job.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`QueueError::NotFound`] when the job does not exist.
+    /// Returns [`QueueError::LeaseExpired`] or [`QueueError::AlreadyLeased`]
+    /// when the lease is gone or belongs to another worker.
+    /// Returns [`QueueError::Store`] when a backend write fails.
     async fn ack(
         &self,
         job_id: JobId,
@@ -244,6 +281,13 @@ pub trait JobQueue: Send + Sync {
     /// The call fails with [`QueueError::LeaseExpired`] or
     /// [`QueueError::AlreadyLeased`] when `lease` is not the current token.
     /// A failed call does not change the job.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`QueueError::NotFound`] when the job does not exist.
+    /// Returns [`QueueError::LeaseExpired`] or [`QueueError::AlreadyLeased`]
+    /// when the lease is gone or belongs to another worker.
+    /// Returns [`QueueError::Store`] when a backend write fails.
     async fn nack(
         &self,
         job_id: JobId,
@@ -258,6 +302,13 @@ pub trait JobQueue: Send + Sync {
     /// [`QueueError::LeaseExpired`] or [`QueueError::AlreadyLeased`] when
     /// `lease` is not the current token. A failed call does not change the
     /// job.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`QueueError::NotFound`] when the job does not exist.
+    /// Returns [`QueueError::LeaseExpired`] or [`QueueError::AlreadyLeased`]
+    /// when the lease is gone or belongs to another worker.
+    /// Returns [`QueueError::Store`] when a backend write fails.
     async fn extend_lease(
         &self,
         job_id: JobId,
@@ -266,6 +317,11 @@ pub trait JobQueue: Send + Sync {
     ) -> Result<LeaseToken, QueueError>;
 
     /// Returns the status of a job.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`QueueError::NotFound`] when the job does not exist.
+    /// Returns [`QueueError::Store`] when a backend read or write fails.
     async fn status(&self, job_id: JobId) -> Result<JobStatus, QueueError>;
 }
 
@@ -276,6 +332,10 @@ pub trait JobHandler: Send + Sync {
     fn kind(&self) -> &'static str;
 
     /// Processes the job. Returns an optional result.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error that the handler reports.
     async fn handle(&self, job: &Job) -> Result<Option<Vec<u8>>, anyhow::Error>;
 }
 
@@ -301,6 +361,17 @@ pub(crate) fn lease_millis(duration: Duration) -> i64 {
         millis.saturating_add(1)
     };
     i64::try_from(millis).unwrap_or(i64::MAX)
+}
+
+/// Converts a delay to whole seconds for [`Job::scheduled_at`].
+///
+/// The call rounds a non-zero fraction up to the next second.
+/// The result saturates at `i64::MAX`.
+pub(crate) fn delay_secs(delay: Duration) -> i64 {
+    let secs = delay
+        .as_secs()
+        .saturating_add(u64::from(delay.subsec_nanos() != 0));
+    i64::try_from(secs).unwrap_or(i64::MAX)
 }
 
 #[cfg(feature = "queue-rabbitmq")]
@@ -343,4 +414,31 @@ pub fn extract_trace_context(headers: &BTreeMap<String, String>) -> opentelemetr
         }
     }
     global::get_text_map_propagator(|propagator| propagator.extract(&MapExtractor(headers)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_sub_second_delay_rounds_up_to_one_second() {
+        assert_eq!(delay_secs(Duration::from_millis(1)), 1);
+    }
+
+    #[test]
+    fn a_whole_second_delay_keeps_its_value() {
+        assert_eq!(delay_secs(Duration::from_secs(3)), 3);
+    }
+
+    #[test]
+    fn a_delay_above_i64_max_saturates() {
+        assert_eq!(delay_secs(Duration::from_secs(u64::MAX)), i64::MAX);
+    }
+
+    #[test]
+    fn a_store_error_keeps_its_source() {
+        let error = QueueError::store(std::io::Error::other("disk full"));
+        assert!(std::error::Error::source(&error).is_some());
+        assert!(error.to_string().contains("disk full"));
+    }
 }

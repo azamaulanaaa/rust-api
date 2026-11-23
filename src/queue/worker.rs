@@ -42,6 +42,19 @@ pub struct QueueWorker {
     metrics: QueueMetrics,
 }
 
+impl std::fmt::Debug for QueueWorker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QueueWorker")
+            .field("worker_id", &self.worker_id)
+            .field("batch_size", &self.batch_size)
+            .field("lease", &self.lease)
+            .field("poll_interval", &self.poll_interval)
+            .field("retry_base", &self.retry_base)
+            .field("retry_max", &self.retry_max)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Returns the retry delay for an attempt.
 ///
 /// The first failure uses `base`. Each later failure doubles the delay.
@@ -141,8 +154,10 @@ impl QueueWorker {
     }
 
     /// Sets the poll interval.
+    ///
+    /// The call clamps the value to at least one millisecond.
     pub fn with_poll_interval(mut self, interval: Duration) -> Self {
-        self.poll_interval = interval;
+        self.poll_interval = interval.max(Duration::from_millis(1));
         self
     }
 
@@ -647,6 +662,18 @@ mod tests {
         let base = Duration::from_secs(1);
         let max = Duration::from_secs(60);
         assert_eq!(retry_delay(u32::MAX, base, max), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn the_worker_clamps_a_zero_poll_interval() {
+        let queue = Arc::new(MemoryQueue::new());
+        let worker = QueueWorker::new(
+            Arc::clone(&queue) as Arc<dyn JobQueue>,
+            Vec::new(),
+            "worker-1".to_string(),
+        )
+        .with_poll_interval(Duration::ZERO);
+        assert!(worker.poll_interval >= Duration::from_millis(1));
     }
 
     #[tokio::test]
