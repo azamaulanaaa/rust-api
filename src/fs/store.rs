@@ -1,6 +1,8 @@
 //! `oxkv` persistence for upload sessions, file records, and relations.
 //! The store uses [`oxkv::OxKvStore`], which is an LSM tree on S3.
 //! Keys: `fs:uploads:{id}:meta`, `fs:files:{id}:meta`, `fs:rel:{type}:{id}:{file}`, `fs:files:{id}:refs`.
+//! The relation key escapes `:` and `\` in the row type and the row id, so a
+//! row id may contain a colon. See [`crate::fs::relation`].
 //! The store scales per user. Each `OxKvStore` uses its own key prefix,
 //! for example `oxkv/fs`, on the shared `ObjectStore`.
 
@@ -19,7 +21,10 @@ use tokio::sync::RwLock;
 
 use crate::fencing::Latch;
 use crate::fs::error::FsError;
-use crate::fs::relation::{REL_PREFIX, RefInfo, refs_key, rel_key};
+use crate::fs::relation::{
+    REL_PREFIX, RefInfo, legacy_rel_key, legacy_rel_prefix_for_row, parse_rel_key, refs_key,
+    rel_key, rel_prefix_for_row,
+};
 
 /// Key prefix under which finalized file records live.
 const FILES_PREFIX: &str = "fs:files:";
@@ -595,16 +600,26 @@ impl FsStore {
         let claim = self.file_lock(file_id);
         let _held = claim.acquire().await;
         let rel = rel_key(row_type, row_id, file_id);
+        // A relation that an older build stored carries no escape. The
+        // function reads that key as attached, so that a later detach removes
+        // it instead of a second relation.
+        let legacy = legacy_rel_key(row_type, row_id, file_id);
         let refs = refs_key(file_id);
         let g = self.inner.write().await;
         for _attempt in 0..RELATION_ATTEMPTS {
             let tx = g.begin_tx().map_err(|e| self.store_err(e))?;
-            if tx
+            let attached = tx
                 .get_bytes(&rel)
                 .await
                 .map_err(|e| self.store_err(e))?
                 .is_some()
-            {
+                || (legacy != rel
+                    && tx
+                        .get_bytes(&legacy)
+                        .await
+                        .map_err(|e| self.store_err(e))?
+                        .is_some());
+            if attached {
                 let info = read_ref_info(&tx, file_id, self.latch, self.primary).await?;
                 tx.rollback().await.map_err(|e| self.store_err(e))?;
                 return Ok(info.count);
@@ -652,20 +667,33 @@ impl FsStore {
         let claim = self.file_lock(file_id);
         let _held = claim.acquire().await;
         let rel = rel_key(row_type, row_id, file_id);
+        // A relation that an older build stored carries no escape. The
+        // function removes that key when the escaped key is absent.
+        let legacy = legacy_rel_key(row_type, row_id, file_id);
         let refs = refs_key(file_id);
         let g = self.inner.write().await;
         for _attempt in 0..RELATION_ATTEMPTS {
             let tx = g.begin_tx().map_err(|e| self.store_err(e))?;
-            if tx
+            let target = if tx
                 .get_bytes(&rel)
                 .await
                 .map_err(|e| self.store_err(e))?
-                .is_none()
+                .is_some()
             {
+                rel.clone()
+            } else if legacy != rel
+                && tx
+                    .get_bytes(&legacy)
+                    .await
+                    .map_err(|e| self.store_err(e))?
+                    .is_some()
+            {
+                legacy.clone()
+            } else {
                 let info = read_ref_info(&tx, file_id, self.latch, self.primary).await?;
                 tx.rollback().await.map_err(|e| self.store_err(e))?;
                 return Ok(info.count);
-            }
+            };
             let expected = tx.get_bytes(&refs).await.map_err(|e| self.store_err(e))?;
             let mut info = read_ref_info(&tx, file_id, self.latch, self.primary).await?;
             info.count = info.count.saturating_sub(1);
@@ -673,7 +701,7 @@ impl FsStore {
                 info.orphan_since = Some(chrono::Utc::now().timestamp());
             }
             let val = serde_json::to_vec(&info).map_err(|e| FsError::Internal(e.to_string()))?;
-            tx.delete_if(&rel, b"1")
+            tx.delete_if(&target, b"1")
                 .await
                 .map_err(|e| self.store_err(e))?;
             tx.compare_and_set(&refs, expected.as_deref(), &val)
@@ -681,7 +709,7 @@ impl FsStore {
                 .map_err(|e| self.store_err(e))?;
             match tx.commit().await {
                 Ok(()) => return Ok(info.count),
-                Err(StoreError::TxConflict { key, .. }) if key == rel => {
+                Err(StoreError::TxConflict { key, .. }) if key == target => {
                     let info = read_ref_info(&*g, file_id, self.latch, self.primary).await?;
                     return Ok(info.count);
                 }
@@ -695,20 +723,20 @@ impl FsStore {
     }
 
     /// Lists rows referencing a file (scan bounded to `fs:rel:`).
+    ///
+    /// The function removes the known `:{file_id}` suffix before it splits
+    /// the row pair. A row id may contain a colon, so the split must keep the
+    /// whole remainder.
     pub async fn rows_for_file(&self, file_id: &str) -> Result<Vec<(String, String)>, FsError> {
-        let suffix = format!(":{file_id}");
         let keys = self.scan_keys_prefix(REL_PREFIX).await?;
         let mut out = Vec::new();
         for key in keys {
-            if key.starts_with(REL_PREFIX) && key.ends_with(&suffix) {
-                let rest = &key[REL_PREFIX.len()..];
-                if let Some((ty, rem)) = rest.split_once(':')
-                    && let Some((rid, _)) = rem.split_once(':')
-                {
-                    out.push((ty.to_string(), rid.to_string()));
-                }
+            if let Some(row) = parse_rel_key(&key, file_id) {
+                out.push(row);
             }
         }
+        out.sort();
+        out.dedup();
         Ok(out)
     }
 
@@ -719,20 +747,30 @@ impl FsStore {
     /// that a rule changed.
     /// The method then avoids a scan of the whole store for a full
     /// rebuild.
+    ///
+    /// The scan also covers the unescaped prefix that an older build wrote.
+    /// The two prefixes differ only when the row type or the row id contains
+    /// a colon or a backslash.
     pub async fn files_for_row(
         &self,
         row_type: &str,
         row_id: &str,
     ) -> Result<Vec<String>, FsError> {
-        let prefix = crate::fs::relation::rel_prefix_for_row(row_type, row_id);
-        let keys = self.scan_keys_prefix(&prefix).await?;
+        let prefix = rel_prefix_for_row(row_type, row_id);
+        let legacy = legacy_rel_prefix_for_row(row_type, row_id);
         let mut out = Vec::new();
-        for key in keys {
-            if let Some(file_id) = key.strip_prefix(&prefix)
-                && !file_id.is_empty()
-                && !file_id.contains(':')
-            {
-                out.push(file_id.to_string());
+        let mut scans = vec![prefix.as_str()];
+        if legacy != prefix {
+            scans.push(legacy.as_str());
+        }
+        for scan in scans {
+            for key in self.scan_keys_prefix(scan).await? {
+                if let Some(file_id) = key.strip_prefix(scan)
+                    && !file_id.is_empty()
+                    && !file_id.contains(':')
+                {
+                    out.push(file_id.to_string());
+                }
             }
         }
         out.sort();
@@ -1142,6 +1180,7 @@ mod tests {
     use super::{FileRecord, FsStore, PersistedMultipart, SCAN_PAGE, UploadSession};
     use crate::db::build_test_store;
     use crate::fencing::Latch;
+    use crate::fs::error::FsError;
     use oxkv::GetSet as _;
     use std::sync::Arc;
 
@@ -1158,8 +1197,6 @@ mod tests {
     /// Otherwise a flaky S3 would read as a lost lease.
     #[tokio::test]
     async fn only_a_fenced_master_write_latches() {
-        use crate::fs::error::FsError;
-
         let master =
             FsStore::primary(build_test_store(&crate::db::test_prefix("latch-master")).await);
         let replica =
@@ -1747,6 +1784,115 @@ mod tests {
         // No marker and no ref-count entry stays behind.
         assert!(store.rows_for_file("rel-file").await?.is_empty());
         assert_eq!(store.get_ref_info("rel-file").await?.count, 0);
+        Ok(())
+    }
+
+    /// A colon inside a row id must survive the round trip through a key.
+    #[tokio::test]
+    async fn a_row_id_with_a_colon_round_trips() -> anyhow::Result<()> {
+        let store = test_store().await;
+        let rec = FileRecord {
+            id: "colon-file".to_string(),
+            name: "c.txt".to_string(),
+            mimetype: "text/plain".to_string(),
+            size: 1,
+            s3_key: "files/colon-file".to_string(),
+            owner_sub: "bob".to_string(),
+            created_at: 0,
+        };
+        store.save_file(&rec).await?;
+        store.attach("invoice", "12:3", "colon-file").await?;
+
+        assert_eq!(
+            store.rows_for_file("colon-file").await?,
+            vec![("invoice".to_string(), "12:3".to_string())],
+            "`rows_for_file` must keep the whole row id and not stop at the second colon"
+        );
+        assert_eq!(
+            store.files_for_row("invoice", "12:3").await?,
+            vec!["colon-file".to_string()]
+        );
+        assert_eq!(store.get_ref_info("colon-file").await?.count, 1);
+
+        store.detach("invoice", "12:3", "colon-file").await?;
+        assert!(store.rows_for_file("colon-file").await?.is_empty());
+        assert_eq!(store.get_ref_info("colon-file").await?.count, 0);
+        Ok(())
+    }
+
+    /// A colon in the type and a colon in the id must not share one key.
+    #[tokio::test]
+    async fn a_colon_in_the_type_does_not_collide_with_a_colon_in_the_id() -> anyhow::Result<()> {
+        let store = test_store().await;
+        store.attach("a:b", "c", "f1").await?;
+        store.attach("a", "b:c", "f2").await?;
+
+        assert_eq!(
+            store.files_for_row("a:b", "c").await?,
+            vec!["f1".to_string()]
+        );
+        assert_eq!(
+            store.files_for_row("a", "b:c").await?,
+            vec!["f2".to_string()]
+        );
+        assert_eq!(
+            store.rows_for_file("f1").await?,
+            vec![("a:b".to_string(), "c".to_string())]
+        );
+        assert_eq!(
+            store.rows_for_file("f2").await?,
+            vec![("a".to_string(), "b:c".to_string())]
+        );
+
+        store.detach("a:b", "c", "f1").await?;
+        assert_eq!(store.get_ref_info("f1").await?.count, 0);
+        assert_eq!(
+            store.get_ref_info("f2").await?.count,
+            1,
+            "the detach of one row must not decrement the other row"
+        );
+        Ok(())
+    }
+
+    /// A relation that an older build stored carries no escape.
+    ///
+    /// The attach must see that relation, and the detach must remove it.
+    #[tokio::test]
+    async fn a_legacy_relation_key_stays_attached_and_detaches() -> anyhow::Result<()> {
+        let store = test_store().await;
+        let rel = crate::fs::relation::legacy_rel_key("invoice", "12:3", "legacy-file");
+        let refs = crate::fs::relation::refs_key("legacy-file");
+        let info = crate::fs::relation::RefInfo {
+            count: 1,
+            orphan_since: None,
+        };
+        let val = serde_json::to_vec(&info).map_err(|e| FsError::Internal(e.to_string()))?;
+        {
+            let handle = store.kv_handle();
+            let writer = handle.write().await;
+            writer.set_bytes(&rel, b"1").await.map_err(FsError::from)?;
+            writer.set_bytes(&refs, &val).await.map_err(FsError::from)?;
+        }
+
+        assert_eq!(
+            store.attach("invoice", "12:3", "legacy-file").await?,
+            1,
+            "an attach must not add a second relation for an existing old key"
+        );
+        assert_eq!(
+            store.files_for_row("invoice", "12:3").await?,
+            vec!["legacy-file".to_string()]
+        );
+        assert_eq!(
+            store.rows_for_file("legacy-file").await?,
+            vec![("invoice".to_string(), "12:3".to_string())]
+        );
+        assert_eq!(
+            store.detach("invoice", "12:3", "legacy-file").await?,
+            0,
+            "the detach must remove the old key and decrement the count"
+        );
+        assert!(store.rows_for_file("legacy-file").await?.is_empty());
         Ok(())
     }
 
