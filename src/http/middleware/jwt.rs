@@ -14,7 +14,8 @@ use std::{
 };
 
 use actix_web::{
-    Error, FromRequest, HttpMessage, HttpRequest,
+    Error, FromRequest, HttpMessage, HttpRequest, ResponseError,
+    body::{BoxBody, EitherBody, MessageBody},
     dev::{Payload, Service, ServiceRequest, ServiceResponse, Transform, forward_ready},
     http::header::SET_COOKIE,
 };
@@ -241,6 +242,11 @@ where
         let issuer_template = IssuerTemplate::parse(issuer, Vec::new());
         let mut validation = Validation::new(Algorithm::RS256);
         validation.set_audience(&[audience]);
+        // `Validation::new` requires only `exp`. Without this call a token
+        // that omits `iss` or `aud` passes validation. The per-request clone
+        // inherits the set below, so the templated-issuer path is covered
+        // after it sets the resolved issuer.
+        validation.set_required_spec_claims(&["exp", "iss", "aud"]);
         if issuer_template.is_none() {
             validation.set_issuer(&[issuer]);
         }
@@ -276,10 +282,10 @@ impl<S, B, C> Transform<S, ServiceRequest> for JwtClaimsMiddleware<C>
 where
     S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = Error> + 'static,
     S::Future: 'static,
-    B: 'static,
+    B: MessageBody + 'static,
     C: DeserializeOwned + Clone + 'static,
 {
-    type Response = ServiceResponse<B>;
+    type Response = ServiceResponse<EitherBody<B, BoxBody>>;
     type Error = Error;
     type Transform = JwtClaimsMiddlewareService<S, C>;
     type InitError = ();
@@ -353,10 +359,10 @@ impl<S, B, C> Service<ServiceRequest> for JwtClaimsMiddlewareService<S, C>
 where
     S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = Error> + 'static,
     S::Future: 'static,
-    B: 'static,
+    B: MessageBody + 'static,
     C: DeserializeOwned + 'static,
 {
-    type Response = ServiceResponse<B>;
+    type Response = ServiceResponse<EitherBody<B, BoxBody>>;
     type Error = Error;
     type Future = LocalBoxFuture<'static, Result<Self::Response, Self::Error>>;
 
@@ -482,8 +488,17 @@ where
                     }
                     Err((reason, hard)) if hard => {
                         // Fail closed. A token that the tenant gate rejects
-                        // never reaches a handler.
-                        return Err(ApiError::InvalidCredentials(reason.into()).into());
+                        // never reaches a handler. The response is built here
+                        // and returned as `Ok`, so the middleware outside this
+                        // one still sees it and adds its headers. An `Err`
+                        // leaves the chain and loses those headers.
+                        return Ok(req.into_response(
+                            ResponseError::error_response(&ApiError::InvalidCredentials(
+                                reason.into(),
+                            ))
+                            .map_into_boxed_body()
+                            .map_into_right_body(),
+                        ));
                     }
                     Err((reason, _)) => {
                         tracing::warn!(
@@ -535,7 +550,7 @@ where
                     ),
                 );
             }
-            Ok(resp)
+            Ok(resp.map_into_left_body())
         })
     }
 }
@@ -708,7 +723,7 @@ mod tests {
             format!("{}/{}/v2.0", server.uri(), tenant_guid),
             "99999999-9999-9999-9999-999999999999",
         )?;
-        let res = actix_web::test::try_call_service(
+        let res = actix_web::test::call_service(
             &svc,
             actix_web::test::TestRequest::get()
                 .uri("/protected")
@@ -716,8 +731,7 @@ mod tests {
                 .to_request(),
         )
         .await;
-        let err = res.expect_err("forged tenant binding must be rejected");
-        assert_eq!(err.as_response_error().status_code(), 401);
+        assert_eq!(res.status(), 401, "forged tenant binding must be rejected");
 
         // A token without a tenant claim cannot resolve the template.
         let no_tid = sign_rs256(
@@ -730,7 +744,7 @@ mod tests {
             "kid-t",
             &enc,
         )?;
-        let res = actix_web::test::try_call_service(
+        let res = actix_web::test::call_service(
             &svc,
             actix_web::test::TestRequest::get()
                 .uri("/protected")
@@ -738,8 +752,7 @@ mod tests {
                 .to_request(),
         )
         .await;
-        let err = res.expect_err("missing tid must be rejected");
-        assert_eq!(err.as_response_error().status_code(), 401);
+        assert_eq!(res.status(), 401, "missing tid must be rejected");
 
         Ok(())
     }
@@ -821,7 +834,12 @@ mod tests {
 
         let token_for = |sub: &str| {
             sign_rs256(
-                &json!({ "sub": sub, "aud": "test-aud", "exp": 2000000000u64 }),
+                &json!({
+                    "sub": sub,
+                    "aud": "test-aud",
+                    "iss": "https://idp.test",
+                    "exp": 2000000000u64,
+                }),
                 "kid-prec",
                 &enc,
             )
@@ -1005,7 +1023,7 @@ mod tests {
             "retired-kid",
             &enc,
         )?;
-        let res = actix_web::test::try_call_service(
+        let res = actix_web::test::call_service(
             &svc,
             actix_web::test::TestRequest::get()
                 .uri("/auth/me")
@@ -1014,8 +1032,11 @@ mod tests {
         )
         .await;
 
-        let err = res.expect_err("the session probe must refuse an unknown kid");
-        assert_eq!(err.as_response_error().status_code(), 401);
+        assert_eq!(
+            res.status(),
+            401,
+            "the session probe must refuse an unknown kid"
+        );
         Ok(())
     }
 
@@ -1140,7 +1161,7 @@ mod tests {
             &enc,
         )?;
 
-        let res = actix_web::test::try_call_service(
+        let res = actix_web::test::call_service(
             &svc,
             actix_web::test::TestRequest::get()
                 .uri("/auth/login")
@@ -1149,8 +1170,11 @@ mod tests {
         )
         .await;
 
-        let err = res.expect_err("a token from an untrusted tenant must not degrade to anonymous");
-        assert_eq!(err.as_response_error().status_code(), 401);
+        assert_eq!(
+            res.status(),
+            401,
+            "a token from an untrusted tenant must not degrade to anonymous"
+        );
 
         Ok(())
     }
@@ -1356,7 +1380,7 @@ mod tests {
             "kid-t",
             &attacker_enc,
         )?;
-        let res = test::try_call_service(
+        let res = test::call_service(
             &svc,
             test::TestRequest::get()
                 .uri("/protected")
@@ -1364,11 +1388,176 @@ mod tests {
                 .to_request(),
         )
         .await;
-        let err = res.expect_err("a forged signature must not degrade to anonymous");
         assert_eq!(
-            err.as_response_error().status_code(),
-            StatusCode::UNAUTHORIZED
+            res.status(),
+            StatusCode::UNAUTHORIZED,
+            "a forged signature must not degrade to anonymous"
         );
+        Ok(())
+    }
+
+    /// A claims type with no `iss` or `aud` field. The shipped [`Claims`]
+    /// requires both, so it cannot show that the validator itself requires
+    /// the claims.
+    #[derive(Debug, Deserialize, Clone)]
+    struct MinimalClaims {
+        #[allow(dead_code)]
+        sub: String,
+        #[allow(dead_code)]
+        exp: u64,
+    }
+
+    /// A signature proves who signed a token. It does not prove that the
+    /// token has the claims that bind it to this deployment. `Validation`
+    /// requires only `exp` by default, so a token without `iss` or `aud`
+    /// would pass unless `new_with_jwks` requires both.
+    #[actix_web::test]
+    async fn a_signed_token_without_iss_or_aud_is_rejected() -> anyhow::Result<()> {
+        use actix_web::{App, HttpResponse, test, web};
+
+        let (key, enc) = rsa_key("kid-required")?;
+        let server = spawn_jwks(json!({ "keys": [key] })).await;
+
+        let mw = JwtClaimsMiddleware::<MinimalClaims>::new_with_jwks(
+            &format!("{}/jwks", server.uri()),
+            "test-aud",
+            "https://idp.test",
+        )
+        .await?;
+
+        async fn protected(_claims: Validated<MinimalClaims>) -> HttpResponse {
+            HttpResponse::Ok().finish()
+        }
+
+        let svc = test::init_service(
+            App::new()
+                .wrap(mw)
+                .service(web::resource("/protected").to(protected)),
+        )
+        .await;
+
+        let complete = sign_rs256(
+            &json!({
+                "sub": "u1",
+                "aud": "test-aud",
+                "iss": "https://idp.test",
+                "exp": 2000000000u64,
+            }),
+            "kid-required",
+            &enc,
+        )?;
+        let res = test::call_service(
+            &svc,
+            test::TestRequest::get()
+                .uri("/protected")
+                .insert_header(("Cookie", format!("auth_token={complete}")))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), 200, "the control token must pass");
+
+        for (name, claims) in [
+            (
+                "aud",
+                json!({
+                    "sub": "u1",
+                    "iss": "https://idp.test",
+                    "exp": 2000000000u64,
+                }),
+            ),
+            (
+                "iss",
+                json!({
+                    "sub": "u1",
+                    "aud": "test-aud",
+                    "exp": 2000000000u64,
+                }),
+            ),
+        ] {
+            let token = sign_rs256(&claims, "kid-required", &enc)?;
+            let res = test::call_service(
+                &svc,
+                test::TestRequest::get()
+                    .uri("/protected")
+                    .insert_header(("Cookie", format!("auth_token={token}")))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(
+                res.status(),
+                401,
+                "a valid signature without `{name}` must be rejected"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// A rejected token must produce its response inside the middleware
+    /// chain. An `Err` leaves the chain, so the outer middleware cannot add
+    /// its headers.
+    #[actix_web::test]
+    async fn a_rejected_token_carries_the_outer_middleware_headers() -> anyhow::Result<()> {
+        use actix_web::{App, HttpResponse, test, web};
+
+        use crate::http::middleware::{
+            no_cache::NoCache, request_id::RequestIdMiddleware, security_headers::SecurityHeaders,
+            server_time::ServerTimeMiddleware,
+        };
+
+        let (key, _enc) = rsa_key("kid-headers")?;
+        let (_other_key, attacker_enc) = rsa_key("kid-headers")?;
+        let server = spawn_jwks(json!({ "keys": [key] })).await;
+        let mw = JwtClaimsMiddleware::<TestClaims>::new_with_jwks(
+            &format!("{}/jwks", server.uri()),
+            "test-aud",
+            "https://idp.test",
+        )
+        .await?;
+
+        let svc = test::init_service(
+            App::new()
+                .wrap(mw)
+                .wrap(NoCache)
+                .wrap(RequestIdMiddleware)
+                .wrap(SecurityHeaders)
+                .wrap(ServerTimeMiddleware)
+                .service(web::resource("/protected").to(|| async { HttpResponse::Ok().finish() })),
+        )
+        .await;
+
+        let forged = sign_rs256(
+            &json!({
+                "sub": "attacker",
+                "aud": "test-aud",
+                "iss": "https://idp.test",
+                "exp": 2000000000u64,
+            }),
+            "kid-headers",
+            &attacker_enc,
+        )?;
+        let res = test::call_service(
+            &svc,
+            test::TestRequest::get()
+                .uri("/protected")
+                .insert_header(("Cookie", format!("auth_token={forged}")))
+                .to_request(),
+        )
+        .await;
+
+        assert_eq!(res.status(), 401);
+        let header = |name: &str| {
+            res.headers()
+                .get(name)
+                .unwrap_or_else(|| panic!("{name} header is missing"))
+                .to_str()
+                .expect("ascii header")
+                .to_string()
+        };
+        assert_eq!(header("x-content-type-options"), "nosniff");
+        assert_eq!(header("cache-control"), "no-store");
+        assert!(!header("x-request-id").is_empty());
+        assert!(!header("x-server-time-ms").is_empty());
         Ok(())
     }
 }
