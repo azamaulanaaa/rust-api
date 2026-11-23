@@ -135,14 +135,29 @@ impl Config {
     /// `RUST_API_CLIENT_SECRET`. A fixture that asserts on the value in the
     /// file then fails for anyone who followed them. Such a failure is a test
     /// bug in production clothes.
+    ///
+    /// The function is compiled for tests only. Production code uses
+    /// [`Self::try_from_with`], which must apply the environment overlay
+    /// before it validates.
+    #[cfg(test)]
     pub fn parse_toml(content: &str) -> anyhow::Result<Self> {
-        let config: Self = toml::from_str(content).context("Failed to parse config file")?;
+        let config = Self::parse_toml_unvalidated(content)?;
         config.validate().context("Invalid config values")?;
         Ok(config)
     }
 
+    /// Parses a TOML document without validation.
+    ///
+    /// `parse_toml` and [`Self::try_from_with`] use this function. The loader
+    /// calls it before the environment overlay, so that a file value that the
+    /// environment replaces cannot fail validation first. Validation then runs
+    /// once, after the overlay.
+    fn parse_toml_unvalidated(content: &str) -> anyhow::Result<Self> {
+        toml::from_str(content).context("Failed to parse config file")
+    }
+
     /// Runs the whole loader: read the file, parse it, overlay the
-    /// environment, then validate again. The caller supplies the variable
+    /// environment, then validate once. The caller supplies the variable
     /// lookup instead of the function reading the process.
     ///
     /// [`TryFrom`] runs this logic with the real environment, and it is the
@@ -151,10 +166,10 @@ impl Config {
     /// process-wide, `unsafe` in Rust 2024, and races with every other test
     /// thread that reads the same variable.
     ///
-    /// The injection matters for more than the assertions. Validation runs
-    /// again and reads the overlaid values. So a hostile `RUST_API_*` value in
-    /// the developer's shell makes a loader test fail inside `validate()`
-    /// before any assertion runs. See `the_loader_reads_a_file_and_applies_the_overlay`.
+    /// The injection matters for more than the assertions. Validation reads
+    /// the overlaid values. So a hostile `RUST_API_*` value in the developer's
+    /// shell makes a loader test fail inside `validate()` before any assertion
+    /// runs. See `the_loader_reads_a_file_and_applies_the_overlay`.
     pub fn try_from_with(
         value: &Path,
         var: impl Fn(&str) -> Option<String>,
@@ -167,15 +182,49 @@ impl Config {
         }
 
         let content = fs::read_to_string(value).context("Failed to read config file")?;
-        let mut config = Self::parse_toml(&content)?;
+        let mut config = Self::parse_toml_unvalidated(&content)?;
         apply_overrides_from(&mut config, var);
-        // Validate again, because an environment value reaches the config
-        // from outside the file. The TOML parser checked no `RUST_API_*`
-        // variable.
+        // Validate after the overlay. An environment value reaches the
+        // config from outside the file, so a file value that the environment
+        // replaces must not fail validation first.
         config.validate().context("Invalid config values")?;
 
         Ok(config)
     }
+
+    /// Returns the warnings for config values that are valid but risky.
+    ///
+    /// The server logs these warnings after it installs the tracing
+    /// subscriber. A `tracing::warn!` call before that point has no
+    /// subscriber, so the message is lost. Validation collects the data and
+    /// does not emit it for the same reason.
+    pub fn startup_warnings(&self) -> Vec<StartupWarning> {
+        let mut warnings = Vec::new();
+        if self.eav.retention_below_safe_floor() {
+            warnings.push(StartupWarning {
+                field: "eav.execution_retention_secs",
+                message: format!(
+                    "eav.execution_retention_secs is {}. Set it to at least \
+                     {MIN_SAFE_RETENTION_SECS} seconds (7 days). A shorter window can delete a \
+                     marker before a replay reads it, so the action can run twice.",
+                    self.eav.execution_retention_secs
+                ),
+            });
+        }
+        warnings
+    }
+}
+
+/// A warning about a config value that is valid but risky.
+///
+/// [`Config::startup_warnings`] returns these values. The caller logs them
+/// after telemetry setup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartupWarning {
+    /// Dotted name of the field that triggered the warning.
+    pub field: &'static str,
+    /// Message for the operator.
+    pub message: String,
 }
 
 /// Overlays secret values from the environment onto a parsed config. The
@@ -235,7 +284,7 @@ fn apply_overrides_from(config: &mut Config, var: impl Fn(&str) -> Option<String
     if let Some(raw) = var(ENV_RABBITMQ_URL)
         && !raw.trim().is_empty()
     {
-        config.rabbitmq.url = Some(raw);
+        config.rabbitmq.url = Some(raw.trim().to_string());
     }
 }
 
@@ -322,6 +371,17 @@ impl Config {
                 self.database.prefix
             );
         }
+        if self.database.writer_lease_ttl_secs != 0
+            && self.database.writer_lease_ttl_secs < MIN_WRITER_LEASE_TTL_SECS
+        {
+            anyhow::bail!(
+                "database.writer_lease_ttl_secs is {}. Set it to 0 to disable the lease, or \
+                 to at least {MIN_WRITER_LEASE_TTL_SECS}. The server renews the lease every \
+                 ttl/3 seconds, with a floor of 1 second, so a shorter TTL lets one late \
+                 renewal make the lease look stale. A second writer can then take the prefix.",
+                self.database.writer_lease_ttl_secs
+            );
+        }
         if self.database.writer_lease_ttl_secs > i64::MAX as u64 {
             anyhow::bail!(
                 "database.writer_lease_ttl_secs is {}, which is above i64::MAX. \
@@ -375,16 +435,8 @@ impl Config {
         if self.eav.execution_retention_secs == 0 {
             anyhow::bail!("eav.execution_retention_secs must be greater than 0");
         }
-        if self.eav.retention_below_safe_floor() {
-            tracing::warn!(
-                field = "eav.execution_retention_secs",
-                value = self.eav.execution_retention_secs,
-                recommended = MIN_SAFE_RETENTION_SECS,
-                "eav.execution_retention_secs is below the safe floor. Set it to at least \
-                 {MIN_SAFE_RETENTION_SECS} seconds (7 days). A shorter window can delete a \
-                 marker before a replay reads it, so the action can run twice."
-            );
-        }
+        // A short retention is valid but risky. `startup_warnings` returns
+        // the text, and the server logs it after telemetry setup.
         if self.eav.timer_interval_ms == 0 {
             anyhow::bail!("eav.timer_interval_ms must be greater than 0");
         }
@@ -435,6 +487,11 @@ pub struct ConfigAuthorization {
     /// OAuth2 client identifier that is registered at the provider.
     pub client_id: String,
     /// OAuth2 client secret that is registered at the provider.
+    ///
+    /// The field may be omitted when `RUST_API_CLIENT_SECRET` supplies the
+    /// value. Validation rejects an empty value after the environment
+    /// overlay.
+    #[serde(default)]
     pub client_secret: String,
     /// Base URL of the OIDC discovery document at the provider.
     pub issuer_url: String,
@@ -525,6 +582,14 @@ fn default_service_name() -> String {
     "rust-api".to_string()
 }
 
+/// Smallest writer lease TTL that validation accepts, in seconds.
+///
+/// The server renews the lease every `ttl / 3` seconds, with a floor of one
+/// second. A TTL below this value makes the renewal interval equal to the
+/// TTL, or more than one third of it. One late renewal can then make a live
+/// lease look stale. The value 0 stays valid and disables the lease.
+pub const MIN_WRITER_LEASE_TTL_SECS: u64 = 3;
+
 /// Settings of the embedded policy database.
 #[derive(Deserialize, Debug)]
 #[serde(deny_unknown_fields)]
@@ -568,6 +633,10 @@ pub struct DatabaseConfig {
     /// The value must fit in the signed range that the lease compares in. A
     /// TTL above `i64::MAX` reads as already stale, which silently disables
     /// single-writer enforcement. Validation rejects that value.
+    ///
+    /// A nonzero value must be at least [`MIN_WRITER_LEASE_TTL_SECS`].
+    /// The server renews at one third of the TTL, with a floor of one second.
+    /// A shorter TTL lets one late renewal make a live lease look stale.
     #[serde(default = "default_writer_lease_ttl_secs")]
     pub writer_lease_ttl_secs: u64,
 }
@@ -1585,6 +1654,80 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// The environment replaces an empty file value before validation runs.
+    ///
+    /// The loader used to validate the file before the overlay. An empty
+    /// `client_secret` under a secret manager then failed even when
+    /// `RUST_API_CLIENT_SECRET` held a valid value.
+    #[test]
+    fn an_empty_file_secret_is_replaced_by_the_environment() {
+        let toml = minimal_toml().replace("client_secret = \"csecret\"", "client_secret = \"\"");
+        let path = tmp_toml(&toml);
+
+        let cfg = Config::try_from_with(path.as_path(), |name| {
+            (name == ENV_CLIENT_SECRET).then(|| "env-secret".to_string())
+        })
+        .expect("the environment secret must replace the empty file value");
+        assert_eq!(cfg.authorization.client_secret, "env-secret");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The environment supplies the secret when the file omits the field.
+    ///
+    /// This test needs the serde default on `client_secret`. Without it,
+    /// deserialization fails before the overlay can run.
+    #[test]
+    fn an_omitted_file_secret_is_replaced_by_the_environment() {
+        let toml = minimal_toml().replace("client_secret = \"csecret\"\n", "");
+        assert!(
+            Config::parse_toml(&toml).is_err(),
+            "a file with no secret and no environment must not validate"
+        );
+
+        let path = tmp_toml(&toml);
+        let cfg = Config::try_from_with(path.as_path(), |name| {
+            (name == ENV_CLIENT_SECRET).then(|| "env-secret".to_string())
+        })
+        .expect("an env-only secret must load when the file omits the field");
+        assert_eq!(cfg.authorization.client_secret, "env-secret");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The environment replaces an invalid file origin before validation.
+    ///
+    /// The file value is invalid on its own. The overlay must win before
+    /// validation runs, or startup fails on a value that the deployment does
+    /// not use.
+    #[test]
+    fn an_invalid_file_origin_is_replaced_by_the_environment() {
+        let toml = minimal_toml().replace(
+            "region = \"us-east-1\"",
+            "region = \"us-east-1\"\n[http]\nallowed_origins = [\"ftp://file.example.com\"]",
+        );
+
+        let path = tmp_toml(&toml);
+        let cfg = Config::try_from_with(path.as_path(), |name| {
+            (name == ENV_ALLOWED_ORIGINS).then(|| "https://env.example.com".to_string())
+        })
+        .expect("the environment origin must replace the invalid file origin");
+        assert_eq!(
+            cfg.http.allowed_origins,
+            vec!["https://env.example.com".to_string()]
+        );
+
+        // Without the overlay, the same file must still fail.
+        let rejected = Config::try_from_with(path.as_path(), |_| None)
+            .expect_err("an invalid file origin must fail without the overlay");
+        assert!(
+            format!("{rejected:?}").contains("http.allowed_origins"),
+            "the error names the field, got: {rejected:?}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// `TryFrom` is the production loader. It must still consult the real
     /// environment. This test checks the loader through the public path,
     /// instead of a copy of the code inside `try_from_with`.
@@ -1593,6 +1736,25 @@ mod tests {
         let missing = std::path::Path::new("/nonexistent/rust-api-config-test.toml");
         let err = Config::try_from(missing).expect_err("a missing file is an error");
         assert!(format!("{err:?}").contains("is not a file"), "got: {err:?}");
+    }
+
+    /// The RabbitMQ URL from the environment must have no surrounding
+    /// whitespace. Validation parses the stored value, so an untrimmed value
+    /// fails startup.
+    #[cfg(feature = "queue-rabbitmq")]
+    #[test]
+    fn the_rabbitmq_url_from_the_environment_is_trimmed() {
+        let path = tmp_toml(&minimal_toml());
+        let cfg = Config::try_from_with(path.as_path(), |name| {
+            (name == ENV_RABBITMQ_URL).then(|| "  amqp://guest:guest@localhost:5672  ".to_string())
+        })
+        .expect("a trimmed AMQP URL must validate");
+        assert_eq!(
+            cfg.rabbitmq.url.as_deref(),
+            Some("amqp://guest:guest@localhost:5672")
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -1714,6 +1876,42 @@ mod tests {
         let cfg = parse(&at_floor).expect("the safe floor must pass validation");
 
         assert!(!cfg.eav.retention_below_safe_floor());
+    }
+
+    /// The retention warning is data, not a log call.
+    ///
+    /// Validation runs before telemetry setup in `serve`. A `tracing::warn!`
+    /// there has no subscriber, so the message is lost. The server logs the
+    /// values from this method after init.
+    #[test]
+    fn a_short_retention_returns_a_startup_warning() {
+        let short = MIN_SAFE_RETENTION_SECS - 1;
+        let toml = minimal_toml().replace(
+            "region = \"us-east-1\"",
+            &format!("region = \"us-east-1\"\n[eav]\nexecution_retention_secs = {short}"),
+        );
+        let cfg = parse(&toml).expect("a short retention must not fail validation");
+        let warnings = cfg.startup_warnings();
+        assert_eq!(warnings.len(), 1, "got: {warnings:?}");
+        assert_eq!(warnings[0].field, "eav.execution_retention_secs");
+        assert!(
+            warnings[0].message.contains(&short.to_string()),
+            "the message states the value, got: {}",
+            warnings[0].message
+        );
+
+        let at_floor = minimal_toml().replace(
+            "region = \"us-east-1\"",
+            &format!(
+                "region = \"us-east-1\"\n[eav]\nexecution_retention_secs = \
+                 {MIN_SAFE_RETENTION_SECS}"
+            ),
+        );
+        let cfg = parse(&at_floor).expect("the safe floor must pass validation");
+        assert!(
+            cfg.startup_warnings().is_empty(),
+            "the safe floor must produce no warning"
+        );
     }
 
     #[test]
@@ -1997,6 +2195,40 @@ mod tests {
             cfg.database.writer_lease_ttl_secs, 0,
             "0 disables the lease"
         );
+    }
+
+    /// A TTL that is too short for the renewal interval must be refused.
+    ///
+    /// The server renews every `ttl / 3` seconds, with a floor of one second.
+    /// At a TTL of 1 or 2 seconds the renewal happens at the TTL or at half of
+    /// it. One late renewal then makes a live lease look stale, and a second
+    /// writer can take the prefix. The value 0 stays valid and disables the
+    /// lease.
+    #[test]
+    fn a_lease_ttl_below_the_renewal_floor_is_refused() {
+        for value in [1, 2] {
+            let toml = minimal_toml().replace(
+                "prefix = \"oxkv\"",
+                &format!("prefix = \"oxkv\"\nwriter_lease_ttl_secs = {value}"),
+            );
+            let err = validation_error(&toml);
+            assert!(
+                err.contains("writer_lease_ttl_secs"),
+                "value {value} must name its field, got: {err}"
+            );
+            assert!(
+                err.contains("at least 3"),
+                "value {value} must state the minimum, got: {err}"
+            );
+        }
+
+        for value in [0, MIN_WRITER_LEASE_TTL_SECS, 60] {
+            let toml = minimal_toml().replace(
+                "prefix = \"oxkv\"",
+                &format!("prefix = \"oxkv\"\nwriter_lease_ttl_secs = {value}"),
+            );
+            assert!(parse(&toml).is_ok(), "value {value} must pass validation");
+        }
     }
 
     #[test]
