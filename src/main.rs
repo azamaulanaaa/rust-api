@@ -744,9 +744,17 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
         &db_prefix,
         wal.clone(),
         vec![Arc::new(NoopAction), Arc::new(LogAction), Arc::new(webhook)],
-        config.eav.check_entity_refs,
+        if config.eav.check_entity_refs {
+            rust_api::eav::runtime::RefCheck::On
+        } else {
+            rust_api::eav::runtime::RefCheck::Off
+        },
         eav_max_causation_depth,
-        config.eav.script_enabled,
+        if config.eav.script_enabled {
+            rust_api::eav::runtime::Scripts::Enabled
+        } else {
+            rust_api::eav::runtime::Scripts::Disabled
+        },
     )
     .await
     .context("build the EAV runtime")?;

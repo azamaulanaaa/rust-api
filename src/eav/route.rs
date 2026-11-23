@@ -1756,9 +1756,9 @@ mod tests {
                         .allow_private_hosts(true),
                 ),
             ],
-            true,
+            crate::eav::runtime::RefCheck::On,
             8,
-            true,
+            crate::eav::runtime::Scripts::Enabled,
         )
         .await?;
         let engine =

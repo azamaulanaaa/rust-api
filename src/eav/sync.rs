@@ -921,6 +921,7 @@ mod tests {
     use crate::eav::entity::{AttributeValue, EntityDraft};
     use crate::eav::metrics::test_support::MetricCapture;
     use crate::eav::route::EavApiModule;
+    use crate::eav::runtime::{RefCheck, Scripts};
     use crate::eav::schema::{AttributeDef, AttributeType, SchemaDraft};
     use crate::fs::s3::{S3Backend, S3ClientConfig};
     use crate::http::ApiModule;
@@ -1007,9 +1008,9 @@ mod tests {
             &prefix,
             wal,
             vec![Arc::new(NoopAction)],
-            true,
+            RefCheck::On,
             8,
-            false,
+            Scripts::Disabled,
         )
         .await?;
         let engine =
