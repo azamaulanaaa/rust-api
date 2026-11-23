@@ -55,7 +55,7 @@ fn ids(entities: &[rust_api::eav::entity::Entity]) -> Vec<String> {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let prefix = format!("eav-example-{}", std::process::id());
-    let store = build_scratch_store(&prefix).await;
+    let store = build_scratch_store(&prefix).await?;
     let schemas = SchemaRegistry::new(store.clone());
     let entities = EntityStore::new(store, schemas.clone());
     let actor = WriteContext::new("example");

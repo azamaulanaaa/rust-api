@@ -64,7 +64,9 @@ fn entity_draft(id: String, value: &str) -> EntityDraft {
 
 /// Builds a store and registry, and publishes the benchmark schema.
 async fn fresh_store(prefix: &str) -> (EntityStore, SchemaRegistry) {
-    let store = build_scratch_store(prefix).await;
+    let store = build_scratch_store(prefix)
+        .await
+        .unwrap_or_else(|error| panic!("scratch store failed: {error}"));
     let schemas = SchemaRegistry::new(store.clone());
     schemas
         .publish(schema_draft())
@@ -192,7 +194,9 @@ fn bench_schema_effective(criterion: &mut Criterion) {
 fn bench_outbox_count(criterion: &mut Criterion) {
     let runtime = current_thread_runtime();
     let prefix = next_prefix("outbox-count");
-    let store = runtime.block_on(build_scratch_store(&prefix));
+    let store = runtime
+        .block_on(build_scratch_store(&prefix))
+        .unwrap_or_else(|error| panic!("scratch store failed: {error}"));
     runtime.block_on(async {
         for index in 0..1_000u64 {
             store

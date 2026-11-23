@@ -698,7 +698,7 @@ impl SnapshotManager {
             safe_sub(sub),
             &uuid::Uuid::now_v7().to_string()[..8]
         );
-        let scratch = FsStore::new(crate::db::build_scratch_store(&snap_prefix).await);
+        let scratch = FsStore::new(crate::db::build_scratch_store(&snap_prefix).await?);
         let undecodable = self.copy_filtered(sub, &scratch).await?;
         if !undecodable.is_empty() {
             // This check runs before the code opens anything on the live
