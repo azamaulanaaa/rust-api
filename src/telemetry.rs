@@ -167,14 +167,16 @@ pub fn init(
         Some(endpoint) => {
             #[cfg(not(any(feature = "otlp-grpc", feature = "otlp-http")))]
             {
-                tracing::warn!(
-                    "OTLP endpoint {endpoint} configured but no otlp-* feature enabled; tracing without export"
-                );
+                // Install the subscriber first. A warning before this point
+                // has no subscriber and is lost.
                 tracing_subscriber::registry()
                     .with(env_filter)
                     .with(fmt_layer)
                     .try_init()
                     .map_err(TelemetryError::subscriber)?;
+                tracing::warn!(
+                    "OTLP endpoint {endpoint} configured but no otlp-* feature enabled; tracing without export"
+                );
                 return Ok(Telemetry {
                     tracer_provider: None,
                     meter_provider: None,
