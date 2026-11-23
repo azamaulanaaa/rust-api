@@ -15,13 +15,29 @@
 //! | `job-status:succeeded:{id}` | Empty status marker. The job finished well. |
 //! | `job-status:failed:{id}` | Empty status marker. The job failed without retry. |
 //! | `job-lease-due:{expiry}:{id}` | Empty lease index entry. `expiry` is a fixed-width unix millisecond value. |
+//! | `job-ready-due:{scheduled_at}:{priority}:{id}` | Empty ready index entry. `scheduled_at` and `created_at` are fixed-width unix second values. `priority` is inverted, so a high priority sorts first. |
 //! | `idemp:{key}` | Job id for an idempotency key. |
+//! | `job-meta:queued-count` | Number of queued jobs. |
 //! | `job-meta:backfilled` | Backfill marker. |
 //! | `job-meta:lease-indexed` | Lease index marker. |
+//! | `job-meta:ready-indexed` | Ready index marker. |
 //!
 //! A job row has one status marker. The row and the marker change in one
 //! transaction. The queue lists one marker family. It does not scan the
 //! `job:` family after the backfill.
+//!
+//! # Ready index
+//!
+//! A queued job has one `job-ready-due:` entry. The key sorts by
+//! `scheduled_at`, then by priority from high to low, then by `created_at`.
+//! `reserve` reads at most `READY_SCAN_BATCH` due entries. It sorts those
+//! candidates by priority and `created_at`. It reads the job rows only for the
+//! candidates that it can reserve. A future entry stops the scan, because
+//! every later key is also in the future.
+//!
+//! The queue changes the ready index and the queued count in the same
+//! transaction as the status change. `job-meta:queued-count` keeps
+//! `record_depth` at one read. The counter is not a scan.
 //!
 //! # Expiry
 //!
@@ -50,6 +66,11 @@
 //! and writes the `job-lease-due:` entry for each one. It writes the
 //! `job-meta:lease-indexed` marker last.
 //!
+//! An old store also has queued markers but no ready index entries. The first
+//! `reserve` or maintenance pass scans the `queued` markers one time. It reads
+//! each row, writes the `job-ready-due:` entry, and writes the queued count.
+//! It writes the `job-meta:ready-indexed` marker last.
+//!
 //! A lease that an older version wrote has an expiry in unix seconds. The
 //! value looks like an expiry in the past under the millisecond format, so
 //! the queue returns that job to the queue at once. The job runs again. The
@@ -67,9 +88,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use oxkv::{
-    GetSet as _, KeyPrefix, ScanExt as _, Store as _, StoreError, Transaction as _, TxCas as _,
-};
+use oxkv::{GetSet as _, KeyPrefix, ScanExt as _, Store as _, StoreError, Transaction as _, TxCas};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::{debug, instrument};
@@ -91,8 +110,14 @@ const SUCCEEDED_PREFIX: &str = "job-status:succeeded:";
 const FAILED_PREFIX: &str = "job-status:failed:";
 /// Prefix of one lease index entry.
 const LEASE_DUE_PREFIX: &str = "job-lease-due:";
+/// Prefix of one ready index entry.
+const READY_DUE_PREFIX: &str = "job-ready-due:";
+/// Key that holds the number of queued jobs.
+const QUEUED_COUNT_KEY: &str = "job-meta:queued-count";
 /// Key that marks a completed lease index backfill.
 const LEASE_INDEX_KEY: &str = "job-meta:lease-indexed";
+/// Key that marks a completed ready index backfill.
+const READY_INDEX_KEY: &str = "job-meta:ready-indexed";
 /// Key that marks a completed backfill.
 const BACKFILL_KEY: &str = "job-meta:backfilled";
 /// Time that a dead, succeeded, or failed row stays in the store: 7 days.
@@ -101,6 +126,10 @@ const TERMINAL_RETENTION_SECS: i64 = 7 * 24 * 60 * 60;
 const QUEUE_SCAN_PAGE: usize = 512;
 /// Maximum number of due leases that one sweep processes.
 const LEASE_SWEEP_BATCH: usize = 256;
+/// Maximum number of ready index entries that one reserve reads.
+const READY_SCAN_BATCH: usize = 256;
+/// Maximum number of queued markers that a depth fallback counts.
+const DEPTH_SCAN_MAX: usize = 100_000;
 
 /// Persisted envelope for one job.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -114,6 +143,18 @@ struct StoredJob {
     /// value. Rows written before this field existed decode with `0`.
     #[serde(default)]
     lease_generation: u64,
+}
+
+/// One ready index entry that `reserve` can use.
+struct ReadyCandidate {
+    /// Index key of the entry.
+    key: String,
+    /// Job id from the entry.
+    id: JobId,
+    /// Priority from the entry.
+    priority: i32,
+    /// Creation time from the entry, in unix seconds.
+    created_at: i64,
 }
 
 /// Durable job queue backed by OxKV.
@@ -132,7 +173,10 @@ struct StoredJob {
 /// | `sweep_expired` retention | Delete the row | Delete the terminal marker |
 ///
 /// Each transition writes the row and the marker in one transaction. A
-/// failed read or write returns [`QueueError::Store`].
+/// transition to `Queued` writes a `job-ready-due:` entry and adds one to the
+/// queued count. A transition away from `Queued` deletes the ready entry and
+/// subtracts one from the count. A failed read or write returns
+/// [`QueueError::Store`].
 ///
 /// `ack`, `nack`, and `extend_lease` check the lease token under a
 /// compare-and-set on the job row. A stale token does not change the job.
@@ -211,15 +255,106 @@ impl DurableQueue {
         Some((expires_at.parse().ok()?, id.parse().ok()?))
     }
 
+    /// Returns a fixed-width value that sorts in numeric order.
+    fn sortable_i64(value: i64) -> u64 {
+        (value as u64) ^ (1u64 << 63)
+    }
+
+    /// Returns the original value from a sortable value.
+    fn unsortable_i64(value: u64) -> i64 {
+        (value ^ (1u64 << 63)) as i64
+    }
+
+    /// Returns the ready index key for one queued job.
+    ///
+    /// The key sorts by `scheduled_at`, then by priority from high to low,
+    /// then by `created_at`, then by job id.
+    fn ready_due_key(id: JobId, scheduled_at: i64, priority: i32, created_at: i64) -> String {
+        let priority_key = (i32::MAX as i64 - priority as i64) as u64;
+        format!(
+            "{READY_DUE_PREFIX}{:020}:{priority_key:010}:{:020}:{id}",
+            Self::sortable_i64(scheduled_at),
+            Self::sortable_i64(created_at),
+        )
+    }
+
+    /// Returns the ready index key for a queued status.
+    fn ready_due_key_for(sj: &StoredJob, id: JobId) -> Option<String> {
+        if matches!(sj.status, JobStatus::Queued) {
+            Some(Self::ready_due_key(
+                id,
+                sj.job.scheduled_at,
+                sj.job.priority,
+                sj.job.created_at,
+            ))
+        } else {
+            None
+        }
+    }
+
+    /// Parses one ready index key.
+    fn parse_ready_due_key(key: &str) -> Option<(i64, i32, i64, JobId)> {
+        let rest = key.strip_prefix(READY_DUE_PREFIX)?;
+        let mut parts = rest.splitn(4, ':');
+        let scheduled_at = parts.next()?.parse::<u64>().ok()?;
+        let priority_key = parts.next()?.parse::<u64>().ok()?;
+        let created_at = parts.next()?.parse::<u64>().ok()?;
+        let id = parts.next()?.parse::<JobId>().ok()?;
+        let priority = i32::MAX as i64 - i64::try_from(priority_key).ok()?;
+        Some((
+            Self::unsortable_i64(scheduled_at),
+            i32::try_from(priority).ok()?,
+            Self::unsortable_i64(created_at),
+            id,
+        ))
+    }
+
+    /// Returns the stored queued count.
+    fn decode_queued_count(bytes: Option<&[u8]>) -> u64 {
+        bytes
+            .and_then(|bytes| std::str::from_utf8(bytes).ok())
+            .and_then(|text| text.parse().ok())
+            .unwrap_or(0)
+    }
+
+    /// Adds `delta` to the stored queued count in one transaction.
+    async fn adjust_queued_count<T>(tx: &T, delta: i64) -> Result<(), QueueError>
+    where
+        T: TxCas + Sync,
+    {
+        let current = tx
+            .get_bytes(QUEUED_COUNT_KEY)
+            .await
+            .map_err(QueueError::store)?;
+        let value = Self::decode_queued_count(current.as_deref());
+        let value = if delta >= 0 {
+            value.saturating_add(delta as u64)
+        } else {
+            value.saturating_sub(delta.unsigned_abs())
+        };
+        tx.compare_and_set(
+            QUEUED_COUNT_KEY,
+            current.as_deref(),
+            value.to_string().as_bytes(),
+        )
+        .await
+        .map_err(QueueError::store)
+    }
+
+    /// Counts one job row read for tests.
+    fn count_row_read(&self) {
+        #[cfg(test)]
+        self.row_reads
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// Reads one job row and counts the read for tests.
     async fn row_bytes(
         &self,
         guard: &oxkv::OxKvStore,
         key: &str,
     ) -> Result<Option<Vec<u8>>, QueueError> {
-        #[cfg(test)]
-        self.row_reads
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.count_row_read();
         guard.get_bytes(key).await.map_err(QueueError::store)
     }
 
@@ -282,6 +417,7 @@ impl DurableQueue {
         let key = Self::job_key(job_id);
         let g = self.store.write().await;
         let tx = g.begin_tx().map_err(QueueError::store)?;
+        self.count_row_read();
         let bytes = tx
             .get_bytes(&key)
             .await
@@ -293,7 +429,10 @@ impl DurableQueue {
             return Err(error);
         }
         let old_due = Self::lease_due_key_for(&sj.status, job_id);
+        let old_ready = Self::ready_due_key_for(&sj, job_id);
+        let was_queued = matches!(sj.status, JobStatus::Queued);
         update(&mut sj);
+        let is_queued = matches!(sj.status, JobStatus::Queued);
         let val = serde_json::to_vec(&sj).map_err(QueueError::store)?;
         tx.compare_and_set(&key, Some(&bytes), &val)
             .await
@@ -310,6 +449,9 @@ impl DurableQueue {
         if let Some(due) = old_due {
             tx.delete(&due).await.map_err(QueueError::store)?;
         }
+        if let Some(ready) = old_ready {
+            tx.delete(&ready).await.map_err(QueueError::store)?;
+        }
         if let Some(marker) = Self::status_key(&sj.status, job_id) {
             tx.set_bytes(&marker, b"")
                 .await
@@ -317,6 +459,17 @@ impl DurableQueue {
         }
         if let Some(due) = Self::lease_due_key_for(&sj.status, job_id) {
             tx.set_bytes(&due, b"").await.map_err(QueueError::store)?;
+        }
+        if let Some(ready) = Self::ready_due_key_for(&sj, job_id) {
+            tx.set_bytes(&ready, b"").await.map_err(QueueError::store)?;
+        }
+        let delta = match (was_queued, is_queued) {
+            (false, true) => 1,
+            (true, false) => -1,
+            _ => 0,
+        };
+        if delta != 0 {
+            Self::adjust_queued_count(&tx, delta).await?;
         }
         match tx.commit().await {
             Ok(()) => {}
@@ -356,12 +509,26 @@ impl DurableQueue {
     }
 
     /// Records the number of jobs that wait to run.
+    ///
+    /// The function reads the queued count. It does not scan the queued
+    /// markers. An old store without a count uses one bounded marker count
+    /// until the ready index backfill writes the count.
     async fn record_depth(&self) {
-        let depth = self
-            .ids_with_prefix(QUEUED_PREFIX)
-            .await
-            .map(|ids| ids.len() as u64)
-            .unwrap_or(0);
+        let depth = {
+            let g = self.store.read().await;
+            match g.get_bytes(QUEUED_COUNT_KEY).await {
+                Ok(Some(bytes)) => Self::decode_queued_count(Some(&bytes)),
+                Ok(None) => g
+                    .count_prefix(KeyPrefix::new(QUEUED_PREFIX), DEPTH_SCAN_MAX)
+                    .await
+                    .map(|count| count as u64)
+                    .unwrap_or(0),
+                Err(error) => {
+                    debug!(error = %error, "cannot read the queued count");
+                    0
+                }
+            }
+        };
         self.metrics.record_depth(depth);
     }
 
@@ -468,6 +635,122 @@ impl DurableQueue {
         Ok(())
     }
 
+    /// Writes the ready index and the queued count for an old store one time.
+    ///
+    /// The function scans the `queued` markers when the ready index marker is
+    /// absent. It reads one row for each marker. It writes one
+    /// `job-ready-due:` entry for each queued row. It writes the queued count
+    /// and the marker last.
+    async fn ensure_ready_index(&self) -> Result<(), QueueError> {
+        {
+            let g = self.store.read().await;
+            if g.has(READY_INDEX_KEY).await.map_err(QueueError::store)? {
+                return Ok(());
+            }
+        }
+
+        let g = self.store.write().await;
+        if g.has(READY_INDEX_KEY).await.map_err(QueueError::store)? {
+            return Ok(());
+        }
+        let tx = g.begin_tx().map_err(QueueError::store)?;
+        let mut depth = 0u64;
+        let mut after = None;
+        loop {
+            let page = g
+                .scan_keys(KeyPrefix::new(QUEUED_PREFIX), after, QUEUE_SCAN_PAGE)
+                .await
+                .map_err(QueueError::store)?;
+            for key in &page.items {
+                let Some(raw_id) = key.strip_prefix(QUEUED_PREFIX) else {
+                    continue;
+                };
+                let Ok(id) = raw_id.parse::<JobId>() else {
+                    continue;
+                };
+                let Some(bytes) = self.row_bytes(&g, &Self::job_key(id)).await? else {
+                    continue;
+                };
+                if let Ok(sj) = serde_json::from_slice::<StoredJob>(&bytes)
+                    && let Some(ready) = Self::ready_due_key_for(&sj, id)
+                {
+                    tx.set_bytes(&ready, b"").await.map_err(QueueError::store)?;
+                    depth = depth.saturating_add(1);
+                }
+            }
+            match page.next {
+                Some(next) => after = Some(next),
+                None => break,
+            }
+        }
+        tx.set_bytes(QUEUED_COUNT_KEY, depth.to_string().as_bytes())
+            .await
+            .map_err(QueueError::store)?;
+        tx.set_bytes(READY_INDEX_KEY, b"1")
+            .await
+            .map_err(QueueError::store)?;
+        tx.commit().await.map_err(QueueError::store)?;
+        Ok(())
+    }
+
+    /// Returns the ready index entries that are due.
+    ///
+    /// The function reads the ready index from the earliest entry. It stops
+    /// at the first entry that is not due and visits at most `budget` entries.
+    /// It reads no job row.
+    async fn due_ready(&self, now: i64, budget: usize) -> Result<Vec<ReadyCandidate>, QueueError> {
+        let g = self.store.read().await;
+        let mut candidates = Vec::new();
+        let mut after = None;
+        let mut visited = 0usize;
+        loop {
+            let remaining = budget.saturating_sub(visited);
+            if remaining == 0 {
+                break;
+            }
+            let page = g
+                .scan_keys(
+                    KeyPrefix::new(READY_DUE_PREFIX),
+                    after,
+                    QUEUE_SCAN_PAGE.min(remaining),
+                )
+                .await
+                .map_err(QueueError::store)?;
+            let mut stop = false;
+            for key in &page.items {
+                let Some((scheduled_at, priority, created_at, id)) = Self::parse_ready_due_key(key)
+                else {
+                    debug!(key = %key, "skipping ready index key that does not decode");
+                    visited += 1;
+                    continue;
+                };
+                if scheduled_at > now {
+                    stop = true;
+                    break;
+                }
+                candidates.push(ReadyCandidate {
+                    key: key.clone(),
+                    id,
+                    priority,
+                    created_at,
+                });
+                visited += 1;
+                if visited >= budget {
+                    stop = true;
+                    break;
+                }
+            }
+            if stop {
+                break;
+            }
+            match page.next {
+                Some(next) => after = Some(next),
+                None => break,
+            }
+        }
+        Ok(candidates)
+    }
+
     /// Returns the row with the next attempt when its lease is due.
     ///
     /// The function returns `None` when the status is not a due lease.
@@ -555,6 +838,7 @@ impl DurableQueue {
         let key = Self::job_key(id);
         let g = self.store.write().await;
         let tx = g.begin_tx().map_err(QueueError::store)?;
+        self.count_row_read();
         let bytes = tx.get_bytes(&key).await.map_err(QueueError::store)?;
         let Some(bytes) = bytes else {
             tx.delete(due_key).await.map_err(QueueError::store)?;
@@ -579,6 +863,7 @@ impl DurableQueue {
         };
         let marker = Self::status_key(&new_sj.status, id)
             .ok_or_else(|| QueueError::store_message("status has no marker"))?;
+        let ready = Self::ready_due_key_for(&new_sj, id);
         let val = serde_json::to_vec(&new_sj).map_err(QueueError::store)?;
         tx.set_bytes(&key, &val).await.map_err(QueueError::store)?;
         tx.delete(&Self::leased_key(id))
@@ -588,6 +873,10 @@ impl DurableQueue {
         tx.set_bytes(&marker, b"")
             .await
             .map_err(QueueError::store)?;
+        if let Some(ready) = ready {
+            tx.set_bytes(&ready, b"").await.map_err(QueueError::store)?;
+            Self::adjust_queued_count(&tx, 1).await?;
+        }
         tx.commit().await.map_err(QueueError::store)?;
         Ok(())
     }
@@ -611,12 +900,14 @@ impl DurableQueue {
 
     /// Runs the full maintenance pass.
     ///
-    /// The function writes the lease index for an old store, returns due
-    /// leases to the queue, and removes old terminal rows. It does not scan
-    /// the `job:` family after the backfill. A host can run the pass on a
-    /// timer with [`DurableQueue::spawn_expiry_sweeper`].
+    /// The function writes the status markers and the indexes for an old
+    /// store, returns due leases to the queue, and removes old terminal rows.
+    /// It does not scan the `job:` family after the backfill. A host can run
+    /// the pass on a timer with [`DurableQueue::spawn_expiry_sweeper`].
     async fn sweep_expired(&self) -> Result<(), QueueError> {
+        self.backfill().await?;
         self.ensure_lease_index().await?;
+        self.ensure_ready_index().await?;
         self.expire_due().await?;
         let now = Self::now();
         for prefix in [DEAD_PREFIX, SUCCEEDED_PREFIX, FAILED_PREFIX] {
@@ -744,6 +1035,7 @@ impl super::JobQueue for DurableQueue {
             lease_generation: 0,
         };
         let val = serde_json::to_vec(&sj).map_err(QueueError::store)?;
+        let ready = Self::ready_due_key(id, job.scheduled_at, job.priority, job.created_at);
         let g = self.store.write().await;
         let tx = g.begin_tx().map_err(QueueError::store)?;
         tx.set_bytes(&Self::job_key(id), &val)
@@ -752,6 +1044,8 @@ impl super::JobQueue for DurableQueue {
         tx.set_bytes(&Self::queued_key(id), b"")
             .await
             .map_err(QueueError::store)?;
+        tx.set_bytes(&ready, b"").await.map_err(QueueError::store)?;
+        Self::adjust_queued_count(&tx, 1).await?;
         if let Some(key) = &idempotency_key {
             tx.set_if_absent(key, id.to_string().as_bytes())
                 .await
@@ -792,50 +1086,38 @@ impl super::JobQueue for DurableQueue {
     ) -> Result<Vec<LeasedJob>, QueueError> {
         self.backfill().await?;
         self.ensure_lease_index().await?;
+        self.ensure_ready_index().await?;
         self.expire_due().await?;
         let now = Self::now();
         let lease_millis = super::lease_millis(lease);
-        let ids = self.ids_with_prefix(QUEUED_PREFIX).await?;
-        let mut candidates: Vec<StoredJob> = Vec::new();
-        {
-            let g = self.store.read().await;
-            for id in ids {
-                let key = Self::job_key(id);
-                let bytes = self.row_bytes(&g, &key).await?;
-                let Some(bytes) = bytes else {
-                    continue;
-                };
-                match serde_json::from_slice::<StoredJob>(&bytes) {
-                    Ok(sj) => {
-                        if matches!(sj.status, JobStatus::Queued) && sj.job.scheduled_at <= now {
-                            candidates.push(sj);
-                        }
-                    }
-                    Err(e) => {
-                        debug!(key = %key, error = %e, "skipping job row that does not decode");
-                    }
-                }
-            }
-        }
+        let budget = READY_SCAN_BATCH.max(limit);
+        let mut candidates = self.due_ready(now, budget).await?;
         candidates.sort_by(|a, b| {
-            b.job
-                .priority
-                .cmp(&a.job.priority)
-                .then(a.job.created_at.cmp(&b.job.created_at))
+            b.priority
+                .cmp(&a.priority)
+                .then(a.created_at.cmp(&b.created_at))
+                .then(a.id.cmp(&b.id))
         });
-        candidates.truncate(limit);
         let mut out = Vec::new();
         for candidate in candidates {
-            let id = candidate.job.id;
+            if out.len() >= limit {
+                break;
+            }
+            let id = candidate.id;
             let expiry = Self::now_millis().saturating_add(lease_millis);
             let key = Self::job_key(id);
             let g = self.store.write().await;
             let tx = g.begin_tx().map_err(QueueError::store)?;
+            self.count_row_read();
             let bytes = tx.get_bytes(&key).await.map_err(QueueError::store)?;
             let Some(bytes) = bytes else {
-                tx.delete(&Self::queued_key(id))
-                    .await
-                    .map_err(QueueError::store)?;
+                tx.delete(&candidate.key).await.map_err(QueueError::store)?;
+                let marker = Self::queued_key(id);
+                let had_marker = tx.has(&marker).await.map_err(QueueError::store)?;
+                if had_marker {
+                    tx.delete(&marker).await.map_err(QueueError::store)?;
+                    Self::adjust_queued_count(&tx, -1).await?;
+                }
                 tx.commit().await.map_err(QueueError::store)?;
                 continue;
             };
@@ -843,8 +1125,9 @@ impl super::JobQueue for DurableQueue {
                 let _ = tx.rollback().await;
                 continue;
             };
-            if !matches!(sj.status, JobStatus::Queued) {
-                let _ = tx.rollback().await;
+            if !matches!(sj.status, JobStatus::Queued) || sj.job.scheduled_at > now {
+                tx.delete(&candidate.key).await.map_err(QueueError::store)?;
+                tx.commit().await.map_err(QueueError::store)?;
                 continue;
             }
             sj.lease_generation = sj.lease_generation.saturating_add(1);
@@ -858,12 +1141,14 @@ impl super::JobQueue for DurableQueue {
             tx.delete(&Self::queued_key(id))
                 .await
                 .map_err(QueueError::store)?;
+            tx.delete(&candidate.key).await.map_err(QueueError::store)?;
             tx.set_bytes(&Self::leased_key(id), b"")
                 .await
                 .map_err(QueueError::store)?;
             tx.set_bytes(&Self::lease_due_key(id, expiry), b"")
                 .await
                 .map_err(QueueError::store)?;
+            Self::adjust_queued_count(&tx, -1).await?;
             tx.commit().await.map_err(QueueError::store)?;
             drop(g);
             out.push(LeasedJob {
@@ -1596,6 +1881,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reserve_reads_a_bounded_number_of_rows_from_a_large_backlog() {
+        let q = queue().await;
+        let total = READY_SCAN_BATCH * 8;
+        {
+            let g = q.store.write().await;
+            let tx = g.begin_tx().unwrap();
+            for index in 0..total {
+                let mut row = job("work");
+                row.created_at = index as i64;
+                let id = row.id;
+                let stored = StoredJob {
+                    job: row,
+                    status: JobStatus::Queued,
+                    lease_generation: 0,
+                };
+                let value = serde_json::to_vec(&stored).unwrap();
+                tx.set_bytes(&DurableQueue::job_key(id), &value)
+                    .await
+                    .unwrap();
+                tx.set_bytes(&DurableQueue::queued_key(id), b"")
+                    .await
+                    .unwrap();
+                tx.set_bytes(&DurableQueue::ready_due_key(id, 0, 0, index as i64), b"")
+                    .await
+                    .unwrap();
+            }
+            tx.set_bytes(BACKFILL_KEY, b"1").await.unwrap();
+            tx.set_bytes(LEASE_INDEX_KEY, b"1").await.unwrap();
+            tx.set_bytes(READY_INDEX_KEY, b"1").await.unwrap();
+            tx.set_bytes(QUEUED_COUNT_KEY, total.to_string().as_bytes())
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+        }
+
+        let before = q.row_reads.load(std::sync::atomic::Ordering::SeqCst);
+        let leased = q.reserve("w1", 1, Duration::from_secs(30)).await.unwrap();
+        let reads = q.row_reads.load(std::sync::atomic::Ordering::SeqCst) - before;
+
+        assert_eq!(leased.len(), 1);
+        assert!(
+            reads <= 4,
+            "reserve read {reads} job rows from a backlog of {total}"
+        );
+    }
+
+    #[tokio::test]
     async fn the_expiry_sweeper_returns_a_due_lease_to_the_queue() {
         let q = Arc::new(queue().await);
         q.enqueue(job("work")).await.unwrap();
@@ -1813,18 +2145,22 @@ mod tests {
         let q = queue().await;
         let j = job("work");
         let id = j.id;
+        let ready = DurableQueue::ready_due_key(id, 0, 0, 0);
         q.enqueue(j).await.unwrap();
         assert!(has_key(&q, &DurableQueue::queued_key(id)).await);
         assert!(!has_key(&q, &DurableQueue::leased_key(id)).await);
+        assert!(has_key(&q, &ready).await);
 
         let leased = q.reserve("w1", 10, Duration::from_secs(30)).await.unwrap();
         assert_eq!(leased.len(), 1);
         assert!(!has_key(&q, &DurableQueue::queued_key(id)).await);
         assert!(has_key(&q, &DurableQueue::leased_key(id)).await);
+        assert!(!has_key(&q, &ready).await);
 
         q.ack(id, &leased[0].lease, Some(vec![7])).await.unwrap();
         assert!(!has_key(&q, &DurableQueue::queued_key(id)).await);
         assert!(!has_key(&q, &DurableQueue::leased_key(id)).await);
+        assert!(!has_key(&q, &ready).await);
         assert!(!has_key(&q, &DurableQueue::dead_key(id)).await);
         assert!(has_key(&q, &DurableQueue::succeeded_key(id)).await);
         assert!(has_key(&q, &DurableQueue::job_key(id)).await);
@@ -1877,6 +2213,14 @@ mod tests {
         assert!(!has_key(&q, &DurableQueue::leased_key(id)).await);
         assert!(has_key(&q, &DurableQueue::queued_key(id)).await);
         assert!(!has_key(&q, &DurableQueue::dead_key(id)).await);
+        let row = q.load(id).await.unwrap();
+        let ready = DurableQueue::ready_due_key(
+            id,
+            row.job.scheduled_at,
+            row.job.priority,
+            row.job.created_at,
+        );
+        assert!(has_key(&q, &ready).await);
     }
 
     #[tokio::test]
@@ -1935,6 +2279,44 @@ mod tests {
         assert_eq!(leased.len(), 1);
         assert_eq!(leased[0].job.id, due_id);
         assert!(has_key(&q, &DurableQueue::queued_key(future_id)).await);
+    }
+
+    #[tokio::test]
+    async fn a_scheduled_job_becomes_ready_after_its_time() {
+        let q = queue().await;
+        let mut later = job("later");
+        later.scheduled_at = DurableQueue::now() + 1;
+        let id = later.id;
+        q.enqueue(later).await.unwrap();
+
+        let waiting = q.reserve("w1", 10, Duration::from_secs(30)).await.unwrap();
+        assert!(waiting.is_empty(), "a future job must not run");
+
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+
+        let leased = q.reserve("w1", 10, Duration::from_secs(30)).await.unwrap();
+        assert_eq!(leased.len(), 1);
+        assert_eq!(leased[0].job.id, id);
+    }
+
+    #[tokio::test]
+    async fn a_priority_job_goes_before_an_older_low_priority_job() {
+        let q = queue().await;
+        let mut older = job("older");
+        older.priority = 0;
+        older.created_at = 1;
+        let older_id = older.id;
+        let mut higher = job("higher");
+        higher.priority = 5;
+        higher.created_at = 2;
+        let higher_id = higher.id;
+        q.enqueue(older).await.unwrap();
+        q.enqueue(higher).await.unwrap();
+
+        let leased = q.reserve("w1", 10, Duration::from_secs(30)).await.unwrap();
+
+        let ids: Vec<_> = leased.iter().map(|l| l.job.id).collect();
+        assert_eq!(ids, vec![higher_id, older_id]);
     }
 
     #[tokio::test]
@@ -2041,8 +2423,10 @@ mod tests {
         assert_eq!(leased.len(), 1);
         assert_eq!(leased[0].job.id, queued_id);
         assert!(has_key(&q, BACKFILL_KEY).await);
+        assert!(has_key(&q, READY_INDEX_KEY).await);
         assert!(has_key(&q, &DurableQueue::leased_key(queued_id)).await);
         assert!(!has_key(&q, &DurableQueue::queued_key(queued_id)).await);
+        assert_eq!(q.metrics.depth_value(), 0);
         // The backfill keeps a terminal row and writes its marker.
         assert!(has_key(&q, &DurableQueue::job_key(succeeded_id)).await);
         assert!(has_key(&q, &DurableQueue::succeeded_key(succeeded_id)).await);
