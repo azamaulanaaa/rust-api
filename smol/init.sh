@@ -14,9 +14,74 @@ if [[ ! -d /workspace ]]; then
 fi
 cd /workspace
 
+# The server writes the cache disk into the kernel command line.
+# A remote machine with a cache disk carries
+# SMOLVM_CACHE_DISK=<device>:<mount>. A local pack build has no entry.
+cache_spec=""
+cache_device=""
+cache_mount=""
+if [[ -r /proc/cmdline ]]; then
+  read -r -a cmdline_words </proc/cmdline || true
+  # The kernel quotes each word. Strip one pair of double quotes.
+  for word in "${cmdline_words[@]}"; do
+    word="${word#\"}"
+    word="${word%\"}"
+    case "$word" in
+    SMOLVM_CACHE_DISK=*) cache_spec="${word#SMOLVM_CACHE_DISK=}" ;;
+    esac
+  done
+fi
+
+# Print the size of one block device in bytes.
+# Print nothing when the device has no size entry.
+cache_disk_size() {
+  local device="$1"
+  local name="${device##*/}"
+  local sectors=""
+  if [[ -r "/sys/class/block/${name}/size" ]]; then
+    read -r sectors <"/sys/class/block/${name}/size" || true
+  fi
+  if [[ -z "$sectors" ]]; then
+    sectors="$(blockdev --getsz "$device" 2>/dev/null || true)"
+  fi
+  if [[ "$sectors" =~ ^[0-9]+$ ]]; then
+    printf '%s' "$((sectors * 512))"
+  fi
+}
+
+# A cache disk with no size cannot hold /cache. The server attaches a
+# seed base with no size when the seed file is empty. Stop before the
+# provisioning steps so the error is clear.
+if [[ -n "$cache_spec" ]]; then
+  cache_device="${cache_spec%%:*}"
+  cache_mount="${cache_spec#*:}"
+  if [[ -z "$cache_device" || "$cache_mount" == "$cache_spec" ]]; then
+    echo "error: SMOLVM_CACHE_DISK is not valid: ${cache_spec}" >&2
+    echo "error: Use <device>:<mount>. See docs/smolvm.md." >&2
+    exit 1
+  fi
+  if [[ ! -b "$cache_device" ]]; then
+    echo "error: The cache disk ${cache_device} is missing." >&2
+    echo "error: The kernel command line set SMOLVM_CACHE_DISK=${cache_spec}." >&2
+    echo "error: Recreate the seed base with a non-zero size. See docs/smolvm.md." >&2
+    echo "error: Set SMOLVM_SERVE_CACHE=0 to run without the cache disk." >&2
+    exit 1
+  fi
+  cache_size="$(cache_disk_size "$cache_device")"
+  if [[ -z "$cache_size" || "$cache_size" == "0" ]]; then
+    echo "error: The cache disk ${cache_device} has zero size." >&2
+    echo "error: The server attached a seed base with no size." >&2
+    echo "error: Recreate the seed base with a non-zero size. See docs/smolvm.md." >&2
+    echo "error: Set SMOLVM_SERVE_CACHE=0 to run without the cache disk." >&2
+    exit 1
+  fi
+fi
+
 # The cache disk is present only on a remote machine that asked for one.
 cache_dir=""
-if [[ -d /cache ]]; then
+if [[ -n "$cache_mount" && -d "$cache_mount" ]]; then
+  cache_dir="$cache_mount"
+elif [[ -d /cache ]]; then
   cache_dir=/cache
 fi
 
@@ -95,6 +160,12 @@ run_step "mise PATH setup" \
 # shellcheck disable=SC2016
 run_step "mise shim links" \
   'shim_dir="${MISE_DATA_DIR:-$HOME/.local/share/mise}/shims"; for shim in "$shim_dir"/*; do [ -e "$shim" ] || continue; ln -sf "$shim" "/usr/local/bin/$(basename "$shim")"; done'
+
+# The client stops the machine and publishes the cache disk after init.
+# Flush the disk writes now so the published base holds them.
+if [[ -n "$cache_dir" ]] && grep -qF " ${cache_dir} " /proc/mounts; then
+  sync
+fi
 
 echo "init complete"
 echo "smolvm-init-mode=${init_mode}"
