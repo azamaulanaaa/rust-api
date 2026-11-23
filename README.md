@@ -276,7 +276,7 @@ becomes an orphan, and GC removes it after 24 hours.
 
 Upload size limits apply at `init`, before the client sends any data:
 
-- Field: `part_size`; Limit: Multiple of 1 KiB, at most 512 KiB
+- Field: `part_size`; Limit: Multiple of 1 KiB, from 5 MiB to 10 MiB
 - Field: `file_total_parts`; Limit: 1 for a single-part upload, otherwise at
   most 10,000
 - Field: Single-part `file_size`; Limit: At most 10 MiB, and equal to
@@ -287,7 +287,10 @@ Upload size limits apply at `init`, before the client sends any data:
 - Field: Multipart part lengths; Limit: Every part except the last part has
   `part_size` bytes. The last part has `file_size - (file_total_parts - 1) ×
   part_size` bytes.
-- Field: Maximum multipart upload; Limit: About 4.9 GiB
+- Field: Maximum multipart upload; Limit: About 97.6 GiB
+
+S3 rejects a multipart upload when a part other than the last part is smaller
+than 5 MiB. The 5 MiB `part_size` floor prevents that failure at `complete`.
 
 Capability tokens are a short-lived HMAC JWT for direct file delegation.
 `FsEngine::mint_token` and `verify_token` are available to applications. The
@@ -1132,8 +1135,8 @@ last part has `part_size` bytes. The last part has `file_size -
 (file_total_parts - 1) × part_size` bytes. The client does not pad the last
 part. A padded last part returns `400`.
 
-Example: `file_size = 2500`, `part_size = 1024`, and `file_total_parts = 3`.
-Part 0 and part 1 have 1024 bytes. Part 2 has 452 bytes.
+Example: `file_size = 5243332`, `part_size = 5242880`, and
+`file_total_parts = 2`. Part 0 has 5242880 bytes. Part 1 has 452 bytes.
 
 #### Errors and CORS
 
