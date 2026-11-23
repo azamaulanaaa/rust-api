@@ -270,13 +270,22 @@ pub async fn import<R: BufRead>(
     let rule_keys = match rules.import_rules(&rule_rows).await {
         Ok(keys) => keys,
         Err(error) => {
-            schemas.remove_import_keys(&schema_keys).await?;
+            if let Err(cleanup) = schemas.remove_import_keys(&schema_keys).await {
+                tracing::warn!(%cleanup, "cannot remove schema keys during rollback");
+            }
             return Err(error.into());
         }
     };
     if let Err(error) = entities.import_entities(&entity_rows).await {
-        rules.remove_import_keys(&rule_keys).await?;
-        schemas.remove_import_keys(&schema_keys).await?;
+        if let Err(cleanup) = entities.remove_import_keys(&entity_rows).await {
+            tracing::warn!(%cleanup, "cannot remove entity rows during rollback");
+        }
+        if let Err(cleanup) = rules.remove_import_keys(&rule_keys).await {
+            tracing::warn!(%cleanup, "cannot remove rule keys during rollback");
+        }
+        if let Err(cleanup) = schemas.remove_import_keys(&schema_keys).await {
+            tracing::warn!(%cleanup, "cannot remove schema keys during rollback");
+        }
         return Err(error.into());
     }
 
@@ -845,6 +854,63 @@ mod tests {
         assert!(
             schemas.versions().await?.is_empty(),
             "the failed import must write no schema key"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_entity_write_failure_removes_every_imported_row() -> anyhow::Result<()> {
+        let (source_schemas, source_entities, source_rules, _) = triple().await;
+        let mut schema = draft("person");
+        schema.attributes.insert(
+            "email".to_string(),
+            attr("email", AttributeType::String, false, true),
+        );
+        source_schemas.publish(schema).await?;
+        let ctx = WriteContext::new("test");
+        for id in ["alice", "bob"] {
+            source_entities
+                .create(
+                    EntityDraft {
+                        id: id.to_string(),
+                        schemas: vec!["person".to_string()],
+                        attributes: values(&[(
+                            "email",
+                            AttributeValue::String(format!("{id}@example.test")),
+                        )]),
+                    },
+                    &ctx,
+                )
+                .await?;
+        }
+        let mut bytes = Vec::new();
+        let exported = export(&source_schemas, &source_entities, &source_rules, &mut bytes).await?;
+        assert_eq!(exported.entities, 2);
+
+        let (schemas, entities, rules, raw) = triple().await;
+        entities.fail_import_after(1);
+        let result = import(&schemas, &entities, &rules, bytes.as_slice()).await;
+
+        assert!(result.is_err(), "the second entity write must fail");
+        assert!(
+            schemas.versions().await?.is_empty(),
+            "the schema keys are gone"
+        );
+        assert!(entities.is_empty().await?, "the entity rows are gone");
+        assert!(rules.is_empty().await?, "the import wrote no rule");
+        let rows = raw.gets_keys(None, Direction::Next, (None, None)).await?;
+        let leftover = rows.iter().find(|row| {
+            let key = row.as_str();
+            key.starts_with("idx:entity:")
+                || key.starts_with("idx:schema:")
+                || key.starts_with("idx:attr:")
+                || key.starts_with("idx:unique-x:")
+                || key.starts_with("idx:time:")
+                || key.starts_with("idx:ref:")
+        });
+        assert!(
+            leftover.is_none(),
+            "an index row from the failed import remains: {leftover:?}"
         );
         Ok(())
     }

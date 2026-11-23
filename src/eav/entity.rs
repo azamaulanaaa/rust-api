@@ -686,6 +686,11 @@ pub struct EntityStore {
     /// test.
     #[cfg(test)]
     migration_commit_hook: Arc<std::sync::Mutex<Option<BackfillPageHook>>>,
+    /// The number of entity rows to commit before a test import fails.
+    ///
+    /// Zero means that the import runs to the end.
+    #[cfg(test)]
+    import_failure_after: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// One create after validation.
@@ -800,6 +805,8 @@ impl EntityStore {
             delete_prepare_hook: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
             migration_commit_hook: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            import_failure_after: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -892,6 +899,15 @@ impl EntityStore {
             .migration_commit_hook
             .lock()
             .expect("migration commit hook lock") = hook;
+    }
+
+    /// Fails a test import after `commits` entity rows commit.
+    ///
+    /// A value of zero disables the hook.
+    #[cfg(test)]
+    pub(crate) fn fail_import_after(&self, commits: usize) {
+        self.import_failure_after
+            .store(commits, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Sets whether a write checks that every `EntityRef` target exists.
@@ -1940,7 +1956,9 @@ impl EntityStore {
                 };
                 feed.append(WalOp::Entity { event })
                     .await
-                    .map_err(|_| EntityError::Feed("entity feed append failed".to_string()))?;
+                    .map_err(|error| {
+                        EntityError::Feed(format!("entity feed append failed: {error}"))
+                    })?;
                 let g = self.store.write().await;
                 let tx = g.begin_tx().map_err(EntityError::Store)?;
                 decrement_outbox_pending(&tx, 1).await?;
@@ -3846,7 +3864,10 @@ impl EntityStore {
                 .await?;
         }
 
-        for entity in entities {
+        // The index drives the test-only failure injection below. The
+        // non-test build does not read it, so silence the clippy lint.
+        #[allow(clippy::unused_enumerate_index)]
+        for (_index, entity) in entities.iter().enumerate() {
             let _write = self.write_lock.lock().await;
             let g = self.store.write().await;
             let effective = self.resolve_import_refs(entity).await?;
@@ -3871,8 +3892,52 @@ impl EntityStore {
             put_entity_rows_except_meta(&tx, None, entity, &merged, &facts, &mut state, None)
                 .await?;
             tx.commit().await.map_err(EntityError::Store)?;
+            #[cfg(test)]
+            if self
+                .import_failure_after
+                .load(std::sync::atomic::Ordering::SeqCst)
+                == _index + 1
+            {
+                return Err(EntityError::Internal(
+                    "the test import write failed".to_string(),
+                ));
+            }
         }
         Ok(entities.len())
+    }
+
+    /// Removes every row that an import wrote for `entities`.
+    ///
+    /// The call runs after a later import step fails. It deletes the metadata
+    /// row, the attribute rows, the index rows, and the unique claims of each
+    /// record. It commits every delete in one transaction. The call leaves the
+    /// name markers in place, because a schema publish owns those markers.
+    pub(crate) async fn remove_import_keys(&self, entities: &[Entity]) -> Result<(), EntityError> {
+        let _write = self.write_lock.lock().await;
+        let g = self.store.write().await;
+        let tx = g.begin_tx().map_err(EntityError::Store)?;
+        let mut state = WriteState::default();
+        for entity in entities {
+            let effective = self.resolve_import_refs(entity).await?;
+            let merged = merge_schemas(&effective)?;
+            let entity_facts = self.name_facts(&tx, &name_keys(entity, None)).await?;
+            delete_mutable_rows(&tx, entity, None, &merged, &entity_facts, &mut state).await?;
+            delete_ref_rows(&tx, entity, &merged).await?;
+            delete_all_timer_markers(&tx, entity, &merged).await?;
+            for schema_id in &merged.schema_ids {
+                tx.delete(&schema_index_key(schema_id, &entity.id))
+                    .await
+                    .map_err(EntityError::Store)?;
+            }
+            tx.delete(&entity_index_key(&entity.id))
+                .await
+                .map_err(EntityError::Store)?;
+            tx.delete(&meta_key(&entity.id))
+                .await
+                .map_err(EntityError::Store)?;
+        }
+        tx.commit().await.map_err(EntityError::Store)?;
+        Ok(())
     }
 
     /// Checks one entity record before an import writes it.
@@ -9342,7 +9407,15 @@ mod tests {
         feed.fail_after(1);
         let result = store.flush_outbox().await;
 
-        assert!(matches!(result, Err(EntityError::Feed(_))));
+        match result {
+            Err(EntityError::Feed(message)) => {
+                assert!(
+                    message.contains("feed down"),
+                    "the feed error is lost: {message}"
+                );
+            }
+            other => panic!("expected a feed error: {other:?}"),
+        }
         assert_eq!(feed.events().len(), 1);
         assert_eq!(outbox_keys(&raw).await, keys[1..]);
         assert_eq!(pending_counter(&raw).await, Some(4));

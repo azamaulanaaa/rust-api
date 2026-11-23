@@ -65,4 +65,4 @@ pub use entity::{
 };
 pub use entity_error::EntityError;
 pub use metrics::EavMetrics;
-pub use runtime::{EavRuntime, EavRuntimeConfig};
+pub use runtime::{EavRuntime, EavRuntimeConfig, EavRuntimeError};

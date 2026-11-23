@@ -1081,16 +1081,17 @@ async fn list_entities(
     let (limit, mode) = query.into_inner().resolve()?;
     match mode {
         PageMode::Cursor(after) => {
-            let (raw, next) = runtime
-                .entities()
-                .list_after(limit, after.as_deref())
-                .await?;
-            let mut items = Vec::with_capacity(raw.len());
-            for entity in raw {
-                if can_read_entity(&policy, &claims.sub, &entity.id).await? {
-                    items.push(entity);
+            let (items, next) = visible_cursor_page(&policy, &claims.sub, limit, after, |cursor| {
+                let runtime = runtime.clone();
+                async move {
+                    runtime
+                        .entities()
+                        .list_after(limit, cursor.as_deref())
+                        .await
+                        .map_err(EavApiError::from)
                 }
-            }
+            })
+            .await?;
             Ok(HttpResponse::Ok().json(EntityPage {
                 items,
                 next_offset: None,
@@ -1345,16 +1346,18 @@ async fn list_schema_entities(
     let (limit, mode) = query.into_inner().resolve()?;
     match mode {
         PageMode::Cursor(after) => {
-            let (raw, next) = runtime
-                .entities()
-                .list_by_schema_after(&id, limit, after.as_deref())
-                .await?;
-            let mut items = Vec::with_capacity(raw.len());
-            for entity in raw {
-                if can_read_entity(&policy, &claims.sub, &entity.id).await? {
-                    items.push(entity);
+            let (items, next) = visible_cursor_page(&policy, &claims.sub, limit, after, |cursor| {
+                let runtime = runtime.clone();
+                let id = id.clone();
+                async move {
+                    runtime
+                        .entities()
+                        .list_by_schema_after(&id, limit, cursor.as_deref())
+                        .await
+                        .map_err(EavApiError::from)
                 }
-            }
+            })
+            .await?;
             Ok(HttpResponse::Ok().json(EntityPage {
                 items,
                 next_offset: None,

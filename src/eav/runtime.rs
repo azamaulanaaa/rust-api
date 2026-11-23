@@ -256,6 +256,11 @@ impl ReplicaTestHooks {
     }
 }
 
+/// An error from one public EAV runtime operation.
+#[derive(Debug, thiserror::Error)]
+#[error(transparent)]
+pub struct EavRuntimeError(#[from] anyhow::Error);
+
 /// The EAV stores and their background loops.
 ///
 /// The runtime holds one shared WAL.
@@ -318,7 +323,7 @@ impl EavRuntime {
         check_entity_refs: bool,
         max_causation_depth: u32,
         script_enabled: bool,
-    ) -> anyhow::Result<Self> {
+    ) -> Result<Self, EavRuntimeError> {
         let schema_store = build_s3_store(s3, &domain_prefix(db_prefix, "schema"))
             .await
             .context("build the EAV schema store")?;
@@ -486,7 +491,7 @@ impl EavRuntime {
     /// The next pass then emits the same event again.
     /// The event id is stable, and a duplicate event is idempotent.
     /// The rule engine execution marker stops a duplicate action.
-    pub async fn fire_due_timers(&self, now: i64, limit: usize) -> anyhow::Result<usize> {
+    pub async fn fire_due_timers(&self, now: i64, limit: usize) -> Result<usize, EavRuntimeError> {
         let mut emitted = 0;
         let mut due_count = 0;
         for key in self
@@ -566,7 +571,7 @@ impl EavRuntime {
         &self,
         cancel: C,
         config: EavRuntimeConfig,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), EavRuntimeError> {
         let relay = self.supervise(LoopSlot::OutboxRelay, cancel.clone(), {
             let runtime = self.clone();
             move |token| {
@@ -705,7 +710,7 @@ impl EavRuntime {
         &self,
         cancel: C,
         config: EavRuntimeConfig,
-    ) -> JoinHandle<anyhow::Result<()>> {
+    ) -> JoinHandle<Result<(), EavRuntimeError>> {
         let runtime = self.clone();
         tokio::spawn(async move {
             let result = runtime.run(cancel, config).await;
