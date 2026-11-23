@@ -627,7 +627,11 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
     let setup_token = config.authorization.setup_token.clone();
 
     let telemetry = telemetry::init(
-        verbose,
+        if verbose {
+            telemetry::LogVerbosity::Verbose
+        } else {
+            telemetry::LogVerbosity::Normal
+        },
         &config.observability.service_name,
         config.observability.otlp_endpoint.as_deref(),
         config.observability.sample_ratio,
