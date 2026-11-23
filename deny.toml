@@ -130,3 +130,14 @@ suggests jiff and time as alternatives. The migration cost is a change to the \
 OIDC client and to the vendored oxkv-s3 adapter and S3 builder. Review this \
 entry when those paths move off chrono.
 """
+
+[[advisories.ignore]]
+id = "RUSTSEC-2026-0594"
+reason = """
+cookie 0.16.2 can reuse a private cookie nonce after fork. Fixed in cookie \
+0.18.3, but every actix-web release through 4.20.0 requires cookie ^0.16, so \
+no patched version can be selected by a dependency bump. This crate builds \
+only plain cookies through Cookie::build; it never uses PrivateJar or \
+SignedJar, and it does not call fork(). The vulnerable path is therefore not \
+reachable. Re-check when actix-web accepts cookie 0.18.
+"""
