@@ -1013,7 +1013,7 @@ mod tests {
     use crate::eav::schema::{AttributeDef, AttributeType, SchemaDraft};
     use crate::fs::s3::S3Backend;
     use crate::records::{ChangeSink, EntityEventKind, WalOp};
-    use crate::rules::action::ActionContext;
+    use crate::rules::action::{ActionContext, ActionError};
     use crate::rules::engine::ExecutionOutcome;
     use crate::rules::rule::{ActionRef, Condition, RuleDraft, RuleTrigger};
 
@@ -1042,7 +1042,7 @@ mod tests {
             &self.kind
         }
 
-        async fn execute(&self, ctx: ActionContext) -> Result<(), anyhow::Error> {
+        async fn execute(&self, ctx: ActionContext) -> Result<(), ActionError> {
             self.records.lock().unwrap().push(ctx);
             Ok(())
         }

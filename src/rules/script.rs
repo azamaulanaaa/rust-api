@@ -213,6 +213,7 @@ pub enum ScriptError {
 /// `event` is always present.
 /// `entity` is `None` for a deleted entity.
 /// `now` is a Unix timestamp in seconds.
+#[derive(Debug)]
 pub struct ScriptActionContext {
     /// The event that started the rule.
     pub event: EntityEvent,
@@ -227,6 +228,7 @@ pub struct ScriptActionContext {
 /// `event` is always present.
 /// `entity` is `None` for a deleted entity.
 /// `now` is a Unix timestamp in seconds.
+#[derive(Debug)]
 pub struct ScriptContext<'a> {
     /// The event that started the rule.
     pub event: &'a EntityEvent,
@@ -274,21 +276,46 @@ pub struct ScriptHost {
     event_id: String,
 }
 
+impl std::fmt::Debug for ScriptHost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScriptHost")
+            .field("rule_id", &self.rule_id)
+            .field("event_id", &self.event_id)
+            .field("read", &self.read)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Configuration for one [`ScriptHost`].
+pub struct ScriptHostConfig {
+    /// Entity store that the host reads.
+    pub entities: EntityStore,
+    /// Schemas that the host may read.
+    pub read: ScriptCapabilities,
+    /// Schemas that the host may write.
+    pub write: Vec<String>,
+    /// Identifier of the rule that runs the script.
+    pub rule_id: String,
+    /// Identifier of the event that started the rule.
+    pub event_id: String,
+    /// Handle of the async runtime. The host calls `block_on` on it.
+    pub runtime: Handle,
+}
+
 impl ScriptHost {
     /// Creates a host for one rule and one event.
     ///
-    /// `read` holds the read capability set.
-    /// `write` holds the write capability set.
-    /// `runtime` is the handle of the async runtime.
-    /// The host calls `block_on` on that handle from a blocking thread.
-    pub fn new(
-        entities: EntityStore,
-        read: ScriptCapabilities,
-        write: Vec<String>,
-        rule_id: String,
-        event_id: String,
-        runtime: Handle,
-    ) -> Self {
+    /// The config groups the identifiers, so a caller cannot swap the rule id
+    /// and the event id without naming them.
+    pub fn new(config: ScriptHostConfig) -> Self {
+        let ScriptHostConfig {
+            entities,
+            read,
+            write,
+            rule_id,
+            event_id,
+            runtime,
+        } = config;
         Self {
             read_host: ScriptReadHost::new(entities.clone(), read.clone()),
             read,
@@ -302,8 +329,12 @@ impl ScriptHost {
     }
 
     /// Returns the effects that the script staged.
-    pub(crate) fn take_effects(&self) -> Vec<EntityEffect> {
-        std::mem::take(&mut self.lock_state().effects)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScriptError::Runtime`] when the host state is poisoned.
+    pub(crate) fn take_effects(&self) -> Result<Vec<EntityEffect>, ScriptError> {
+        Ok(std::mem::take(&mut self.lock_state()?.effects))
     }
 
     /// Returns one entity as a Rhai map or `()`.
@@ -456,7 +487,9 @@ impl ScriptHost {
 
     /// Counts one read call and rejects a call above the read limit.
     fn count_read(&self) -> Result<(), Box<EvalAltResult>> {
-        let mut state = self.lock_state();
+        let mut state = self
+            .lock_state()
+            .map_err(|_| host_error("script host state is poisoned"))?;
         if state.reads >= MAX_READ_CALLS {
             return Err(host_error(READ_LIMIT_MESSAGE));
         }
@@ -466,7 +499,9 @@ impl ScriptHost {
 
     /// Stages one effect and rejects an effect above the effect limit.
     fn stage(&self, effect: EntityEffect) -> Result<(), Box<EvalAltResult>> {
-        let mut state = self.lock_state();
+        let mut state = self
+            .lock_state()
+            .map_err(|_| host_error("script host state is poisoned"))?;
         if state.effects.len() >= MAX_EFFECTS {
             return Err(host_error(EFFECT_LIMIT_MESSAGE));
         }
@@ -591,7 +626,7 @@ impl ScriptHost {
         match error {
             ScriptHostError::Denied => host_error(READ_DENIED_MESSAGE),
             ScriptHostError::Invalid(message) => host_error(&message),
-            ScriptHostError::Store(_) => {
+            ScriptHostError::Store { .. } => {
                 tracing::warn!(
                     rule_id = %self.rule_id,
                     event_id = %self.event_id,
@@ -602,9 +637,9 @@ impl ScriptHost {
         }
     }
 
-    /// Locks the host state and recovers from a poisoned lock.
-    fn lock_state(&self) -> MutexGuard<'_, HostState> {
-        self.state.lock().unwrap_or_else(|error| error.into_inner())
+    /// Locks the host state. A poisoned state cannot be trusted.
+    fn lock_state(&self) -> Result<MutexGuard<'_, HostState>, ScriptError> {
+        self.state.lock().map_err(|_| ScriptError::Runtime)
     }
 }
 
@@ -637,6 +672,17 @@ pub struct ScriptEngine {
     /// A test hook that runs before one condition evaluation.
     #[cfg(test)]
     probe: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+impl std::fmt::Debug for ScriptEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let cached = self.cache.lock().map(|cache| cache.len()).unwrap_or(0);
+        f.debug_struct("ScriptEngine")
+            .field("enabled", &self.enabled)
+            .field("cached_scripts", &cached)
+            .field("wall_guard", &self.wall_guard)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ScriptEngine {
@@ -809,7 +855,7 @@ impl ScriptEngine {
         EVAL_DEADLINE.with(|deadline| deadline.set(None));
 
         match result {
-            Ok(_) => Ok(staged.take_effects()),
+            Ok(_) => staged.take_effects(),
             Err(error) => Err(classify(&error)),
         }
     }
@@ -828,7 +874,7 @@ impl ScriptEngine {
         }
         let key = source_hash(source);
         {
-            let cache = lock_cache(&self.cache);
+            let cache = lock_cache(&self.cache)?;
             if let Some(entry) = cache.get(&key)
                 && entry.source == source
             {
@@ -840,7 +886,7 @@ impl ScriptEngine {
             .engine
             .compile(source)
             .map_err(|_| ScriptError::Compile)?;
-        let mut cache = lock_cache(&self.cache);
+        let mut cache = lock_cache(&self.cache)?;
         if cache.len() >= CACHE_CAPACITY {
             cache.clear();
         }
@@ -857,15 +903,17 @@ impl ScriptEngine {
     /// Returns the number of cached scripts.
     #[cfg(test)]
     fn cache_len(&self) -> usize {
-        lock_cache(&self.cache).len()
+        lock_cache(&self.cache)
+            .expect("script cache is not poisoned")
+            .len()
     }
 }
 
-/// Locks the cache and recovers from a poisoned lock.
+/// Locks the script cache. A poisoned cache cannot be trusted.
 fn lock_cache(
     cache: &Mutex<HashMap<u64, CachedScript>>,
-) -> MutexGuard<'_, HashMap<u64, CachedScript>> {
-    cache.lock().unwrap_or_else(|error| error.into_inner())
+) -> Result<MutexGuard<'_, HashMap<u64, CachedScript>>, ScriptError> {
+    cache.lock().map_err(|_| ScriptError::Runtime)
 }
 
 /// Returns a stable hash of one script source.
@@ -1005,7 +1053,9 @@ pub(crate) async fn visible_attribute_keys(
                     .iter()
                     .flat_map(|schema| schema.attributes.keys().cloned()),
             ),
-            Err(EntityError::UnknownSchema(_)) | Err(EntityError::Invalid(_)) => {}
+            Err(EntityError::UnknownSchema(_))
+            | Err(EntityError::Invalid(_))
+            | Err(EntityError::Internal(_)) => {}
             Err(_) => return Err(ScriptError::Runtime),
         }
     }
@@ -1261,14 +1311,14 @@ mod tests {
             ))
             .await
             .unwrap();
-        let host = ScriptHost::new(
-            store.clone(),
-            ScriptCapabilities::new(read.iter().copied()).unwrap(),
-            write.iter().map(|schema| (*schema).to_string()).collect(),
-            "rule-1".to_string(),
-            "evt-1".to_string(),
-            Handle::current(),
-        );
+        let host = ScriptHost::new(ScriptHostConfig {
+            entities: store.clone(),
+            read: ScriptCapabilities::new(read.iter().copied()).unwrap(),
+            write: write.iter().map(|schema| (*schema).to_string()).collect(),
+            rule_id: "rule-1".to_string(),
+            event_id: "evt-1".to_string(),
+            runtime: Handle::current(),
+        });
         (host, store)
     }
 

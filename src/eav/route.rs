@@ -721,9 +721,10 @@ impl From<RuleError> for EavApiError {
             | RuleError::UnknownAction(_) => Kind::Invalid,
             RuleError::VersionConflict => Kind::Conflict,
             RuleError::Store(_)
-            | RuleError::Serialization(_)
+            | RuleError::Serialization { .. }
+            | RuleError::Cause { .. }
             | RuleError::Action(_)
-            | RuleError::Wal(_)
+            | RuleError::Wal { .. }
             | RuleError::DuplicateAction(_)
             | RuleError::Script(_) => Kind::Internal,
         };
@@ -1625,7 +1626,7 @@ mod tests {
     use crate::http::middleware::jwks::test_support::{rsa_key, sign_rs256, spawn_jwks};
     use crate::policy::PolicyEngine;
     use crate::records::WalOp;
-    use crate::rules::action::{ActionContext, RuleAction};
+    use crate::rules::action::{ActionContext, ActionError, RuleAction};
     use crate::rules::webhook::WebhookAction;
     use crate::sync::wal::Wal;
 
@@ -1686,7 +1687,7 @@ mod tests {
             "record"
         }
 
-        async fn execute(&self, _ctx: ActionContext) -> Result<(), anyhow::Error> {
+        async fn execute(&self, _ctx: ActionContext) -> Result<(), ActionError> {
             Ok(())
         }
     }
@@ -2039,7 +2040,7 @@ mod tests {
                 "internal_error",
             ),
             (
-                EavApiError::from(RuleError::Wal("x".into())),
+                EavApiError::from(RuleError::wal("x")),
                 500,
                 "internal_error",
             ),

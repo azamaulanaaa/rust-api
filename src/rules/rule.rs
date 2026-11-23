@@ -28,7 +28,7 @@ use crate::rules::script_host::ScriptCapabilities;
 const MAX_NAME_BYTES: usize = 128;
 
 /// Maximum depth of a condition tree. The root counts as depth 1.
-const MAX_DEPTH: usize = 16;
+pub(crate) const MAX_DEPTH: usize = 16;
 
 /// Maximum count of ids in one capability list.
 const MAX_CAPABILITY_IDS: usize = 32;
@@ -143,7 +143,7 @@ impl RuleCapabilities {
     /// The write side stays in the rule until the host supports it.
     pub fn to_script_capabilities(&self) -> Result<ScriptCapabilities, RuleError> {
         ScriptCapabilities::new(self.read.iter().cloned())
-            .map_err(|error| RuleError::Invalid(error.to_string()))
+            .map_err(|error| RuleError::cause(error.to_string(), error))
     }
 }
 
@@ -287,6 +287,9 @@ impl Condition {
     /// The rule engine must resolve a script through
     /// [eval_bool](crate::rules::script::ScriptEngine::eval_bool).
     pub fn eval(&self, entity: Option<&Entity>, event: &EntityEvent) -> bool {
+        if !self.within_depth(MAX_DEPTH) {
+            return false;
+        }
         match self {
             Self::Always => true,
             Self::All(children) => children.iter().all(|child| child.eval(entity, event)),
@@ -311,21 +314,46 @@ impl Condition {
 
     /// Returns the depth of this tree. The root counts as depth 1.
     fn depth(&self) -> usize {
-        match self {
-            Self::Always
-            | Self::Compare { .. }
-            | Self::Exists { .. }
-            | Self::Changed { .. }
-            | Self::Script { .. } => 1,
-            Self::Not(child) => 1 + child.depth(),
-            Self::All(children) | Self::Any(children) => {
-                1 + children.iter().map(Self::depth).max().unwrap_or(0)
+        let mut deepest = 0;
+        let mut stack = vec![(self, 1usize)];
+        while let Some((node, depth)) = stack.pop() {
+            deepest = deepest.max(depth);
+            match node {
+                Self::All(children) | Self::Any(children) => {
+                    stack.extend(children.iter().map(|child| (child, depth + 1)));
+                }
+                Self::Not(child) => stack.push((child, depth + 1)),
+                _ => {}
             }
         }
+        deepest
+    }
+
+    /// Returns false when any node sits deeper than `limit`.
+    ///
+    /// The walk uses a stack, so a deep tree cannot overflow the call stack.
+    pub(crate) fn within_depth(&self, limit: usize) -> bool {
+        let mut stack = vec![(self, 1usize)];
+        while let Some((node, depth)) = stack.pop() {
+            if depth > limit {
+                return false;
+            }
+            match node {
+                Self::All(children) | Self::Any(children) => {
+                    stack.extend(children.iter().map(|child| (child, depth + 1)));
+                }
+                Self::Not(child) => stack.push((child, depth + 1)),
+                _ => {}
+            }
+        }
+        true
     }
 
     /// Rejects a script source that is larger than [`MAX_SOURCE_BYTES`].
     fn validate_source_size(&self) -> Result<(), RuleError> {
+        if !self.within_depth(MAX_DEPTH) {
+            return Err(RuleError::ConditionDepth);
+        }
         match self {
             Self::Script { source } if source.len() > MAX_SOURCE_BYTES => Err(RuleError::Invalid(
                 "rule script source is larger than 64 KiB".to_string(),
@@ -898,5 +926,16 @@ mod tests {
 
         assert!(script.allows("task"));
         assert!(!script.allows("other"));
+    }
+
+    #[test]
+    fn a_deep_condition_is_rejected_without_a_stack_overflow() {
+        let mut condition = Condition::Always;
+        for _ in 0..MAX_DEPTH + 8 {
+            condition = Condition::Not(Box::new(condition));
+        }
+        assert_eq!(condition.depth(), MAX_DEPTH + 9);
+        assert!(!condition.within_depth(MAX_DEPTH));
+        assert!(!condition.eval(None, &event(Vec::new())));
     }
 }

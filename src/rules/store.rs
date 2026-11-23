@@ -228,6 +228,19 @@ pub struct RuleStore {
     gc_page_high_water: Arc<std::sync::atomic::AtomicUsize>,
 }
 
+impl std::fmt::Debug for RuleStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let cached = self
+            .match_cache
+            .lock()
+            .map(|cache| cache.entries.len())
+            .unwrap_or(0);
+        f.debug_struct("RuleStore")
+            .field("cached_matches", &cached)
+            .finish_non_exhaustive()
+    }
+}
+
 impl RuleStore {
     /// Creates a rule store over `store`.
     pub fn new(store: OxKvStore) -> Self {
@@ -240,28 +253,31 @@ impl RuleStore {
         }
     }
 
-    /// Locks the match cache and ignores a poisoned lock.
-    fn cache(&self) -> std::sync::MutexGuard<'_, RuleMatchCache> {
+    /// Locks the match cache. A poisoned cache cannot be trusted.
+    fn cache(&self) -> Result<std::sync::MutexGuard<'_, RuleMatchCache>, RuleError> {
         self.match_cache
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .map_err(|_| RuleError::Invalid("rule match cache is poisoned".to_string()))
     }
 
     /// Removes every cached match result after a rule change.
-    fn invalidate_match_cache(&self) {
-        self.cache().invalidate();
+    fn invalidate_match_cache(&self) -> Result<(), RuleError> {
+        self.cache()?.invalidate();
+        Ok(())
     }
 
     /// Returns the cache hit count in a test build.
     #[cfg(test)]
     pub(crate) fn cache_hits(&self) -> usize {
-        self.cache().hits
+        self.cache().expect("rule match cache is not poisoned").hits
     }
 
     /// Returns the cache miss count in a test build.
     #[cfg(test)]
     pub(crate) fn cache_misses(&self) -> usize {
-        self.cache().misses
+        self.cache()
+            .expect("rule match cache is not poisoned")
+            .misses
     }
 
     /// Adds one rule or replaces the rule with the same id.
@@ -281,7 +297,7 @@ impl RuleStore {
         let tx = g.begin_tx().map_err(RuleError::Store)?;
         let rule = self.stage_upsert(&tx, draft).await?;
         map_rule_commit(&rule.id, tx.commit().await)?;
-        self.invalidate_match_cache();
+        self.invalidate_match_cache()?;
         Ok(rule)
     }
 
@@ -318,14 +334,10 @@ impl RuleStore {
         };
 
         let expected = match &previous {
-            Some(previous) => Some(
-                serde_json::to_vec(previous)
-                    .map_err(|error| RuleError::Serialization(error.to_string()))?,
-            ),
+            Some(previous) => Some(serde_json::to_vec(previous).map_err(RuleError::serialization)?),
             None => None,
         };
-        let bytes = serde_json::to_vec(&rule)
-            .map_err(|error| RuleError::Serialization(error.to_string()))?;
+        let bytes = serde_json::to_vec(&rule).map_err(RuleError::serialization)?;
         tx.compare_and_set(&meta_key(&rule.id), expected.as_deref(), &bytes)
             .await
             .map_err(RuleError::Store)?;
@@ -362,8 +374,8 @@ impl RuleStore {
         let rows = scan_prefix(&*g, META_PREFIX).await?;
         let mut rules = Vec::with_capacity(rows.len());
         for row in rows {
-            let rule: Rule = serde_json::from_slice(&row.value)
-                .map_err(|error| RuleError::Serialization(error.to_string()))?;
+            let rule: Rule =
+                serde_json::from_slice(&row.value).map_err(RuleError::serialization)?;
             rules.push(rule);
         }
         sort_rules(&mut rules);
@@ -411,7 +423,7 @@ impl RuleStore {
         }
         tx.delete(&meta_key(id)).await.map_err(RuleError::Store)?;
         tx.commit().await.map_err(RuleError::Store)?;
-        self.invalidate_match_cache();
+        self.invalidate_match_cache()?;
         Ok(true)
     }
 
@@ -452,7 +464,7 @@ impl RuleStore {
             .stage_set_enabled(&tx, id, enabled, expected_version)
             .await?;
         map_rule_commit(id, tx.commit().await)?;
-        self.invalidate_match_cache();
+        self.invalidate_match_cache()?;
         Ok(rule)
     }
 
@@ -477,8 +489,7 @@ impl RuleStore {
         let Some(previous) = tx.get_bytes(&key).await.map_err(RuleError::Store)? else {
             return Err(RuleError::NotFound(id.to_string()));
         };
-        let mut rule: Rule = serde_json::from_slice(&previous)
-            .map_err(|error| RuleError::Serialization(error.to_string()))?;
+        let mut rule: Rule = serde_json::from_slice(&previous).map_err(RuleError::serialization)?;
         if let Some(expected) = expected_version
             && rule.version != expected
         {
@@ -490,8 +501,7 @@ impl RuleStore {
             .checked_add(1)
             .ok_or_else(|| RuleError::Invalid("rule version overflow".to_string()))?;
         rule.updated_at = chrono::Utc::now().timestamp();
-        let bytes = serde_json::to_vec(&rule)
-            .map_err(|error| RuleError::Serialization(error.to_string()))?;
+        let bytes = serde_json::to_vec(&rule).map_err(RuleError::serialization)?;
         tx.compare_and_set(&key, Some(&previous), &bytes)
             .await
             .map_err(RuleError::Store)?;
@@ -509,7 +519,7 @@ impl RuleStore {
     pub async fn matching(&self, event: &EntityEvent) -> Result<Vec<Rule>, RuleError> {
         let cache_key = match_cache_key(event);
         let generation = {
-            let mut cache = self.cache();
+            let mut cache = self.cache()?;
             if let Some(rules) = cache.get(&cache_key) {
                 return Ok((*rules).clone());
             }
@@ -545,7 +555,7 @@ impl RuleStore {
         }
         sort_rules(&mut rules);
 
-        let mut cache = self.cache();
+        let mut cache = self.cache()?;
         if cache.generation == generation {
             cache.insert(cache_key, Arc::new(rules.clone()));
         }
@@ -560,13 +570,12 @@ impl RuleStore {
         let Some(bytes) = g.get_bytes(CURSOR_KEY).await.map_err(RuleError::Store)? else {
             return Ok(0);
         };
-        serde_json::from_slice(&bytes).map_err(|error| RuleError::Serialization(error.to_string()))
+        serde_json::from_slice(&bytes).map_err(RuleError::serialization)
     }
 
     /// Writes the durable change-feed cursor.
     pub(crate) async fn set_cursor(&self, seq: u64) -> Result<(), RuleError> {
-        let bytes = serde_json::to_vec(&seq)
-            .map_err(|error| RuleError::Serialization(error.to_string()))?;
+        let bytes = serde_json::to_vec(&seq).map_err(RuleError::serialization)?;
         let g = self.store.write().await;
         g.put_bytes(CURSOR_KEY, &bytes)
             .await
@@ -588,12 +597,10 @@ impl RuleStore {
         let _publish = self.publish_lock.lock().await;
         let g = self.store.write().await;
         let old = match g.get_bytes(CURSOR_KEY).await.map_err(RuleError::Store)? {
-            Some(bytes) => serde_json::from_slice(&bytes)
-                .map_err(|error| RuleError::Serialization(error.to_string()))?,
+            Some(bytes) => serde_json::from_slice(&bytes).map_err(RuleError::serialization)?,
             None => 0,
         };
-        let bytes = serde_json::to_vec(&seq)
-            .map_err(|error| RuleError::Serialization(error.to_string()))?;
+        let bytes = serde_json::to_vec(&seq).map_err(RuleError::serialization)?;
         g.put_bytes(CURSOR_KEY, &bytes)
             .await
             .map_err(RuleError::Store)?;
@@ -612,7 +619,7 @@ impl RuleStore {
     /// The value is the JSON encoding of the Unix time in seconds.
     /// [`RuleStore::mark_executed`] and a script action use the same format.
     pub(crate) fn execution_marker_value(now: i64) -> Result<Vec<u8>, RuleError> {
-        serde_json::to_vec(&now).map_err(|error| RuleError::Serialization(error.to_string()))
+        serde_json::to_vec(&now).map_err(RuleError::serialization)
     }
 
     /// True when an execution marker exists for one rule and one event.
@@ -659,7 +666,7 @@ impl RuleStore {
         else {
             return Ok(0);
         };
-        serde_json::from_slice(&bytes).map_err(|error| RuleError::Serialization(error.to_string()))
+        serde_json::from_slice(&bytes).map_err(RuleError::serialization)
     }
 
     /// Records one failed attempt and returns the new count.
@@ -676,12 +683,11 @@ impl RuleStore {
         let g = self.store.write().await;
         let attempts = match g.get_bytes(&key).await.map_err(RuleError::Store)? {
             Some(bytes) => serde_json::from_slice::<u32>(&bytes)
-                .map_err(|error| RuleError::Serialization(error.to_string()))?
+                .map_err(RuleError::serialization)?
                 .saturating_add(1),
             None => 1,
         };
-        let bytes = serde_json::to_vec(&attempts)
-            .map_err(|error| RuleError::Serialization(error.to_string()))?;
+        let bytes = serde_json::to_vec(&attempts).map_err(RuleError::serialization)?;
         g.put_bytes(&key, &bytes).await.map_err(RuleError::Store)?;
         Ok(attempts)
     }
@@ -706,8 +712,7 @@ impl RuleStore {
     /// The key is `rule-dead:{seq}:{event_id}:{rule_id}`.
     /// The value holds a [`RuleDeadLetter`] as JSON.
     pub(crate) async fn write_dead_letter(&self, dead: &RuleDeadLetter) -> Result<(), RuleError> {
-        let bytes = serde_json::to_vec(dead)
-            .map_err(|error| RuleError::Serialization(error.to_string()))?;
+        let bytes = serde_json::to_vec(dead).map_err(RuleError::serialization)?;
         let g = self.store.write().await;
         g.put_bytes(&dead_key(dead.seq, &dead.event_id, &dead.rule_id), &bytes)
             .await
@@ -724,8 +729,8 @@ impl RuleStore {
         let rows = scan_family(&*g, DEAD_PREFIX).await?;
         let mut dead = Vec::with_capacity(rows.len());
         for row in rows {
-            let entry: RuleDeadLetter = serde_json::from_slice(&row.value)
-                .map_err(|error| RuleError::Serialization(error.to_string()))?;
+            let entry: RuleDeadLetter =
+                serde_json::from_slice(&row.value).map_err(RuleError::serialization)?;
             dead.push(entry);
         }
         dead.sort_by(|left, right| {
@@ -774,8 +779,7 @@ impl RuleStore {
         else {
             return Ok(None);
         };
-        let entry = serde_json::from_slice(&bytes)
-            .map_err(|error| RuleError::Serialization(error.to_string()))?;
+        let entry = serde_json::from_slice(&bytes).map_err(RuleError::serialization)?;
         Ok(Some(entry))
     }
 
@@ -1011,8 +1015,7 @@ impl RuleStore {
         }
         for rule in rules {
             let key = meta_key(&rule.id);
-            let bytes = serde_json::to_vec(rule)
-                .map_err(|error| RuleError::Serialization(error.to_string()))?;
+            let bytes = serde_json::to_vec(rule).map_err(RuleError::serialization)?;
             tx.set_bytes(&key, &bytes).await.map_err(RuleError::Store)?;
             keys.push(key);
             for key in index_keys(&rule.trigger, &rule.id) {
@@ -1108,7 +1111,7 @@ where
     };
     serde_json::from_slice(&bytes)
         .map(Some)
-        .map_err(|error| RuleError::Serialization(error.to_string()))
+        .map_err(RuleError::serialization)
 }
 
 /// Reads one bounded page of one key family.
@@ -1220,6 +1223,21 @@ mod tests {
 
     async fn new_store() -> RuleStore {
         RuleStore::new(build_test_store(&test_prefix("rules-store")).await)
+    }
+
+    #[tokio::test]
+    async fn a_poisoned_match_cache_is_an_error() {
+        let store = new_store().await;
+        let cache = Arc::clone(&store.match_cache);
+        let _ = std::thread::spawn(move || {
+            let _guard = cache.lock().expect("lock before the panic");
+            panic!("poison the match cache");
+        })
+        .join();
+        assert!(
+            store.cache().is_err(),
+            "a poisoned cache must fail closed instead of serving stale rules"
+        );
     }
 
     async fn store_with_raw() -> (RuleStore, OxKvStore) {

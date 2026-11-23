@@ -928,7 +928,7 @@ mod tests {
     use crate::http::middleware::jwks::test_support::{rsa_key, sign_rs256, spawn_jwks};
     use crate::policy::PolicyEngine;
     use crate::records::{ChangeSink, EntityEventKind};
-    use crate::rules::action::{ActionContext, RuleAction};
+    use crate::rules::action::{ActionContext, ActionError, RuleAction};
     use crate::sync::wal::Wal;
 
     const KID: &str = "eav-sync-test-kid";
@@ -943,7 +943,7 @@ mod tests {
             "record"
         }
 
-        async fn execute(&self, _ctx: ActionContext) -> Result<(), anyhow::Error> {
+        async fn execute(&self, _ctx: ActionContext) -> Result<(), ActionError> {
             Ok(())
         }
     }

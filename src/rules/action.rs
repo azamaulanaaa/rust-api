@@ -12,6 +12,36 @@ use crate::eav::entity::{Entity, WriteContext};
 use crate::records::EntityEvent;
 use crate::rules::rule::Rule;
 
+/// An error from a rule action.
+#[derive(Debug, thiserror::Error)]
+pub enum ActionError {
+    /// The action parameters are not valid.
+    #[error("rule action parameters are not valid")]
+    Invalid,
+    /// The action could not run or could not validate its parameters.
+    #[error("rule action failed: {kind}")]
+    Failed {
+        /// Kind of the action that failed.
+        kind: String,
+    },
+}
+
+impl ActionError {
+    /// Creates an error for invalid parameters.
+    #[must_use]
+    pub fn invalid() -> Self {
+        Self::Invalid
+    }
+
+    /// Creates an error that names the failed action kind.
+    #[must_use]
+    pub fn failed(kind: &str) -> Self {
+        Self::Failed {
+            kind: kind.to_string(),
+        }
+    }
+}
+
 /// The owned input of one rule action.
 ///
 /// The engine builds one context for each rule that it runs.
@@ -59,7 +89,11 @@ pub trait RuleAction: Send + Sync {
     ///
     /// The API calls this check before it stores a rule.
     /// The default accepts every parameter.
-    fn validate(&self, _params: &serde_json::Value) -> Result<(), anyhow::Error> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ActionError`] when a parameter is not valid.
+    fn validate(&self, _params: &serde_json::Value) -> Result<(), ActionError> {
         Ok(())
     }
 
@@ -67,5 +101,9 @@ pub trait RuleAction: Send + Sync {
     ///
     /// A failure stops the engine for this event.
     /// The engine writes no execution marker in that case.
-    async fn execute(&self, ctx: ActionContext) -> Result<(), anyhow::Error>;
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ActionError`] when the action cannot run.
+    async fn execute(&self, ctx: ActionContext) -> Result<(), ActionError>;
 }

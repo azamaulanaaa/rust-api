@@ -7,7 +7,7 @@
 use async_trait::async_trait;
 use serde_json::Value;
 
-use crate::rules::action::{ActionContext, RuleAction};
+use crate::rules::action::{ActionContext, ActionError, RuleAction};
 
 /// The text that replaces a secret value in a log line.
 const REDACTED: &str = "[REDACTED]";
@@ -90,7 +90,7 @@ impl RuleAction for NoopAction {
         "noop"
     }
 
-    async fn execute(&self, _ctx: ActionContext) -> Result<(), anyhow::Error> {
+    async fn execute(&self, _ctx: ActionContext) -> Result<(), ActionError> {
         Ok(())
     }
 }
@@ -113,7 +113,7 @@ impl RuleAction for LogAction {
         "log"
     }
 
-    async fn execute(&self, ctx: ActionContext) -> Result<(), anyhow::Error> {
+    async fn execute(&self, ctx: ActionContext) -> Result<(), ActionError> {
         let params = redact_params(&ctx.params);
         tracing::info!(
             rule.id = %ctx.rule.id,
