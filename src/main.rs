@@ -312,6 +312,8 @@ async fn run_eav_command(action: EavAction) -> anyhow::Result<()> {
     let cfg = config::Config::try_from(config.as_path())?;
     let s3_cfg = s3_client_config(&cfg);
     let db_prefix = cfg.database.prefix.trim_matches('/').to_string();
+    // Set the cache budget before the first EAV store is built.
+    rust_api::db::configure_sst_cache_bytes(cfg.database.sst_cache_mb.saturating_mul(1024 * 1024));
 
     let (_lost, guard) = claim_writer_lease(
         &s3_cfg,
@@ -357,6 +359,8 @@ async fn reset_eav_cursor(config_path: &Path, to: u64) -> anyhow::Result<()> {
     let cfg = config::Config::try_from(config_path)?;
     let s3_cfg = s3_client_config(&cfg);
     let db_prefix = cfg.database.prefix.trim_matches('/').to_string();
+    // Set the cache budget before the first EAV store is built.
+    rust_api::db::configure_sst_cache_bytes(cfg.database.sst_cache_mb.saturating_mul(1024 * 1024));
     let (_lost, guard) = claim_writer_lease(
         &s3_cfg,
         &db_prefix,
@@ -613,7 +617,6 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
     );
     // Resolve every value that borrows `config`, before the code moves
     // parts of `config` into the configs of the modules below.
-    let token_keys = resolve_token_keys(&config)?;
     let s3_client_config = s3_client_config(&config);
     let db_prefix = config.database.prefix.trim_matches('/').to_string();
     let mirror_master = config.database.mirror_master;
@@ -636,6 +639,13 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
         config.observability.otlp_endpoint.as_deref(),
         config.observability.sample_ratio,
     )?;
+
+    // The subscriber now exists. Warnings that startup raised before this
+    // point are visible only when they are logged here.
+    for warning in config.startup_warnings() {
+        tracing::warn!(field = warning.field, "{}", warning.message);
+    }
+    let token_keys = resolve_token_keys(&config)?;
 
     let base = Url::parse(&config.public_address).context("Invalid public_address in config")?;
 
@@ -1645,6 +1655,69 @@ force_path_style = true
             claim < dispatch,
             "the lease is claimed at offset {claim} but the action runs at \
              {dispatch}: a claim after a store build already fenced the writer",
+        );
+    }
+
+    /// Each EAV command applies `[database].sst_cache_mb` before a store.
+    ///
+    /// The first OxKV handle fixes the process-wide cache size. A call after
+    /// that point changes a stored number and nothing else.
+    #[test]
+    fn each_eav_command_configures_the_sst_cache_before_a_store() {
+        let src = std::fs::read_to_string("src/main.rs").expect("readable");
+
+        let run = src
+            .split_once("async fn run_eav_command")
+            .expect("run_eav_command exists")
+            .1
+            .split_once("\nasync fn ")
+            .expect("run_eav_command is terminated by the next fn")
+            .0;
+        let configure = run
+            .find("configure_sst_cache_bytes(")
+            .expect("the EAV command configures the SST cache");
+        let claim = run
+            .find("claim_writer_lease(")
+            .expect("the EAV command claims the writer lease");
+        let dispatch = run
+            .find("run_eav_action(")
+            .expect("the EAV command dispatches an action");
+        assert!(
+            configure < claim,
+            "the SST cache is configured at offset {configure} but the lease is claimed at \
+             {claim}: the cache size must apply before the first store"
+        );
+        assert!(
+            configure < dispatch,
+            "the SST cache is configured at offset {configure} but the action runs at \
+             {dispatch}: the cache size must apply before the first store"
+        );
+
+        let reset = src
+            .split_once("async fn reset_eav_cursor")
+            .expect("reset_eav_cursor exists")
+            .1
+            .split_once("\nasync fn ")
+            .expect("reset_eav_cursor is terminated by the next fn")
+            .0;
+        let configure = reset
+            .find("configure_sst_cache_bytes(")
+            .expect("reset_eav_cursor configures the SST cache");
+        let claim = reset
+            .find("claim_writer_lease(")
+            .expect("reset_eav_cursor claims the writer lease");
+        let work = reset
+            .find("reset_eav_cursor_with_store(")
+            .expect("reset_eav_cursor resets through the store helper");
+        assert!(
+            configure < claim,
+            "the SST cache is configured at offset {configure} but the lease is claimed at \
+             {claim}: the cache size must apply before the first store"
+        );
+        assert!(
+            configure < work,
+            "the SST cache is configured at offset {configure} but the store is built at \
+             {work}: the cache size must apply before the first store"
         );
     }
 }
