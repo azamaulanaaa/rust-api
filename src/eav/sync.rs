@@ -128,6 +128,7 @@ const REPLICA_BUILD_MAX_BYTES: usize = 16 * 1024;
 
 /// The current head of the entity change feed.
 #[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
+#[schema(as = EavSyncStatusResponse)]
 pub struct SyncStatusResponse {
     /// The sequence number of the last entry in the change log.
     pub head: u64,
@@ -3345,7 +3346,7 @@ mod tests {
             .as_object()
             .expect("component schemas");
         for name in [
-            "SyncStatusResponse",
+            "EavSyncStatusResponse",
             "SyncEvent",
             "SyncEventsResponse",
             "SyncEventsQuery",

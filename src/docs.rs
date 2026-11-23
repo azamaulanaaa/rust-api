@@ -3,7 +3,7 @@
 use utoipa::OpenApi;
 
 /// Top-level OpenAPI document.
-#[derive(OpenApi)]
+#[derive(Debug, OpenApi)]
 #[openapi(
     info(title = "rust-api", version = "0.1.0", description = "S3 proxy FS + Casbin RBAC + OIDC"),
     paths(
@@ -215,7 +215,7 @@ mod tests {
             .as_object()
             .expect("component schemas");
         for name in [
-            "SyncStatusResponse",
+            "EavSyncStatusResponse",
             "SyncEvent",
             "SyncEventsResponse",
             "SyncEventsQuery",
@@ -320,6 +320,7 @@ mod tests {
             ("/eav/entities", "post"),
             ("/eav/entities", "get"),
             ("/eav/entities/query", "post"),
+            ("/eav/entities/{id}/referrers", "get"),
             ("/eav/entities/{id}", "get"),
             ("/eav/entities/{id}", "patch"),
             ("/eav/entities/{id}", "delete"),
@@ -328,6 +329,12 @@ mod tests {
             ("/eav/rules/{id}", "get"),
             ("/eav/rules/{id}", "delete"),
             ("/eav/rules/{id}/enabled", "post"),
+            ("/eav/rules/dead-letters", "get"),
+            (
+                "/eav/rules/dead-letters/{seq}/{event_id}/{rule_id}/retry",
+                "post",
+            ),
+            ("/eav/rules/dead-letters/{seq}/{event_id}/retry", "post"),
             ("/eav/sync/status", "get"),
             ("/eav/sync/events", "get"),
             ("/eav/sync/snapshot", "get"),
