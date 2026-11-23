@@ -246,6 +246,69 @@ fn is_valid_return_to(value: &str) -> bool {
     }
 }
 
+/// Encodes a return path for the `oidc_return_to` cookie.
+///
+/// A cookie value must not contain `;`, a control character, or non-ASCII
+/// text. A `;` in a stored value can inject a cookie attribute. The encoder
+/// percent-encodes every byte outside the RFC 3986 unreserved set. The
+/// callback decodes the value before it checks the path.
+fn encode_return_to(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push('%');
+            encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+            encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+    }
+    encoded
+}
+
+/// Returns the value of one hexadecimal digit.
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Decodes a return path from the `oidc_return_to` cookie.
+///
+/// The function returns `None` for a cookie value with a control character,
+/// `;`, or a non-ASCII byte. It also returns `None` for a malformed percent
+/// escape. The callback then uses the cookie as if it were absent.
+fn decode_return_to(value: &str) -> Option<String> {
+    if value.is_empty()
+        || value
+            .bytes()
+            .any(|byte| !byte.is_ascii() || byte == b';' || byte.is_ascii_control())
+    {
+        return None;
+    }
+
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let high = hex_value(*bytes.get(index + 1)?)?;
+            let low = hex_value(*bytes.get(index + 2)?)?;
+            decoded.push((high << 4) | low);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).ok()
+}
+
 /// Adds the `error` query parameter to a relative return path.
 ///
 /// An existing `error` parameter stays unchanged. The function keeps an
@@ -378,7 +441,7 @@ pub async fn login(
             auth_data.pkce_verifier.secret().to_string(),
         ));
     if let Some(return_to) = &query.return_to {
-        response.cookie(base_cookie("oidc_return_to", return_to.clone()));
+        response.cookie(base_cookie("oidc_return_to", encode_return_to(return_to)));
     }
     response.finish()
 }
@@ -412,7 +475,8 @@ pub struct AuthResponse {
 /// OIDC authorization-code callback.
 ///
 /// The handler validates the state, nonce, and PKCE values and sets the
-/// session cookies. It clears the temporary OIDC cookies on every outcome.
+/// session cookies. It clears the temporary OIDC cookies on every outcome,
+/// except a provider error whose `state` does not match the active flow.
 ///
 /// A valid `oidc_return_to` cookie selects a `302` redirect to the SPA. A
 /// failure adds a stable `error` query parameter. Without the cookie the
@@ -427,10 +491,34 @@ pub async fn callback(
     let secure = oidc_client.secure_cookies();
     let return_to = req
         .cookie("oidc_return_to")
-        .map(|cookie| cookie.value().to_string())
+        .and_then(|cookie| decode_return_to(cookie.value()))
         .filter(|value| is_valid_return_to(value));
 
     if let Some(provider_error) = query.error.as_deref() {
+        // A provider can send `state` with an error. Check the value before
+        // this handler clears the flow cookies or sends the browser back to
+        // `return_to`. Without the check, a third party can cancel a login in
+        // progress with a request that carries any other `state` value. A
+        // provider that sends no `state` keeps the old behavior.
+        if let Some(state) = query.state.as_deref() {
+            let state_matches = req
+                .cookie("oidc_csrf")
+                .is_some_and(|csrf| csrf.value() == state);
+            if !state_matches {
+                tracing::warn!(
+                    "OIDC callback error arrived with a state value that does not match the flow"
+                );
+                // The code does not clear the flow cookies or redirect here.
+                // Either action would let an unrelated request end the login
+                // that the browser is still completing.
+                return HttpResponse::Unauthorized().json(AuthResponse {
+                    success: false,
+                    token: None,
+                    error: Some("Invalid state parameter".to_string()),
+                });
+            }
+        }
+
         return if provider_error == "access_denied" {
             tracing::warn!("OIDC provider denied access");
             callback_failure(
@@ -928,7 +1016,16 @@ mod tests {
             .cookies()
             .find(|cookie| cookie.name() == "oidc_return_to")
             .expect("login must set oidc_return_to");
-        assert_eq!(cookie.value(), "/app?tab=1#section");
+        let stored = cookie.value();
+        assert!(
+            stored.is_ascii() && !stored.contains(';') && !stored.chars().any(char::is_control),
+            "the stored return path must be a safe cookie value, got: {stored:?}"
+        );
+        assert_eq!(
+            decode_return_to(stored).as_deref(),
+            Some("/app?tab=1#section"),
+            "the callback must decode the stored path"
+        );
         assert_eq!(cookie.http_only(), Some(true));
         assert_eq!(cookie.secure(), None, "the fixture callback uses http");
         assert_eq!(cookie.same_site(), Some(SameSite::Lax));
@@ -1166,6 +1263,212 @@ mod tests {
         assert_eq!(query["error"], "access_denied");
         assert_eq!(query["tab"], "1");
         assert_cookie_cleared(&res, "oidc_return_to");
+    }
+
+    /// A `return_to` value with a `;` can inject a cookie attribute when the
+    /// login stores it. The login must percent-encode it instead.
+    #[tokio::test]
+    async fn login_escapes_cookie_metacharacters_in_return_to() {
+        let fx = Fixture::new().await.unwrap();
+        let svc = test_app!(fx);
+
+        let res = test::call_service(
+            &svc,
+            test::TestRequest::get()
+                .uri("/auth/login?return_to=%2Fapp%3B%20Path%3D%2Fevil")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), 302);
+
+        // `HttpResponse::cookies` decodes the stored value, so read the raw
+        // `Set-Cookie` header. The raw value is what the browser stores.
+        let raw = res
+            .response()
+            .headers()
+            .get_all("set-cookie")
+            .filter_map(|value| value.to_str().ok())
+            .find_map(|value| value.strip_prefix("oidc_return_to="))
+            .expect("login must set oidc_return_to");
+        let stored = raw.split(';').next().expect("cookie value");
+        assert!(
+            !raw.contains("/app;"),
+            "a stored return path must not inject a cookie separator: {raw:?}"
+        );
+        assert!(
+            stored.is_ascii(),
+            "a stored return path must be ASCII: {stored:?}"
+        );
+        assert!(
+            !stored.chars().any(char::is_control),
+            "a stored return path must not contain a control character: {stored:?}"
+        );
+        assert_eq!(
+            decode_return_to(stored).as_deref(),
+            Some("/app; Path=/evil")
+        );
+    }
+
+    /// The encoded cookie from `login` must survive the callback and become
+    /// the original redirect target.
+    #[tokio::test]
+    async fn the_encoded_return_cookie_round_trips_through_the_callback() -> anyhow::Result<()> {
+        let fx = Fixture::new().await?;
+        let svc = test_app!(fx);
+        let login_res = test::call_service(
+            &svc,
+            test::TestRequest::get()
+                .uri("/auth/login?return_to=%2Fapp%3Ftab%3D1%23section")
+                .to_request(),
+        )
+        .await;
+        let (csrf, nonce, pkce, state) = login_parts(&login_res)?;
+
+        let raw_return = login_res
+            .response()
+            .headers()
+            .get_all("set-cookie")
+            .filter_map(|value| value.to_str().ok())
+            .find_map(|value| value.strip_prefix("oidc_return_to="))
+            .and_then(|value| value.split(';').next())
+            .expect("login must set oidc_return_to")
+            .to_string();
+        assert!(
+            raw_return.contains("%2F"),
+            "the stored path must be percent-encoded: {raw_return:?}"
+        );
+
+        mount_successful_exchange(&fx, &nonce).await?;
+
+        let res = test::call_service(
+            &svc,
+            test::TestRequest::get()
+                .uri(&format!("/auth/callback?code=test-code&state={state}"))
+                .insert_header((
+                    "Cookie",
+                    format!(
+                        "oidc_csrf={csrf}; oidc_nonce={nonce}; oidc_pkce={pkce}; \
+                         oidc_return_to={raw_return}"
+                    ),
+                ))
+                .to_request(),
+        )
+        .await;
+
+        assert_eq!(res.status(), 302);
+        assert_eq!(location(&res), "/app?tab=1#section");
+        Ok(())
+    }
+
+    /// The decoder is the last gate before a cookie value becomes a redirect.
+    /// It rejects the shapes that can inject a cookie attribute.
+    #[actix_web::test]
+    async fn decode_return_to_rejects_unsafe_cookie_values() {
+        for value in ["/app;Path=/evil", "/app\u{7f}", "/appé", "/bad%2"] {
+            assert!(
+                decode_return_to(value).is_none(),
+                "unsafe cookie value accepted: {value:?}"
+            );
+        }
+        assert_eq!(decode_return_to("/app").as_deref(), Some("/app"));
+        assert_eq!(
+            decode_return_to("%2Fapp%3Ftab%3D1%23section").as_deref(),
+            Some("/app?tab=1#section")
+        );
+    }
+
+    /// An unauthenticated error callback must not end a login in progress.
+    /// The code checks the `state` before it clears the flow cookies or
+    /// redirects.
+    #[tokio::test]
+    async fn callback_error_with_a_mismatched_state_does_not_end_the_flow() -> anyhow::Result<()> {
+        let fx = Fixture::new().await?;
+        let svc = test_app!(fx);
+        let login_res = test::call_service(
+            &svc,
+            test::TestRequest::get()
+                .uri("/auth/login?return_to=%2Fapp")
+                .to_request(),
+        )
+        .await;
+        let (csrf, nonce, pkce, _state) = login_parts(&login_res)?;
+
+        let res = test::call_service(
+            &svc,
+            test::TestRequest::get()
+                .uri("/auth/callback?error=access_denied&state=not-the-flow-state")
+                .insert_header(("Cookie", return_cookie_header(&csrf, &nonce, &pkce, "/app")))
+                .to_request(),
+        )
+        .await;
+
+        assert_eq!(res.status(), 401);
+        assert!(
+            res.response().headers().get(LOCATION).is_none(),
+            "a mismatched state must not redirect"
+        );
+        assert!(
+            res.response().cookies().next().is_none(),
+            "a mismatched state must not clear the flow cookies"
+        );
+        let body: AuthResponse = serde_json::from_slice(&test::read_body(res).await)?;
+        assert_eq!(body.error.as_deref(), Some("Invalid state parameter"));
+        Ok(())
+    }
+
+    /// A provider error with the `state` of the active flow is legitimate. The
+    /// handler clears the flow and redirects to `return_to`.
+    #[tokio::test]
+    async fn callback_error_with_the_matching_state_clears_the_flow() -> anyhow::Result<()> {
+        let fx = Fixture::new().await?;
+        let svc = test_app!(fx);
+        let login_res = test::call_service(
+            &svc,
+            test::TestRequest::get()
+                .uri("/auth/login?return_to=%2Fapp")
+                .to_request(),
+        )
+        .await;
+        let (csrf, nonce, pkce, state) = login_parts(&login_res)?;
+
+        let res = test::call_service(
+            &svc,
+            test::TestRequest::get()
+                .uri(&format!("/auth/callback?error=access_denied&state={state}"))
+                .insert_header(("Cookie", return_cookie_header(&csrf, &nonce, &pkce, "/app")))
+                .to_request(),
+        )
+        .await;
+
+        assert_eq!(res.status(), 302);
+        assert!(location(&res).contains("error=access_denied"));
+        for name in ["oidc_csrf", "oidc_nonce", "oidc_pkce", "oidc_return_to"] {
+            assert_cookie_cleared(&res, name);
+        }
+        Ok(())
+    }
+
+    /// A decoded value that is not a safe relative path is not a redirect
+    /// target. The callback behaves as if the cookie were absent.
+    #[tokio::test]
+    async fn callback_ignores_a_return_cookie_that_decodes_to_a_control_character() {
+        let fx = Fixture::new().await.unwrap();
+        let svc = test_app!(fx);
+
+        let res = test::call_service(
+            &svc,
+            test::TestRequest::get()
+                .uri("/auth/callback?error=access_denied")
+                .insert_header(("Cookie", "oidc_return_to=%2Fapp%0A"))
+                .to_request(),
+        )
+        .await;
+
+        assert_eq!(res.status(), 403);
+        assert!(
+            res.response().headers().get(LOCATION).is_none(),
+            "a return path with a control character must not become a redirect"
+        );
     }
 
     #[tokio::test]
