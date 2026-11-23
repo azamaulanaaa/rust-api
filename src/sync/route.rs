@@ -94,7 +94,7 @@ impl ApiModule for SyncApiModule {
 }
 
 /// Replica pointer returned by `GET /sync/status`.
-#[derive(serde::Serialize, utoipa::ToSchema)]
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
 pub struct SyncStatusResponse {
     /// Replica prefix for the caller (`{db}/u/{sha256-hex(sub)}`).
     pub prefix: String,
@@ -105,7 +105,7 @@ pub struct SyncStatusResponse {
 }
 
 /// Replica pointer returned by `POST /sync/sync`.
-#[derive(serde::Serialize, utoipa::ToSchema)]
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
 pub struct SyncAdvanceResponse {
     /// Replica prefix for the caller (`{db}/u/{sha256-hex(sub)}`).
     pub prefix: String,
@@ -583,12 +583,12 @@ mod tests {
     }
 
     async fn setup(fx: &Fixture) -> anyhow::Result<JwtClaimsMiddleware<Claims>> {
-        JwtClaimsMiddleware::<Claims>::new_with_jks(
+        Ok(JwtClaimsMiddleware::<Claims>::new_with_jks(
             &format!("{}/jwks", fx.server.uri()),
             AUD,
             &fx.issuer(),
         )
-        .await
+        .await?)
     }
 
     /// The replica object response is built without reading the body.

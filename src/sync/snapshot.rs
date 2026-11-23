@@ -316,10 +316,9 @@ impl BuildPool {
         cancel: C,
     ) -> tokio::task::JoinHandle<()> {
         // A single receiver cannot move into N tasks, so the pool shares one
-        // receiver behind a lock. The code holds the lock for a short time.
-        // The code awaits `recv` outside the guard. The guard only decides
-        // which worker takes the next job. Holding the guard across the await
-        // would make the workers run one at a time.
+        // receiver behind a tokio Mutex. A worker holds the guard while it
+        // waits in `recv`, at most 100 ms. The wait is bounded, and each build
+        // runs after the guard drops, so the workers do not serialize builds.
         let rx = std::sync::Arc::new(tokio::sync::Mutex::new(self.rx));
         let workers = workers.max(1);
         let mut handles = Vec::with_capacity(workers);
@@ -494,6 +493,25 @@ pub struct AdvanceOutcome {
     pub pending: bool,
 }
 
+/// Builds the advance outcome after a lost fencing race.
+///
+/// A missing marker returns the original error. A marker behind the head
+/// keeps `pending` true, so the client polls until the competing builder
+/// finishes.
+fn fenced_advance_outcome(
+    applied: Option<u64>,
+    head: u64,
+    e: FsError,
+) -> Result<AdvanceOutcome, FsError> {
+    let Some(applied_seq) = applied else {
+        return Err(e);
+    };
+    Ok(AdvanceOutcome {
+        applied_seq,
+        pending: applied_seq < head,
+    })
+}
+
 impl SnapshotManager {
     /// Advances the replica of `sub` toward the WAL head.
     ///
@@ -578,13 +596,11 @@ impl SnapshotManager {
             // A fencing loss here means that a concurrent builder published
             // this replica first. The method adopts the coverage of that
             // builder instead of returning an error. The full-rebuild path
-            // used the same recovery before it moved into the pool.
+            // used the same recovery before it moved into the pool. The
+            // outcome stays pending while that builder is behind the head.
             Err(e) if e.is_fencing_loss() => {
                 drop(claim);
-                Ok(AdvanceOutcome {
-                    applied_seq: self.load_applied(sub).await?.ok_or(e)?,
-                    pending: false,
-                })
+                fenced_advance_outcome(self.load_applied(sub).await?, head, e)
             }
             Err(e) => {
                 drop(claim);
@@ -949,7 +965,7 @@ impl SnapshotManager {
                         .policy
                         .authorize_row(sub, row_type, row_id, Action::Read)
                         .await
-                        .unwrap_or(false)
+                        .map_err(policy_err)?
                     {
                         dst.attach(row_type, row_id, file_id).await?;
                     }
@@ -1162,7 +1178,7 @@ impl SnapshotManager {
             .policy
             .authorize_row(sub, row_type, row_id, Action::Read)
             .await
-            .unwrap_or(false)
+            .map_err(policy_err)?
         {
             dst.attach(row_type, row_id, file_id).await?;
         } else {
@@ -1289,7 +1305,7 @@ impl SnapshotManager {
                 .policy
                 .authorize_row(sub, &ty, &rid, Action::Read)
                 .await
-                .unwrap_or(false)
+                .map_err(policy_err)?
             {
                 out.push((ty, rid));
             }
@@ -1310,6 +1326,15 @@ impl SnapshotManager {
 /// Maps oxkv errors into [`FsError`].
 fn store_err(e: oxkv::StoreError) -> FsError {
     FsError::from(e)
+}
+
+/// Maps policy errors into [`FsError`].
+///
+/// A policy error is not a denial. The caller must see the error and retry
+/// the replay. Treating the error as a denial can delete a file from the
+/// replica while the master still allows it.
+fn policy_err(e: crate::policy::PolicyError) -> FsError {
+    FsError::Internal(e.to_string())
 }
 
 /// Splits a rule object into `(row_type, row_id)` when it names a row.
@@ -2568,5 +2593,47 @@ mod tests {
             .await
             .expect_err("multipart uploads are not supported by the replica wrapper");
         assert!(matches!(err, object_store::Error::NotSupported { .. }));
+    }
+
+    /// A policy engine error must stop the rebuild.
+    ///
+    /// The old code mapped the error to a denial. The denial then made the
+    /// rebuild delete a file that the master still allows. The policy fix
+    /// skips stored rules with the wrong field count at load time, so the
+    /// old way to plant an enforce error no longer works. This test pins the
+    /// error mapping itself and every call site that uses it.
+    #[test]
+    fn a_policy_error_stops_the_rebuild_instead_of_hiding_as_a_denial() {
+        let mapped = policy_err(crate::policy::PolicyError::AccessDenied);
+        assert!(
+            matches!(mapped, FsError::Internal(_)),
+            "a policy error must be an internal error, not a denial: {mapped:?}"
+        );
+
+        let src = crate::test_support::production_source("src/sync/snapshot.rs");
+        assert_eq!(
+            src.matches(".map_err(policy_err)?").count(),
+            3,
+            "every policy check in the replica must map its error to FsError"
+        );
+    }
+
+    /// A fenced advance keeps `pending` true while the marker trails the head.
+    #[test]
+    fn a_fenced_advance_reports_pending_when_the_marker_is_behind_the_head() {
+        let error = || FsError::Store("epoch lost".to_string());
+
+        let behind = fenced_advance_outcome(Some(2), 5, error()).unwrap();
+        assert!(behind.pending);
+        assert_eq!(behind.applied_seq, 2);
+
+        let current = fenced_advance_outcome(Some(5), 5, error()).unwrap();
+        assert!(!current.pending);
+        assert_eq!(current.applied_seq, 5);
+
+        assert!(
+            fenced_advance_outcome(None, 5, error()).is_err(),
+            "a missing marker must keep the fencing error"
+        );
     }
 }
