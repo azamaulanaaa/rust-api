@@ -539,9 +539,10 @@ pub async fn callback(
             // The server logs receive the full detail. Clients only ever see a stable,
             // non-sensitive message.
             let (status, message, code) = match &e {
-                OidcError::ExchangeFailure(_)
+                OidcError::ExchangeFailure { .. }
                 | OidcError::MissingIdToken
-                | OidcError::InvalidToken(_) => {
+                | OidcError::InvalidToken(_)
+                | OidcError::UnknownSigningKey(_) => {
                     tracing::warn!("OIDC code exchange rejected: {e}");
                     (
                         StatusCode::UNAUTHORIZED,

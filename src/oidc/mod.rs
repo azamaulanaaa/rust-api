@@ -46,7 +46,7 @@ type CoreOidcClient = CoreClient<
 >;
 
 /// Provider and client settings required to bootstrap [`OidcClient`].
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct OidcConfig {
     /// OAuth2 client identifier registered at the provider.
     pub client_id: String,
@@ -63,6 +63,18 @@ pub struct OidcConfig {
     /// statically. Must be non-empty when the discovered issuer is
     /// templated. [`OidcClient::new`] rejects that combination.
     pub allowed_tenants: Vec<String>,
+}
+
+impl std::fmt::Debug for OidcConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OidcConfig")
+            .field("client_id", &self.client_id)
+            .field("client_secret", &"<redacted>")
+            .field("issuer_url", &self.issuer_url)
+            .field("redirect_url", &self.redirect_url)
+            .field("allowed_tenants", &self.allowed_tenants)
+            .finish()
+    }
 }
 
 /// Errors raised by [`OidcClient`] during discovery and token exchange.
@@ -90,8 +102,14 @@ pub enum OidcError {
     Discovery(String),
 
     /// The authorization-code exchange was rejected by the provider.
-    #[error("failed to exchange authorization code: {0}")]
-    ExchangeFailure(String),
+    #[error("failed to exchange authorization code: {message}")]
+    ExchangeFailure {
+        /// Sanitized detail for server logs.
+        message: String,
+        /// Cause from the HTTP client, when the request itself failed.
+        #[source]
+        source: Option<Box<dyn std::error::Error + Send + Sync>>,
+    },
 
     /// The provider's token response contained no ID token.
     #[error("provider did not return an ID token")]
@@ -101,9 +119,19 @@ pub enum OidcError {
     #[error("id token validation failed: {0}")]
     InvalidToken(String),
 
+    /// The token named a signing key that the cached JWKS does not hold.
+    #[error("unknown signing key: {0}")]
+    UnknownSigningKey(String),
+
     /// The provider rejected or did not complete token revocation.
-    #[error("token revocation failed: {0}")]
-    Revocation(String),
+    #[error("token revocation failed: {message}")]
+    Revocation {
+        /// Sanitized detail for server logs.
+        message: String,
+        /// Cause from the HTTP client, when the request itself failed.
+        #[source]
+        source: Option<Box<dyn std::error::Error + Send + Sync>>,
+    },
 }
 
 /// OpenID Connect client wrapping the discovered provider metadata:
@@ -288,17 +316,21 @@ impl OidcClient {
         nonce: Nonce,
         pkce_verifier: PkceCodeVerifier,
     ) -> Result<(String, Option<String>), OidcError> {
-        let token_response = {
-            let client = self.client.read().await;
-            let request = client
-                .exchange_code(AuthorizationCode::new(code))
-                .map_err(|e| OidcError::Configuration(format!("{:?}", e)))?;
-            request
-                .set_pkce_verifier(pkce_verifier)
-                .request_async(&self.http_client)
-                .await
-                .map_err(|e| OidcError::ExchangeFailure(e.to_string()))?
-        };
+        // The code request borrows the client, so clone it out of the guard
+        // before the network call. A key rotation can then take the write
+        // lock at once.
+        let client = self.client.read().await.clone();
+        let request = client
+            .exchange_code(AuthorizationCode::new(code))
+            .map_err(|e| OidcError::Configuration(format!("{:?}", e)))?
+            .set_pkce_verifier(pkce_verifier);
+        let token_response = request
+            .request_async(&self.http_client)
+            .await
+            .map_err(|e| OidcError::ExchangeFailure {
+                message: e.to_string(),
+                source: Some(Box::new(e)),
+            })?;
 
         let refresh_token = token_response
             .refresh_token()
@@ -317,17 +349,20 @@ impl OidcClient {
         &self,
         refresh_token: &str,
     ) -> Result<(String, Option<String>), OidcError> {
-        let token_response = {
-            let client = self.client.read().await;
-            let refresh_token_value = RefreshToken::new(refresh_token.to_string());
-            let request = client
-                .exchange_refresh_token(&refresh_token_value)
-                .map_err(|e| OidcError::Configuration(format!("{:?}", e)))?;
-            request
-                .request_async(&self.http_client)
-                .await
-                .map_err(|e| OidcError::ExchangeFailure(e.to_string()))?
-        };
+        // The refresh request borrows the client, so clone it out of the
+        // guard before the network call. A key rotation can then take the
+        // write lock at once.
+        let client = self.client.read().await.clone();
+        let refresh_token_value = RefreshToken::new(refresh_token.to_string());
+        let token_response = client
+            .exchange_refresh_token(&refresh_token_value)
+            .map_err(|e| OidcError::Configuration(format!("{:?}", e)))?
+            .request_async(&self.http_client)
+            .await
+            .map_err(|e| OidcError::ExchangeFailure {
+                message: e.to_string(),
+                source: Some(Box::new(e)),
+            })?;
 
         let new_refresh = token_response
             .refresh_token()
@@ -361,7 +396,7 @@ impl OidcClient {
         };
 
         match first {
-            Err(OidcError::InvalidToken(message)) if mentions_unknown_key(&message) => {
+            Err(OidcError::UnknownSigningKey(_)) => {
                 tracing::info!("refreshing the OIDC JWKS after an unknown signing key");
                 self.refresh_id_token_keys().await?;
                 let client = self.client.read().await;
@@ -457,14 +492,17 @@ impl OidcClient {
             .form(&[("token", token), ("token_type_hint", "refresh_token")])
             .send()
             .await
-            .map_err(|e| OidcError::Revocation(e.to_string()))?;
+            .map_err(|e| OidcError::Revocation {
+                message: e.to_string(),
+                source: Some(Box::new(e)),
+            })?;
         if response.status().is_success() {
             Ok(())
         } else {
-            Err(OidcError::Revocation(format!(
-                "provider returned {}",
-                response.status()
-            )))
+            Err(OidcError::Revocation {
+                message: format!("provider returned {}", response.status()),
+                source: None,
+            })
         }
     }
 
@@ -580,37 +618,17 @@ async fn fetch_provider_metadata(
 
 /// Maps a claims verification error to an [`OidcError`].
 ///
-/// The display text of `SignatureVerification` hides its source. The source
-/// is the only place that says whether the token named an unknown signing
-/// key. The mapping keeps that fact, so the caller can refresh the JWKS.
+/// The typed variant records an unknown signing key. The caller matches on
+/// the variant, so a change in the provider's error text cannot stop a JWKS
+/// refresh.
 fn map_claims_error(error: ClaimsVerificationError) -> OidcError {
     if let ClaimsVerificationError::SignatureVerification(
         SignatureVerificationError::NoMatchingKey | SignatureVerificationError::AmbiguousKeyId(_),
     ) = &error
     {
-        return OidcError::InvalidToken(format!("unknown signing key: {error}"));
+        return OidcError::UnknownSigningKey(error.to_string());
     }
     OidcError::InvalidToken(error.to_string())
-}
-
-/// Reports whether an ID-token error says that no key matched the token.
-///
-/// The provider names the signing key in the token header. A key that left
-/// the JWKS after a rotation yields this error. Any other validation error
-/// must not start a key refresh.
-fn mentions_unknown_key(message: &str) -> bool {
-    let message = message.to_ascii_lowercase();
-    [
-        "unknown signing key",
-        "no matching key",
-        "matching key not found",
-        "no key found",
-        "unknown key",
-        "unknown kid",
-        "kid not found",
-    ]
-    .iter()
-    .any(|needle| message.contains(needle))
 }
 
 /// Reports whether `callback_url` uses `https`.
@@ -652,10 +670,21 @@ mod tests {
     fn error_display_is_lowercase_sentence_style() {
         for rendered in [
             OidcError::MissingIdToken.to_string(),
+            OidcError::Configuration("bad client".into()).to_string(),
             OidcError::Discovery("no issuer".into()).to_string(),
-            OidcError::ExchangeFailure("400 from /token".into()).to_string(),
+            OidcError::ExchangeFailure {
+                message: "400 from /token".into(),
+                source: None,
+            }
+            .to_string(),
             OidcError::InvalidToken("aud mismatch".into()).to_string(),
-            OidcError::Revocation("400 from /revoke".into()).to_string(),
+            OidcError::UnknownSigningKey("kid missing".into()).to_string(),
+            OidcError::UrlParse(url::ParseError::EmptyHost).to_string(),
+            OidcError::Revocation {
+                message: "400 from /revoke".into(),
+                source: None,
+            }
+            .to_string(),
         ] {
             let first = rendered.chars().next().expect("non-empty display");
             assert!(
@@ -848,12 +877,33 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_key_error_is_recognized() {
-        assert!(mentions_unknown_key(
-            "signature verification failed: no matching key found"
+    fn config_debug_hides_the_client_secret() {
+        let config = OidcConfig {
+            client_id: "client".into(),
+            client_secret: "super-secret-value".into(),
+            issuer_url: "https://idp.test".into(),
+            redirect_url: "https://app.test/auth/callback".into(),
+            allowed_tenants: vec!["tenant-a".into()],
+        };
+        let rendered = format!("{config:?}");
+        assert!(!rendered.contains("super-secret-value"), "{rendered}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+    }
+
+    #[test]
+    fn an_unknown_signing_key_is_a_typed_error() {
+        let error = ClaimsVerificationError::SignatureVerification(
+            SignatureVerificationError::NoMatchingKey,
+        );
+        assert!(matches!(
+            map_claims_error(error),
+            OidcError::UnknownSigningKey(_)
         ));
-        assert!(mentions_unknown_key("unknown kid in token header"));
-        assert!(!mentions_unknown_key("expired token"));
-        assert!(!mentions_unknown_key("audience mismatch"));
+
+        let error = ClaimsVerificationError::Expired("token expired".into());
+        assert!(matches!(
+            map_claims_error(error),
+            OidcError::InvalidToken(_)
+        ));
     }
 }
