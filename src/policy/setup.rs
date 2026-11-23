@@ -133,8 +133,10 @@ async fn claim_admin(
         return Err(ApiError::Conflict);
     }
     tracing::info!(
-        "bootstrap: assigned {SUPERADMIN_ROLE} role to {}",
-        auth_claims.sub
+        action = "setup.admin_claim",
+        subject = %auth_claims.sub,
+        role = SUPERADMIN_ROLE,
+        "bootstrap role granted"
     );
     Ok(HttpResponse::Created().json(SetupResponse {
         sub: auth_claims.sub.clone(),

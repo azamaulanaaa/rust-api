@@ -4,10 +4,27 @@ use casbin::{CoreApi, DefaultModel, Enforcer, MgmtApi};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    RBAC_MODEL,
+    PolicyError, RBAC_MODEL,
     adapter::{Outbox, OxkvAdapter, PolicyOutbox},
 };
 use crate::records::ChangeSink;
+
+/// A failure in a policy export or import.
+#[derive(Debug, thiserror::Error)]
+pub enum PolicyAdminError {
+    /// The RBAC model text is invalid.
+    #[error("failed to parse RBAC model: {0}")]
+    Model(#[source] casbin::Error),
+    /// The policy store did not open.
+    #[error("failed to open policy store: {0}")]
+    Open(#[source] casbin::Error),
+    /// A policy write failed.
+    #[error("policy write failed: {0}")]
+    Write(#[source] casbin::Error),
+    /// The change-feed drain failed.
+    #[error("drain policy outbox: {0}")]
+    Drain(#[source] PolicyError),
+}
 
 /// A portable snapshot of every policy rule in a store.
 #[derive(Debug, Serialize, Deserialize)]
@@ -37,18 +54,17 @@ pub struct ImportReport {
 /// [`oxkv::TxCas`]. The caller can pass a fenced [`oxkv::OxKvStore`] or a
 /// read-only [`oxkv::OxKvReader`]. A reader takes no epoch, so an export
 /// through a reader cannot fence the writer.
-pub async fn export_s3<S>(s3_store: S) -> anyhow::Result<PolicyDump>
+pub async fn export_s3<S>(s3_store: S) -> Result<PolicyDump, PolicyAdminError>
 where
     S: oxkv::Store + Send + Sync + 'static,
     S::Transaction: oxkv::TxCas,
 {
-    use anyhow::Context as _;
     let model = DefaultModel::from_str(RBAC_MODEL)
         .await
-        .context("failed to parse RBAC model")?;
+        .map_err(PolicyAdminError::Model)?;
     let enforcer = Enforcer::new(model, OxkvAdapter::new(s3_store))
         .await
-        .context("failed to open policy store")?;
+        .map_err(PolicyAdminError::Open)?;
     Ok(PolicyDump {
         p: enforcer.get_policy(),
         g: enforcer.get_grouping_policy(),
@@ -70,11 +86,10 @@ pub async fn import_s3(
     s3_store: oxkv::OxKvStore,
     dump: &PolicyDump,
     feed: Option<std::sync::Arc<dyn ChangeSink>>,
-) -> anyhow::Result<ImportReport> {
-    use anyhow::Context as _;
+) -> Result<ImportReport, PolicyAdminError> {
     let model = DefaultModel::from_str(RBAC_MODEL)
         .await
-        .context("failed to parse RBAC model")?;
+        .map_err(PolicyAdminError::Model)?;
     // Stage the announcements in the outbox only when the caller wires a
     // feed. Without a feed no replica waits for the changes.
     let adapter = if feed.is_some() {
@@ -84,7 +99,7 @@ pub async fn import_s3(
     };
     let mut enforcer = Enforcer::new(model, adapter)
         .await
-        .context("failed to open policy store")?;
+        .map_err(PolicyAdminError::Open)?;
 
     let mut report = ImportReport {
         rules_added: 0,
@@ -92,14 +107,22 @@ pub async fn import_s3(
         duplicates: 0,
     };
     for rule in &dump.p {
-        if enforcer.add_policy(rule.clone()).await? {
+        if enforcer
+            .add_policy(rule.clone())
+            .await
+            .map_err(PolicyAdminError::Write)?
+        {
             report.rules_added += 1;
         } else {
             report.duplicates += 1;
         }
     }
     for link in &dump.g {
-        if enforcer.add_grouping_policy(link.clone()).await? {
+        if enforcer
+            .add_grouping_policy(link.clone())
+            .await
+            .map_err(PolicyAdminError::Write)?
+        {
             report.groups_added += 1;
         } else {
             report.duplicates += 1;
@@ -109,7 +132,7 @@ pub async fn import_s3(
         Outbox::new(s3_store)
             .drain(Some(feed.as_ref()))
             .await
-            .context("drain policy outbox")?;
+            .map_err(PolicyAdminError::Drain)?;
     }
     Ok(report)
 }

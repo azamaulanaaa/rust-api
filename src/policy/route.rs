@@ -237,7 +237,7 @@ impl From<PolicyError> for ApiError {
     }
 }
 
-#[utoipa::path(get, path = "/policy/rules", tag = "policy", params(ListQuery), responses((status=200, body=RuleListResponse), (status=401, body=crate::http::error::ErrorBody)))]
+#[utoipa::path(get, path = "/policy/rules", tag = "policy", params(ListQuery), responses((status=200, body=RuleListResponse), (status=401, body=crate::http::error::ErrorBody), (status=403, body=crate::http::error::ErrorBody)))]
 #[get("/rules")]
 async fn get_rules(
     policy_engine: web::Data<PolicyEngine>,
@@ -248,7 +248,7 @@ async fn get_rules(
         .require(&auth_claims.sub, Resource::Rules.as_str(), Action::Read)
         .await?;
 
-    let all_rules = policy_engine.get_all_rules().await;
+    let all_rules = policy_engine.all_rules().await;
     let total = all_rules.len();
     let page = Page::from_query(&query);
     Ok(HttpResponse::Ok().json(RuleListResponse {
@@ -259,7 +259,7 @@ async fn get_rules(
     }))
 }
 
-#[utoipa::path(post, path = "/policy/rules", tag = "policy", request_body = PolicyRequest, responses((status=200, body=ActionResponse), (status=401, body=crate::http::error::ErrorBody)))]
+#[utoipa::path(post, path = "/policy/rules", tag = "policy", request_body = PolicyRequest, responses((status=200, body=ActionResponse), (status=401, body=crate::http::error::ErrorBody), (status=403, body=crate::http::error::ErrorBody)))]
 #[post("/rules")]
 async fn add_rule(
     policy_engine: web::Data<PolicyEngine>,
@@ -276,13 +276,15 @@ async fn add_rule(
     tracing::info!(
         subject = %auth_claims.sub,
         action = "rule.add",
-        target = %format!("{} {} {}", req.sub, req.obj, req.act),
+        rule_sub = %req.sub,
+        rule_obj = %req.obj,
+        rule_act = %req.act,
         "audit mutation"
     );
     Ok(HttpResponse::Ok().json(ActionResponse { success }))
 }
 
-#[utoipa::path(delete, path = "/policy/rules", tag = "policy", request_body = PolicyRequest, responses((status=200, body=ActionResponse), (status=401, body=crate::http::error::ErrorBody)))]
+#[utoipa::path(delete, path = "/policy/rules", tag = "policy", request_body = PolicyRequest, responses((status=200, body=ActionResponse), (status=401, body=crate::http::error::ErrorBody), (status=403, body=crate::http::error::ErrorBody)))]
 #[delete("/rules")]
 async fn remove_rule(
     policy_engine: web::Data<PolicyEngine>,
@@ -299,7 +301,9 @@ async fn remove_rule(
     tracing::info!(
         subject = %auth_claims.sub,
         action = "rule.remove",
-        target = %format!("{} {} {}", req.sub, req.obj, req.act),
+        rule_sub = %req.sub,
+        rule_obj = %req.obj,
+        rule_act = %req.act,
         "audit mutation"
     );
     Ok(HttpResponse::Ok().json(ActionResponse { success }))
@@ -321,7 +325,7 @@ async fn get_user_groups(
         .await?;
 
     let user_id = path.into_inner();
-    let groups = policy_engine.get_groups_of_user(&user_id).await;
+    let groups = policy_engine.groups_of_user(&user_id).await;
 
     Ok(HttpResponse::Ok().json(ListResponse { items: groups }))
 }
@@ -342,7 +346,7 @@ async fn get_group_users(
         .await?;
 
     let group_name = path.into_inner();
-    let users = policy_engine.get_users_in_group(&group_name).await;
+    let users = policy_engine.users_in_group(&group_name).await;
 
     Ok(HttpResponse::Ok().json(ListResponse { items: users }))
 }
@@ -368,7 +372,8 @@ async fn assign_group(
     tracing::info!(
         subject = %auth_claims.sub,
         action = "group.assign",
-        target = %format!("{} -> {}", req.user_id, req.group),
+        user = %req.user_id,
+        group = %req.group,
         "audit mutation"
     );
     Ok(HttpResponse::Ok().json(ActionResponse { success }))
@@ -390,13 +395,16 @@ async fn remove_user_from_group(
         .await?;
 
     let (group_name, user_id) = path.into_inner();
+    let success = policy_engine
+        .remove_from_group(user_id.clone(), group_name.clone())
+        .await?;
     tracing::info!(
         subject = %auth_claims.sub,
         action = "group.remove",
-        target = %format!("{} -> {}", user_id, group_name),
+        user = %user_id,
+        group = %group_name,
         "audit mutation"
     );
-    let success = policy_engine.remove_from_group(user_id, group_name).await?;
 
     Ok(HttpResponse::Ok().json(ActionResponse { success }))
 }
