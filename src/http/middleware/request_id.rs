@@ -23,7 +23,7 @@ use uuid::Uuid;
 /// The request identifier that [`RequestIdMiddleware`] stores in the request
 /// extensions.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct RequestId(pub String);
+pub struct RequestId(String);
 
 impl RequestId {
     /// Wraps an arbitrary identifier string.
@@ -61,11 +61,6 @@ impl AsRef<str> for RequestId {
         &self.0
     }
 }
-
-/// Alias for [`RequestId`].
-pub type RequestID = RequestId;
-/// Alias for [`RequestIdMiddleware`].
-pub type RequestIDMiddleware = RequestIdMiddleware;
 
 /// The middleware factory that propagates `X-Request-Id`.
 #[derive(Debug, Default, Clone, Copy)]
@@ -126,15 +121,9 @@ where
 
         let request_id = RequestId(id.clone());
 
-        req.extensions_mut().insert(request_id.clone());
-        req.extensions_mut().insert(id.clone());
-        if let Ok(uuid) = Uuid::parse_str(&id) {
-            req.extensions_mut().insert(uuid);
-        }
+        req.extensions_mut().insert(request_id);
 
         let span = tracing::Span::current();
-        span.record("request.id", id.as_str());
-        span.record("request_id", id.as_str());
         span.record("http.request.id", id.as_str());
 
         let header_value = match HeaderValue::from_str(&id) {
@@ -225,5 +214,41 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("error-id-456")
         );
+    }
+
+    /// The middleware stores one typed request id in the extensions.
+    #[actix_web::test]
+    async fn request_id_uses_one_extension_type() {
+        async fn inspect(req: actix_web::HttpRequest) -> HttpResponse {
+            let typed = req
+                .extensions()
+                .get::<RequestId>()
+                .map(|id| id.as_str().to_string());
+            let plain = req.extensions().get::<String>().is_some();
+            let uuid = req.extensions().get::<Uuid>().is_some();
+            HttpResponse::Ok().json(serde_json::json!({
+                "typed": typed,
+                "plain": plain,
+                "uuid": uuid,
+            }))
+        }
+
+        let app = test::init_service(
+            App::new()
+                .wrap(RequestIdMiddleware)
+                .route("/", web::get().to(inspect)),
+        )
+        .await;
+
+        let req = test::TestRequest::get()
+            .uri("/")
+            .insert_header(("X-Request-Id", "11111111-2222-3333-4444-555555555555"))
+            .to_request();
+        let res = test::call_service(&app, req).await;
+        let body: serde_json::Value =
+            serde_json::from_slice(&test::read_body(res).await).expect("json body");
+        assert_eq!(body["typed"], "11111111-2222-3333-4444-555555555555");
+        assert_eq!(body["plain"], false);
+        assert_eq!(body["uuid"], false);
     }
 }

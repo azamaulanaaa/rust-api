@@ -16,6 +16,7 @@ pub use rust_api::fs::s3::S3Backend;
 /// Top-level server configuration. The server loads it from the path that
 /// `--config` gives.
 #[derive(Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     /// Public base URL of this deployment. The server uses it to build the
     /// OIDC redirect.
@@ -242,7 +243,7 @@ fn apply_overrides_from(config: &mut Config, var: impl Fn(&str) -> Option<String
 /// and not empty. Otherwise the value in the file applies.
 fn prefer_env(env: Option<String>, file: String) -> String {
     match env {
-        Some(v) if !v.is_empty() => v,
+        Some(v) if !v.trim().is_empty() => v.trim().to_string(),
         _ => file,
     }
 }
@@ -250,7 +251,7 @@ fn prefer_env(env: Option<String>, file: String) -> String {
 /// Effective optional value. It uses the same precedence as [`prefer_env`].
 fn prefer_env_opt(env: Option<String>, file: Option<String>) -> Option<String> {
     match env {
-        Some(v) if !v.is_empty() => Some(v),
+        Some(v) if !v.trim().is_empty() => Some(v.trim().to_string()),
         _ => file,
     }
 }
@@ -280,7 +281,7 @@ impl Config {
             );
         }
         if let Some(token) = &self.authorization.setup_token {
-            if token.is_empty() {
+            if token.trim().is_empty() {
                 anyhow::bail!(
                     "authorization.setup_token must not be empty when the field is present"
                 );
@@ -400,7 +401,7 @@ impl Config {
             validate_webhook_allowed_host(host)?;
         }
         if let Some(secret) = &self.eav.webhook_signing_secret {
-            if secret.is_empty() {
+            if secret.trim().is_empty() {
                 anyhow::bail!("eav.webhook_signing_secret must not be empty");
             }
             if secret.len() < 32 {
@@ -417,7 +418,7 @@ impl Config {
         if let Some(url) = &self.rabbitmq.url {
             let parsed: url::Url = url
                 .parse()
-                .map_err(|e| anyhow::anyhow!("rabbitmq.url is not a valid URL ({url:?}): {e}"))?;
+                .map_err(|e| anyhow::anyhow!("rabbitmq.url is not a valid URL: {e}"))?;
             if parsed.scheme() != "amqp" && parsed.scheme() != "amqps" {
                 anyhow::bail!("rabbitmq.url must use amqp(s), got {:?}", parsed.scheme());
             }
@@ -428,7 +429,8 @@ impl Config {
 }
 
 /// Identity provider connection settings for the OIDC client.
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ConfigAuthorization {
     /// OAuth2 client identifier that is registered at the provider.
     pub client_id: String,
@@ -467,8 +469,24 @@ pub struct ConfigAuthorization {
     pub setup_token: Option<String>,
 }
 
+impl std::fmt::Debug for ConfigAuthorization {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConfigAuthorization")
+            .field("client_id", &self.client_id)
+            .field("client_secret", &"<redacted>")
+            .field("issuer_url", &self.issuer_url)
+            .field("allowed_tenants", &self.allowed_tenants)
+            .field(
+                "setup_token",
+                &self.setup_token.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
 /// Telemetry and observability settings.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct ObservabilityConfig {
     /// Service name that is attached to every exported telemetry resource.
     #[serde(default = "default_service_name")]
@@ -509,6 +527,7 @@ fn default_service_name() -> String {
 
 /// Settings of the embedded policy database.
 #[derive(Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct DatabaseConfig {
     /// Object prefix inside the S3 bucket for OxKV keys, for example
     /// `"oxkv"`. The default is `"oxkv"`.
@@ -578,6 +597,7 @@ fn default_writer_lease_ttl_secs() -> u64 {
 /// answer without authentication. Set [`expose_docs`](Self::expose_docs)
 /// only when the deployment needs them.
 #[derive(Deserialize, Debug, Default, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct HttpConfig {
     /// Browser origins that CORS allows, for example
     /// `["https://app.example.com"]`.
@@ -596,6 +616,7 @@ pub struct HttpConfig {
 /// not limit anything. The values that a deployment needs depend on its
 /// egress budget and its client poll interval. This crate knows neither.
 #[derive(Deserialize, Debug, Default, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct LimitsConfig {
     /// Requests per minute for each peer address, after an initial burst of the
     /// same size. A value of `0` disables the bucket.
@@ -652,7 +673,8 @@ pub const MIN_SAFE_RETENTION_SECS: u64 = 604_800;
 ///
 /// The runtime is always on.
 /// It relays the entity outbox and runs matching rules.
-#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct EavConfig {
     /// Pause in milliseconds between outbox flushes.
     #[serde(default = "default_eav_outbox_interval_ms")]
@@ -722,6 +744,32 @@ pub struct EavConfig {
     /// Set the value to `true` only for an intentional internal webhook.
     #[serde(default)]
     pub webhook_allow_private_hosts: bool,
+}
+
+impl std::fmt::Debug for EavConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EavConfig")
+            .field("outbox_interval_ms", &self.outbox_interval_ms)
+            .field("rule_poll_interval_ms", &self.rule_poll_interval_ms)
+            .field("gc_interval_ms", &self.gc_interval_ms)
+            .field("execution_retention_secs", &self.execution_retention_secs)
+            .field("timer_interval_ms", &self.timer_interval_ms)
+            .field("timer_batch", &self.timer_batch)
+            .field("max_causation_depth", &self.max_causation_depth)
+            .field("script_enabled", &self.script_enabled)
+            .field("check_entity_refs", &self.check_entity_refs)
+            .field("webhook_allowed_hosts", &self.webhook_allowed_hosts)
+            .field(
+                "webhook_signing_secret",
+                &self.webhook_signing_secret.as_ref().map(|_| "<redacted>"),
+            )
+            .field("webhook_max_attempts", &self.webhook_max_attempts)
+            .field(
+                "webhook_allow_private_hosts",
+                &self.webhook_allow_private_hosts,
+            )
+            .finish()
+    }
 }
 
 impl Default for EavConfig {
@@ -864,7 +912,8 @@ fn validate_webhook_allowed_host(entry: &str) -> anyhow::Result<()> {
 /// `previous_secret`, then deploy the new one as `secret`. A token that was
 /// made under either key still verifies until the old generation expires. The
 /// TTL is 5 minutes.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct CapabilityConfig {
     /// Current signing secret. It makes tokens.
     #[serde(default)]
@@ -874,13 +923,26 @@ pub struct CapabilityConfig {
     pub previous_secret: Option<String>,
 }
 
+impl std::fmt::Debug for CapabilityConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CapabilityConfig")
+            .field("secret", &self.secret.as_ref().map(|_| "<redacted>"))
+            .field(
+                "previous_secret",
+                &self.previous_secret.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
 /// Object store settings, using AmazonS3 through object_store. Tests use
 /// InMemory.
 ///
 /// The settings apply to `object_store::aws::AmazonS3` for S3-compatible
 /// providers, which are AWS, MinIO, and R2. Tests use
 /// `object_store::memory::InMemory`.
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct S3Config {
     /// Storage backend to use: `s3` (default) or `memory`.
     #[serde(default)]
@@ -902,6 +964,23 @@ pub struct S3Config {
     /// Secret access key.
     #[serde(default)]
     pub secret_access_key: Option<String>,
+}
+
+impl std::fmt::Debug for S3Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("S3Config")
+            .field("backend", &self.backend)
+            .field("bucket", &self.bucket)
+            .field("region", &self.region)
+            .field("endpoint_url", &self.endpoint_url)
+            .field("force_path_style", &self.force_path_style)
+            .field("access_key_id", &self.access_key_id)
+            .field(
+                "secret_access_key",
+                &self.secret_access_key.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 #[cfg(test)]
@@ -1919,14 +1998,95 @@ mod tests {
             "0 disables the lease"
         );
     }
+
+    #[test]
+    fn debug_output_never_prints_a_secret() {
+        let toml = r#"
+            public_address = "https://example.test"
+            listen_port = 8080
+            [authorization]
+            client_id = "cid"
+            client_secret = "oidc-secret-value"
+            issuer_url = "https://idp.test"
+            setup_token = "setup-token-that-is-at-least-32-bytes"
+            [database]
+            prefix = "oxkv"
+            [s3]
+            bucket = "my-bucket"
+            region = "us-east-1"
+            secret_access_key = "s3-secret-value"
+            [capability]
+            secret = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            previous_secret = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            [eav]
+            webhook_signing_secret = "webhook-secret-value-that-is-long"
+        "#;
+        let cfg = parse(toml).expect("the secret fixture must parse");
+        let debug = format!("{cfg:?}");
+        for secret in [
+            "oidc-secret-value",
+            "setup-token-that-is-at-least-32-bytes",
+            "s3-secret-value",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "webhook-secret-value-that-is-long",
+        ] {
+            assert!(!debug.contains(secret), "Debug printed a secret: {secret}");
+        }
+        assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn whitespace_only_environment_values_do_not_replace_file_values() {
+        let path = tmp_toml(&minimal_toml());
+        let spaces = " ".repeat(40);
+        let cfg = Config::try_from_with(path.as_path(), |name| match name {
+            ENV_CLIENT_SECRET | ENV_SETUP_TOKEN | ENV_EAV_WEBHOOK_SIGNING_SECRET => {
+                Some(spaces.clone())
+            }
+            _ => None,
+        })
+        .expect("a whitespace-only overlay must not replace a valid value");
+        assert_eq!(cfg.authorization.client_secret, "csecret");
+        assert!(cfg.authorization.setup_token.is_none());
+        assert!(cfg.eav.webhook_signing_secret.is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn unknown_config_keys_are_rejected() {
+        let toml = minimal_toml().replace(
+            "client_id = \"cid\"",
+            "client_id = \"cid\"\n            client_secrett = \"typo\"",
+        );
+        let err = validation_error(&toml);
+        assert!(err.contains("unknown field"), "got: {err}");
+
+        let toml = minimal_toml().replace(
+            "prefix = \"oxkv\"",
+            "prefix = \"oxkv\"\n            writeer_lease_ttl_secs = 0",
+        );
+        let err = validation_error(&toml);
+        assert!(err.contains("unknown field"), "got: {err}");
+    }
 }
 
 /// RabbitMQ connection settings. Only present with the `queue-rabbitmq`
 /// cargo feature.
 #[cfg(feature = "queue-rabbitmq")]
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct RabbitMqConfig {
     /// AMQP URL, for example `amqp://guest:guest@localhost:5672`.
     #[serde(default)]
     pub url: Option<String>,
+}
+
+#[cfg(feature = "queue-rabbitmq")]
+impl std::fmt::Debug for RabbitMqConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RabbitMqConfig")
+            .field("url", &self.url.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }

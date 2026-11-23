@@ -60,6 +60,21 @@ pub struct SigningKey {
     pub(crate) algorithm: Algorithm,
 }
 
+/// A failure while loading the signing keys.
+#[derive(Debug, thiserror::Error)]
+pub enum JwksError {
+    /// The JWKS request failed.
+    #[error("JWKS request failed: {0}")]
+    Request(#[from] reqwest::Error),
+
+    /// The JWKS document had no usable signing keys.
+    #[error("no usable signing keys found in JWKS at {url}")]
+    NoUsableKeys {
+        /// The URL that served the unusable document.
+        url: String,
+    },
+}
+
 /// A signing key store that uses JWKS and can refresh its keys.
 ///
 /// The process has one cache. Every clone of `JwtClaimsMiddleware` shares
@@ -83,7 +98,7 @@ struct JwksKeysInner {
 
 impl JwksKeys {
     /// Fetches the JWKS document and builds the initial cache.
-    pub async fn new(url: impl Into<String>) -> anyhow::Result<Self> {
+    pub async fn new(url: impl Into<String>) -> Result<Self, JwksError> {
         Self::build(url.into(), JWKS_REFRESH_DEBOUNCE).await
     }
 
@@ -93,18 +108,16 @@ impl JwksKeys {
     async fn with_refresh_debounce(
         url: impl Into<String>,
         debounce: Duration,
-    ) -> anyhow::Result<Self> {
+    ) -> Result<Self, JwksError> {
         Self::build(url.into(), debounce).await
     }
 
-    async fn build(url: String, refresh_debounce: Duration) -> anyhow::Result<Self> {
+    async fn build(url: String, refresh_debounce: Duration) -> Result<Self, JwksError> {
         let keys = fetch_keys(&url).await?;
 
-        anyhow::ensure!(
-            !keys.is_empty(),
-            "No usable signing keys found in JWKS at {}",
-            url
-        );
+        if keys.is_empty() {
+            return Err(JwksError::NoUsableKeys { url });
+        }
 
         Ok(Self {
             inner: Arc::new(JwksKeysInner {
@@ -210,7 +223,7 @@ impl JwksKeys {
     }
 }
 
-async fn fetch_keys(url: &str) -> anyhow::Result<HashMap<String, SigningKey>> {
+async fn fetch_keys(url: &str) -> Result<HashMap<String, SigningKey>, JwksError> {
     let jwks: JwkSet = JWKS_CLIENT.get(url).send().await?.json().await?;
 
     Ok(jwks.keys.iter().filter_map(to_signing_key).collect())

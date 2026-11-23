@@ -55,6 +55,10 @@ pub fn configure_sst_cache_bytes(bytes: usize) {
 /// the client for the file bytes and the OxKV stores share one
 /// `AmazonS3Builder` setup. It returns the raw store, so that
 /// `OxKvStoreBuilder` can wrap it.
+///
+/// # Errors
+///
+/// Returns `object_store::Error` when the S3 client cannot be built.
 pub fn build_object_store(
     cfg: &S3ClientConfig,
 ) -> Result<Arc<dyn ObjectStore>, object_store::Error> {
@@ -76,8 +80,14 @@ pub fn build_object_store(
 /// buffer. Two live handles on one prefix can fence each other. They can also
 /// diverge on a real S3. Share the handle with `Arc` instead of building a
 /// second one. A clone of the handle shares the state of the writer.
+///
+/// # Errors
+///
+/// Returns [`StoreError`] when the object store or the OxKV handle cannot be
+/// built.
 pub async fn build_s3_store(cfg: &S3ClientConfig, prefix: &str) -> Result<OxKvStore, StoreError> {
-    let inner = build_object_store(cfg).map_err(|e| StoreError::Other(e.to_string()))?;
+    let inner = build_object_store(cfg)
+        .map_err(|e| StoreError::Other(format!("build object store for prefix `{prefix}`: {e}")))?;
     let object_prefix = ObjectPath::from(prefix.trim_matches('/'));
     let mut builder = OxKvStore::builder()
         .with_store(Arc::new(oxkv_s3::ObjectStoreStorage::new(inner)))
@@ -101,12 +111,14 @@ pub async fn build_s3_store(cfg: &S3ClientConfig, prefix: &str) -> Result<OxKvSt
 ///
 /// # Errors
 ///
+/// Returns [`StoreError::Other`] when the object store cannot be built.
 /// Returns [`StoreError::Storage`] when the object store cannot be read.
 pub async fn build_s3_reader(
     cfg: &S3ClientConfig,
     prefix: &str,
 ) -> Result<oxkv::OxKvReader, StoreError> {
-    let inner = build_object_store(cfg).map_err(|e| StoreError::Other(e.to_string()))?;
+    let inner = build_object_store(cfg)
+        .map_err(|e| StoreError::Other(format!("build object store for prefix `{prefix}`: {e}")))?;
     reader_over(inner, prefix).await
 }
 
@@ -230,8 +242,11 @@ pub async fn build_test_reader(inner: Arc<dyn ObjectStore>, prefix: &str) -> oxk
 /// The scratch store shares the one process-wide SST cache. A snapshot build
 /// can run beside the writer handles, so a second 256 MB cache per build would
 /// break the memory budget.
-#[allow(clippy::expect_used)]
-pub async fn build_scratch_store(prefix: &str) -> OxKvStore {
+///
+/// # Errors
+///
+/// Returns [`StoreError`] when the scratch OxKV handle cannot be built.
+pub async fn build_scratch_store(prefix: &str) -> Result<OxKvStore, StoreError> {
     let inner = Arc::new(object_store::memory::InMemory::new()) as Arc<dyn ObjectStore>;
     OxKvStore::builder()
         .with_store(Arc::new(oxkv_s3::ObjectStoreStorage::new(inner)))
@@ -239,14 +254,11 @@ pub async fn build_scratch_store(prefix: &str) -> OxKvStore {
         .skip_probe(true)
         .build_with_cache(default_sst_cache())
         .await
-        .expect("scratch OxKvStore must build")
 }
 
-// `build_scratch_store` needs an `#[allow(clippy::expect_used)]` of its
-// own. The builders for tests only do not need one. `build_scratch_store` is
-// unconditional public API. `sync` uses it to build a snapshot in RAM. So it
-// compiles in builds that are not tests. The crate-root
-// `cfg_attr(test, allow(..))` does not cover it.
+// The builders for tests only keep their local allowances. They are gated by
+// `cfg(test)` and are not part of the public API. `build_scratch_store` is
+// unconditional public API, so it returns the build error to the caller.
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -296,6 +308,19 @@ mod tests {
                 .is_some_and(|i| !above[i..].contains("///"));
             assert!(gated, "{name} is public API but only used by tests");
         }
+    }
+
+    #[tokio::test]
+    async fn scratch_store_returns_the_build_result() -> anyhow::Result<()> {
+        use oxkv::GetSet;
+
+        let store = build_scratch_store(&test_prefix("db-scratch")).await?;
+        store.set_bytes("scratch-key", b"scratch-value").await?;
+        assert_eq!(
+            store.get_bytes("scratch-key").await?,
+            Some(b"scratch-value".to_vec())
+        );
+        Ok(())
     }
 
     #[tokio::test]

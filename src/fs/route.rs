@@ -61,7 +61,7 @@ async fn init_upload(
     body: ValidatedJson<InitRequest>,
 ) -> Result<HttpResponse, FsError> {
     let file_id = engine.init_upload(body.into_inner(), &claims.sub).await?;
-    Ok(HttpResponse::Created().json(serde_json::json!({ "file_id": file_id })))
+    Ok(HttpResponse::Created().json(InitResponse { file_id }))
 }
 
 #[utoipa::path(put, path = "/fs/uploads/{id}/parts/{idx}", tag = "fs", params(("id" = String, Path), ("idx" = u64, Path)), request_body(content = Vec<u8>, content_type = "application/octet-stream"), responses((status=204, description="part stored"), (status=401, body=crate::http::error::ErrorBody)))]
@@ -115,7 +115,7 @@ async fn complete_upload(
     engine
         .complete_upload(&id, body.into_inner(), &claims.sub)
         .await?;
-    Ok(HttpResponse::Ok().json(serde_json::json!({ "file_id": id })))
+    Ok(HttpResponse::Ok().json(InitResponse { file_id: id }))
 }
 
 #[utoipa::path(delete, path = "/fs/uploads/{id}", tag = "fs", params(("id" = String, Path)), responses((status=204, description="cancelled")))]
@@ -414,7 +414,7 @@ mod tests {
         let fx = fixture(true).await.expect("fixture");
         let module = FsApiModule::new(
             fx.engine.clone(),
-            JwtClaimsMiddleware::<Claims>::new_with_jks(
+            JwtClaimsMiddleware::<Claims>::new_with_jwks(
                 &format!("{}/jwks", fx.issuer()),
                 AUD,
                 &fx.issuer(),
@@ -517,7 +517,7 @@ mod tests {
     #[actix_web::test]
     async fn request_without_a_token_returns_401() -> anyhow::Result<()> {
         let fx = fixture(true).await?;
-        let mw = JwtClaimsMiddleware::<Claims>::new_with_jks(
+        let mw = JwtClaimsMiddleware::<Claims>::new_with_jwks(
             &format!("{}/jwks", fx.server.uri()),
             AUD,
             &fx.issuer(),
@@ -540,7 +540,7 @@ mod tests {
     #[actix_web::test]
     async fn temp_upload_allowed_without_policy() -> anyhow::Result<()> {
         let fx = fixture(false).await?; // A temp upload needs no fs policy.
-        let mw = JwtClaimsMiddleware::<Claims>::new_with_jks(
+        let mw = JwtClaimsMiddleware::<Claims>::new_with_jwks(
             &format!("{}/jwks", fx.server.uri()),
             AUD,
             &fx.issuer(),
@@ -564,7 +564,7 @@ mod tests {
     #[actix_web::test]
     async fn init_upload_validation_rejects_bad_body() -> anyhow::Result<()> {
         let fx = fixture(true).await?;
-        let mw = JwtClaimsMiddleware::<Claims>::new_with_jks(
+        let mw = JwtClaimsMiddleware::<Claims>::new_with_jwks(
             &format!("{}/jwks", fx.server.uri()),
             AUD,
             &fx.issuer(),
@@ -588,7 +588,7 @@ mod tests {
     #[actix_web::test]
     async fn full_single_part_flow_via_http() -> anyhow::Result<()> {
         let fx = fixture(true).await?;
-        let mw = JwtClaimsMiddleware::<Claims>::new_with_jks(
+        let mw = JwtClaimsMiddleware::<Claims>::new_with_jwks(
             &format!("{}/jwks", fx.server.uri()),
             AUD,
             &fx.issuer(),
@@ -715,7 +715,7 @@ mod tests {
     #[actix_web::test]
     async fn checksum_alias_header_forwarded() -> anyhow::Result<()> {
         let fx = fixture(true).await?;
-        let mw = JwtClaimsMiddleware::<Claims>::new_with_jks(
+        let mw = JwtClaimsMiddleware::<Claims>::new_with_jwks(
             &format!("{}/jwks", fx.server.uri()),
             AUD,
             &fx.issuer(),
@@ -753,7 +753,7 @@ mod tests {
     #[actix_web::test]
     async fn complete_validates_body_and_requires_all_parts() -> anyhow::Result<()> {
         let fx = fixture(true).await?;
-        let mw = JwtClaimsMiddleware::<Claims>::new_with_jks(
+        let mw = JwtClaimsMiddleware::<Claims>::new_with_jwks(
             &format!("{}/jwks", fx.server.uri()),
             AUD,
             &fx.issuer(),
@@ -801,7 +801,7 @@ mod tests {
     #[actix_web::test]
     async fn multipart_http_flow_with_two_parts() -> anyhow::Result<()> {
         let fx = fixture(true).await?;
-        let mw = JwtClaimsMiddleware::<Claims>::new_with_jks(
+        let mw = JwtClaimsMiddleware::<Claims>::new_with_jwks(
             &format!("{}/jwks", fx.server.uri()),
             AUD,
             &fx.issuer(),
@@ -859,7 +859,7 @@ mod tests {
     #[actix_web::test]
     async fn upload_part_rejects_padded_last_part() -> anyhow::Result<()> {
         let fx = fixture(true).await?;
-        let mw = JwtClaimsMiddleware::<Claims>::new_with_jks(
+        let mw = JwtClaimsMiddleware::<Claims>::new_with_jwks(
             &format!("{}/jwks", fx.server.uri()),
             AUD,
             &fx.issuer(),
@@ -899,7 +899,7 @@ mod tests {
     #[actix_web::test]
     async fn multipart_upload_and_download_preserve_exact_bytes() -> anyhow::Result<()> {
         let fx = fixture(true).await?;
-        let mw = JwtClaimsMiddleware::<Claims>::new_with_jks(
+        let mw = JwtClaimsMiddleware::<Claims>::new_with_jwks(
             &format!("{}/jwks", fx.server.uri()),
             AUD,
             &fx.issuer(),
@@ -965,7 +965,7 @@ mod tests {
     #[actix_web::test]
     async fn ranged_download_serves_206_and_416() -> anyhow::Result<()> {
         let fx = fixture(true).await?;
-        let mw = JwtClaimsMiddleware::<Claims>::new_with_jks(
+        let mw = JwtClaimsMiddleware::<Claims>::new_with_jwks(
             &format!("{}/jwks", fx.server.uri()),
             AUD,
             &fx.issuer(),
@@ -1062,7 +1062,7 @@ mod tests {
     #[actix_web::test]
     async fn oversize_part_is_rejected_with_413() -> anyhow::Result<()> {
         let fx = fixture(true).await?;
-        let mw = JwtClaimsMiddleware::<Claims>::new_with_jks(
+        let mw = JwtClaimsMiddleware::<Claims>::new_with_jwks(
             &format!("{}/jwks", fx.server.uri()),
             AUD,
             &fx.issuer(),

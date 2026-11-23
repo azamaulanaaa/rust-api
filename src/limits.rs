@@ -98,7 +98,7 @@ const MAX_TRACKED_PEERS: usize = 4096;
 /// The bucket refills at a steady rate, not in steps. A client that waits
 /// does not have to wait for a whole window to open again. A client that
 /// bursts is capped at `capacity`, not at `capacity * window`.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct TokenBucket {
     capacity: f64,
     refill_per_sec: f64,
@@ -109,6 +109,7 @@ pub struct TokenBucket {
     since_sweep: Arc<AtomicU64>,
 }
 
+#[derive(Debug)]
 struct BucketState {
     tokens: f64,
     last: Instant,
@@ -157,20 +158,17 @@ impl TokenBucket {
     /// lock.
     ///
     /// The answer is true once every [`IDLE_SWEEP_EVERY`] requests.
-    /// `fetch_update` sets the counter back to zero in the same step that
-    /// claims the sweep. So two workers cannot both believe that they are
-    /// the one that is due. At worst, a pair that races loses one sweep.
-    /// That is harmless for housekeeping. The counter starts one short of the
-    /// threshold, so the first call sweeps. That keeps a process with little
-    /// traffic reclaiming memory, instead of never doing so.
+    /// One `store` claims the window and resets the counter. A race can run
+    /// two sweeps. That is harmless for housekeeping. The counter starts one
+    /// short of the threshold, so the first call sweeps. That keeps a process
+    /// with little traffic reclaiming memory, instead of never doing so.
     fn sweep_due(&self) -> bool {
         let seen = self.since_sweep.fetch_add(1, Ordering::Relaxed);
-        if seen + 1 < IDLE_SWEEP_EVERY {
+        if seen < IDLE_SWEEP_EVERY - 1 {
             return false;
         }
-        // The function claims the window. It drops everything that was
-        // counted since the last sweep.
-        self.since_sweep.fetch_sub(seen + 1, Ordering::Relaxed);
+        // Reset to zero. A race can cause two sweeps. That is harmless.
+        self.since_sweep.store(0, Ordering::Relaxed);
         true
     }
 
@@ -276,7 +274,7 @@ impl TokenBucket {
 /// permit belonged to the handler, a client that opened a stream and then
 /// stopped reading would give back its slot. That client would still hold
 /// the memory.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ConcurrencyGate {
     /// `None` disables the gate. A semaphore with zero permits cannot
     /// represent this. A semaphore with zero permits refuses everything,
@@ -346,7 +344,7 @@ fn is_health_probe(path: &str) -> bool {
 
 /// Rejects a request with the uniform error body when a limit is reached.
 pub fn too_many(what: &str) -> HttpResponse {
-    tracing::warn!("rate limited: {what}");
+    tracing::debug!("rate limited: {what}");
     // `ResponseError` renders the uniform error body. So a limited response
     // has the same form as every other error.
     ResponseError::error_response(&ApiError::TooManyRequests)
@@ -367,6 +365,7 @@ pub fn too_many(what: &str) -> HttpResponse {
 /// The type is a `Stream`, not a `MessageBody`. Actix has a blanket
 /// implementation of `MessageBody` for streams, which keeps this free of
 /// `unsafe` pinning in a crate that denies `unwrap` and `expect`.
+#[derive(Debug)]
 pub struct GatedStream<S> {
     /// The field is boxed so that the wrapper is `Unpin` whatever the
     /// stream is. That keeps the `poll_next` below free of `unsafe`.
@@ -409,6 +408,7 @@ where
 /// which makes an outgoing round trip to the identity provider. The health
 /// probes `/health` and `/ready` are exempt, because a refused probe takes
 /// the instance out of service.
+#[derive(Debug)]
 pub struct RateLimit {
     bucket: TokenBucket,
 }
@@ -421,6 +421,7 @@ impl RateLimit {
 }
 
 /// The limiter that is installed. See [`RateLimit`].
+#[derive(Debug)]
 pub struct RateLimitMiddleware<S> {
     service: std::rc::Rc<S>,
     bucket: TokenBucket,
@@ -872,6 +873,26 @@ mod tests {
             4,
             "expected one sweep per {IDLE_SWEEP_EVERY} requests, got {sweeps} in {}",
             IDLE_SWEEP_EVERY * 4
+        );
+    }
+
+    /// A sweep resets the counter with one store. A raced or large counter
+    /// can never wrap the value back into a long run with no sweep.
+    #[test]
+    fn a_sweep_resets_the_counter_without_subtraction() {
+        let bucket = TokenBucket::new(1, 60);
+        bucket
+            .since_sweep
+            .store(IDLE_SWEEP_EVERY - 1, Ordering::Relaxed);
+        assert!(bucket.sweep_due());
+        assert_eq!(bucket.since_sweep.load(Ordering::Relaxed), 0);
+
+        bucket.since_sweep.store(u64::MAX, Ordering::Relaxed);
+        assert!(bucket.sweep_due());
+        assert_eq!(
+            bucket.since_sweep.load(Ordering::Relaxed),
+            0,
+            "a large counter must reset, not wrap into a negative value"
         );
     }
 

@@ -136,6 +136,7 @@ struct StoredJob {
 ///
 /// `ack`, `nack`, and `extend_lease` check the lease token under a
 /// compare-and-set on the job row. A stale token does not change the job.
+#[derive(Debug)]
 pub struct DurableQueue {
     store: Arc<RwLock<oxkv::OxKvStore>>,
     metrics: QueueMetrics,
@@ -219,10 +220,7 @@ impl DurableQueue {
         #[cfg(test)]
         self.row_reads
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        guard
-            .get_bytes(key)
-            .await
-            .map_err(|e| QueueError::Store(e.to_string()))
+        guard.get_bytes(key).await.map_err(QueueError::store)
     }
 
     fn idempotency_key(key: &str) -> String {
@@ -283,24 +281,23 @@ impl DurableQueue {
     {
         let key = Self::job_key(job_id);
         let g = self.store.write().await;
-        let tx = g.begin_tx().map_err(|e| QueueError::Store(e.to_string()))?;
+        let tx = g.begin_tx().map_err(QueueError::store)?;
         let bytes = tx
             .get_bytes(&key)
             .await
-            .map_err(|e| QueueError::Store(e.to_string()))?
+            .map_err(QueueError::store)?
             .ok_or(QueueError::NotFound(job_id))?;
-        let mut sj = serde_json::from_slice::<StoredJob>(&bytes)
-            .map_err(|e| QueueError::Store(e.to_string()))?;
+        let mut sj = serde_json::from_slice::<StoredJob>(&bytes).map_err(QueueError::store)?;
         if let Err(error) = Self::check_lease(&sj, lease) {
             self.metrics.record_lease_lost();
             return Err(error);
         }
         let old_due = Self::lease_due_key_for(&sj.status, job_id);
         update(&mut sj);
-        let val = serde_json::to_vec(&sj).map_err(|e| QueueError::Store(e.to_string()))?;
+        let val = serde_json::to_vec(&sj).map_err(QueueError::store)?;
         tx.compare_and_set(&key, Some(&bytes), &val)
             .await
-            .map_err(|e| QueueError::Store(e.to_string()))?;
+            .map_err(QueueError::store)?;
         for marker in [
             Self::queued_key(job_id),
             Self::leased_key(job_id),
@@ -308,24 +305,18 @@ impl DurableQueue {
             Self::succeeded_key(job_id),
             Self::failed_key(job_id),
         ] {
-            tx.delete(&marker)
-                .await
-                .map_err(|e| QueueError::Store(e.to_string()))?;
+            tx.delete(&marker).await.map_err(QueueError::store)?;
         }
         if let Some(due) = old_due {
-            tx.delete(&due)
-                .await
-                .map_err(|e| QueueError::Store(e.to_string()))?;
+            tx.delete(&due).await.map_err(QueueError::store)?;
         }
         if let Some(marker) = Self::status_key(&sj.status, job_id) {
             tx.set_bytes(&marker, b"")
                 .await
-                .map_err(|e| QueueError::Store(e.to_string()))?;
+                .map_err(QueueError::store)?;
         }
         if let Some(due) = Self::lease_due_key_for(&sj.status, job_id) {
-            tx.set_bytes(&due, b"")
-                .await
-                .map_err(|e| QueueError::Store(e.to_string()))?;
+            tx.set_bytes(&due, b"").await.map_err(QueueError::store)?;
         }
         match tx.commit().await {
             Ok(()) => {}
@@ -333,7 +324,7 @@ impl DurableQueue {
                 self.metrics.record_lease_lost();
                 return Err(QueueError::AlreadyLeased);
             }
-            Err(error) => return Err(QueueError::Store(error.to_string())),
+            Err(error) => return Err(QueueError::store(error)),
         }
         drop(g);
         Ok(sj)
@@ -348,7 +339,7 @@ impl DurableQueue {
             let page = g
                 .scan_keys(KeyPrefix::new(prefix), after, QUEUE_SCAN_PAGE)
                 .await
-                .map_err(|e| QueueError::Store(e.to_string()))?;
+                .map_err(QueueError::store)?;
             for key in &page.items {
                 if let Some(id) = key.strip_prefix(prefix)
                     && let Ok(id) = id.parse::<Uuid>()
@@ -364,6 +355,16 @@ impl DurableQueue {
         Ok(ids)
     }
 
+    /// Records the number of jobs that wait to run.
+    async fn record_depth(&self) {
+        let depth = self
+            .ids_with_prefix(QUEUED_PREFIX)
+            .await
+            .map(|ids| ids.len() as u64)
+            .unwrap_or(0);
+        self.metrics.record_depth(depth);
+    }
+
     /// Writes the status markers for an old store one time.
     ///
     /// The function scans the `job:` family when the backfill marker is
@@ -373,19 +374,13 @@ impl DurableQueue {
     async fn backfill(&self) -> Result<(), QueueError> {
         {
             let g = self.store.read().await;
-            if g.has(BACKFILL_KEY)
-                .await
-                .map_err(|e| QueueError::Store(e.to_string()))?
-            {
+            if g.has(BACKFILL_KEY).await.map_err(QueueError::store)? {
                 return Ok(());
             }
         }
 
         let g = self.store.write().await;
-        if g.has(BACKFILL_KEY)
-            .await
-            .map_err(|e| QueueError::Store(e.to_string()))?
-        {
+        if g.has(BACKFILL_KEY).await.map_err(QueueError::store)? {
             return Ok(());
         }
         let rows = g
@@ -398,15 +393,15 @@ impl DurableQueue {
                 ),
             )
             .await
-            .map_err(|e| QueueError::Store(e.to_string()))?;
-        let tx = g.begin_tx().map_err(|e| QueueError::Store(e.to_string()))?;
+            .map_err(QueueError::store)?;
+        let tx = g.begin_tx().map_err(QueueError::store)?;
         for kv in &rows {
             match serde_json::from_slice::<StoredJob>(&kv.value) {
                 Ok(sj) => {
                     if let Some(marker) = Self::status_key(&sj.status, sj.job.id) {
                         tx.set_bytes(&marker, b"")
                             .await
-                            .map_err(|e| QueueError::Store(e.to_string()))?;
+                            .map_err(QueueError::store)?;
                     }
                 }
                 Err(e) => {
@@ -416,10 +411,8 @@ impl DurableQueue {
         }
         tx.set_bytes(BACKFILL_KEY, b"1")
             .await
-            .map_err(|e| QueueError::Store(e.to_string()))?;
-        tx.commit()
-            .await
-            .map_err(|e| QueueError::Store(e.to_string()))?;
+            .map_err(QueueError::store)?;
+        tx.commit().await.map_err(QueueError::store)?;
         Ok(())
     }
 
@@ -431,28 +424,22 @@ impl DurableQueue {
     async fn ensure_lease_index(&self) -> Result<(), QueueError> {
         {
             let g = self.store.read().await;
-            if g.has(LEASE_INDEX_KEY)
-                .await
-                .map_err(|e| QueueError::Store(e.to_string()))?
-            {
+            if g.has(LEASE_INDEX_KEY).await.map_err(QueueError::store)? {
                 return Ok(());
             }
         }
 
         let g = self.store.write().await;
-        if g.has(LEASE_INDEX_KEY)
-            .await
-            .map_err(|e| QueueError::Store(e.to_string()))?
-        {
+        if g.has(LEASE_INDEX_KEY).await.map_err(QueueError::store)? {
             return Ok(());
         }
-        let tx = g.begin_tx().map_err(|e| QueueError::Store(e.to_string()))?;
+        let tx = g.begin_tx().map_err(QueueError::store)?;
         let mut after = None;
         loop {
             let page = g
                 .scan_keys(KeyPrefix::new(LEASED_PREFIX), after, QUEUE_SCAN_PAGE)
                 .await
-                .map_err(|e| QueueError::Store(e.to_string()))?;
+                .map_err(QueueError::store)?;
             for key in &page.items {
                 let Some(raw_id) = key.strip_prefix(LEASED_PREFIX) else {
                     continue;
@@ -466,9 +453,7 @@ impl DurableQueue {
                 if let Ok(sj) = serde_json::from_slice::<StoredJob>(&bytes)
                     && let Some(due) = Self::lease_due_key_for(&sj.status, id)
                 {
-                    tx.set_bytes(&due, b"")
-                        .await
-                        .map_err(|e| QueueError::Store(e.to_string()))?;
+                    tx.set_bytes(&due, b"").await.map_err(QueueError::store)?;
                 }
             }
             match page.next {
@@ -478,10 +463,8 @@ impl DurableQueue {
         }
         tx.set_bytes(LEASE_INDEX_KEY, b"1")
             .await
-            .map_err(|e| QueueError::Store(e.to_string()))?;
-        tx.commit()
-            .await
-            .map_err(|e| QueueError::Store(e.to_string()))?;
+            .map_err(QueueError::store)?;
+        tx.commit().await.map_err(QueueError::store)?;
         Ok(())
     }
 
@@ -525,7 +508,7 @@ impl DurableQueue {
                 let page = g
                     .scan_keys(KeyPrefix::new(LEASE_DUE_PREFIX), after, QUEUE_SCAN_PAGE)
                     .await
-                    .map_err(|e| QueueError::Store(e.to_string()))?;
+                    .map_err(QueueError::store)?;
                 let mut stop = false;
                 for key in &page.items {
                     let Some((expires_at, id)) = Self::parse_lease_due_key(key) else {
@@ -571,18 +554,11 @@ impl DurableQueue {
     ) -> Result<(), QueueError> {
         let key = Self::job_key(id);
         let g = self.store.write().await;
-        let tx = g.begin_tx().map_err(|e| QueueError::Store(e.to_string()))?;
-        let bytes = tx
-            .get_bytes(&key)
-            .await
-            .map_err(|e| QueueError::Store(e.to_string()))?;
+        let tx = g.begin_tx().map_err(QueueError::store)?;
+        let bytes = tx.get_bytes(&key).await.map_err(QueueError::store)?;
         let Some(bytes) = bytes else {
-            tx.delete(due_key)
-                .await
-                .map_err(|e| QueueError::Store(e.to_string()))?;
-            tx.commit()
-                .await
-                .map_err(|e| QueueError::Store(e.to_string()))?;
+            tx.delete(due_key).await.map_err(QueueError::store)?;
+            tx.commit().await.map_err(QueueError::store)?;
             return Ok(());
         };
         let Ok(sj) = serde_json::from_slice::<StoredJob>(&bytes) else {
@@ -597,32 +573,22 @@ impl DurableQueue {
                 let _ = tx.rollback().await;
                 return Ok(());
             }
-            tx.delete(due_key)
-                .await
-                .map_err(|e| QueueError::Store(e.to_string()))?;
-            tx.commit()
-                .await
-                .map_err(|e| QueueError::Store(e.to_string()))?;
+            tx.delete(due_key).await.map_err(QueueError::store)?;
+            tx.commit().await.map_err(QueueError::store)?;
             return Ok(());
         };
         let marker = Self::status_key(&new_sj.status, id)
-            .ok_or_else(|| QueueError::Store("status has no marker".to_string()))?;
-        let val = serde_json::to_vec(&new_sj).map_err(|e| QueueError::Store(e.to_string()))?;
-        tx.set_bytes(&key, &val)
-            .await
-            .map_err(|e| QueueError::Store(e.to_string()))?;
+            .ok_or_else(|| QueueError::store_message("status has no marker"))?;
+        let val = serde_json::to_vec(&new_sj).map_err(QueueError::store)?;
+        tx.set_bytes(&key, &val).await.map_err(QueueError::store)?;
         tx.delete(&Self::leased_key(id))
             .await
-            .map_err(|e| QueueError::Store(e.to_string()))?;
-        tx.delete(due_key)
-            .await
-            .map_err(|e| QueueError::Store(e.to_string()))?;
+            .map_err(QueueError::store)?;
+        tx.delete(due_key).await.map_err(QueueError::store)?;
         tx.set_bytes(&marker, b"")
             .await
-            .map_err(|e| QueueError::Store(e.to_string()))?;
-        tx.commit()
-            .await
-            .map_err(|e| QueueError::Store(e.to_string()))?;
+            .map_err(QueueError::store)?;
+        tx.commit().await.map_err(QueueError::store)?;
         Ok(())
     }
 
@@ -670,18 +636,11 @@ impl DurableQueue {
             let key = Self::job_key(id);
             let marker = format!("{prefix}{id}");
             let g = self.store.write().await;
-            let tx = g.begin_tx().map_err(|e| QueueError::Store(e.to_string()))?;
-            let bytes = tx
-                .get_bytes(&key)
-                .await
-                .map_err(|e| QueueError::Store(e.to_string()))?;
+            let tx = g.begin_tx().map_err(QueueError::store)?;
+            let bytes = tx.get_bytes(&key).await.map_err(QueueError::store)?;
             let Some(bytes) = bytes else {
-                tx.delete(&marker)
-                    .await
-                    .map_err(|e| QueueError::Store(e.to_string()))?;
-                tx.commit()
-                    .await
-                    .map_err(|e| QueueError::Store(e.to_string()))?;
+                tx.delete(&marker).await.map_err(QueueError::store)?;
+                tx.commit().await.map_err(QueueError::store)?;
                 continue;
             };
             let Ok(sj) = serde_json::from_slice::<StoredJob>(&bytes) else {
@@ -698,29 +657,19 @@ impl DurableQueue {
             };
             let expired = matches_prefix && finished_at.is_some_and(|t| t < cutoff);
             if expired {
-                tx.delete(&key)
-                    .await
-                    .map_err(|e| QueueError::Store(e.to_string()))?;
-                tx.delete(&marker)
-                    .await
-                    .map_err(|e| QueueError::Store(e.to_string()))?;
+                tx.delete(&key).await.map_err(QueueError::store)?;
+                tx.delete(&marker).await.map_err(QueueError::store)?;
                 if let Some(idempotency_key) = &sj.job.idempotency_key {
                     tx.delete(&Self::idempotency_key(idempotency_key))
                         .await
-                        .map_err(|e| QueueError::Store(e.to_string()))?;
+                        .map_err(QueueError::store)?;
                 }
-                tx.commit()
-                    .await
-                    .map_err(|e| QueueError::Store(e.to_string()))?;
+                tx.commit().await.map_err(QueueError::store)?;
             } else if matches_prefix {
                 let _ = tx.rollback().await;
             } else {
-                tx.delete(&marker)
-                    .await
-                    .map_err(|e| QueueError::Store(e.to_string()))?;
-                tx.commit()
-                    .await
-                    .map_err(|e| QueueError::Store(e.to_string()))?;
+                tx.delete(&marker).await.map_err(QueueError::store)?;
+                tx.commit().await.map_err(QueueError::store)?;
             }
         }
         Ok(())
@@ -729,13 +678,10 @@ impl DurableQueue {
     async fn load(&self, id: JobId) -> Result<StoredJob, QueueError> {
         let key = Self::job_key(id);
         let g = self.store.read().await;
-        let bytes = g
-            .get_bytes(&key)
-            .await
-            .map_err(|e| QueueError::Store(e.to_string()))?;
+        let bytes = g.get_bytes(&key).await.map_err(QueueError::store)?;
         drop(g);
         let bytes = bytes.ok_or(QueueError::NotFound(id))?;
-        serde_json::from_slice(&bytes).map_err(|e| QueueError::Store(e.to_string()))
+        serde_json::from_slice(&bytes).map_err(QueueError::store)
     }
 
     /// Returns all dead-lettered jobs.
@@ -744,6 +690,10 @@ impl DurableQueue {
     /// those job rows. It returns only jobs with the `Dead` status. The
     /// result is sorted by completion time, newest first. The function skips
     /// rows that do not decode.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`QueueError::Store`] when a backfill or a read fails.
     pub async fn dead_jobs(&self) -> Result<Vec<Job>, QueueError> {
         self.backfill().await?;
         let ids = self.ids_with_prefix(DEAD_PREFIX).await?;
@@ -751,10 +701,7 @@ impl DurableQueue {
         let g = self.store.read().await;
         for id in ids {
             let key = Self::job_key(id);
-            let bytes = g
-                .get_bytes(&key)
-                .await
-                .map_err(|e| QueueError::Store(e.to_string()))?;
+            let bytes = g.get_bytes(&key).await.map_err(QueueError::store)?;
             let Some(bytes) = bytes else {
                 continue;
             };
@@ -796,19 +743,19 @@ impl super::JobQueue for DurableQueue {
             status: JobStatus::Queued,
             lease_generation: 0,
         };
-        let val = serde_json::to_vec(&sj).map_err(|e| QueueError::Store(e.to_string()))?;
+        let val = serde_json::to_vec(&sj).map_err(QueueError::store)?;
         let g = self.store.write().await;
-        let tx = g.begin_tx().map_err(|e| QueueError::Store(e.to_string()))?;
+        let tx = g.begin_tx().map_err(QueueError::store)?;
         tx.set_bytes(&Self::job_key(id), &val)
             .await
-            .map_err(|e| QueueError::Store(e.to_string()))?;
+            .map_err(QueueError::store)?;
         tx.set_bytes(&Self::queued_key(id), b"")
             .await
-            .map_err(|e| QueueError::Store(e.to_string()))?;
+            .map_err(QueueError::store)?;
         if let Some(key) = &idempotency_key {
             tx.set_if_absent(key, id.to_string().as_bytes())
                 .await
-                .map_err(|e| QueueError::Store(e.to_string()))?;
+                .map_err(QueueError::store)?;
         }
         match tx.commit().await {
             Ok(()) => {}
@@ -817,31 +764,22 @@ impl super::JobQueue for DurableQueue {
                 current: Some(current),
             }) if Some(&key) == idempotency_key.as_ref() => {
                 drop(g);
-                let id_str =
-                    String::from_utf8(current).map_err(|e| QueueError::Store(e.to_string()))?;
-                let existing = id_str
-                    .parse::<Uuid>()
-                    .map_err(|e| QueueError::Store(e.to_string()))?;
+                let id_str = String::from_utf8(current).map_err(QueueError::store)?;
+                let existing = id_str.parse::<Uuid>().map_err(QueueError::store)?;
                 return Ok(existing);
             }
             Err(StoreError::TxConflict { key, current: None })
                 if Some(&key) == idempotency_key.as_ref() =>
             {
-                return Err(QueueError::Store(
-                    "idempotency key conflict has no stored id".to_string(),
+                return Err(QueueError::store_message(
+                    "idempotency key conflict has no stored id",
                 ));
             }
-            Err(error) => return Err(QueueError::Store(error.to_string())),
+            Err(error) => return Err(QueueError::store(error)),
         }
         drop(g);
         self.metrics.record_enqueued();
-        // Best-effort depth for telemetry. Count the queued markers only.
-        let depth = self
-            .ids_with_prefix(QUEUED_PREFIX)
-            .await
-            .map(|ids| ids.len() as u64)
-            .unwrap_or(0);
-        self.metrics.record_depth(depth);
+        self.record_depth().await;
         Ok(id)
     }
 
@@ -892,18 +830,13 @@ impl super::JobQueue for DurableQueue {
             let expiry = Self::now_millis().saturating_add(lease_millis);
             let key = Self::job_key(id);
             let g = self.store.write().await;
-            let tx = g.begin_tx().map_err(|e| QueueError::Store(e.to_string()))?;
-            let bytes = tx
-                .get_bytes(&key)
-                .await
-                .map_err(|e| QueueError::Store(e.to_string()))?;
+            let tx = g.begin_tx().map_err(QueueError::store)?;
+            let bytes = tx.get_bytes(&key).await.map_err(QueueError::store)?;
             let Some(bytes) = bytes else {
                 tx.delete(&Self::queued_key(id))
                     .await
-                    .map_err(|e| QueueError::Store(e.to_string()))?;
-                tx.commit()
-                    .await
-                    .map_err(|e| QueueError::Store(e.to_string()))?;
+                    .map_err(QueueError::store)?;
+                tx.commit().await.map_err(QueueError::store)?;
                 continue;
             };
             let Ok(mut sj) = serde_json::from_slice::<StoredJob>(&bytes) else {
@@ -920,22 +853,18 @@ impl super::JobQueue for DurableQueue {
                 worker: worker.to_string(),
                 expires_at: expiry,
             };
-            let val = serde_json::to_vec(&sj).map_err(|e| QueueError::Store(e.to_string()))?;
-            tx.set_bytes(&key, &val)
-                .await
-                .map_err(|e| QueueError::Store(e.to_string()))?;
+            let val = serde_json::to_vec(&sj).map_err(QueueError::store)?;
+            tx.set_bytes(&key, &val).await.map_err(QueueError::store)?;
             tx.delete(&Self::queued_key(id))
                 .await
-                .map_err(|e| QueueError::Store(e.to_string()))?;
+                .map_err(QueueError::store)?;
             tx.set_bytes(&Self::leased_key(id), b"")
                 .await
-                .map_err(|e| QueueError::Store(e.to_string()))?;
+                .map_err(QueueError::store)?;
             tx.set_bytes(&Self::lease_due_key(id, expiry), b"")
                 .await
-                .map_err(|e| QueueError::Store(e.to_string()))?;
-            tx.commit()
-                .await
-                .map_err(|e| QueueError::Store(e.to_string()))?;
+                .map_err(QueueError::store)?;
+            tx.commit().await.map_err(QueueError::store)?;
             drop(g);
             out.push(LeasedJob {
                 job: sj.job,
@@ -946,6 +875,7 @@ impl super::JobQueue for DurableQueue {
             });
         }
         self.metrics.record_reserved(out.len() as u64);
+        self.record_depth().await;
         Ok(out)
     }
 
@@ -966,6 +896,7 @@ impl super::JobQueue for DurableQueue {
         })
         .await?;
         self.metrics.record_completed();
+        self.record_depth().await;
         Ok(())
     }
 
@@ -987,14 +918,15 @@ impl super::JobQueue for DurableQueue {
                     };
                 }
                 RetryPolicy::Retry { delay } => {
-                    if sj.job.attempt.saturating_add(1) >= sj.job.max_attempts {
+                    let attempt = sj.job.attempt.saturating_add(1);
+                    sj.job.attempt = attempt;
+                    if attempt >= sj.job.max_attempts {
                         sj.status = JobStatus::Dead {
                             error: error.to_string(),
                             finished_at: finished,
                         };
                     } else {
-                        sj.job.attempt = sj.job.attempt.saturating_add(1);
-                        sj.job.scheduled_at = finished + delay.as_secs() as i64;
+                        sj.job.scheduled_at = finished.saturating_add(super::delay_secs(delay));
                         sj.status = JobStatus::Queued;
                     }
                 }
@@ -1008,6 +940,7 @@ impl super::JobQueue for DurableQueue {
             JobStatus::Failed { .. } | JobStatus::Queued => self.metrics.record_failed(),
             JobStatus::Succeeded { .. } | JobStatus::Leased { .. } => {}
         }
+        self.record_depth().await;
         Ok(())
     }
 
@@ -1028,6 +961,7 @@ impl super::JobQueue for DurableQueue {
                 };
             })
             .await?;
+        self.record_depth().await;
         Ok(LeaseToken {
             worker: lease.worker.clone(),
             generation: updated.lease_generation,
@@ -1038,6 +972,7 @@ impl super::JobQueue for DurableQueue {
     async fn status(&self, job_id: JobId) -> Result<JobStatus, QueueError> {
         self.expire_job(job_id).await?;
         let sj = self.load(job_id).await?;
+        self.record_depth().await;
         Ok(sj.status)
     }
 }
@@ -2266,5 +2201,67 @@ mod tests {
         assert_eq!(got, id);
         assert_eq!(q.ids_with_prefix(QUEUED_PREFIX).await.unwrap(), vec![id]);
         assert_eq!(q.ids_with_prefix(JOB_PREFIX).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_dead_letter_records_the_final_attempt() {
+        let q = queue().await;
+        let mut j = job("work");
+        j.max_attempts = 1;
+        let id = j.id;
+        q.enqueue(j).await.unwrap();
+        let leased = q.reserve("w1", 10, Duration::from_secs(30)).await.unwrap();
+        q.nack(
+            leased[0].job.id,
+            &leased[0].lease,
+            "boom",
+            RetryPolicy::Retry {
+                delay: Duration::ZERO,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(q.load(id).await.unwrap().job.attempt, 1);
+    }
+
+    #[tokio::test]
+    async fn a_sub_second_retry_delay_rounds_up() {
+        let q = queue().await;
+        let j = job("work");
+        let id = j.id;
+        q.enqueue(j).await.unwrap();
+        let leased = q.reserve("w1", 10, Duration::from_secs(30)).await.unwrap();
+        let before = DurableQueue::now();
+        q.nack(
+            leased[0].job.id,
+            &leased[0].lease,
+            "boom",
+            RetryPolicy::Retry {
+                delay: Duration::from_millis(500),
+            },
+        )
+        .await
+        .unwrap();
+        let after = DurableQueue::now();
+
+        let scheduled_at = q.load(id).await.unwrap().job.scheduled_at;
+        assert!(scheduled_at > before, "the job must wait one second");
+        assert!(scheduled_at <= after + 1, "the job must not wait too long");
+    }
+
+    #[tokio::test]
+    async fn the_depth_gauge_tracks_only_queued_jobs() {
+        let q = queue().await;
+        let j = job("work");
+        let id = j.id;
+        q.enqueue(j).await.unwrap();
+        assert_eq!(q.metrics.depth_value(), 1);
+
+        let leased = q.reserve("w1", 10, Duration::from_secs(30)).await.unwrap();
+        assert_eq!(q.metrics.depth_value(), 0);
+
+        q.ack(id, &leased[0].lease, None).await.unwrap();
+        assert_eq!(q.metrics.depth_value(), 0);
     }
 }

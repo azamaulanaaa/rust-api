@@ -116,6 +116,7 @@ impl LeaseRecord {
 
 /// Why a lease could not be claimed.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum LeaseError {
     /// Another process holds a live lease on this prefix.
     #[error(
@@ -186,11 +187,22 @@ impl WriterLease {
     /// A create response can be lost. The function then reads its own record
     /// and compares the instance. A matching instance means that the claim
     /// succeeded.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LeaseError::Held`] when another writer holds the lease.
+    /// Returns [`LeaseError::Corrupt`] when the record cannot be parsed.
+    /// Returns [`LeaseError::Io`] when the store fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `ttl_secs` is zero. A zero TTL gives no exclusion.
     pub async fn acquire(
         store: Arc<dyn ObjectStore>,
         db_prefix: &str,
         ttl_secs: u64,
     ) -> Result<Self, LeaseError> {
+        assert!(ttl_secs > 0, "lease TTL must be greater than zero");
         let prefix = db_prefix.trim_matches('/').to_string();
         let path = lease_path(&prefix);
         let now = chrono::Utc::now().timestamp();
@@ -467,16 +479,9 @@ impl WriterLease {
             }
         }
 
-        if let Err(e) = self.store.delete(&self.path).await {
-            tracing::warn!(
-                instance = %self.record.instance,
-                error = %e,
-                "failed to delete the released single-writer lease; it will expire in {}s",
-                self.record.ttl_secs
-            );
-        } else {
-            tracing::info!(instance = %self.record.instance, "released single-writer lease");
-        }
+        // The `released` flag makes the record stale for the next claim.
+        // An unconditional delete can remove a successor's lease.
+        tracing::info!(instance = %self.record.instance, "released single-writer lease");
     }
 }
 
@@ -589,10 +594,18 @@ pub const RELEASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// after a lost lease instead of exiting. A later renewal that succeeds
 /// cannot un-fence us. The flag must stay set, so that the process never
 /// takes traffic again. Nothing useful is left for the task to do.
+///
+/// # Panics
+///
+/// Panics if `interval` is zero. Tokio rejects a zero period.
 pub fn spawn_renewer(
     mut lease: WriterLease,
     interval: std::time::Duration,
 ) -> (Arc<AtomicBool>, LeaseGuard) {
+    assert!(
+        !interval.is_zero(),
+        "renewal interval must be greater than zero"
+    );
     let lost = lease.lost_flag();
     let (tx, rx) = tokio::sync::oneshot::channel();
     let task = tokio::spawn(async move {
@@ -1339,10 +1352,17 @@ mod tests {
         // The orderly shutdown path.
         guard.release().await;
 
+        let bytes = store
+            .get(&path)
+            .await
+            .expect("kept")
+            .bytes()
+            .await
+            .expect("read");
+        let released: LeaseRecord = serde_json::from_slice(&bytes).expect("decodes");
         assert!(
-            store.get(&path).await.is_err(),
-            "awaiting the release returned without deleting the lease record; \
-             a replacement waits out the whole TTL",
+            released.released,
+            "the release must mark the record stale instead of deleting it"
         );
         // The practical result. The prefix can be claimed at once, with
         // no wait for the TTL.
@@ -1412,7 +1432,18 @@ mod tests {
         guard
             .release_within(std::time::Duration::from_secs(5))
             .await;
-        assert!(store.get(&path).await.is_err());
+        let bytes = store
+            .get(&path)
+            .await
+            .expect("kept")
+            .bytes()
+            .await
+            .expect("read");
+        let released: LeaseRecord = serde_json::from_slice(&bytes).expect("decodes");
+        assert!(
+            released.released,
+            "the first release marks the record stale"
+        );
 
         // The call must not hang or panic. There is nothing left to await.
         guard
@@ -1632,14 +1663,18 @@ mod tests {
                 .unwrap();
         stale.renewed_at -= TTL as i64 * 10;
         overwrite_record(&*store, &path, &stale).await;
-        let _second = WriterLease::acquire(Arc::clone(&store), prefix, TTL)
+        let second = WriterLease::acquire(Arc::clone(&store), prefix, TTL)
             .await
             .expect("stale lease is takeable");
+        let successor = second.instance().to_string();
 
         first.release().await;
-        assert!(
-            store.get(&path).await.is_ok(),
-            "release deleted the successor's lease"
+        let on_disk: LeaseRecord =
+            serde_json::from_slice(&store.get(&path).await.unwrap().bytes().await.unwrap())
+                .unwrap();
+        assert_eq!(
+            on_disk.instance, successor,
+            "release deleted or replaced the successor's lease"
         );
     }
 
@@ -1749,5 +1784,20 @@ mod tests {
             .await
             .expect_err("multipart uploads are not supported by the lease wrapper");
         assert!(matches!(err, object_store::Error::NotSupported { .. }));
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "lease TTL must be greater than zero")]
+    async fn a_zero_ttl_is_refused_at_the_entry_point() {
+        let _ = WriterLease::acquire(mem(), "lease-test-zero-ttl", 0).await;
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "renewal interval must be greater than zero")]
+    async fn a_zero_renewal_interval_is_refused_before_spawn() {
+        let lease = WriterLease::acquire(mem(), "lease-test-zero-interval", TTL)
+            .await
+            .expect("claims");
+        let _guard = spawn_renewer(lease, std::time::Duration::ZERO);
     }
 }

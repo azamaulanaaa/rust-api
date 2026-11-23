@@ -128,6 +128,7 @@ const REPLICA_BUILD_MAX_BYTES: usize = 16 * 1024;
 
 /// The current head of the entity change feed.
 #[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
+#[schema(as = EavSyncStatusResponse)]
 pub struct SyncStatusResponse {
     /// The sequence number of the last entry in the change log.
     pub head: u64,
@@ -920,13 +921,14 @@ mod tests {
     use crate::eav::entity::{AttributeValue, EntityDraft};
     use crate::eav::metrics::test_support::MetricCapture;
     use crate::eav::route::EavApiModule;
+    use crate::eav::runtime::{RefCheck, Scripts};
     use crate::eav::schema::{AttributeDef, AttributeType, SchemaDraft};
     use crate::fs::s3::{S3Backend, S3ClientConfig};
     use crate::http::ApiModule;
     use crate::http::middleware::jwks::test_support::{rsa_key, sign_rs256, spawn_jwks};
     use crate::policy::PolicyEngine;
     use crate::records::{ChangeSink, EntityEventKind};
-    use crate::rules::action::{ActionContext, RuleAction};
+    use crate::rules::action::{ActionContext, ActionError, RuleAction};
     use crate::sync::wal::Wal;
 
     const KID: &str = "eav-sync-test-kid";
@@ -941,7 +943,7 @@ mod tests {
             "record"
         }
 
-        async fn execute(&self, _ctx: ActionContext) -> Result<(), anyhow::Error> {
+        async fn execute(&self, _ctx: ActionContext) -> Result<(), ActionError> {
             Ok(())
         }
     }
@@ -973,7 +975,7 @@ mod tests {
 
         async fn module(&self) -> anyhow::Result<EavApiModule> {
             let middleware =
-                crate::http::middleware::jwt::JwtClaimsMiddleware::<Claims>::new_with_jks(
+                crate::http::middleware::jwt::JwtClaimsMiddleware::<Claims>::new_with_jwks(
                     &format!("{}/jwks", self.server.uri()),
                     AUD,
                     &self.issuer(),
@@ -1006,9 +1008,9 @@ mod tests {
             &prefix,
             wal,
             vec![Arc::new(NoopAction)],
-            true,
+            RefCheck::On,
             8,
-            false,
+            Scripts::Disabled,
         )
         .await?;
         let engine =
@@ -3345,7 +3347,7 @@ mod tests {
             .as_object()
             .expect("component schemas");
         for name in [
-            "SyncStatusResponse",
+            "EavSyncStatusResponse",
             "SyncEvent",
             "SyncEventsResponse",
             "SyncEventsQuery",

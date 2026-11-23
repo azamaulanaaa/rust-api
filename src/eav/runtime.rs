@@ -256,6 +256,29 @@ impl ReplicaTestHooks {
     }
 }
 
+/// Controls whether an entity write checks that its `EntityRef` targets exist.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RefCheck {
+    /// Check that each target entity exists.
+    On,
+    /// Validate the target form, but skip the existence read.
+    Off,
+}
+
+/// Controls whether the rule engine accepts condition scripts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scripts {
+    /// Accept a script condition and run it.
+    Enabled,
+    /// Reject a script condition.
+    Disabled,
+}
+
+/// An error from one public EAV runtime operation.
+#[derive(Debug, thiserror::Error)]
+#[error(transparent)]
+pub struct EavRuntimeError(#[from] anyhow::Error);
+
 /// The EAV stores and their background loops.
 ///
 /// The runtime holds one shared WAL.
@@ -305,20 +328,20 @@ impl EavRuntime {
     /// The entity store writes its events to `wal`.
     /// The rule engine uses the given actions.
     /// The entity store checks that each `EntityRef` target exists when
-    /// `check_entity_refs` is true.
+    /// `ref_check` is [`RefCheck::On`].
     /// The rule engine runs an action only when the event depth is at most
     /// `max_causation_depth`.
-    /// The rule engine accepts a condition script only when `script_enabled`
-    /// is true.
+    /// The rule engine accepts a condition script only when `scripts` is
+    /// [`Scripts::Enabled`].
     pub async fn build(
         s3: &S3ClientConfig,
         db_prefix: &str,
         wal: Wal,
         actions: Vec<Arc<dyn RuleAction>>,
-        check_entity_refs: bool,
+        ref_check: RefCheck,
         max_causation_depth: u32,
-        script_enabled: bool,
-    ) -> anyhow::Result<Self> {
+        scripts: Scripts,
+    ) -> Result<Self, EavRuntimeError> {
         let schema_store = build_s3_store(s3, &domain_prefix(db_prefix, "schema"))
             .await
             .context("build the EAV schema store")?;
@@ -335,14 +358,14 @@ impl EavRuntime {
         let schemas = SchemaRegistry::new(schema_store);
         let entities = EntityStore::new(entity_store, schemas.clone())
             .with_change_sink(Arc::new(wal.clone()))
-            .with_entity_ref_check(check_entity_refs);
+            .with_entity_ref_check(ref_check == RefCheck::On);
         let rules = RuleStore::new(rule_store);
         let replicas = ReplicaStore::new(replica_store);
         let metrics = EavMetrics::global();
         let engine = RuleEngine::new(rules.clone(), entities.clone(), actions)
             .context("build the EAV rule engine")?
             .with_max_causation_depth(max_causation_depth)
-            .with_script_enabled(script_enabled)
+            .with_script_enabled(scripts == Scripts::Enabled)
             .with_observer(Arc::new(metrics.clone()));
 
         Ok(Self {
@@ -486,7 +509,7 @@ impl EavRuntime {
     /// The next pass then emits the same event again.
     /// The event id is stable, and a duplicate event is idempotent.
     /// The rule engine execution marker stops a duplicate action.
-    pub async fn fire_due_timers(&self, now: i64, limit: usize) -> anyhow::Result<usize> {
+    pub async fn fire_due_timers(&self, now: i64, limit: usize) -> Result<usize, EavRuntimeError> {
         let mut emitted = 0;
         let mut due_count = 0;
         for key in self
@@ -566,7 +589,7 @@ impl EavRuntime {
         &self,
         cancel: C,
         config: EavRuntimeConfig,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), EavRuntimeError> {
         let relay = self.supervise(LoopSlot::OutboxRelay, cancel.clone(), {
             let runtime = self.clone();
             move |token| {
@@ -705,7 +728,7 @@ impl EavRuntime {
         &self,
         cancel: C,
         config: EavRuntimeConfig,
-    ) -> JoinHandle<anyhow::Result<()>> {
+    ) -> JoinHandle<Result<(), EavRuntimeError>> {
         let runtime = self.clone();
         tokio::spawn(async move {
             let result = runtime.run(cancel, config).await;
@@ -990,7 +1013,7 @@ mod tests {
     use crate::eav::schema::{AttributeDef, AttributeType, SchemaDraft};
     use crate::fs::s3::S3Backend;
     use crate::records::{ChangeSink, EntityEventKind, WalOp};
-    use crate::rules::action::ActionContext;
+    use crate::rules::action::{ActionContext, ActionError};
     use crate::rules::engine::ExecutionOutcome;
     use crate::rules::rule::{ActionRef, Condition, RuleDraft, RuleTrigger};
 
@@ -1019,7 +1042,7 @@ mod tests {
             &self.kind
         }
 
-        async fn execute(&self, ctx: ActionContext) -> Result<(), anyhow::Error> {
+        async fn execute(&self, ctx: ActionContext) -> Result<(), ActionError> {
             self.records.lock().unwrap().push(ctx);
             Ok(())
         }
@@ -1119,18 +1142,34 @@ mod tests {
         let s3 = memory_s3();
         let prefix = test_prefix("eav-runtime");
         let wal = Wal::new(build_s3_store(&s3, &format!("{prefix}/wal")).await.unwrap());
-        EavRuntime::build(&s3, &prefix, wal, actions, true, max_causation_depth, false)
-            .await
-            .unwrap()
+        EavRuntime::build(
+            &s3,
+            &prefix,
+            wal,
+            actions,
+            RefCheck::On,
+            max_causation_depth,
+            Scripts::Disabled,
+        )
+        .await
+        .unwrap()
     }
 
     async fn build_runtime_with_scripts(actions: Vec<Arc<dyn RuleAction>>) -> EavRuntime {
         let s3 = memory_s3();
         let prefix = test_prefix("eav-runtime-script");
         let wal = Wal::new(build_s3_store(&s3, &format!("{prefix}/wal")).await.unwrap());
-        EavRuntime::build(&s3, &prefix, wal, actions, true, 8, true)
-            .await
-            .unwrap()
+        EavRuntime::build(
+            &s3,
+            &prefix,
+            wal,
+            actions,
+            RefCheck::On,
+            8,
+            Scripts::Enabled,
+        )
+        .await
+        .unwrap()
     }
 
     fn short_config() -> EavRuntimeConfig {

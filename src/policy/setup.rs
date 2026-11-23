@@ -133,8 +133,10 @@ async fn claim_admin(
         return Err(ApiError::Conflict);
     }
     tracing::info!(
-        "bootstrap: assigned {SUPERADMIN_ROLE} role to {}",
-        auth_claims.sub
+        action = "setup.admin_claim",
+        subject = %auth_claims.sub,
+        role = SUPERADMIN_ROLE,
+        "bootstrap role granted"
     );
     Ok(HttpResponse::Created().json(SetupResponse {
         sub: auth_claims.sub.clone(),
@@ -208,7 +210,7 @@ mod tests {
         fx: &Fixture,
         setup_token: Option<&str>,
     ) -> anyhow::Result<SetupApiModule> {
-        let middleware = JwtClaimsMiddleware::<Claims>::new_with_jks(
+        let middleware = JwtClaimsMiddleware::<Claims>::new_with_jwks(
             &format!("{}/jwks", fx.server.uri()),
             AUDIENCE,
             &fx.issuer(),
@@ -403,7 +405,7 @@ mod tests {
             latch: reopened.latch,
         };
         let middleware =
-            JwtClaimsMiddleware::<Claims>::new_with_jks(&jwks_url, AUDIENCE, &issuer).await?;
+            JwtClaimsMiddleware::<Claims>::new_with_jwks(&jwks_url, AUDIENCE, &issuer).await?;
         let module = SetupApiModule::new(engine_clone, middleware, Some(SETUP_TOKEN.to_string()));
         let app =
             test::init_service(App::new().configure(|cfg| ApiModule::configure(&module, cfg)))

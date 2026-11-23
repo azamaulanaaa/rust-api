@@ -28,7 +28,7 @@ use super::jwks::JwksKeys;
 use crate::http::error::ApiError;
 
 // Re-exports the public API for the users of this module.
-pub use super::jwks::SigningKey;
+pub use super::jwks::{JwksError, SigningKey};
 
 /// The literal segment that marks a template for a multi-tenant issuer.
 /// The format follows Azure AD, for example
@@ -225,11 +225,11 @@ where
     /// Fetches the JWKS document from `jwks_url` and builds the middleware.
     /// The function pins the `audience` and `issuer` checks. See
     /// [`JwksKeys`] for the refresh behavior.
-    pub async fn new_with_jks(
+    pub async fn new_with_jwks(
         jwks_url: &str,
         audience: &str,
         issuer: &str,
-    ) -> anyhow::Result<Self> {
+    ) -> Result<Self, JwksError> {
         let keys = JwksKeys::new(jwks_url).await?;
 
         // The base validation holds the audience and issuer checks. The
@@ -303,7 +303,14 @@ where
 /// extractor returns a **401 Unauthorized** instead. An anonymous request
 /// to a protected route must not look like a server fault.
 #[derive(Debug)]
-pub struct Validated<C>(pub C);
+pub struct Validated<C>(C);
+
+impl<C> Validated<C> {
+    /// Returns the validated claims.
+    pub fn into_inner(self) -> C {
+        self.0
+    }
+}
 
 impl<C> std::ops::Deref for Validated<C> {
     type Target = C;
@@ -371,7 +378,11 @@ where
         // changes the parse cache in the request extensions, which would
         // conflict with a live `extensions()` borrow that is held across an
         // array literal.
-        let bearer = req.extensions().get::<BearerToken>().cloned().map(|v| v.0);
+        let bearer = req
+            .extensions()
+            .get::<BearerToken>()
+            .cloned()
+            .map(BearerToken::into_inner);
         let cookie_token = req.cookie(AUTH_COOKIE).map(|c| c.value().to_string());
         // The code records the source of the CHOSEN token. It does not
         // record only that one token was chosen. Only a stale cookie is
@@ -454,7 +465,14 @@ where
 
                     decode::<C>(&token, &signing_key.decoding_key, &validation)
                         .map(|td| td.claims)
-                        .map_err(|e| (format!("token failed validation: {e}"), false))
+                        .map_err(|e| {
+                            let expired =
+                                e.kind() == &jsonwebtoken::errors::ErrorKind::ExpiredSignature;
+                            (
+                                format!("token failed validation: {e}"),
+                                !public_route && !expired,
+                            )
+                        })
                 }
                 .await;
 
@@ -640,7 +658,7 @@ mod tests {
         let server = spawn_jwks(json!({ "keys": [key] })).await;
         let tenant_guid = "11111111-2222-3333-4444-555555555555";
 
-        let mw = JwtClaimsMiddleware::<TestClaims>::new_with_jks(
+        let mw = JwtClaimsMiddleware::<TestClaims>::new_with_jwks(
             &format!("{}/jwks", server.uri()),
             "test-aud",
             &format!("{}/{{tenantid}}/v2.0", server.uri()),
@@ -779,7 +797,7 @@ mod tests {
         let (key, enc) = rsa_key("kid-prec")?;
         let server = spawn_jwks(json!({ "keys": [key] })).await;
 
-        let mw = JwtClaimsMiddleware::<TestClaims>::new_with_jks(
+        let mw = JwtClaimsMiddleware::<TestClaims>::new_with_jwks(
             &format!("{}/jwks", server.uri()),
             "test-aud",
             "https://idp.test",
@@ -884,7 +902,7 @@ mod tests {
         let (key, _enc) = rsa_key("kid-t")?;
         let server = spawn_jwks(json!({ "keys": [key] })).await;
 
-        let mw = JwtClaimsMiddleware::<TestClaims>::new_with_jks(
+        let mw = JwtClaimsMiddleware::<TestClaims>::new_with_jwks(
             &format!("{}/jwks", server.uri()),
             "test-aud",
             "https://idp.test",
@@ -922,7 +940,7 @@ mod tests {
         let (key, enc) = rsa_key("kid-t")?;
         let server = spawn_jwks(json!({ "keys": [key] })).await;
 
-        let mw = JwtClaimsMiddleware::<TestClaims>::new_with_jks(
+        let mw = JwtClaimsMiddleware::<TestClaims>::new_with_jwks(
             &format!("{}/jwks", server.uri()),
             "test-aud",
             "https://idp.test",
@@ -964,7 +982,7 @@ mod tests {
         let (key, enc) = rsa_key("kid-t")?;
         let server = spawn_jwks(json!({ "keys": [key] })).await;
 
-        let mw = JwtClaimsMiddleware::<TestClaims>::new_with_jks(
+        let mw = JwtClaimsMiddleware::<TestClaims>::new_with_jwks(
             &format!("{}/jwks", server.uri()),
             "test-aud",
             "https://idp.test",
@@ -1022,7 +1040,7 @@ mod tests {
         let (key, enc) = rsa_key("kid-t")?;
         let server = spawn_jwks(json!({ "keys": [key] })).await;
 
-        let mw = JwtClaimsMiddleware::<TestClaims>::new_with_jks(
+        let mw = JwtClaimsMiddleware::<TestClaims>::new_with_jwks(
             &format!("{}/jwks", server.uri()),
             "test-aud",
             &format!("{}/{{tenantid}}/v2.0", server.uri()),
@@ -1095,7 +1113,7 @@ mod tests {
         let (key, enc) = rsa_key("kid-t")?;
         let server = spawn_jwks(json!({ "keys": [key] })).await;
 
-        let mw = JwtClaimsMiddleware::<TestClaims>::new_with_jks(
+        let mw = JwtClaimsMiddleware::<TestClaims>::new_with_jwks(
             &format!("{}/jwks", server.uri()),
             "test-aud",
             &format!("{}/{{tenantid}}/v2.0", server.uri()),
@@ -1162,7 +1180,7 @@ mod tests {
         let (key, enc) = rsa_key("kid-t")?;
         let server = spawn_jwks(json!({ "keys": [key] })).await;
 
-        let mw = JwtClaimsMiddleware::<TestClaims>::new_with_jks(
+        let mw = JwtClaimsMiddleware::<TestClaims>::new_with_jwks(
             &format!("{}/jwks", server.uri()),
             "test-aud",
             &format!("{}/{{tenantid}}/v2.0", server.uri()),
@@ -1250,7 +1268,7 @@ mod tests {
         let (key, enc) = rsa_key("kid-t")?;
         let server = spawn_jwks(json!({ "keys": [key] })).await;
 
-        let mw = JwtClaimsMiddleware::<TestClaims>::new_with_jks(
+        let mw = JwtClaimsMiddleware::<TestClaims>::new_with_jwks(
             &format!("{}/jwks", server.uri()),
             "test-aud",
             &format!("{}/{{tenantid}}/v2.0", server.uri()),
@@ -1298,6 +1316,58 @@ mod tests {
         assert!(
             !cleared,
             "a bad Authorization header must not delete an unrelated session cookie"
+        );
+        Ok(())
+    }
+
+    /// A forged signature fails with `invalid credentials` on a protected route.
+    #[actix_web::test]
+    async fn forged_signature_does_not_degrade_to_anonymous() -> anyhow::Result<()> {
+        use actix_web::{App, HttpResponse, http::StatusCode, test, web};
+
+        let (key, _enc) = rsa_key("kid-t")?;
+        let (_other_key, attacker_enc) = rsa_key("kid-t")?;
+        let server = spawn_jwks(json!({ "keys": [key] })).await;
+        let mw = JwtClaimsMiddleware::<TestClaims>::new_with_jwks(
+            &format!("{}/jwks", server.uri()),
+            "test-aud",
+            "https://idp.test",
+        )
+        .await?;
+
+        async fn protected(_claims: Validated<TestClaims>) -> HttpResponse {
+            HttpResponse::Ok().finish()
+        }
+
+        let svc = test::init_service(
+            App::new()
+                .wrap(mw)
+                .service(web::resource("/protected").to(protected)),
+        )
+        .await;
+
+        let forged = sign_rs256(
+            &json!({
+                "sub": "attacker",
+                "aud": "test-aud",
+                "iss": "https://idp.test",
+                "exp": 2000000000u64,
+            }),
+            "kid-t",
+            &attacker_enc,
+        )?;
+        let res = test::try_call_service(
+            &svc,
+            test::TestRequest::get()
+                .uri("/protected")
+                .insert_header(("Cookie", format!("auth_token={forged}")))
+                .to_request(),
+        )
+        .await;
+        let err = res.expect_err("a forged signature must not degrade to anonymous");
+        assert_eq!(
+            err.as_response_error().status_code(),
+            StatusCode::UNAUTHORIZED
         );
         Ok(())
     }

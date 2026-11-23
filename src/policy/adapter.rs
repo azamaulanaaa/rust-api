@@ -361,6 +361,9 @@ where
                 continue;
             }
             let rule: Vec<String> = serde_json::from_slice(&kv.value)?;
+            if rule.len() != PolicyRuleValidator::expected_arity(sec) {
+                continue;
+            }
             out.push((sec.to_string(), ptype.to_string(), rule));
         }
         Ok(out)
@@ -719,7 +722,7 @@ where
                 })?;
                 feed.append(row.op)
                     .await
-                    .map_err(|e| PolicyError::ChangeFeed(e.to_string()))?;
+                    .map_err(|e| PolicyError::ChangeFeed(e.into_boxed_dyn_error()))?;
             }
             self.store.delete(&key).await?;
             delivered += 1;
@@ -950,6 +953,26 @@ mod tests {
             "a fenced policy write must latch the fencing signal, or /ready \
              keeps reporting 200 while every master policy write fails"
         );
+    }
+
+    /// A stored rule with the wrong field count must not enter the model.
+    #[tokio::test]
+    async fn load_all_skips_rules_with_wrong_arity() {
+        let store = BTreeStore::default();
+        store
+            .set_bytes("g:g:ab01", br#"["only-one-field"]"#)
+            .await
+            .unwrap();
+        store
+            .set_bytes("g:g:cd02", br#"["user-1","admins"]"#)
+            .await
+            .unwrap();
+
+        let adapter = OxkvAdapter::new(store);
+        let loaded = adapter.load_all().await.unwrap();
+
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].2, vec!["user-1", "admins"]);
     }
 
     #[tokio::test]

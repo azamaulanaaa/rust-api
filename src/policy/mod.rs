@@ -59,16 +59,25 @@ impl fmt::Display for Action {
     }
 }
 
+/// The input is not a known action name.
+#[derive(Debug, Error)]
+#[error("unknown action: {0}")]
+pub struct ParseActionError(String);
+
 impl FromStr for Action {
-    type Err = String;
+    type Err = ParseActionError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "read" => Ok(Action::Read),
-            "write" => Ok(Action::Write),
-            "delete" => Ok(Action::Delete),
-            "execute" => Ok(Action::Execute),
-            _ => Err(format!("Unknown action: {}", s)),
+        if s.eq_ignore_ascii_case("read") {
+            Ok(Action::Read)
+        } else if s.eq_ignore_ascii_case("write") {
+            Ok(Action::Write)
+        } else if s.eq_ignore_ascii_case("delete") {
+            Ok(Action::Delete)
+        } else if s.eq_ignore_ascii_case("execute") {
+            Ok(Action::Execute)
+        } else {
+            Err(ParseActionError(s.to_string()))
         }
     }
 }
@@ -96,7 +105,7 @@ pub enum PolicyError {
 
     /// Announcing a committed mutation to the change feed failed.
     #[error("change feed error: {0}")]
-    ChangeFeed(String),
+    ChangeFeed(#[source] Box<dyn std::error::Error + Send + Sync>),
 
     /// The policy store's epoch was lost to another writer.
     ///
@@ -374,9 +383,14 @@ impl PolicyEngine {
     }
 
     /// Returns all granular permissions (p-rules).
-    pub async fn get_all_rules(&self) -> Vec<Vec<String>> {
+    pub async fn all_rules(&self) -> Vec<Vec<String>> {
         let ef = self.enforcer.read().await;
         ef.get_policy()
+    }
+
+    /// Alias for [`Self::all_rules`].
+    pub async fn get_all_rules(&self) -> Vec<Vec<String>> {
+        self.all_rules().await
     }
 
     /// Adds a granular permission (e.g. user_1, table_a.col_1, read).
@@ -538,10 +552,10 @@ impl PolicyEngine {
         let ef = self.enforcer.read().await;
         let mut by_user: HashMap<String, Vec<String>> = HashMap::new();
         for link in ef.get_grouping_policy() {
-            by_user
-                .entry(link[0].clone())
-                .or_default()
-                .push(link[1].clone());
+            let (Some(user), Some(group)) = (link.first(), link.get(1)) else {
+                continue;
+            };
+            by_user.entry(user.clone()).or_default().push(group.clone());
         }
         let mut users: Vec<UserAssignment> = by_user
             .into_iter()
@@ -610,13 +624,23 @@ impl PolicyEngine {
     }
 
     /// Returns every user that belongs to a specific group.
-    pub async fn get_users_in_group(&self, group: &str) -> Vec<String> {
-        self.authorizer().get_users_in_group(group).await
+    pub async fn users_in_group(&self, group: &str) -> Vec<String> {
+        self.authorizer().users_in_group(group).await
     }
 
     /// Returns every group assigned to a specific user.
+    pub async fn groups_of_user(&self, user_id: &str) -> Vec<String> {
+        self.authorizer().groups_of_user(user_id).await
+    }
+
+    /// Alias for [`Self::users_in_group`].
+    pub async fn get_users_in_group(&self, group: &str) -> Vec<String> {
+        self.users_in_group(group).await
+    }
+
+    /// Alias for [`Self::groups_of_user`].
     pub async fn get_groups_of_user(&self, user_id: &str) -> Vec<String> {
-        self.authorizer().get_groups_of_user(user_id).await
+        self.groups_of_user(user_id).await
     }
 
     /// Returns a read-only handle that callers can pass to other services.
@@ -689,16 +713,26 @@ impl Authorizer {
         }
     }
 
-    /// Read-only method. Returns the users in a group.
-    pub async fn get_users_in_group(&self, group: &str) -> Vec<String> {
+    /// Returns the users in a group.
+    pub async fn users_in_group(&self, group: &str) -> Vec<String> {
         let ef = self.enforcer.read().await;
         ef.get_users_for_role(group, None)
     }
 
-    /// Read-only method. Returns the groups of a user.
-    pub async fn get_groups_of_user(&self, user_id: &str) -> Vec<String> {
+    /// Returns the groups of a user.
+    pub async fn groups_of_user(&self, user_id: &str) -> Vec<String> {
         let ef = self.enforcer.read().await;
         ef.get_roles_for_user(user_id, None)
+    }
+
+    /// Alias for [`Self::users_in_group`].
+    pub async fn get_users_in_group(&self, group: &str) -> Vec<String> {
+        self.users_in_group(group).await
+    }
+
+    /// Alias for [`Self::groups_of_user`].
+    pub async fn get_groups_of_user(&self, user_id: &str) -> Vec<String> {
+        self.groups_of_user(user_id).await
     }
 
     /// Returns the `(obj, act)` pairs granted to `sub` by `p` rules.
@@ -785,7 +819,7 @@ mod tests {
     fn error_display_is_lowercase_sentence_style() {
         for rendered in [
             PolicyError::AccessDenied.to_string(),
-            PolicyError::ChangeFeed("seq 7 missing".into()).to_string(),
+            PolicyError::ChangeFeed(Box::new(std::io::Error::other("seq 7 missing"))).to_string(),
             PolicyError::Fenced("epoch 7 superseded".into()).to_string(),
         ] {
             let first = rendered.chars().next().expect("non-empty display");
@@ -794,6 +828,26 @@ mod tests {
                 "expected lowercase start, got {rendered:?}"
             );
         }
+    }
+
+    /// A feed failure keeps the cause under `source()`.
+    #[test]
+    fn change_feed_error_keeps_its_source() {
+        let err = PolicyError::ChangeFeed(Box::new(std::io::Error::other("feed unavailable")));
+        assert!(err.to_string().contains("feed unavailable"));
+        assert!(
+            std::error::Error::source(&err).is_some(),
+            "the feed failure must stay available to callers"
+        );
+    }
+
+    #[test]
+    fn action_from_str_returns_typed_error() {
+        assert_eq!("read".parse::<Action>().unwrap(), Action::Read);
+        assert_eq!("WRITE".parse::<Action>().unwrap(), Action::Write);
+
+        let err = "launch".parse::<Action>().unwrap_err();
+        assert_eq!(err.to_string(), "unknown action: launch");
     }
 
     #[tokio::test]
@@ -832,11 +886,32 @@ mod tests {
         let groups = engine.list_groups().await;
         let names: Vec<&str> = groups.iter().map(|g| g.name.as_str()).collect();
         assert_eq!(names, vec!["viewers"]);
-        assert!(engine.get_groups_of_user("alice").await.is_empty());
-        assert!(engine.get_groups_of_user("carol").await.is_empty());
+        assert!(engine.groups_of_user("alice").await.is_empty());
+        assert!(engine.groups_of_user("carol").await.is_empty());
 
         // The function does nothing for an unknown group, and does not fail.
         assert!(!engine.delete_group("admins").await.unwrap());
+    }
+
+    /// A short grouping row must not stop the listing.
+    #[tokio::test]
+    async fn list_user_assignments_skips_malformed_group_rows() {
+        let engine = engine().await;
+        {
+            let mut ef = engine.enforcer.write().await;
+            ef.get_mut_model()
+                .add_policy("g", "g", vec!["only-one-field".to_string()]);
+            ef.get_mut_model().add_policy(
+                "g",
+                "g",
+                vec!["alice".to_string(), "admins".to_string()],
+            );
+        }
+
+        let users = engine.list_user_assignments().await;
+        assert_eq!(users.len(), 1, "a short row must not abort the listing");
+        assert_eq!(users[0].sub, "alice");
+        assert_eq!(users[0].groups, vec!["admins"]);
     }
 
     #[tokio::test]
@@ -916,7 +991,7 @@ mod tests {
         // it is useless for the sharing across modules that it exists to
         // support.
         let auth = engine.authorizer();
-        assert_eq!(auth.get_groups_of_user("alice").await, vec!["editors"]);
+        assert_eq!(auth.groups_of_user("alice").await, vec!["editors"]);
         assert!(
             auth.authorize("alice", "doc", Action::Write).await.unwrap(),
             "authorizer must see the engine's rules"
@@ -944,8 +1019,8 @@ mod tests {
         const DELEGATED: [&str; 6] = [
             "authorize",
             "require",
-            "get_users_in_group",
-            "get_groups_of_user",
+            "users_in_group",
+            "groups_of_user",
             "rules_for_subject",
             "is_unlocked",
         ];

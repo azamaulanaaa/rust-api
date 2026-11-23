@@ -340,9 +340,7 @@ impl FsEngine {
         policy: Authorizer,
     ) -> Result<Self, FsError> {
         let store = FsStore::primary(s3_store);
-        let s3 = s3::build_s3_client(s3_config)
-            .await
-            .map_err(|e| FsError::Internal(format!("failed to build S3 client: {e}")))?;
+        let s3 = s3::build_s3_client(s3_config).await?;
         Ok(Self {
             store,
             s3,
@@ -539,7 +537,7 @@ impl FsEngine {
                 .policy
                 .authorize_row(caller_sub, &ty, &rid, act)
                 .await
-                .unwrap_or(false)
+                .map_err(|e| FsError::Internal(e.to_string()))?
             {
                 return Ok(true);
             }
@@ -974,7 +972,7 @@ impl FsEngine {
             return Err(FsError::BadRequest("not all parts uploaded".into()));
         }
         if session.file_total_parts == 1 {
-            if session.etags[0].is_none() {
+            if session.etags.first().is_none_or(|etag| etag.is_none()) {
                 return Err(FsError::BadRequest(
                     "missing part for single-part upload".into(),
                 ));
@@ -1813,6 +1811,53 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn a_single_part_session_with_no_etags_is_rejected() -> anyhow::Result<()> {
+        use crate::db::{build_test_store, test_prefix};
+        use crate::fs::store::UploadSession;
+
+        let store = FsStore::primary(build_test_store(&test_prefix("fs-empty-etags")).await);
+        let policy =
+            PolicyEngine::init_s3(build_test_store(&test_prefix("fs-empty-etags-policy")).await)
+                .await?;
+        let engine = FsEngine::from_parts(
+            store.clone(),
+            ObjectStoreClient::in_memory(),
+            "test-bucket".to_string(),
+            policy.authorizer(),
+        );
+        let session = UploadSession {
+            id: "empty-etags".to_string(),
+            file_size: 1024,
+            part_size: 1024,
+            file_total_parts: 1,
+            s3_upload_id: None,
+            s3_key: "files/empty-etags".to_string(),
+            owner_sub: "alice".to_string(),
+            created_at: chrono::Utc::now().timestamp(),
+            etags: Vec::new(),
+            checksums: Vec::new(),
+        };
+        store.save_session(&session).await?;
+
+        let error = engine
+            .complete_upload(
+                &session.id,
+                CompleteRequest {
+                    name: "doc.txt".into(),
+                    mimetype: "text/plain".into(),
+                },
+                "alice",
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, FsError::BadRequest(_)),
+            "a corrupt session must return BadRequest, not panic: {error:?}"
+        );
+        Ok(())
+    }
+
     /// `FsEngine` holds the read-only handle, and not the engine that can
     /// write rules.
     ///
@@ -1853,6 +1898,29 @@ mod tests {
             vec!["impl RowAuthorizer for Authorizer {"],
             "RowAuthorizer must be implemented once, for the handle whose \
              capability matches the trait"
+        );
+    }
+
+    /// A policy store failure must reach the caller as `FsError::Internal`.
+    /// A plain denial is a different outcome and must not hide the failure.
+    #[test]
+    fn can_access_propagates_policy_errors() {
+        let src = std::fs::read_to_string("src/fs/mod.rs").expect("read src/fs/mod.rs");
+        let start = src
+            .find("    async fn can_access(")
+            .expect("FsEngine has can_access");
+        let rest = &src[start..];
+        let end = rest
+            .find("\n    ///")
+            .expect("can_access is followed by another method");
+        let body = &rest[..end];
+        assert!(
+            !body.contains("unwrap_or(false)"),
+            "can_access must not turn a policy error into a denial"
+        );
+        assert!(
+            body.contains(".map_err(|e| FsError::Internal(e.to_string()))?"),
+            "can_access must propagate the policy error with context"
         );
     }
 

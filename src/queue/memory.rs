@@ -13,7 +13,7 @@ use tracing::instrument;
 use super::{Job, JobId, JobStatus, LeaseToken, LeasedJob, QueueError, QueueMetrics, RetryPolicy};
 
 /// Internal record held by the in-memory backend.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct Record {
     job: Job,
     status: JobStatus,
@@ -27,11 +27,13 @@ struct Record {
 }
 
 /// In-memory job queue.
+#[derive(Debug)]
 pub struct MemoryQueue {
     state: Arc<Mutex<State>>,
     metrics: QueueMetrics,
 }
 
+#[derive(Debug)]
 struct State {
     records: BTreeMap<JobId, Record>,
     idempotency: BTreeMap<String, JobId>,
@@ -105,6 +107,18 @@ impl MemoryQueue {
             _ => Err(QueueError::LeaseExpired),
         }
     }
+
+    /// Records the number of jobs that wait to run.
+    async fn record_depth(&self) {
+        let state = self.state.lock().await;
+        let depth = state
+            .records
+            .values()
+            .filter(|record| matches!(record.status, JobStatus::Queued))
+            .count() as u64;
+        drop(state);
+        self.metrics.record_depth(depth);
+    }
 }
 
 impl Default for MemoryQueue {
@@ -145,8 +159,7 @@ impl super::JobQueue for MemoryQueue {
         state.records.insert(id, rec);
         drop(state);
         self.metrics.record_enqueued();
-        self.metrics
-            .record_depth(self.state.lock().await.records.len() as u64);
+        self.record_depth().await;
         Ok(id)
     }
 
@@ -199,6 +212,7 @@ impl super::JobQueue for MemoryQueue {
         }
         drop(state);
         self.metrics.record_reserved(out.len() as u64);
+        self.record_depth().await;
         Ok(out)
     }
 
@@ -227,6 +241,7 @@ impl super::JobQueue for MemoryQueue {
         rec.finished_at = Some(finished);
         drop(state);
         self.metrics.record_completed();
+        self.record_depth().await;
         Ok(())
     }
 
@@ -256,31 +271,31 @@ impl super::JobQueue for MemoryQueue {
                 };
                 rec.error = Some(error.to_string());
                 rec.finished_at = Some(finished);
-                drop(state);
-                self.metrics.record_failed();
             }
             RetryPolicy::Retry { delay } => {
-                let attempt = rec.job.attempt;
-                if attempt.saturating_add(1) >= rec.job.max_attempts {
+                let attempt = rec.job.attempt.saturating_add(1);
+                rec.job.attempt = attempt;
+                if attempt >= rec.job.max_attempts {
                     rec.status = JobStatus::Dead {
                         error: error.to_string(),
                         finished_at: finished,
                     };
                     rec.error = Some(error.to_string());
                     rec.finished_at = Some(finished);
-                    drop(state);
-                    self.metrics.record_dead_lettered();
-                    self.metrics.record_failed();
                 } else {
-                    rec.job.attempt = attempt.saturating_add(1);
-                    rec.job.scheduled_at = finished + delay.as_secs() as i64;
+                    rec.job.scheduled_at = finished.saturating_add(super::delay_secs(delay));
                     rec.status = JobStatus::Queued;
                     rec.error = Some(error.to_string());
-                    drop(state);
-                    self.metrics.record_failed();
                 }
             }
         }
+        let dead_lettered = matches!(rec.status, JobStatus::Dead { .. });
+        drop(state);
+        self.metrics.record_failed();
+        if dead_lettered {
+            self.metrics.record_dead_lettered();
+        }
+        self.record_depth().await;
         Ok(())
     }
 
@@ -298,6 +313,8 @@ impl super::JobQueue for MemoryQueue {
             .get_mut(&job_id)
             .ok_or(QueueError::NotFound(job_id))?;
         if let Err(error) = Self::check_lease(rec, lease) {
+            drop(state);
+            self.record_depth().await;
             self.metrics.record_lease_lost();
             return Err(error);
         }
@@ -307,21 +324,27 @@ impl super::JobQueue for MemoryQueue {
             worker: lease.worker.clone(),
             expires_at: new_expiry,
         };
-        Ok(LeaseToken {
+        let token = LeaseToken {
             worker: lease.worker.clone(),
             generation: rec.lease_generation,
-        })
+        };
+        drop(state);
+        self.record_depth().await;
+        Ok(token)
     }
 
     #[instrument(name = "queue.status", skip(self), fields(queue.backend = "memory", job.id = %job_id))]
     async fn status(&self, job_id: JobId) -> Result<JobStatus, QueueError> {
         let mut state = self.state.lock().await;
         Self::sweep_expired(&mut state);
-        let rec = state
+        let status = state
             .records
             .get(&job_id)
-            .ok_or(QueueError::NotFound(job_id))?;
-        Ok(rec.status.clone())
+            .map(|rec| rec.status.clone())
+            .ok_or(QueueError::NotFound(job_id));
+        drop(state);
+        self.record_depth().await;
+        status
     }
 }
 
@@ -726,5 +749,69 @@ mod tests {
         j2.idempotency_key = Some("key-1".to_string());
         let id2 = q.enqueue(j2).await.unwrap();
         assert_eq!(id1, id2);
+    }
+
+    #[tokio::test]
+    async fn a_dead_letter_records_the_final_attempt() {
+        let q = MemoryQueue::new();
+        let mut j = job("work");
+        j.max_attempts = 1;
+        let id = j.id;
+        q.enqueue(j).await.unwrap();
+        let leased = q.reserve("w1", 10, Duration::from_secs(30)).await.unwrap();
+        q.nack(
+            leased[0].job.id,
+            &leased[0].lease,
+            "boom",
+            RetryPolicy::Retry {
+                delay: Duration::ZERO,
+            },
+        )
+        .await
+        .unwrap();
+
+        let state = q.state.lock().await;
+        assert_eq!(state.records[&id].job.attempt, 1);
+    }
+
+    #[tokio::test]
+    async fn a_sub_second_retry_delay_rounds_up() {
+        let q = MemoryQueue::new();
+        let j = job("work");
+        let id = j.id;
+        q.enqueue(j).await.unwrap();
+        let leased = q.reserve("w1", 10, Duration::from_secs(30)).await.unwrap();
+        let before = MemoryQueue::now();
+        q.nack(
+            leased[0].job.id,
+            &leased[0].lease,
+            "boom",
+            RetryPolicy::Retry {
+                delay: Duration::from_millis(500),
+            },
+        )
+        .await
+        .unwrap();
+        let after = MemoryQueue::now();
+
+        let state = q.state.lock().await;
+        let scheduled_at = state.records[&id].job.scheduled_at;
+        assert!(scheduled_at > before, "the job must wait one second");
+        assert!(scheduled_at <= after + 1, "the job must not wait too long");
+    }
+
+    #[tokio::test]
+    async fn the_depth_gauge_tracks_only_queued_jobs() {
+        let q = MemoryQueue::new();
+        let j = job("work");
+        let id = j.id;
+        q.enqueue(j).await.unwrap();
+        assert_eq!(q.metrics.depth_value(), 1);
+
+        let leased = q.reserve("w1", 10, Duration::from_secs(30)).await.unwrap();
+        assert_eq!(q.metrics.depth_value(), 0);
+
+        q.ack(id, &leased[0].lease, None).await.unwrap();
+        assert_eq!(q.metrics.depth_value(), 0);
     }
 }

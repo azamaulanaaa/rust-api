@@ -15,15 +15,21 @@ use super::{Job, JobId, JobStatus, LeaseToken, LeasedJob, QueueError, RetryPolic
 /// The type reserves the seam for an AMQP backend. The application wires a
 /// connection factory. Until then, operations report that the backend is not
 /// available.
+#[derive(Debug)]
 pub struct RabbitMqQueue {
     /// Connection URL.
-    pub url: String,
+    url: String,
 }
 
 impl RabbitMqQueue {
     /// Builds a queue handle.
-    pub fn new(url: String) -> Self {
-        Self { url }
+    pub fn new(url: impl Into<String>) -> Self {
+        Self { url: url.into() }
+    }
+
+    /// Returns the connection URL.
+    pub fn url(&self) -> &str {
+        &self.url
     }
 }
 
@@ -84,5 +90,16 @@ impl super::JobQueue for RabbitMqQueue {
         Err(QueueError::Unsupported(
             "rabbitmq backend is not wired".to_string(),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_queue_handle_keeps_the_connection_url() {
+        let queue = RabbitMqQueue::new("amqp://localhost");
+        assert_eq!(queue.url(), "amqp://localhost");
     }
 }

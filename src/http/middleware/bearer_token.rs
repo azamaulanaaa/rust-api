@@ -49,7 +49,14 @@ where
 /// [`BearerTokenMiddleware`] puts this value into the request
 /// extensions.
 #[derive(Debug, Clone)]
-pub struct BearerToken(pub String);
+pub struct BearerToken(String);
+
+impl BearerToken {
+    /// Returns the raw token string.
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+}
 
 /// The middleware service for one worker, which
 /// [`BearerTokenMiddleware`] creates.
@@ -121,10 +128,18 @@ mod tests {
 
     #[test]
     fn parse_bearer_token_accepts_a_valid_value() {
-        assert_eq!(parse_bearer_token("Bearer abc123").unwrap().0, "abc123");
-        assert_eq!(parse_bearer_token("bearer XYZ").unwrap().0, "XYZ");
         assert_eq!(
-            parse_bearer_token("BEARER token-with-dash_123").unwrap().0,
+            parse_bearer_token("Bearer abc123").unwrap().into_inner(),
+            "abc123"
+        );
+        assert_eq!(
+            parse_bearer_token("bearer XYZ").unwrap().into_inner(),
+            "XYZ"
+        );
+        assert_eq!(
+            parse_bearer_token("BEARER token-with-dash_123")
+                .unwrap()
+                .into_inner(),
             "token-with-dash_123"
         );
     }
@@ -143,6 +158,9 @@ mod tests {
     fn parse_bearer_token_keeps_the_raw_token() {
         // The code keeps the token exactly as it received it and does not
         // trim it. The downstream validation decides.
-        assert_eq!(parse_bearer_token("Bearer  abc").unwrap().0, " abc");
+        assert_eq!(
+            parse_bearer_token("Bearer  abc").unwrap().into_inner(),
+            " abc"
+        );
     }
 }

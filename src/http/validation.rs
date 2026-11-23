@@ -32,7 +32,7 @@ pub trait Validate {
 /// The message is for server-side logs. [`ValidatedJson`] never puts it on
 /// the wire; the client receives the fixed `bad request` envelope.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ValidationError(pub String);
+pub struct ValidationError(String);
 
 impl ValidationError {
     /// Builds a [`ValidationError`] from any message-like value.
@@ -73,7 +73,7 @@ impl From<&str> for ValidationError {
 /// with [`ApiError::BadRequest`] (HTTP 400), rendered as the uniform
 /// envelope.
 #[derive(Debug)]
-pub struct ValidatedJson<T>(pub T);
+pub struct ValidatedJson<T>(T);
 
 impl<T> ValidatedJson<T> {
     /// Consumes the extractor and returns the inner value.

@@ -578,20 +578,29 @@ fn print_validation_report(report: &ValidationReport) {
     }
 }
 
+/// Inputs that decide whether this instance can serve writes.
+struct ReadinessInputs {
+    /// The policy lock is free.
+    policy_unlocked: bool,
+    /// The single-writer lease was lost.
+    lease_lost: bool,
+    /// A primary prefix was fenced.
+    primary_loss: bool,
+    /// The last dependency probe succeeded.
+    dependencies_healthy: bool,
+    /// An EAV background loop is failed.
+    eav_failed: bool,
+}
+
 /// Returns `true` when this instance can serve writes.
 ///
-/// The policy lock, the lease, the fencing state, and the dependency health
-/// keep their existing behaviour.
-/// `eav_failed` is `true` while any EAV background loop is failed.
-/// Readiness stays false until a later pass succeeds.
-fn readiness_state(
-    policy_unlocked: bool,
-    lease_lost: bool,
-    primary_loss: bool,
-    dependencies_healthy: bool,
-    eav_failed: bool,
-) -> bool {
-    policy_unlocked && !lease_lost && !primary_loss && dependencies_healthy && !eav_failed
+/// Readiness stays false until a later pass succeeds after an EAV failure.
+fn readiness_state(input: ReadinessInputs) -> bool {
+    input.policy_unlocked
+        && !input.lease_lost
+        && !input.primary_loss
+        && input.dependencies_healthy
+        && !input.eav_failed
 }
 
 /// Runs the HTTP listener until stopped.
@@ -618,7 +627,11 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
     let setup_token = config.authorization.setup_token.clone();
 
     let telemetry = telemetry::init(
-        verbose,
+        if verbose {
+            telemetry::LogVerbosity::Verbose
+        } else {
+            telemetry::LogVerbosity::Normal
+        },
         &config.observability.service_name,
         config.observability.otlp_endpoint.as_deref(),
         config.observability.sample_ratio,
@@ -735,9 +748,17 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
         &db_prefix,
         wal.clone(),
         vec![Arc::new(NoopAction), Arc::new(LogAction), Arc::new(webhook)],
-        config.eav.check_entity_refs,
+        if config.eav.check_entity_refs {
+            rust_api::eav::runtime::RefCheck::On
+        } else {
+            rust_api::eav::runtime::RefCheck::Off
+        },
         eav_max_causation_depth,
-        config.eav.script_enabled,
+        if config.eav.script_enabled {
+            rust_api::eav::runtime::Scripts::Enabled
+        } else {
+            rust_api::eav::runtime::Scripts::Disabled
+        },
     )
     .await
     .context("build the EAV runtime")?;
@@ -865,13 +886,13 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
             //   background probe.
             // - An EAV background loop is failed. Entity events may not flow.
             //   Readiness stays false until a pass succeeds.
-            readiness_state(
-                policy_engine.is_unlocked(),
-                lease_lost.load(std::sync::atomic::Ordering::Relaxed),
-                rust_api::fencing::primary_loss(),
-                dependency_health.is_healthy(),
-                eav_failures.failed(),
-            )
+            readiness_state(ReadinessInputs {
+                policy_unlocked: policy_engine.is_unlocked(),
+                lease_lost: lease_lost.load(std::sync::atomic::Ordering::Relaxed),
+                primary_loss: rust_api::fencing::primary_loss(),
+                dependencies_healthy: dependency_health.is_healthy(),
+                eav_failed: eav_failures.failed(),
+            })
         }
     });
     // The function builds the server first, so that it can start the
@@ -912,8 +933,10 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
     // Stop reactive services before releasing the lease. They observe the
     // token and exit their loops instead of being dropped.
     for handle in reactive_handles {
-        if let Ok(Err(error)) = handle.await {
-            tracing::error!(?error, "reactive service failed");
+        match handle.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => tracing::error!(?error, "reactive service failed"),
+            Err(error) => tracing::error!(?error, "reactive service task failed"),
         }
     }
 
@@ -1118,15 +1141,24 @@ force_path_style = true
         let latch = Arc::new(AtomicBool::new(false));
         let read = |latch: &Arc<AtomicBool>| latch.load(Ordering::Relaxed);
 
-        assert!(readiness_state(true, false, false, true, read(&latch)));
+        let inputs =
+            |policy_unlocked, lease_lost, primary_loss, dependencies_healthy| ReadinessInputs {
+                policy_unlocked,
+                lease_lost,
+                primary_loss,
+                dependencies_healthy,
+                eav_failed: read(&latch),
+            };
+        assert!(readiness_state(inputs(true, false, false, true)));
         latch.store(true, Ordering::Relaxed);
-        assert!(!readiness_state(true, false, false, true, read(&latch)));
+        assert!(!readiness_state(inputs(true, false, false, true)));
 
         // A healthy EAV runtime does not change the other reasons.
-        assert!(!readiness_state(false, false, false, true, false));
-        assert!(!readiness_state(true, true, false, true, false));
-        assert!(!readiness_state(true, false, true, true, false));
-        assert!(!readiness_state(true, false, false, false, false));
+        latch.store(false, Ordering::Relaxed);
+        assert!(!readiness_state(inputs(false, false, false, true)));
+        assert!(!readiness_state(inputs(true, true, false, true)));
+        assert!(!readiness_state(inputs(true, false, true, true)));
+        assert!(!readiness_state(inputs(true, false, false, false)));
     }
 
     /// The `[s3]` section of the config file becomes the type that the engine

@@ -160,8 +160,8 @@ mod tests {
         /// This function is small by design. It recognises the
         /// `[[advisories.ignore]]` header and the two keys. It also handles
         /// the TOML `"""` multi-line form, because a real rationale does not
-        /// fit on one line. A full TOML parser would add a dependency to a
-        /// test that needs only these three shapes.
+        /// fit on one line. The test checks that the parser reads every
+        /// header, so a missing reason cannot disappear.
         fn parse(text: &str) -> Vec<(String, String)> {
             let mut entries: Vec<(String, String)> = Vec::new();
             let mut id: Option<String> = None;
@@ -169,8 +169,8 @@ mod tests {
             let mut in_block = false;
 
             let flush = |id: &mut Option<String>, reason: &mut Option<String>, out: &mut Vec<_>| {
-                if let (Some(i), Some(r)) = (id.take(), reason.take()) {
-                    out.push((i, r));
+                if let Some(i) = id.take() {
+                    out.push((i, reason.take().unwrap_or_default()));
                 }
             };
 
@@ -181,11 +181,9 @@ mod tests {
                     if line == "\"\"\"" {
                         in_block = false;
                     } else {
-                        reason.get_or_insert_with(String::new).push(' ');
-                        reason
-                            .as_mut()
-                            .expect("just inserted")
-                            .push_str(&line.replace('\\', " "));
+                        let slot = reason.get_or_insert_with(String::new);
+                        slot.push(' ');
+                        slot.push_str(&line.replace('\\', " "));
                     }
                     continue;
                 }
@@ -219,12 +217,22 @@ mod tests {
             !entries.is_empty(),
             "no [[advisories.ignore]] entries found; the parser is broken, not the config"
         );
+        let expected = deny
+            .lines()
+            .filter(|line| line.trim() == "[[advisories.ignore]]")
+            .count();
+        assert_eq!(
+            entries.len(),
+            expected,
+            "the parser dropped an advisory ignore entry"
+        );
 
         for (id, reason) in &entries {
             assert!(
                 id.starts_with("RUSTSEC-") || id.starts_with("CVE-"),
                 "advisory id looks wrong: {id:?}"
             );
+            assert!(!reason.trim().is_empty(), "{id} has no reason");
 
             // A link is not a justification. Measure the prose with URLs
             // removed, so "see <link>" cannot satisfy the length check.

@@ -36,6 +36,38 @@ pub struct ReactiveContext {
     pub cancel: CancellationToken,
 }
 
+/// A failure reported by a background service.
+#[derive(Debug, thiserror::Error)]
+#[error("service {name} failed")]
+pub struct ReactiveError {
+    /// Stable name of the service that failed.
+    pub name: &'static str,
+    /// Underlying cause of the failure.
+    #[source]
+    pub source: Box<dyn std::error::Error + Send + Sync>,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct ReactiveMessage(String);
+
+impl ReactiveError {
+    /// Wraps a typed failure for the service with the given name.
+    #[must_use]
+    pub fn new(name: &'static str, source: impl std::error::Error + Send + Sync + 'static) -> Self {
+        Self {
+            name,
+            source: Box::new(source),
+        }
+    }
+
+    /// Builds a failure from a message. Use it when no typed cause exists.
+    #[must_use]
+    pub fn message(name: &'static str, message: impl Into<String>) -> Self {
+        Self::new(name, ReactiveMessage(message.into()))
+    }
+}
+
 /// A background service that reacts to store changes.
 #[async_trait]
 pub trait ReactiveService: Send + Sync {
@@ -49,14 +81,14 @@ pub trait ReactiveService: Send + Sync {
     fn register(&self, ctx: &ReactiveContext);
 
     /// Run until `ctx.cancel` fires. An error stops only this service.
-    async fn run(&self, ctx: ReactiveContext) -> anyhow::Result<()>;
+    async fn run(&self, ctx: ReactiveContext) -> Result<(), ReactiveError>;
 }
 
 /// Register and spawn every service. Returns handles to await on shutdown.
 pub fn spawn_services(
     services: &[Arc<dyn ReactiveService>],
     ctx: ReactiveContext,
-) -> Vec<tokio::task::JoinHandle<anyhow::Result<()>>> {
+) -> Vec<tokio::task::JoinHandle<Result<(), ReactiveError>>> {
     for service in services {
         service.register(&ctx);
     }
@@ -65,7 +97,13 @@ pub fn spawn_services(
         .map(|service| {
             let service = Arc::clone(service);
             let ctx = ctx.clone();
-            tokio::spawn(async move { service.run(ctx).await })
+            let name = service.name();
+            tokio::spawn(async move {
+                service.run(ctx).await.map_err(|error| ReactiveError {
+                    name,
+                    source: error.source,
+                })
+            })
         })
         .collect()
 }
@@ -86,9 +124,24 @@ mod tests {
 
         fn register(&self, _ctx: &ReactiveContext) {}
 
-        async fn run(&self, ctx: ReactiveContext) -> anyhow::Result<()> {
+        async fn run(&self, ctx: ReactiveContext) -> Result<(), ReactiveError> {
             ctx.cancel.cancelled().await;
             Ok(())
+        }
+    }
+
+    struct FailingService;
+
+    #[async_trait::async_trait]
+    impl ReactiveService for FailingService {
+        fn name(&self) -> &'static str {
+            "failing"
+        }
+
+        fn register(&self, _ctx: &ReactiveContext) {}
+
+        async fn run(&self, _ctx: ReactiveContext) -> Result<(), ReactiveError> {
+            Err(ReactiveError::message("other", "service failed"))
         }
     }
 
@@ -120,14 +173,21 @@ mod tests {
             cancel: cancel.clone(),
         };
 
-        let services: Vec<Arc<dyn ReactiveService>> = vec![Arc::new(DummyService)];
+        let services: Vec<Arc<dyn ReactiveService>> =
+            vec![Arc::new(DummyService), Arc::new(FailingService)];
         let handles = spawn_services(&services, ctx);
 
         cancel.cancel();
+        let mut results = Vec::new();
         for handle in handles {
-            let result = handle.await?;
-            result?;
+            results.push(handle.await?);
         }
+        assert!(results[0].is_ok(), "the dummy service must run cleanly");
+        let error = results[1]
+            .as_ref()
+            .expect_err("the failing service reports");
+        assert_eq!(error.name, "failing", "the service name reaches the error");
+        assert!(error.to_string().contains("failing"), "{error}");
         Ok(())
     }
 }

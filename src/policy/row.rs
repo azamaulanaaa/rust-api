@@ -34,8 +34,15 @@ pub trait RowAuthorizer: Send + Sync {
 }
 
 /// Canonical object for a row.
+///
+/// The function escapes `:` and `\` in both parts. Two different row pairs
+/// therefore never give the same object string.
 pub fn row_object(row_type: &str, row_id: &str) -> String {
-    format!("{row_type}:{row_id}")
+    fn escape(value: &str) -> String {
+        value.replace('\\', "\\\\").replace(':', "\\:")
+    }
+
+    format!("{}:{}", escape(row_type), escape(row_id))
 }
 
 /// Row-level checks for business entities.
@@ -79,6 +86,14 @@ mod tests {
     #[tokio::test]
     async fn row_object_joins_type_and_id() {
         assert_eq!(row_object("invoice", "123"), "invoice:123");
+    }
+
+    #[test]
+    fn row_object_escapes_colons_in_type_and_id() {
+        assert_eq!(row_object("invoice", "12:3"), "invoice:12\\:3");
+        assert_eq!(row_object("invoice:12", "3"), "invoice\\:12:3");
+        assert_ne!(row_object("invoice", "12:3"), row_object("invoice:12", "3"));
+        assert_eq!(row_object("a\\b", "c"), "a\\\\b:c");
     }
 
     #[tokio::test]

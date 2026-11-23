@@ -238,6 +238,22 @@ pub struct DuplicateRoutePrefix {
     pub prefix: String,
 }
 
+/// A failure that stops the HTTP server from serving.
+#[derive(Debug, thiserror::Error)]
+pub enum ApiServiceError {
+    /// Two modules claim the same route prefix.
+    #[error(transparent)]
+    Prefix(#[from] DuplicateRoutePrefix),
+
+    /// The server could not bind the socket address.
+    #[error("bind failed: {0}")]
+    Bind(#[source] std::io::Error),
+
+    /// The running server returned an error.
+    #[error("server failed: {0}")]
+    Run(#[source] std::io::Error),
+}
+
 /// Rejects a module set in which two modules claim the same
 /// [`ApiModule::prefix`].
 ///
@@ -488,7 +504,7 @@ impl ApiService {
     /// application until a shutdown signal arrives (Ctrl-C or SIGTERM). The
     /// method then drains the connections within the shutdown timeout. It
     /// returns after that.
-    pub async fn start(self, addr: SocketAddr) -> anyhow::Result<()> {
+    pub async fn start(self, addr: SocketAddr) -> Result<(), ApiServiceError> {
         // The check runs before the listener exists, so a bad composition is
         // a startup error that names the prefix. Otherwise the server runs
         // with a module whose routes return 404.
@@ -506,7 +522,8 @@ impl ApiService {
         .shutdown_timeout(SHUTDOWN_TIMEOUT_SECS)
         .client_request_timeout(CLIENT_TIMEOUT)
         .client_disconnect_timeout(CLIENT_TIMEOUT)
-        .bind(addr)?
+        .bind(addr)
+        .map_err(ApiServiceError::Bind)?
         .run();
         let handle = server.handle();
         tokio::spawn(async move {
@@ -514,7 +531,7 @@ impl ApiService {
             tracing::info!("shutdown signal received; draining connections");
             handle.stop(true).await;
         });
-        server.await?;
+        server.await.map_err(ApiServiceError::Run)?;
 
         Ok(())
     }
@@ -866,6 +883,10 @@ mod tests {
             .start("127.0.0.1:0".parse().expect("literal addr"))
             .await
             .expect_err("start should refuse a duplicate prefix");
+        assert!(
+            matches!(&err, ApiServiceError::Prefix(_)),
+            "a duplicate prefix must produce the typed prefix error"
+        );
         assert!(err.to_string().contains("/ping"), "unexpected error: {err}");
     }
 

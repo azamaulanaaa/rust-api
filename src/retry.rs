@@ -11,8 +11,27 @@ use std::time::Duration;
 /// between attempts.
 ///
 /// The first attempt runs immediately. A failed attempt waits
-/// `base_delay * 2^attempt` before the next attempt. The last error is
-/// returned when every attempt fails. `attempts == 0` is not supported.
+/// `base_delay * 2^attempt` before the next attempt. The factor stops at
+/// `2^31`. The last error is returned when every attempt fails.
+///
+/// # Examples
+///
+/// ```
+/// # use std::time::Duration;
+/// # use rust_api::retry::retry_with_backoff;
+/// # async fn example() -> Result<i32, &'static str> {
+/// let value = retry_with_backoff(3, Duration::from_millis(10), || async {
+///     Ok::<i32, &'static str>(42)
+/// })
+/// .await?;
+/// assert_eq!(value, 42);
+/// # Ok(0)
+/// # }
+/// ```
+///
+/// # Panics
+///
+/// Panics if `attempts` is zero.
 pub async fn retry_with_backoff<F, Fut, T, E>(
     attempts: usize,
     base_delay: Duration,
@@ -22,6 +41,7 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T, E>>,
 {
+    assert!(attempts > 0, "attempts must be positive: got {attempts}");
     let mut last_error: Option<E> = None;
 
     for attempt in 0..attempts {
@@ -39,7 +59,7 @@ where
 
     match last_error {
         Some(error) => Err(error),
-        None => panic!("retry_with_backoff requires at least one attempt"),
+        None => unreachable!("assert!(attempts > 0) already checked this"),
     }
 }
 
@@ -84,7 +104,13 @@ mod tests {
             })
             .await;
 
-        assert!(result.is_err());
+        assert_eq!(result, Err("boom"));
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "attempts must be positive: got 0")]
+    async fn zero_attempts_panics_at_the_entry_point() {
+        let _ = retry_with_backoff(0, Duration::ZERO, || async { Ok::<_, ()>(()) }).await;
     }
 }

@@ -721,9 +721,10 @@ impl From<RuleError> for EavApiError {
             | RuleError::UnknownAction(_) => Kind::Invalid,
             RuleError::VersionConflict => Kind::Conflict,
             RuleError::Store(_)
-            | RuleError::Serialization(_)
+            | RuleError::Serialization { .. }
+            | RuleError::Cause { .. }
             | RuleError::Action(_)
-            | RuleError::Wal(_)
+            | RuleError::Wal { .. }
             | RuleError::DuplicateAction(_)
             | RuleError::Script(_) => Kind::Internal,
         };
@@ -1081,16 +1082,17 @@ async fn list_entities(
     let (limit, mode) = query.into_inner().resolve()?;
     match mode {
         PageMode::Cursor(after) => {
-            let (raw, next) = runtime
-                .entities()
-                .list_after(limit, after.as_deref())
-                .await?;
-            let mut items = Vec::with_capacity(raw.len());
-            for entity in raw {
-                if can_read_entity(&policy, &claims.sub, &entity.id).await? {
-                    items.push(entity);
+            let (items, next) = visible_cursor_page(&policy, &claims.sub, limit, after, |cursor| {
+                let runtime = runtime.clone();
+                async move {
+                    runtime
+                        .entities()
+                        .list_after(limit, cursor.as_deref())
+                        .await
+                        .map_err(EavApiError::from)
                 }
-            }
+            })
+            .await?;
             Ok(HttpResponse::Ok().json(EntityPage {
                 items,
                 next_offset: None,
@@ -1345,16 +1347,18 @@ async fn list_schema_entities(
     let (limit, mode) = query.into_inner().resolve()?;
     match mode {
         PageMode::Cursor(after) => {
-            let (raw, next) = runtime
-                .entities()
-                .list_by_schema_after(&id, limit, after.as_deref())
-                .await?;
-            let mut items = Vec::with_capacity(raw.len());
-            for entity in raw {
-                if can_read_entity(&policy, &claims.sub, &entity.id).await? {
-                    items.push(entity);
+            let (items, next) = visible_cursor_page(&policy, &claims.sub, limit, after, |cursor| {
+                let runtime = runtime.clone();
+                let id = id.clone();
+                async move {
+                    runtime
+                        .entities()
+                        .list_by_schema_after(&id, limit, cursor.as_deref())
+                        .await
+                        .map_err(EavApiError::from)
                 }
-            }
+            })
+            .await?;
             Ok(HttpResponse::Ok().json(EntityPage {
                 items,
                 next_offset: None,
@@ -1622,7 +1626,7 @@ mod tests {
     use crate::http::middleware::jwks::test_support::{rsa_key, sign_rs256, spawn_jwks};
     use crate::policy::PolicyEngine;
     use crate::records::WalOp;
-    use crate::rules::action::{ActionContext, RuleAction};
+    use crate::rules::action::{ActionContext, ActionError, RuleAction};
     use crate::rules::webhook::WebhookAction;
     use crate::sync::wal::Wal;
 
@@ -1683,7 +1687,7 @@ mod tests {
             "record"
         }
 
-        async fn execute(&self, _ctx: ActionContext) -> Result<(), anyhow::Error> {
+        async fn execute(&self, _ctx: ActionContext) -> Result<(), ActionError> {
             Ok(())
         }
     }
@@ -1714,7 +1718,7 @@ mod tests {
         }
 
         async fn module(&self) -> anyhow::Result<EavApiModule> {
-            let middleware = JwtClaimsMiddleware::<Claims>::new_with_jks(
+            let middleware = JwtClaimsMiddleware::<Claims>::new_with_jwks(
                 &format!("{}/jwks", self.server.uri()),
                 AUD,
                 &self.issuer(),
@@ -1753,9 +1757,9 @@ mod tests {
                         .allow_private_hosts(true),
                 ),
             ],
-            true,
+            crate::eav::runtime::RefCheck::On,
             8,
-            true,
+            crate::eav::runtime::Scripts::Enabled,
         )
         .await?;
         let engine =
@@ -2036,7 +2040,7 @@ mod tests {
                 "internal_error",
             ),
             (
-                EavApiError::from(RuleError::Wal("x".into())),
+                EavApiError::from(RuleError::wal("x")),
                 500,
                 "internal_error",
             ),

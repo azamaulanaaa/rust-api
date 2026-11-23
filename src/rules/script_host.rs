@@ -94,8 +94,10 @@ impl ScriptCapabilities {
 ///
 /// Each message is stable.
 /// No message contains an attribute value or the queried value.
-#[derive(Debug, Error, PartialEq, Eq)]
+#[derive(Debug, Error)]
 pub enum ScriptHostError {
+    // Equality compares the sanitized message only. The typed source is for
+    // server logs and must not affect a caller's comparison.
     /// The capability set does not allow the schema.
     #[error("schema access denied")]
     Denied,
@@ -106,8 +108,29 @@ pub enum ScriptHostError {
     ///
     /// The message is generic, so store internals do not leak.
     #[error("script host store operation failed")]
-    Store(String),
+    Store {
+        /// Sanitized detail for server logs.
+        message: String,
+        /// Cause from the entity store.
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
+
+impl PartialEq for ScriptHostError {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Denied, Self::Denied) => true,
+            (Self::Invalid(left), Self::Invalid(right)) => left == right,
+            (Self::Store { message: left, .. }, Self::Store { message: right, .. }) => {
+                left == right
+            }
+            _ => false,
+        }
+    }
+}
+
+impl Eq for ScriptHostError {}
 
 /// A read-only host over one [`EntityStore`].
 ///
@@ -119,6 +142,14 @@ pub struct ScriptReadHost {
     entities: EntityStore,
     /// The schema ids that the host can read.
     capabilities: ScriptCapabilities,
+}
+
+impl std::fmt::Debug for ScriptReadHost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScriptReadHost")
+            .field("capabilities", &self.capabilities)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ScriptReadHost {
@@ -372,7 +403,10 @@ fn pins_schema(entity: &Entity, schema: &str) -> bool {
 fn map_entity_error(error: EntityError) -> ScriptHostError {
     match error {
         EntityError::NotIndexed(_) => ScriptHostError::Invalid(NOT_INDEXED_MESSAGE.to_string()),
-        _ => ScriptHostError::Store(STORE_MESSAGE.to_string()),
+        other => ScriptHostError::Store {
+            message: STORE_MESSAGE.to_string(),
+            source: Box::new(other),
+        },
     }
 }
 

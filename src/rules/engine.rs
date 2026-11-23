@@ -85,7 +85,7 @@ use crate::records::{EntityEvent, WalOp};
 use crate::rules::action::{ActionContext, RuleAction};
 use crate::rules::effect::EffectPlan;
 use crate::rules::error::RuleError;
-use crate::rules::rule::{Condition, Rule, validate_identifier};
+use crate::rules::rule::{Condition, MAX_DEPTH, Rule, validate_identifier};
 use crate::rules::script::{
     MAX_SOURCE_BYTES, SCRIPT_ACTION_KIND, ScriptActionContext, ScriptContext, ScriptEngine,
     ScriptError, ScriptHost, visible_attribute_keys,
@@ -184,6 +184,7 @@ pub trait RuleProgress: Send + Sync {
 /// A [`RuleProgress`] that records nothing.
 ///
 /// [`RuleEngine::run`] uses this value.
+#[derive(Debug, Clone, Copy, Default)]
 pub struct NoProgress;
 
 impl RuleProgress for NoProgress {
@@ -255,6 +256,21 @@ pub struct RuleEngine {
     ///
     /// One lock stops two calls from running one rule and one event twice.
     process_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+}
+
+impl std::fmt::Debug for RuleEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RuleEngine")
+            .field("rules", &self.rules)
+            .field(
+                "action_kinds",
+                &self.actions.keys().collect::<BTreeSet<_>>(),
+            )
+            .field("max_causation_depth", &self.max_causation_depth)
+            .field("has_observer", &self.observer.is_some())
+            .field("script_enabled", &self.script.is_enabled())
+            .finish_non_exhaustive()
+    }
 }
 
 impl RuleEngine {
@@ -343,6 +359,9 @@ impl RuleEngine {
     /// A compile failure returns an invalid error with a stable message.
     /// The error never repeats the script source.
     pub fn validate_condition(&self, condition: &Condition) -> Result<(), RuleError> {
+        if !condition.within_depth(MAX_DEPTH) {
+            return Err(RuleError::ConditionDepth);
+        }
         match condition {
             Condition::Script { source } => self
                 .script
@@ -479,7 +498,7 @@ impl RuleEngine {
     ) -> Result<Vec<RuleExecution>, RuleError> {
         let entries = wal.range(dead.seq, dead.seq).await.map_err(map_wal_error)?;
         let Some(entry) = entries.into_iter().next() else {
-            return Err(RuleError::Wal(format!(
+            return Err(RuleError::wal(format!(
                 "dead-letter sequence {} is missing from the feed",
                 dead.seq
             )));
@@ -661,6 +680,9 @@ impl RuleEngine {
         visible: Option<&'a BTreeSet<String>>,
     ) -> BoxFuture<'a, Result<bool, RuleError>> {
         Box::pin(async move {
+            if !condition.within_depth(MAX_DEPTH) {
+                return Err(RuleError::ConditionDepth);
+            }
             match condition {
                 Condition::Script { source } => {
                     let script = self.script.clone();
@@ -720,14 +742,14 @@ impl RuleEngine {
         entity: Option<&Entity>,
     ) -> Result<(), RuleError> {
         let source = script_source(&rule.action.params)?.to_string();
-        let host = ScriptHost::new(
-            self.entities.clone(),
-            rule.capabilities.to_script_capabilities()?,
-            rule.capabilities.write.clone(),
-            rule.id.clone(),
-            event.event_id.clone(),
-            tokio::runtime::Handle::current(),
-        );
+        let host = ScriptHost::new(crate::rules::script::ScriptHostConfig {
+            entities: self.entities.clone(),
+            read: rule.capabilities.to_script_capabilities()?,
+            write: rule.capabilities.write.clone(),
+            rule_id: rule.id.clone(),
+            event_id: event.event_id.clone(),
+            runtime: tokio::runtime::Handle::current(),
+        });
         let ctx = ScriptActionContext {
             event: event.clone(),
             entity: entity.cloned(),
@@ -857,7 +879,7 @@ impl RuleEngine {
             let head = wal.head().await.map_err(map_wal_error)?;
             self.observe_feed_lag(head.saturating_sub(cursor));
             if cursor > head {
-                return Err(RuleError::Wal(format!(
+                return Err(RuleError::wal(format!(
                     "rule cursor {cursor} is ahead of feed head {head}"
                 )));
             }
@@ -993,6 +1015,9 @@ impl RuleEngine {
 ///
 /// The engine reads no schema for a tree with no script node.
 fn has_script_condition(condition: &Condition) -> bool {
+    if !condition.within_depth(MAX_DEPTH) {
+        return false;
+    }
     match condition {
         Condition::Script { .. } => true,
         Condition::All(children) | Condition::Any(children) => {
@@ -1032,13 +1057,13 @@ fn script_source(params: &serde_json::Value) -> Result<&str, RuleError> {
 fn map_entity_error(error: EntityError) -> RuleError {
     match error {
         EntityError::Store(error) => RuleError::Store(error),
-        other => RuleError::Invalid(other.to_string()),
+        other => RuleError::cause(other.to_string(), other),
     }
 }
 
 /// Maps a change-feed error into a rule error.
 fn map_wal_error(error: crate::fs::error::FsError) -> RuleError {
-    RuleError::Wal(error.to_string())
+    RuleError::wal_source(error)
 }
 
 #[cfg(test)]
@@ -1053,6 +1078,7 @@ mod tests {
     use crate::eav::entity::{AttributeValue, Entity, EntityDraft, WriteContext};
     use crate::eav::schema::{AttributeDef, AttributeType, SchemaDraft, SchemaRegistry};
     use crate::records::{AttributeChange, ChangeSink, EntityEventKind};
+    use crate::rules::action::ActionError;
     use crate::rules::rule::{ActionRef, CompareOp, Condition, RuleDraft, RuleTrigger};
     use crate::rules::script::{MAX_SOURCE_BYTES, ScriptError};
     use oxkv::{GetSet as _, Hooks as _, KeyPrefix, OxKvStore, ScanExt as _};
@@ -1106,7 +1132,7 @@ mod tests {
             &self.kind
         }
 
-        async fn execute(&self, ctx: ActionContext) -> Result<(), anyhow::Error> {
+        async fn execute(&self, ctx: ActionContext) -> Result<(), ActionError> {
             let call = {
                 let mut records = self.records.lock().unwrap();
                 records.push(ctx);
@@ -1117,7 +1143,7 @@ mod tests {
             }
             let fail_at = self.fail_at_call.load(Ordering::SeqCst);
             if self.failing.load(Ordering::SeqCst) || (fail_at != 0 && call == fail_at) {
-                return Err(anyhow::anyhow!("recording action failed"));
+                return Err(ActionError::failed("record"));
             }
             Ok(())
         }
@@ -1159,7 +1185,7 @@ mod tests {
             &self.kind
         }
 
-        async fn execute(&self, ctx: ActionContext) -> Result<(), anyhow::Error> {
+        async fn execute(&self, ctx: ActionContext) -> Result<(), ActionError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             if ctx.event.event_id == self.waited_event_id {
                 self.waiting.notify_one();
@@ -1261,11 +1287,11 @@ mod tests {
             "reject"
         }
 
-        fn validate(&self, _params: &serde_json::Value) -> Result<(), anyhow::Error> {
-            Err(anyhow::anyhow!("the test action rejects the parameters"))
+        fn validate(&self, _params: &serde_json::Value) -> Result<(), ActionError> {
+            Err(ActionError::invalid())
         }
 
-        async fn execute(&self, _ctx: ActionContext) -> Result<(), anyhow::Error> {
+        async fn execute(&self, _ctx: ActionContext) -> Result<(), ActionError> {
             Ok(())
         }
     }
@@ -2759,7 +2785,7 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(RuleError::Wal(message)) if message.contains("ahead")
+            Err(RuleError::Wal { message, .. }) if message.contains("ahead")
         ));
         assert_eq!(stores.rules.cursor().await.unwrap(), 5);
     }
@@ -3336,7 +3362,7 @@ mod tests {
 
         let result = engine.process(&event(EntityEventKind::Created)).await;
 
-        assert!(matches!(result, Err(RuleError::Invalid(_))));
+        assert!(matches!(result, Err(RuleError::Cause { .. })));
         let e1 = stores.entities.get("e1").await.unwrap().unwrap();
         assert_eq!(e1.version, 1);
         assert_eq!(

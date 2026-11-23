@@ -84,6 +84,7 @@ impl Latch {
     }
 
     /// True after the server fences a primary write.
+    #[must_use]
     pub fn is_tripped(&self) -> bool {
         self.tripped.load(Ordering::SeqCst)
     }
@@ -113,6 +114,7 @@ pub fn note_primary_loss(source: &str, reason: &str) {
 
 /// True after the server fences a primary write. So this instance must stop
 /// advertising that it is ready.
+#[must_use]
 pub fn primary_loss() -> bool {
     PRIMARY_LOSS.is_tripped()
 }

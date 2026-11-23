@@ -53,7 +53,7 @@ use url::Url;
 use crate::eav::metrics::EavMetrics;
 use crate::queue::{Job, JobError, JobHandler, JobQueue};
 use crate::records::{AttributeChange, EntityEventKind};
-use crate::rules::action::{ActionContext, RuleAction};
+use crate::rules::action::{ActionContext, ActionError, RuleAction};
 
 /// The job kind for one webhook delivery.
 const JOB_KIND: &str = "webhook.deliver";
@@ -131,7 +131,16 @@ impl WebhookAction {
     pub fn new(allowed_hosts: Vec<String>) -> Self {
         let allowed_hosts = allowed_hosts
             .iter()
-            .filter_map(|entry| parse_allowed_host(entry))
+            .filter_map(|entry| {
+                let parsed = parse_allowed_host(entry);
+                if parsed.is_none() {
+                    tracing::warn!(
+                        entry = %entry,
+                        "webhook allowlist entry is not valid"
+                    );
+                }
+                parsed
+            })
             .collect();
         Self {
             allowed_hosts,
@@ -190,16 +199,18 @@ impl RuleAction for WebhookAction {
     /// It rejects user information, a missing host, a fragment, a long URL,
     /// a non-public literal address, and a host that is not in the allowlist.
     /// It does not resolve the host.
-    fn validate(&self, params: &serde_json::Value) -> Result<(), anyhow::Error> {
-        let url = url_from_params(params)?;
+    fn validate(&self, params: &serde_json::Value) -> Result<(), ActionError> {
+        let url = url_from_params(params).map_err(|_| ActionError::invalid())?;
         validate_url(&url, &self.allowed_hosts, self.allow_private_hosts)
+            .map_err(|_| ActionError::invalid())
     }
 
-    async fn execute(&self, ctx: ActionContext) -> Result<(), anyhow::Error> {
-        let url = url_from_params(&ctx.params)?;
+    async fn execute(&self, ctx: ActionContext) -> Result<(), ActionError> {
+        let failed = || ActionError::failed("webhook");
+        let url = url_from_params(&ctx.params).map_err(|_| failed())?;
         // The delivery path applies the address policy.
         // This early check keeps the scheme and the allowlist rules.
-        validate_url(&url, &self.allowed_hosts, true)?;
+        validate_url(&url, &self.allowed_hosts, true).map_err(|_| failed())?;
         let payload = WebhookPayload {
             rule_id: &ctx.rule.id,
             event_id: &ctx.event.event_id,
@@ -214,8 +225,7 @@ impl RuleAction for WebhookAction {
             params: &ctx.params,
         };
         let Some(queue) = &self.queue else {
-            let body = serde_json::to_vec(&payload)
-                .map_err(|_| anyhow::anyhow!("webhook payload is not valid"))?;
+            let body = serde_json::to_vec(&payload).map_err(|_| failed())?;
             let started = Instant::now();
             let result = send_webhook(
                 url,
@@ -227,15 +237,13 @@ impl RuleAction for WebhookAction {
             )
             .await;
             record_delivery(result.is_ok(), started.elapsed());
-            return result;
+            return result.map_err(|_| failed());
         };
         let envelope = WebhookJobPayload {
             url: url.to_string(),
-            body: serde_json::to_value(&payload)
-                .map_err(|_| anyhow::anyhow!("webhook payload is not valid"))?,
+            body: serde_json::to_value(&payload).map_err(|_| failed())?,
         };
-        let body = serde_json::to_vec(&envelope)
-            .map_err(|_| anyhow::anyhow!("webhook job payload is not valid"))?;
+        let body = serde_json::to_vec(&envelope).map_err(|_| failed())?;
         let now = chrono::Utc::now().timestamp();
         let job = Job {
             id: uuid::Uuid::now_v7(),
@@ -249,10 +257,7 @@ impl RuleAction for WebhookAction {
             idempotency_key: Some(format!("webhook:{}:{}", ctx.rule.id, ctx.event.event_id)),
             headers: BTreeMap::new(),
         };
-        queue
-            .enqueue(job)
-            .await
-            .map_err(|error| anyhow::anyhow!("webhook job enqueue failed: {error}"))?;
+        queue.enqueue(job).await.map_err(|_| failed())?;
         Ok(())
     }
 }
@@ -269,6 +274,16 @@ pub struct WebhookJobHandler {
     signing_secret: Option<Vec<u8>>,
     /// Allows delivery to a private address when true.
     allow_private_hosts: bool,
+}
+
+impl std::fmt::Debug for WebhookJobHandler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WebhookJobHandler")
+            .field("allowed_hosts", &self.allowed_hosts)
+            .field("has_signing_secret", &self.signing_secret.is_some())
+            .field("allow_private_hosts", &self.allow_private_hosts)
+            .finish()
+    }
 }
 
 impl WebhookJobHandler {
@@ -310,7 +325,7 @@ impl JobHandler for WebhookJobHandler {
     /// exists.
     /// A 2xx status is a success.
     /// Any other status or a network error returns an error.
-    async fn handle(&self, job: &Job) -> Result<Option<Vec<u8>>, anyhow::Error> {
+    async fn handle(&self, job: &Job) -> Result<Option<Vec<u8>>, JobError> {
         let started = Instant::now();
         let result = self.deliver(job).await;
         record_delivery(result.is_ok(), started.elapsed());
@@ -328,24 +343,24 @@ impl WebhookJobHandler {
     /// exists.
     /// A 2xx status is a success.
     /// Any other status or a network error returns an error.
-    async fn deliver(&self, job: &Job) -> Result<Option<Vec<u8>>, anyhow::Error> {
-        let envelope: WebhookJobPayload = serde_json::from_slice(&job.payload)
-            .map_err(|_| anyhow::anyhow!("webhook job payload is not valid"))?;
-        let url = Url::parse(&envelope.url)
-            .map_err(|_| anyhow::anyhow!("webhook job URL is not valid"))?;
-        validate_url(&url, &self.allowed_hosts, self.allow_private_hosts)?;
+    async fn deliver(&self, job: &Job) -> Result<Option<Vec<u8>>, JobError> {
+        let invalid = || JobError::from(anyhow::anyhow!("webhook job payload is not valid"));
+        let envelope: WebhookJobPayload =
+            serde_json::from_slice(&job.payload).map_err(|_| invalid())?;
+        let url = Url::parse(&envelope.url).map_err(|_| invalid())?;
+        validate_url(&url, &self.allowed_hosts, self.allow_private_hosts)
+            .map_err(JobError::from)?;
         let event_id = envelope
             .body
             .get("event_id")
             .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| anyhow::anyhow!("webhook job body has no event id"))?;
+            .ok_or_else(invalid)?;
         let rule_id = envelope
             .body
             .get("rule_id")
             .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| anyhow::anyhow!("webhook job body has no rule id"))?;
-        let body = serde_json::to_vec(&envelope.body)
-            .map_err(|_| anyhow::anyhow!("webhook job body is not valid"))?;
+            .ok_or_else(invalid)?;
+        let body = serde_json::to_vec(&envelope.body).map_err(|_| invalid())?;
         send_webhook(
             url,
             &body,
@@ -427,8 +442,10 @@ async fn send_webhook(
     rule_id: &str,
     signing_secret: Option<&[u8]>,
     allow_private_hosts: bool,
-) -> Result<(), anyhow::Error> {
-    let client = build_pinned_client(&url, allow_private_hosts).await?;
+) -> Result<(), JobError> {
+    let client = build_pinned_client(&url, allow_private_hosts)
+        .await
+        .map_err(JobError::from)?;
     let mut request = client
         .post(url)
         .header(reqwest::header::CONTENT_TYPE, "application/json")
@@ -439,21 +456,24 @@ async fn send_webhook(
     if let Some(secret) = signing_secret {
         let timestamp = chrono::Utc::now().timestamp().to_string();
         request = request
-            .header(SIGNATURE_HEADER, signature_header(secret, body)?)
+            .header(
+                SIGNATURE_HEADER,
+                signature_header(secret, body).map_err(JobError::from)?,
+            )
             .header(TIMESTAMP_HEADER, timestamp.as_str())
             .header(
                 SIGNATURE_V2_HEADER,
-                timestamped_signature(secret, &timestamp, body)?,
+                timestamped_signature(secret, &timestamp, body).map_err(JobError::from)?,
             );
     }
     let response = request
         .send()
         .await
-        .map_err(|_| anyhow::anyhow!("webhook request failed"))?;
+        .map_err(|_| JobError::from(anyhow::anyhow!("webhook request failed")))?;
     if !response.status().is_success() {
         let status = response.status();
         let retry_after = retry_after(&response);
-        return Err(classify_response(status, retry_after).into());
+        return Err(classify_response(status, retry_after));
     }
     Ok(())
 }
@@ -549,6 +569,26 @@ fn format_signature(bytes: &[u8]) -> String {
     header
 }
 
+/// A failure while checking an incoming webhook signature.
+#[derive(Debug, thiserror::Error)]
+pub enum WebhookSignatureError {
+    /// The timestamp is not an integer.
+    #[error("webhook signature timestamp is not valid")]
+    InvalidTimestamp,
+    /// The timestamp is outside the replay window.
+    #[error("webhook signature timestamp is outside the replay window")]
+    StaleTimestamp,
+    /// The signature header is malformed.
+    #[error("webhook signature is not valid")]
+    InvalidSignature,
+    /// The signing secret cannot initialize HMAC.
+    #[error("webhook signing secret is not valid")]
+    InvalidSecret,
+    /// The signature does not match the body.
+    #[error("webhook signature does not match")]
+    Mismatch,
+}
+
 /// Checks the timestamped HMAC signature of one webhook request.
 ///
 /// The verifier checks the `X-Signature-Timestamp` and `X-Signature-V2`
@@ -590,7 +630,7 @@ impl WebhookSignatureVerifier {
         timestamp: &str,
         body: &[u8],
         signature: &str,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<(), WebhookSignatureError> {
         self.verify_at(timestamp, body, signature, chrono::Utc::now().timestamp())
     }
 
@@ -605,39 +645,37 @@ impl WebhookSignatureVerifier {
         body: &[u8],
         signature: &str,
         now: i64,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<(), WebhookSignatureError> {
         let parsed = timestamp
             .parse::<i64>()
-            .map_err(|_| anyhow::anyhow!("webhook signature timestamp is not valid"))?;
+            .map_err(|_| WebhookSignatureError::InvalidTimestamp)?;
         let window = self.replay_window.as_secs();
         if parsed.abs_diff(now) > window {
-            bail!("webhook signature timestamp is outside the replay window");
+            return Err(WebhookSignatureError::StaleTimestamp);
         }
         let raw = signature
             .strip_prefix("sha256=")
-            .ok_or_else(|| anyhow::anyhow!("webhook signature is not valid"))?;
+            .ok_or(WebhookSignatureError::InvalidSignature)?;
         let provided = decode_hex(raw)?;
         let mut mac = Hmac::<Sha256>::new_from_slice(&self.secret)
-            .map_err(|_| anyhow::anyhow!("webhook signing secret is not valid"))?;
+            .map_err(|_| WebhookSignatureError::InvalidSecret)?;
         mac.update(timestamp.as_bytes());
         mac.update(b".");
         mac.update(body);
         mac.verify_slice(&provided)
-            .map_err(|_| anyhow::anyhow!("webhook signature does not match"))
+            .map_err(|_| WebhookSignatureError::Mismatch)
     }
 }
 
 /// Reads one hexadecimal string into bytes.
-fn decode_hex(raw: &str) -> Result<Vec<u8>, anyhow::Error> {
+fn decode_hex(raw: &str) -> Result<Vec<u8>, WebhookSignatureError> {
     if !raw.len().is_multiple_of(2) {
-        bail!("webhook signature is not valid");
+        return Err(WebhookSignatureError::InvalidSignature);
     }
     let mut out = Vec::with_capacity(raw.len() / 2);
     for pair in raw.as_bytes().as_chunks::<2>().0 {
-        let high =
-            hex_value(pair[0]).ok_or_else(|| anyhow::anyhow!("webhook signature is not valid"))?;
-        let low =
-            hex_value(pair[1]).ok_or_else(|| anyhow::anyhow!("webhook signature is not valid"))?;
+        let high = hex_value(pair[0]).ok_or(WebhookSignatureError::InvalidSignature)?;
+        let low = hex_value(pair[1]).ok_or(WebhookSignatureError::InvalidSignature)?;
         out.push((high << 4) | low);
     }
     Ok(out)
@@ -1230,10 +1268,7 @@ mod tests {
         let error = denied
             .validate(&json!({"url": "http://127.0.0.1/hook"}))
             .unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "webhook URL must not target a private address or another non-public address"
-        );
+        assert_eq!(error.to_string(), "rule action parameters are not valid");
 
         let allowed = WebhookAction::new(vec!["127.0.0.1".to_string()]).allow_private_hosts(true);
         assert!(
@@ -1265,10 +1300,7 @@ mod tests {
         let error = denied
             .validate(&json!({"url": "https://10.0.0.1/hook"}))
             .unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "webhook URL must not target a private address or another non-public address"
-        );
+        assert_eq!(error.to_string(), "rule action parameters are not valid");
 
         let allowed = WebhookAction::new(vec!["10.0.0.1".to_string()]).allow_private_hosts(true);
         assert!(
@@ -1418,7 +1450,10 @@ mod tests {
 
         let error = action.execute(context(params, "evt-1")).await.unwrap_err();
 
-        assert!(error.to_string().contains("private address"), "{error}");
+        assert!(
+            matches!(error, crate::rules::action::ActionError::Failed { .. }),
+            "the action reports a typed failure: {error}"
+        );
         assert_eq!(server.received_requests().await.unwrap().len(), 0);
     }
 
@@ -1900,6 +1935,7 @@ mod tests {
             .verify_at(&timestamp, body, &signature, 1_700_000_061)
             .unwrap_err();
 
+        assert!(matches!(error, WebhookSignatureError::StaleTimestamp));
         assert!(
             error.to_string().contains("replay window"),
             "unexpected error: {error}"
@@ -1918,6 +1954,7 @@ mod tests {
             .verify_at(&timestamp, tampered, &signature, 1_700_000_000)
             .unwrap_err();
 
+        assert!(matches!(error, WebhookSignatureError::Mismatch));
         assert!(
             error.to_string().contains("does not match"),
             "unexpected error: {error}"

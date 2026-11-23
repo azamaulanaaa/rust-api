@@ -16,7 +16,6 @@
 //! and `http://collector:4317`. So a change of feature also needs a change
 //! to `observability.otlp_endpoint`.
 
-use anyhow::Context;
 use opentelemetry::global;
 #[cfg(any(feature = "otlp-grpc", feature = "otlp-http"))]
 use opentelemetry::trace::TracerProvider as _; // trait method: provider.tracer(name)
@@ -29,6 +28,39 @@ use opentelemetry_sdk::{
     trace::{Sampler, SdkTracerProvider},
 };
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
+
+/// Verbosity of the console log filter.
+#[derive(Clone, Copy, Debug)]
+pub enum LogVerbosity {
+    /// Use `info` unless `RUST_LOG` sets another filter.
+    Normal,
+    /// Use `debug` unless `RUST_LOG` sets another filter.
+    Verbose,
+}
+
+/// An error from telemetry setup or shutdown.
+#[derive(Debug, thiserror::Error)]
+pub enum TelemetryError {
+    /// The global tracing subscriber could not be installed.
+    #[error("failed to install the tracing subscriber: {0}")]
+    Subscriber(#[source] Box<dyn std::error::Error + Send + Sync>),
+    /// An OTLP exporter could not be built.
+    #[error("failed to build the OTLP exporter: {0}")]
+    Exporter(#[source] Box<dyn std::error::Error + Send + Sync>),
+    /// A provider could not flush its pending data.
+    #[error("telemetry shutdown failed: {0}")]
+    Shutdown(String),
+}
+
+impl TelemetryError {
+    fn subscriber(error: impl std::error::Error + Send + Sync + 'static) -> Self {
+        Self::Subscriber(Box::new(error))
+    }
+
+    fn exporter(error: impl std::error::Error + Send + Sync + 'static) -> Self {
+        Self::Exporter(Box::new(error))
+    }
+}
 
 /// Handle for the telemetry resources. The resources must stay alive for the
 /// whole run of the process.
@@ -56,7 +88,12 @@ impl Telemetry {
     /// error if any span or metric point could not be delivered. Call the
     /// function once at the end of the process. Dropping the handle without
     /// this call still sends the data on a best effort basis.
-    pub fn shutdown(mut self) -> anyhow::Result<()> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TelemetryError::Shutdown`] when a provider cannot flush its
+    /// pending data.
+    pub fn shutdown(mut self) -> Result<(), TelemetryError> {
         let mut errors = Vec::new();
         if let Some(provider) = self.tracer_provider.take()
             && let Err(e) = provider.shutdown()
@@ -73,10 +110,7 @@ impl Telemetry {
         if errors.is_empty() {
             Ok(())
         } else {
-            Err(anyhow::anyhow!(
-                "telemetry shutdown failed: {}",
-                errors.join("; ")
-            ))
+            Err(TelemetryError::Shutdown(errors.join("; ")))
         }
     }
 
@@ -84,13 +118,13 @@ impl Telemetry {
         if let Some(provider) = self.tracer_provider.take()
             && let Err(e) = provider.shutdown()
         {
-            eprintln!("failed to shut down tracer provider: {e:?}");
+            tracing::error!(error = ?e, "failed to shut down tracer provider");
         }
         if let Some(provider) = self.meter_provider.take() {
             // The last collection of the periodic reader. It sends
             // the metric points that are still pending to the collector.
             if let Err(e) = provider.shutdown() {
-                eprintln!("failed to shut down meter provider: {e:?}");
+                tracing::error!(error = ?e, "failed to shut down meter provider");
             }
         }
     }
@@ -100,19 +134,25 @@ impl Telemetry {
 /// endpoint, the export of spans.
 ///
 /// The filter of the logs uses the syntax of `RUST_LOG`. When the variable
-/// is not set, `verbose` selects `debug` or `info`. When `otlp_endpoint` is
+/// is not set, `verbosity` selects `debug` or `info`. When `otlp_endpoint` is
 /// `Some`, the server exports spans over OTLP. It also registers the W3C
 /// Trace Context propagator for the whole process. The request metrics go
 /// through a second OTLP pipeline. That pipeline uses the same endpoint and
 /// the same transport, which is HTTP and protobuf by default, or gRPC with
 /// `otlp-grpc`.
+///
+/// # Errors
+///
+/// Returns [`TelemetryError::Subscriber`] when a subscriber is already
+/// installed. Returns [`TelemetryError::Exporter`] when an OTLP exporter
+/// cannot be built.
 pub fn init(
-    verbose: bool,
+    verbosity: LogVerbosity,
     service_name: &str,
     otlp_endpoint: Option<&str>,
     sample_ratio: f64,
-) -> anyhow::Result<Telemetry> {
-    let default_filter = if verbose { "debug" } else { "info" };
+) -> Result<Telemetry, TelemetryError> {
+    let default_filter = filter_for(verbosity);
     let env_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter));
 
@@ -134,8 +174,7 @@ pub fn init(
                     .with(env_filter)
                     .with(fmt_layer)
                     .try_init()
-                    .map_err(|e| anyhow::anyhow!("failed to install tracing subscriber: {e}"))
-                    .context("telemetry initialization")?;
+                    .map_err(TelemetryError::subscriber)?;
                 return Ok(Telemetry {
                     tracer_provider: None,
                     meter_provider: None,
@@ -148,15 +187,13 @@ pub fn init(
                     .with_tonic()
                     .with_endpoint(endpoint)
                     .build()
-                    .map_err(|e| anyhow::anyhow!("OTLP span exporter build failed: {e}"))
-                    .context("telemetry initialization")?;
+                    .map_err(TelemetryError::exporter)?;
                 #[cfg(all(feature = "otlp-http", not(feature = "otlp-grpc")))]
                 let exporter = SpanExporter::builder()
                     .with_http()
                     .with_endpoint(endpoint)
                     .build()
-                    .map_err(|e| anyhow::anyhow!("OTLP span exporter build failed: {e}"))
-                    .context("telemetry initialization")?;
+                    .map_err(TelemetryError::exporter)?;
 
                 let resource = Resource::builder()
                     .with_service_name(service_name.to_string())
@@ -175,15 +212,13 @@ pub fn init(
                     .with_tonic()
                     .with_endpoint(endpoint)
                     .build()
-                    .map_err(|e| anyhow::anyhow!("OTLP metric exporter build failed: {e}"))
-                    .context("telemetry initialization")?;
+                    .map_err(TelemetryError::exporter)?;
                 #[cfg(all(feature = "otlp-http", not(feature = "otlp-grpc")))]
                 let metric_exporter = MetricExporter::builder()
                     .with_http()
                     .with_endpoint(endpoint)
                     .build()
-                    .map_err(|e| anyhow::anyhow!("OTLP metric exporter build failed: {e}"))
-                    .context("telemetry initialization")?;
+                    .map_err(TelemetryError::exporter)?;
                 let reader =
                     opentelemetry_sdk::metrics::PeriodicReader::builder(metric_exporter).build();
                 let meter_provider = SdkMeterProvider::builder()
@@ -199,8 +234,7 @@ pub fn init(
                     .with(fmt_layer)
                     .with(tracing_opentelemetry::layer().with_tracer(tracer))
                     .try_init()
-                    .map_err(|e| anyhow::anyhow!("failed to install tracing subscriber: {e}"))
-                    .context("telemetry initialization")?;
+                    .map_err(TelemetryError::subscriber)?;
 
                 Ok(Telemetry {
                     tracer_provider: Some(provider),
@@ -213,13 +247,38 @@ pub fn init(
                 .with(env_filter)
                 .with(fmt_layer)
                 .try_init()
-                .map_err(|e| anyhow::anyhow!("failed to install tracing subscriber: {e}"))
-                .context("telemetry initialization")?;
+                .map_err(TelemetryError::subscriber)?;
 
             Ok(Telemetry {
                 tracer_provider: None,
                 meter_provider: None,
             })
         }
+    }
+}
+
+/// Returns the console filter for one verbosity.
+fn filter_for(verbosity: LogVerbosity) -> &'static str {
+    match verbosity {
+        LogVerbosity::Normal => "info",
+        LogVerbosity::Verbose => "debug",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn verbosity_selects_the_filter() {
+        assert_eq!(filter_for(LogVerbosity::Normal), "info");
+        assert_eq!(filter_for(LogVerbosity::Verbose), "debug");
+    }
+
+    #[test]
+    fn setup_errors_keep_their_source() {
+        let error = TelemetryError::subscriber(std::io::Error::other("install failed"));
+        assert!(std::error::Error::source(&error).is_some());
+        assert!(error.to_string().starts_with("failed to install"));
     }
 }
