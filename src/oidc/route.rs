@@ -55,7 +55,7 @@ where
     /// validation middleware. The audience is the client ID. The issuer is
     /// the provider.
     pub async fn init(oidc_client: OidcClient) -> anyhow::Result<Self> {
-        let jwt_middleware = middleware::jwt::JwtClaimsMiddleware::new_with_jks(
+        let jwt_middleware = middleware::jwt::JwtClaimsMiddleware::new_with_jwks(
             oidc_client.jwks_uri().as_str(),
             oidc_client.client_id().as_str(),
             oidc_client.issuer(),
@@ -67,7 +67,7 @@ where
         // claims type. Loading the JWKS twice costs one extra request at
         // startup. It keeps `/auth/me` able to answer for a host app that
         // gives its own claims type any value other than `Claims`.
-        let session_middleware = middleware::jwt::JwtClaimsMiddleware::new_with_jks(
+        let session_middleware = middleware::jwt::JwtClaimsMiddleware::new_with_jwks(
             oidc_client.jwks_uri().as_str(),
             oidc_client.client_id().as_str(),
             oidc_client.issuer(),

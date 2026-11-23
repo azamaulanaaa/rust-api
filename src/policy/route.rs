@@ -661,7 +661,7 @@ mod tests {
     #[actix_web::test]
     async fn unauthenticated_rules_is_401() -> anyhow::Result<()> {
         let fx = fixture(true).await?;
-        let mw = JwtClaimsMiddleware::<Claims>::new_with_jks(
+        let mw = JwtClaimsMiddleware::<Claims>::new_with_jwks(
             &format!("{}/jwks", fx.server.uri()),
             AUD,
             &fx.issuer(),
@@ -684,7 +684,7 @@ mod tests {
     #[actix_web::test]
     async fn forbidden_without_rule() -> anyhow::Result<()> {
         let fx = fixture(false).await?;
-        let mw = JwtClaimsMiddleware::<Claims>::new_with_jks(
+        let mw = JwtClaimsMiddleware::<Claims>::new_with_jwks(
             &format!("{}/jwks", fx.server.uri()),
             AUD,
             &fx.issuer(),
@@ -708,7 +708,7 @@ mod tests {
     #[actix_web::test]
     async fn rule_crud_over_http() -> anyhow::Result<()> {
         let fx = fixture(true).await?;
-        let mw = JwtClaimsMiddleware::<Claims>::new_with_jks(
+        let mw = JwtClaimsMiddleware::<Claims>::new_with_jwks(
             &format!("{}/jwks", fx.server.uri()),
             AUD,
             &fx.issuer(),
@@ -775,7 +775,7 @@ mod tests {
     #[actix_web::test]
     async fn group_crud_over_http() -> anyhow::Result<()> {
         let fx = fixture(true).await?;
-        let mw = JwtClaimsMiddleware::<Claims>::new_with_jks(
+        let mw = JwtClaimsMiddleware::<Claims>::new_with_jwks(
             &format!("{}/jwks", fx.server.uri()),
             AUD,
             &fx.issuer(),
@@ -885,7 +885,7 @@ mod tests {
         // then covers the branches of pagination in the delete_group
         // handler.
         fx.engine.assign_group("dave".into(), "temp".into()).await?;
-        let mw = JwtClaimsMiddleware::<Claims>::new_with_jks(
+        let mw = JwtClaimsMiddleware::<Claims>::new_with_jwks(
             &format!("{}/jwks", fx.server.uri()),
             AUD,
             &fx.issuer(),

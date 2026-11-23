@@ -225,7 +225,7 @@ where
     /// Fetches the JWKS document from `jwks_url` and builds the middleware.
     /// The function pins the `audience` and `issuer` checks. See
     /// [`JwksKeys`] for the refresh behavior.
-    pub async fn new_with_jks(
+    pub async fn new_with_jwks(
         jwks_url: &str,
         audience: &str,
         issuer: &str,
@@ -658,7 +658,7 @@ mod tests {
         let server = spawn_jwks(json!({ "keys": [key] })).await;
         let tenant_guid = "11111111-2222-3333-4444-555555555555";
 
-        let mw = JwtClaimsMiddleware::<TestClaims>::new_with_jks(
+        let mw = JwtClaimsMiddleware::<TestClaims>::new_with_jwks(
             &format!("{}/jwks", server.uri()),
             "test-aud",
             &format!("{}/{{tenantid}}/v2.0", server.uri()),
@@ -797,7 +797,7 @@ mod tests {
         let (key, enc) = rsa_key("kid-prec")?;
         let server = spawn_jwks(json!({ "keys": [key] })).await;
 
-        let mw = JwtClaimsMiddleware::<TestClaims>::new_with_jks(
+        let mw = JwtClaimsMiddleware::<TestClaims>::new_with_jwks(
             &format!("{}/jwks", server.uri()),
             "test-aud",
             "https://idp.test",
@@ -902,7 +902,7 @@ mod tests {
         let (key, _enc) = rsa_key("kid-t")?;
         let server = spawn_jwks(json!({ "keys": [key] })).await;
 
-        let mw = JwtClaimsMiddleware::<TestClaims>::new_with_jks(
+        let mw = JwtClaimsMiddleware::<TestClaims>::new_with_jwks(
             &format!("{}/jwks", server.uri()),
             "test-aud",
             "https://idp.test",
@@ -940,7 +940,7 @@ mod tests {
         let (key, enc) = rsa_key("kid-t")?;
         let server = spawn_jwks(json!({ "keys": [key] })).await;
 
-        let mw = JwtClaimsMiddleware::<TestClaims>::new_with_jks(
+        let mw = JwtClaimsMiddleware::<TestClaims>::new_with_jwks(
             &format!("{}/jwks", server.uri()),
             "test-aud",
             "https://idp.test",
@@ -982,7 +982,7 @@ mod tests {
         let (key, enc) = rsa_key("kid-t")?;
         let server = spawn_jwks(json!({ "keys": [key] })).await;
 
-        let mw = JwtClaimsMiddleware::<TestClaims>::new_with_jks(
+        let mw = JwtClaimsMiddleware::<TestClaims>::new_with_jwks(
             &format!("{}/jwks", server.uri()),
             "test-aud",
             "https://idp.test",
@@ -1040,7 +1040,7 @@ mod tests {
         let (key, enc) = rsa_key("kid-t")?;
         let server = spawn_jwks(json!({ "keys": [key] })).await;
 
-        let mw = JwtClaimsMiddleware::<TestClaims>::new_with_jks(
+        let mw = JwtClaimsMiddleware::<TestClaims>::new_with_jwks(
             &format!("{}/jwks", server.uri()),
             "test-aud",
             &format!("{}/{{tenantid}}/v2.0", server.uri()),
@@ -1113,7 +1113,7 @@ mod tests {
         let (key, enc) = rsa_key("kid-t")?;
         let server = spawn_jwks(json!({ "keys": [key] })).await;
 
-        let mw = JwtClaimsMiddleware::<TestClaims>::new_with_jks(
+        let mw = JwtClaimsMiddleware::<TestClaims>::new_with_jwks(
             &format!("{}/jwks", server.uri()),
             "test-aud",
             &format!("{}/{{tenantid}}/v2.0", server.uri()),
@@ -1180,7 +1180,7 @@ mod tests {
         let (key, enc) = rsa_key("kid-t")?;
         let server = spawn_jwks(json!({ "keys": [key] })).await;
 
-        let mw = JwtClaimsMiddleware::<TestClaims>::new_with_jks(
+        let mw = JwtClaimsMiddleware::<TestClaims>::new_with_jwks(
             &format!("{}/jwks", server.uri()),
             "test-aud",
             &format!("{}/{{tenantid}}/v2.0", server.uri()),
@@ -1268,7 +1268,7 @@ mod tests {
         let (key, enc) = rsa_key("kid-t")?;
         let server = spawn_jwks(json!({ "keys": [key] })).await;
 
-        let mw = JwtClaimsMiddleware::<TestClaims>::new_with_jks(
+        let mw = JwtClaimsMiddleware::<TestClaims>::new_with_jwks(
             &format!("{}/jwks", server.uri()),
             "test-aud",
             &format!("{}/{{tenantid}}/v2.0", server.uri()),
@@ -1328,7 +1328,7 @@ mod tests {
         let (key, _enc) = rsa_key("kid-t")?;
         let (_other_key, attacker_enc) = rsa_key("kid-t")?;
         let server = spawn_jwks(json!({ "keys": [key] })).await;
-        let mw = JwtClaimsMiddleware::<TestClaims>::new_with_jks(
+        let mw = JwtClaimsMiddleware::<TestClaims>::new_with_jwks(
             &format!("{}/jwks", server.uri()),
             "test-aud",
             "https://idp.test",

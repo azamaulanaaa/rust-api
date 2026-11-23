@@ -583,7 +583,7 @@ mod tests {
     }
 
     async fn setup(fx: &Fixture) -> anyhow::Result<JwtClaimsMiddleware<Claims>> {
-        Ok(JwtClaimsMiddleware::<Claims>::new_with_jks(
+        Ok(JwtClaimsMiddleware::<Claims>::new_with_jwks(
             &format!("{}/jwks", fx.server.uri()),
             AUD,
             &fx.issuer(),

@@ -1717,7 +1717,7 @@ mod tests {
         }
 
         async fn module(&self) -> anyhow::Result<EavApiModule> {
-            let middleware = JwtClaimsMiddleware::<Claims>::new_with_jks(
+            let middleware = JwtClaimsMiddleware::<Claims>::new_with_jwks(
                 &format!("{}/jwks", self.server.uri()),
                 AUD,
                 &self.issuer(),
