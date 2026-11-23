@@ -28,4 +28,4 @@ if ! grep -A4 'build-local-artifacts:' "$workflow" | grep -q '^ *- checks$'; the
   exit 1
 fi
 echo "release workflow is gated on CI"
-dist plan --output-format=human > /dev/null
+dist plan --output-format=human >/dev/null
