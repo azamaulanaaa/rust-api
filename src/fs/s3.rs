@@ -103,6 +103,21 @@ pub trait S3Client: Send + Sync {
     /// Fetches an object body.
     async fn get_object(&self, bucket: &str, key: &str) -> Result<Bytes, FsError>;
 
+    /// Returns `true` when the object exists.
+    ///
+    /// [`crate::fs::FsEngine::complete_upload`] uses this method to detect a
+    /// multipart upload that an earlier attempt already completed.
+    /// The default implementation reads the whole body through
+    /// [`S3Client::get_object`], so that test doubles keep working.
+    /// The production implementation reads only the metadata.
+    async fn object_exists(&self, bucket: &str, key: &str) -> Result<bool, FsError> {
+        match self.get_object(bucket, key).await {
+            Ok(_) => Ok(true),
+            Err(FsError::NotFound(_)) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Streams an object body with its length.
     ///
     /// A download must not buffer the whole file.

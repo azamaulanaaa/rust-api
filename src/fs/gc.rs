@@ -88,6 +88,11 @@ pub fn spawn<C: crate::CancelToken>(
 /// The listing is a snapshot. The code takes it before the loop starts.
 /// Therefore the listing alone says nothing about what a row holds when the
 /// sweeper reaches it. See the note inside the loop.
+///
+/// A committed file record for the session id means that an earlier
+/// completion saved the record.
+/// The session pass then deletes only the session row.
+/// The pass does not abort the upload, and it does not delete the object.
 #[tracing::instrument(skip(engine), err)]
 pub async fn sweep_once(engine: &FsEngine) -> Result<usize, crate::fs::error::FsError> {
     let now = chrono::Utc::now().timestamp();
@@ -155,6 +160,22 @@ pub async fn sweep_once(engine: &FsEngine) -> Result<usize, crate::fs::error::Fs
             continue;
         };
         if !s.is_expired(now, TTL_SECS) {
+            continue;
+        }
+        // A committed record means an earlier completion saved the file
+        // record but did not delete the session.
+        // The object belongs to the file, and the file can still answer a
+        // download.
+        // Delete only the session row. Do not abort the upload, and do not
+        // delete the object.
+        if engine.store.get_file(&s.id).await?.is_some() {
+            tracing::info!(
+                "fs gc dropping the finished session of file {} (age {}s)",
+                s.id,
+                now - s.created_at
+            );
+            engine.store.delete_session(&s.id).await?;
+            cleaned += 1;
             continue;
         }
         tracing::info!(
@@ -458,6 +479,61 @@ mod tests {
         Ok(())
     }
 
+    /// An expired session must not take the bytes of a committed file.
+    ///
+    /// `complete_upload` saves the file record, and then announces.
+    /// If the announce fails and the client does not retry, the session
+    /// stays.
+    /// The old session pass aborted that session.
+    /// For a single-part session, the abort deletes the object, and the file
+    /// record then points at bytes that are gone.
+    /// The file answers 404 for ever.
+    #[tokio::test]
+    async fn sweep_keeps_the_bytes_of_a_committed_file() -> anyhow::Result<()> {
+        let engine = make_engine().await;
+        let id = "committed";
+        engine
+            .store
+            .save_session(&session_with_age(id, TTL_SECS + 3600, false))
+            .await?;
+        let rec = FileRecord {
+            id: id.into(),
+            name: "kept.bin".into(),
+            mimetype: "application/octet-stream".into(),
+            size: 4,
+            s3_key: format!("files/{id}"),
+            owner_sub: "alice".into(),
+            created_at: chrono::Utc::now().timestamp(),
+        };
+        engine.store.save_file(&rec).await?;
+        engine
+            .s3
+            .put_object(
+                "test-bucket",
+                &rec.s3_key,
+                Bytes::from_static(b"data"),
+                None,
+                None,
+            )
+            .await?;
+
+        assert_eq!(sweep_once(&engine).await?, 1);
+        assert!(engine.store.get_session(id).await?.is_none());
+        assert!(
+            engine.store.get_file(id).await?.is_some(),
+            "the sweep deleted the record of a committed file"
+        );
+        assert!(
+            engine
+                .s3
+                .get_object("test-bucket", &rec.s3_key)
+                .await
+                .is_ok(),
+            "the sweep deleted the bytes of a committed file"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn sweep_cleans_orphaned_files() -> anyhow::Result<()> {
         let engine = make_engine().await;
@@ -732,8 +808,8 @@ mod tests {
         let file_id = engine_pre
             .init_upload(
                 crate::fs::model::InitRequest {
-                    file_size: 2048,
-                    part_size: 1024,
+                    file_size: 2 * crate::fs::model::MIN_MULTIPART_PART_SIZE,
+                    part_size: crate::fs::model::MIN_MULTIPART_PART_SIZE,
                     file_total_parts: 2,
                 },
                 "alice",

@@ -69,6 +69,15 @@ fn feed_error(e: anyhow::Error) -> FsError {
     FsError::Internal(e.to_string())
 }
 
+/// The error text for a multipart upload whose durable state is gone.
+///
+/// The text tells the client to start a new upload.
+/// A completed object at the target key is the one exception.
+/// [`FsEngine::complete_upload`] detects that object and commits the file
+/// record instead.
+const MULTIPART_STATE_UNAVAILABLE: &str =
+    "multipart state unavailable (restarted server or expired session); start a new upload";
+
 /// The core file system engine.
 /// It uses a temp scope per user, and a row check for each row.
 #[derive(Clone)]
@@ -842,10 +851,7 @@ impl FsEngine {
     /// `unknown upload_id`.
     async fn ensure_multipart(&self, upload_id: &str) -> Result<(), FsError> {
         let Some(record) = self.store.load_multipart(upload_id).await? else {
-            return Err(FsError::BadRequest(
-                "multipart state unavailable (restarted server or expired session); start a new upload"
-                    .into(),
-            ));
+            return Err(FsError::BadRequest(MULTIPART_STATE_UNAVAILABLE.into()));
         };
         self.s3.restore_multipart(&record).await
     }
@@ -914,6 +920,15 @@ impl FsEngine {
     /// The method announces again, and the retry converges.
     /// See [`with_change_sink`](Self::with_change_sink) for what this
     /// guarantees.
+    ///
+    /// A retry also converges after a crash or a store error between the S3
+    /// complete and the file record write.
+    /// The method keeps the durable multipart record until the file record
+    /// is saved.
+    /// A retry that finds no record, and a retry whose S3 complete reports
+    /// an unknown upload, check for the completed object.
+    /// A completed object proves that the S3 upload succeeded.
+    /// The method then saves the file record.
     #[tracing::instrument(skip(self, req), fields(file_id = %file_id, caller_sub = %caller_sub), err)]
     pub async fn complete_upload(
         &self,
@@ -989,14 +1004,46 @@ impl FsEngine {
                 .s3_upload_id
                 .as_deref()
                 .ok_or_else(|| FsError::Internal("missing s3 upload id".into()))?;
-            self.ensure_multipart(upload_id).await?;
-            self.s3
-                .complete_multipart_upload(&self.bucket, &session.s3_key, upload_id, etags)
-                .await?;
-            // The engine deletes the durable record with the
-            // completed upload.
-            // The session delete below is then a backup for that delete.
-            self.store.delete_multipart(upload_id).await?;
+            // The durable multipart record stays until the file record is
+            // saved.
+            // A retry after a crash can then finish the completion.
+            match self.store.load_multipart(upload_id).await? {
+                Some(state) => {
+                    self.s3.restore_multipart(&state).await?;
+                    if let Err(e) = self
+                        .s3
+                        .complete_multipart_upload(&self.bucket, &session.s3_key, upload_id, etags)
+                        .await
+                    {
+                        // S3 reports an unknown upload id when an earlier
+                        // attempt already completed the upload.
+                        // The object proves that the bytes are in place.
+                        // A different failure leaves the session and the
+                        // record for the next retry.
+                        if !self.s3.object_exists(&self.bucket, &session.s3_key).await? {
+                            return Err(e);
+                        }
+                        tracing::debug!(
+                            file_id = %file_id,
+                            "multipart upload was already complete; committing the file record"
+                        );
+                    }
+                }
+                None => {
+                    // The record is gone. An old attempt can leave this
+                    // state when it completed S3 and then lost the record
+                    // before it saved the file record.
+                    // The object is then the only proof that the bytes are
+                    // complete.
+                    if !self.s3.object_exists(&self.bucket, &session.s3_key).await? {
+                        return Err(FsError::BadRequest(MULTIPART_STATE_UNAVAILABLE.into()));
+                    }
+                    tracing::debug!(
+                        file_id = %file_id,
+                        "no multipart record; committing the completed object"
+                    );
+                }
+            }
         }
         let record = FileRecord {
             id: file_id.to_string(),
@@ -1097,8 +1144,18 @@ impl FsEngine {
     /// download.
     /// A retry of that case finds no row and returns 404.
     /// That is why the bytes are last.
+    ///
+    /// The engine takes the per-file lock before it reads the ref count.
+    /// `FsStore::attach`, `FsStore::detach`, and the GC sweeper take the
+    /// same lock.
+    /// Without the lock, an attach can commit between the ref-count read and
+    /// the delete.
+    /// The delete then removes the bytes of a file that a row already
+    /// references.
     #[tracing::instrument(skip(self), fields(file_id = %file_id, caller_sub = %caller_sub), err)]
     pub async fn delete_file(&self, file_id: &str, caller_sub: &str) -> Result<(), FsError> {
+        let file_lock = self.store.file_lock(file_id);
+        let _held = file_lock.acquire().await;
         let rec = self
             .store
             .get_file(file_id)
@@ -1268,6 +1325,51 @@ mod tests {
             part_size: 1024,
             file_total_parts: 1,
         }
+    }
+
+    /// A two-part upload whose parts meet the S3 minimum size.
+    fn valid_multipart() -> InitRequest {
+        InitRequest {
+            file_size: model::MIN_MULTIPART_PART_SIZE + 1024,
+            part_size: model::MIN_MULTIPART_PART_SIZE,
+            file_total_parts: 2,
+        }
+    }
+
+    /// Starts a two-part multipart upload and stores both parts.
+    async fn engine_with_two_parts(sub: &str) -> anyhow::Result<(FsEngine, String)> {
+        let engine = make_engine(sub).await;
+        let req = valid_multipart();
+        let part_size = req.part_size as usize;
+        let id = engine.init_upload(req, "alice").await?;
+        engine
+            .upload_part(&id, 0, once_body(vec![1u8; part_size]), None, None, "alice")
+            .await?;
+        engine
+            .upload_part(&id, 1, once_body(vec![2u8; 1024]), None, None, "alice")
+            .await?;
+        Ok((engine, id))
+    }
+
+    /// Completes the S3 side of a multipart upload, and leaves the durable
+    /// rows in place.
+    ///
+    /// The helper stands in for a completion attempt that crashed after the
+    /// S3 complete.
+    async fn complete_s3_only(engine: &FsEngine, id: &str) -> anyhow::Result<String> {
+        let session = engine.store.get_session(id).await?.expect("upload session");
+        let upload_id = session.s3_upload_id.clone().expect("multipart session");
+        engine.ensure_multipart(&upload_id).await?;
+        let etags = session
+            .etags
+            .iter()
+            .map(|etag| etag.clone().expect("uploaded part"))
+            .collect();
+        engine
+            .s3
+            .complete_multipart_upload("test-bucket", &session.s3_key, &upload_id, etags)
+            .await?;
+        Ok(upload_id)
     }
 
     /// Wraps one buffered part as the chunk stream that the engine now takes.
@@ -1469,6 +1571,7 @@ mod tests {
     #[tokio::test]
     async fn concurrent_part_uploads_keep_every_etag_and_record_part() -> anyhow::Result<()> {
         const PARTS: u64 = 3;
+        let part_size = model::MIN_MULTIPART_PART_SIZE;
         // The LAST part is parked.
         // The parts must reach the backend in ascending order.
         // The parked part must therefore be the one whose siblings ran
@@ -1478,8 +1581,8 @@ mod tests {
         let id = engine
             .init_upload(
                 InitRequest {
-                    file_size: PARTS * 1024,
-                    part_size: 1024,
+                    file_size: PARTS * part_size,
+                    part_size,
                     file_total_parts: PARTS,
                 },
                 "alice",
@@ -1496,7 +1599,7 @@ mod tests {
                     .upload_part(
                         &id,
                         PARTS - 1,
-                        once_body(vec![9u8; 1024]),
+                        once_body(vec![9u8; part_size as usize]),
                         None,
                         None,
                         "alice",
@@ -1510,7 +1613,14 @@ mod tests {
         for part in 0..PARTS - 1 {
             tokio::time::timeout(
                 std::time::Duration::from_secs(5),
-                engine.upload_part(&id, part, once_body(vec![part as u8; 1024]), None, None, "alice"),
+                engine.upload_part(
+                    &id,
+                    part,
+                    once_body(vec![part as u8; part_size as usize]),
+                    None,
+                    None,
+                    "alice",
+                ),
             )
             .await
             .expect("a part was blocked behind a SIBLING's backend call: the session lock is held too wide")?;
@@ -1555,8 +1665,8 @@ mod tests {
             )
             .await?;
         let (rec, obj) = engine.get_object(&id, "alice").await?;
-        assert_eq!(rec.size, PARTS * 1024);
-        assert_eq!(obj.size, PARTS * 1024);
+        assert_eq!(rec.size, PARTS * part_size);
+        assert_eq!(obj.size, PARTS * part_size);
         Ok(())
     }
 
@@ -1998,18 +2108,26 @@ mod tests {
         use actix_web::ResponseError as _;
 
         let engine = make_engine("alice").await;
+        let part_size = model::MIN_MULTIPART_PART_SIZE;
         let id = engine
             .init_upload(
                 InitRequest {
-                    file_size: 2500,
-                    part_size: 1024,
-                    file_total_parts: 3,
+                    file_size: part_size + 2500,
+                    part_size,
+                    file_total_parts: 2,
                 },
                 "alice",
             )
             .await?;
         let err = engine
-            .upload_part(&id, 2, once_body(vec![9u8; 1024]), None, None, "alice")
+            .upload_part(
+                &id,
+                1,
+                once_body(vec![9u8; part_size as usize]),
+                None,
+                None,
+                "alice",
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, FsError::BadRequest(_)), "got {err:?}");
@@ -2020,7 +2138,7 @@ mod tests {
             .await?
             .expect("session survives a rejected part");
         assert!(
-            session.etags[2].is_none(),
+            session.etags[1].is_none(),
             "a padded part must not be stored"
         );
         Ok(())
@@ -2219,6 +2337,156 @@ mod tests {
 
         // The file is the one that was committed, and not a new upload.
         assert_eq!(engine.get_metadata(&id, "alice").await?.name, "retry.txt");
+        Ok(())
+    }
+
+    /// A completion retry must commit the file record when the S3 complete
+    /// already succeeded and the durable multipart record is gone.
+    ///
+    /// The old order completed S3, deleted the durable multipart record, and
+    /// then saved the file record.
+    /// A crash or a store error between the record delete and the file save
+    /// left a session, no record, and a complete object.
+    /// Every retry then failed with 400 "multipart state unavailable".
+    #[tokio::test]
+    async fn complete_upload_retries_when_the_multipart_record_is_gone() -> anyhow::Result<()> {
+        let (engine, id) = engine_with_two_parts("retry-record-gone").await?;
+        let upload_id = complete_s3_only(&engine, &id).await?;
+        // This is the state that the old order reached before it saved the
+        // file record.
+        engine.store.delete_multipart(&upload_id).await?;
+        assert!(engine.store.get_file(&id).await?.is_none());
+
+        engine
+            .complete_upload(
+                &id,
+                CompleteRequest {
+                    name: "gone.bin".into(),
+                    mimetype: "application/octet-stream".into(),
+                },
+                "alice",
+            )
+            .await?;
+
+        let rec = engine
+            .store
+            .get_file(&id)
+            .await?
+            .expect("the retry must commit the file record");
+        assert_eq!(rec.size, valid_multipart().file_size);
+        assert!(engine.store.get_session(&id).await?.is_none());
+        assert!(
+            engine.s3.object_exists("test-bucket", &rec.s3_key).await?,
+            "the retry must keep the completed object"
+        );
+        Ok(())
+    }
+
+    /// A completion retry must converge when S3 reports that the upload id is
+    /// unknown because an earlier attempt already completed that upload.
+    #[tokio::test]
+    async fn complete_upload_retries_an_s3_complete_that_already_ran() -> anyhow::Result<()> {
+        let (engine, id) = engine_with_two_parts("retry-s3-complete").await?;
+        complete_s3_only(&engine, &id).await?;
+        // The durable record is still there. The old RAM state is gone.
+        // The retry restores the state from the record, and S3 then reports
+        // that the upload id is unknown.
+        assert!(engine.store.get_file(&id).await?.is_none());
+
+        engine
+            .complete_upload(
+                &id,
+                CompleteRequest {
+                    name: "again.bin".into(),
+                    mimetype: "application/octet-stream".into(),
+                },
+                "alice",
+            )
+            .await?;
+
+        let rec = engine
+            .store
+            .get_file(&id)
+            .await?
+            .expect("the retry must commit the file record");
+        assert_eq!(rec.name, "again.bin");
+        assert!(engine.store.get_session(&id).await?.is_none());
+        let obj = engine.s3.get_object("test-bucket", &rec.s3_key).await?;
+        assert_eq!(obj.len() as u64, valid_multipart().file_size);
+        Ok(())
+    }
+
+    /// A delete must wait for the per-file lock that an attach holds.
+    ///
+    /// The delete used to read the ref count and delete the rows without that
+    /// lock.
+    /// An attach could then commit between the read and the delete.
+    /// The delete removed the bytes of a file that a row already references.
+    #[tokio::test]
+    async fn delete_waits_for_the_file_lock_that_an_attach_holds() -> anyhow::Result<()> {
+        let engine = make_engine("alice").await;
+        let id = engine.init_upload(valid_single(), "alice").await?;
+        engine
+            .upload_part(&id, 0, once_body(vec![5u8; 1024]), None, None, "alice")
+            .await?;
+        engine
+            .complete_upload(
+                &id,
+                CompleteRequest {
+                    name: "locked.bin".into(),
+                    mimetype: "application/octet-stream".into(),
+                },
+                "alice",
+            )
+            .await?;
+
+        let held = engine.store.file_lock(&id);
+        let guard = held.acquire().await;
+
+        let attach_engine = engine.clone();
+        let attach_id = id.clone();
+        let mut attacher =
+            tokio::spawn(
+                async move { attach_engine.store.attach("invoice", "1", &attach_id).await },
+            );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(250), &mut attacher)
+                .await
+                .is_err(),
+            "the attach did not wait for the file lock"
+        );
+
+        let delete_engine = engine.clone();
+        let delete_id = id.clone();
+        let mut deleter =
+            tokio::spawn(async move { delete_engine.delete_file(&delete_id, "alice").await });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(250), &mut deleter)
+                .await
+                .is_err(),
+            "the delete did not wait for the file lock"
+        );
+
+        drop(guard);
+        drop(held);
+
+        assert_eq!(attacher.await.expect("attach task")?, 1);
+        let err = deleter
+            .await
+            .expect("delete task")
+            .expect_err("a referenced file needs row delete access");
+        assert!(matches!(err, FsError::Forbidden), "got {err:?}");
+        assert!(
+            engine.store.get_file(&id).await?.is_some(),
+            "the delete removed a file that an attach had just claimed"
+        );
+        assert!(
+            engine
+                .s3
+                .object_exists("test-bucket", &format!("files/{id}"))
+                .await?,
+            "the delete removed the bytes of a file that an attach had just claimed"
+        );
         Ok(())
     }
 

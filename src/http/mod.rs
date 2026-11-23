@@ -1009,7 +1009,7 @@ mod tests {
     /// A 300 KiB body is larger than the actix default of 256 KiB for
     /// `Bytes`. Without the shared limits, the request must return 413. With
     /// the limits, the request must pass. The test protects the documented
-    /// upload sizes of 512 KiB parts and 10 MiB single-part uploads from a
+    /// upload sizes of up to 10 MiB parts and single-part uploads from a
     /// silent 413.
     #[actix_web::test]
     async fn payload_limit_covers_documented_part_sizes() {

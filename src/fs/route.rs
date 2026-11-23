@@ -689,12 +689,17 @@ mod tests {
         .await;
         assert_eq!(res.status(), http::StatusCode::NO_CONTENT);
         // The test also checks the cancel path for a multipart upload.
+        let part_size = crate::fs::model::MIN_MULTIPART_PART_SIZE;
         let res = test::call_service(
             &app,
             test::TestRequest::post()
                 .uri("/fs/uploads")
                 .insert_header(("Cookie", format!("auth_token={token}")))
-                .set_json(json!({"file_size": 524288, "part_size": 262144, "file_total_parts": 2}))
+                .set_json(json!({
+                    "file_size": part_size + 1024,
+                    "part_size": part_size,
+                    "file_total_parts": 2
+                }))
                 .to_request(),
         )
         .await;
@@ -762,12 +767,17 @@ mod tests {
         let module = FsApiModule::new(fx.engine.clone(), mw);
         let app = test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
         let token = fx.token("alice")?;
+        let part_size = crate::fs::model::MIN_MULTIPART_PART_SIZE;
         let res = test::call_service(
             &app,
             test::TestRequest::post()
                 .uri("/fs/uploads")
                 .insert_header(("Cookie", format!("auth_token={token}")))
-                .set_json(json!({"file_size": 524288, "part_size": 262144, "file_total_parts": 2}))
+                .set_json(json!({
+                    "file_size": part_size + 1024,
+                    "part_size": part_size,
+                    "file_total_parts": 2
+                }))
                 .to_request(),
         )
         .await;
@@ -810,24 +820,30 @@ mod tests {
         let module = FsApiModule::new(fx.engine.clone(), mw);
         let app = test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
         let token = fx.token("alice")?;
+        let part_size = crate::fs::model::MIN_MULTIPART_PART_SIZE;
         let res = test::call_service(
             &app,
             test::TestRequest::post()
                 .uri("/fs/uploads")
                 .insert_header(("Cookie", format!("auth_token={token}")))
-                .set_json(json!({"file_size": 524288, "part_size": 262144, "file_total_parts": 2}))
+                .set_json(json!({
+                    "file_size": part_size + 1024,
+                    "part_size": part_size,
+                    "file_total_parts": 2
+                }))
                 .to_request(),
         )
         .await;
         let body: serde_json::Value = test::read_body_json(res).await;
         let file_id = body["file_id"].as_str().unwrap();
         for idx in 0..2 {
+            let len = if idx == 0 { part_size as usize } else { 1024 };
             let res = test::call_service(
                 &app,
                 test::TestRequest::put()
                     .uri(&format!("/fs/uploads/{file_id}/parts/{idx}"))
                     .insert_header(("Cookie", format!("auth_token={token}")))
-                    .set_payload(vec![9u8; 262144])
+                    .set_payload(vec![9u8; len])
                     .to_request(),
             )
             .await;
@@ -852,7 +868,10 @@ mod tests {
         )
         .await;
         assert_eq!(res.status(), http::StatusCode::OK);
-        assert_eq!(test::read_body(res).await.len(), 524288);
+        assert_eq!(
+            test::read_body(res).await.len(),
+            (part_size + 1024) as usize
+        );
         Ok(())
     }
 
@@ -868,27 +887,32 @@ mod tests {
         let module = FsApiModule::new(fx.engine.clone(), mw);
         let app = test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
         let token = fx.token("alice")?;
+        let part_size = crate::fs::model::MIN_MULTIPART_PART_SIZE;
         let res = test::call_service(
             &app,
             test::TestRequest::post()
                 .uri("/fs/uploads")
                 .insert_header(("Cookie", format!("auth_token={token}")))
-                .set_json(json!({"file_size": 2500, "part_size": 1024, "file_total_parts": 3}))
+                .set_json(json!({
+                    "file_size": part_size + 2500,
+                    "part_size": part_size,
+                    "file_total_parts": 2
+                }))
                 .to_request(),
         )
         .await;
         assert_eq!(res.status(), http::StatusCode::CREATED);
         let body: serde_json::Value = test::read_body_json(res).await;
         let file_id = body["file_id"].as_str().unwrap();
-        // Part 2 has 452 real bytes. A 1024-byte body is padding.
+        // Part 1 has 2500 real bytes. A 5 MiB body is padding.
         // The route must return 400 and must not trim the body.
         let res = test::call_service(
             &app,
             test::TestRequest::put()
-                .uri(&format!("/fs/uploads/{file_id}/parts/2"))
+                .uri(&format!("/fs/uploads/{file_id}/parts/1"))
                 .insert_header(("Cookie", format!("auth_token={token}")))
-                .set_payload(vec![9u8; 1024])
-                .insert_header(("content-length", "1024"))
+                .set_payload(vec![9u8; part_size as usize])
+                .insert_header(("content-length", part_size.to_string()))
                 .to_request(),
         )
         .await;
@@ -908,20 +932,29 @@ mod tests {
         let module = FsApiModule::new(fx.engine.clone(), mw);
         let app = test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
         let token = fx.token("alice")?;
+        let part_size = crate::fs::model::MIN_MULTIPART_PART_SIZE;
         let res = test::call_service(
             &app,
             test::TestRequest::post()
                 .uri("/fs/uploads")
                 .insert_header(("Cookie", format!("auth_token={token}")))
-                .set_json(json!({"file_size": 2500, "part_size": 1024, "file_total_parts": 3}))
+                .set_json(json!({
+                    "file_size": part_size + 2500,
+                    "part_size": part_size,
+                    "file_total_parts": 2
+                }))
                 .to_request(),
         )
         .await;
         assert_eq!(res.status(), http::StatusCode::CREATED);
         let body: serde_json::Value = test::read_body_json(res).await;
         let file_id = body["file_id"].as_str().unwrap();
-        let payload: Vec<u8> = (0..2500u32).map(|i| (i % 251) as u8).collect();
-        for (idx, start, len) in [(0usize, 0usize, 1024usize), (1, 1024, 1024), (2, 2048, 452)] {
+        let file_size = (part_size + 2500) as usize;
+        let payload: Vec<u8> = (0..file_size).map(|i| (i % 251) as u8).collect();
+        for (idx, start, len) in [
+            (0usize, 0usize, part_size as usize),
+            (1, part_size as usize, 2500usize),
+        ] {
             let res = test::call_service(
                 &app,
                 test::TestRequest::put()
@@ -957,7 +990,7 @@ mod tests {
         .await;
         assert_eq!(res.status(), http::StatusCode::OK);
         let body = test::read_body(res).await;
-        assert_eq!(body.len(), 2500);
+        assert_eq!(body.len(), file_size);
         assert_eq!(body.as_ref(), payload.as_slice());
         Ok(())
     }

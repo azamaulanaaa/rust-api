@@ -11,13 +11,12 @@ pub struct InitRequest {
     /// Total file size in bytes.
     /// For a multipart upload, every part except the last part has
     /// `part_size` bytes. The last part has the remaining bytes.
-    /// Example: `file_size` 2500, `part_size` 1024, and
-    /// `file_total_parts` 3. Part 0 and part 1 have 1024 bytes. Part 2 has
-    /// 452 bytes.
+    /// Example: `file_size` 5243332, `part_size` 5242880, and
+    /// `file_total_parts` 2. Part 0 has 5242880 bytes. Part 1 has 452 bytes.
     pub file_size: u64,
     /// Chunk size in bytes.
-    /// For a multipart upload, this value is a multiple of 1 KiB and at most
-    /// 512 KiB.
+    /// For a multipart upload, this value is a multiple of 1 KiB from 5 MiB
+    /// to 10 MiB.
     pub part_size: u64,
     /// Total number of parts.
     /// For a multipart upload, this value is
@@ -36,6 +35,22 @@ pub struct InitRequest {
 /// Without the check, a 70-byte request body could ask for a
 /// multi-terabyte allocation.
 pub const MAX_MULTIPART_PARTS: u64 = 10_000;
+
+/// The smallest multipart `part_size`.
+///
+/// S3 rejects a multipart upload when a part other than the last part is
+/// smaller than 5 MiB.
+/// The engine sends one client part as one S3 part.
+/// A smaller `part_size` therefore makes every multipart upload fail at
+/// `complete_upload`, after the client sent all parts.
+pub const MIN_MULTIPART_PART_SIZE: u64 = 5 * 1024 * 1024;
+
+/// The largest multipart `part_size`.
+///
+/// The value is the single-part size limit.
+/// The value is below the 16 MiB body limit, so the engine can buffer one
+/// part.
+pub const MAX_MULTIPART_PART_SIZE: u64 = 10 * 1024 * 1024;
 
 impl InitRequest {
     /// Validates the same constraints as the TS `Schema.filter`, and also
@@ -72,16 +87,19 @@ impl InitRequest {
             if self.file_total_parts > MAX_MULTIPART_PARTS {
                 return Err(FsError::BadRequest(format!(
                     "file_total_parts must be at most {MAX_MULTIPART_PARTS} (S3's per-upload part \
-                     limit); got {}. Raise part_size (max 512 KB) to split a larger file.",
+                     limit); got {}. Raise part_size (max 10 MiB) to split a larger file.",
                     self.file_total_parts
                 )));
             }
             let is_multiple_of_1kb = self.part_size.is_multiple_of(1024);
-            let within_bounds = self.part_size <= 524288;
+            let within_bounds =
+                (MIN_MULTIPART_PART_SIZE..=MAX_MULTIPART_PART_SIZE).contains(&self.part_size);
             if !is_multiple_of_1kb || !within_bounds {
-                return Err(FsError::BadRequest(
-                    "part_size must be a multiple of 1 KB up to 512 KB (e.g., 131072, 262144, 524288)".into(),
-                ));
+                return Err(FsError::BadRequest(format!(
+                    "part_size must be a multiple of 1 KB from 5 MiB to 10 MiB (e.g., 5242880, \
+                     8388608, 10485760); got {}",
+                    self.part_size
+                )));
             }
             let expected = self.file_size.div_ceil(self.part_size);
             if self.file_total_parts != expected {
@@ -93,7 +111,7 @@ impl InitRequest {
             // The count check above makes these two range checks true.
             // Keep the checks explicit, because they state the multipart
             // contract.
-            // The cap above bounds this product to about 5 GB, so the
+            // The cap above bounds this product to about 100 GiB, so the
             // multiplication cannot overflow.
             let last_part_start = (self.file_total_parts - 1) * self.part_size;
             let covered = self.file_total_parts * self.part_size;
@@ -253,22 +271,58 @@ mod tests {
         .unwrap();
     }
 
+    /// A multipart `part_size` below the S3 minimum of 5 MiB must fail at
+    /// init.
+    ///
+    /// S3 rejects a multipart upload when a part other than the last part is
+    /// smaller than 5 MiB.
+    /// The engine sends one client part as one S3 part.
+    /// The old limit of 512 KiB therefore failed every multipart upload at
+    /// `complete_upload`.
     #[test]
-    fn init_request_multi_part_checks_size_and_count() {
-        // The engine requires part_size to be a multiple of 1 KB and at
-        // most 512 KB. A wrong bound is easy to copy into this test.
+    fn init_request_rejects_multipart_part_size_below_the_s3_minimum() {
         assert_bad(
             InitRequest {
-                file_size: 2048,
-                part_size: 1500,
+                file_size: 2 * 1024 * 1024,
+                part_size: 1024 * 1024,
                 file_total_parts: 2,
             },
             "part_size",
         );
         assert_bad(
             InitRequest {
-                file_size: 1024 * 1024,
-                part_size: 600 * 1024,
+                file_size: MIN_MULTIPART_PART_SIZE - 1024,
+                part_size: MIN_MULTIPART_PART_SIZE - 1024,
+                file_total_parts: 2,
+            },
+            "part_size",
+        );
+        // The minimum itself is valid.
+        InitRequest {
+            file_size: MIN_MULTIPART_PART_SIZE * 2,
+            part_size: MIN_MULTIPART_PART_SIZE,
+            file_total_parts: 2,
+        }
+        .validate()
+        .expect("5 MiB is the S3 minimum part size");
+    }
+
+    #[test]
+    fn init_request_multi_part_checks_size_and_count() {
+        // The engine requires part_size to be a multiple of 1 KB and from
+        // 5 MiB to 10 MiB. A wrong bound is easy to copy into this test.
+        assert_bad(
+            InitRequest {
+                file_size: 2 * MIN_MULTIPART_PART_SIZE,
+                part_size: MIN_MULTIPART_PART_SIZE + 512,
+                file_total_parts: 2,
+            },
+            "part_size",
+        );
+        assert_bad(
+            InitRequest {
+                file_size: 2 * MAX_MULTIPART_PART_SIZE,
+                part_size: MAX_MULTIPART_PART_SIZE + 1024,
                 file_total_parts: 2,
             },
             "part_size",
@@ -276,25 +330,26 @@ mod tests {
         // file_total_parts must equal ceil(file_size/part_size)
         assert_bad(
             InitRequest {
-                file_size: 1024 * 1024,
-                part_size: 262144,
+                file_size: 2 * MIN_MULTIPART_PART_SIZE,
+                part_size: MIN_MULTIPART_PART_SIZE,
                 file_total_parts: 5,
             },
             "must be exactly",
         );
-        // A shorter last part is valid. 300 KiB with 128 KiB parts has
-        // three parts, and the last part has 44 KiB.
+        // A shorter last part is valid. 5 MiB + 44 KiB with 5 MiB parts has
+        // two parts, and the last part has 44 KiB.
         InitRequest {
-            file_size: 300 * 1024,
-            part_size: 131072,
-            file_total_parts: 3,
+            file_size: MIN_MULTIPART_PART_SIZE + 44 * 1024,
+            part_size: MIN_MULTIPART_PART_SIZE,
+            file_total_parts: 2,
         }
         .validate()
         .unwrap();
-        // Valid multi-part upload. A 1 MB file with 256 KB parts has 4 parts.
+        // Valid multi-part upload. A 20 MiB file with 5 MiB parts has 4
+        // parts.
         InitRequest {
-            file_size: 1024 * 1024,
-            part_size: 262144,
+            file_size: 4 * MIN_MULTIPART_PART_SIZE,
+            part_size: MIN_MULTIPART_PART_SIZE,
             file_total_parts: 4,
         }
         .validate()
@@ -308,18 +363,19 @@ mod tests {
     /// This test pins the behaviour that the message now describes.
     #[test]
     fn init_request_multi_part_allows_any_1kb_multiple() {
-        // 3 KiB is not a power of two, and it is a valid part size.
+        // 5 MiB + 3 KiB is not a power of two, and it is a valid part size.
+        let part_size = MIN_MULTIPART_PART_SIZE + 3072;
         InitRequest {
-            file_size: 6144,
-            part_size: 3072,
+            file_size: part_size * 2,
+            part_size,
             file_total_parts: 2,
         }
         .validate()
         .unwrap();
         assert_bad(
             InitRequest {
-                file_size: 6144,
-                part_size: 3073,
+                file_size: 2 * (MIN_MULTIPART_PART_SIZE + 3073),
+                part_size: MIN_MULTIPART_PART_SIZE + 3073,
                 file_total_parts: 2,
             },
             "part_size",
@@ -382,9 +438,9 @@ mod tests {
     #[test]
     fn init_accepts_short_last_part() {
         InitRequest {
-            file_size: 2500,
-            part_size: 1024,
-            file_total_parts: 3,
+            file_size: MIN_MULTIPART_PART_SIZE + 452,
+            part_size: MIN_MULTIPART_PART_SIZE,
+            file_total_parts: 2,
         }
         .validate()
         .expect("the last part has 452 bytes");
@@ -395,8 +451,8 @@ mod tests {
         // A count below ceil(file_size / part_size) cannot hold the file.
         assert_bad(
             InitRequest {
-                file_size: 2500,
-                part_size: 1024,
+                file_size: 2 * MIN_MULTIPART_PART_SIZE + 100,
+                part_size: MIN_MULTIPART_PART_SIZE,
                 file_total_parts: 2,
             },
             "must be exactly 3",
@@ -405,11 +461,11 @@ mod tests {
         // the file has.
         assert_bad(
             InitRequest {
-                file_size: 2500,
-                part_size: 1024,
+                file_size: MIN_MULTIPART_PART_SIZE + 452,
+                part_size: MIN_MULTIPART_PART_SIZE,
                 file_total_parts: 4,
             },
-            "must be exactly 3",
+            "must be exactly 2",
         );
     }
 
@@ -418,8 +474,8 @@ mod tests {
     #[test]
     fn init_accepts_10000_parts() {
         InitRequest {
-            file_size: MAX_MULTIPART_PARTS * 1024,
-            part_size: 1024,
+            file_size: MAX_MULTIPART_PARTS * MIN_MULTIPART_PART_SIZE,
+            part_size: MIN_MULTIPART_PART_SIZE,
             file_total_parts: MAX_MULTIPART_PARTS,
         }
         .validate()
@@ -430,8 +486,8 @@ mod tests {
     fn init_rejects_more_than_10000_parts() {
         assert_bad(
             InitRequest {
-                file_size: (MAX_MULTIPART_PARTS + 1) * 1024,
-                part_size: 1024,
+                file_size: (MAX_MULTIPART_PARTS + 1) * MIN_MULTIPART_PART_SIZE,
+                part_size: MIN_MULTIPART_PART_SIZE,
                 file_total_parts: MAX_MULTIPART_PARTS + 1,
             },
             "at most 10000",

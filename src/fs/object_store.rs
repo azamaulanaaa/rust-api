@@ -384,6 +384,15 @@ impl S3Client for ObjectStoreClient {
         Ok(bytes)
     }
 
+    async fn object_exists(&self, bucket: &str, key: &str) -> Result<bool, FsError> {
+        let path = self.path(bucket, key);
+        match self.store.head(&path).await {
+            Ok(_) => Ok(true),
+            Err(object_store::Error::NotFound { .. }) => Ok(false),
+            Err(e) => Err(Self::map_err(e)),
+        }
+    }
+
     async fn get_object_stream(
         &self,
         bucket: &str,
