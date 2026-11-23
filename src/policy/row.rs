@@ -38,11 +38,67 @@ pub trait RowAuthorizer: Send + Sync {
 /// The function escapes `:` and `\` in both parts. Two different row pairs
 /// therefore never give the same object string.
 pub fn row_object(row_type: &str, row_id: &str) -> String {
-    fn escape(value: &str) -> String {
-        value.replace('\\', "\\\\").replace(':', "\\:")
-    }
+    format!("{}:{}", escape_row_part(row_type), escape_row_part(row_id))
+}
 
-    format!("{}:{}", escape(row_type), escape(row_id))
+/// Escapes one part of a row object.
+///
+/// The backslash escapes first, so that the later colon escape does not
+/// double-escape the backslash that it inserts.
+fn escape_row_part(value: &str) -> String {
+    value.replace('\\', "\\\\").replace(':', "\\:")
+}
+
+/// Splits a canonical row object into `(row_type, row_id)`.
+///
+/// The function inverts [`row_object`]. It splits at the first unescaped
+/// colon and then unescapes both parts. The function returns `None` when the
+/// object is not a row object, when a part is empty, or when an escape is
+/// malformed.
+///
+/// A control-plane object (`rules`, `user_groups`, …) has no colon and
+/// returns `None`.
+pub fn parse_row_object(obj: &str) -> Option<(String, String)> {
+    let (row_type, row_id) = split_unescaped(obj)?;
+    if row_type.is_empty() || row_id.is_empty() {
+        return None;
+    }
+    Some((unescape_row_part(row_type)?, unescape_row_part(row_id)?))
+}
+
+/// Splits at the first colon that a backslash does not escape.
+fn split_unescaped(value: &str) -> Option<(&str, &str)> {
+    let mut escaped = false;
+    for (at, ch) in value.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' => escaped = true,
+            ':' => return Some((&value[..at], &value[at + 1..])),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Inverts [`escape_row_part`] for one part of a row object.
+fn unescape_row_part(value: &str) -> Option<String> {
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            out.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some(':') => out.push(':'),
+            Some('\\') => out.push('\\'),
+            _ => return None,
+        }
+    }
+    Some(out)
 }
 
 /// Row-level checks for business entities.
@@ -94,6 +150,45 @@ mod tests {
         assert_eq!(row_object("invoice:12", "3"), "invoice\\:12:3");
         assert_ne!(row_object("invoice", "12:3"), row_object("invoice:12", "3"));
         assert_eq!(row_object("a\\b", "c"), "a\\\\b:c");
+    }
+
+    /// The parser is the exact inverse of the encoder.
+    #[test]
+    fn parse_row_object_inverts_row_object() {
+        for (row_type, row_id) in [
+            ("invoice", "123"),
+            ("invoice", "12:3"),
+            ("invoice:12", "3"),
+            ("a\\b", "c"),
+            ("a:b", "c\\d:e"),
+        ] {
+            let obj = row_object(row_type, row_id);
+            assert_eq!(
+                parse_row_object(&obj),
+                Some((row_type.to_string(), row_id.to_string())),
+                "the object {obj:?} must decode to its original parts"
+            );
+        }
+    }
+
+    /// A colon in the id must not truncate it.
+    #[test]
+    fn parse_row_object_keeps_colons_in_the_row_id() {
+        assert_eq!(
+            parse_row_object("invoice:12\\:3"),
+            Some(("invoice".to_string(), "12:3".to_string()))
+        );
+    }
+
+    /// An object that is not a canonical row object has no row pair.
+    #[test]
+    fn parse_row_object_rejects_control_plane_and_malformed_objects() {
+        assert_eq!(parse_row_object("rules"), None);
+        assert_eq!(parse_row_object("user_groups"), None);
+        assert_eq!(parse_row_object(":123"), None);
+        assert_eq!(parse_row_object("invoice:"), None);
+        assert_eq!(parse_row_object("invoice:12\\"), None);
+        assert_eq!(parse_row_object("invoice:12\\q3"), None);
     }
 
     #[tokio::test]
