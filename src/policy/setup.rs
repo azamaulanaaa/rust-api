@@ -60,10 +60,22 @@ pub struct SetupApiModule {
     setup_token: Option<String>,
 }
 
+/// Returns the bootstrap secret, or `None` when the value cannot enable the
+/// route.
+///
+/// An empty or whitespace-only value is not a secret. If the route accepted
+/// one, a request with no `X-Setup-Token` header would match it, because a
+/// missing header reads as the empty string. The route then authorizes any
+/// authenticated caller.
+fn non_empty_setup_token(token: Option<String>) -> Option<String> {
+    token.filter(|value| !value.trim().is_empty())
+}
+
 impl SetupApiModule {
     /// Wraps a [`PolicyEngine`] with the given JWT middleware and bootstrap
     /// secret. Pass a clone of the engine that other modules share, because
-    /// all clones see one policy state. Pass `None` to disable the route.
+    /// all clones see one policy state. Pass `None` to disable the route. An
+    /// empty or whitespace-only secret also disables the route.
     pub fn new(
         policy_engine: PolicyEngine,
         jwt_middleware: JwtClaimsMiddleware<Claims>,
@@ -72,7 +84,7 @@ impl SetupApiModule {
         Self {
             policy_engine: Arc::new(policy_engine),
             jwt_middleware,
-            setup_token,
+            setup_token: non_empty_setup_token(setup_token),
         }
     }
 }
@@ -84,8 +96,13 @@ impl ApiModule for SetupApiModule {
 
     fn configure(&self, cfg: &mut web::ServiceConfig) {
         // No token means no bootstrap path. The route is then absent, and
-        // the request gets a 404.
-        let Some(token) = &self.setup_token else {
+        // the request gets a 404. The check repeats here, because an empty
+        // value must never mount a route that accepts a missing header.
+        let Some(token) = self
+            .setup_token
+            .as_ref()
+            .filter(|value| !value.trim().is_empty())
+        else {
             return;
         };
         let policy_engine = web::Data::from(self.policy_engine.clone());
@@ -290,6 +307,37 @@ mod tests {
         .await;
 
         assert_eq!(res.status(), http::StatusCode::NOT_FOUND);
+        Ok(())
+    }
+
+    /// An empty secret must disable the route, not accept a missing header.
+    ///
+    /// `new` is public, so a host app can supply `Some("")` even though the
+    /// config validation rejects it. The public constructor must fail
+    /// closed.
+    #[actix_web::test]
+    async fn an_empty_setup_token_disables_the_route() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        for token in ["", "   "] {
+            let module = setup_module(&fx, Some(token)).await?;
+            let app =
+                test::init_service(App::new().configure(|cfg| ApiModule::configure(&module, cfg)))
+                    .await;
+
+            let res = test::call_service(
+                &app,
+                test::TestRequest::post()
+                    .uri("/setup/admin")
+                    .insert_header(("Cookie", format!("auth_token={}", fx.token("alice")?)))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(
+                res.status(),
+                http::StatusCode::NOT_FOUND,
+                "an empty secret {token:?} must not mount the route"
+            );
+        }
         Ok(())
     }
 

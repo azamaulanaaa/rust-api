@@ -35,15 +35,26 @@ pub mod row;
 pub mod setup;
 
 /// The operation a policy rule grants on an object.
+///
+/// The serde form is the lowercase string that Casbin stores and that
+/// `GET /policy/rules` returns. A client can replay a listed value to
+/// `DELETE /policy/rules`. The PascalCase names stay accepted on input for
+/// older clients.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "lowercase")]
+#[schema(rename_all = "lowercase")]
 pub enum Action {
     /// Permission to view the object.
+    #[serde(alias = "Read")]
     Read,
     /// Permission to modify the object.
+    #[serde(alias = "Write")]
     Write,
     /// Permission to remove the object.
+    #[serde(alias = "Delete")]
     Delete,
     /// Permission to run the object.
+    #[serde(alias = "Execute")]
     Execute,
 }
 
@@ -848,6 +859,31 @@ mod tests {
 
         let err = "launch".parse::<Action>().unwrap_err();
         assert_eq!(err.to_string(), "unknown action: launch");
+    }
+
+    /// The serde form must match the string that Casbin stores and lists.
+    /// The previous derived form expected `Read`, so a client that replayed a
+    /// listed action to a delete request got a `400`.
+    #[test]
+    fn action_serde_matches_the_lowercase_listing_form() {
+        for (action, pascal, lower) in [
+            (Action::Read, "Read", "read"),
+            (Action::Write, "Write", "write"),
+            (Action::Delete, "Delete", "delete"),
+            (Action::Execute, "Execute", "execute"),
+        ] {
+            let serialized = serde_json::to_value(action).expect("action serializes");
+            assert_eq!(serialized, serde_json::json!(lower));
+            assert_eq!(action.to_string(), lower);
+
+            let from_lower: Action =
+                serde_json::from_value(serde_json::json!(lower)).expect("lowercase parses");
+            assert_eq!(from_lower, action);
+
+            let from_pascal: Action =
+                serde_json::from_value(serde_json::json!(pascal)).expect("PascalCase alias parses");
+            assert_eq!(from_pascal, action);
+        }
     }
 
     #[tokio::test]

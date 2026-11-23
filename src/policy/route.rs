@@ -724,7 +724,7 @@ mod tests {
             actix_web::test::TestRequest::post()
                 .uri("/policy/rules")
                 .insert_header(("Cookie", format!("auth_token={token}")))
-                .set_json(json!({"sub":"bob","obj":"doc","act":"Read"}))
+                .set_json(json!({"sub":"bob","obj":"doc","act":"read"}))
                 .to_request(),
         )
         .await;
@@ -737,7 +737,7 @@ mod tests {
             actix_web::test::TestRequest::post()
                 .uri("/policy/rules")
                 .insert_header(("Cookie", format!("auth_token={token}")))
-                .set_json(json!({"sub":"bob","obj":"doc","act":"Read"}))
+                .set_json(json!({"sub":"bob","obj":"doc","act":"read"}))
                 .to_request(),
         )
         .await;
@@ -762,11 +762,88 @@ mod tests {
             actix_web::test::TestRequest::delete()
                 .uri("/policy/rules")
                 .insert_header(("Cookie", format!("auth_token={token}")))
-                .set_json(json!({"sub":"bob","obj":"doc","act":"Read"}))
+                .set_json(json!({"sub":"bob","obj":"doc","act":"read"}))
                 .to_request(),
         )
         .await;
         assert_eq!(res.status(), http::StatusCode::OK);
+        let body: serde_json::Value = actix_web::test::read_body_json(res).await;
+        assert_eq!(body["success"], true);
+        Ok(())
+    }
+
+    /// A client lists a rule and replays its `act` value to the delete
+    /// endpoint. The value comes from Casbin, so it is lowercase. The serde
+    /// form of [`Action`] must accept it. The derived form expected
+    /// `Read`, and the replay got a `400`.
+    #[actix_web::test]
+    async fn a_listed_action_replays_into_a_delete_request() -> anyhow::Result<()> {
+        let fx = fixture(true).await?;
+        let mw = JwtClaimsMiddleware::<Claims>::new_with_jwks(
+            &format!("{}/jwks", fx.server.uri()),
+            AUD,
+            &fx.issuer(),
+        )
+        .await?;
+        let module = PolicyApiModule::new(fx.engine.clone(), mw);
+        let app =
+            actix_web::test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+
+        let res = actix_web::test::call_service(
+            &app,
+            actix_web::test::TestRequest::post()
+                .uri("/policy/rules")
+                .insert_header(("Cookie", format!("auth_token={token}")))
+                .set_json(json!({"sub":"bob","obj":"doc","act":"write"}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+
+        // List the rules and read the action exactly as a client receives it.
+        let res = actix_web::test::call_service(
+            &app,
+            actix_web::test::TestRequest::get()
+                .uri("/policy/rules?limit=1000&offset=0")
+                .insert_header(("Cookie", format!("auth_token={token}")))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let body: serde_json::Value = actix_web::test::read_body_json(res).await;
+        let listed_act = body["items"]
+            .as_array()
+            .and_then(|items| {
+                items.iter().find(|item| {
+                    item.get(0).and_then(|v| v.as_str()) == Some("bob")
+                        && item.get(1).and_then(|v| v.as_str()) == Some("doc")
+                })
+            })
+            .and_then(|item| item.get(2))
+            .and_then(|value| value.as_str())
+            .expect("the added rule appears in the list")
+            .to_string();
+        assert_eq!(listed_act, "write");
+
+        // The listed string deserializes as an Action and serializes back to
+        // the same lowercase string in the delete body.
+        let action: Action = serde_json::from_value(serde_json::Value::String(listed_act.clone()))
+            .expect("a listed action must deserialize");
+        let res = actix_web::test::call_service(
+            &app,
+            actix_web::test::TestRequest::delete()
+                .uri("/policy/rules")
+                .insert_header(("Cookie", format!("auth_token={token}")))
+                .set_json(json!({"sub":"bob","obj":"doc","act":action}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(
+            res.status(),
+            http::StatusCode::OK,
+            "a replayed listed action must not be a 400"
+        );
         let body: serde_json::Value = actix_web::test::read_body_json(res).await;
         assert_eq!(body["success"], true);
         Ok(())
