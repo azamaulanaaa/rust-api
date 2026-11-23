@@ -66,6 +66,15 @@
 //! for an action script.
 //! The operation and wall-time limits still apply.
 //!
+//! A non-script condition and a non-script action obey the same read set.
+//! The engine drops each `event.changed` entry and each snapshot key that the
+//! read set does not allow.
+//! It drops each entity attribute that the read set does not allow.
+//! The action or condition keeps the entity identity fields and the event
+//! metadata.
+//! A rule with an empty read set therefore cannot observe an attribute value.
+//! A rule runs with an empty attribute view, so it does not fail.
+//!
 //! [`RuleEngine::run_with_progress`] sends one health signal after a real
 //! cursor advance and after one healthy idle poll.
 //! A caller can clear a failure flag only after this signal.
@@ -85,12 +94,15 @@ use crate::records::{EntityEvent, WalOp};
 use crate::rules::action::{ActionContext, RuleAction};
 use crate::rules::effect::EffectPlan;
 use crate::rules::error::RuleError;
-use crate::rules::rule::{Condition, MAX_DEPTH, Rule, validate_identifier};
+use crate::rules::rule::{
+    ActionRef, Condition, MAX_DEPTH, Rule, RuleCapabilities, validate_identifier,
+};
 use crate::rules::script::{
     MAX_SOURCE_BYTES, SCRIPT_ACTION_KIND, ScriptActionContext, ScriptContext, ScriptEngine,
     ScriptError, ScriptHost, visible_attribute_keys,
 };
 use crate::rules::store::{RuleDeadLetter, RuleStore};
+use crate::sleep_unless_cancelled;
 use crate::sync::wal::Wal;
 
 /// The default maximum causation depth.
@@ -311,6 +323,32 @@ impl RuleEngine {
     /// The built-in `script` kind is always present.
     pub fn has_action(&self, kind: &str) -> bool {
         kind == SCRIPT_ACTION_KIND || self.actions.contains_key(kind)
+    }
+
+    /// Returns true when one rule can observe entity data at run time.
+    ///
+    /// A non-empty `read` list lets a script read data.
+    /// A non-script action can read the event and the entity.
+    /// An action can report that it reads no entity data.
+    /// A non-script condition reads data when it tests an attribute or a
+    /// change.
+    /// A script action and a script condition obey the read capability set.
+    /// An unknown action returns true, so a caller needs the grant.
+    pub fn observes_entity_data(
+        &self,
+        capabilities: &RuleCapabilities,
+        action: &ActionRef,
+        condition: &Condition,
+    ) -> bool {
+        if !capabilities.read.is_empty() || condition.reads_entity_data() {
+            return true;
+        }
+        if action.kind == SCRIPT_ACTION_KIND {
+            return false;
+        }
+        self.actions
+            .get(&action.kind)
+            .is_none_or(|registered| registered.reads_entity_data())
     }
 
     /// Checks the parameters for one registered action kind.
@@ -589,6 +627,8 @@ impl RuleEngine {
     /// A script action reads its marker from the entity store.
     /// Every other action reads its marker from the rule store.
     /// A script action writes its marker in the effect transaction.
+    /// The call restricts the event and the entity to the rule read set
+    /// before the condition and the action see them.
     async fn run_one_rule(
         &self,
         rule: &Rule,
@@ -607,7 +647,33 @@ impl RuleEngine {
         if marker_exists {
             return Ok(ExecutionOutcome::AlreadyExecuted);
         }
-        if !self.eval_condition(rule, event, entity).await? {
+        let visible = if rule.action.kind != SCRIPT_ACTION_KIND
+            || rule.condition.reads_entity_data()
+            || has_script_condition(&rule.condition)
+        {
+            let read = rule.capabilities.to_script_capabilities()?;
+            Some(
+                visible_attribute_keys(&self.entities, &read, entity, event)
+                    .await
+                    .map_err(RuleError::Script)?,
+            )
+        } else {
+            None
+        };
+        let restricted_event;
+        let restricted_entity;
+        let (event, entity) = match &visible {
+            Some(keys) => {
+                restricted_event = restrict_event(event, keys);
+                restricted_entity = entity.map(|value| restrict_entity(value, keys));
+                (&restricted_event, restricted_entity.as_ref())
+            }
+            None => (event, entity),
+        };
+        if !self
+            .eval_condition(rule, event, entity, visible.as_ref())
+            .await?
+        {
             return Ok(ExecutionOutcome::ConditionFalse);
         }
         if rule.action.kind == SCRIPT_ACTION_KIND {
@@ -639,32 +705,23 @@ impl RuleEngine {
     ///
     /// A script condition runs on a blocking thread through
     /// [`ScriptEngine::eval_bool`], so a script cannot block the async reactor.
-    /// The call computes the visible attribute keys from the rule read set.
-    /// It returns an empty set when the rule grants no read access.
-    /// A tree with no script condition reads no schema.
+    /// The caller passes the visible attribute keys from the rule read set.
+    /// The caller restricts the event and the entity to those keys.
+    /// A rule with no data access passes `None`.
     /// A script error stops the rule and returns the sanitized error.
     async fn eval_condition(
         &self,
         rule: &Rule,
         event: &EntityEvent,
         entity: Option<&Entity>,
+        visible: Option<&BTreeSet<String>>,
     ) -> Result<bool, RuleError> {
         let ctx = ScriptContext {
             event,
             entity,
             now: chrono::Utc::now().timestamp(),
         };
-        let visible = if has_script_condition(&rule.condition) {
-            let read = rule.capabilities.to_script_capabilities()?;
-            Some(
-                visible_attribute_keys(&self.entities, &read, entity, event)
-                    .await
-                    .map_err(RuleError::Script)?,
-            )
-        } else {
-            None
-        };
-        self.eval_condition_with(&rule.condition, &ctx, visible.as_ref())
+        self.eval_condition_with(&rule.condition, &ctx, visible)
             .await
     }
 
@@ -825,8 +882,8 @@ impl RuleEngine {
     ///
     /// When the cursor is ahead of the head, the call returns an error and
     /// does not rewind.
-    /// When the feed is caught up, the call sleeps for `poll_interval` and
-    /// checks cancellation again.
+    /// When the feed is caught up, the call sleeps for `poll_interval`.
+    /// The sleep stops when the token fires.
     ///
     /// Delivery is at least once for an entry below the limit.
     /// A crash can replay the last batch, so at most 32 entries repeat.
@@ -1006,7 +1063,9 @@ impl RuleEngine {
             // A caught-up feed is healthy: the engine read the head and found
             // the cursor equal to it.
             progress.record();
-            tokio::time::sleep(poll_interval).await;
+            if sleep_unless_cancelled(&cancel, poll_interval).await {
+                continue;
+            }
         }
     }
 }
@@ -1026,6 +1085,32 @@ fn has_script_condition(condition: &Condition) -> bool {
         Condition::Not(child) => has_script_condition(child),
         _ => false,
     }
+}
+
+/// Returns the event with only the visible attribute changes.
+///
+/// The call drops each change whose key is not visible.
+/// It also drops each snapshot key that is not visible.
+/// Every other event field stays as it is.
+fn restrict_event(event: &EntityEvent, visible: &BTreeSet<String>) -> EntityEvent {
+    let mut restricted = event.clone();
+    restricted
+        .changed
+        .retain(|change| visible.contains(&change.key));
+    if let Some(snapshot) = &mut restricted.snapshot {
+        snapshot.retain(|key, _| visible.contains(key));
+    }
+    restricted
+}
+
+/// Returns the entity with only the visible attributes.
+///
+/// The call drops each attribute whose key is not visible.
+/// The identity fields and the pinned schemas stay as they are.
+fn restrict_entity(entity: &Entity, visible: &BTreeSet<String>) -> Entity {
+    let mut restricted = entity.clone();
+    restricted.attributes.retain(|key, _| visible.contains(key));
+    restricted
 }
 
 /// Returns the source of one script action.
@@ -1079,7 +1164,9 @@ mod tests {
     use crate::eav::schema::{AttributeDef, AttributeType, SchemaDraft, SchemaRegistry};
     use crate::records::{AttributeChange, ChangeSink, EntityEventKind};
     use crate::rules::action::ActionError;
-    use crate::rules::rule::{ActionRef, CompareOp, Condition, RuleDraft, RuleTrigger};
+    use crate::rules::rule::{
+        ActionRef, CompareOp, Condition, RuleCapabilities, RuleDraft, RuleTrigger,
+    };
     use crate::rules::script::{MAX_SOURCE_BYTES, ScriptError};
     use oxkv::{GetSet as _, Hooks as _, KeyPrefix, OxKvStore, ScanExt as _};
 
@@ -1519,6 +1606,34 @@ mod tests {
             .await
             .expect("the run must stop after cancellation")
             .expect("the run task must not panic")
+            .expect("the run must return no error");
+    }
+
+    /// A long poll interval does not delay cancellation of the rule runner.
+    ///
+    /// The test uses paused time and one hour as the interval.
+    /// The token fires at once.
+    /// A cancellation-aware sleep ends the run after one short slice.
+    #[tokio::test(start_paused = true)]
+    async fn a_long_poll_interval_stops_the_runner_on_cancellation() {
+        let stores = stores().await;
+        let wal = test_wal().await;
+        let subject = engine(&stores, vec![Arc::new(RecordingAction::new("record"))]);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let handle = tokio::spawn({
+            let subject = subject.clone();
+            let wal = wal.clone();
+            let cancel = cancel.clone();
+            async move { subject.run(&wal, cancel, Duration::from_secs(3_600)).await }
+        });
+        tokio::task::yield_now().await;
+        cancel.store(true, Ordering::SeqCst);
+
+        let result = tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("the runner must stop after cancellation");
+        result
+            .expect("the runner task must not panic")
             .expect("the run must return no error");
     }
 
@@ -2060,7 +2175,9 @@ mod tests {
         let recorder = Arc::new(RecordingAction::new("record"));
         let engine = engine(&stores, vec![recorder.clone()]);
         make_entity(&stores.entities).await;
-        stores.rules.upsert(draft("alpha", "record")).await.unwrap();
+        let mut rule = draft("alpha", "record");
+        rule.capabilities.read = vec!["invoice".to_string()];
+        stores.rules.upsert(rule).await.unwrap();
 
         engine
             .process(&event(EntityEventKind::Created))
@@ -2852,6 +2969,7 @@ mod tests {
             source: r#"event.kind == "created" && entity.attributes.total == 10"#.to_string(),
         };
         let mut json = draft("json", "record");
+        json.capabilities.read = vec!["invoice".to_string()];
         json.condition = Condition::Compare {
             key: "total".to_string(),
             op: CompareOp::Eq,
@@ -2874,6 +2992,58 @@ mod tests {
         assert_eq!(recorder.records().len(), 2);
     }
 
+    /// The observation helper names the rules that need the entity read grant.
+    ///
+    /// A script rule needs the grant only for a non-empty read list.
+    /// A non-script action needs the grant.
+    /// A noop action reports that it reads no entity data.
+    /// A data condition needs the grant, even with a noop action.
+    /// An unknown action needs the grant.
+    #[tokio::test]
+    async fn the_observation_helper_names_the_entity_read_boundary() {
+        let stores = stores().await;
+        let subject = engine(
+            &stores,
+            vec![
+                Arc::new(RecordingAction::new("record")),
+                Arc::new(crate::rules::builtin::NoopAction),
+            ],
+        );
+        let script = ActionRef {
+            kind: "script".to_string(),
+            params: serde_json::json!({}),
+        };
+        let record = ActionRef {
+            kind: "record".to_string(),
+            params: serde_json::json!({}),
+        };
+        let noop = ActionRef {
+            kind: "noop".to_string(),
+            params: serde_json::json!({}),
+        };
+        let ghost = ActionRef {
+            kind: "ghost".to_string(),
+            params: serde_json::json!({}),
+        };
+        let data = Condition::Compare {
+            key: "total".to_string(),
+            op: CompareOp::Eq,
+            value: serde_json::json!(10),
+        };
+        let empty = RuleCapabilities::default();
+        let read = RuleCapabilities {
+            read: vec!["invoice".to_string()],
+            ..RuleCapabilities::default()
+        };
+
+        assert!(!subject.observes_entity_data(&empty, &script, &Condition::Always));
+        assert!(subject.observes_entity_data(&read, &script, &Condition::Always));
+        assert!(subject.observes_entity_data(&empty, &record, &Condition::Always));
+        assert!(!subject.observes_entity_data(&empty, &noop, &Condition::Always));
+        assert!(subject.observes_entity_data(&empty, &noop, &data));
+        assert!(subject.observes_entity_data(&empty, &ghost, &Condition::Always));
+    }
+
     #[tokio::test]
     async fn nested_scripts_are_evaluated_in_all_any_and_not() {
         let stores = stores().await;
@@ -2894,9 +3064,11 @@ mod tests {
 
         let mut all = draft("all", "record");
         all.priority = 30;
+        all.capabilities.read = vec!["invoice".to_string()];
         all.condition = Condition::All(vec![yes.clone(), total.clone()]);
         let mut any = draft("any", "record");
         any.priority = 20;
+        any.capabilities.read = vec!["invoice".to_string()];
         any.condition = Condition::Any(vec![no.clone(), total.clone()]);
         let mut not = draft("not", "record");
         not.priority = 10;
@@ -3005,6 +3177,144 @@ mod tests {
 
         let executions = subject.process(&updated).await.unwrap();
 
+        assert_eq!(executions[0].outcome, ExecutionOutcome::Executed);
+    }
+
+    /// A non-script action applies the read set of its rule.
+    ///
+    /// The entity pins the allowed `invoice` schema and the denied `secret`
+    /// schema.
+    /// The action sees `total` and not `code`.
+    /// It sees the `total` change and not the `code` change.
+    /// It sees the `total` snapshot key and not the `code` snapshot key.
+    #[tokio::test]
+    async fn a_non_script_action_reads_only_the_allowed_attributes_and_changes() {
+        let stores = stores().await;
+        let recorder = Arc::new(RecordingAction::new("record"));
+        let subject = engine(&stores, vec![recorder.clone()]);
+        make_invoice_and_secret(&stores.entities, "e1").await;
+        let mut rule = draft("alpha", "record");
+        rule.trigger.events = vec![EntityEventKind::Updated];
+        rule.capabilities.read = vec!["invoice".to_string()];
+        stores.rules.upsert(rule).await.unwrap();
+        let mut updated = event(EntityEventKind::Updated);
+        updated.schemas = vec!["invoice".to_string(), "secret".to_string()];
+        updated.changed = vec![
+            AttributeChange {
+                key: "total".to_string(),
+                old: Some(serde_json::json!(5)),
+                new: Some(serde_json::json!(10)),
+            },
+            AttributeChange {
+                key: "code".to_string(),
+                old: Some(serde_json::json!("s0")),
+                new: Some(serde_json::json!("s1")),
+            },
+        ];
+        updated.snapshot = Some(BTreeMap::from([
+            ("total".to_string(), serde_json::json!(10)),
+            ("code".to_string(), serde_json::json!("s1")),
+        ]));
+
+        let executions = subject.process(&updated).await.unwrap();
+
+        assert_eq!(executions[0].outcome, ExecutionOutcome::Executed);
+        let records = recorder.records();
+        assert_eq!(records.len(), 1);
+        let ctx = &records[0];
+        let entity = ctx.entity.as_ref().expect("the action gets the entity");
+        assert_eq!(
+            entity.attributes.keys().cloned().collect::<Vec<_>>(),
+            vec!["total".to_string()]
+        );
+        assert_eq!(
+            ctx.event
+                .changed
+                .iter()
+                .map(|change| change.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["total"]
+        );
+        let snapshot = ctx
+            .event
+            .snapshot
+            .as_ref()
+            .expect("the event has a snapshot");
+        assert_eq!(
+            snapshot.keys().cloned().collect::<Vec<_>>(),
+            vec!["total".to_string()]
+        );
+    }
+
+    /// A non-script condition applies the read set of its rule.
+    ///
+    /// The entity holds `code` in the denied `secret` schema.
+    /// A `Compare` condition on `code` is false, because the value is hidden.
+    /// A `Compare` condition on `total` is true, because the rule allows
+    /// `invoice`.
+    #[tokio::test]
+    async fn a_non_script_condition_reads_only_the_allowed_attributes() {
+        let stores = stores().await;
+        let recorder = Arc::new(RecordingAction::new("record"));
+        let subject = engine(&stores, vec![recorder.clone()]);
+        make_invoice_and_secret(&stores.entities, "e1").await;
+        let mut denied = draft("denied", "record");
+        denied.trigger.events = vec![EntityEventKind::Updated];
+        denied.condition = Condition::Compare {
+            key: "code".to_string(),
+            op: CompareOp::Eq,
+            value: serde_json::json!("s1"),
+        };
+        stores.rules.upsert(denied).await.unwrap();
+        let mut allowed = draft("allowed", "record");
+        allowed.trigger.events = vec![EntityEventKind::Updated];
+        allowed.capabilities.read = vec!["invoice".to_string()];
+        allowed.condition = Condition::Compare {
+            key: "total".to_string(),
+            op: CompareOp::Eq,
+            value: serde_json::json!(10),
+        };
+        stores.rules.upsert(allowed).await.unwrap();
+        let mut updated = event(EntityEventKind::Updated);
+        updated.schemas = vec!["invoice".to_string(), "secret".to_string()];
+        updated.changed = vec![AttributeChange {
+            key: "code".to_string(),
+            old: Some(serde_json::json!("s0")),
+            new: Some(serde_json::json!("s1")),
+        }];
+
+        let executions = subject.process(&updated).await.unwrap();
+
+        let denied = executions
+            .iter()
+            .find(|item| item.rule_id == "denied")
+            .expect("the denied rule ran");
+        assert_eq!(denied.outcome, ExecutionOutcome::ConditionFalse);
+        let allowed = executions
+            .iter()
+            .find(|item| item.rule_id == "allowed")
+            .expect("the allowed rule ran");
+        assert_eq!(allowed.outcome, ExecutionOutcome::Executed);
+        assert_eq!(recorder.records().len(), 1);
+    }
+
+    /// A noop rule with no data condition runs with an empty read set.
+    ///
+    /// The engine hides every attribute, but the rule still runs and records
+    /// its outcome.
+    #[tokio::test]
+    async fn a_noop_rule_with_no_data_access_still_runs() {
+        let stores = stores().await;
+        let subject = engine(&stores, vec![Arc::new(crate::rules::builtin::NoopAction)]);
+        make_invoice_and_secret(&stores.entities, "e1").await;
+        stores.rules.upsert(draft("alpha", "noop")).await.unwrap();
+
+        let executions = subject
+            .process(&event(EntityEventKind::Created))
+            .await
+            .unwrap();
+
+        assert_eq!(executions.len(), 1);
         assert_eq!(executions[0].outcome, ExecutionOutcome::Executed);
     }
 

@@ -5,6 +5,11 @@
 //! The condition tests one entity state and one event.
 //! The action reference names one registered action.
 //!
+//! A rule declares the schema ids that it may read and write.
+//! The engine applies the read set to a non-script action and a non-script
+//! condition, as it does to a script.
+//! A rule with an empty read set sees no attribute value.
+//!
 //! [`store::RuleStore`](crate::rules::store::RuleStore) stores rules on OxKV.
 //! It keeps one index marker for each trigger event and schema pair.
 //! It lists the rules that match one event.

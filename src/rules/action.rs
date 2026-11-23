@@ -97,6 +97,15 @@ pub trait RuleAction: Send + Sync {
         Ok(())
     }
 
+    /// Returns true when this action reads entity data from its context.
+    ///
+    /// The default is `true`.
+    /// The rule route needs `read` on `eav_entities` for such a rule.
+    /// An action that ignores the context returns `false`.
+    fn reads_entity_data(&self) -> bool {
+        true
+    }
+
     /// Runs this action for one context.
     ///
     /// A failure stops the engine for this event.

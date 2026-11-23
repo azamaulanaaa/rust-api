@@ -131,6 +131,32 @@ impl CancelToken for tokio_util::sync::CancellationToken {
     }
 }
 
+/// The longest single sleep in a cancellation-aware wait.
+///
+/// A shorter slice lets a cancelled task stop before the full delay ends.
+pub(crate) const CANCEL_SLEEP_SLICE: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// Waits for `delay` in short slices and stops when `cancel` fires.
+///
+/// The call checks `cancel` before each slice and after the last slice.
+/// It returns `true` when the token is cancelled.
+/// A zero delay does not sleep and checks the token one time.
+pub(crate) async fn sleep_unless_cancelled<C: CancelToken>(
+    cancel: &C,
+    delay: std::time::Duration,
+) -> bool {
+    let mut remaining = delay;
+    while !remaining.is_zero() {
+        if cancel.is_cancelled() {
+            return true;
+        }
+        let slice = remaining.min(CANCEL_SLEEP_SLICE);
+        tokio::time::sleep(slice).await;
+        remaining = remaining.saturating_sub(slice);
+    }
+    cancel.is_cancelled()
+}
+
 #[cfg(test)]
 mod tests {
     /// Every advisory this project suppresses has a reason on purpose.

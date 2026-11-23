@@ -53,7 +53,7 @@ pub struct RuleDraft {
     pub condition: Condition,
     /// The action to run. The store does not run it.
     pub action: ActionRef,
-    /// The schema ids that the rule script may read and write.
+    /// The schema ids that the rule may read and write.
     #[serde(default)]
     pub capabilities: RuleCapabilities,
 }
@@ -106,13 +106,13 @@ impl RuleDraft {
     }
 }
 
-/// The schema ids that a rule script may read and write.
+/// The schema ids that a rule may read and write.
 ///
 /// An old stored rule without this field gets two empty lists.
 /// An empty list grants no access.
 /// The ids do not need a schema that exists. A rule can be saved before its
 /// schema.
-/// The host enforces the stored lists at run time.
+/// The engine enforces the stored lists at run time.
 /// The author needs the collection grant on `eav_entities`, and the rule
 /// narrows that grant to the listed schemas.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
@@ -136,11 +136,11 @@ impl RuleCapabilities {
         Ok(())
     }
 
-    /// Builds the read-side capability set for the script host.
+    /// Builds the read-side capability set for the rule.
     ///
     /// The call uses only the `read` list.
     /// It returns an invalid-input error for an invalid schema id.
-    /// The write side stays in the rule until the host supports it.
+    /// The script host and the observation filter use the set.
     pub fn to_script_capabilities(&self) -> Result<ScriptCapabilities, RuleError> {
         ScriptCapabilities::new(self.read.iter().cloned())
             .map_err(|error| RuleError::cause(error.to_string(), error))
@@ -187,7 +187,7 @@ pub struct Rule {
     pub condition: Condition,
     /// The action to run. The store does not run it.
     pub action: ActionRef,
-    /// The schema ids that the rule script may read and write.
+    /// The schema ids that the rule may read and write.
     #[serde(default)]
     pub capabilities: RuleCapabilities,
     /// The creation time as a Unix timestamp in seconds.
@@ -309,6 +309,27 @@ impl Condition {
             },
             Self::Changed { key } => event.changed.iter().any(|change| change.key == *key),
             Self::Script { .. } => false,
+        }
+    }
+
+    /// Returns true when this condition holds a non-script data test.
+    ///
+    /// `Compare`, `Exists`, and `Changed` test an attribute value or a change.
+    /// `All`, `Any`, and `Not` return true when a child returns true.
+    /// `Always` and `Script` return false.
+    /// A script obeys the read capability set of its rule.
+    /// A tree deeper than 16 levels returns false.
+    pub fn reads_entity_data(&self) -> bool {
+        if !self.within_depth(MAX_DEPTH) {
+            return false;
+        }
+        match self {
+            Self::Always | Self::Script { .. } => false,
+            Self::Compare { .. } | Self::Exists { .. } | Self::Changed { .. } => true,
+            Self::Not(child) => child.reads_entity_data(),
+            Self::All(children) | Self::Any(children) => {
+                children.iter().any(|child| child.reads_entity_data())
+            }
         }
     }
 
@@ -681,6 +702,39 @@ mod tests {
             }
             .eval(Some(&e), &ev)
         );
+    }
+
+    /// A non-script data test reports that it reads entity data.
+    ///
+    /// `Always` and `Script` report false.
+    /// A logical node reports true when a child reports true.
+    #[test]
+    fn a_non_script_data_test_reports_its_data_access() {
+        let compare = Condition::Compare {
+            key: "total".to_string(),
+            op: CompareOp::Eq,
+            value: serde_json::json!(10),
+        };
+        let changed = Condition::Changed {
+            key: "total".to_string(),
+        };
+        let script = Condition::Script {
+            source: "true".to_string(),
+        };
+
+        assert!(!Condition::Always.reads_entity_data());
+        assert!(!script.reads_entity_data());
+        assert!(compare.reads_entity_data());
+        assert!(
+            Condition::Exists {
+                key: "total".to_string()
+            }
+            .reads_entity_data()
+        );
+        assert!(changed.reads_entity_data());
+        assert!(Condition::Not(Box::new(changed.clone())).reads_entity_data());
+        assert!(Condition::All(vec![Condition::Always, compare.clone()]).reads_entity_data());
+        assert!(!Condition::Any(vec![Condition::Always, script]).reads_entity_data());
     }
 
     /// A snapshot decides the comparison, even when the entity has changed.

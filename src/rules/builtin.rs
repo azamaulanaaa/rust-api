@@ -90,6 +90,11 @@ impl RuleAction for NoopAction {
         "noop"
     }
 
+    /// Returns false, because this action ignores its context.
+    fn reads_entity_data(&self) -> bool {
+        false
+    }
+
     async fn execute(&self, _ctx: ActionContext) -> Result<(), ActionError> {
         Ok(())
     }
@@ -201,6 +206,7 @@ mod tests {
     async fn noop_action_reports_its_kind_and_succeeds() {
         let action = NoopAction;
         assert_eq!(action.kind(), "noop");
+        assert!(!action.reads_entity_data());
         assert!(action.execute(context("noop")).await.is_ok());
     }
 
