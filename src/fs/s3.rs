@@ -264,9 +264,11 @@ pub struct S3ClientConfig {
 
 /// Builds an `Arc<dyn S3Client>` from [`S3ClientConfig`] through
 /// `object_store`.
-pub async fn build_s3_client(
-    config: &S3ClientConfig,
-) -> Result<Arc<dyn S3Client>, object_store::Error> {
+///
+/// # Errors
+///
+/// Returns [`FsError::Internal`] when the object store cannot be built.
+pub async fn build_s3_client(config: &S3ClientConfig) -> Result<Arc<dyn S3Client>, FsError> {
     crate::fs::object_store::build_object_store(config)
 }
 

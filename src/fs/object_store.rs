@@ -519,9 +519,11 @@ pub fn shared_memory_store() -> Arc<InMemory> {
 }
 
 /// Builds object store client.
-pub fn build_object_store(
-    config: &S3ClientConfig,
-) -> Result<Arc<dyn S3Client>, object_store::Error> {
+///
+/// # Errors
+///
+/// Returns [`FsError::Internal`] when the object store cannot be built.
+pub fn build_object_store(config: &S3ClientConfig) -> Result<Arc<dyn S3Client>, FsError> {
     if config.backend == S3Backend::Memory {
         let inner = shared_memory_store();
         return Ok(Arc::new(ObjectStoreClient {
@@ -531,7 +533,9 @@ pub fn build_object_store(
             is_memory: false,
         }));
     }
-    let store = s3_builder(config).build()?;
+    let store = s3_builder(config)
+        .build()
+        .map_err(|e| FsError::Internal(format!("failed to build S3 client: {e}")))?;
     Ok(Arc::new(ObjectStoreClient::new_combined(Arc::new(store))))
 }
 

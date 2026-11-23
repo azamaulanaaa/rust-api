@@ -61,7 +61,7 @@ async fn init_upload(
     body: ValidatedJson<InitRequest>,
 ) -> Result<HttpResponse, FsError> {
     let file_id = engine.init_upload(body.into_inner(), &claims.sub).await?;
-    Ok(HttpResponse::Created().json(serde_json::json!({ "file_id": file_id })))
+    Ok(HttpResponse::Created().json(InitResponse { file_id }))
 }
 
 #[utoipa::path(put, path = "/fs/uploads/{id}/parts/{idx}", tag = "fs", params(("id" = String, Path), ("idx" = u64, Path)), request_body(content = Vec<u8>, content_type = "application/octet-stream"), responses((status=204, description="part stored"), (status=401, body=crate::http::error::ErrorBody)))]
@@ -115,7 +115,7 @@ async fn complete_upload(
     engine
         .complete_upload(&id, body.into_inner(), &claims.sub)
         .await?;
-    Ok(HttpResponse::Ok().json(serde_json::json!({ "file_id": id })))
+    Ok(HttpResponse::Ok().json(InitResponse { file_id: id }))
 }
 
 #[utoipa::path(delete, path = "/fs/uploads/{id}", tag = "fs", params(("id" = String, Path)), responses((status=204, description="cancelled")))]
