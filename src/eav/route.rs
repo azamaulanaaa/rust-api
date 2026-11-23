@@ -60,12 +60,6 @@ pub(crate) const ENTITY_ROW: &str = "entity";
 const DEFAULT_PAGE_LIMIT: usize = 50;
 /// The maximum page size of a list route.
 const MAX_PAGE_LIMIT: usize = 200;
-/// The maximum count of raw pages that one cursor page reads.
-///
-/// The route checks a grant on each row.
-/// A raw page can hold no visible row.
-/// The route then reads the next raw page, up to this count.
-const CURSOR_SCAN_BATCH: usize = 4;
 /// The default count of entities that a revalidation checks.
 const DEFAULT_REVALIDATE_LIMIT: usize = 100;
 /// The maximum count of entities that a revalidation checks.
@@ -1161,8 +1155,10 @@ async fn query_entities(
 /// Reads one cursor page of referrer ids and keeps only the rows that the
 /// caller can read.
 ///
-/// The call reads at most [`CURSOR_SCAN_BATCH`] raw pages.
-/// It stops when the visible page is full or the raw scan ends.
+/// The call reads raw pages until the visible page is full or the raw scan
+/// ends.
+/// A raw page can hold only rows that the caller cannot read, so a fixed raw
+/// page budget could miss a later visible row.
 /// The returned cursor is the last visible source id.
 /// A raw cursor stays inside this function, so `next` never names a row that
 /// the caller cannot read.
@@ -1176,7 +1172,7 @@ async fn visible_referrer_page(
 ) -> Result<(Vec<String>, Option<String>), EavApiError> {
     let mut items: Vec<String> = Vec::with_capacity(limit);
     let mut cursor = after;
-    for _ in 0..CURSOR_SCAN_BATCH {
+    loop {
         let (raw, raw_next) = runtime
             .entities()
             .list_referrers_after(target_id, limit, cursor.as_deref())
@@ -1199,7 +1195,6 @@ async fn visible_referrer_page(
             None => return Ok((items, None)),
         }
     }
-    Ok((items, None))
 }
 
 /// Lists the distinct entity ids that reference one entity.
@@ -4647,6 +4642,42 @@ mod tests {
         assert_eq!(res.status(), http::StatusCode::OK);
         let page: Value = actix_test::read_body_json(res).await;
         assert_eq!(page["items"], json!(["c"]));
+        assert!(page["next"].is_null());
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn referrers_scan_past_more_unreadable_rows_than_one_batch() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        publish_node_schema(&fx).await?;
+        create_node(&fx, "root", None).await?;
+        for index in 0..10 {
+            create_node(&fx, &format!("hidden{index:02}"), Some("root")).await?;
+        }
+        create_node(&fx, "visible", Some("root")).await?;
+        fx.engine
+            .assign_group("carol".into(), "row-readers".into())
+            .await?;
+        for id in ["root", "visible"] {
+            fx.engine
+                .add_rule("row-readers".into(), format!("entity:{id}"), Action::Read)
+                .await?;
+        }
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+
+        let res = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::get().uri("/eav/entities/root/referrers?limit=1&after="),
+                &fx.token("carol")?,
+            )
+            .to_request(),
+        )
+        .await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let page: Value = actix_test::read_body_json(res).await;
+        assert_eq!(page["items"], json!(["visible"]));
         assert!(page["next"].is_null());
         Ok(())
     }

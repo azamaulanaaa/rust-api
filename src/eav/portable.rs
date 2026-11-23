@@ -841,6 +841,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_import_rejects_an_entity_with_no_pinned_schema() -> anyhow::Result<()> {
+        let file = concat!(
+            "{\"kind\":\"header\",\"format\":1}\n",
+            "{\"kind\":\"schema\",\"schema\":{\"id\":\"person\",\"version\":1,\"extends\":[],\"attributes\":{},\"created_at\":0}}\n",
+            "{\"kind\":\"entity\",\"entity\":{\"id\":\"e1\",\"version\":1,\"schemas\":[],\"attributes\":{},\"created_at\":0,\"updated_at\":0}}\n",
+            "{\"kind\":\"end\",\"schemas\":1,\"entities\":1,\"rules\":0}\n",
+        );
+        let (schemas, entities, rules, _) = triple().await;
+        let result = import(&schemas, &entities, &rules, file.as_bytes()).await;
+        assert!(
+            matches!(
+                &result,
+                Err(PortableError::Entity(EntityError::Invalid(message)))
+                    if message == "entity e1 pins no schema"
+            ),
+            "the import must reject an entity with no schema: {result:?}"
+        );
+        assert!(
+            schemas.versions().await?.is_empty(),
+            "the failed import must remove the schema keys"
+        );
+        assert!(entities.is_empty().await?, "the import wrote no entity");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_import_rejects_two_versions_of_one_schema_id() -> anyhow::Result<()> {
+        let file = concat!(
+            "{\"kind\":\"header\",\"format\":1}\n",
+            "{\"kind\":\"schema\",\"schema\":{\"id\":\"person\",\"version\":1,\"extends\":[],\"attributes\":{},\"created_at\":0}}\n",
+            "{\"kind\":\"schema\",\"schema\":{\"id\":\"person\",\"version\":2,\"extends\":[],\"attributes\":{},\"created_at\":0}}\n",
+            "{\"kind\":\"entity\",\"entity\":{\"id\":\"e1\",\"version\":1,\"schemas\":[{\"id\":\"person\",\"version\":1},{\"id\":\"person\",\"version\":2}],\"attributes\":{},\"created_at\":0,\"updated_at\":0}}\n",
+            "{\"kind\":\"end\",\"schemas\":2,\"entities\":1,\"rules\":0}\n",
+        );
+        let (schemas, entities, rules, _) = triple().await;
+        let result = import(&schemas, &entities, &rules, file.as_bytes()).await;
+        assert!(
+            matches!(
+                &result,
+                Err(PortableError::Entity(EntityError::Invalid(message)))
+                    if message == "entity e1 pins schema person twice"
+            ),
+            "the import must reject two versions of one schema id: {result:?}"
+        );
+        assert!(
+            schemas.versions().await?.is_empty(),
+            "the failed import must remove the schema keys"
+        );
+        assert!(entities.is_empty().await?, "the import wrote no entity");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn an_invalid_version_sequence_writes_nothing() -> anyhow::Result<()> {
         let file = concat!(
             "{\"kind\":\"header\",\"format\":1}\n",

@@ -305,8 +305,22 @@ const EXECUTION_GC_BATCH: usize = 200;
 #[cfg(test)]
 const EXECUTION_GC_BATCH: usize = 2;
 
-/// The key that holds the last entity id of a committed rebuild page.
+/// The key that holds the scope and the last entity id of a committed
+/// rebuild page.
 const REBUILD_CURSOR_KEY: &str = "idx:rebuild:cursor";
+
+/// The saved position of an interrupted index rebuild.
+///
+/// `scope` is the schema filter of the rebuild.
+/// `after` is the last entity id of the committed page.
+/// A later run ignores the record when the scope differs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct RebuildCursor {
+    /// The schema filter of the rebuild.
+    scope: Option<String>,
+    /// The last entity id of the committed page.
+    after: String,
+}
 
 /// The largest number of entities that one rebuild page reads.
 #[cfg(not(test))]
@@ -2310,6 +2324,7 @@ impl EntityStore {
     /// Checks stored entities against a target schema version.
     ///
     /// The call reads at most `limit` entities that pin `schema_id`.
+    /// The call ignores an entity that pins only a child schema.
     /// The scan starts after the `after` id when the caller gives a cursor.
     /// It changes no key, no entity version, and no pinned schema.
     /// The check applies the schema defaults.
@@ -2341,8 +2356,12 @@ impl EntityStore {
         }
 
         let (entities, next) = self.list_by_schema_after(schema_id, limit, after).await?;
+        let candidates: Vec<Entity> = entities
+            .into_iter()
+            .filter(|entity| entity.schemas.iter().any(|schema| schema.id == schema_id))
+            .collect();
         let outcomes = self
-            .dry_run_outcomes(schema_id, target_version, &entities)
+            .dry_run_outcomes(schema_id, target_version, &candidates)
             .await?;
         let mut report = RevalidationReport {
             scanned: 0,
@@ -2350,7 +2369,7 @@ impl EntityStore {
             invalid: Vec::new(),
             next,
         };
-        for (entity, outcome) in entities.iter().zip(outcomes) {
+        for (entity, outcome) in candidates.iter().zip(outcomes) {
             report.scanned += 1;
             match outcome {
                 DryRunOutcome::Migrated | DryRunOutcome::Unchanged => report.compatible += 1,
@@ -2499,6 +2518,9 @@ impl EntityStore {
     /// A missing target version is [`EntityError::UnknownSchema`].
     /// The report holds the cursor for the next page.
     /// A `limit` of 0 returns an empty report.
+    /// The call reads at most `limit` entities that pin `schema_id`.
+    /// The call ignores an entity that pins only a child schema.
+    /// The scan starts after the `after` id when the caller gives a cursor.
     /// When the target version marks an attribute unique, a dry run also
     /// checks every entity that pins `schema_id`, so that a duplicate value
     /// across two pages is visible. That pass ignores `limit` and costs one
@@ -2536,12 +2558,16 @@ impl EntityStore {
         }
 
         let (entities, next) = self.list_by_schema_after(schema_id, limit, after).await?;
+        let candidates: Vec<Entity> = entities
+            .into_iter()
+            .filter(|entity| entity.schemas.iter().any(|schema| schema.id == schema_id))
+            .collect();
         report.next = next;
         if dry_run {
             let outcomes = self
-                .dry_run_outcomes(schema_id, target_version, &entities)
+                .dry_run_outcomes(schema_id, target_version, &candidates)
                 .await?;
-            for (entity, outcome) in entities.iter().zip(outcomes) {
+            for (entity, outcome) in candidates.iter().zip(outcomes) {
                 report.scanned += 1;
                 match outcome {
                     DryRunOutcome::Migrated => report.migrated += 1,
@@ -2555,10 +2581,6 @@ impl EntityStore {
             return Ok(report);
         }
 
-        let candidates: Vec<Entity> = entities
-            .into_iter()
-            .filter(|entity| entity.schemas.iter().any(|schema| schema.id == schema_id))
-            .collect();
         report.scanned = candidates.len();
         let applied = self
             .apply_schema_migration_batch(&candidates, schema_id, target_version, ctx)
@@ -3961,6 +3983,12 @@ impl EntityStore {
                 entity.id
             )));
         }
+        if entity.schemas.is_empty() {
+            return Err(EntityError::Invalid(format!(
+                "entity {} pins no schema",
+                entity.id
+            )));
+        }
         let effective = self.resolve_import_refs(entity).await?;
         let merged = merge_schemas(&effective)?;
         check_known(&entity.attributes, &merged.attributes)?;
@@ -3987,15 +4015,25 @@ impl EntityStore {
     }
 
     /// Resolves the pinned schema versions of one import record.
+    ///
+    /// The call rejects an import record that pins no schema.
+    /// The call rejects an import record that pins one schema id twice at any
+    /// version.
     async fn resolve_import_refs(
         &self,
         entity: &Entity,
     ) -> Result<Vec<EffectiveSchema>, EntityError> {
+        if entity.schemas.is_empty() {
+            return Err(EntityError::Invalid(format!(
+                "entity {} pins no schema",
+                entity.id
+            )));
+        }
         let mut seen = BTreeSet::new();
         let mut effective = Vec::with_capacity(entity.schemas.len());
         for schema in &entity.schemas {
             validate_name("schema id", &schema.id)?;
-            if !seen.insert((schema.id.clone(), schema.version)) {
+            if !seen.insert(schema.id.clone()) {
                 return Err(EntityError::Invalid(format!(
                     "entity {} pins schema {} twice",
                     entity.id, schema.id
@@ -4023,6 +4061,8 @@ impl EntityStore {
     /// It then reads the entities in id order, one page at a time.
     /// Each page rewrites the index rows in one transaction.
     /// The call keeps a cursor after each page, so a later run resumes.
+    /// The cursor records the schema filter of the run.
+    /// A later run ignores a cursor from a different filter.
     /// The cursor is removed after the last page.
     /// A second run writes the same rows and changes no value.
     /// With `schema`, the call rewrites only the entities that pin that schema.
@@ -4082,14 +4122,16 @@ impl EntityStore {
                 .await
                 .map_err(EntityError::Store)?
             {
-                Some(bytes) => serde_json::from_slice::<String>(&bytes).ok(),
+                Some(bytes) => serde_json::from_slice::<RebuildCursor>(&bytes)
+                    .ok()
+                    .filter(|cursor| cursor.scope.as_deref() == schema),
                 None => None,
             }
         };
-        report.resumed_after = resume.clone();
+        report.resumed_after = resume.as_ref().map(|cursor| cursor.after.clone());
         let mut cursor = resume
-            .as_deref()
-            .map(|id| format!("{ENTITY_INDEX_PREFIX}{id}\0"))
+            .as_ref()
+            .map(|cursor| format!("{ENTITY_INDEX_PREFIX}{}\0", cursor.after))
             .unwrap_or_else(|| ENTITY_INDEX_PREFIX.to_string());
         let end = KeyPrefix::new(ENTITY_INDEX_PREFIX).upper_bound();
 
@@ -4185,7 +4227,11 @@ impl EntityStore {
                     tx.commit().await.map_err(EntityError::Store)?;
                     report.pages += 1;
                     if let Some(id) = &last_id {
-                        let bytes = serde_json::to_vec(id)
+                        let record = RebuildCursor {
+                            scope: schema.map(str::to_string),
+                            after: id.clone(),
+                        };
+                        let bytes = serde_json::to_vec(&record)
                             .map_err(|e| EntityError::Internal(e.to_string()))?;
                         g.put_bytes(REBUILD_CURSOR_KEY, &bytes)
                             .await
@@ -10733,6 +10779,78 @@ mod tests {
         assert!(report.invalid.is_empty());
         assert!(report.dry_run);
         assert_eq!(store.get("e1").await.unwrap(), Some(created));
+    }
+
+    #[tokio::test]
+    async fn a_migration_ignores_an_entity_that_pins_only_a_child_schema() {
+        let (store, registry, _raw) = new_store().await;
+        registry.publish(schema("base", &[], vec![])).await.unwrap();
+        registry
+            .publish(schema("child", &["base"], vec![]))
+            .await
+            .unwrap();
+        store
+            .create(draft("e1", &["child"], vec![]), &ctx())
+            .await
+            .unwrap();
+        registry.publish(schema("base", &[], vec![])).await.unwrap();
+
+        let dry_run = store
+            .migrate_schema("base", 2, 100, None, true, &ctx())
+            .await
+            .unwrap();
+        assert_eq!(dry_run.scanned, 0);
+        assert_eq!(dry_run.migrated, 0);
+        assert_eq!(dry_run.unchanged, 0);
+        assert!(dry_run.invalid.is_empty());
+
+        let revalidation = store
+            .revalidation_report("base", 2, 100, None)
+            .await
+            .unwrap();
+        assert_eq!(revalidation.scanned, 0);
+        assert_eq!(revalidation.compatible, 0);
+        assert!(revalidation.invalid.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_rebuild_ignores_a_cursor_from_another_schema_scope() {
+        let (store, registry, raw) = new_store().await;
+        registry
+            .publish(schema("alpha", &[], vec![]))
+            .await
+            .unwrap();
+        registry.publish(schema("beta", &[], vec![])).await.unwrap();
+        store
+            .create(draft("a", &["alpha"], vec![]), &ctx())
+            .await
+            .unwrap();
+        store
+            .create(draft("b", &["beta"], vec![]), &ctx())
+            .await
+            .unwrap();
+
+        let bytes = serde_json::to_vec(&RebuildCursor {
+            scope: Some("alpha".to_string()),
+            after: "b".to_string(),
+        })
+        .unwrap();
+        raw.set_bytes(REBUILD_CURSOR_KEY, &bytes).await.unwrap();
+
+        let report = store.rebuild_indexes(Some("beta")).await.unwrap();
+
+        assert!(
+            report.resumed_after.is_none(),
+            "the beta rebuild must ignore the alpha cursor"
+        );
+        assert_eq!(
+            report.entities, 1,
+            "the beta rebuild must not skip an entity before the alpha cursor"
+        );
+        assert!(
+            raw.get_bytes(REBUILD_CURSOR_KEY).await.unwrap().is_none(),
+            "the finished rebuild must remove the cursor"
+        );
     }
 
     #[tokio::test]

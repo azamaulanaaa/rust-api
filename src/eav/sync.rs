@@ -27,6 +27,8 @@
 //! A build holds at most `MAX_REPLICA_ENTITIES` visible entities.
 //! The current limit is 100,000.
 //! A build that exceeds the limit stops the entity scan and returns `400`.
+//! The build scans at most `MAX_REPLICA_SCAN_ENTITIES` entities.
+//! A build that exceeds the scan limit returns `400`.
 //! The build writes no snapshot, so the stored replica stays unchanged.
 //! A change that commits after the head can appear in the snapshot.
 //! An apply must be idempotent and version-aware.
@@ -119,6 +121,11 @@ const MAX_REPLICA_ENTITIES: usize = 100_000;
 /// A small entity cap in tests, so a build can exceed it.
 #[cfg(test)]
 const MAX_REPLICA_ENTITIES: usize = 2;
+/// The largest number of entities that one replica build scans.
+///
+/// The build checks the caller grant on each scanned entity.
+/// The bound stops a caller with no grant from scanning the full store.
+const MAX_REPLICA_SCAN_ENTITIES: usize = MAX_REPLICA_ENTITIES * 10;
 /// The largest serialized byte size of one replica build.
 #[cfg(not(test))]
 const REPLICA_BUILD_MAX_BYTES: usize = 64 * 1024 * 1024;
@@ -659,6 +666,8 @@ fn replica_entity_limit(runtime: &EavRuntime) -> usize {
 /// The build holds at most `MAX_REPLICA_ENTITIES` visible entities.
 /// The current limit is 100,000.
 /// A build that exceeds the limit stops the entity scan and returns `400`.
+/// The build scans at most `MAX_REPLICA_SCAN_ENTITIES` entities.
+/// A build that exceeds the scan limit returns `400`.
 /// The build serializes each chunk as it fills and holds the total serialized
 /// size under `REPLICA_BUILD_MAX_BYTES`.
 /// A build that exceeds the byte limit returns `400`.
@@ -709,6 +718,7 @@ async fn build_replica_inner(
         let mut chunk_bytes = 0usize;
         let mut pending: Vec<Entity> = Vec::new();
         let mut count = 0;
+        let mut scanned: usize = 0;
         let mut after: Option<String> = None;
         loop {
             let (page, next) = runtime
@@ -716,8 +726,14 @@ async fn build_replica_inner(
                 .list_after(REPLICA_PAGE, after.as_deref())
                 .await?;
             for entity in page {
+                scanned = scanned.saturating_add(1);
                 #[cfg(test)]
                 runtime.replica_test().count_read();
+                if scanned > MAX_REPLICA_SCAN_ENTITIES {
+                    return Err(EavApiError::Invalid(Box::new(ReplicaBuildTooLarge(
+                        "replica build exceeds the scan limit",
+                    ))));
+                }
                 if can_read_entity(&policy, &claims.sub, &entity.id).await? {
                     count += 1;
                     if count > entity_limit {
@@ -2289,6 +2305,36 @@ mod tests {
             fx.runtime.replica_test().read() < 5,
             "the scan read every entity before it stopped"
         );
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn a_replica_build_stops_reading_at_the_scan_limit_without_a_grant() -> anyhow::Result<()>
+    {
+        let fx = fixture().await?;
+        publish_task_schema(&fx).await?;
+        for index in 0..=MAX_REPLICA_SCAN_ENTITIES {
+            create_entity(&fx, &format!("e{index:02}")).await?;
+        }
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+
+        let res = post_replica!(&app, &token).await;
+
+        assert_eq!(res.status(), http::StatusCode::BAD_REQUEST);
+        let body: crate::http::error::ErrorBody = actix_test::read_body_json(res).await;
+        assert_eq!(body.code.as_deref(), Some("invalid_request"));
+        assert_eq!(
+            ReplicaBuildTooLarge("replica build exceeds the scan limit").to_string(),
+            "replica build exceeds the scan limit"
+        );
+        assert_eq!(
+            fx.runtime.replica_test().read(),
+            MAX_REPLICA_SCAN_ENTITIES + 1,
+            "the scan must stop at the entity that passes the scan limit"
+        );
+        assert_eq!(fx.runtime.replicas().get("alice").await?, None);
         Ok(())
     }
 
