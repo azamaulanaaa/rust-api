@@ -1541,6 +1541,34 @@ serve_readiness_check() {
   return 0
 }
 
+# Report whether the guest mounted the cache disk at /cache.
+# The session mode uses one exec session. The fallback mode uses the
+# buffered exec endpoint. Return 0 when /cache is mounted. Return 1
+# when it is not mounted or the check did not run.
+serve_cache_mount_check() {
+  local worker="$1"
+  local purpose="${2:-cache-mount}"
+
+  if ((SERVE_SESSION_MODE == 1)); then
+    if ! serve_session_run "$worker" "$purpose" "mountpoint -q /cache"; then
+      return 1
+    fi
+    [[ "$SERVE_SESSION_EXIT_CODE" == "0" ]]
+    return
+  fi
+
+  local response
+  local code=""
+  if ! response="$(serve_request_ok "check cache mount" POST \
+    "/api/v1/machines/${worker}/exec" \
+    -H 'content-type: application/json' \
+    -d '{"command":["bash","-lc","mountpoint -q /cache"],"timeoutSecs":'"$SERVE_EXEC_TIMEOUT_SECS"'}')"; then
+    return 1
+  fi
+  code="$(serve_exec_rc "$response")"
+  [[ "$code" == "0" ]]
+}
+
 # Run one command in a machine on the remote server.
 # Upload the live working tree as an archive before the command runs.
 # Set SERVE_GUEST_RC to the guest exit code on success.
@@ -1914,22 +1942,42 @@ serve_run_remote() {
     fi
   fi
 
+  # Check the /cache mount before the publish. A cache disk with no
+  # mount cannot hold a usable base. Skip the publish in that case so
+  # the client does not save an empty base.
+  local cache_mounted=0
+  if [[ "$SERVE_CACHE_ATTACHED" == "1" ]]; then
+    if serve_cache_mount_check "$worker"; then
+      cache_mounted=1
+    fi
+  fi
+
   # Publish the content-keyed base when the run attached the seed. A
   # run that attached the content-keyed base uses the published base
   # and publishes nothing.
   if [[ "$SERVE_CACHE_ATTACHED" == "1" && "$SERVE_CACHE_ATTACHED_NAME" != "$cache_base" ]]; then
-    if ! serve_publish_cache_disk "$worker" "$cache_base"; then
-      return 1
-    fi
-    local ready2_log
-    ready2_log="$(mktemp "${TMPDIR:-/tmp}/smolvm-ready.XXXXXX")" || return 1
-    if ! serve_readiness_check "$worker" "$ready2_log" ready2; then
+    if ((cache_mounted == 0)); then
+      echo "warning: The guest has no /cache mount. The client does not publish the cache base." >&2
+      echo "warning: Recreate the seed base with a non-zero size. See docs/smolvm.md." >&2
+    else
+      if ! serve_publish_cache_disk "$worker" "$cache_base"; then
+        return 1
+      fi
+      local ready2_log
+      ready2_log="$(mktemp "${TMPDIR:-/tmp}/smolvm-ready.XXXXXX")" || return 1
+      if ! serve_readiness_check "$worker" "$ready2_log" ready2; then
+        rm -f "$ready2_log"
+        return 1
+      fi
       rm -f "$ready2_log"
-      return 1
     fi
-    rm -f "$ready2_log"
   elif [[ "$SERVE_CACHE_ATTACHED" == "1" ]]; then
-    echo "note: the run used the published base ${cache_base}." >&2
+    if ((cache_mounted == 0)); then
+      echo "warning: The guest has no /cache mount. The client does not publish the cache base." >&2
+      echo "warning: The published base ${SERVE_CACHE_ATTACHED_NAME} is not usable. Delete it and run again." >&2
+    else
+      echo "note: the run used the published base ${cache_base}." >&2
+    fi
   fi
 
   if ((SERVE_SESSION_MODE == 1)); then

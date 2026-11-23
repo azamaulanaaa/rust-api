@@ -383,10 +383,11 @@ database.
   default is `1`. The value must be `0` or `1`. See
   [Cache disk](#cache-disk).
 - `SMOLVM_SERVE_CACHE_SEED` names the blank base that builds a missing
-  content base. The default is `smolvm-seed.qcow2`. An empty value
-  disables the seed attempt. The value is a bare file name of at most
-  128 characters: letters, digits, hyphens, underscores, and the suffix
-  `.qcow2`, `.img`, or `.raw`. See [Cache disk](#cache-disk).
+  content base. The default is `smolvm-seed.qcow2`. The base must have a
+  non-zero size. An empty value disables the seed attempt. The value is
+  a bare file name of at most 128 characters: letters, digits, hyphens,
+  underscores, and the suffix `.qcow2`, `.img`, or `.raw`. See
+  [Cache disk](#cache-disk).
 - `SMOLVM_SERVE_SYNC_DIR` sends one local directory to the machine in
   addition to the worktree archive. `SMOLVM_SERVE_SYNC_TARGET` names the
   absolute guest path for it. The default is `/workspace`. See
@@ -661,26 +662,56 @@ downloads. The init script prints `smolvm-init-mode=warm` then. A cold
 machine prints `smolvm-init-mode=cold` and downloads everything. The
 client prints the init duration on every remote run.
 
-The seed base builds the first content base. Seed it once on the
-server: create one empty file in the server's cache disk directory. A
-blank base is valid; the runtime formats it as ext4 at the mount path.
-The default name is `smolvm-seed.qcow2`. On a Windows server, run one
-of these commands:
-
-```text
-cmd:        type nul > C:\cache\smolvm\smolvm-seed.qcow2
-PowerShell: New-Item -ItemType File C:\cache\smolvm\smolvm-seed.qcow2
-```
+The seed base builds the first content base. Create it once on the
+server with a non-zero size. The default name is `smolvm-seed.qcow2`.
+The base must have a non-zero size. A zero-byte base attaches as a
+zero-byte disk. The guest does not mount `/cache`, and the run is cold.
+The runtime formats a blank sized base as ext4 at the mount path.
 
 On a POSIX server, run this command:
 
 ```text
-: > /path/to/cache-dir/smolvm-seed.qcow2
+truncate -s 20G /path/to/cache-dir/smolvm-seed.qcow2
+```
+
+On a Windows server, run one of these commands:
+
+```text
+cmd:        fsutil file createnew C:\cache\smolvm\smolvm-seed.qcow2 21474836480
+PowerShell: fsutil file createnew C:\cache\smolvm\smolvm-seed.qcow2 21474836480
 ```
 
 Set `SMOLVM_SERVE_CACHE_SEED` to another bare file name. An empty
 value turns the seed attempt off. The seed name has no owner token, so
 the clean step never derives it.
+
+The kernel command line on a remote machine carries
+`SMOLVM_CACHE_DISK=<device>:<mount>`. The init script reads this value.
+It stops before provisioning when the named block device is missing or
+has zero size. The error lines name the setting and the docs. To run
+without the cache disk, set `SMOLVM_SERVE_CACHE=0`.
+
+The init script runs `sync` before the final line when it mounted the
+cache disk. The client stops the machine after that, so the published
+base holds the recent writes. The client also checks for the `/cache`
+mount before the publish. When the mount is absent, it prints a warning
+and skips the publish. It does not save another empty base.
+
+##### Recover from a zero-byte seed
+
+A zero-byte seed produces a zero-byte disk. The guest never mounts
+`/cache`, and every publish makes an empty base of 192 KiB. The base
+names are immutable, so the client attaches the same empty base until
+you delete it.
+
+1. Stop and delete every machine that uses the seed base.
+2. Replace the seed with a sized file. Use one command above.
+3. Delete the empty 192 KiB bases for the owner. Run `make smolvm-clean`
+    with `SMOLVM_ADDR` and `SMOLVM_OWNER` set:
+    `SMOLVM_ADDR=<addr> SMOLVM_OWNER=<owner> make smolvm-clean`. The
+    clean step derives the bases for the current repository state only.
+    Delete other empty bases by hand on the server.
+4. Run one remote command. The run builds a good base.
 
 The create sequence with caching on:
 
@@ -694,12 +725,15 @@ The create sequence with caching on:
 5. Any other failure stops the run with the status and the message.
 
 The publish rule: after a successful init, the client publishes the
-content base when the machine attached the seed. It stops the machine,
-publishes, and starts the machine again. A publish answer of 409 names
-a base that exists already. The client treats that answer as success. A
-run that attached the content base skips the publish and prints one
-`note:` line. A publish that fails another way prints the status and
-the message and one warning, and the run continues.
+content base when the machine attached the seed. It checks the `/cache`
+mount first. When the guest has no mount, it prints a warning and skips
+the publish. Otherwise it stops the machine, publishes, and starts the
+machine again. A publish answer of 409 names a base that exists
+already. The client treats that answer as success. A run that attached
+the content base skips the publish and prints one `note:` line. When
+that base has no `/cache` mount, the client prints a warning that the
+base is not usable. A publish that fails another way prints the status
+and the message and one warning, and the run continues.
 
 One limit stays: later writes to a published base are not published
 again. A provisioning change must change the hash to build a new base.
