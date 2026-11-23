@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use rust_api::fs::s3::{S3Backend, S3ClientConfig};
-use rust_api::reactive::{ReactiveContext, ReactiveService};
+use rust_api::reactive::{ReactiveContext, ReactiveError, ReactiveService};
 use rust_api::{db, fs, policy, sync};
 use tokio_util::sync::CancellationToken;
 
@@ -28,12 +28,12 @@ impl ReactiveService for ExampleReactiveService {
         // happens in `run`.
     }
 
-    async fn run(&self, ctx: ReactiveContext) -> anyhow::Result<()> {
+    async fn run(&self, ctx: ReactiveContext) -> Result<(), ReactiveError> {
         // Build a store from the shared runtime configuration. An
         // application would scope this prefix to its own domain.
         let store = db::build_s3_store(&ctx.s3, &format!("{}/reactive-example", ctx.db_prefix))
             .await
-            .map_err(|e| anyhow::anyhow!("build reactive store: {e}"))?;
+            .map_err(|e| ReactiveError::new("reactive-example", e))?;
 
         struct ExampleObserver;
 
