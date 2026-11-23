@@ -73,39 +73,9 @@ impl DependencyHealth {
         self.s3.load(Ordering::Relaxed)
     }
 
-    /// Returns the last-known S3 reachability.
-    pub fn s3_ok(&self) -> bool {
-        self.s3()
-    }
-
-    /// Returns the last-known S3 reachability.
-    pub fn s3_healthy(&self) -> bool {
-        self.s3()
-    }
-
-    /// Returns the last-known S3 reachability.
-    pub fn is_s3_healthy(&self) -> bool {
-        self.s3()
-    }
-
     /// Returns the last-known OIDC reachability.
     pub fn oidc(&self) -> bool {
         self.oidc.load(Ordering::Relaxed)
-    }
-
-    /// Returns the last-known OIDC reachability.
-    pub fn oidc_ok(&self) -> bool {
-        self.oidc()
-    }
-
-    /// Returns the last-known OIDC reachability.
-    pub fn oidc_healthy(&self) -> bool {
-        self.oidc()
-    }
-
-    /// Returns the last-known OIDC reachability.
-    pub fn is_oidc_healthy(&self) -> bool {
-        self.oidc()
     }
 
     /// Returns `true` when both dependencies were reachable at the last probe.
@@ -113,49 +83,14 @@ impl DependencyHealth {
         self.s3() && self.oidc()
     }
 
-    /// Returns `true` when both dependencies were reachable at the last probe.
-    pub fn all_ok(&self) -> bool {
-        self.is_healthy()
-    }
-
-    /// Returns `true` when both dependencies were reachable at the last probe.
-    pub fn healthy(&self) -> bool {
-        self.is_healthy()
-    }
-
-    /// Returns `true` when both dependencies were reachable at the last probe.
-    pub fn ok(&self) -> bool {
-        self.is_healthy()
-    }
-
     /// Stores the last-known S3 reachability.
     pub fn set_s3(&self, value: bool) {
         self.s3.store(value, Ordering::Relaxed);
     }
 
-    /// Stores the last-known S3 reachability.
-    pub fn set_s3_ok(&self, value: bool) {
-        self.set_s3(value);
-    }
-
-    /// Stores the last-known S3 reachability.
-    pub fn set_s3_healthy(&self, value: bool) {
-        self.set_s3(value);
-    }
-
     /// Stores the last-known OIDC reachability.
     pub fn set_oidc(&self, value: bool) {
         self.oidc.store(value, Ordering::Relaxed);
-    }
-
-    /// Stores the last-known OIDC reachability.
-    pub fn set_oidc_ok(&self, value: bool) {
-        self.set_oidc(value);
-    }
-
-    /// Stores the last-known OIDC reachability.
-    pub fn set_oidc_healthy(&self, value: bool) {
-        self.set_oidc(value);
     }
 
     /// Spawns a background task that refreshes both flags periodically.

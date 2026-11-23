@@ -120,9 +120,8 @@ where
             "http.request.method" = %method,
             "url.path" = %req.path(),
             "http.response.status_code" = Empty,
+            "otel.status_code" = Empty,
             "latency.ms" = Empty,
-            "request.id" = Empty,
-            "request_id" = Empty,
             "http.request.id" = Empty,
         );
 
@@ -163,7 +162,58 @@ where
     }
 }
 
-/// Re-exported request id types for callers that expect them here.
-pub use crate::http::middleware::request_id::{
-    RequestID, RequestIDMiddleware, RequestId, RequestIdMiddleware,
-};
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use actix_web::{App, HttpResponse, http::StatusCode, test, web};
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::prelude::*;
+
+    /// Collects the names of the fields that a span records.
+    #[derive(Clone, Default)]
+    struct RecordedFields(Arc<Mutex<Vec<String>>>);
+
+    /// Collects one field name from a record call.
+    struct NameVisitor(Arc<Mutex<Vec<String>>>);
+
+    impl tracing::field::Visit for NameVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, _: &dyn std::fmt::Debug) {
+            self.0.lock().unwrap().push(field.name().to_string());
+        }
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RecordedFields {
+        fn on_record(
+            &self,
+            _span: &tracing::Id,
+            values: &tracing::span::Record<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            values.record(&mut NameVisitor(Arc::clone(&self.0)));
+        }
+    }
+
+    /// A 5xx response records the error status on the request span.
+    #[actix_web::test]
+    async fn server_errors_record_the_otel_status_field() {
+        let names = RecordedFields::default();
+        let subscriber = tracing_subscriber::registry().with(names.clone());
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let app = test::init_service(App::new().wrap(RequestTracingMiddleware).route(
+            "/fail",
+            web::get().to(|| async { HttpResponse::InternalServerError().finish() }),
+        ))
+        .await;
+
+        let req = test::TestRequest::get().uri("/fail").to_request();
+        let res = test::call_service(&app, req).await;
+        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let recorded = names.0.lock().unwrap();
+        assert!(
+            recorded.iter().any(|name| name == "otel.status_code"),
+            "a 5xx span must record otel.status_code; got {recorded:?}"
+        );
+    }
+}

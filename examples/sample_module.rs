@@ -38,5 +38,5 @@ async fn main() -> anyhow::Result<()> {
         .parse()
         .map_err(|e| anyhow::anyhow!("invalid listen address: {e}"))?;
 
-    service.start(addr).await
+    Ok(service.start(addr).await?)
 }

@@ -37,13 +37,5 @@ pub mod security_headers;
 /// The middleware that adds the server time to each response.
 pub mod server_time;
 
-pub use request_id::RequestID;
-pub use request_id::RequestIDMiddleware;
 /// Re-exported request id types for ergonomic access.
-pub use request_id::RequestId;
-pub use request_id::RequestIdMiddleware;
-
-/// Alias module name for [`request_id`].
-pub use request_id as requestid;
-/// Alias module name for [`request_id`].
-pub use request_id as request_ids;
+pub use request_id::{RequestId, RequestIdMiddleware};
