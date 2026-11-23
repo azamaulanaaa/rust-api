@@ -80,33 +80,35 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileRecord {
     /// File identifier.
-    pub id: String,
+    pub(crate) id: String,
     /// Original file name. The value is empty when the field is missing from an
     /// older row. A name is only for display, so no value of it is wrong.
     #[serde(default)]
-    pub name: String,
+    pub(crate) name: String,
     /// MIME type. The value is empty when the field is missing, for the same
     /// reason as `name`.
     #[serde(default)]
-    pub mimetype: String,
+    pub(crate) mimetype: String,
     /// Size in bytes.
-    pub size: u64,
+    pub(crate) size: u64,
     /// S3 key.
-    pub s3_key: String,
+    pub(crate) s3_key: String,
     /// Subject of the owner. The value is empty when the field is missing.
     /// An empty value then matches no caller. So a record with no owner is
     /// read by nobody, not by everyone.
     #[serde(default)]
-    pub owner_sub: String,
+    pub(crate) owner_sub: String,
     /// Creation timestamp.
-    pub created_at: i64,
+    pub(crate) created_at: i64,
 }
 
 /// What happened to an entity.
 ///
 /// The kind is part of the wire format. A new variant is safe. An existing
-/// variant must not change its name.
+/// variant must not change its name. External matches need a wildcard arm
+/// because the enum is non-exhaustive.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
+#[non_exhaustive]
 pub enum EntityEventKind {
     /// The entity was created.
     Created,
@@ -201,12 +203,13 @@ pub struct EntityEvent {
 /// They always need a full rebuild.
 ///
 /// **Wire format.** The server encodes this type with `serde` into a durable
-/// log. So a new variant is safe, but an existing variant must not change
-/// its form. An older reader cannot decode a newer entry, and
-/// [`Wal`](crate::sync::wal::Wal) treats an entry that it cannot decode as
-/// corruption instead of skipping it. Add a variant with
-/// `#[serde(default)]` fields where that is safe.
+/// log. A new variant makes an older reader refuse the entry. An older reader
+/// ignores a new field on an existing variant. A newer reader needs
+/// `#[serde(default)]` to read an older row that lacks the field. An entry
+/// that cannot decode is corruption, not a row to skip. External matches
+/// need a wildcard arm because the enum is non-exhaustive.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum WalOp {
     /// An old policy mark that names only an object, from before the rich
     /// operations existed.
@@ -685,6 +688,24 @@ mod tests {
                  `crate::records::ChangeSink` instead."
             );
         }
+    }
+
+    #[test]
+    fn wire_types_keep_their_representation_private() {
+        let src = std::fs::read_to_string("src/records.rs").expect("read src/records.rs");
+        let start = src
+            .find("pub struct FileRecord {")
+            .expect("FileRecord exists");
+        let end = src[start..].find("\n}").expect("FileRecord has an end") + start;
+        let block = &src[start..end];
+        assert!(
+            !block.contains("\n    pub "),
+            "FileRecord fields must not be public: {block}"
+        );
+        assert!(
+            src.matches("#[non_exhaustive]").count() >= 2,
+            "both public wire enums must allow new variants"
+        );
     }
 
     /// This module must stay a leaf. If `records` gained a dependency on `fs`,
