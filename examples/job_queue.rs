@@ -17,7 +17,7 @@ impl JobHandler for EchoHandler {
         "echo"
     }
 
-    async fn handle(&self, job: &Job) -> Result<Option<Vec<u8>>, anyhow::Error> {
+    async fn handle(&self, job: &Job) -> Result<Option<Vec<u8>>, rust_api::queue::JobError> {
         Ok(Some(job.payload.clone()))
     }
 }

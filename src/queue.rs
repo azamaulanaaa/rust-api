@@ -150,6 +150,12 @@ pub struct JobError {
     retry: JobRetry,
 }
 
+impl From<anyhow::Error> for JobError {
+    fn from(error: anyhow::Error) -> Self {
+        Self::retryable(error.to_string())
+    }
+}
+
 impl JobError {
     /// Creates an error for a permanent failure.
     ///
@@ -335,8 +341,8 @@ pub trait JobHandler: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns the error that the handler reports.
-    async fn handle(&self, job: &Job) -> Result<Option<Vec<u8>>, anyhow::Error>;
+    /// Returns [`JobError`] with the retry decision for the job.
+    async fn handle(&self, job: &Job) -> Result<Option<Vec<u8>>, JobError>;
 }
 
 pub mod memory;
@@ -440,5 +446,12 @@ mod tests {
         let error = QueueError::store(std::io::Error::other("disk full"));
         assert!(std::error::Error::source(&error).is_some());
         assert!(error.to_string().contains("disk full"));
+    }
+
+    #[test]
+    fn an_anyhow_error_becomes_a_retryable_job_error() {
+        let error = JobError::from(anyhow::anyhow!("handler failed"));
+        assert!(matches!(error.retry(), JobRetry::RetryDefault));
+        assert_eq!(error.to_string(), "handler failed");
     }
 }

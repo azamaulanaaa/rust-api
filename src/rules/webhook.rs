@@ -310,9 +310,9 @@ impl JobHandler for WebhookJobHandler {
     /// exists.
     /// A 2xx status is a success.
     /// Any other status or a network error returns an error.
-    async fn handle(&self, job: &Job) -> Result<Option<Vec<u8>>, anyhow::Error> {
+    async fn handle(&self, job: &Job) -> Result<Option<Vec<u8>>, JobError> {
         let started = Instant::now();
-        let result = self.deliver(job).await;
+        let result = self.deliver(job).await.map_err(JobError::from);
         record_delivery(result.is_ok(), started.elapsed());
         result
     }

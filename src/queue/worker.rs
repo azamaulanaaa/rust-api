@@ -13,7 +13,8 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 use crate::CancelToken;
 
 use super::{
-    Job, JobHandler, JobId, JobQueue, LeaseToken, LeasedJob, QueueError, QueueMetrics, RetryPolicy,
+    Job, JobError, JobHandler, JobId, JobQueue, LeaseToken, LeasedJob, QueueError, QueueMetrics,
+    RetryPolicy,
 };
 
 /// A worker that reserves and processes jobs.
@@ -72,7 +73,7 @@ async fn run_handler(
     handler: Arc<dyn JobHandler>,
     job: Job,
     span: tracing::Span,
-) -> Result<Option<Vec<u8>>, anyhow::Error> {
+) -> Result<Option<Vec<u8>>, JobError> {
     handler.handle(&job).instrument(span).await
 }
 
@@ -322,7 +323,7 @@ impl QueueWorker {
                 self.metrics.record_processing_duration(elapsed);
                 return;
             }
-            Err(join) => Err(anyhow::anyhow!("job task failed: {join}")),
+            Err(join) => Err(JobError::retryable(format!("job task failed: {join}"))),
         };
         let lease = guard.stop().await;
         let elapsed = start.elapsed().as_secs_f64();
@@ -348,15 +349,10 @@ impl QueueWorker {
             },
             Err(e) => {
                 warn!(error = %e, job_id = %job_id, "job failed");
-                let policy = match e.downcast_ref::<super::JobError>() {
-                    Some(error) => match error.retry() {
-                        super::JobRetry::NoRetry => RetryPolicy::NoRetry,
-                        super::JobRetry::RetryAfter(delay) => RetryPolicy::Retry { delay },
-                        super::JobRetry::RetryDefault => RetryPolicy::Retry {
-                            delay: retry_delay(job.attempt, self.retry_base, self.retry_max),
-                        },
-                    },
-                    None => RetryPolicy::Retry {
+                let policy = match e.retry() {
+                    super::JobRetry::NoRetry => RetryPolicy::NoRetry,
+                    super::JobRetry::RetryAfter(delay) => RetryPolicy::Retry { delay },
+                    super::JobRetry::RetryDefault => RetryPolicy::Retry {
                         delay: retry_delay(job.attempt, self.retry_base, self.retry_max),
                     },
                 };
@@ -398,7 +394,7 @@ mod tests {
             "flaky"
         }
 
-        async fn handle(&self, _job: &Job) -> Result<Option<Vec<u8>>, anyhow::Error> {
+        async fn handle(&self, _job: &Job) -> Result<Option<Vec<u8>>, JobError> {
             let call = self.calls.fetch_add(1, Ordering::SeqCst);
             if call == 0 {
                 panic!("handler panic");
@@ -416,7 +412,7 @@ mod tests {
             "panic"
         }
 
-        async fn handle(&self, _job: &Job) -> Result<Option<Vec<u8>>, anyhow::Error> {
+        async fn handle(&self, _job: &Job) -> Result<Option<Vec<u8>>, JobError> {
             panic!("handler panic");
         }
     }
@@ -430,7 +426,7 @@ mod tests {
             "ok"
         }
 
-        async fn handle(&self, _job: &Job) -> Result<Option<Vec<u8>>, anyhow::Error> {
+        async fn handle(&self, _job: &Job) -> Result<Option<Vec<u8>>, JobError> {
             Ok(Some(vec![7]))
         }
     }
@@ -444,8 +440,8 @@ mod tests {
             "fail"
         }
 
-        async fn handle(&self, _job: &Job) -> Result<Option<Vec<u8>>, anyhow::Error> {
-            Err(anyhow::anyhow!("handler failed"))
+        async fn handle(&self, _job: &Job) -> Result<Option<Vec<u8>>, JobError> {
+            Err(JobError::retryable("handler failed"))
         }
     }
 
@@ -495,7 +491,7 @@ mod tests {
             self.kind
         }
 
-        async fn handle(&self, job: &Job) -> Result<Option<Vec<u8>>, anyhow::Error> {
+        async fn handle(&self, job: &Job) -> Result<Option<Vec<u8>>, JobError> {
             self.tracker.enter(job.id).await;
             tokio::time::sleep(self.delay).await;
             self.tracker.leave(job.id).await;
@@ -567,8 +563,8 @@ mod tests {
             "permanent"
         }
 
-        async fn handle(&self, _job: &Job) -> Result<Option<Vec<u8>>, anyhow::Error> {
-            Err(crate::queue::JobError::permanent("permanent failure").into())
+        async fn handle(&self, _job: &Job) -> Result<Option<Vec<u8>>, JobError> {
+            Err(JobError::permanent("permanent failure"))
         }
     }
 
@@ -581,11 +577,11 @@ mod tests {
             "retry-after"
         }
 
-        async fn handle(&self, _job: &Job) -> Result<Option<Vec<u8>>, anyhow::Error> {
-            Err(
-                crate::queue::JobError::retry_after("temporary failure", Duration::from_secs(60))
-                    .into(),
-            )
+        async fn handle(&self, _job: &Job) -> Result<Option<Vec<u8>>, JobError> {
+            Err(JobError::retry_after(
+                "temporary failure",
+                Duration::from_secs(60),
+            ))
         }
     }
 
