@@ -57,7 +57,7 @@
 
 use crate::fs::error::FsError;
 use crate::fs::store::{FileScan, FsStore, KvPages};
-use crate::policy::row::RowAuthorizer;
+use crate::policy::row::{RowAuthorizer, parse_row_object};
 use crate::policy::{Action, Authorizer};
 use crate::records::WalOp;
 use oxkv::{GetSet as _, OxKvReader, Store as _, Transaction as _};
@@ -977,6 +977,13 @@ impl SnapshotManager {
                 file_id,
             } => {
                 dst.detach(row_type, row_id, file_id).await?;
+                // The detach removes the last relation that may have made the
+                // file readable. The file record must then leave the replica.
+                // A full rebuild agrees, because it keeps a file only when
+                // the subject owns it or can read a row that holds it.
+                if !self.can_read(sub, file_id).await? {
+                    dst.delete_file(file_id).await?;
+                }
             }
             WalOp::PolicyAdd { .. } | WalOp::PolicyRemove { .. } => {
                 // `replay` rejects a range that contains one of these ops
@@ -1066,29 +1073,31 @@ impl SnapshotManager {
         if !act.eq_ignore_ascii_case("read") {
             return Ok(ApplyOutcome::Applied);
         }
-        let Some((row_type, row_id)) = split_row_obj(obj) else {
+        let Some((row_type, row_id)) = parse_row_object(obj) else {
             return Ok(ApplyOutcome::Applied);
         };
         if rule_sub != sub && !self.implicit_groups(sub).await.contains(rule_sub) {
             return Ok(ApplyOutcome::Applied);
         }
-        let files = self.store.files_for_row(row_type, row_id).await?;
+        let files = self.store.files_for_row(&row_type, &row_id).await?;
         if files.len() > MAX_POLICY_REPLAY_FILES {
             return Ok(ApplyOutcome::NeedsFullRebuild);
         }
         for file_id in files {
-            self.resync_file(sub, dst, row_type, row_id, &file_id)
+            self.resync_file(sub, dst, &row_type, &row_id, &file_id)
                 .await?;
         }
         Ok(ApplyOutcome::Applied)
     }
 
-    /// Resyncs the rows that a membership change can affect. The method acts
-    /// only when `user == sub`.
+    /// Resyncs the rows that a membership change can affect.
     ///
-    /// The method does nothing when the change is for another user. For `sub`
-    /// itself, the method resyncs every `read` row that the group grants.
-    /// Groups with no row reads, such as `superadmin` on
+    /// The method does nothing when the change is for a group outside the
+    /// group closure of `sub`. A change to `user ∈ group` can affect `sub`
+    /// when `sub` is `user` or when `sub` is a member of `user`. A nested
+    /// edge such as `editors ∈ staff` therefore reaches `alice` when
+    /// `alice ∈ editors`. The method resyncs every `read` row that the
+    /// group grants. Groups with no row reads, such as `superadmin` on
     /// `rules`/`user_groups`, cause no work. An oversized fan-out returns
     /// [`ApplyOutcome::NeedsFullRebuild`].
     async fn apply_membership_op(
@@ -1099,7 +1108,16 @@ impl SnapshotManager {
         group: &str,
     ) -> Result<ApplyOutcome, FsError> {
         if user != sub {
-            return Ok(ApplyOutcome::Applied);
+            // The edge is `user ∈ group`. It changes the access of `sub`
+            // when `sub` is `user`, when `sub` is a member of `user`, or
+            // when a rule names `group` and `sub` already holds `group`.
+            // The last case cannot lose access, but the extra resync is
+            // safe and bounded. A group outside the closure of `sub` cannot
+            // affect `sub`.
+            let groups = self.implicit_groups(sub).await;
+            if !groups.contains(user) && !groups.contains(group) {
+                return Ok(ApplyOutcome::Applied);
+            }
         }
         let rows = self.read_rows_for_group(group).await?;
         let mut total = 0usize;
@@ -1240,8 +1258,8 @@ impl SnapshotManager {
                 if !act.eq_ignore_ascii_case("read") {
                     continue;
                 }
-                if let Some((ty, rid)) = split_row_obj(&obj) {
-                    out.insert((ty.to_string(), rid.to_string()));
+                if let Some((ty, rid)) = parse_row_object(&obj) {
+                    out.insert((ty, rid));
                 }
             }
         }
@@ -1335,19 +1353,6 @@ fn store_err(e: oxkv::StoreError) -> FsError {
 /// replica while the master still allows it.
 fn policy_err(e: crate::policy::PolicyError) -> FsError {
     FsError::Internal(e.to_string())
-}
-
-/// Splits a rule object into `(row_type, row_id)` when it names a row.
-///
-/// Row objects have the form `{type}:{id}`. Control-plane objects (`rules`,
-/// `user_groups`, …) contain no colon. The function returns `None` for them,
-/// so that policy replay can skip them without touching storage.
-fn split_row_obj(obj: &str) -> Option<(&str, &str)> {
-    let (ty, rid) = obj.split_once(':')?;
-    if ty.is_empty() || rid.is_empty() {
-        return None;
-    }
-    Some((ty, rid))
 }
 
 /// Maps a subject to an identifier that is safe in a prefix.
@@ -1745,6 +1750,45 @@ mod tests {
         assert_eq!(mgr.replay(2, "alice").await?, ReplayOutcome::Advanced(2));
         assert!(!replica_has(&mem, &mgr, "alice", "fs:rel:invoice:1:f1").await);
         assert!(!replica_has(&mem, &mgr, "alice", "fs:files:f1:meta").await);
+        Ok(())
+    }
+
+    /// A detach that removes the last path to a file must remove the file
+    /// record from the replica.
+    ///
+    /// The master keeps the policy rule that grants `read` on the row. Only
+    /// the relation is gone. A full rebuild therefore drops the file, because
+    /// no row holds it. The incremental path must agree. Otherwise the
+    /// revoked user keeps the file metadata.
+    #[tokio::test]
+    async fn a_detach_removes_the_file_record_from_the_replica() -> anyhow::Result<()> {
+        let (mgr, policy, mem) = test_manager().await;
+        policy
+            .add_rule("alice".into(), "invoice:1".into(), Action::Read)
+            .await?;
+        mgr.store.save_file(&file_record("f1", "bob")).await?;
+        mgr.store.attach("invoice", "1", "f1").await?;
+        mgr.build_full("alice").await?;
+        assert!(replica_has(&mem, &mgr, "alice", "fs:files:f1:meta").await);
+        assert!(replica_has(&mem, &mgr, "alice", "fs:rel:invoice:1:f1").await);
+
+        // The master removes the relation, and the policy stays. The file
+        // must leave the replica with the relation.
+        mgr.store.detach("invoice", "1", "f1").await?;
+        mgr.wal
+            .append(WalOp::Detach {
+                row_type: "invoice".into(),
+                row_id: "1".into(),
+                file_id: "f1".into(),
+            })
+            .await?;
+
+        assert_eq!(mgr.replay(1, "alice").await?, ReplayOutcome::Advanced(1));
+        assert!(!replica_has(&mem, &mgr, "alice", "fs:rel:invoice:1:f1").await);
+        assert!(
+            !replica_has(&mem, &mgr, "alice", "fs:files:f1:meta").await,
+            "a detach must delete the file record when the subject can no longer read the file"
+        );
         Ok(())
     }
 
@@ -2209,6 +2253,47 @@ mod tests {
         Ok(())
     }
 
+    /// A policy object with an escaped colon must decode to the whole row id.
+    ///
+    /// The rule names `invoice:12\:3`, which is `row_object("invoice",
+    /// "12:3")`. The relation key uses the same escape. A rule removal must
+    /// find the file and revoke it.
+    #[tokio::test]
+    async fn replay_decodes_an_escaped_row_object() -> anyhow::Result<()> {
+        let (mgr, policy, mem) = test_manager().await;
+        let obj = crate::policy::row::row_object("invoice", "12:3");
+        assert_eq!(obj, "invoice:12\\:3");
+        policy
+            .add_rule("alice".into(), obj.clone(), Action::Read)
+            .await?;
+        mgr.store.save_file(&file_record("f1", "bob")).await?;
+        mgr.store.attach("invoice", "12:3", "f1").await?;
+        mgr.build_full("alice").await?;
+        assert!(replica_has(&mem, &mgr, "alice", "fs:files:f1:meta").await);
+        assert!(
+            replica_has(&mem, &mgr, "alice", "fs:rel:invoice:12\\:3:f1").await,
+            "the replica must store the escaped relation key for a colon row id"
+        );
+
+        policy
+            .remove_rule("alice".into(), obj.clone(), Action::Read)
+            .await?;
+        mgr.wal
+            .append(WalOp::PolicyRuleRemove {
+                sub: "alice".into(),
+                obj,
+                act: "read".into(),
+            })
+            .await?;
+        assert_eq!(mgr.replay(1, "alice").await?, ReplayOutcome::Advanced(1));
+        assert!(
+            !replica_has(&mem, &mgr, "alice", "fs:files:f1:meta").await,
+            "the escaped policy object must reach the file of the colon row id"
+        );
+        assert!(!replica_has(&mem, &mgr, "alice", "fs:rel:invoice:12\\:3:f1").await);
+        Ok(())
+    }
+
     /// A revocation through a NESTED group must still reach the replica.
     ///
     /// The test guards against a past fault. `apply_rule_op` decided "this
@@ -2377,6 +2462,86 @@ mod tests {
         Ok(())
     }
 
+    /// A change to a NESTED membership edge must revoke the access of a
+    /// member at the lower level.
+    ///
+    /// The fixture is `alice ∈ editors ∈ staff`, and the rule names `staff`.
+    /// The replayed op changes the INNER edge, so `user` is `editors` and
+    /// `sub` is `alice`. An early return on `user != sub` then skipped the
+    /// op and left the revoked file in the replica.
+    #[tokio::test]
+    async fn a_membership_change_through_a_nested_group_revokes_the_file() -> anyhow::Result<()> {
+        let (mgr, policy, mem) = test_manager().await;
+        policy
+            .assign_group("alice".into(), "editors".into())
+            .await?;
+        policy
+            .assign_group("editors".into(), "staff".into())
+            .await?;
+        policy
+            .add_rule("staff".into(), "invoice:1".into(), Action::Read)
+            .await?;
+        mgr.store.save_file(&file_record("f1", "bob")).await?;
+        mgr.store.attach("invoice", "1", "f1").await?;
+        mgr.build_full("alice").await?;
+        assert!(replica_has(&mem, &mgr, "alice", "fs:files:f1:meta").await);
+
+        // Remove the inner edge. Alice keeps her membership in editors.
+        policy
+            .remove_from_group("editors".into(), "staff".into())
+            .await?;
+        mgr.wal
+            .append(WalOp::GroupRemove {
+                user: "editors".into(),
+                group: "staff".into(),
+            })
+            .await?;
+
+        assert_eq!(mgr.replay(1, "alice").await?, ReplayOutcome::Advanced(1));
+        assert!(
+            !replica_has(&mem, &mgr, "alice", "fs:files:f1:meta").await,
+            "a nested revoke must remove the file that only the outer group granted"
+        );
+        assert!(!replica_has(&mem, &mgr, "alice", "fs:rel:invoice:1:f1").await);
+        Ok(())
+    }
+
+    /// The mirror case: a change to a NESTED membership edge must grant the
+    /// access of a member at the lower level.
+    #[tokio::test]
+    async fn a_membership_change_through_a_nested_group_grants_the_file() -> anyhow::Result<()> {
+        let (mgr, policy, mem) = test_manager().await;
+        policy
+            .assign_group("alice".into(), "editors".into())
+            .await?;
+        policy
+            .add_rule("staff".into(), "invoice:1".into(), Action::Read)
+            .await?;
+        mgr.store.save_file(&file_record("f1", "bob")).await?;
+        mgr.store.attach("invoice", "1", "f1").await?;
+        mgr.build_full("alice").await?;
+        assert!(!replica_has(&mem, &mgr, "alice", "fs:files:f1:meta").await);
+
+        // Add the inner edge. Only the nested rule can make f1 visible.
+        policy
+            .assign_group("editors".into(), "staff".into())
+            .await?;
+        mgr.wal
+            .append(WalOp::GroupAdd {
+                user: "editors".into(),
+                group: "staff".into(),
+            })
+            .await?;
+
+        assert_eq!(mgr.replay(1, "alice").await?, ReplayOutcome::Advanced(1));
+        assert!(
+            replica_has(&mem, &mgr, "alice", "fs:files:f1:meta").await,
+            "a nested grant must add the file that the outer group grants"
+        );
+        assert!(replica_has(&mem, &mgr, "alice", "fs:rel:invoice:1:f1").await);
+        Ok(())
+    }
+
     /// The direct rule still resolves, and the code does not invent a rule
     /// that an ancestor does NOT hold.
     ///
@@ -2537,15 +2702,6 @@ mod tests {
         assert!(second.pending, "still pending, and still not an error");
         assert_eq!(second.applied_seq, 0);
         Ok(())
-    }
-
-    #[tokio::test]
-    async fn split_row_obj_rejects_control_plane_objects() {
-        assert_eq!(split_row_obj("invoice:123"), Some(("invoice", "123")));
-        assert_eq!(split_row_obj("rules"), None);
-        assert_eq!(split_row_obj("user_groups"), None);
-        assert_eq!(split_row_obj(":123"), None);
-        assert_eq!(split_row_obj("invoice:"), None);
     }
 
     #[tokio::test]
