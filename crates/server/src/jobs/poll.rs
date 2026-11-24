@@ -15,7 +15,7 @@ use crate::http::middleware::jwt::{Claims, Validated};
 use crate::policy::{Authorizer, SUPERADMIN_ROLE};
 use crate::queue::{Job, JobQueue, QueueError};
 
-use super::status_view;
+use super::{JobKinds, status_view};
 
 /// The queue priority of a job that an HTTP request enqueues.
 const JOB_PRIORITY: i32 = 0;
@@ -33,7 +33,8 @@ const MAX_ATTEMPTS: u32 = 5;
 ///
 /// # Errors
 ///
-/// Returns `400` when the body is not a [`CommandEnvelope`].
+/// Returns `400` when the body is not a [`CommandEnvelope`] or the kind has
+/// no registered handler.
 /// Returns `401` when the request has no valid token.
 /// Returns `409` when the queue reports a duplicate key without the stored
 /// job id, because that error carries no id to read.
@@ -41,10 +42,14 @@ const MAX_ATTEMPTS: u32 = 5;
 pub async fn create_job(
     claims: Validated<Claims>,
     queue: web::Data<Arc<dyn JobQueue>>,
+    kinds: web::Data<JobKinds>,
     body: web::Json<CommandEnvelope>,
 ) -> Result<HttpResponse, ApiError> {
     let now = chrono::Utc::now().timestamp();
     let envelope = body.into_inner();
+    if !kinds.contains(&envelope.kind) {
+        return Err(ApiError::BadRequest);
+    }
     let owner = claims.sub.clone();
     let payload = serde_json::to_vec(&envelope.payload)
         .map_err(|error| ApiError::Internal(Box::new(error)))?;
@@ -191,18 +196,33 @@ mod tests {
     use crate::http::ApiModule as _;
     use crate::http::middleware::jwks::test_support::{rsa_key, sign_rs256, spawn_jwks};
     use crate::http::middleware::jwt::JwtClaimsMiddleware;
-    use crate::jobs::JobsApiModule;
+    use crate::jobs::{JobKinds, JobsApiModule};
     use crate::policy::PolicyEngine;
-    use crate::queue::MemoryQueue;
+    use crate::queue::{JobError, JobHandler, MemoryQueue};
 
     const KID: &str = "jobs-poll-test-kid";
     const AUD: &str = "test-aud";
+
+    /// A handler with one kind, for the test registry.
+    struct TestHandler(&'static str);
+
+    #[async_trait::async_trait]
+    impl JobHandler for TestHandler {
+        fn kind(&self) -> &'static str {
+            self.0
+        }
+
+        async fn handle(&self, _job: &Job) -> Result<Option<Vec<u8>>, JobError> {
+            Ok(None)
+        }
+    }
 
     struct Fixture {
         server: wiremock::MockServer,
         encoding_key: EncodingKey,
         queue: Arc<MemoryQueue>,
         engine: PolicyEngine,
+        kinds: JobKinds,
     }
 
     impl Fixture {
@@ -230,6 +250,7 @@ mod tests {
                 self.queue.clone(),
                 middleware,
                 self.engine.authorizer(),
+                self.kinds.clone(),
             ))
         }
     }
@@ -239,11 +260,14 @@ mod tests {
         let server = spawn_jwks(json!({ "keys": [key] })).await;
         let engine =
             PolicyEngine::init_s3(build_test_store(&test_prefix("jobs-poll-policy")).await).await?;
+        let handlers: Vec<Arc<dyn JobHandler>> = vec![Arc::new(TestHandler("entity.create"))];
+        let kinds = JobKinds::from_handlers(&handlers);
         Ok(Fixture {
             server,
             encoding_key,
             queue: Arc::new(MemoryQueue::new()),
             engine,
+            kinds,
         })
     }
 
@@ -324,6 +348,31 @@ mod tests {
         assert_eq!(read["id"], created["id"]);
         assert_eq!(read["kind"], "entity.create");
         assert_eq!(read["state"], "queued");
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn an_unregistered_kind_is_400() -> anyhow::Result<()> {
+        let fixture = fixture().await?;
+        let module = fixture.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+
+        let token = fixture.token("alice")?;
+        let body = json!({
+            "kind": "entity.delete",
+            "payload": {"name": "alice"},
+            "idempotency_key": "key-1",
+        });
+        let request = auth(actix_test::TestRequest::post().uri("/jobs"), &token)
+            .insert_header(("Content-Type", "application/json"))
+            .set_payload(body.to_string())
+            .to_request();
+        let response = actix_test::call_service(&app, request).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: Value = actix_test::read_body_json(response).await;
+        assert_eq!(body["error"], "bad request");
+        assert_eq!(body["code"], "invalid_request");
+        assert!(!body.to_string().contains("entity.delete"), "the answer must not echo the kind");
         Ok(())
     }
 

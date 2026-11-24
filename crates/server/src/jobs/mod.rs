@@ -9,6 +9,7 @@
 //! The poll route is live. The SSE route answers 501 until its feature
 //! branch lands.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use actix_web::{
@@ -29,7 +30,7 @@ use crate::http::{
     },
 };
 use crate::policy::Authorizer;
-use crate::queue::{Job, JobQueue, JobStatus};
+use crate::queue::{Job, JobHandler, JobQueue, JobStatus};
 
 /// The poll routes for job submission and one job status.
 pub mod poll;
@@ -37,24 +38,63 @@ pub mod poll;
 /// The server-sent event route for one job status.
 pub mod sse;
 
+/// The set of job kinds that have a registered handler.
+///
+/// The type is cheap to clone, because the set sits behind an [`Arc`]. The
+/// worker and the submission route use one kind list.
+#[derive(Clone, Debug)]
+pub struct JobKinds {
+    kinds: Arc<BTreeSet<String>>,
+}
+
+impl JobKinds {
+    /// Builds the set from a handler list.
+    ///
+    /// The function reads [`JobHandler::kind`] from each handler. A caller
+    /// must not keep a second kind list.
+    pub fn from_handlers(handlers: &[Arc<dyn JobHandler>]) -> Self {
+        let mut kinds = BTreeSet::new();
+        for handler in handlers {
+            kinds.insert(handler.kind().to_string());
+        }
+        Self {
+            kinds: Arc::new(kinds),
+        }
+    }
+
+    /// Returns `true` when a handler is registered for `kind`.
+    pub fn contains(&self, kind: &CommandKind) -> bool {
+        self.kinds.contains(kind.as_str())
+    }
+}
+
 /// The module that owns the `/jobs` route prefix.
 pub struct JobsApiModule {
     queue: Arc<dyn JobQueue>,
     policy: Authorizer,
     jwt: JwtClaimsMiddleware<Claims>,
+    kinds: JobKinds,
 }
 
 impl JobsApiModule {
-    /// Creates the module from a queue, JWT middleware, and authorizer.
+    /// Creates the module from a queue, JWT middleware, authorizer, and kind
+    /// registry.
     ///
     /// Share the authorizer with the policy engine, so the module sees the
-    /// same policy state as every other module.
+    /// same policy state as every other module. Share the kind registry with
+    /// the worker, so the two see the same handler list.
     pub fn new(
         queue: Arc<dyn JobQueue>,
         jwt: JwtClaimsMiddleware<Claims>,
         policy: Authorizer,
+        kinds: JobKinds,
     ) -> Self {
-        Self { queue, jwt, policy }
+        Self {
+            queue,
+            jwt,
+            policy,
+            kinds,
+        }
     }
 }
 
@@ -66,11 +106,13 @@ impl ApiModule for JobsApiModule {
     fn configure(&self, cfg: &mut ServiceConfig) {
         let queue = web::Data::new(self.queue.clone());
         let policy = web::Data::new(self.policy.clone());
+        let kinds = web::Data::new(self.kinds.clone());
         let jwt = self.jwt.clone();
         cfg.service(
             web::scope("/jobs")
                 .app_data(queue)
                 .app_data(policy)
+                .app_data(kinds)
                 .wrap(jwt)
                 .wrap(NoCache)
                 .route("", web::post().to(poll::create_job))
@@ -186,6 +228,37 @@ mod tests {
         assert!(object.remove("owner_sub").is_some());
         let job: Job = serde_json::from_value(value).expect("the stored job parses");
         assert_eq!(job.owner_sub, None);
+    }
+
+    /// A handler with one kind, for the registry test.
+    struct KindHandler(&'static str);
+
+    #[async_trait::async_trait]
+    impl JobHandler for KindHandler {
+        fn kind(&self) -> &'static str {
+            self.0
+        }
+
+        async fn handle(&self, _job: &Job) -> Result<Option<Vec<u8>>, crate::queue::JobError> {
+            Ok(None)
+        }
+    }
+
+    /// The registry holds every kind of the handler list and no other kind.
+    #[test]
+    fn the_kind_registry_keeps_every_handler_kind() {
+        let handlers: Vec<Arc<dyn JobHandler>> = vec![
+            Arc::new(KindHandler("entity.create")),
+            Arc::new(KindHandler("entity.delete")),
+        ];
+        let kinds = JobKinds::from_handlers(&handlers);
+
+        for handler in &handlers {
+            let kind = CommandKind::parse(handler.kind()).expect("the handler kind is valid");
+            assert!(kinds.contains(&kind), "the registry is missing {}", handler.kind());
+        }
+        let unregistered = CommandKind::parse("entity.update").expect("the test kind is valid");
+        assert!(!kinds.contains(&unregistered));
     }
 
     /// `status_view` maps the queued and leased states and their fields.

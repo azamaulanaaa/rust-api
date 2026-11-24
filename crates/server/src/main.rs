@@ -748,17 +748,17 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
         .allow_private_hosts(webhook_allow_private_hosts)
         .with_queue(queue.clone(), signing_secret, webhook_max_attempts);
     // The HTTP job routes share the queue with the worker, so clone it
-    // before the worker takes ownership.
+    // before the worker takes ownership. Build the handler list one time,
+    // then derive the registered kinds from it.
+    let handlers: Vec<Arc<dyn rust_api::queue::JobHandler>> = vec![Arc::new(webhook.job_handler())];
+    let job_kinds = rust_api::jobs::JobKinds::from_handlers(&handlers);
     let jobs_api_module = rust_api::jobs::JobsApiModule::new(
         queue.clone(),
         oidc_api_module.middleware(),
         policy_engine.authorizer(),
+        job_kinds,
     );
-    let worker = QueueWorker::new(
-        queue,
-        vec![Arc::new(webhook.job_handler())],
-        "eav-webhook".to_string(),
-    );
+    let worker = QueueWorker::new(queue, handlers, "eav-webhook".to_string());
     let worker_cancel = cancel.clone();
     let webhook_worker = tokio::spawn(async move { worker.run(worker_cancel).await });
     let runtime = rust_api::eav::runtime::EavRuntime::build(
