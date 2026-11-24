@@ -1638,11 +1638,13 @@ serve_run_remote() {
   # /tmp maps to the repository's .tmp directory. Without the excludes the
   # first tar would read the staging directory while the second tar writes
   # it. That loop never ends. Exclude both by their unique base names.
+  # The .tmp and target trees hold local state and build output. They can
+  # be more than the 1 GiB serve upload limit. Never upload them.
   local stage_name tarball_name
   stage_name="${stage##*/}"
   tarball_name="${tarball##*/}"
   if ! tar -C "$repo_root" \
-    --exclude=.git --exclude=.cache \
+    --exclude=.git --exclude=.cache --exclude=.tmp --exclude=target \
     --exclude="*/$stage_name" --exclude="*/$tarball_name" \
     -cf - . |
     tar -C "$stage" -xf -; then
