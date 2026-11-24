@@ -3,8 +3,9 @@
 This repository uses two tools for a release. Cocogitto (`cog`) prepares the
 version and the changelog. [cargo-dist](https://opensource.axo.dev/cargo-dist/)
 version 0.32.0 packages and publishes the release. The dist configuration is
-in [`dist-workspace.toml`](../dist-workspace.toml). The generated workflow is
-[`.github/workflows/release.yml`](../.github/workflows/release.yml).
+in [`dist-workspace.toml`](../dist-workspace.toml). The server package is
+`crates/server`, and the file selects it with `cargo:crates/server`. The
+generated workflow is [`.github/workflows/release.yml`](../.github/workflows/release.yml).
 
 ## Quick start
 

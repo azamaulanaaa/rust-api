@@ -32,5 +32,5 @@ if [[ "$(run_msrv rustc --version)" != "$pattern"* ]]; then
   exit 1
 fi
 
-run_msrv cargo check --all-targets --all-features --locked
+run_msrv cargo check --workspace --all-targets --all-features --locked
 echo "checked Rust code against the declared MSRV"

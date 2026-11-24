@@ -95,9 +95,10 @@ versions are affected. Upstream offers no replacement. This crate reaches \
 smartstring through casbin and then rhai. casbin 2.20.0 is the latest release, \
 so a dependency bump cannot remove it. The compensating control limits the \
 exposure. rhai evaluates only RBAC_MODEL, a compile-time constant in \
-src/policy/mod.rs. No request-derived expression reaches the evaluator. No \
-attacker-controlled expression reaches the evaluator. A parser denial of \
-service in that path is exploitable only through such an expression.
+crates/server/src/policy/mod.rs. No request-derived expression reaches the \
+evaluator. No attacker-controlled expression reaches the evaluator. A parser \
+denial of service in that path is exploitable only through such an \
+expression.
 """
 
 [sources]

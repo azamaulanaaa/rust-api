@@ -6,9 +6,21 @@ authorization, S3-backed file uploads, and per-user sync replicas. Applications
 implement `ApiModule` and compose their own API surface on the shared plumbing.
 
 For module documentation, run `cargo doc --no-deps --open`. Start with
-[`http`](src/http/mod.rs), [`oidc`](src/oidc/mod.rs),
-[`policy`](src/policy/mod.rs), [`fs`](src/fs/mod.rs), and
-[`sync`](src/sync/mod.rs).
+[`http`](crates/server/src/http/mod.rs), [`oidc`](crates/server/src/oidc/mod.rs),
+[`policy`](crates/server/src/policy/mod.rs), [`fs`](crates/server/src/fs/mod.rs),
+and [`sync`](crates/server/src/sync/mod.rs).
+
+## Workspace layout
+
+The repository holds four crates:
+
+- `crates/model` holds the shared wire contract.
+- `crates/core` holds the shared pure behavior.
+- `crates/server` holds the Actix server and the `rust-api` binary.
+- `crates/client` holds the WASM client.
+
+`model` and `core` build for the server and for `wasm32`. `core` has no I/O
+and no runtime. The client makes no authorization decision.
 
 ## At a glance
 
@@ -86,7 +98,7 @@ The database prefix defaults to `oxkv`. See [Configuration](#configuration) and
 
 ```bash
 mise install
-cargo run -- serve --config config.toml
+cargo run -p rust-api -- serve --config config.toml
 ```
 
 The server listens on port 8080. Confirm readiness:
@@ -329,7 +341,7 @@ miss a write. Replicas consume the feed. The vocabulary lives in `records`. The
 durable implementation is `sync::wal::Wal`. A WAL range read uses one range
 scan. It returns every entry in sequence order.
 
-The job queue lives in `src/queue.rs`. It provides `MemoryQueue` for tests,
+The job queue lives in `crates/server/src/queue.rs`. It provides `MemoryQueue` for tests,
 `DurableQueue` over an OxKV handle, and `QueueWorker`, which reserves jobs,
 dispatches by `kind`, acknowledges success, and retries or dead-letters
 failures. Delivery is at least once, so handlers must be idempotent.
@@ -347,13 +359,13 @@ drive the full maintenance sweep with `DurableQueue::spawn_expiry_sweeper`.
 `RabbitMqQueue` is a feature-gated seam behind `queue-rabbitmq`. The broker
 wiring is not implemented, and its operations return an unsupported error. Other
 metrics cover depth, enqueue, reserve, completion, dead-letter, and processing
-time. See `examples/job_queue.rs`.
+time. See `crates/server/examples/job_queue.rs`.
 
 `reactive::ReactiveService` gives an application a place to attach `oxkv` hooks
 and run background work. `register` runs once at startup and must stay cheap.
 `run` ends when the cancellation token fires. Hooks are read-only, run on the
 writer path, and their watch channels are bounded and lossy. See
-`examples/reactive_service.rs` and module `reactive`.
+`crates/server/examples/reactive_service.rs` and module `reactive`.
 
 `audit::AuditEvent` and `audit::AuditSink` record mutations. `TracingAuditSink`
 writes each event at info level. The binary does not install a sink.
@@ -1370,7 +1382,8 @@ NAT share a budget. See module `limits` in the rustdoc.
 ### EAV and rules
 
 The `[eav]` section controls the EAV runtime and the webhook action. The EAV
-module is always on. To omit it, remove its wiring in `src/main.rs` and rebuild.
+module is always on. To omit it, remove its wiring in
+`crates/server/src/main.rs` and rebuild.
 
 - Key: `outbox_interval_ms`; Default: `1000`; Effect: Pause between entity
   outbox flushes.
@@ -1619,7 +1632,7 @@ Console logging is always on. `RUST_LOG` sets the filter. Without it,
 `--verbose` selects debug and the default selects info.
 
 ```bash
-RUST_LOG=debug cargo run -- serve --config config.toml
+RUST_LOG=debug cargo run -p rust-api -- serve --config config.toml
 ```
 
 When `observability.otlp_endpoint` is set, the server exports one span per
@@ -1787,14 +1800,15 @@ returns `401` when claims are absent.
 
 Examples:
 
-- [examples/sample_module.rs](examples/sample_module.rs): a complete module.
-  Build with `cargo build --example sample_module`.
-- [examples/job_queue.rs](examples/job_queue.rs): a memory queue and worker.
-- [examples/reactive_service.rs](examples/reactive_service.rs): a reactive
-  service with an `oxkv` observer.
-- [examples/eav_service.rs](examples/eav_service.rs): schema publish, entity
-  create and update, an indexed query, and cursor paging. Run with `cargo run
-  --example eav_service`.
+- [crates/server/examples/sample_module.rs](crates/server/examples/sample_module.rs):
+  a complete module. Build with `cargo build -p rust-api --example sample_module`.
+- [crates/server/examples/job_queue.rs](crates/server/examples/job_queue.rs):
+  a memory queue and worker.
+- [crates/server/examples/reactive_service.rs](crates/server/examples/reactive_service.rs):
+  a reactive service with an `oxkv` observer.
+- [crates/server/examples/eav_service.rs](crates/server/examples/eav_service.rs):
+  schema publish, entity create and update, an indexed query, and cursor paging.
+  Run with `cargo run -p rust-api --example eav_service`.
 
 ### Mount inside your own server
 
@@ -1844,8 +1858,9 @@ can shadow your modules.
 The EAV benchmarks cover six hot paths: entity create, entity read, entity list
 paging, indexed attribute query, cached effective schema, and outbox count. Each
 group uses an in-memory scratch store and a fixed seed. The suite needs no S3
-bucket and no network. The benchmark target is `benches/eav.rs`. Run every new
-benchmark through `cargo bench --bench eav`.
+bucket and no network. The benchmark target is
+`crates/server/benches/eav.rs`. Run every new benchmark through
+`cargo bench -p rust-api --bench eav`.
 
 One bounded SST block cache serves every OxKV handle in the process. The default
 size is 128 MiB. The cache size does not grow with the handle count.
@@ -1856,7 +1871,7 @@ one replica build capped at 64 MiB.
 Run the full suite:
 
 ```bash
-cargo bench --bench eav
+cargo bench -p rust-api --bench eav
 ```
 
 Run a quick smoke test:
@@ -1910,9 +1925,9 @@ update procedure.
 
 ### Configuration tests
 
-The configuration module is part of the binary target. Run its tests with `cargo
-test --bin rust-api config`. A `cargo test --lib config` filter runs no
-configuration test.
+The configuration module is part of the binary target. Run its tests with
+`cargo test -p rust-api --bin rust-api config`. A `cargo test --lib config`
+filter runs no configuration test.
 
 ### Full-stack tests
 
@@ -1945,9 +1960,9 @@ The `cargo-dist` pin in `mise.toml` must track `cargo-dist-version` in
 `.github/workflows/release.yml`. Run `dist init --ci=github` to regenerate it at
 the pinned version. That command overwrites the local edits in the file.
 
-The crate is distributed as a binary. `publish = false` in `Cargo.toml` keeps
-`cargo publish` from uploading a package that depends on the local path
-adapters.
+The server crate is distributed as a binary. `publish = false` in
+`crates/server/Cargo.toml` keeps `cargo publish` from uploading a package that
+depends on the local path adapters.
 
 ### Container image
 

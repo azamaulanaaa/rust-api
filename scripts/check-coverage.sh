@@ -13,5 +13,5 @@ if ! command -v cargo >/dev/null 2>&1; then
   exit 1
 fi
 
-cargo llvm-cov --all-features --locked --html --output-dir target/llvm-cov --fail-under-lines 90
+cargo llvm-cov --workspace --all-features --locked --html --output-dir target/llvm-cov --fail-under-lines 90
 echo "checked Rust coverage"
