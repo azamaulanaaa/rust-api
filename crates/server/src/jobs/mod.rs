@@ -259,7 +259,11 @@ mod tests {
 
         for handler in &handlers {
             let kind = CommandKind::parse(handler.kind()).expect("the handler kind is valid");
-            assert!(kinds.contains(&kind), "the registry is missing {}", handler.kind());
+            assert!(
+                kinds.contains(&kind),
+                "the registry is missing {}",
+                handler.kind()
+            );
         }
         let unregistered = CommandKind::parse("entity.update").expect("the test kind is valid");
         assert!(!kinds.contains(&unregistered));

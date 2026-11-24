@@ -164,7 +164,10 @@ async fn may_read(job: &Job, sub: &str, policy: &Authorizer) -> bool {
     if roles.iter().any(|role| role == SUPERADMIN_ROLE) {
         return true;
     }
-    match policy.authorize(sub, job_object(job.id), Action::Read).await {
+    match policy
+        .authorize(sub, job_object(job.id), Action::Read)
+        .await
+    {
         Ok(allowed) => allowed,
         Err(error) => {
             tracing::warn!(%error, "the job read policy check failed; the read is denied");
@@ -422,7 +425,10 @@ mod tests {
         let body: Value = actix_test::read_body_json(response).await;
         assert_eq!(body["error"], "bad request");
         assert_eq!(body["code"], "invalid_request");
-        assert!(!body.to_string().contains("entity.delete"), "the answer must not echo the kind");
+        assert!(
+            !body.to_string().contains("entity.delete"),
+            "the answer must not echo the kind"
+        );
         Ok(())
     }
 
@@ -525,7 +531,10 @@ mod tests {
         assert_eq!(denied.status(), StatusCode::NOT_FOUND);
 
         let object = job_object(Uuid::parse_str(&id)?);
-        fixture.engine.add_rule("bob".into(), object, Action::Read).await?;
+        fixture
+            .engine
+            .add_rule("bob".into(), object, Action::Read)
+            .await?;
 
         let allowed = read_job!(app, bob_token, id);
         assert_eq!(allowed.status(), StatusCode::OK);
@@ -553,7 +562,10 @@ mod tests {
         let bob_token = fixture.token("bob")?;
 
         let object = job_object(Uuid::parse_str(&second_id)?);
-        fixture.engine.add_rule("bob".into(), object, Action::Read).await?;
+        fixture
+            .engine
+            .add_rule("bob".into(), object, Action::Read)
+            .await?;
 
         let denied = read_job!(app, bob_token, first_id);
         assert_eq!(denied.status(), StatusCode::NOT_FOUND);
@@ -578,7 +590,10 @@ mod tests {
             .expect("the view has an id")
             .to_string();
 
-        let _ = fixture.queue.reserve("worker-1", 10, Duration::from_secs(0)).await?;
+        let _ = fixture
+            .queue
+            .reserve("worker-1", 10, Duration::from_secs(0))
+            .await?;
 
         let response = read_job!(app, alice_token, id);
         assert_eq!(response.status(), StatusCode::OK);
