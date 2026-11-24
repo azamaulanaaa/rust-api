@@ -43,6 +43,10 @@ pub mod fs;
 /// Generic job queue traits, backends, and worker runtime.
 pub mod queue;
 
+/// Job submission and status routes. The module owns the `/jobs` prefix.
+/// Poll and SSE are stubs until their feature branches land.
+pub mod jobs;
+
 /// Reactive scaffolding: a business-logic-free extension point for
 /// applications to attach `oxkv` hooks and run background systems.
 pub mod reactive;

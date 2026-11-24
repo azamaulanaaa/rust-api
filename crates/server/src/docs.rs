@@ -68,6 +68,8 @@ use utoipa::OpenApi;
         crate::eav::sync::replica,
         crate::eav::sync::reset_replica,
         crate::eav::sync::replica_status,
+        crate::jobs::poll::get_job,
+        crate::jobs::sse::job_events,
     ),
     components(schemas(
         crate::eav::schema::SchemaDraft,
