@@ -39,6 +39,19 @@ const MAX_ATTEMPTS: u32 = 5;
 /// Returns `409` when the queue reports a duplicate key without the stored
 /// job id, because that error carries no id to read.
 /// Returns `500` when the queue fails.
+#[utoipa::path(
+    post,
+    path = "/jobs",
+    tag = "jobs",
+    request_body = rust_api_model::wire::CommandEnvelope,
+    responses(
+        (status = 202, description = "the job was accepted", body = rust_api_model::wire::JobStatusView),
+        (status = 400, description = "the body or the kind is invalid", body = crate::http::error::ErrorBody),
+        (status = 401, description = "authentication required", body = crate::http::error::ErrorBody),
+        (status = 409, description = "the idempotency key conflicts", body = crate::http::error::ErrorBody),
+        (status = 500, description = "the queue failed", body = crate::http::error::ErrorBody)
+    )
+)]
 pub async fn create_job(
     claims: Validated<Claims>,
     queue: web::Data<Arc<dyn JobQueue>>,
@@ -101,7 +114,7 @@ pub async fn create_job(
     tag = "jobs",
     params(("id" = String, Path, description = "job identifier")),
     responses(
-        (status = 200, description = "the job status"),
+        (status = 200, description = "the job status", body = rust_api_model::wire::JobStatusView),
         (status = 400, description = "the id is not a UUID", body = crate::http::error::ErrorBody),
         (status = 401, description = "authentication required", body = crate::http::error::ErrorBody),
         (status = 404, description = "the job is absent or not visible", body = crate::http::error::ErrorBody)
