@@ -2355,6 +2355,8 @@ dependencies = [
  "async-trait",
  "futures",
  "oxkv",
+ "serde_json",
+ "tokio",
  "web-time",
 ]
 
@@ -2366,6 +2368,7 @@ dependencies = [
  "futures",
  "object_store",
  "oxkv",
+ "tokio",
 ]
 
 [[package]]
@@ -3023,6 +3026,8 @@ dependencies = [
  "reqwest",
  "rhai",
  "rsa",
+ "rust-api-core",
+ "rust-api-model",
  "serde",
  "serde_json",
  "sha2",
@@ -3038,6 +3043,32 @@ dependencies = [
  "utoipa-swagger-ui",
  "uuid",
  "wiremock",
+]
+
+[[package]]
+name = "rust-api-client"
+version = "0.1.0"
+dependencies = [
+ "rust-api-core",
+ "rust-api-model",
+]
+
+[[package]]
+name = "rust-api-core"
+version = "0.1.0"
+dependencies = [
+ "rust-api-model",
+]
+
+[[package]]
+name = "rust-api-model"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "utoipa",
+ "uuid",
 ]
 
 [[package]]

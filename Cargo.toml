@@ -1,117 +1,46 @@
-[package]
-name = "rust-api"
+# The workspace root. The server package lives under crates/server. The
+# model and core crates build for the server and for wasm32. The client
+# crate builds for the browser.
+[workspace]
+members = [
+    "crates/model",
+    "crates/core",
+    "crates/server",
+    "crates/client",
+]
+# The edition 2024 resolver.
+resolver = "3"
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.89"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/azamaulanaaa/rust-api"
-# This crate is distributed as a binary. The path adapters in `[dependencies]`
-# and the casbin patch in `[patch.crates-io]` cannot form a crates.io package.
 publish = false
 
-# The lib and bin targets are picked up from `src/lib.rs` and `src/main.rs`
-# by cargo's defaults, so no [lib]/[[bin]] table is needed.
-
-[features]
-default = ["otlp-http"]
-otlp-grpc = ["dep:opentelemetry-otlp", "opentelemetry-otlp/grpc-tonic", "opentelemetry-otlp/trace", "opentelemetry-otlp/metrics", "opentelemetry-otlp/internal-logs"]
-otlp-http = ["dep:opentelemetry-otlp", "opentelemetry-otlp/http-proto", "opentelemetry-otlp/trace", "opentelemetry-otlp/metrics", "opentelemetry-otlp/internal-logs"]
-queue-rabbitmq = []
-
-# Version floors are `major.minor`: a new minor is a deliberate bump, patch
-# releases float. Exact versions are pinned by the committed Cargo.lock and
-# the `--locked` CI jobs, so nothing resolves differently between runs.
-[dependencies]
-# zstd 0.13 has four security advisories. No actix-http release accepts
-# zstd 0.14 yet. This crate mounts `middleware::Compress`. The middleware
-# loses zstd response encoding and keeps brotli, gzip and deflate. Restore
-# `compress-zstd` when actix-http accepts zstd >= 0.14.3.
-actix-web = { version = "4.18", default-features = false, features = ["macros", "compress-brotli", "compress-gzip", "cookies", "http2", "unicode"] }
-actix-cors = "0.7"
-bytes = "1.11"
-futures-util = "0.3"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-url = "2.5"
-
-async-trait = "0.1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
-tokio-util = "0.7"
-
+[workspace.dependencies]
+# The path dependencies carry a version, because the deny check refuses a
+# wildcard path dependency.
+rust-api-model = { version = "0.1.0", path = "crates/model" }
+rust-api-core = { version = "0.1.0", path = "crates/core" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-toml = "0.9"
-
-base64 = "0.22"
-casbin = "2.20"
-hmac = "0.12"
-sha2 = "0.10"
-jsonwebtoken = { version = "10.2", features = ["rust_crypto"] }
-openidconnect = { version = "4.0", default-features = false, features = ["reqwest", "rustls-tls"] }
-
-object_store = { version = "0.12", default-features = false, features = ["aws"] }
-# `btree` is named explicitly because oxkv 0.12 gates its `BTreeStore` on that
-# feature, and the policy adapter tests use `BTreeStore`. The `oxkv` feature is
-# the default and stays implicit. The S3 adapter and the cache adapter are
-# local copies, because crates.io does not publish them before 1.0.
-oxkv = { version = "0.12", features = ["btree"] }
-oxkv-s3 = { version = "0.12.1", path = "vendor/oxkv-s3" }
-oxkv-cached = { version = "0.12.1", path = "vendor/oxkv-cached" }
-
-opentelemetry = "0.32"
-opentelemetry-otlp = { version = "0.32", optional = true, default-features = false }
-opentelemetry_sdk = "0.32"
-tracing = "0.1"
-tracing-opentelemetry = "0.33"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-chrono = "0.4"
-uuid = { version = "1.18", features = ["v7", "serde"] }
-rand = "0.8"
-# The `sync` feature makes the engine and the cached AST values `Send` and
-# `Sync`, so the rule engine can share them across Tokio tasks.
-rhai = { version = "1", features = ["sync"] }
-
-utoipa = { version = "6", features = ["actix_extras"] }
-utoipa-swagger-ui = { version = "10", features = ["actix-web"] }
-
-anyhow = "1.0"
-clap = { version = "4.5", features = ["derive"] }
 thiserror = "2.0"
+uuid = { version = "1.18", features = ["serde"] }
 
-[dev-dependencies]
-criterion = { version = "0.5", features = ["async_tokio"] }
-futures-channel = "0.3"
-# The metrics tests read the recorded values through the in-memory exporter.
-# That exporter is behind the `testing` feature.
-opentelemetry_sdk = { version = "0.32", features = ["testing"] }
-rsa = "0.9"
-wiremock = "0.6"
-# The dependency-probe test pauses and advances the clock.
-tokio = { version = "1", features = ["test-util"] }
-
-[[bench]]
-name = "eav"
-harness = false
-
-# Enforce rustdoc on every public item across all targets (lib + bin).
-[lints.rust]
+# Enforce rustdoc on every public item in every crate.
+[workspace.lints.rust]
 missing_docs = "deny"
 
-[lints.clippy]
+[workspace.lints.clippy]
 unwrap_used = "deny"
 expect_used = "deny"
 
-# The profile that 'dist' will build with
+# The profile that 'dist' will build with.
 [profile.dist]
 inherits = "release"
 lto = "thin"
-
-[[bin]]
-name = "rust-api"
-path = "src/main.rs"
-
-[package.metadata.dist]
-dist = true
 
 # Casbin enables Rhai features that remove the limits, the function calls,
 # and the 64-bit integers that the condition script engine needs. The local
