@@ -7,6 +7,9 @@
 
 use rust_api_model::wire::{ReplicaManifest, SyncCursor};
 
+/// Pure entity-attribute-value (EAV) validation rules and in-memory search.
+pub mod eav;
+
 /// Returns `true` when a replica has applied the full change feed.
 ///
 /// The cursor is current when its sequence is at or above the manifest
