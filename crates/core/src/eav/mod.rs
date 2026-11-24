@@ -11,4 +11,6 @@ pub use search::{
     DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT, QueryWindow, SearchEntity, SearchPage, SearchValue,
     WindowError, search_by_attribute,
 };
-pub use validation::{MAX_NAME_BYTES, NameError, UpdateError, validate_name, validate_update_input};
+pub use validation::{
+    MAX_NAME_BYTES, NameError, UpdateError, validate_name, validate_update_input,
+};

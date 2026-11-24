@@ -143,11 +143,7 @@ pub fn search_by_attribute<'a>(
     ids.dedup();
     let has_more = ids.len() > window.limit();
     ids.truncate(window.limit());
-    let next = if has_more {
-        ids.last().copied()
-    } else {
-        None
-    };
+    let next = if has_more { ids.last().copied() } else { None };
     SearchPage { ids, next }
 }
 
