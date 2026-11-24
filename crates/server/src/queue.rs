@@ -41,6 +41,13 @@ pub struct Job {
     pub scheduled_at: i64,
     /// Optional key for idempotent enqueue.
     pub idempotency_key: Option<String>,
+    /// The authenticated subject that enqueued the job.
+    ///
+    /// An HTTP request that enqueues a job sets the owner. An internal job
+    /// can leave the field empty. The serde default keeps old stored records
+    /// readable.
+    #[serde(default)]
+    pub owner_sub: Option<String>,
     /// Transport metadata.
     pub headers: BTreeMap<String, String>,
 }
