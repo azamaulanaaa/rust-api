@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::http::error::ApiError;
 use crate::http::middleware::jwt::{Claims, Validated};
-use crate::policy::{Authorizer, SUPERADMIN_ROLE};
+use crate::policy::{Action, Authorizer, SUPERADMIN_ROLE};
 use crate::queue::{Job, JobQueue, QueueError};
 
 use super::{JobKinds, status_view};
@@ -85,9 +85,11 @@ pub async fn create_job(
 /// Returns the status of one job.
 ///
 /// The owner reads the job. A holder of the `superadmin` role reads every
-/// job. Any other subject gets `404`, the same answer as for a missing job,
-/// so the route does not show whether a job exists. The response carries
-/// `Cache-Control: no-store`.
+/// job. A policy rule on the object `job:<uuid>` with the `read` action also
+/// allows that job. An administrator adds the rule through the existing
+/// policy routes. Any other subject gets `404`, the same answer as for a
+/// missing job, so the route does not show whether a job exists. The
+/// response carries `Cache-Control: no-store`.
 ///
 /// # Errors
 ///
@@ -134,14 +136,33 @@ pub async fn get_job(
 /// Reports whether `sub` may read `job`.
 ///
 /// The owner reads the job. A holder of the [`SUPERADMIN_ROLE`] role reads
-/// every job. A per-job Casbin grant is not implemented: the policy has no
-/// object and action for a job, so the function does not guess one.
+/// every job. A policy rule on the object `job:<uuid>` with the `read`
+/// action also allows that job. An administrator adds the rule through the
+/// existing policy routes. A policy error denies the read and stays in the
+/// log, so a failure does not change the answer from `404` to `500`.
 async fn may_read(job: &Job, sub: &str, policy: &Authorizer) -> bool {
     if job.owner_sub.as_deref() == Some(sub) {
         return true;
     }
     let roles = policy.groups_of_user(sub).await;
-    roles.iter().any(|role| role == SUPERADMIN_ROLE)
+    if roles.iter().any(|role| role == SUPERADMIN_ROLE) {
+        return true;
+    }
+    match policy.authorize(sub, job_object(job.id), Action::Read).await {
+        Ok(allowed) => allowed,
+        Err(error) => {
+            tracing::warn!(%error, "the job read policy check failed; the read is denied");
+            false
+        }
+    }
+}
+
+/// Returns the policy object name for one job.
+///
+/// The form is `job:<uuid>` and the action is `read`. An administrator
+/// grants one subject access to one job with these values.
+fn job_object(id: Uuid) -> String {
+    format!("job:{id}")
 }
 
 /// Builds the answer for an absent job and for a job that the caller may not
@@ -297,6 +318,18 @@ mod tests {
             let response = actix_test::call_service(&$app, request).await;
             assert_eq!(response.status(), StatusCode::ACCEPTED);
             actix_test::read_body_json::<Value, _>(response).await
+        }};
+    }
+
+    /// Sends one status read and returns the response.
+    macro_rules! read_job {
+        ($app:expr, $token:expr, $id:expr) => {{
+            let request = auth(
+                actix_test::TestRequest::get().uri(&format!("/jobs/{}", $id)),
+                &$token,
+            )
+            .to_request();
+            actix_test::call_service(&$app, request).await
         }};
     }
 
@@ -456,6 +489,64 @@ mod tests {
             queue_error(QueueError::store(std::io::Error::other("disk full"))),
             ApiError::Internal(_)
         ));
+    }
+
+    #[actix_web::test]
+    async fn a_per_job_grant_allows_a_second_subject() -> anyhow::Result<()> {
+        let fixture = fixture().await?;
+        let module = fixture.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let alice_token = fixture.token("alice")?;
+        let created = post_command!(app, alice_token, "key-1");
+        let id = created["id"]
+            .as_str()
+            .expect("the view has an id")
+            .to_string();
+        let bob_token = fixture.token("bob")?;
+
+        let denied = read_job!(app, bob_token, id);
+        assert_eq!(denied.status(), StatusCode::NOT_FOUND);
+
+        let object = job_object(Uuid::parse_str(&id)?);
+        fixture.engine.add_rule("bob".into(), object, Action::Read).await?;
+
+        let allowed = read_job!(app, bob_token, id);
+        assert_eq!(allowed.status(), StatusCode::OK);
+        let view: Value = actix_test::read_body_json(allowed).await;
+        assert_eq!(view["id"], created["id"]);
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn a_grant_for_another_job_does_not_allow_the_read() -> anyhow::Result<()> {
+        let fixture = fixture().await?;
+        let module = fixture.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let alice_token = fixture.token("alice")?;
+        let first = post_command!(app, alice_token, "key-1");
+        let second = post_command!(app, alice_token, "key-2");
+        let first_id = first["id"]
+            .as_str()
+            .expect("the view has an id")
+            .to_string();
+        let second_id = second["id"]
+            .as_str()
+            .expect("the view has an id")
+            .to_string();
+        let bob_token = fixture.token("bob")?;
+
+        let object = job_object(Uuid::parse_str(&second_id)?);
+        fixture.engine.add_rule("bob".into(), object, Action::Read).await?;
+
+        let denied = read_job!(app, bob_token, first_id);
+        assert_eq!(denied.status(), StatusCode::NOT_FOUND);
+        let body: Value = actix_test::read_body_json(denied).await;
+        assert_eq!(body["error"], "job not found");
+        assert_eq!(body["code"], "not_found");
+
+        let allowed = read_job!(app, bob_token, second_id);
+        assert_eq!(allowed.status(), StatusCode::OK);
+        Ok(())
     }
 
     #[actix_web::test]
