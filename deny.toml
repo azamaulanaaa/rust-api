@@ -33,66 +33,71 @@ yanked = "deny"
 [[advisories.ignore]]
 id = "RUSTSEC-2026-0258"
 reason = """
-h2: unbounded empty DATA frames allow memory exhaustion. Fixed in h2 >= 0.4.16, \
-but every published actix-http through 3.18.12 requires h2 ^0.3.27, so no \
-actix-web release can carry the fix yet. h2 IS compiled in (actix-web enables \
-its http2 feature by default) and reachable by any client that speaks h2c to \
-this listener, so the exposure is real rather than theoretical. Mitigation \
-today is to terminate HTTP/2 in front of this process. Re-check when \
-actix-web moves off h2 0.3.
+h2 accepts empty DATA frames without a limit. These frames allow memory \
+exhaustion. The defect is fixed in h2 0.4.16 and later. Every published \
+actix-http release through 3.18.12 requires h2 ^0.3.27. Thus no actix-web \
+release can carry the fix now. actix-web enables the http2 feature of h2 by \
+default, so h2 is in the build. Any client that speaks h2c to this listener can reach the \
+vulnerable path. The exposure is real. The current control is to terminate \
+HTTP/2 in front of this process. Review this entry when actix-web moves off \
+h2 0.3.
 """
 
 [[advisories.ignore]]
 id = "RUSTSEC-2026-0194"
 reason = """
-quick-xml: quadratic runtime scanning a start tag for duplicate attribute \
-names, a denial-of-service. Fixed in quick-xml >= 0.41.0. quick-xml is reached \
-only through object_store, and object_store is at 0.12.5 because the vendored \
-oxkv-s3 0.12.1 adapter declares Arc<dyn object_store::ObjectStore> in its \
-public API and object_store 0.12.5 requires quick-xml ^0.38. This crate also \
-calls the object_store 0.12 S3 builder directly. So the fix needs a port of \
-both paths to a newer object_store. Both this and RUSTSEC-2026-0195 are \
-response-parsing DoS: triggering one requires the S3 endpoint to return a \
-crafted XML body, and the S3 origin is a configured, trusted endpoint (AWS, \
-or a MinIO/R2 the operator controls).
+quick-xml has a quadratic runtime when it scans a start tag for duplicate \
+attribute names. This condition is a denial of service. The defect is fixed in \
+quick-xml 0.41.0 and later. This crate reaches quick-xml only through \
+object_store. The vendored oxkv-s3 0.12.1 adapter declares \
+Arc<dyn object_store::ObjectStore> in its public API. Thus object_store stays \
+at 0.12.5, and that release requires quick-xml ^0.38. This crate also calls \
+the object_store 0.12 S3 builder directly. The fix needs a port of both paths \
+to a newer object_store. This advisory and RUSTSEC-2026-0195 are \
+response-parsing denial-of-service faults. An attacker must make the S3 \
+endpoint return a crafted XML body. The S3 origin is a configured endpoint \
+that the operator trusts, such as AWS, MinIO, or R2.
 """
 
 [[advisories.ignore]]
 id = "RUSTSEC-2026-0195"
 reason = """
-quick-xml: unbounded namespace-declaration allocation in NsReader, a \
-memory-exhaustion denial of service. Fixed in quick-xml >= 0.41.0. Same \
-upstream block as RUSTSEC-2026-0194: object_store 0.12.5 is the version that \
-the vendored oxkv-s3 0.12.1 adapter and the S3 builder of this crate both \
-use, and object_store 0.12.5 requires quick-xml ^0.38. So the fix cannot be \
-taken until both paths move to a newer object_store. Response-parsing only, \
-from a trusted S3 origin.
+quick-xml does not limit the allocation for namespace declarations in \
+NsReader. This condition is a memory-exhaustion denial of service. The defect \
+is fixed in quick-xml 0.41.0 and later. The same upstream block as \
+RUSTSEC-2026-0194 applies. The vendored oxkv-s3 0.12.1 adapter and the S3 builder of this crate \
+both use object_store 0.12.5. That release requires quick-xml ^0.38. Thus \
+this project cannot take the fix until both paths move to a newer \
+object_store. An attacker must reach this path through response parsing only. \
+The S3 origin is trusted.
 """
 
 [[advisories.ignore]]
 id = "RUSTSEC-2023-0071"
 reason = """
-rsa: the Marvin attack recovers an RSA private key from decryption timing. \
-No patched version of `rsa` exists at all, so this can never be bumped away. \
-The vulnerable path is RSA private-key decryption, which this crate does not \
-perform: JWTs are verified as RS256 against public keys fetched from the \
-provider's JWKS. There is no RSA signing outside tests either -- the OIDC \
-flow is authorization-code with PKCE, with no encrypted ID tokens and no \
-private_key_jwt client assertion. Recorded rather than ignored silently \
-because a future change adding client-assertion signing would make this \
-reachable and it would then need a real answer.
+rsa is open to the Marvin attack. This attack recovers an RSA private key \
+from decryption timing. No patched version of rsa exists, so no dependency \
+bump can remove this advisory. The vulnerable path is RSA private-key \
+decryption. This crate does not perform that operation. This crate verifies \
+JWTs as RS256 against public keys from the provider JWKS. This crate does no \
+RSA signing outside tests. The OIDC flow is authorization-code with PKCE. It \
+has no encrypted ID tokens and no private_key_jwt client assertion. This \
+project records the entry and does not ignore it in silence. A future change \
+that adds client-assertion signing would make the path reachable. That change \
+would need a real answer.
 """
 
 [[advisories.ignore]]
 id = "RUSTSEC-2026-0249"
 reason = """
-smartstring is unmaintained (archived May 2026), all versions affected, and no \
-replacement is offered upstream. Reached through casbin -> rhai, and casbin \
-2.20.0 is the latest published release, so it cannot be dropped by bumping. \
-The compensating control is that rhai only ever evaluates RBAC_MODEL, a \
-compile-time constant in src/policy/mod.rs -- no request-derived or \
-attacker-controlled expression reaches the evaluator, which is the only way a \
-parser DoS in that path would be exploitable.
+smartstring is unmaintained and upstream archived it in May 2026. All \
+versions are affected. Upstream offers no replacement. This crate reaches \
+smartstring through casbin and then rhai. casbin 2.20.0 is the latest release, \
+so a dependency bump cannot remove it. The compensating control limits the \
+exposure. rhai evaluates only RBAC_MODEL, a compile-time constant in \
+src/policy/mod.rs. No request-derived expression reaches the evaluator. No \
+attacker-controlled expression reaches the evaluator. A parser denial of \
+service in that path is exploitable only through such an expression.
 """
 
 [sources]
@@ -103,32 +108,33 @@ allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 [[advisories.ignore]]
 id = "RUSTSEC-2026-0387"
 reason = """
-crypto-bigint: timing variability in constant-time operations. Reached through \
-jsonwebtoken and openidconnect via elliptic-curve. No patched version is \
-available within the current dependency constraints; RSA/ECDSA verification uses \
-public keys and does not perform secret-dependent operations on attacker input.
+crypto-bigint has timing variability in its constant-time operations. This \
+crate reaches crypto-bigint through jsonwebtoken and openidconnect, and then \
+through elliptic-curve. No patched version is available within the current \
+dependency constraints. RSA and ECDSA verification uses public keys. It does \
+not perform secret-dependent operations on attacker input.
 """
 
 [[advisories.ignore]]
 id = "RUSTSEC-2026-0542"
 reason = """
 humantime is unmaintained. All versions are affected. The advisory offers no \
-safe upgrade. The path is oxkv-s3 0.12.1 -> object_store 0.12.5 -> humantime \
-2.4.0. The vendored oxkv-s3 adapter exposes object_store types in its public \
-API. That fact pins object_store at 0.12.5. The migration cost is a port of both \
-the adapter and the S3 builder to a newer object_store. Review this entry when \
-that port lands.
+safe upgrade. The dependency path is oxkv-s3 0.12.1, then object_store 0.12.5, \
+then humantime 2.4.0. The vendored oxkv-s3 adapter exposes object_store types \
+in its public API. That fact pins object_store at 0.12.5. The migration cost \
+is a port of the adapter and the S3 builder to a newer object_store. Review \
+this entry when that port lands.
 """
 
 [[advisories.ignore]]
 id = "RUSTSEC-2026-0543"
 reason = """
 chrono is unmaintained. All versions are affected. The advisory offers no safe \
-upgrade. Two paths reach it. oauth2 and openidconnect use it for token time \
-handling. object_store 0.12.5 uses it for metadata timestamps. The advisory \
-suggests jiff and time as alternatives. The migration cost is a change to the \
-OIDC client and to the vendored oxkv-s3 adapter and S3 builder. Review this \
-entry when those paths move off chrono.
+upgrade. Two paths reach chrono. oauth2 and openidconnect use chrono for token \
+time handling. object_store 0.12.5 uses chrono for metadata timestamps. The \
+advisory suggests jiff and time as alternatives. The migration cost is a \
+change to the OIDC client and to the vendored oxkv-s3 adapter and S3 builder. \
+Review this entry when those paths move off chrono.
 """
 
 [[advisories.ignore]]
