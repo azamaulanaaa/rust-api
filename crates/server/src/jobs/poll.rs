@@ -81,14 +81,15 @@ pub async fn create_job(
     };
 
     let id = queue.enqueue(job).await.map_err(queue_error)?;
-    // A duplicate key returns the id of the stored job, so read it back.
+    // A duplicate key returns the id of the stored job. Read the status
+    // first: an expired lease updates the stored attempt.
+    let status = queue.status(id).await.map_err(queue_error)?;
     let stored = queue.get(id).await.map_err(queue_error)?;
     // The queue keys are owner-scoped above. This check is defensive: a
     // backend that returns another owner's id must not answer with that job.
     if stored.owner_sub.as_deref() != Some(owner.as_str()) {
         return Err(ApiError::Conflict);
     }
-    let status = queue.status(id).await.map_err(queue_error)?;
     let view =
         status_view(&stored, &status).map_err(|error| ApiError::Internal(Box::new(error)))?;
 
@@ -128,6 +129,13 @@ pub async fn get_job(
     policy: web::Data<Authorizer>,
 ) -> Result<HttpResponse, ApiError> {
     let id = Uuid::parse_str(&id.into_inner()).map_err(|_| ApiError::BadRequest)?;
+    // Read the status first: an expired lease updates the stored attempt, so
+    // the job read that follows carries the same attempt as the view.
+    let status = match queue.status(id).await {
+        Ok(status) => status,
+        Err(QueueError::NotFound(_)) => return Ok(not_found()),
+        Err(error) => return Err(queue_error(error)),
+    };
     let job = match queue.get(id).await {
         Ok(job) => job,
         Err(QueueError::NotFound(_)) => return Ok(not_found()),
@@ -136,11 +144,6 @@ pub async fn get_job(
     if !may_read(&job, &claims.sub, &policy).await {
         return Ok(not_found());
     }
-    let status = match queue.status(id).await {
-        Ok(status) => status,
-        Err(QueueError::NotFound(_)) => return Ok(not_found()),
-        Err(error) => return Err(queue_error(error)),
-    };
     let view = status_view(&job, &status).map_err(|error| ApiError::Internal(Box::new(error)))?;
 
     Ok(HttpResponse::Ok().json(view))
@@ -220,6 +223,7 @@ fn owner_idempotency_key(owner: &str, key: &str) -> String {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::time::Duration;
 
     use actix_web::{App, http::StatusCode, test as actix_test};
     use jsonwebtoken::EncodingKey;
@@ -559,6 +563,28 @@ mod tests {
 
         let allowed = read_job!(app, bob_token, second_id);
         assert_eq!(allowed.status(), StatusCode::OK);
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn the_view_keeps_the_attempt_of_an_expired_lease() -> anyhow::Result<()> {
+        let fixture = fixture().await?;
+        let module = fixture.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let alice_token = fixture.token("alice")?;
+        let created = post_command!(app, alice_token, "key-1");
+        let id = created["id"]
+            .as_str()
+            .expect("the view has an id")
+            .to_string();
+
+        let _ = fixture.queue.reserve("worker-1", 10, Duration::from_secs(0)).await?;
+
+        let response = read_job!(app, alice_token, id);
+        assert_eq!(response.status(), StatusCode::OK);
+        let view: Value = actix_test::read_body_json(response).await;
+        assert_eq!(view["attempt"], 1);
+        assert_eq!(view["state"], "queued");
         Ok(())
     }
 
