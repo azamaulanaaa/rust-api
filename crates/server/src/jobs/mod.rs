@@ -19,7 +19,7 @@ use actix_web::{
 };
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
-use rust_api_model::{CommandKind, CommandKindError, JobState, JobStatusView};
+use rust_api_model::{CommandKind, CommandKindError, JobState, JobStatusView, wire::CommitReceipt};
 
 use crate::http::{
     ApiModule,
@@ -139,8 +139,10 @@ pub(crate) fn not_implemented(route: &str) -> HttpResponse {
 /// Builds the API view of one stored job status.
 ///
 /// The function maps the stored status to [`JobStatusView`]. The stored
-/// status never goes on the wire. The poll handler can set `commit_seq`
-/// after this call when it has a source for the value.
+/// status never goes on the wire. A handler that advances the change feed
+/// returns a [`CommitReceipt`] as JSON in its result bytes. The function
+/// maps those bytes to `commit_seq`. Other result bytes, including a
+/// malformed or absent value, leave the field empty.
 ///
 /// The function returns [`CommandKindError`] when the stored kind is not a
 /// valid command kind.
@@ -180,6 +182,8 @@ pub(crate) fn status_view(
             view.finished_at = Some(*finished_at);
             if let Some(bytes) = result {
                 view.result_base64 = Some(STANDARD.encode(bytes));
+                let receipt = serde_json::from_slice::<CommitReceipt>(bytes).ok();
+                view.commit_seq = receipt.map(|receipt| receipt.commit_seq);
             }
         }
         JobStatus::Failed { error, finished_at } => {
@@ -324,6 +328,7 @@ mod tests {
         )
         .expect("the empty succeeded status maps");
         assert_eq!(empty.result_base64, None);
+        assert_eq!(empty.commit_seq, None);
 
         for (status, state, error, finished_at) in [
             (
@@ -353,5 +358,26 @@ mod tests {
             assert_eq!(view.result_base64, None);
             assert_eq!(view.commit_seq, None);
         }
+    }
+
+    /// A succeeded job reads `commit_seq` from result bytes that are a receipt.
+    #[test]
+    fn status_view_reads_the_commit_receipt() {
+        let job = sample_job();
+        let result =
+            serde_json::to_vec(&CommitReceipt { commit_seq: 42 }).expect("receipt serializes");
+
+        let view = status_view(
+            &job,
+            &JobStatus::Succeeded {
+                result: Some(result.clone()),
+                finished_at: 1_700_000_020,
+            },
+        )
+        .expect("the succeeded status maps");
+
+        assert_eq!(view.state, JobState::Succeeded);
+        assert_eq!(view.commit_seq, Some(42));
+        assert_eq!(view.result_base64, Some(STANDARD.encode(result)));
     }
 }
