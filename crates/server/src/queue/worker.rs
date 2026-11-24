@@ -549,6 +549,10 @@ mod tests {
             self.inner.extend_lease(job_id, lease, extend).await
         }
 
+        async fn get(&self, job_id: JobId) -> Result<Job, QueueError> {
+            self.inner.get(job_id).await
+        }
+
         async fn status(&self, job_id: JobId) -> Result<JobStatus, QueueError> {
             self.inner.status(job_id).await
         }

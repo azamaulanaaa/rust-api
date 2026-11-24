@@ -86,6 +86,12 @@ impl super::JobQueue for RabbitMqQueue {
         ))
     }
 
+    async fn get(&self, _job_id: JobId) -> Result<Job, QueueError> {
+        Err(QueueError::Unsupported(
+            "rabbitmq backend is not wired".to_string(),
+        ))
+    }
+
     async fn status(&self, _job_id: JobId) -> Result<JobStatus, QueueError> {
         Err(QueueError::Unsupported(
             "rabbitmq backend is not wired".to_string(),

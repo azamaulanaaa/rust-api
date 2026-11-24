@@ -333,6 +333,16 @@ impl super::JobQueue for MemoryQueue {
         Ok(token)
     }
 
+    #[instrument(name = "queue.get", skip(self), fields(queue.backend = "memory", job.id = %job_id))]
+    async fn get(&self, job_id: JobId) -> Result<Job, QueueError> {
+        let state = self.state.lock().await;
+        state
+            .records
+            .get(&job_id)
+            .map(|record| record.job.clone())
+            .ok_or(QueueError::NotFound(job_id))
+    }
+
     #[instrument(name = "queue.status", skip(self), fields(queue.backend = "memory", job.id = %job_id))]
     async fn status(&self, job_id: JobId) -> Result<JobStatus, QueueError> {
         let mut state = self.state.lock().await;
@@ -378,6 +388,31 @@ mod tests {
         let id = j.id;
         let got = q.enqueue(j).await.unwrap();
         assert_eq!(got, id);
+    }
+
+    #[tokio::test]
+    async fn get_returns_the_stored_job_and_its_owner() {
+        let q = MemoryQueue::new();
+        let mut j = job("work");
+        j.owner_sub = Some("alice".to_string());
+        j.idempotency_key = Some("key-1".to_string());
+        let id = j.id;
+        q.enqueue(j).await.unwrap();
+
+        let got = q.get(id).await.unwrap();
+        assert_eq!(got.id, id);
+        assert_eq!(got.kind, "work");
+        assert_eq!(got.payload, vec![1, 2, 3]);
+        assert_eq!(got.owner_sub.as_deref(), Some("alice"));
+        assert_eq!(got.idempotency_key.as_deref(), Some("key-1"));
+        assert_eq!(got.max_attempts, 3);
+    }
+
+    #[tokio::test]
+    async fn get_of_an_unknown_job_is_not_found() {
+        let q = MemoryQueue::new();
+        let id = Uuid::now_v7();
+        assert!(matches!(q.get(id).await, Err(QueueError::NotFound(missing)) if missing == id));
     }
 
     #[tokio::test]
