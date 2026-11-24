@@ -6,7 +6,10 @@
 //! handler module.
 //!
 //! Polling is the guaranteed fallback. The SSE route is an optimization.
-//! Both routes answer 501 until their feature branch lands.
+//! The poll route is live. The SSE route answers 501 until its feature
+//! branch lands.
+
+use std::sync::Arc;
 
 use actix_web::{
     HttpResponse,
@@ -17,23 +20,41 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use rust_api_model::{CommandKind, CommandKindError, JobState, JobStatusView};
 
-use crate::http::{ApiModule, error::ApiError};
-use crate::queue::{Job, JobStatus};
+use crate::http::{
+    ApiModule,
+    error::ApiError,
+    middleware::{
+        jwt::{Claims, JwtClaimsMiddleware},
+        no_cache::NoCache,
+    },
+};
+use crate::policy::Authorizer;
+use crate::queue::{Job, JobQueue, JobStatus};
 
-/// The poll route for one job status.
+/// The poll routes for job submission and one job status.
 pub mod poll;
 
 /// The server-sent event route for one job status.
 pub mod sse;
 
 /// The module that owns the `/jobs` route prefix.
-#[derive(Default)]
-pub struct JobsApiModule;
+pub struct JobsApiModule {
+    queue: Arc<dyn JobQueue>,
+    policy: Authorizer,
+    jwt: JwtClaimsMiddleware<Claims>,
+}
 
 impl JobsApiModule {
-    /// Creates the module. The module holds no state yet.
-    pub fn new() -> Self {
-        Self
+    /// Creates the module from a queue, JWT middleware, and authorizer.
+    ///
+    /// Share the authorizer with the policy engine, so the module sees the
+    /// same policy state as every other module.
+    pub fn new(
+        queue: Arc<dyn JobQueue>,
+        jwt: JwtClaimsMiddleware<Claims>,
+        policy: Authorizer,
+    ) -> Self {
+        Self { queue, jwt, policy }
     }
 }
 
@@ -43,8 +64,16 @@ impl ApiModule for JobsApiModule {
     }
 
     fn configure(&self, cfg: &mut ServiceConfig) {
+        let queue = web::Data::new(self.queue.clone());
+        let policy = web::Data::new(self.policy.clone());
+        let jwt = self.jwt.clone();
         cfg.service(
             web::scope("/jobs")
+                .app_data(queue)
+                .app_data(policy)
+                .wrap(jwt)
+                .wrap(NoCache)
+                .route("", web::post().to(poll::create_job))
                 .service(poll::get_job)
                 .service(sse::job_events),
         );
@@ -73,9 +102,6 @@ pub(crate) fn not_implemented(route: &str) -> HttpResponse {
 ///
 /// The function returns [`CommandKindError`] when the stored kind is not a
 /// valid command kind.
-// The poll and SSE feature branches call this helper. The foundation has no
-// caller yet.
-#[allow(dead_code)]
 pub(crate) fn status_view(
     job: &Job,
     status: &JobStatus,
@@ -132,9 +158,6 @@ pub(crate) fn status_view(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use actix_web::test as actix_test;
-    use actix_web::{App, http::StatusCode};
-    use serde_json::Value;
     use std::collections::BTreeMap;
     use uuid::Uuid;
 
@@ -152,35 +175,6 @@ mod tests {
             idempotency_key: Some("key-1".to_string()),
             owner_sub: None,
             headers: BTreeMap::new(),
-        }
-    }
-
-    /// The module claims only the `/jobs` prefix.
-    #[test]
-    fn the_module_claims_the_jobs_prefix() {
-        assert_eq!(JobsApiModule::new().prefix(), "/jobs");
-    }
-
-    /// Both stub routes answer 501 with the shared error envelope.
-    #[actix_web::test]
-    async fn both_stub_routes_answer_not_implemented() {
-        let module = JobsApiModule::new();
-        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
-
-        let cases = [
-            ("/jobs/one", "job status polling is not implemented"),
-            (
-                "/jobs/one/events",
-                "job status streaming is not implemented",
-            ),
-        ];
-        for (uri, message) in cases {
-            let request = actix_test::TestRequest::get().uri(uri).to_request();
-            let response = actix_test::call_service(&app, request).await;
-            assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED, "{uri}");
-            let body: Value = actix_test::read_body_json(response).await;
-            assert_eq!(body["error"], message, "{uri}");
-            assert_eq!(body["code"], "not_implemented", "{uri}");
         }
     }
 

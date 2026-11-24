@@ -747,6 +747,13 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
     let webhook = WebhookAction::new(config.eav.webhook_allowed_hosts.clone())
         .allow_private_hosts(webhook_allow_private_hosts)
         .with_queue(queue.clone(), signing_secret, webhook_max_attempts);
+    // The HTTP job routes share the queue with the worker, so clone it
+    // before the worker takes ownership.
+    let jobs_api_module = rust_api::jobs::JobsApiModule::new(
+        queue.clone(),
+        oidc_api_module.middleware(),
+        policy_engine.authorizer(),
+    );
     let worker = QueueWorker::new(
         queue,
         vec![Arc::new(webhook.job_handler())],
@@ -925,7 +932,7 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
         .register_module(Box::new(fs_api_module))
         .register_module(Box::new(sync_api_module))
         .register_module(Box::new(eav_api_module))
-        .register_module(Box::new(rust_api::jobs::JobsApiModule::new()));
+        .register_module(Box::new(jobs_api_module));
     let served = service.start(listen_addr.into()).await;
 
     // This is the orderly release, and the code awaits it. `start` returns
