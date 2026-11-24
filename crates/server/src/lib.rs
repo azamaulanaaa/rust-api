@@ -44,7 +44,7 @@ pub mod fs;
 pub mod queue;
 
 /// Job submission and status routes. The module owns the `/jobs` prefix.
-/// Poll and SSE are stubs until their feature branches land.
+/// The poll route reads one job and the SSE route streams one job.
 pub mod jobs;
 
 /// Reactive scaffolding: a business-logic-free extension point for

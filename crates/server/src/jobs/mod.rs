@@ -6,34 +6,35 @@
 //! handler module.
 //!
 //! Polling is the guaranteed fallback. The SSE route is an optimization.
-//! The poll route is live. The SSE route answers 501 until its feature
-//! branch lands.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use actix_web::{
-    HttpResponse,
-    http::StatusCode,
-    web::{self, ServiceConfig},
-};
+use actix_web::web::{self, ServiceConfig};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use rust_api_model::{CommandKind, CommandKindError, JobState, JobStatusView, wire::CommitReceipt};
 
 use crate::http::{
     ApiModule,
-    error::ApiError,
     middleware::{
         jwt::{Claims, JwtClaimsMiddleware},
         no_cache::NoCache,
     },
 };
+use crate::limits::ConcurrencyGate;
 use crate::policy::Authorizer;
 use crate::queue::{Job, JobHandler, JobQueue, JobStatus};
 
 /// The `entity.create` job handler.
 pub mod entity;
+
+/// The default number of job status streams that one process serves at the
+/// same time.
+///
+/// The value is fixed in v1. A stream reads the queue every 500 ms, so the cap
+/// also bounds the queue read rate to 64 reads a second.
+const DEFAULT_MAX_CONCURRENT_STREAMS: usize = 32;
 
 /// The poll routes for job submission and one job status.
 pub mod poll;
@@ -232,6 +233,7 @@ pub struct JobsApiModule {
     policy: Authorizer,
     jwt: JwtClaimsMiddleware<Claims>,
     submittable: SubmittableKinds,
+    stream_gate: ConcurrencyGate,
 }
 
 impl JobsApiModule {
@@ -254,7 +256,17 @@ impl JobsApiModule {
             jwt,
             policy,
             submittable,
+            stream_gate: ConcurrencyGate::new(DEFAULT_MAX_CONCURRENT_STREAMS),
         }
+    }
+
+    /// Replaces the gate that caps concurrent job status streams.
+    ///
+    /// A gate with a limit of `0` disables the cap. The module uses a fixed
+    /// cap in v1, so a host app calls this method only to change it.
+    pub fn with_stream_gate(mut self, gate: ConcurrencyGate) -> Self {
+        self.stream_gate = gate;
+        self
     }
 }
 
@@ -267,12 +279,14 @@ impl ApiModule for JobsApiModule {
         let queue = web::Data::new(self.queue.clone());
         let policy = web::Data::new(self.policy.clone());
         let submittable = web::Data::new(self.submittable.clone());
+        let gate = web::Data::new(self.stream_gate.clone());
         let jwt = self.jwt.clone();
         cfg.service(
             web::scope("/jobs")
                 .app_data(queue)
                 .app_data(policy)
                 .app_data(submittable)
+                .app_data(gate)
                 .wrap(jwt)
                 .wrap(NoCache)
                 .route("", web::post().to(poll::create_job))
@@ -280,20 +294,6 @@ impl ApiModule for JobsApiModule {
                 .service(sse::job_events),
         );
     }
-}
-
-/// Builds the not-implemented answer for one route.
-///
-/// The answer uses the shared error envelope and a message that names the
-/// missing behavior. A caller therefore learns that the route exists and
-/// that the server has no implementation yet.
-pub(crate) fn not_implemented(route: &str) -> HttpResponse {
-    ApiError::envelope(
-        StatusCode::NOT_IMPLEMENTED,
-        &format!("{route} is not implemented"),
-        Some("not_implemented"),
-        None,
-    )
 }
 
 /// Builds the API view of one stored job status.
