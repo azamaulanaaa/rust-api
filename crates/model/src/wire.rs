@@ -10,8 +10,10 @@ use crate::domain::{CommandKind, JobState};
 /// The server builds this view from the stored queue status. The stored
 /// status is part of the durable queue format and never goes on the wire.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct JobStatusView {
     /// The job identifier.
+    #[cfg_attr(feature = "openapi", schema(value_type = String))]
     pub id: Uuid,
     /// The command kind of the job.
     pub kind: CommandKind,
@@ -51,6 +53,7 @@ pub struct JobStatusView {
 
 /// One write command from a client.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct CommandEnvelope {
     /// The command kind. The server rejects a kind without a handler.
     pub kind: CommandKind,

@@ -42,6 +42,8 @@ impl JobState {
 /// value is 1 to 64 ASCII bytes of lowercase letters, digits, `.`, `-`, and
 /// `_`. The server keeps the second allowlist of kinds that have a handler.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "openapi", schema(value_type = String))]
 #[serde(try_from = "String", into = "String")]
 pub struct CommandKind(String);
 
