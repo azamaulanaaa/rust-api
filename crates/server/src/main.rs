@@ -7,8 +7,9 @@
 //! JSON, for backups and migrations. The `eav reset-cursor` subcommand
 //! rewinds the durable rule cursor, for operator recovery.
 
-// Cargo.toml sets the deny level through [lints.clippy]. The level applies to
-// this target too. This attribute only opens the test escape hatch.
+// The root Cargo.toml sets the deny level through [workspace.lints.clippy].
+// The level applies to this target too. This attribute only opens the test
+// escape hatch.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 use std::{
