@@ -341,10 +341,11 @@ miss a write. Replicas consume the feed. The vocabulary lives in `records`. The
 durable implementation is `sync::wal::Wal`. A WAL range read uses one range
 scan. It returns every entry in sequence order.
 
-The job queue lives in `crates/server/src/queue.rs`. It provides `MemoryQueue` for tests,
-`DurableQueue` over an OxKV handle, and `QueueWorker`, which reserves jobs,
-dispatches by `kind`, acknowledges success, and retries or dead-letters
-failures. Delivery is at least once, so handlers must be idempotent.
+The job queue lives in `crates/server/src/queue.rs`. It provides
+`MemoryQueue` for tests, `DurableQueue` over an OxKV handle, and
+`QueueWorker`, which reserves jobs, dispatches by `kind`, acknowledges
+success, and retries or dead-letters failures. Delivery is at least once,
+so handlers must be idempotent.
 
 A lease token carries a worker and a generation. Reserve increments the
 generation. Each lease extension increments it again. A renewal returns a new
