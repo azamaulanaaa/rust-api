@@ -6,15 +6,15 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use actix_web::{HttpResponse, get, web};
+use actix_web::{HttpResponse, get, http::StatusCode, web};
 use rust_api_model::wire::CommandEnvelope;
 use uuid::Uuid;
 
 use crate::http::error::ApiError;
 use crate::http::middleware::jwt::{Claims, Validated};
+use crate::policy::{Authorizer, SUPERADMIN_ROLE};
 use crate::queue::{Job, JobQueue, QueueError};
 
-use super::not_implemented;
 use super::status_view;
 
 /// The queue priority of a job that an HTTP request enqueues.
@@ -71,28 +71,86 @@ pub async fn create_job(
         return Err(ApiError::Conflict);
     }
     let status = queue.status(id).await.map_err(queue_error)?;
-    let view = status_view(&stored, &status).map_err(|error| ApiError::Internal(Box::new(error)))?;
+    let view =
+        status_view(&stored, &status).map_err(|error| ApiError::Internal(Box::new(error)))?;
 
     Ok(HttpResponse::Accepted().json(view))
 }
 
 /// Returns the status of one job.
 ///
-/// The route answers 501 until the status feature lands. The finished route
-/// returns `200` with a [`JobStatusView`](rust_api_model::wire::JobStatusView)
-/// and `404` for an absent or invisible job.
+/// The owner reads the job. A holder of the `superadmin` role reads every
+/// job. Any other subject gets `404`, the same answer as for a missing job,
+/// so the route does not show whether a job exists. The response carries
+/// `Cache-Control: no-store`.
+///
+/// # Errors
+///
+/// Returns `400` when the id is not a UUID.
+/// Returns `401` when the request has no valid token.
 #[utoipa::path(
     get,
     path = "/jobs/{id}",
     tag = "jobs",
     params(("id" = String, Path, description = "job identifier")),
     responses(
-        (status = 501, description = "not implemented", body = crate::http::error::ErrorBody)
+        (status = 200, description = "the job status"),
+        (status = 400, description = "the id is not a UUID", body = crate::http::error::ErrorBody),
+        (status = 401, description = "authentication required", body = crate::http::error::ErrorBody),
+        (status = 404, description = "the job is absent or not visible", body = crate::http::error::ErrorBody)
     )
 )]
 #[get("/{id}")]
-pub async fn get_job(_id: web::Path<String>) -> HttpResponse {
-    not_implemented("job status polling")
+pub async fn get_job(
+    id: web::Path<String>,
+    claims: Validated<Claims>,
+    queue: web::Data<Arc<dyn JobQueue>>,
+    policy: web::Data<Authorizer>,
+) -> Result<HttpResponse, ApiError> {
+    let id = Uuid::parse_str(&id.into_inner()).map_err(|_| ApiError::BadRequest)?;
+    let job = match queue.get(id).await {
+        Ok(job) => job,
+        Err(QueueError::NotFound(_)) => return Ok(not_found()),
+        Err(error) => return Err(queue_error(error)),
+    };
+    if !may_read(&job, &claims.sub, &policy).await {
+        return Ok(not_found());
+    }
+    let status = match queue.status(id).await {
+        Ok(status) => status,
+        Err(QueueError::NotFound(_)) => return Ok(not_found()),
+        Err(error) => return Err(queue_error(error)),
+    };
+    let view = status_view(&job, &status).map_err(|error| ApiError::Internal(Box::new(error)))?;
+
+    Ok(HttpResponse::Ok().json(view))
+}
+
+/// Reports whether `sub` may read `job`.
+///
+/// The owner reads the job. A holder of the [`SUPERADMIN_ROLE`] role reads
+/// every job. A per-job Casbin grant is not implemented: the policy has no
+/// object and action for a job, so the function does not guess one.
+async fn may_read(job: &Job, sub: &str, policy: &Authorizer) -> bool {
+    if job.owner_sub.as_deref() == Some(sub) {
+        return true;
+    }
+    let roles = policy.groups_of_user(sub).await;
+    roles.iter().any(|role| role == SUPERADMIN_ROLE)
+}
+
+/// Builds the answer for an absent job and for a job that the caller may not
+/// read.
+///
+/// Both cases return the same answer, so the route does not show whether a
+/// job exists.
+fn not_found() -> HttpResponse {
+    ApiError::envelope(
+        StatusCode::NOT_FOUND,
+        "job not found",
+        Some("not_found"),
+        None,
+    )
 }
 
 /// Maps a queue failure onto the shared API error type.
@@ -131,8 +189,8 @@ mod tests {
     use super::*;
     use crate::db::{build_test_store, test_prefix};
     use crate::http::ApiModule as _;
-    use crate::http::middleware::jwt::JwtClaimsMiddleware;
     use crate::http::middleware::jwks::test_support::{rsa_key, sign_rs256, spawn_jwks};
+    use crate::http::middleware::jwt::JwtClaimsMiddleware;
     use crate::jobs::JobsApiModule;
     use crate::policy::PolicyEngine;
     use crate::queue::MemoryQueue;
@@ -214,8 +272,7 @@ mod tests {
                 .to_request();
             let response = actix_test::call_service(&$app, request).await;
             assert_eq!(response.status(), StatusCode::ACCEPTED);
-            let view: Value = actix_test::read_body_json(response).await;
-            view
+            actix_test::read_body_json::<Value, _>(response).await
         }};
     }
 
@@ -227,7 +284,7 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn the_owner_enqueues_the_job() -> anyhow::Result<()> {
+    async fn the_owner_enqueues_and_reads_the_job() -> anyhow::Result<()> {
         let fixture = fixture().await?;
         let module = fixture.module().await?;
         let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
@@ -238,14 +295,118 @@ mod tests {
         assert_eq!(created["state"], "queued");
         assert_eq!(created["attempt"], 0);
         assert_eq!(created["max_attempts"], 5);
-        let id = created["id"].as_str().expect("the view has an id").to_string();
+        let id = created["id"]
+            .as_str()
+            .expect("the view has an id")
+            .to_string();
 
         let stored = fixture.queue.get(Uuid::parse_str(&id)?).await?;
         assert_eq!(stored.owner_sub.as_deref(), Some("alice"));
         assert_eq!(stored.kind, "entity.create");
         assert_eq!(stored.priority, 0);
         assert_eq!(stored.max_attempts, 5);
+
+        let request = auth(
+            actix_test::TestRequest::get().uri(&format!("/jobs/{id}")),
+            &token,
+        )
+        .to_request();
+        let response = actix_test::call_service(&app, request).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("cache-control")
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store")
+        );
+        let read: Value = actix_test::read_body_json(response).await;
+        assert_eq!(read["id"], created["id"]);
+        assert_eq!(read["kind"], "entity.create");
+        assert_eq!(read["state"], "queued");
         Ok(())
+    }
+
+    #[actix_web::test]
+    async fn a_second_subject_gets_404_for_the_job() -> anyhow::Result<()> {
+        let fixture = fixture().await?;
+        let module = fixture.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let alice_token = fixture.token("alice")?;
+        let created = post_command!(app, alice_token, "key-1");
+        let id = created["id"].as_str().expect("the view has an id");
+
+        let bob_token = fixture.token("bob")?;
+        let request = auth(
+            actix_test::TestRequest::get().uri(&format!("/jobs/{id}")),
+            &bob_token,
+        )
+        .to_request();
+        let response = actix_test::call_service(&app, request).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body: Value = actix_test::read_body_json(response).await;
+        assert_eq!(body["error"], "job not found");
+        assert_eq!(body["code"], "not_found");
+        assert!(
+            body.get("kind").is_none(),
+            "the answer must not show the job"
+        );
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn an_invalid_id_is_400() -> anyhow::Result<()> {
+        let fixture = fixture().await?;
+        let module = fixture.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+
+        let token = fixture.token("alice")?;
+        let request = auth(
+            actix_test::TestRequest::get().uri("/jobs/not-a-uuid"),
+            &token,
+        )
+        .to_request();
+        let response = actix_test::call_service(&app, request).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: Value = actix_test::read_body_json(response).await;
+        assert_eq!(body["code"], "invalid_request");
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn an_unknown_job_is_404() -> anyhow::Result<()> {
+        let fixture = fixture().await?;
+        let module = fixture.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+
+        let token = fixture.token("alice")?;
+        let id = Uuid::now_v7();
+        let request = auth(
+            actix_test::TestRequest::get().uri(&format!("/jobs/{id}")),
+            &token,
+        )
+        .to_request();
+        let response = actix_test::call_service(&app, request).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body: Value = actix_test::read_body_json(response).await;
+        assert_eq!(body["code"], "not_found");
+        Ok(())
+    }
+
+    #[test]
+    fn queue_errors_map_to_the_expected_api_errors() {
+        assert!(matches!(
+            queue_error(QueueError::Invalid("bad max_attempts".to_string())),
+            ApiError::BadRequest
+        ));
+        assert!(matches!(
+            queue_error(QueueError::DuplicateIdempotency("key-1".to_string())),
+            ApiError::Conflict
+        ));
+        assert!(matches!(
+            queue_error(QueueError::store(std::io::Error::other("disk full"))),
+            ApiError::Internal(_)
+        ));
     }
 
     #[actix_web::test]
@@ -278,18 +439,47 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn an_anonymous_command_is_401() -> anyhow::Result<()> {
+    async fn a_superadmin_reads_every_job() -> anyhow::Result<()> {
+        let fixture = fixture().await?;
+        assert!(fixture.engine.claim_superadmin("root").await?);
+        let module = fixture.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let alice_token = fixture.token("alice")?;
+        let created = post_command!(app, alice_token, "key-1");
+        let id = created["id"].as_str().expect("the view has an id");
+
+        let root_token = fixture.token("root")?;
+        let request = auth(
+            actix_test::TestRequest::get().uri(&format!("/jobs/{id}")),
+            &root_token,
+        )
+        .to_request();
+        let response = actix_test::call_service(&app, request).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let read: Value = actix_test::read_body_json(response).await;
+        assert_eq!(read["id"], created["id"]);
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn an_anonymous_request_is_401() -> anyhow::Result<()> {
         let fixture = fixture().await?;
         let module = fixture.module().await?;
         let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
 
-        let request = actix_test::TestRequest::post()
-            .uri("/jobs")
-            .insert_header(("Content-Type", "application/json"))
-            .set_payload(command_body("key-1"))
-            .to_request();
-        let response = actix_test::call_service(&app, request).await;
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        for request in [
+            actix_test::TestRequest::post()
+                .uri("/jobs")
+                .insert_header(("Content-Type", "application/json"))
+                .set_payload(command_body("key-1"))
+                .to_request(),
+            actix_test::TestRequest::get()
+                .uri("/jobs/0190f6e0-0000-7000-8000-000000000000")
+                .to_request(),
+        ] {
+            let response = actix_test::call_service(&app, request).await;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
         Ok(())
     }
 }
