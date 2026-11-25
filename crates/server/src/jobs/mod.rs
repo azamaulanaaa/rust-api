@@ -45,6 +45,12 @@ pub const DEFAULT_JOB_EVENT_STREAM_MAX_SECS: u64 = 900;
 /// same time.
 pub const DEFAULT_MAX_JOB_EVENT_STREAMS_PER_SUBJECT: usize = 8;
 
+/// The highest per-subject stream cap that [`SubjectGates::new`] accepts.
+///
+/// The constructor clamps a larger value to this cap, so a direct caller
+/// cannot exceed the safe permit range of [`Semaphore`].
+const MAX_SUBJECT_STREAM_CAP: usize = 1_024;
+
 /// The default fallback for the longest time that one stream stays open.
 ///
 /// A host sets the deployed value with
@@ -258,11 +264,13 @@ pub struct SubjectGates {
 impl SubjectGates {
     /// Builds a gate that allows `max` streams for each subject.
     ///
-    /// A value of `0` refuses every stream. The config maps `0` to
-    /// [`DEFAULT_MAX_JOB_EVENT_STREAMS_PER_SUBJECT`] before this call.
+    /// The constructor clamps `max` to `MAX_SUBJECT_STREAM_CAP`, so a huge
+    /// value cannot panic. A value of `0` refuses every stream. The config
+    /// maps `0` to [`DEFAULT_MAX_JOB_EVENT_STREAMS_PER_SUBJECT`] before this
+    /// call.
     pub fn new(max: usize) -> Self {
         Self {
-            max,
+            max: max.min(MAX_SUBJECT_STREAM_CAP),
             gates: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -712,5 +720,21 @@ mod tests {
 
         assert_eq!(view.commit_seq, None);
         assert_eq!(view.result_base64, Some(STANDARD.encode(result)));
+    }
+
+    /// A huge subject limit is clamped, and the gate still refuses past it.
+    #[test]
+    fn a_subject_gate_clamps_a_huge_limit() {
+        let gates = SubjectGates::new(usize::MAX);
+        let permits: Vec<_> = (0..MAX_SUBJECT_STREAM_CAP)
+            .map(|_| gates.acquire("alice").expect("the clamped gate has a slot"))
+            .collect();
+
+        assert!(gates.acquire("alice").is_none(), "the gate is finite");
+        drop(permits);
+        assert!(
+            gates.acquire("alice").is_some(),
+            "a released slot is reusable"
+        );
     }
 }
