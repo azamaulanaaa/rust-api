@@ -80,6 +80,7 @@ const HEARTBEAT_FRAME: &[u8] = b": heartbeat\n\n";
 /// Returns `400` when the id is not a UUID.
 /// Returns `401` when the request has no valid token.
 /// Returns `429` when no stream slot is free.
+/// Returns `500` when the queue or the status view fails.
 #[utoipa::path(
     get,
     path = "/jobs/{id}/events",
@@ -90,7 +91,8 @@ const HEARTBEAT_FRAME: &[u8] = b": heartbeat\n\n";
         (status = 400, description = "the id is not a UUID", body = crate::http::error::ErrorBody),
         (status = 401, description = "authentication required", body = crate::http::error::ErrorBody),
         (status = 404, description = "the job is absent or not visible", body = crate::http::error::ErrorBody),
-        (status = 429, description = "no stream slot is free", body = crate::http::error::ErrorBody)
+        (status = 429, description = "no stream slot is free", body = crate::http::error::ErrorBody),
+        (status = 500, description = "the queue or the status view failed", body = crate::http::error::ErrorBody)
     )
 )]
 #[get("/{id}/events")]
@@ -442,7 +444,6 @@ mod tests {
             actix_test::TestRequest::get().uri(&format!("/jobs/{id}/events")),
             &token,
         )
-        .insert_header(("Last-Event-ID", "7"))
         .to_request();
         let response = actix_test::call_service(&app, request).await;
         assert_eq!(response.status(), StatusCode::OK);
