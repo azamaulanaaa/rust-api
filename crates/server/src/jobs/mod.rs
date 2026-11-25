@@ -40,8 +40,8 @@ pub mod sse;
 
 /// The set of job kinds that have a registered handler.
 ///
-/// The type is cheap to clone, because the set sits behind an [`Arc`]. The
-/// worker and the submission route use one kind list.
+/// The type is cheap to clone, because the set sits behind an [`Arc`]. A
+/// worker handler set and a client-submittable set are separate values.
 #[derive(Clone, Debug)]
 pub struct JobKinds {
     kinds: Arc<BTreeSet<CommandKind>>,
@@ -58,7 +58,7 @@ impl JobKinds {
     /// Builds the set from a handler list.
     ///
     /// The function reads [`JobHandler::kind`] from each handler. A caller
-    /// must not keep a second kind list.
+    /// must not keep a second worker kind list.
     ///
     /// # Errors
     ///
