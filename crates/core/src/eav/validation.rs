@@ -62,6 +62,9 @@ impl fmt::Display for NameError {
 impl std::error::Error for NameError {}
 
 /// A reason that an entity update input is not valid.
+///
+/// The enum is non-exhaustive. A caller must treat a new variant as an error.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpdateError {
     /// The entity id is not valid.
