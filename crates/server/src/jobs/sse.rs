@@ -50,6 +50,9 @@ const ERROR_EVENT: &str = "error";
 /// The error code for a stream that lost its read grant.
 const ACCESS_REVOKED_CODE: &str = "access_revoked";
 
+/// The error code for a stream that cannot read its job.
+const STREAM_UNAVAILABLE_CODE: &str = "stream_unavailable";
+
 /// The comment line that keeps the connection alive.
 const HEARTBEAT_FRAME: &[u8] = b": heartbeat\n\n";
 
@@ -76,8 +79,9 @@ const HEARTBEAT_FRAME: &[u8] = b": heartbeat\n\n";
 /// for `succeeded`, `failed`, or `dead` closes the stream.
 ///
 /// A mid-stream failure sends one `error` event with a stable code.
-/// `access_revoked` means the subject lost the read grant. The client must
-/// fall back to polling after that code.
+/// `access_revoked` means the subject lost the read grant.
+/// `stream_unavailable` means the queue or the status view failed. After
+/// either code, the client must fall back to polling.
 ///
 /// The route keeps no event history. It ignores `Last-Event-ID` and sends the
 /// current status on every reconnect.
@@ -258,7 +262,8 @@ struct StreamState {
 /// The stream sends the initial view at once. A terminal initial view sends
 /// its terminal event at once. Otherwise the stream reads the queue on each
 /// tick and sends an event only when the view changes or a heartbeat is due.
-/// A lost grant sends `access_revoked`. A queue or view error ends the stream.
+/// A lost grant sends `access_revoked`. A queue or view error sends
+/// `stream_unavailable`. Both end the stream.
 fn event_stream(
     queue: Arc<dyn JobQueue>,
     job_id: Uuid,
@@ -316,7 +321,10 @@ fn event_stream(
                         state.done = true;
                         return Some((Ok(error_frame(ACCESS_REVOKED_CODE)), state));
                     }
-                    Err(PollError::Unavailable) => return None,
+                    Err(PollError::Unavailable) => {
+                        state.done = true;
+                        return Some((Ok(error_frame(STREAM_UNAVAILABLE_CODE)), state));
+                    }
                 };
             if view.state.is_terminal() {
                 state.done = true;
@@ -1023,6 +1031,14 @@ mod tests {
         tokio::pin!(events);
 
         assert!(events.next().await.is_some(), "the initial event arrives");
+        let error = events
+            .next()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("the stream has no error event"))??;
+        let error = parse_events(&String::from_utf8_lossy(&error));
+        assert_eq!(error.len(), 1);
+        assert_eq!(error[0].0, "error");
+        assert_eq!(error[0].1["code"], "stream_unavailable");
         assert!(
             events.next().await.is_none(),
             "the queue error ends the stream"
@@ -1050,6 +1066,14 @@ mod tests {
         tokio::pin!(events);
 
         assert!(events.next().await.is_some(), "the initial event arrives");
+        let error = events
+            .next()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("the stream has no error event"))??;
+        let error = parse_events(&String::from_utf8_lossy(&error));
+        assert_eq!(error.len(), 1);
+        assert_eq!(error[0].0, "error");
+        assert_eq!(error[0].1["code"], "stream_unavailable");
         assert!(
             events.next().await.is_none(),
             "the view error ends the stream"
