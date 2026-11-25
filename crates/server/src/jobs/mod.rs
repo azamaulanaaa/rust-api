@@ -158,8 +158,9 @@ pub(crate) fn not_implemented(route: &str) -> HttpResponse {
 /// The function maps the stored status to [`JobStatusView`]. The stored
 /// status never goes on the wire. A handler that advances the change feed
 /// returns a [`CommitReceipt`] as JSON in its result bytes. The function
-/// maps those bytes to `commit_seq`. Other result bytes, including a
-/// malformed or absent value, leave the field empty.
+/// maps those bytes to `commit_seq` and does not repeat them in
+/// `result_base64`. Other result bytes go in `result_base64` and leave
+/// `commit_seq` empty.
 ///
 /// The function returns [`CommandKindError`] when the stored kind is not a
 /// valid command kind.
@@ -198,9 +199,10 @@ pub(crate) fn status_view(
             view.state = JobState::Succeeded;
             view.finished_at = Some(*finished_at);
             if let Some(bytes) = result {
-                view.result_base64 = Some(STANDARD.encode(bytes));
-                let receipt = serde_json::from_slice::<CommitReceipt>(bytes).ok();
-                view.commit_seq = receipt.map(|receipt| receipt.commit_seq);
+                match serde_json::from_slice::<CommitReceipt>(bytes) {
+                    Ok(receipt) => view.commit_seq = Some(receipt.commit_seq),
+                    Err(_) => view.result_base64 = Some(STANDARD.encode(bytes)),
+                }
             }
         }
         JobStatus::Failed { error, finished_at } => {
@@ -397,7 +399,7 @@ mod tests {
         }
     }
 
-    /// A succeeded job reads `commit_seq` from result bytes that are a receipt.
+    /// A succeeded job reads `commit_seq` from a receipt result and omits the bytes.
     #[test]
     fn status_view_reads_the_commit_receipt() {
         let job = sample_job();
@@ -407,7 +409,7 @@ mod tests {
         let view = status_view(
             &job,
             &JobStatus::Succeeded {
-                result: Some(result.clone()),
+                result: Some(result),
                 finished_at: 1_700_000_020,
             },
         )
@@ -415,6 +417,6 @@ mod tests {
 
         assert_eq!(view.state, JobState::Succeeded);
         assert_eq!(view.commit_seq, Some(42));
-        assert_eq!(view.result_base64, Some(STANDARD.encode(result)));
+        assert_eq!(view.result_base64, None);
     }
 }
