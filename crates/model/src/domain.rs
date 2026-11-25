@@ -201,9 +201,14 @@ mod tests {
     #[test]
     fn command_kind_from_str_uses_the_parser() {
         let kind: CommandKind = "entity.create".parse().expect("the kind parses");
-        assert_eq!(kind, CommandKind::parse("entity.create").expect("the kind parses"));
+        assert_eq!(
+            kind,
+            CommandKind::parse("entity.create").expect("the kind parses")
+        );
 
-        let error = "Bad Kind".parse::<CommandKind>().expect_err("the kind must fail");
+        let error = "Bad Kind"
+            .parse::<CommandKind>()
+            .expect_err("the kind must fail");
         assert_eq!(error, CommandKindError::InvalidByte);
     }
 
