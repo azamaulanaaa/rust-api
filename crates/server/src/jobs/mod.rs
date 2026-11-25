@@ -220,7 +220,7 @@ pub(crate) fn status_view(
         max_attempts: job.max_attempts,
         created_at: job.created_at,
         scheduled_at: job.scheduled_at,
-        lease_expires_at: None,
+        lease_expires_at_ms: None,
         finished_at: None,
         worker: None,
         error: None,
@@ -233,7 +233,7 @@ pub(crate) fn status_view(
         JobStatus::Leased { worker, expires_at } => {
             view.state = JobState::Leased;
             view.worker = Some(worker.clone());
-            view.lease_expires_at = Some(*expires_at);
+            view.lease_expires_at_ms = Some(*expires_at);
         }
         JobStatus::Succeeded {
             result,
@@ -372,7 +372,7 @@ mod tests {
         assert_eq!(queued.max_attempts, job.max_attempts);
         assert_eq!(queued.created_at, job.created_at);
         assert_eq!(queued.scheduled_at, job.scheduled_at);
-        assert_eq!(queued.lease_expires_at, None);
+        assert_eq!(queued.lease_expires_at_ms, None);
         assert_eq!(queued.finished_at, None);
         assert_eq!(queued.worker, None);
         assert_eq!(queued.error, None);
@@ -389,7 +389,7 @@ mod tests {
         .expect("the leased status maps");
         assert_eq!(leased.state, JobState::Leased);
         assert_eq!(leased.worker.as_deref(), Some("worker-7"));
-        assert_eq!(leased.lease_expires_at, Some(1_700_000_000_123));
+        assert_eq!(leased.lease_expires_at_ms, Some(1_700_000_000_123));
         assert_eq!(leased.finished_at, None);
         assert_eq!(leased.commit_seq, None);
     }

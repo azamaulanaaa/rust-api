@@ -31,7 +31,7 @@ pub struct JobStatusView {
     ///
     /// The field is present only while a worker holds the job.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub lease_expires_at: Option<i64>,
+    pub lease_expires_at_ms: Option<i64>,
     /// The finish time in unix seconds.
     ///
     /// The field is present only in a terminal state.
@@ -132,7 +132,7 @@ mod tests {
             max_attempts: 5,
             created_at: 1_700_000_000,
             scheduled_at: 1_700_000_001,
-            lease_expires_at: None,
+            lease_expires_at_ms: None,
             finished_at: None,
             worker: None,
             error: None,
@@ -146,7 +146,7 @@ mod tests {
     fn a_queued_job_omits_the_optional_fields() {
         let value = serde_json::to_value(job_view()).expect("job view serializes");
         for field in [
-            "lease_expires_at",
+            "lease_expires_at_ms",
             "finished_at",
             "worker",
             "error",
