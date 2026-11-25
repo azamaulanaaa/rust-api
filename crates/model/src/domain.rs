@@ -101,6 +101,14 @@ impl TryFrom<String> for CommandKind {
     }
 }
 
+impl std::str::FromStr for CommandKind {
+    type Err = CommandKindError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::parse(value)
+    }
+}
+
 impl From<CommandKind> for String {
     fn from(kind: CommandKind) -> Self {
         kind.0
@@ -187,6 +195,16 @@ mod tests {
             );
         }
         assert!(CommandKind::parse("a.b-c_9").is_ok());
+    }
+
+    /// `FromStr` uses the command kind parser.
+    #[test]
+    fn command_kind_from_str_uses_the_parser() {
+        let kind: CommandKind = "entity.create".parse().expect("the kind parses");
+        assert_eq!(kind, CommandKind::parse("entity.create").expect("the kind parses"));
+
+        let error = "Bad Kind".parse::<CommandKind>().expect_err("the kind must fail");
+        assert_eq!(error, CommandKindError::InvalidByte);
     }
 
     /// Serde uses the parser and the string form of the type.
