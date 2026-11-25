@@ -27,7 +27,7 @@ use crate::http::{
 };
 use crate::limits::{ConcurrencyGate, GatedStream, too_many};
 use crate::policy::Authorizer;
-use crate::queue::{Job, JobQueue, QueueError};
+use crate::queue::{JobQueue, QueueError};
 
 /// The interval between two queue status reads.
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -135,12 +135,47 @@ fn stream_duration(exp: u64, now: i64, max_duration: Duration) -> Duration {
     Duration::from_secs(exp.saturating_sub(now)).min(max_duration)
 }
 
+/// Reads the current view of one job.
+///
+/// The function reads the status first, because an expired lease updates the
+/// stored attempt. It then reads the stored job, so the view carries the same
+/// attempt and run time as the status. A missing job ends the stream. Another
+/// queue error or a view error is logged and ends the stream.
+async fn current_view(queue: &Arc<dyn JobQueue>, job_id: Uuid) -> Option<JobStatusView> {
+    let status = match queue.status(job_id).await {
+        Ok(status) => status,
+        Err(QueueError::NotFound(_)) => return None,
+        Err(error) => {
+            tracing::warn!(%error, "the job status read failed; the status stream ends");
+            return None;
+        }
+    };
+    let job = match queue.get(job_id).await {
+        Ok(job) => job,
+        Err(QueueError::NotFound(_)) => return None,
+        Err(error) => {
+            tracing::warn!(%error, "the job read failed; the status stream ends");
+            return None;
+        }
+    };
+    match status_view(&job, &status) {
+        Ok(view) => Some(view),
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "the job status view could not be built; the status stream ends"
+            );
+            None
+        }
+    }
+}
+
 /// State of one event stream.
 struct StreamState {
     /// The queue that the stream reads.
     queue: Arc<dyn JobQueue>,
-    /// The stored job. The stream builds each view from this record.
-    job: Job,
+    /// The identifier of the job that the stream follows.
+    job_id: Uuid,
     /// The first view. The stream sends it before it reads the queue.
     initial: Option<JobStatusView>,
     /// A terminal view that the stream sends after the initial status.
@@ -164,7 +199,7 @@ struct StreamState {
 /// tick and sends an event only when the view changes or a heartbeat is due.
 fn event_stream(
     queue: Arc<dyn JobQueue>,
-    job: Job,
+    job_id: Uuid,
     initial: JobStatusView,
     duration: Duration,
     poll_interval: Duration,
@@ -172,15 +207,16 @@ fn event_stream(
     let mut ticker = tokio::time::interval(poll_interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let now = Instant::now();
+    let deadline = now.checked_add(duration).unwrap_or(now);
     let state = StreamState {
         queue,
-        job,
+        job_id,
         initial: Some(initial),
         pending_terminal: None,
         last: None,
         done: false,
         ticker,
-        deadline: now + duration,
+        deadline,
         last_heartbeat: now,
     };
 
@@ -207,35 +243,19 @@ fn event_stream(
             {
                 return None;
             }
-            match state.queue.status(state.job.id).await {
-                Ok(status) => match status_view(&state.job, &status) {
-                    Ok(view) => {
-                        if view.state.is_terminal() {
-                            state.done = true;
-                            return Some((terminal_frame(&view), state));
-                        }
-                        if state.last.as_ref() != Some(&view) {
-                            state.last = Some(view.clone());
-                            state.last_heartbeat = Instant::now();
-                            return Some((status_frame(&view), state));
-                        }
-                        if state.last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
-                            state.last_heartbeat = Instant::now();
-                            return Some((Ok(Bytes::from_static(HEARTBEAT_FRAME)), state));
-                        }
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            %error,
-                            "the job status view could not be built; the status stream ends"
-                        );
-                        return None;
-                    }
-                },
-                Err(error) => {
-                    tracing::warn!(%error, "the job status stream ended on a queue error");
-                    return None;
-                }
+            let view = current_view(&state.queue, state.job_id).await?;
+            if view.state.is_terminal() {
+                state.done = true;
+                return Some((terminal_frame(&view), state));
+            }
+            if state.last.as_ref() != Some(&view) {
+                state.last = Some(view.clone());
+                state.last_heartbeat = Instant::now();
+                return Some((status_frame(&view), state));
+            }
+            if state.last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
+                state.last_heartbeat = Instant::now();
+                return Some((Ok(Bytes::from_static(HEARTBEAT_FRAME)), state));
             }
         }
     })
@@ -275,32 +295,17 @@ mod tests {
     use crate::http::middleware::jwt::JwtClaimsMiddleware;
     use crate::jobs::{JobKinds, JobsApiModule, poll::job_object};
     use crate::policy::{Action, PolicyEngine};
-    use crate::queue::{JobError, JobHandler, JobStatus, MemoryQueue};
+    use crate::queue::{Job, JobStatus, MemoryQueue};
     use rust_api_model::wire::CommitReceipt;
 
     const KID: &str = "jobs-sse-test-kid";
     const AUD: &str = "test-aud";
-
-    /// A handler with one kind, for the test registry.
-    struct TestHandler(&'static str);
-
-    #[async_trait::async_trait]
-    impl JobHandler for TestHandler {
-        fn kind(&self) -> &'static str {
-            self.0
-        }
-
-        async fn handle(&self, _job: &Job) -> Result<Option<Vec<u8>>, JobError> {
-            Ok(None)
-        }
-    }
 
     struct Fixture {
         server: wiremock::MockServer,
         encoding_key: EncodingKey,
         queue: Arc<MemoryQueue>,
         engine: PolicyEngine,
-        kinds: JobKinds,
     }
 
     impl Fixture {
@@ -328,7 +333,7 @@ mod tests {
                 self.queue.clone(),
                 middleware,
                 self.engine.authorizer(),
-                self.kinds.clone(),
+                JobKinds::empty(),
             ))
         }
     }
@@ -338,14 +343,11 @@ mod tests {
         let server = spawn_jwks(json!({ "keys": [key] })).await;
         let engine =
             PolicyEngine::init_s3(build_test_store(&test_prefix("jobs-sse-policy")).await).await?;
-        let handlers: Vec<Arc<dyn JobHandler>> = vec![Arc::new(TestHandler("entity.create"))];
-        let kinds = JobKinds::from_handlers(&handlers)?;
         Ok(Fixture {
             server,
             encoding_key,
             queue: Arc::new(MemoryQueue::new()),
             engine,
-            kinds,
         })
     }
 
@@ -655,7 +657,7 @@ mod tests {
         let view = status_view(&job, &status)?;
         let events = event_stream(
             queue,
-            job,
+            id,
             view,
             Duration::from_secs(60),
             Duration::from_millis(100),
@@ -691,7 +693,7 @@ mod tests {
         let view = status_view(&job, &queue.status(id).await?)?;
         let events = event_stream(
             queue.clone(),
-            job,
+            id,
             view,
             Duration::from_secs(60),
             Duration::from_millis(100),
@@ -724,7 +726,7 @@ mod tests {
         let view = status_view(&job, &queue.status(id).await?)?;
         let events = event_stream(
             queue.clone(),
-            job,
+            id,
             view,
             Duration::from_secs(60),
             Duration::from_millis(100),
@@ -756,15 +758,65 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn the_stream_reads_a_fresh_job_after_a_lease_expires() -> anyhow::Result<()> {
+        let queue = Arc::new(MemoryQueue::new());
+        let job = sample_job("alice");
+        let id = job.id;
+        queue.enqueue(job.clone()).await?;
+        let view = status_view(&job, &queue.status(id).await?)?;
+        let events = event_stream(
+            queue.clone(),
+            id,
+            view,
+            Duration::from_secs(60),
+            Duration::from_millis(100),
+        );
+        tokio::pin!(events);
+
+        let first = events
+            .next()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("the stream has no initial event"))??;
+        let first = String::from_utf8_lossy(&first).to_string();
+        assert!(first.contains("\"attempt\":0"));
+
+        // A zero lease expires before the next tick. The status read then
+        // moves the job back to queued with a new attempt and run time.
+        queue
+            .reserve("worker-1", 10, Duration::from_secs(0))
+            .await?;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let next = events
+            .next()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("the stream has no refreshed event"))??;
+        let next = parse_events(&String::from_utf8_lossy(&next));
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].0, "status");
+        assert_eq!(next[0].1["state"], "queued");
+        assert_eq!(next[0].1["attempt"], 1);
+        let scheduled_at = next[0].1["scheduled_at"]
+            .as_i64()
+            .ok_or_else(|| anyhow::anyhow!("the view has no run time"))?;
+        assert!(
+            scheduled_at > job.scheduled_at,
+            "the refreshed view must not reuse the connect-time run time"
+        );
+        Ok(())
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_stream_ends_at_the_configured_duration() -> anyhow::Result<()> {
         let queue = Arc::new(MemoryQueue::new());
         let job = sample_job("alice");
+        let id = job.id;
         queue.enqueue(job.clone()).await?;
         let view = status_view(&job, &JobStatus::Queued)?;
         let events = event_stream(
             queue,
-            job,
+            id,
             view,
             Duration::from_millis(300),
             Duration::from_millis(100),
@@ -779,14 +831,33 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn an_overflowing_stream_duration_ends_after_the_initial_status() -> anyhow::Result<()> {
+        let queue = Arc::new(MemoryQueue::new());
+        let job = sample_job("alice");
+        let id = job.id;
+        queue.enqueue(job.clone()).await?;
+        let view = status_view(&job, &JobStatus::Queued)?;
+        let events = event_stream(queue, id, view, Duration::MAX, Duration::from_millis(100));
+        tokio::pin!(events);
+
+        assert!(events.next().await.is_some(), "the initial event arrives");
+        assert!(
+            events.next().await.is_none(),
+            "an overflow falls back to an immediate deadline"
+        );
+        Ok(())
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_queue_error_ends_the_stream_without_sending_text() -> anyhow::Result<()> {
         let queue = Arc::new(MemoryQueue::new());
         let job = sample_job("alice");
+        let id = job.id;
         let view = status_view(&job, &JobStatus::Queued)?;
         let events = event_stream(
             queue,
-            job,
+            id,
             view,
             Duration::from_secs(60),
             Duration::from_millis(100),
@@ -808,10 +879,11 @@ mod tests {
         let view = status_view(&valid, &JobStatus::Queued)?;
         let mut job = valid;
         job.kind = "not a kind".to_string();
+        let id = job.id;
         queue.enqueue(job.clone()).await?;
         let events = event_stream(
             queue,
-            job,
+            id,
             view,
             Duration::from_secs(60),
             Duration::from_millis(100),
