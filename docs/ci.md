@@ -73,6 +73,8 @@ runs CI on a push.
 Run `make help` to list every target. The main targets are:
 
 - `make ci` runs `scripts/ci.sh`.
+- `make wasm` runs `scripts/wasm-check.sh`. It checks the client crate for
+  `wasm32-unknown-unknown`. See [the WASM check section](#wasm-check).
 - `make smolvm` runs the checks in a smolvm microVM, local or remote.
 - `make smolvm-exec ARGS='...'` runs one command in the microVM, local or
   remote.
@@ -87,6 +89,26 @@ Run `make help` to list every target. The main targets are:
 
 The template also provides the `make smolvm-pack`, `make smolvm-preflight`, and
 `make smolvm-verify` targets. See [the smolvm document](smolvm.md).
+
+## WASM check
+
+`make wasm` runs one command:
+
+```bash
+cargo check -p rust-api-client --target wasm32-unknown-unknown --locked
+```
+
+The check is not part of `make ci`. The remote guest does not install the
+`wasm32-unknown-unknown` target. Install the target in a disposable guest,
+then run the check in the same guest:
+
+```bash
+make smolvm-exec ARGS='rustup target add wasm32-unknown-unknown && make wasm'
+```
+
+`scripts/wasm-check.sh` asks `rustc` for the target library directory before
+it calls `cargo`. When the target is absent, the script prints a clear error
+and stops. The script never installs a target.
 
 ## GitHub Actions
 
