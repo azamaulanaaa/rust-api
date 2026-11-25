@@ -305,6 +305,24 @@ mod tests {
         assert_eq!(schema["pattern"], serde_json::json!("^[a-z0-9._-]{1,64}$"));
     }
 
+    /// The command envelope schema carries the idempotency key bounds.
+    #[test]
+    fn the_command_envelope_schema_carries_the_idempotency_key_bounds() {
+        let spec: Value =
+            serde_json::from_str(&ApiDoc::openapi().to_json().expect("spec serializes"))
+                .expect("spec is JSON");
+
+        let key =
+            &spec["components"]["schemas"]["CommandEnvelope"]["properties"]["idempotency_key"];
+        assert_eq!(key["type"], serde_json::json!("string"));
+        assert_eq!(key["minLength"], serde_json::json!(1));
+        assert_eq!(key["maxLength"], serde_json::json!(128));
+        assert_eq!(
+            key["maxLength"],
+            serde_json::json!(rust_api_model::wire::MAX_IDEMPOTENCY_KEY_LEN)
+        );
+    }
+
     /// Guards the PWA contract. Every served route that the SPA code generator
     /// uses must appear in the specification. Drift therefore breaks this
     /// test instead of the front end at run time.

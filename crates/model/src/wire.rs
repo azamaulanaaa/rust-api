@@ -67,6 +67,9 @@ pub struct CommandEnvelope {
     ///
     /// The key must hold 1 to [`MAX_IDEMPOTENCY_KEY_LEN`] bytes. The server
     /// rejects an empty key or a key above the limit with `400`.
+    // Keep this value equal to `MAX_IDEMPOTENCY_KEY_LEN`. The schema
+    // attribute accepts a number literal only.
+    #[cfg_attr(feature = "openapi", schema(min_length = 1, max_length = 128))]
     pub idempotency_key: String,
     /// The entity version that the client read.
     ///
