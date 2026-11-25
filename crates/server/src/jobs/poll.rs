@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use actix_web::{HttpResponse, get, http::StatusCode, web};
-use rust_api_model::wire::CommandEnvelope;
+use rust_api_model::wire::{CommandEnvelope, MAX_IDEMPOTENCY_KEY_LEN};
 use uuid::Uuid;
 
 use crate::http::error::ApiError;
@@ -34,7 +34,8 @@ const MAX_ATTEMPTS: u32 = 5;
 /// # Errors
 ///
 /// Returns `400` when the body is not a [`CommandEnvelope`], the kind is
-/// not in the client-submittable set, or `expected_version` is present.
+/// not in the client-submittable set, `expected_version` is present, or the
+/// idempotency key is empty or longer than [`MAX_IDEMPOTENCY_KEY_LEN`].
 /// Returns `401` when the request has no valid token.
 /// Returns `409` when the queue reports a duplicate key without the stored
 /// job id, because that error carries no id to read.
@@ -46,7 +47,7 @@ const MAX_ATTEMPTS: u32 = 5;
     request_body = rust_api_model::wire::CommandEnvelope,
     responses(
         (status = 202, description = "the job was accepted", body = rust_api_model::wire::JobStatusView),
-        (status = 400, description = "the body or the kind is invalid", body = crate::http::error::ErrorBody),
+        (status = 400, description = "the body, kind, version, or key is invalid", body = crate::http::error::ErrorBody),
         (status = 401, description = "authentication required", body = crate::http::error::ErrorBody),
         (status = 409, description = "the idempotency key conflicts", body = crate::http::error::ErrorBody),
         (status = 500, description = "the queue failed", body = crate::http::error::ErrorBody)
@@ -66,6 +67,10 @@ pub async fn create_job(
     if envelope.expected_version.is_some() {
         return Err(ApiError::BadRequest);
     }
+    let key = &envelope.idempotency_key;
+    if key.is_empty() || key.len() > MAX_IDEMPOTENCY_KEY_LEN {
+        return Err(ApiError::BadRequest);
+    }
     let owner = claims.sub.clone();
     let payload = serde_json::to_vec(&envelope.payload)
         .map_err(|error| ApiError::Internal(Box::new(error)))?;
@@ -78,7 +83,7 @@ pub async fn create_job(
         max_attempts: MAX_ATTEMPTS,
         created_at: now,
         scheduled_at: now,
-        idempotency_key: Some(owner_idempotency_key(&owner, &envelope.idempotency_key)),
+        idempotency_key: Some(owner_idempotency_key(&owner, key)),
         owner_sub: Some(owner.clone()),
         headers: BTreeMap::new(),
     };
@@ -448,6 +453,40 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let body: Value = actix_test::read_body_json(response).await;
         assert_eq!(body["code"], "invalid_request");
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn an_invalid_idempotency_key_is_400() -> anyhow::Result<()> {
+        let fixture = fixture().await?;
+        let module = fixture.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fixture.token("alice")?;
+
+        for key in [String::new(), "k".repeat(MAX_IDEMPOTENCY_KEY_LEN + 1)] {
+            let body = command_body(&key);
+            let request = auth(actix_test::TestRequest::post().uri("/jobs"), &token)
+                .insert_header(("Content-Type", "application/json"))
+                .set_payload(body)
+                .to_request();
+            let response = actix_test::call_service(&app, request).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body: Value = actix_test::read_body_json(response).await;
+            assert_eq!(body["code"], "invalid_request");
+        }
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn a_maximum_length_idempotency_key_is_accepted() -> anyhow::Result<()> {
+        let fixture = fixture().await?;
+        let module = fixture.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fixture.token("alice")?;
+
+        let key = "k".repeat(MAX_IDEMPOTENCY_KEY_LEN);
+        let created = post_command!(app, token, &key);
+        assert_eq!(created["state"], "queued");
         Ok(())
     }
 

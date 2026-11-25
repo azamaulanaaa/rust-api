@@ -51,15 +51,22 @@ pub struct JobStatusView {
     pub commit_seq: Option<u64>,
 }
 
+/// The maximum length of an idempotency key in bytes.
+pub const MAX_IDEMPOTENCY_KEY_LEN: usize = 128;
+
 /// One write command from a client.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct CommandEnvelope {
-    /// The command kind. The server rejects a kind without a handler.
+    /// The command kind. The server rejects a kind that a client cannot
+    /// submit.
     pub kind: CommandKind,
     /// The command data in JSON form.
     pub payload: serde_json::Value,
     /// The client key that makes the enqueue idempotent.
+    ///
+    /// The key must hold 1 to [`MAX_IDEMPOTENCY_KEY_LEN`] bytes. The server
+    /// rejects an empty key or a key above the limit with `400`.
     pub idempotency_key: String,
     /// The entity version that the client read.
     ///
