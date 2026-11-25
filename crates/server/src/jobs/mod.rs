@@ -109,6 +109,7 @@ impl JobKinds {
 
 /// A handler kind is invalid, or more than one handler declares it.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum JobKindsError {
     /// A handler declares a kind outside the command kind allowlist.
     #[error("a job handler declares an invalid kind: {kind}")]
