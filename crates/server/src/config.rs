@@ -40,7 +40,7 @@ pub struct Config {
     /// omitted.
     #[serde(default)]
     pub http: HttpConfig,
-    /// Cost limits. Each limit is off by default. See [`LimitsConfig`].
+    /// Cost limits. Most limits are off by default. See [`LimitsConfig`].
     #[serde(default)]
     pub limits: LimitsConfig,
     /// EAV background runtime settings. The runtime is always on.
@@ -679,12 +679,12 @@ pub struct HttpConfig {
 
 /// Cost limits for requests whose work a single request does not bound.
 ///
-/// Every limit defaults to off, which means `0`, not to a number that the
-/// crate guesses. A default limit is a default outage. If the limit is too
-/// low, a valid burst gets 429 responses. If the limit is too high, it does
-/// not limit anything. The values that a deployment needs depend on its
-/// egress budget and its client poll interval. This crate knows neither.
-#[derive(Deserialize, Debug, Default, Clone)]
+/// Most limits default to off, which means `0`, not to a number that the
+/// crate guesses. The job event stream limits are the exception: they default
+/// on, because a stream that has no cap holds a slot and a connection for as
+/// long as the client waits. A value of `0` for either job event stream limit
+/// selects the built-in default. It does not disable the control.
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct LimitsConfig {
     /// Requests per minute for each peer address, after an initial burst of the
@@ -716,6 +716,53 @@ pub struct LimitsConfig {
     /// `?chunk=N`.
     #[serde(default)]
     pub max_full_replica_bytes: usize,
+
+    /// Job status streams that may run at the same time. The default is 32.
+    ///
+    /// The route `/jobs/{id}/events` holds one slot for each open stream. A
+    /// value of `0` selects the default. It does not disable the gate.
+    #[serde(default = "default_max_job_event_streams")]
+    pub max_job_event_streams: usize,
+
+    /// Longest time that one job status stream stays open, in seconds. The
+    /// default is 900.
+    ///
+    /// The stream also closes when the token expires. A value of `0` selects
+    /// the default. It does not remove the cap.
+    #[serde(default = "default_job_event_stream_max_secs")]
+    pub job_event_stream_max_secs: u64,
+}
+
+/// The default number of job status streams that one process serves at the
+/// same time.
+pub const DEFAULT_MAX_JOB_EVENT_STREAMS: usize = 32;
+
+/// The default longest time that one job status stream stays open, in
+/// seconds.
+pub const DEFAULT_JOB_EVENT_STREAM_MAX_SECS: u64 = 900;
+
+/// The serde default of [`LimitsConfig::max_job_event_streams`].
+fn default_max_job_event_streams() -> usize {
+    DEFAULT_MAX_JOB_EVENT_STREAMS
+}
+
+/// The serde default of [`LimitsConfig::job_event_stream_max_secs`].
+fn default_job_event_stream_max_secs() -> u64 {
+    DEFAULT_JOB_EVENT_STREAM_MAX_SECS
+}
+
+impl Default for LimitsConfig {
+    /// Built-in defaults. A config that omits the section gets these values.
+    fn default() -> Self {
+        Self {
+            rate_per_minute: 0,
+            rate_burst: 0,
+            max_concurrent_downloads: 0,
+            max_full_replica_bytes: 0,
+            max_job_event_streams: DEFAULT_MAX_JOB_EVENT_STREAMS,
+            job_event_stream_max_secs: DEFAULT_JOB_EVENT_STREAM_MAX_SECS,
+        }
+    }
 }
 
 impl LimitsConfig {
@@ -725,6 +772,30 @@ impl LimitsConfig {
             self.rate_per_minute
         } else {
             self.rate_burst
+        }
+    }
+
+    /// Concurrent job status streams to use when the config sets none.
+    ///
+    /// A value of `0` selects the built-in default. It does not disable the
+    /// gate.
+    pub fn max_job_event_streams(&self) -> usize {
+        if self.max_job_event_streams == 0 {
+            DEFAULT_MAX_JOB_EVENT_STREAMS
+        } else {
+            self.max_job_event_streams
+        }
+    }
+
+    /// Job status stream lifetime to use when the config sets none.
+    ///
+    /// A value of `0` selects the built-in default. It does not remove the
+    /// cap.
+    pub fn job_event_stream_max_secs(&self) -> u64 {
+        if self.job_event_stream_max_secs == 0 {
+            DEFAULT_JOB_EVENT_STREAM_MAX_SECS
+        } else {
+            self.job_event_stream_max_secs
         }
     }
 }
@@ -1173,6 +1244,48 @@ mod tests {
         assert_eq!(cfg.observability.service_name, "rust-api");
         assert!(cfg.observability.otlp_endpoint.is_none());
         assert_eq!(cfg.observability.sample_ratio, 1.0);
+    }
+
+    /// The job event stream limits default on, unlike every other limit.
+    #[test]
+    fn job_event_stream_limits_default_to_32_and_900() {
+        let cfg = parse(&minimal_toml()).expect("the limits section is optional");
+
+        assert_eq!(cfg.limits.max_job_event_streams, 32);
+        assert_eq!(cfg.limits.job_event_stream_max_secs, 900);
+        assert_eq!(cfg.limits, LimitsConfig::default());
+        assert_eq!(cfg.limits.max_job_event_streams(), 32);
+        assert_eq!(cfg.limits.job_event_stream_max_secs(), 900);
+    }
+
+    /// Explicit job event stream limits reach the accessors.
+    #[test]
+    fn job_event_stream_limits_parse_explicit_values() {
+        let toml = minimal_toml().replace(
+            "region = \"us-east-1\"",
+            "region = \"us-east-1\"\n[limits]\nmax_job_event_streams = 7\njob_event_stream_max_secs = 120",
+        );
+        let cfg = parse(&toml).expect("explicit stream limits must parse");
+
+        assert_eq!(cfg.limits.max_job_event_streams, 7);
+        assert_eq!(cfg.limits.job_event_stream_max_secs, 120);
+        assert_eq!(cfg.limits.max_job_event_streams(), 7);
+        assert_eq!(cfg.limits.job_event_stream_max_secs(), 120);
+    }
+
+    /// A zero job event stream limit selects the default, not "off".
+    #[test]
+    fn zero_job_event_stream_limits_select_the_defaults() {
+        let toml = minimal_toml().replace(
+            "region = \"us-east-1\"",
+            "region = \"us-east-1\"\n[limits]\nmax_job_event_streams = 0\njob_event_stream_max_secs = 0",
+        );
+        let cfg = parse(&toml).expect("zero stream limits must parse");
+
+        assert_eq!(cfg.limits.max_job_event_streams, 0);
+        assert_eq!(cfg.limits.job_event_stream_max_secs, 0);
+        assert_eq!(cfg.limits.max_job_event_streams(), 32);
+        assert_eq!(cfg.limits.job_event_stream_max_secs(), 900);
     }
 
     #[test]
