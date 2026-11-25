@@ -608,6 +608,14 @@ fn readiness_state(input: ReadinessInputs) -> bool {
         && !input.eav_failed
 }
 
+/// Returns the job kinds that a client may submit.
+///
+/// No application handler accepts client commands yet, so the set is empty.
+/// The webhook delivery kind is a worker-only kind and stays private.
+fn submittable_kinds() -> rust_api::jobs::JobKinds {
+    rust_api::jobs::JobKinds::empty()
+}
+
 /// Runs the HTTP listener until stopped.
 async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
     let config = config::Config::try_from(config_path)?;
@@ -749,14 +757,15 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
         .with_queue(queue.clone(), signing_secret, webhook_max_attempts);
     // The HTTP job routes share the queue with the worker, so clone it
     // before the worker takes ownership. Build the handler list one time,
-    // then derive the registered kinds from it.
+    // then validate the worker kinds. The route uses a separate
+    // submittable set, so a worker-only kind stays private.
     let handlers: Vec<Arc<dyn rust_api::queue::JobHandler>> = vec![Arc::new(webhook.job_handler())];
-    let job_kinds = rust_api::jobs::JobKinds::from_handlers(&handlers)?;
+    rust_api::jobs::JobKinds::from_handlers(&handlers)?;
     let jobs_api_module = rust_api::jobs::JobsApiModule::new(
         queue.clone(),
         oidc_api_module.middleware(),
         policy_engine.authorizer(),
-        job_kinds,
+        submittable_kinds(),
     );
     let worker = QueueWorker::new(queue, handlers, "eav-webhook".to_string());
     let worker_cancel = cancel.clone();
@@ -1147,6 +1156,12 @@ force_path_style = true
         assert_eq!(domain_prefix("oxkv", "policy"), "oxkv/policy");
         assert_eq!(domain_prefix("oxkv", "fs"), "oxkv/fs");
         assert_eq!(domain_prefix("oxkv", "wal"), "oxkv/wal");
+    }
+
+    /// The served routes accept no client-submittable job kind yet.
+    #[test]
+    fn the_submittable_kind_set_is_empty() {
+        assert!(submittable_kinds().is_empty());
     }
 
     /// A failed EAV loop takes the instance out of the rotation.

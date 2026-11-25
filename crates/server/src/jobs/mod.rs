@@ -132,27 +132,28 @@ pub struct JobsApiModule {
     queue: Arc<dyn JobQueue>,
     policy: Authorizer,
     jwt: JwtClaimsMiddleware<Claims>,
-    kinds: JobKinds,
+    submittable: JobKinds,
 }
 
 impl JobsApiModule {
-    /// Creates the module from a queue, JWT middleware, authorizer, and kind
-    /// registry.
+    /// Creates the module from a queue, JWT middleware, authorizer, and the
+    /// client-submittable kind registry.
     ///
     /// Share the authorizer with the policy engine, so the module sees the
-    /// same policy state as every other module. Share the kind registry with
-    /// the worker, so the two see the same handler list.
+    /// same policy state as every other module. The submittable set is
+    /// separate from the worker handler set, so a worker-only kind stays
+    /// private.
     pub fn new(
         queue: Arc<dyn JobQueue>,
         jwt: JwtClaimsMiddleware<Claims>,
         policy: Authorizer,
-        kinds: JobKinds,
+        submittable: JobKinds,
     ) -> Self {
         Self {
             queue,
             jwt,
             policy,
-            kinds,
+            submittable,
         }
     }
 }
@@ -165,13 +166,13 @@ impl ApiModule for JobsApiModule {
     fn configure(&self, cfg: &mut ServiceConfig) {
         let queue = web::Data::new(self.queue.clone());
         let policy = web::Data::new(self.policy.clone());
-        let kinds = web::Data::new(self.kinds.clone());
+        let submittable = web::Data::new(self.submittable.clone());
         let jwt = self.jwt.clone();
         cfg.service(
             web::scope("/jobs")
                 .app_data(queue)
                 .app_data(policy)
-                .app_data(kinds)
+                .app_data(submittable)
                 .wrap(jwt)
                 .wrap(NoCache)
                 .route("", web::post().to(poll::create_job))
