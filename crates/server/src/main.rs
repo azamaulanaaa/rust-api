@@ -751,7 +751,7 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
     // before the worker takes ownership. Build the handler list one time,
     // then derive the registered kinds from it.
     let handlers: Vec<Arc<dyn rust_api::queue::JobHandler>> = vec![Arc::new(webhook.job_handler())];
-    let job_kinds = rust_api::jobs::JobKinds::from_handlers(&handlers);
+    let job_kinds = rust_api::jobs::JobKinds::from_handlers(&handlers)?;
     let jobs_api_module = rust_api::jobs::JobsApiModule::new(
         queue.clone(),
         oidc_api_module.middleware(),

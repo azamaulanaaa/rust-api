@@ -52,20 +52,37 @@ impl JobKinds {
     ///
     /// The function reads [`JobHandler::kind`] from each handler. A caller
     /// must not keep a second kind list.
-    pub fn from_handlers(handlers: &[Arc<dyn JobHandler>]) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DuplicateJobKind`] when two handlers declare the same kind.
+    pub fn from_handlers(handlers: &[Arc<dyn JobHandler>]) -> Result<Self, DuplicateJobKind> {
         let mut kinds = BTreeSet::new();
         for handler in handlers {
-            kinds.insert(handler.kind().to_string());
+            let kind = handler.kind();
+            if !kinds.insert(kind.to_string()) {
+                return Err(DuplicateJobKind {
+                    kind: kind.to_string(),
+                });
+            }
         }
-        Self {
+        Ok(Self {
             kinds: Arc::new(kinds),
-        }
+        })
     }
 
     /// Returns `true` when a handler is registered for `kind`.
     pub fn contains(&self, kind: &CommandKind) -> bool {
         self.kinds.contains(kind.as_str())
     }
+}
+
+/// More than one handler declares one job kind.
+#[derive(Debug, thiserror::Error)]
+#[error("two job handlers declare the same kind: {kind}")]
+pub struct DuplicateJobKind {
+    /// The kind that more than one handler declares.
+    pub kind: String,
 }
 
 /// The module that owns the `/jobs` route prefix.
@@ -255,7 +272,7 @@ mod tests {
             Arc::new(KindHandler("entity.create")),
             Arc::new(KindHandler("entity.delete")),
         ];
-        let kinds = JobKinds::from_handlers(&handlers);
+        let kinds = JobKinds::from_handlers(&handlers).expect("the handler kinds are unique");
 
         for handler in &handlers {
             let kind = CommandKind::parse(handler.kind()).expect("the handler kind is valid");
@@ -267,6 +284,22 @@ mod tests {
         }
         let unregistered = CommandKind::parse("entity.update").expect("the test kind is valid");
         assert!(!kinds.contains(&unregistered));
+    }
+
+    /// The registry rejects two handlers with the same kind.
+    #[test]
+    fn the_kind_registry_rejects_a_duplicate_kind() {
+        let handlers: Vec<Arc<dyn JobHandler>> = vec![
+            Arc::new(KindHandler("entity.create")),
+            Arc::new(KindHandler("entity.create")),
+        ];
+        let error = JobKinds::from_handlers(&handlers).expect_err("the duplicate must fail");
+
+        assert_eq!(error.kind, "entity.create");
+        assert_eq!(
+            error.to_string(),
+            "two job handlers declare the same kind: entity.create"
+        );
     }
 
     /// `status_view` maps the queued and leased states and their fields.

@@ -302,7 +302,7 @@ mod tests {
         let engine =
             PolicyEngine::init_s3(build_test_store(&test_prefix("jobs-poll-policy")).await).await?;
         let handlers: Vec<Arc<dyn JobHandler>> = vec![Arc::new(TestHandler("entity.create"))];
-        let kinds = JobKinds::from_handlers(&handlers);
+        let kinds = JobKinds::from_handlers(&handlers)?;
         Ok(Fixture {
             server,
             encoding_key,
