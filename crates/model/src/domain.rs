@@ -41,7 +41,7 @@ impl JobState {
 /// becoming an unchecked `String`. The parse rules are an allowlist: the
 /// value is 1 to 64 ASCII bytes of lowercase letters, digits, `.`, `-`, and
 /// `_`. The server keeps the second allowlist of kinds that have a handler.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[cfg_attr(
     feature = "openapi",

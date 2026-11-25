@@ -44,10 +44,17 @@ pub mod sse;
 /// worker and the submission route use one kind list.
 #[derive(Clone, Debug)]
 pub struct JobKinds {
-    kinds: Arc<BTreeSet<String>>,
+    kinds: Arc<BTreeSet<CommandKind>>,
 }
 
 impl JobKinds {
+    /// Builds an empty set.
+    pub fn empty() -> Self {
+        Self {
+            kinds: Arc::new(BTreeSet::new()),
+        }
+    }
+
     /// Builds the set from a handler list.
     ///
     /// The function reads [`JobHandler::kind`] from each handler. A caller
@@ -55,15 +62,33 @@ impl JobKinds {
     ///
     /// # Errors
     ///
-    /// Returns [`DuplicateJobKind`] when two handlers declare the same kind.
-    pub fn from_handlers(handlers: &[Arc<dyn JobHandler>]) -> Result<Self, DuplicateJobKind> {
+    /// Returns [`JobKindsError`] when a handler kind is invalid or two
+    /// handlers declare the same kind.
+    pub fn from_handlers(handlers: &[Arc<dyn JobHandler>]) -> Result<Self, JobKindsError> {
+        Self::from_names(handlers.iter().map(|handler| handler.kind()))
+    }
+
+    /// Builds the set from explicit kind names.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JobKindsError::Invalid`] when a name is not a valid command
+    /// kind. Returns [`JobKindsError::Duplicate`] when a name appears more
+    /// than one time.
+    pub fn from_names<I, S>(names: I) -> Result<Self, JobKindsError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
         let mut kinds = BTreeSet::new();
-        for handler in handlers {
-            let kind = handler.kind();
-            if !kinds.insert(kind.to_string()) {
-                return Err(DuplicateJobKind {
-                    kind: kind.to_string(),
-                });
+        for name in names {
+            let name = name.as_ref();
+            let kind = CommandKind::parse(name).map_err(|source| JobKindsError::Invalid {
+                kind: name.to_string(),
+                source,
+            })?;
+            if !kinds.insert(kind.clone()) {
+                return Err(JobKindsError::Duplicate { kind });
             }
         }
         Ok(Self {
@@ -71,18 +96,35 @@ impl JobKinds {
         })
     }
 
-    /// Returns `true` when a handler is registered for `kind`.
+    /// Returns `true` when the set holds `kind`.
     pub fn contains(&self, kind: &CommandKind) -> bool {
-        self.kinds.contains(kind.as_str())
+        self.kinds.contains(kind)
+    }
+
+    /// Returns `true` when the set holds no kind.
+    pub fn is_empty(&self) -> bool {
+        self.kinds.is_empty()
     }
 }
 
-/// More than one handler declares one job kind.
+/// A handler kind is invalid, or more than one handler declares it.
 #[derive(Debug, thiserror::Error)]
-#[error("two job handlers declare the same kind: {kind}")]
-pub struct DuplicateJobKind {
-    /// The kind that more than one handler declares.
-    pub kind: String,
+pub enum JobKindsError {
+    /// A handler declares a kind outside the command kind allowlist.
+    #[error("a job handler declares an invalid kind: {kind}")]
+    Invalid {
+        /// The kind that the handler declares.
+        kind: String,
+        /// The parser failure.
+        #[source]
+        source: CommandKindError,
+    },
+    /// More than one handler declares the same kind.
+    #[error("two job handlers declare the same kind: {kind}")]
+    Duplicate {
+        /// The kind that more than one handler declares.
+        kind: CommandKind,
+    },
 }
 
 /// The module that owns the `/jobs` route prefix.
@@ -297,11 +339,23 @@ mod tests {
         ];
         let error = JobKinds::from_handlers(&handlers).expect_err("the duplicate must fail");
 
-        assert_eq!(error.kind, "entity.create");
+        assert!(matches!(
+            &error,
+            JobKindsError::Duplicate { kind } if kind.as_str() == "entity.create"
+        ));
         assert_eq!(
             error.to_string(),
             "two job handlers declare the same kind: entity.create"
         );
+    }
+
+    /// The registry rejects a handler kind outside the allowlist.
+    #[test]
+    fn the_kind_registry_rejects_an_invalid_handler_kind() {
+        let handlers: Vec<Arc<dyn JobHandler>> = vec![Arc::new(KindHandler("Webhook.Deliver"))];
+        let error = JobKinds::from_handlers(&handlers).expect_err("the invalid kind must fail");
+
+        assert!(matches!(error, JobKindsError::Invalid { .. }));
     }
 
     /// `status_view` maps the queued and leased states and their fields.
