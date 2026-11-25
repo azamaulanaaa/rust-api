@@ -44,6 +44,12 @@ const STATUS_EVENT: &str = "status";
 /// The event name for a terminal status view.
 const TERMINAL_EVENT: &str = "terminal";
 
+/// The event name for a stream failure.
+const ERROR_EVENT: &str = "error";
+
+/// The error code for a stream that lost its read grant.
+const ACCESS_REVOKED_CODE: &str = "access_revoked";
+
 /// The comment line that keeps the connection alive.
 const HEARTBEAT_FRAME: &[u8] = b": heartbeat\n\n";
 
@@ -68,6 +74,10 @@ const HEARTBEAT_FRAME: &[u8] = b": heartbeat\n\n";
 ///
 /// The initial `status` event carries the current view. A `terminal` event
 /// for `succeeded`, `failed`, or `dead` closes the stream.
+///
+/// A mid-stream failure sends one `error` event with a stable code.
+/// `access_revoked` means the subject lost the read grant. The client must
+/// fall back to polling after that code.
 ///
 /// The route keeps no event history. It ignores `Last-Event-ID` and sends the
 /// current status on every reconnect.
@@ -140,6 +150,8 @@ pub async fn job_events(
     let events = event_stream(
         queue.get_ref().clone(),
         id,
+        claims.sub.clone(),
+        policy.get_ref().clone(),
         view,
         duration,
         timing.poll_interval,
@@ -162,37 +174,55 @@ fn stream_duration(exp: u64, now: i64, max_duration: Duration) -> Duration {
     Duration::from_secs(exp.saturating_sub(now)).min(max_duration)
 }
 
-/// Reads the current view of one job.
+/// Why the stream can no longer read its job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PollError {
+    /// The subject lost the read grant.
+    AccessRevoked,
+    /// The queue or the status view failed.
+    Unavailable,
+}
+
+/// Reads the current view of one job for one subject.
 ///
 /// The function reads the status first, because an expired lease updates the
 /// stored attempt. It then reads the stored job, so the view carries the same
-/// attempt and run time as the status. A missing job ends the stream. Another
-/// queue error or a view error is logged and ends the stream.
-async fn current_view(queue: &Arc<dyn JobQueue>, job_id: Uuid) -> Option<JobStatusView> {
+/// attempt and run time as the status. It checks the shared read predicate
+/// after the job read. A missing job, a queue error, or a view error is
+/// unavailable. A lost grant is [`PollError::AccessRevoked`].
+async fn current_view(
+    queue: &Arc<dyn JobQueue>,
+    job_id: Uuid,
+    sub: &str,
+    policy: &Authorizer,
+) -> Result<JobStatusView, PollError> {
     let status = match queue.status(job_id).await {
         Ok(status) => status,
-        Err(QueueError::NotFound(_)) => return None,
+        Err(QueueError::NotFound(_)) => return Err(PollError::Unavailable),
         Err(error) => {
             tracing::warn!(%error, "the job status read failed; the status stream ends");
-            return None;
+            return Err(PollError::Unavailable);
         }
     };
     let job = match queue.get(job_id).await {
         Ok(job) => job,
-        Err(QueueError::NotFound(_)) => return None,
+        Err(QueueError::NotFound(_)) => return Err(PollError::Unavailable),
         Err(error) => {
             tracing::warn!(%error, "the job read failed; the status stream ends");
-            return None;
+            return Err(PollError::Unavailable);
         }
     };
+    if !may_read(&job, sub, policy).await {
+        return Err(PollError::AccessRevoked);
+    }
     match status_view(&job, &status) {
-        Ok(view) => Some(view),
+        Ok(view) => Ok(view),
         Err(error) => {
             tracing::warn!(
                 %error,
                 "the job status view could not be built; the status stream ends"
             );
-            None
+            Err(PollError::Unavailable)
         }
     }
 }
@@ -203,13 +233,17 @@ struct StreamState {
     queue: Arc<dyn JobQueue>,
     /// The identifier of the job that the stream follows.
     job_id: Uuid,
+    /// The subject that opened the stream.
+    sub: String,
+    /// The policy that decides whether the subject may still read the job.
+    policy: Authorizer,
     /// The first view. The stream sends it before it reads the queue.
     initial: Option<JobStatusView>,
     /// A terminal view that the stream sends after the initial status.
     pending_terminal: Option<JobStatusView>,
     /// The view that the stream sent last.
     last: Option<JobStatusView>,
-    /// True after the stream sent its terminal event.
+    /// True after the stream sent its terminal or error event.
     done: bool,
     /// The timer that bounds the queue read rate.
     ticker: Interval,
@@ -224,9 +258,12 @@ struct StreamState {
 /// The stream sends the initial view at once. A terminal initial view sends
 /// its terminal event at once. Otherwise the stream reads the queue on each
 /// tick and sends an event only when the view changes or a heartbeat is due.
+/// A lost grant sends `access_revoked`. A queue or view error ends the stream.
 fn event_stream(
     queue: Arc<dyn JobQueue>,
     job_id: Uuid,
+    sub: String,
+    policy: Authorizer,
     initial: JobStatusView,
     duration: Duration,
     poll_interval: Duration,
@@ -238,6 +275,8 @@ fn event_stream(
     let state = StreamState {
         queue,
         job_id,
+        sub,
+        policy,
         initial: Some(initial),
         pending_terminal: None,
         last: None,
@@ -270,7 +309,15 @@ fn event_stream(
             {
                 return None;
             }
-            let view = current_view(&state.queue, state.job_id).await?;
+            let view =
+                match current_view(&state.queue, state.job_id, &state.sub, &state.policy).await {
+                    Ok(view) => view,
+                    Err(PollError::AccessRevoked) => {
+                        state.done = true;
+                        return Some((Ok(error_frame(ACCESS_REVOKED_CODE)), state));
+                    }
+                    Err(PollError::Unavailable) => return None,
+                };
             if view.state.is_terminal() {
                 state.done = true;
                 return Some((terminal_frame(&view), state));
@@ -296,6 +343,16 @@ fn status_frame(view: &JobStatusView) -> Result<Bytes, io::Error> {
 /// Builds one `terminal` event.
 fn terminal_frame(view: &JobStatusView) -> Result<Bytes, io::Error> {
     view_frame(TERMINAL_EVENT, view)
+}
+
+/// Builds one `error` event with a stable code.
+///
+/// The frame has no internal text. The code tells the client why the stream
+/// ended and that it must fall back to polling.
+fn error_frame(code: &str) -> Bytes {
+    Bytes::from(format!(
+        "event: {ERROR_EVENT}\ndata: {{\"code\":\"{code}\"}}\n\n"
+    ))
 }
 
 /// Builds one event frame with a JSON data line.
@@ -382,6 +439,12 @@ mod tests {
         req.insert_header(("Cookie", format!("auth_token={token}")))
     }
 
+    /// Builds a policy with no rules. The owner check needs no rule.
+    async fn stream_policy() -> anyhow::Result<Authorizer> {
+        let store = build_test_store(&test_prefix("jobs-sse-stream-policy")).await;
+        Ok(PolicyEngine::init_s3(store).await?.authorizer())
+    }
+
     /// Builds a stream for the owner of the test job.
     async fn test_stream(
         queue: Arc<MemoryQueue>,
@@ -390,7 +453,15 @@ mod tests {
         duration: Duration,
         poll_interval: Duration,
     ) -> anyhow::Result<impl Stream<Item = Result<Bytes, io::Error>> + 'static> {
-        Ok(event_stream(queue, id, view, duration, poll_interval))
+        Ok(event_stream(
+            queue,
+            id,
+            "alice".to_string(),
+            stream_policy().await?,
+            view,
+            duration,
+            poll_interval,
+        ))
     }
 
     fn sample_job(owner: &str) -> Job {
@@ -982,6 +1053,54 @@ mod tests {
         assert!(
             events.next().await.is_none(),
             "the view error ends the stream"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stream_sends_access_revoked_when_the_grant_is_removed() -> anyhow::Result<()> {
+        let fixture = fixture().await?;
+        let job = sample_job("alice");
+        let id = job.id;
+        fixture.queue.enqueue(job.clone()).await?;
+        let view = status_view(&job, &fixture.queue.status(id).await?)?;
+        let object = job_object(id);
+        fixture
+            .engine
+            .add_rule("bob".into(), object.clone(), Action::Read)
+            .await?;
+        let events = event_stream(
+            fixture.queue.clone(),
+            id,
+            "bob".to_string(),
+            fixture.engine.authorizer(),
+            view,
+            Duration::from_secs(60),
+            Duration::from_millis(100),
+        );
+        tokio::pin!(events);
+
+        let first = events
+            .next()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("the stream has no initial event"))??;
+        assert!(String::from_utf8_lossy(&first).contains("event: status"));
+
+        fixture
+            .engine
+            .remove_rule("bob".into(), object, Action::Read)
+            .await?;
+        let error = events
+            .next()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("the stream has no error event"))??;
+        let error = parse_events(&String::from_utf8_lossy(&error));
+        assert_eq!(error.len(), 1);
+        assert_eq!(error[0].0, "error");
+        assert_eq!(error[0].1["code"], "access_revoked");
+        assert!(
+            events.next().await.is_none(),
+            "the revoked stream must close"
         );
         Ok(())
     }
