@@ -474,4 +474,23 @@ mod tests {
         assert_eq!(view.commit_seq, Some(42));
         assert_eq!(view.result_base64, None);
     }
+
+    /// A receipt with an unknown field stays in the result bytes.
+    #[test]
+    fn status_view_keeps_a_receipt_with_unknown_fields_as_result_bytes() {
+        let job = sample_job();
+        let result = br#"{"commit_seq": 9, "detail": "x"}"#.to_vec();
+
+        let view = status_view(
+            &job,
+            &JobStatus::Succeeded {
+                result: Some(result.clone()),
+                finished_at: 1_700_000_020,
+            },
+        )
+        .expect("the succeeded status maps");
+
+        assert_eq!(view.commit_seq, None);
+        assert_eq!(view.result_base64, Some(STANDARD.encode(result)));
+    }
 }

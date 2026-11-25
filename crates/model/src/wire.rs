@@ -78,6 +78,7 @@ pub struct CommandEnvelope {
 
 /// The result of one applied job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct CommitReceipt {
     /// The change feed sequence that the write advanced to.
@@ -208,6 +209,13 @@ mod tests {
         assert_eq!(value, serde_json::json!({"commit_seq": 9}));
         let back: CommitReceipt = serde_json::from_value(value).expect("receipt parses");
         assert_eq!(back, receipt);
+    }
+
+    /// A commit receipt rejects an unknown field.
+    #[test]
+    fn a_commit_receipt_rejects_an_unknown_field() {
+        let value = serde_json::json!({"commit_seq": 9, "detail": "x"});
+        assert!(serde_json::from_value::<CommitReceipt>(value).is_err());
     }
 
     /// A sync cursor starts at zero and keeps its sequence.
