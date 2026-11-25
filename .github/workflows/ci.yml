@@ -137,6 +137,36 @@ jobs:
           path: target/llvm-cov/html
           retention-days: 7
 
+  wasm:
+    name: wasm
+    runs-on: ubuntu-24.04
+    container:
+      image: jdxcode/mise@sha256:05360b08fb68ace24d4814adaa6f36371584f6931782ead4891872049667af5a # jdxcode/mise:2026.11.8-debian
+    timeout-minutes: 10
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install a C toolchain for Rust checks
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential
+      - name: Install Rust with cache
+        uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
+        with:
+          cache: true
+          version: "2026.11.8"
+          install_args: rust
+      - name: Trust the checkout directory
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: Install the WASM target
+        run: rustup target add wasm32-unknown-unknown
+      - name: Check the WASM client build
+        run: make wasm
+      - name: Lint the WASM client
+        run: cargo clippy -p rust-api-client --target wasm32-unknown-unknown --locked -- -D warnings
+
   pr-title:
     name: PR title
     if: github.event_name == 'pull_request'

@@ -106,6 +106,9 @@ then run the check in the same guest:
 make smolvm-exec ARGS='rustup target add wasm32-unknown-unknown && make wasm'
 ```
 
+The GitHub Actions `wasm` job installs the target and runs the same gate. It
+also runs the client clippy command, so the wasm-only module is linted.
+
 `scripts/wasm-check.sh` asks `rustc` for the target library directory before
 it calls `cargo`. When the target is absent, the script prints a clear error
 and stops. The script never installs a target.
@@ -114,7 +117,7 @@ and stops. The script never installs a target.
 
 The workflow [`ci.yml`](../.github/workflows/ci.yml) runs on each pull
 request, each push to `main` and `feature/**`, a manual dispatch, and a weekly
-schedule. It has one matrix job and these extra jobs: `pr-title`,
+schedule. It has one matrix job and these extra jobs: `wasm`, `pr-title`,
 `gitleaks`, `editorconfig`, and `dependency-review`.
 
 The matrix runs one check per entry. The feature/rust entries are `mise`,
