@@ -63,8 +63,8 @@ pub struct CommandEnvelope {
     pub idempotency_key: String,
     /// The entity version that the client read.
     ///
-    /// The server rejects the command when the current version is not the
-    /// same value.
+    /// No job handler enforces this precondition yet. The server rejects the
+    /// request with `400` when the field is present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_version: Option<u64>,
 }

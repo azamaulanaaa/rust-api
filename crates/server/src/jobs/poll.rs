@@ -33,8 +33,8 @@ const MAX_ATTEMPTS: u32 = 5;
 ///
 /// # Errors
 ///
-/// Returns `400` when the body is not a [`CommandEnvelope`] or the kind is
-/// not in the client-submittable set.
+/// Returns `400` when the body is not a [`CommandEnvelope`], the kind is
+/// not in the client-submittable set, or `expected_version` is present.
 /// Returns `401` when the request has no valid token.
 /// Returns `409` when the queue reports a duplicate key without the stored
 /// job id, because that error carries no id to read.
@@ -61,6 +61,9 @@ pub async fn create_job(
     let now = chrono::Utc::now().timestamp();
     let envelope = body.into_inner();
     if !submittable.contains(&envelope.kind) {
+        return Err(ApiError::BadRequest);
+    }
+    if envelope.expected_version.is_some() {
         return Err(ApiError::BadRequest);
     }
     let owner = claims.sub.clone();
@@ -421,6 +424,30 @@ mod tests {
             !body.to_string().contains("entity.delete"),
             "the answer must not echo the kind"
         );
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn an_expected_version_is_400() -> anyhow::Result<()> {
+        let fixture = fixture().await?;
+        let module = fixture.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+
+        let token = fixture.token("alice")?;
+        let body = json!({
+            "kind": "entity.create",
+            "payload": {"name": "alice"},
+            "idempotency_key": "key-1",
+            "expected_version": 3,
+        });
+        let request = auth(actix_test::TestRequest::post().uri("/jobs"), &token)
+            .insert_header(("Content-Type", "application/json"))
+            .set_payload(body.to_string())
+            .to_request();
+        let response = actix_test::call_service(&app, request).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: Value = actix_test::read_body_json(response).await;
+        assert_eq!(body["code"], "invalid_request");
         Ok(())
     }
 
