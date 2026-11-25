@@ -105,6 +105,13 @@ pub async fn create_job(
 /// missing job, so the route does not show whether a job exists. The
 /// response carries `Cache-Control: no-store`.
 ///
+/// # Per-job grants
+///
+/// An administrator grants one subject access to one job with a policy rule
+/// on the object `job:<uuid>` and the action `read`. The rule has no TTL and
+/// no automatic cleanup. Remove the rule through the existing policy route
+/// `DELETE /policy/rules` when access must end.
+///
 /// # Errors
 ///
 /// Returns `400` when the id is not a UUID.
