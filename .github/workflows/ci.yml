@@ -165,7 +165,7 @@ jobs:
       - name: Check the WASM client build
         run: make wasm
       - name: Lint the WASM client
-        run: cargo clippy -p rust-api-client --target wasm32-unknown-unknown --locked -- -D warnings
+        run: make wasm-clippy
 
   pr-title:
     name: PR title

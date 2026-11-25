@@ -75,6 +75,8 @@ Run `make help` to list every target. The main targets are:
 - `make ci` runs `scripts/ci.sh`.
 - `make wasm` runs `scripts/wasm-check.sh`. It checks the client crate for
   `wasm32-unknown-unknown`. See [the WASM check section](#wasm-check).
+- `make wasm-clippy` runs `scripts/wasm-clippy.sh`. It lints the client crate
+  for `wasm32-unknown-unknown`. See [the WASM check section](#wasm-check).
 - `make smolvm` runs the checks in a smolvm microVM, local or remote.
 - `make smolvm-exec ARGS='...'` runs one command in the microVM, local or
   remote.
@@ -95,23 +97,32 @@ The template also provides the `make smolvm-pack`, `make smolvm-preflight`, and
 `make wasm` runs one command:
 
 ```bash
-cargo check -p rust-api-client --target wasm32-unknown-unknown --locked
+cargo check -p rust-api-client \
+  --target wasm32-unknown-unknown --locked
 ```
 
-The check is not part of `make ci`. The remote guest does not install the
-`wasm32-unknown-unknown` target. Install the target in a disposable guest,
-then run the check in the same guest:
+`make wasm-clippy` runs one command:
 
 ```bash
-make smolvm-exec ARGS='rustup target add wasm32-unknown-unknown && make wasm'
+cargo clippy -p rust-api-client \
+  --target wasm32-unknown-unknown --locked -- -D warnings
 ```
 
-The GitHub Actions `wasm` job installs the target and runs the same gate. It
-also runs the client clippy command, so the wasm-only module is linted.
+Neither check is part of `make ci`. The remote guest does not install the
+`wasm32-unknown-unknown` target. Install the target in a disposable guest,
+then run both checks in the same guest:
 
-`scripts/wasm-check.sh` asks `rustc` for the target library directory before
-it calls `cargo`. When the target is absent, the script prints a clear error
-and stops. The script never installs a target.
+```bash
+make smolvm-exec ARGS="rustup target add wasm32-unknown-unknown \
+  && make wasm && make wasm-clippy"
+```
+
+The GitHub Actions `wasm` job installs the target and runs `make wasm` and
+`make wasm-clippy`, so the local and CI commands match.
+
+`scripts/wasm-check.sh` and `scripts/wasm-clippy.sh` ask `rustc` for the
+target library directory before they call `cargo`. When the target is absent,
+each script prints a clear error and stops. Neither script installs a target.
 
 ## GitHub Actions
 
