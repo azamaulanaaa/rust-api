@@ -8,6 +8,10 @@
 //! The route has a fixed time cap and a concurrency gate. It keeps no event
 //! history. It ignores the `Last-Event-ID` header and sends the current status
 //! on every reconnect.
+//!
+//! The poll interval comes from `[limits].job_event_stream_poll_ms`. A shorter
+//! interval sends a change sooner and reads the full job row more often. A
+//! lighter status API is a later change.
 
 use std::{io, sync::Arc, time::Duration};
 
@@ -19,7 +23,7 @@ use tokio::time::{Instant, Interval, MissedTickBehavior};
 use uuid::Uuid;
 
 use super::{
-    SubjectGates,
+    JobStreamTiming, SubjectGates,
     poll::{may_read, not_found},
     status_view,
 };
@@ -30,9 +34,6 @@ use crate::http::{
 use crate::limits::{ConcurrencyGate, GatedStream, too_many};
 use crate::policy::Authorizer;
 use crate::queue::{JobQueue, QueueError};
-
-/// The interval between two queue status reads.
-const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// The interval between two heartbeat comments.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
@@ -103,7 +104,7 @@ pub async fn job_events(
     policy: web::Data<Authorizer>,
     gate: web::Data<ConcurrencyGate>,
     subject_gates: web::Data<SubjectGates>,
-    max_duration: web::Data<Duration>,
+    timing: web::Data<JobStreamTiming>,
 ) -> Result<HttpResponse, ApiError> {
     let id = Uuid::parse_str(&id.into_inner()).map_err(|_| ApiError::BadRequest)?;
     // Read the status first: an expired lease updates the stored attempt, so
@@ -134,9 +135,15 @@ pub async fn job_events(
     let duration = stream_duration(
         claims.exp,
         chrono::Utc::now().timestamp(),
-        *max_duration.get_ref(),
+        timing.max_duration,
     );
-    let events = event_stream(queue.get_ref().clone(), id, view, duration, POLL_INTERVAL);
+    let events = event_stream(
+        queue.get_ref().clone(),
+        id,
+        view,
+        duration,
+        timing.poll_interval,
+    );
 
     Ok(HttpResponse::Ok()
         .content_type("text/event-stream")
@@ -373,6 +380,17 @@ mod tests {
 
     fn auth(req: actix_test::TestRequest, token: &str) -> actix_test::TestRequest {
         req.insert_header(("Cookie", format!("auth_token={token}")))
+    }
+
+    /// Builds a stream for the owner of the test job.
+    async fn test_stream(
+        queue: Arc<MemoryQueue>,
+        id: Uuid,
+        view: JobStatusView,
+        duration: Duration,
+        poll_interval: Duration,
+    ) -> anyhow::Result<impl Stream<Item = Result<Bytes, io::Error>> + 'static> {
+        Ok(event_stream(queue, id, view, duration, poll_interval))
     }
 
     fn sample_job(owner: &str) -> Job {
@@ -717,13 +735,14 @@ mod tests {
         queue.enqueue(job.clone()).await?;
         let status = queue.status(id).await?;
         let view = status_view(&job, &status)?;
-        let events = event_stream(
+        let events = test_stream(
             queue,
             id,
             view,
             Duration::from_secs(60),
             Duration::from_millis(100),
-        );
+        )
+        .await?;
         tokio::pin!(events);
 
         let first = events
@@ -753,13 +772,14 @@ mod tests {
         let id = job.id;
         queue.enqueue(job.clone()).await?;
         let view = status_view(&job, &queue.status(id).await?)?;
-        let events = event_stream(
+        let events = test_stream(
             queue.clone(),
             id,
             view,
             Duration::from_secs(60),
             Duration::from_millis(100),
-        );
+        )
+        .await?;
         tokio::pin!(events);
 
         let first = events
@@ -786,13 +806,14 @@ mod tests {
         let id = job.id;
         queue.enqueue(job.clone()).await?;
         let view = status_view(&job, &queue.status(id).await?)?;
-        let events = event_stream(
+        let events = test_stream(
             queue.clone(),
             id,
             view,
             Duration::from_secs(60),
             Duration::from_millis(100),
-        );
+        )
+        .await?;
         tokio::pin!(events);
 
         let first = events
@@ -827,13 +848,14 @@ mod tests {
         let id = job.id;
         queue.enqueue(job.clone()).await?;
         let view = status_view(&job, &queue.status(id).await?)?;
-        let events = event_stream(
+        let events = test_stream(
             queue.clone(),
             id,
             view,
             Duration::from_secs(60),
             Duration::from_millis(100),
-        );
+        )
+        .await?;
         tokio::pin!(events);
 
         let first = events
@@ -876,13 +898,14 @@ mod tests {
         let id = job.id;
         queue.enqueue(job.clone()).await?;
         let view = status_view(&job, &JobStatus::Queued)?;
-        let events = event_stream(
+        let events = test_stream(
             queue,
             id,
             view,
             Duration::from_millis(300),
             Duration::from_millis(100),
-        );
+        )
+        .await?;
         tokio::pin!(events);
 
         assert!(events.next().await.is_some(), "the initial event arrives");
@@ -900,7 +923,8 @@ mod tests {
         let id = job.id;
         queue.enqueue(job.clone()).await?;
         let view = status_view(&job, &JobStatus::Queued)?;
-        let events = event_stream(queue, id, view, Duration::MAX, Duration::from_millis(100));
+        let events =
+            test_stream(queue, id, view, Duration::MAX, Duration::from_millis(100)).await?;
         tokio::pin!(events);
 
         assert!(events.next().await.is_some(), "the initial event arrives");
@@ -917,13 +941,14 @@ mod tests {
         let job = sample_job("alice");
         let id = job.id;
         let view = status_view(&job, &JobStatus::Queued)?;
-        let events = event_stream(
+        let events = test_stream(
             queue,
             id,
             view,
             Duration::from_secs(60),
             Duration::from_millis(100),
-        );
+        )
+        .await?;
         tokio::pin!(events);
 
         assert!(events.next().await.is_some(), "the initial event arrives");
@@ -943,13 +968,14 @@ mod tests {
         job.kind = "not a kind".to_string();
         let id = job.id;
         queue.enqueue(job.clone()).await?;
-        let events = event_stream(
+        let events = test_stream(
             queue,
             id,
             view,
             Duration::from_secs(60),
             Duration::from_millis(100),
-        );
+        )
+        .await?;
         tokio::pin!(events);
 
         assert!(events.next().await.is_some(), "the initial event arrives");

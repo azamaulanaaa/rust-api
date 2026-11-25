@@ -45,6 +45,9 @@ pub const DEFAULT_JOB_EVENT_STREAM_MAX_SECS: u64 = 900;
 /// same time.
 pub const DEFAULT_MAX_JOB_EVENT_STREAMS_PER_SUBJECT: usize = 8;
 
+/// The default interval between two job event stream polls, in milliseconds.
+pub const DEFAULT_JOB_EVENT_STREAM_POLL_MS: u64 = 1_000;
+
 /// The highest per-subject stream cap that [`SubjectGates::new`] accepts.
 ///
 /// The constructor clamps a larger value to this cap, so a direct caller
@@ -298,6 +301,15 @@ impl SubjectGates {
     }
 }
 
+/// The timing limits of one job event stream.
+#[derive(Clone, Copy, Debug)]
+pub struct JobStreamTiming {
+    /// The longest time that one stream stays open.
+    pub max_duration: Duration,
+    /// The interval between two queue status reads.
+    pub poll_interval: Duration,
+}
+
 /// The module that owns the `/jobs` route prefix.
 pub struct JobsApiModule {
     queue: Arc<dyn JobQueue>,
@@ -306,7 +318,7 @@ pub struct JobsApiModule {
     submittable: SubmittableKinds,
     stream_gate: ConcurrencyGate,
     subject_gates: SubjectGates,
-    stream_max_duration: Duration,
+    stream_timing: JobStreamTiming,
 }
 
 impl JobsApiModule {
@@ -331,7 +343,10 @@ impl JobsApiModule {
             submittable,
             stream_gate: ConcurrencyGate::new(DEFAULT_MAX_JOB_EVENT_STREAMS),
             subject_gates: SubjectGates::new(DEFAULT_MAX_JOB_EVENT_STREAMS_PER_SUBJECT),
-            stream_max_duration: DEFAULT_STREAM_MAX_DURATION,
+            stream_timing: JobStreamTiming {
+                max_duration: DEFAULT_STREAM_MAX_DURATION,
+                poll_interval: Duration::from_millis(DEFAULT_JOB_EVENT_STREAM_POLL_MS),
+            },
         }
     }
 
@@ -349,7 +364,17 @@ impl JobsApiModule {
     /// The stream also closes when the token expires. The deployed value comes
     /// from `[limits].job_event_stream_max_secs`.
     pub fn with_stream_max_duration(mut self, max_duration: Duration) -> Self {
-        self.stream_max_duration = max_duration;
+        self.stream_timing.max_duration = max_duration;
+        self
+    }
+
+    /// Replaces the interval between two job status stream polls.
+    ///
+    /// A shorter interval sends a status change sooner and reads the full job
+    /// row more often. The deployed value comes from
+    /// `[limits].job_event_stream_poll_ms`.
+    pub fn with_stream_poll_interval(mut self, poll_interval: Duration) -> Self {
+        self.stream_timing.poll_interval = poll_interval;
         self
     }
 
@@ -373,7 +398,7 @@ impl ApiModule for JobsApiModule {
         let submittable = web::Data::new(self.submittable.clone());
         let gate = web::Data::new(self.stream_gate.clone());
         let subject_gates = web::Data::new(self.subject_gates.clone());
-        let stream_max_duration = web::Data::new(self.stream_max_duration);
+        let stream_timing = web::Data::new(self.stream_timing);
         let jwt = self.jwt.clone();
         cfg.service(
             web::scope("/jobs")
@@ -382,7 +407,7 @@ impl ApiModule for JobsApiModule {
                 .app_data(submittable)
                 .app_data(gate)
                 .app_data(subject_gates)
-                .app_data(stream_max_duration)
+                .app_data(stream_timing)
                 .wrap(jwt)
                 .wrap(NoCache)
                 .route("", web::post().to(poll::create_job))

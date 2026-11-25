@@ -161,6 +161,11 @@ sample_ratio = 1.0
 # not disable the gate. Default: 8.
 # max_job_event_streams_per_subject = 8
 
+# Milliseconds between job status stream polls. The value must be within
+# 100..=60000. A shorter interval sends changes sooner and reads the full job
+# row more often. 0 selects the built-in default, 1000. Default: 1000.
+# job_event_stream_poll_ms = 1000
+
 [eav]
 # Pause in milliseconds between outbox flushes. Must be above 0.
 # Default: 1000.
