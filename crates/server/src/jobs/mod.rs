@@ -40,10 +40,11 @@ pub mod sse;
 
 /// The set of job kinds that have a registered handler.
 ///
-/// The type is cheap to clone, because the set sits behind an [`Arc`]. A
-/// worker handler set and a client-submittable set are separate values.
+/// The type is cheap to clone, because the set sits behind an [`Arc`]. Use
+/// [`WorkerKinds`] for a worker handler set and [`SubmittableKinds`] for a
+/// client-submittable set.
 #[derive(Clone, Debug)]
-pub struct JobKinds {
+struct JobKinds {
     kinds: Arc<BTreeSet<CommandKind>>,
 }
 
@@ -120,6 +121,81 @@ impl JobKinds {
     }
 }
 
+/// The set of job kinds that a worker handler declares.
+///
+/// A [`WorkerKinds`] value cannot be passed where a [`SubmittableKinds`] is
+/// required. The distinct types keep the worker capability and the client
+/// capability apart at compile time.
+#[derive(Clone, Debug)]
+pub struct WorkerKinds(JobKinds);
+
+impl WorkerKinds {
+    /// Builds the set from a handler list.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JobKindsError`] when a handler kind is invalid or two
+    /// handlers declare the same kind.
+    pub fn from_handlers(handlers: &[Arc<dyn JobHandler>]) -> Result<Self, JobKindsError> {
+        JobKinds::from_handlers(handlers).map(Self)
+    }
+
+    /// Returns `true` when the set holds `kind`.
+    pub fn contains(&self, kind: &CommandKind) -> bool {
+        self.0.contains(kind)
+    }
+}
+
+/// The set of job kinds that a client may submit.
+///
+/// A [`SubmittableKinds`] value cannot be passed where a [`WorkerKinds`] is
+/// required. Use [`SubmittableKinds::ensure_subset_of`] to prove that each
+/// kind has a worker handler.
+#[derive(Clone, Debug)]
+pub struct SubmittableKinds(JobKinds);
+
+impl SubmittableKinds {
+    /// Builds an empty set.
+    pub fn empty() -> Self {
+        Self(JobKinds::empty())
+    }
+
+    /// Builds the set from explicit kind names.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JobKindsError::Invalid`] when a name is not a valid command
+    /// kind. Returns [`JobKindsError::Duplicate`] when a name appears more
+    /// than one time.
+    pub fn from_names<I, S>(names: I) -> Result<Self, JobKindsError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        JobKinds::from_names(names).map(Self)
+    }
+
+    /// Checks that every kind in this set has a worker handler.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JobKindsError::Unhandled`] for the first kind that no
+    /// handler in `workers` declares.
+    pub fn ensure_subset_of(&self, workers: &WorkerKinds) -> Result<(), JobKindsError> {
+        self.0.ensure_subset_of(&workers.0)
+    }
+
+    /// Returns `true` when the set holds `kind`.
+    pub fn contains(&self, kind: &CommandKind) -> bool {
+        self.0.contains(kind)
+    }
+
+    /// Returns `true` when the set holds no kind.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
 /// A handler kind is invalid, or more than one handler declares it.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -152,7 +228,7 @@ pub struct JobsApiModule {
     queue: Arc<dyn JobQueue>,
     policy: Authorizer,
     jwt: JwtClaimsMiddleware<Claims>,
-    submittable: JobKinds,
+    submittable: SubmittableKinds,
 }
 
 impl JobsApiModule {
@@ -162,12 +238,13 @@ impl JobsApiModule {
     /// Share the authorizer with the policy engine, so the module sees the
     /// same policy state as every other module. The submittable set is
     /// separate from the worker handler set, so a worker-only kind stays
-    /// private.
+    /// private. The constructor takes [`SubmittableKinds`], so a
+    /// [`WorkerKinds`] value cannot be passed here.
     pub fn new(
         queue: Arc<dyn JobQueue>,
         jwt: JwtClaimsMiddleware<Claims>,
         policy: Authorizer,
-        submittable: JobKinds,
+        submittable: SubmittableKinds,
     ) -> Self {
         Self {
             queue,
@@ -330,20 +407,20 @@ mod tests {
         }
     }
 
-    /// The registry holds every kind of the handler list and no other kind.
+    /// The worker set holds every kind of the handler list and no other kind.
     #[test]
-    fn the_kind_registry_keeps_every_handler_kind() {
+    fn the_worker_kinds_keep_every_handler_kind() {
         let handlers: Vec<Arc<dyn JobHandler>> = vec![
             Arc::new(KindHandler("entity.create")),
             Arc::new(KindHandler("entity.delete")),
         ];
-        let kinds = JobKinds::from_handlers(&handlers).expect("the handler kinds are unique");
+        let kinds = WorkerKinds::from_handlers(&handlers).expect("the handler kinds are unique");
 
         for handler in &handlers {
             let kind = CommandKind::parse(handler.kind()).expect("the handler kind is valid");
             assert!(
                 kinds.contains(&kind),
-                "the registry is missing {}",
+                "the worker set is missing {}",
                 handler.kind()
             );
         }
@@ -351,14 +428,14 @@ mod tests {
         assert!(!kinds.contains(&unregistered));
     }
 
-    /// The registry rejects two handlers with the same kind.
+    /// The worker set rejects two handlers with the same kind.
     #[test]
-    fn the_kind_registry_rejects_a_duplicate_kind() {
+    fn the_worker_kinds_reject_a_duplicate_kind() {
         let handlers: Vec<Arc<dyn JobHandler>> = vec![
             Arc::new(KindHandler("entity.create")),
             Arc::new(KindHandler("entity.create")),
         ];
-        let error = JobKinds::from_handlers(&handlers).expect_err("the duplicate must fail");
+        let error = WorkerKinds::from_handlers(&handlers).expect_err("the duplicate must fail");
 
         assert!(matches!(
             &error,
@@ -370,28 +447,31 @@ mod tests {
         );
     }
 
-    /// The registry rejects a handler kind outside the allowlist.
+    /// The worker set rejects a handler kind outside the allowlist.
     #[test]
-    fn the_kind_registry_rejects_an_invalid_handler_kind() {
+    fn the_worker_kinds_reject_an_invalid_handler_kind() {
         let handlers: Vec<Arc<dyn JobHandler>> = vec![Arc::new(KindHandler("Webhook.Deliver"))];
-        let error = JobKinds::from_handlers(&handlers).expect_err("the invalid kind must fail");
+        let error = WorkerKinds::from_handlers(&handlers).expect_err("the invalid kind must fail");
 
         assert!(matches!(error, JobKindsError::Invalid { .. }));
     }
 
     /// A submittable kind must have a worker handler.
+    ///
+    /// [`WorkerKinds`] and [`SubmittableKinds`] are different types, so a
+    /// worker set does not compile where a submittable set is required.
     #[test]
     fn the_submittable_set_must_be_a_worker_subset() {
         let handlers: Vec<Arc<dyn JobHandler>> = vec![Arc::new(KindHandler("entity.create"))];
-        let workers = JobKinds::from_handlers(&handlers).expect("the worker kinds are valid");
+        let workers = WorkerKinds::from_handlers(&handlers).expect("the worker kinds are valid");
         let handled =
-            JobKinds::from_names(["entity.create"]).expect("the submittable kind is valid");
+            SubmittableKinds::from_names(["entity.create"]).expect("the submittable kind is valid");
 
         assert!(handled.ensure_subset_of(&workers).is_ok());
-        assert!(JobKinds::empty().ensure_subset_of(&workers).is_ok());
+        assert!(SubmittableKinds::empty().ensure_subset_of(&workers).is_ok());
 
         let missing =
-            JobKinds::from_names(["entity.delete"]).expect("the submittable kind is valid");
+            SubmittableKinds::from_names(["entity.delete"]).expect("the submittable kind is valid");
         let error = missing
             .ensure_subset_of(&workers)
             .expect_err("the missing handler must fail");

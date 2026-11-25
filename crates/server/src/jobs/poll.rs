@@ -15,7 +15,7 @@ use crate::http::middleware::jwt::{Claims, Validated};
 use crate::policy::{Action, Authorizer, SUPERADMIN_ROLE};
 use crate::queue::{Job, JobQueue, QueueError};
 
-use super::{JobKinds, status_view};
+use super::{SubmittableKinds, status_view};
 
 /// The queue priority of a job that an HTTP request enqueues.
 const JOB_PRIORITY: i32 = 0;
@@ -56,7 +56,7 @@ const MAX_ATTEMPTS: u32 = 5;
 pub async fn create_job(
     claims: Validated<Claims>,
     queue: web::Data<Arc<dyn JobQueue>>,
-    submittable: web::Data<JobKinds>,
+    submittable: web::Data<SubmittableKinds>,
     body: web::Json<CommandEnvelope>,
 ) -> Result<HttpResponse, ApiError> {
     let now = chrono::Utc::now().timestamp();
@@ -253,7 +253,7 @@ mod tests {
     use crate::http::ApiModule as _;
     use crate::http::middleware::jwks::test_support::{rsa_key, sign_rs256, spawn_jwks};
     use crate::http::middleware::jwt::JwtClaimsMiddleware;
-    use crate::jobs::{JobKinds, JobsApiModule};
+    use crate::jobs::{JobsApiModule, SubmittableKinds};
     use crate::policy::PolicyEngine;
     use crate::queue::MemoryQueue;
 
@@ -265,7 +265,7 @@ mod tests {
         encoding_key: EncodingKey,
         queue: Arc<MemoryQueue>,
         engine: PolicyEngine,
-        submittable: JobKinds,
+        submittable: SubmittableKinds,
     }
 
     impl Fixture {
@@ -303,7 +303,7 @@ mod tests {
         let server = spawn_jwks(json!({ "keys": [key] })).await;
         let engine =
             PolicyEngine::init_s3(build_test_store(&test_prefix("jobs-poll-policy")).await).await?;
-        let submittable = JobKinds::from_names(["entity.create"])?;
+        let submittable = SubmittableKinds::from_names(["entity.create"])?;
         Ok(Fixture {
             server,
             encoding_key,
