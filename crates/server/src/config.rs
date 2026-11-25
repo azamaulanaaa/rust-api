@@ -12,6 +12,10 @@ use anyhow::Context;
 use serde::Deserialize;
 
 pub use rust_api::fs::s3::S3Backend;
+pub use rust_api::jobs::{
+    DEFAULT_JOB_EVENT_STREAM_MAX_SECS, DEFAULT_MAX_JOB_EVENT_STREAMS,
+    DEFAULT_MAX_JOB_EVENT_STREAMS_PER_SUBJECT,
+};
 
 /// Top-level server configuration. The server loads it from the path that
 /// `--config` gives.
