@@ -16,6 +16,8 @@ pub const MAX_NAME_BYTES: usize = 128;
 /// A reason that a name is not valid.
 ///
 /// The message names the checked value, for example `entity id`.
+/// The enum is non-exhaustive. A caller must treat a new variant as an error.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NameError {
     /// The value has no bytes.

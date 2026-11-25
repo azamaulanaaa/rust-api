@@ -19,6 +19,9 @@ pub const DEFAULT_PAGE_LIMIT: usize = 50;
 pub const MAX_PAGE_LIMIT: usize = 200;
 
 /// A reason that a page window is not valid.
+///
+/// The enum is non-exhaustive. A caller must treat a new variant as an error.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WindowError {
     /// The page size is zero or above [`MAX_PAGE_LIMIT`].
