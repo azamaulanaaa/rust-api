@@ -8,7 +8,7 @@
 //! Polling is the guaranteed fallback. The SSE route is an optimization.
 
 use std::collections::{BTreeSet, HashMap};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::Duration;
 
 use actix_web::web::{self, ServiceConfig};
@@ -252,13 +252,13 @@ pub enum JobKindsError {
 
 /// Caps the job event streams that one subject may hold.
 ///
-/// The helper keeps one semaphore for each subject that opened a stream. An
-/// entry stays for the life of the process. The number of entries is
-/// therefore at most the number of distinct subjects that opened a stream.
+/// The helper keeps one weak reference for each subject that opened a stream.
+/// The map drops an entry after the last stream for that subject ends, on the
+/// next acquire call. The map therefore holds no idle subject forever.
 #[derive(Clone, Debug)]
 pub struct SubjectGates {
     max: usize,
-    gates: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
+    gates: Arc<Mutex<HashMap<String, Weak<Semaphore>>>>,
 }
 
 impl SubjectGates {
@@ -278,16 +278,21 @@ impl SubjectGates {
     /// Takes one stream permit for `subject`.
     ///
     /// The function returns `None` when the subject already holds `max`
-    /// streams. It clones the semaphore and releases the map lock before the
-    /// acquire, so no lock is held across an await point.
+    /// streams. It prunes entries whose last stream ended, then clones the
+    /// semaphore and releases the map lock before the acquire. No lock is held
+    /// across an await point.
     pub fn acquire(&self, subject: &str) -> Option<OwnedSemaphorePermit> {
         let gate = {
             let mut gates = self.gates.lock().unwrap_or_else(PoisonError::into_inner);
-            Arc::clone(
-                gates
-                    .entry(subject.to_string())
-                    .or_insert_with(|| Arc::new(Semaphore::new(self.max))),
-            )
+            gates.retain(|_, gate| gate.strong_count() > 0);
+            match gates.get(subject).and_then(Weak::upgrade) {
+                Some(gate) => gate,
+                None => {
+                    let gate = Arc::new(Semaphore::new(self.max));
+                    gates.insert(subject.to_string(), Arc::downgrade(&gate));
+                    gate
+                }
+            }
         };
         gate.try_acquire_owned().ok()
     }
@@ -736,5 +741,30 @@ mod tests {
             gates.acquire("alice").is_some(),
             "a released slot is reusable"
         );
+    }
+
+    /// An idle subject entry is pruned on the next acquire call.
+    #[test]
+    fn a_subject_gate_prunes_an_idle_subject() {
+        let gates = SubjectGates::new(1);
+        let alice = gates.acquire("alice").expect("alice has a slot");
+        assert_eq!(gates.gates.lock().unwrap().len(), 1);
+
+        drop(alice);
+        let bob = gates.acquire("bob").expect("bob has a slot");
+        {
+            let map = gates.gates.lock().unwrap();
+            assert_eq!(map.len(), 1, "the idle alice entry must be pruned");
+            assert!(map.contains_key("bob"));
+            assert!(!map.contains_key("alice"));
+        }
+        drop(bob);
+
+        let alice = gates.acquire("alice").expect("alice can connect again");
+        assert!(
+            gates.acquire("alice").is_none(),
+            "the reused entry keeps the cap"
+        );
+        drop(alice);
     }
 }
