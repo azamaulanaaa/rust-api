@@ -3051,6 +3051,7 @@ version = "0.1.0"
 dependencies = [
  "rust-api-core",
  "rust-api-model",
+ "wasm-bindgen",
 ]
 
 [[package]]

@@ -17,5 +17,10 @@ crate-type = ["cdylib", "rlib"]
 rust-api-model.workspace = true
 rust-api-core.workspace = true
 
+# The JS binding is a WebAssembly-only dependency. The native test target
+# does not build it. Keep this target-specific: do not add a Cargo feature.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+
 [lints]
 workspace = true
