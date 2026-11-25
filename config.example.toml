@@ -156,6 +156,11 @@ sample_ratio = 1.0
 # cap. Default: 900.
 # job_event_stream_max_secs = 900
 
+# Job status streams that one subject may hold at the same time. The
+# process-wide cap still applies. 0 selects the built-in default, 8. It does
+# not disable the gate. Default: 8.
+# max_job_event_streams_per_subject = 8
+
 [eav]
 # Pause in milliseconds between outbox flushes. Must be above 0.
 # Default: 1000.

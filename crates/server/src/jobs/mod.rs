@@ -7,14 +7,15 @@
 //!
 //! Polling is the guaranteed fallback. The SSE route is an optimization.
 
-use std::collections::BTreeSet;
-use std::sync::Arc;
+use std::collections::{BTreeSet, HashMap};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use actix_web::web::{self, ServiceConfig};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use rust_api_model::{CommandKind, CommandKindError, JobState, JobStatusView, wire::CommitReceipt};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::http::{
     ApiModule,
@@ -30,19 +31,27 @@ use crate::queue::{Job, JobHandler, JobQueue, JobStatus};
 /// The `entity.create` job handler.
 pub mod entity;
 
-/// The default number of job status streams that one process serves at the
+/// The default number of job event streams that one process serves at the
 /// same time.
 ///
-/// The value is fixed in v1. A stream reads the queue every 500 ms, so the cap
-/// also bounds the queue read rate to 64 reads a second.
-const DEFAULT_MAX_CONCURRENT_STREAMS: usize = 32;
+/// A stream reads the queue every 500 ms, so the cap also bounds the queue
+/// read rate.
+pub const DEFAULT_MAX_JOB_EVENT_STREAMS: usize = 32;
+
+/// The default longest time that one job event stream stays open, in seconds.
+pub const DEFAULT_JOB_EVENT_STREAM_MAX_SECS: u64 = 900;
+
+/// The default number of job event streams that one subject may hold at the
+/// same time.
+pub const DEFAULT_MAX_JOB_EVENT_STREAMS_PER_SUBJECT: usize = 8;
 
 /// The default fallback for the longest time that one stream stays open.
 ///
 /// A host sets the deployed value with
 /// [`JobsApiModule::with_stream_max_duration`]. This value applies only when
 /// the host does not call that method.
-const DEFAULT_STREAM_MAX_DURATION: Duration = Duration::from_secs(900);
+const DEFAULT_STREAM_MAX_DURATION: Duration =
+    Duration::from_secs(DEFAULT_JOB_EVENT_STREAM_MAX_SECS);
 
 /// The poll routes for job submission and one job status.
 pub mod poll;
@@ -235,6 +244,47 @@ pub enum JobKindsError {
     },
 }
 
+/// Caps the job event streams that one subject may hold.
+///
+/// The helper keeps one semaphore for each subject that opened a stream. An
+/// entry stays for the life of the process. The number of entries is
+/// therefore at most the number of distinct subjects that opened a stream.
+#[derive(Clone, Debug)]
+pub struct SubjectGates {
+    max: usize,
+    gates: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
+}
+
+impl SubjectGates {
+    /// Builds a gate that allows `max` streams for each subject.
+    ///
+    /// A value of `0` refuses every stream. The config maps `0` to
+    /// [`DEFAULT_MAX_JOB_EVENT_STREAMS_PER_SUBJECT`] before this call.
+    pub fn new(max: usize) -> Self {
+        Self {
+            max,
+            gates: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Takes one stream permit for `subject`.
+    ///
+    /// The function returns `None` when the subject already holds `max`
+    /// streams. It clones the semaphore and releases the map lock before the
+    /// acquire, so no lock is held across an await point.
+    pub fn acquire(&self, subject: &str) -> Option<OwnedSemaphorePermit> {
+        let gate = {
+            let mut gates = self.gates.lock().unwrap_or_else(PoisonError::into_inner);
+            Arc::clone(
+                gates
+                    .entry(subject.to_string())
+                    .or_insert_with(|| Arc::new(Semaphore::new(self.max))),
+            )
+        };
+        gate.try_acquire_owned().ok()
+    }
+}
+
 /// The module that owns the `/jobs` route prefix.
 pub struct JobsApiModule {
     queue: Arc<dyn JobQueue>,
@@ -242,6 +292,7 @@ pub struct JobsApiModule {
     jwt: JwtClaimsMiddleware<Claims>,
     submittable: SubmittableKinds,
     stream_gate: ConcurrencyGate,
+    subject_gates: SubjectGates,
     stream_max_duration: Duration,
 }
 
@@ -265,7 +316,8 @@ impl JobsApiModule {
             jwt,
             policy,
             submittable,
-            stream_gate: ConcurrencyGate::new(DEFAULT_MAX_CONCURRENT_STREAMS),
+            stream_gate: ConcurrencyGate::new(DEFAULT_MAX_JOB_EVENT_STREAMS),
+            subject_gates: SubjectGates::new(DEFAULT_MAX_JOB_EVENT_STREAMS_PER_SUBJECT),
             stream_max_duration: DEFAULT_STREAM_MAX_DURATION,
         }
     }
@@ -287,6 +339,14 @@ impl JobsApiModule {
         self.stream_max_duration = max_duration;
         self
     }
+
+    /// Replaces the gate that caps the job streams of one subject.
+    ///
+    /// The deployed value comes from `[limits].max_job_event_streams_per_subject`.
+    pub fn with_subject_gate(mut self, subject_gates: SubjectGates) -> Self {
+        self.subject_gates = subject_gates;
+        self
+    }
 }
 
 impl ApiModule for JobsApiModule {
@@ -299,6 +359,7 @@ impl ApiModule for JobsApiModule {
         let policy = web::Data::new(self.policy.clone());
         let submittable = web::Data::new(self.submittable.clone());
         let gate = web::Data::new(self.stream_gate.clone());
+        let subject_gates = web::Data::new(self.subject_gates.clone());
         let stream_max_duration = web::Data::new(self.stream_max_duration);
         let jwt = self.jwt.clone();
         cfg.service(
@@ -307,6 +368,7 @@ impl ApiModule for JobsApiModule {
                 .app_data(policy)
                 .app_data(submittable)
                 .app_data(gate)
+                .app_data(subject_gates)
                 .app_data(stream_max_duration)
                 .wrap(jwt)
                 .wrap(NoCache)

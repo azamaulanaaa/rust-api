@@ -370,16 +370,27 @@ pub struct GatedStream<S> {
     /// The field is boxed so that the wrapper is `Unpin` whatever the
     /// stream is. That keeps the `poll_next` below free of `unsafe`.
     inner: std::pin::Pin<Box<S>>,
-    /// The field is dropped with the stream, which releases the slot.
-    _permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    /// The fields are dropped with the stream, which releases the slots.
+    _permits: Vec<tokio::sync::OwnedSemaphorePermit>,
 }
 
 impl<S> GatedStream<S> {
     /// Wraps `inner` and holds `permit` until the wrapper drops.
     pub fn new(inner: S, permit: Option<tokio::sync::OwnedSemaphorePermit>) -> Self {
+        Self::with_permits(inner, permit)
+    }
+
+    /// Wraps `inner` and holds every permit until the wrapper drops.
+    ///
+    /// A route that must hold more than one gate uses this constructor. The
+    /// stream releases every slot when it ends or the client goes away.
+    pub fn with_permits<I>(inner: S, permits: I) -> Self
+    where
+        I: IntoIterator<Item = tokio::sync::OwnedSemaphorePermit>,
+    {
         Self {
             inner: Box::pin(inner),
-            _permit: permit,
+            _permits: permits.into_iter().collect(),
         }
     }
 }

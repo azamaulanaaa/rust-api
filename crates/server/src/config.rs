@@ -753,15 +753,16 @@ pub struct LimitsConfig {
     /// the default. It does not remove the cap.
     #[serde(default = "default_job_event_stream_max_secs")]
     pub job_event_stream_max_secs: u64,
+
+    /// Job status streams that one subject may hold at the same time. The
+    /// default is 8.
+    ///
+    /// The value caps one subject, so no single subject can hold every
+    /// process-wide stream slot. A value of `0` selects the default. It does
+    /// not disable the gate.
+    #[serde(default = "default_max_job_event_streams_per_subject")]
+    pub max_job_event_streams_per_subject: usize,
 }
-
-/// The default number of job status streams that one process serves at the
-/// same time.
-pub const DEFAULT_MAX_JOB_EVENT_STREAMS: usize = 32;
-
-/// The default longest time that one job status stream stays open, in
-/// seconds.
-pub const DEFAULT_JOB_EVENT_STREAM_MAX_SECS: u64 = 900;
 
 /// The serde default of [`LimitsConfig::max_job_event_streams`].
 fn default_max_job_event_streams() -> usize {
@@ -771,6 +772,11 @@ fn default_max_job_event_streams() -> usize {
 /// The serde default of [`LimitsConfig::job_event_stream_max_secs`].
 fn default_job_event_stream_max_secs() -> u64 {
     DEFAULT_JOB_EVENT_STREAM_MAX_SECS
+}
+
+/// The serde default of [`LimitsConfig::max_job_event_streams_per_subject`].
+fn default_max_job_event_streams_per_subject() -> usize {
+    DEFAULT_MAX_JOB_EVENT_STREAMS_PER_SUBJECT
 }
 
 impl Default for LimitsConfig {
@@ -783,6 +789,7 @@ impl Default for LimitsConfig {
             max_full_replica_bytes: 0,
             max_job_event_streams: DEFAULT_MAX_JOB_EVENT_STREAMS,
             job_event_stream_max_secs: DEFAULT_JOB_EVENT_STREAM_MAX_SECS,
+            max_job_event_streams_per_subject: DEFAULT_MAX_JOB_EVENT_STREAMS_PER_SUBJECT,
         }
     }
 }
@@ -1297,9 +1304,11 @@ mod tests {
 
         assert_eq!(cfg.limits.max_job_event_streams, 32);
         assert_eq!(cfg.limits.job_event_stream_max_secs, 900);
+        assert_eq!(cfg.limits.max_job_event_streams_per_subject, 8);
         assert_eq!(cfg.limits, LimitsConfig::default());
         assert_eq!(cfg.limits.max_job_event_streams(), 32);
         assert_eq!(cfg.limits.job_event_stream_max_secs(), 900);
+        assert_eq!(cfg.limits.max_job_event_streams_per_subject(), 8);
     }
 
     /// Explicit job event stream limits reach the accessors.
@@ -1307,14 +1316,16 @@ mod tests {
     fn job_event_stream_limits_parse_explicit_values() {
         let toml = minimal_toml().replace(
             "region = \"us-east-1\"",
-            "region = \"us-east-1\"\n[limits]\nmax_job_event_streams = 7\njob_event_stream_max_secs = 120",
+            "region = \"us-east-1\"\n[limits]\nmax_job_event_streams = 7\njob_event_stream_max_secs = 120\nmax_job_event_streams_per_subject = 3",
         );
         let cfg = parse(&toml).expect("explicit stream limits must parse");
 
         assert_eq!(cfg.limits.max_job_event_streams, 7);
         assert_eq!(cfg.limits.job_event_stream_max_secs, 120);
+        assert_eq!(cfg.limits.max_job_event_streams_per_subject, 3);
         assert_eq!(cfg.limits.max_job_event_streams(), 7);
         assert_eq!(cfg.limits.job_event_stream_max_secs(), 120);
+        assert_eq!(cfg.limits.max_job_event_streams_per_subject(), 3);
     }
 
     /// A zero job event stream limit selects the default, not "off".

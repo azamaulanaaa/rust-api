@@ -18,6 +18,7 @@ use tokio::time::{Instant, Interval, MissedTickBehavior};
 use uuid::Uuid;
 
 use super::{
+    SubjectGates,
     poll::{may_read, not_found},
     status_view,
 };
@@ -89,6 +90,7 @@ pub async fn job_events(
     queue: web::Data<Arc<dyn JobQueue>>,
     policy: web::Data<Authorizer>,
     gate: web::Data<ConcurrencyGate>,
+    subject_gates: web::Data<SubjectGates>,
     max_duration: web::Data<Duration>,
 ) -> Result<HttpResponse, ApiError> {
     let id = Uuid::parse_str(&id.into_inner()).map_err(|_| ApiError::BadRequest)?;
@@ -113,17 +115,23 @@ pub async fn job_events(
     if permit.is_none() && !gate.is_disabled() {
         return Ok(too_many("job status stream"));
     }
+    let Some(subject_permit) = subject_gates.acquire(&claims.sub) else {
+        return Ok(too_many("job status streams for one subject"));
+    };
 
     let duration = stream_duration(
         claims.exp,
         chrono::Utc::now().timestamp(),
         *max_duration.get_ref(),
     );
-    let events = event_stream(queue.get_ref().clone(), job, view, duration, POLL_INTERVAL);
+    let events = event_stream(queue.get_ref().clone(), id, view, duration, POLL_INTERVAL);
 
     Ok(HttpResponse::Ok()
         .content_type("text/event-stream")
-        .streaming(GatedStream::new(events, permit)))
+        .streaming(GatedStream::with_permits(
+            events,
+            permit.into_iter().chain(std::iter::once(subject_permit)),
+        )))
 }
 
 /// Returns the time that a stream may stay open.
@@ -611,6 +619,49 @@ mod tests {
         );
         assert_eq!(events[0].0, "status");
         assert_eq!(events[0].1["state"], "queued");
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn a_subject_at_its_stream_cap_gets_429_while_another_subject_connects()
+    -> anyhow::Result<()> {
+        let fixture = fixture().await?;
+        let subject_gates = SubjectGates::new(1);
+        let slot = subject_gates
+            .acquire("alice")
+            .expect("alice holds the only subject slot");
+        let module = fixture.module().await?.with_subject_gate(subject_gates);
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+
+        let alice_token = fixture.token("alice")?;
+        let alice_id = finished_job(&fixture.queue, "alice", None).await?;
+        let request = auth(
+            actix_test::TestRequest::get().uri(&format!("/jobs/{alice_id}/events")),
+            &alice_token,
+        )
+        .to_request();
+        let response = actix_test::call_service(&app, request).await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let body: Value = actix_test::read_body_json(response).await;
+        assert_eq!(body["error"], "too many requests");
+
+        let bob_token = fixture.token("bob")?;
+        let bob_id = finished_job(&fixture.queue, "bob", None).await?;
+        let request = auth(
+            actix_test::TestRequest::get().uri(&format!("/jobs/{bob_id}/events")),
+            &bob_token,
+        )
+        .to_request();
+        let response = actix_test::call_service(&app, request).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "one subject at its cap must not refuse another subject"
+        );
+        let body = String::from_utf8(actix_test::read_body(response).await.to_vec())?;
+        assert_eq!(parse_events(&body).len(), 2);
+
+        drop(slot);
         Ok(())
     }
 
