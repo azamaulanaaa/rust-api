@@ -34,8 +34,8 @@ pub mod entity;
 /// The default number of job event streams that one process serves at the
 /// same time.
 ///
-/// A stream reads the queue every 500 ms, so the cap also bounds the queue
-/// read rate.
+/// A stream reads the queue at the configured poll interval. The cap bounds
+/// the number of concurrent queue reads.
 pub const DEFAULT_MAX_JOB_EVENT_STREAMS: usize = 32;
 
 /// The default longest time that one job event stream stays open, in seconds.

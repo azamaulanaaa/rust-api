@@ -251,18 +251,27 @@ struct StreamState {
     done: bool,
     /// The timer that bounds the queue read rate.
     ticker: Interval,
+    /// The timer that sends a heartbeat comment.
+    heartbeat: Interval,
     /// The instant at which the stream must close.
     deadline: Instant,
-    /// The instant of the last event or heartbeat.
-    last_heartbeat: Instant,
+}
+
+/// One timer event of the stream loop.
+enum TimerEvent {
+    /// The poll timer fired.
+    Poll,
+    /// The heartbeat timer fired.
+    Heartbeat,
 }
 
 /// Builds the stream of events for one job.
 ///
 /// The stream sends the initial view at once. A terminal initial view sends
 /// its terminal event at once. Otherwise the stream reads the queue on each
-/// tick and sends an event only when the view changes or a heartbeat is due.
-/// A lost grant sends `access_revoked`. A queue or view error sends
+/// poll tick and sends a status event only when the view changes. A heartbeat
+/// comment goes out every [`HEARTBEAT_INTERVAL`], independent of the poll
+/// interval. A lost grant sends `access_revoked`. A queue or view error sends
 /// `stream_unavailable`. Both end the stream.
 fn event_stream(
     queue: Arc<dyn JobQueue>,
@@ -273,9 +282,11 @@ fn event_stream(
     duration: Duration,
     poll_interval: Duration,
 ) -> impl Stream<Item = Result<Bytes, io::Error>> + 'static {
+    let now = Instant::now();
     let mut ticker = tokio::time::interval(poll_interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    let now = Instant::now();
+    let mut heartbeat = tokio::time::interval_at(now + HEARTBEAT_INTERVAL, HEARTBEAT_INTERVAL);
+    heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let deadline = now.checked_add(duration).unwrap_or(now);
     let state = StreamState {
         queue,
@@ -287,8 +298,8 @@ fn event_stream(
         last: None,
         done: false,
         ticker,
+        heartbeat,
         deadline,
-        last_heartbeat: now,
     };
 
     stream::unfold(state, |mut state| async move {
@@ -308,11 +319,13 @@ fn event_stream(
         }
 
         loop {
-            if tokio::time::timeout_at(state.deadline, state.ticker.tick())
-                .await
-                .is_err()
-            {
-                return None;
+            let event = tokio::select! {
+                () = tokio::time::sleep_until(state.deadline) => return None,
+                _ = state.ticker.tick() => TimerEvent::Poll,
+                _ = state.heartbeat.tick() => TimerEvent::Heartbeat,
+            };
+            if matches!(event, TimerEvent::Heartbeat) {
+                return Some((Ok(Bytes::from_static(HEARTBEAT_FRAME)), state));
             }
             let view =
                 match current_view(&state.queue, state.job_id, &state.sub, &state.policy).await {
@@ -332,12 +345,7 @@ fn event_stream(
             }
             if state.last.as_ref() != Some(&view) {
                 state.last = Some(view.clone());
-                state.last_heartbeat = Instant::now();
                 return Some((status_frame(&view), state));
-            }
-            if state.last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
-                state.last_heartbeat = Instant::now();
-                return Some((Ok(Bytes::from_static(HEARTBEAT_FRAME)), state));
             }
         }
     })
@@ -841,6 +849,60 @@ mod tests {
             }
         }
         assert!(heartbeat, "a quiet stream must send a heartbeat");
+        Ok(())
+    }
+
+    /// A heartbeat arrives before a poll that is slower than the heartbeat.
+    #[tokio::test(start_paused = true)]
+    async fn a_heartbeat_arrives_before_a_slow_poll() -> anyhow::Result<()> {
+        let queue = Arc::new(MemoryQueue::new());
+        let job = sample_job("alice");
+        let id = job.id;
+        queue.enqueue(job.clone()).await?;
+        let view = status_view(&job, &queue.status(id).await?)?;
+        let events = test_stream(
+            queue.clone(),
+            id,
+            view,
+            Duration::from_secs(60),
+            Duration::from_secs(20),
+        )
+        .await?;
+        tokio::pin!(events);
+
+        let first = events
+            .next()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("the stream has no initial event"))??;
+        assert!(String::from_utf8_lossy(&first).contains("event: status"));
+
+        let start = Instant::now();
+        let heartbeat = events
+            .next()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("the stream has no heartbeat"))??;
+        assert_eq!(heartbeat.as_ref(), HEARTBEAT_FRAME);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= HEARTBEAT_INTERVAL,
+            "the heartbeat must wait for its own interval"
+        );
+        assert!(
+            elapsed < Duration::from_secs(20),
+            "the heartbeat must arrive before the 20 s poll"
+        );
+
+        queue
+            .reserve("worker-1", 1, Duration::from_secs(30))
+            .await?;
+        let next = events
+            .next()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("the stream has no status change"))??;
+        let next = parse_events(&String::from_utf8_lossy(&next));
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].0, "status");
+        assert_eq!(next[0].1["state"], "leased");
         Ok(())
     }
 
