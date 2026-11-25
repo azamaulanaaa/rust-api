@@ -68,9 +68,13 @@ const HEARTBEAT_FRAME: &[u8] = b": heartbeat\n\n";
 /// The grant rule has no TTL and no automatic cleanup. Remove the rule through
 /// the existing policy route `DELETE /policy/rules` when access must end.
 ///
-/// Each event carries the full [`JobStatusView`], including `worker`,
-/// `attempt`, the timestamps, and the stored handler error text in `error`.
-/// The server does not sanitize that error text.
+/// Each `status` or `terminal` event carries the full [`JobStatusView`],
+/// including `worker`, `attempt`, the timestamps, and the stored handler
+/// error text in `error`. The server does not sanitize that error text.
+///
+/// An `error` event carries only a stable code. It never carries the stored
+/// view or internal error text. The client must fall back to polling after an
+/// `error` event.
 ///
 /// An event goes only to the job owner, a holder of the `superadmin` role, or
 /// a subject that holds a `job:<uuid>` / `read` grant.
@@ -80,15 +84,14 @@ const HEARTBEAT_FRAME: &[u8] = b": heartbeat\n\n";
 ///
 /// A mid-stream failure sends one `error` event with a stable code.
 /// `access_revoked` means the subject lost the read grant.
-/// `stream_unavailable` means the queue or the status view failed. After
-/// either code, the client must fall back to polling.
+/// `stream_unavailable` means the queue or the status view failed.
 ///
 /// The route keeps no event history. It ignores `Last-Event-ID` and sends the
 /// current status on every reconnect.
 ///
 /// The stream closes when the token expires or at the configured stream time
-/// limit. A queue error also ends the stream. The server logs the error and
-/// sends no text for it.
+/// limit. A queue or view error sends `stream_unavailable` before the close.
+/// The internal error stays in the log.
 ///
 /// # Errors
 ///
