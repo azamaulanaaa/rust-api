@@ -50,7 +50,7 @@ const MAX_ATTEMPTS: u32 = 5;
         (status = 400, description = "the body, kind, version, or key is invalid", body = crate::http::error::ErrorBody),
         (status = 401, description = "authentication required", body = crate::http::error::ErrorBody),
         (status = 409, description = "the idempotency key conflicts", body = crate::http::error::ErrorBody),
-        (status = 500, description = "the queue failed", body = crate::http::error::ErrorBody)
+        (status = 500, description = "the queue or the job view failed", body = crate::http::error::ErrorBody)
     )
 )]
 pub async fn create_job(
@@ -133,7 +133,8 @@ pub async fn create_job(
         (status = 200, description = "the job status", body = rust_api_model::wire::JobStatusView),
         (status = 400, description = "the id is not a UUID", body = crate::http::error::ErrorBody),
         (status = 401, description = "authentication required", body = crate::http::error::ErrorBody),
-        (status = 404, description = "the job is absent or not visible", body = crate::http::error::ErrorBody)
+        (status = 404, description = "the job is absent or not visible", body = crate::http::error::ErrorBody),
+        (status = 500, description = "the queue or the job view failed", body = crate::http::error::ErrorBody)
     )
 )]
 #[get("/{id}")]
