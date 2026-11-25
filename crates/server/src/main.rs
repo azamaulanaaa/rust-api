@@ -760,12 +760,14 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
     // then validate the worker kinds. The route uses a separate
     // submittable set, so a worker-only kind stays private.
     let handlers: Vec<Arc<dyn rust_api::queue::JobHandler>> = vec![Arc::new(webhook.job_handler())];
-    rust_api::jobs::JobKinds::from_handlers(&handlers)?;
+    let worker_kinds = rust_api::jobs::JobKinds::from_handlers(&handlers)?;
+    let submittable = submittable_kinds();
+    submittable.ensure_subset_of(&worker_kinds)?;
     let jobs_api_module = rust_api::jobs::JobsApiModule::new(
         queue.clone(),
         oidc_api_module.middleware(),
         policy_engine.authorizer(),
-        submittable_kinds(),
+        submittable,
     );
     let worker = QueueWorker::new(queue, handlers, "eav-webhook".to_string());
     let worker_cancel = cancel.clone();

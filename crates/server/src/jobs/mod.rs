@@ -105,6 +105,19 @@ impl JobKinds {
     pub fn is_empty(&self) -> bool {
         self.kinds.is_empty()
     }
+
+    /// Checks that every kind in this set has a worker handler.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JobKindsError::Unhandled`] for the first kind that no
+    /// handler in `workers` declares.
+    pub fn ensure_subset_of(&self, workers: &JobKinds) -> Result<(), JobKindsError> {
+        if let Some(kind) = self.kinds.difference(&workers.kinds).next() {
+            return Err(JobKindsError::Unhandled { kind: kind.clone() });
+        }
+        Ok(())
+    }
 }
 
 /// A handler kind is invalid, or more than one handler declares it.
@@ -124,6 +137,12 @@ pub enum JobKindsError {
     #[error("two job handlers declare the same kind: {kind}")]
     Duplicate {
         /// The kind that more than one handler declares.
+        kind: CommandKind,
+    },
+    /// A client-submittable kind has no worker handler.
+    #[error("a client-submittable kind has no worker handler: {kind}")]
+    Unhandled {
+        /// The kind that no worker handler declares.
         kind: CommandKind,
     },
 }
@@ -358,6 +377,28 @@ mod tests {
         let error = JobKinds::from_handlers(&handlers).expect_err("the invalid kind must fail");
 
         assert!(matches!(error, JobKindsError::Invalid { .. }));
+    }
+
+    /// A submittable kind must have a worker handler.
+    #[test]
+    fn the_submittable_set_must_be_a_worker_subset() {
+        let handlers: Vec<Arc<dyn JobHandler>> = vec![Arc::new(KindHandler("entity.create"))];
+        let workers = JobKinds::from_handlers(&handlers).expect("the worker kinds are valid");
+        let handled =
+            JobKinds::from_names(["entity.create"]).expect("the submittable kind is valid");
+
+        assert!(handled.ensure_subset_of(&workers).is_ok());
+        assert!(JobKinds::empty().ensure_subset_of(&workers).is_ok());
+
+        let missing =
+            JobKinds::from_names(["entity.delete"]).expect("the submittable kind is valid");
+        let error = missing
+            .ensure_subset_of(&workers)
+            .expect_err("the missing handler must fail");
+        assert!(matches!(
+            error,
+            JobKindsError::Unhandled { kind } if kind.as_str() == "entity.delete"
+        ));
     }
 
     /// `status_view` maps the queued and leased states and their fields.
