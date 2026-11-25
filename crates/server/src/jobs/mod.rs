@@ -48,6 +48,18 @@ pub const DEFAULT_MAX_JOB_EVENT_STREAMS_PER_SUBJECT: usize = 8;
 /// The default interval between two job event stream polls, in milliseconds.
 pub const DEFAULT_JOB_EVENT_STREAM_POLL_MS: u64 = 1_000;
 
+/// The shortest interval that one job event stream poll accepts.
+///
+/// The stream timer panics on a zero interval, so the builder clamps to this
+/// value. It matches the worker poll floor.
+const MIN_STREAM_POLL_INTERVAL: Duration = Duration::from_millis(1);
+
+/// The longest interval that one job event stream poll accepts.
+///
+/// The value matches the upper bound of `[limits].job_event_stream_poll_ms`.
+/// A larger value could overflow the stream timer deadline.
+const MAX_STREAM_POLL_INTERVAL: Duration = Duration::from_millis(60_000);
+
 /// The highest per-subject stream cap that [`SubjectGates::new`] accepts.
 ///
 /// The constructor clamps a larger value to this cap, so a direct caller
@@ -370,11 +382,14 @@ impl JobsApiModule {
 
     /// Replaces the interval between two job status stream polls.
     ///
-    /// A shorter interval sends a status change sooner and reads the full job
-    /// row more often. The deployed value comes from
+    /// The call clamps the value to 1..=60_000 ms. A zero value would panic
+    /// in the stream timer, and a larger value could overflow it. A shorter
+    /// interval sends a status change sooner and reads the full job row more
+    /// often. The deployed value comes from
     /// `[limits].job_event_stream_poll_ms`.
     pub fn with_stream_poll_interval(mut self, poll_interval: Duration) -> Self {
-        self.stream_timing.poll_interval = poll_interval;
+        self.stream_timing.poll_interval =
+            poll_interval.clamp(MIN_STREAM_POLL_INTERVAL, MAX_STREAM_POLL_INTERVAL);
         self
     }
 

@@ -906,6 +906,24 @@ mod tests {
         Ok(())
     }
 
+    /// A zero poll interval from the builder gets a finite timer.
+    #[tokio::test(start_paused = true)]
+    async fn a_zero_stream_poll_interval_gets_a_finite_tick() -> anyhow::Result<()> {
+        let fixture = fixture().await?;
+        let module = fixture
+            .module()
+            .await?
+            .with_stream_poll_interval(Duration::ZERO);
+        let poll_interval = module.stream_timing.poll_interval;
+        assert!(
+            !poll_interval.is_zero(),
+            "a zero poll interval must not reach the timer"
+        );
+        let mut ticker = tokio::time::interval(poll_interval);
+        ticker.tick().await;
+        Ok(())
+    }
+
     #[tokio::test(start_paused = true)]
     async fn the_stream_sends_a_status_event_when_the_view_changes() -> anyhow::Result<()> {
         let queue = Arc::new(MemoryQueue::new());
