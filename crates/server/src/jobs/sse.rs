@@ -6,7 +6,8 @@
 //! `terminal` event and closes the stream.
 //!
 //! The route has a fixed time cap and a concurrency gate. It keeps no event
-//! history. A reconnect sends the current status again.
+//! history. It ignores the `Last-Event-ID` header and sends the current status
+//! on every reconnect.
 
 use std::{io, sync::Arc, time::Duration};
 
