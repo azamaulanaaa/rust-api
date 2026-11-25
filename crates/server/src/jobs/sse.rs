@@ -57,9 +57,18 @@ const HEARTBEAT_FRAME: &[u8] = b": heartbeat\n\n";
 /// The grant rule has no TTL and no automatic cleanup. Remove the rule through
 /// the existing policy route `DELETE /policy/rules` when access must end.
 ///
+/// Each event carries the full [`JobStatusView`], including `worker`,
+/// `attempt`, the timestamps, and the stored handler error text in `error`.
+/// The server does not sanitize that error text.
+///
+/// An event goes only to the job owner, a holder of the `superadmin` role, or
+/// a subject that holds a `job:<uuid>` / `read` grant.
+///
 /// The initial `status` event carries the current view. A `terminal` event
-/// for `succeeded`, `failed`, or `dead` closes the stream. An event carries
-/// no stored queue data and no internal error text.
+/// for `succeeded`, `failed`, or `dead` closes the stream.
+///
+/// The route keeps no event history. It ignores `Last-Event-ID` and sends the
+/// current status on every reconnect.
 ///
 /// The stream closes when the token expires or at the configured stream time
 /// limit. A queue error also ends the stream. The server logs the error and
