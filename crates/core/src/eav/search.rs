@@ -443,7 +443,7 @@ mod tests {
         let entities: Vec<SearchEntity<'_>> = ids
             .iter()
             .map(|id| SearchEntity {
-                id: *id,
+                id,
                 attributes: &attributes,
             })
             .collect();
