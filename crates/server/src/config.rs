@@ -423,6 +423,28 @@ impl Config {
                 );
             }
         }
+        if self.limits.max_job_event_streams() > MAX_JOB_EVENT_STREAMS {
+            anyhow::bail!(
+                "limits.max_job_event_streams is {}, which is above the maximum of \
+                 {MAX_JOB_EVENT_STREAMS}. A larger cap lets one process hold too many \
+                 open streams.",
+                self.limits.max_job_event_streams()
+            );
+        }
+        if self.limits.job_event_stream_max_secs() > MAX_JOB_EVENT_STREAM_SECS {
+            anyhow::bail!(
+                "limits.job_event_stream_max_secs is {}, which is above the maximum of \
+                 {MAX_JOB_EVENT_STREAM_SECS} seconds (24 hours).",
+                self.limits.job_event_stream_max_secs()
+            );
+        }
+        if self.limits.max_job_event_streams_per_subject() > MAX_JOB_EVENT_STREAMS_PER_SUBJECT {
+            anyhow::bail!(
+                "limits.max_job_event_streams_per_subject is {}, which is above the \
+                 maximum of {MAX_JOB_EVENT_STREAMS_PER_SUBJECT}.",
+                self.limits.max_job_event_streams_per_subject()
+            );
+        }
         if self.eav.outbox_interval_ms == 0 {
             anyhow::bail!("eav.outbox_interval_ms must be greater than 0");
         }
@@ -798,7 +820,29 @@ impl LimitsConfig {
             self.job_event_stream_max_secs
         }
     }
+
+    /// Job status streams per subject to use when the config sets none.
+    ///
+    /// A value of `0` selects the built-in default. It does not disable the
+    /// gate.
+    pub fn max_job_event_streams_per_subject(&self) -> usize {
+        if self.max_job_event_streams_per_subject == 0 {
+            DEFAULT_MAX_JOB_EVENT_STREAMS_PER_SUBJECT
+        } else {
+            self.max_job_event_streams_per_subject
+        }
+    }
 }
+
+/// Highest number of job event streams that one process may serve at the
+/// same time.
+const MAX_JOB_EVENT_STREAMS: usize = 4_096;
+
+/// Longest job event stream, in seconds, that the config may set.
+const MAX_JOB_EVENT_STREAM_SECS: u64 = 86_400;
+
+/// Highest number of job event streams that one subject may hold.
+const MAX_JOB_EVENT_STREAMS_PER_SUBJECT: usize = 1_024;
 
 /// Minimum safe retention for execution markers, in seconds.
 ///
@@ -1278,14 +1322,51 @@ mod tests {
     fn zero_job_event_stream_limits_select_the_defaults() {
         let toml = minimal_toml().replace(
             "region = \"us-east-1\"",
-            "region = \"us-east-1\"\n[limits]\nmax_job_event_streams = 0\njob_event_stream_max_secs = 0",
+            "region = \"us-east-1\"\n[limits]\nmax_job_event_streams = 0\njob_event_stream_max_secs = 0\nmax_job_event_streams_per_subject = 0",
         );
         let cfg = parse(&toml).expect("zero stream limits must parse");
 
         assert_eq!(cfg.limits.max_job_event_streams, 0);
         assert_eq!(cfg.limits.job_event_stream_max_secs, 0);
+        assert_eq!(cfg.limits.max_job_event_streams_per_subject, 0);
         assert_eq!(cfg.limits.max_job_event_streams(), 32);
         assert_eq!(cfg.limits.job_event_stream_max_secs(), 900);
+        assert_eq!(cfg.limits.max_job_event_streams_per_subject(), 8);
+    }
+
+    /// A job event stream limit above its bound fails validation.
+    #[test]
+    fn job_event_stream_limits_reject_values_above_the_bounds() {
+        for (field, value) in [
+            ("max_job_event_streams", "4097"),
+            ("job_event_stream_max_secs", "86401"),
+            ("max_job_event_streams_per_subject", "1025"),
+        ] {
+            let toml = minimal_toml().replace(
+                "region = \"us-east-1\"",
+                &format!("region = \"us-east-1\"\n[limits]\n{field} = {value}"),
+            );
+            let error = parse(&toml).expect_err("a value above the bound must fail");
+            let message = format!("{error:#}");
+            assert!(
+                message.contains(field),
+                "the error must name {field}: {message}"
+            );
+        }
+    }
+
+    /// A job event stream limit at its bound passes validation.
+    #[test]
+    fn job_event_stream_limits_accept_the_bounds() {
+        let toml = minimal_toml().replace(
+            "region = \"us-east-1\"",
+            "region = \"us-east-1\"\n[limits]\nmax_job_event_streams = 4096\njob_event_stream_max_secs = 86400\nmax_job_event_streams_per_subject = 1024",
+        );
+        let cfg = parse(&toml).expect("a value at the bound must pass");
+
+        assert_eq!(cfg.limits.max_job_event_streams(), 4096);
+        assert_eq!(cfg.limits.job_event_stream_max_secs(), 86_400);
+        assert_eq!(cfg.limits.max_job_event_streams_per_subject(), 1_024);
     }
 
     #[test]
