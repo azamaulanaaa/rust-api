@@ -6,6 +6,7 @@
 //! It does no I/O and it checks no authorization.
 //! The caller loads only the data that the user may read.
 
+use std::collections::BTreeSet;
 use std::fmt;
 
 /// The default size of an entity page.
@@ -116,8 +117,11 @@ pub struct SearchPage<'a> {
 ///
 /// The call keeps each entity with an exact attribute match.
 /// It keeps only ids above the cursor id.
-/// It sorts the ids and removes duplicates.
-/// It returns at most `window.limit()` ids.
+/// It removes duplicate ids.
+/// It returns the first `window.limit()` ids in id order.
+///
+/// The call keeps at most `window.limit() + 1` ids in a sorted set while it
+/// scans. It does not sort the full match set.
 ///
 /// The caller must pass an attribute that the replica index covers.
 /// This function cannot check the index.
@@ -127,22 +131,29 @@ pub fn search_by_attribute<'a>(
     value: &SearchValue,
     window: &QueryWindow,
 ) -> SearchPage<'a> {
+    let limit = window.limit();
     let cursor = window.after();
-    let mut ids: Vec<&'a str> = entities
-        .iter()
-        .filter(|entity| {
-            entity
-                .attributes
-                .iter()
-                .any(|(name, candidate)| *name == attribute && candidate == value)
-        })
-        .map(|entity| entity.id)
-        .filter(|id| cursor.is_none_or(|after| *id > after))
-        .collect();
-    ids.sort_unstable();
-    ids.dedup();
-    let has_more = ids.len() > window.limit();
-    ids.truncate(window.limit());
+    let mut selected: BTreeSet<&'a str> = BTreeSet::new();
+    for entity in entities {
+        let matches = entity
+            .attributes
+            .iter()
+            .any(|(name, candidate)| *name == attribute && candidate == value);
+        if !matches || cursor.is_some_and(|after| entity.id <= after) {
+            continue;
+        }
+        // A full buffer holds the smallest `limit + 1` ids. An id at or
+        // above the largest id cannot join that set.
+        if selected.len() > limit && selected.last().is_some_and(|last| entity.id >= *last) {
+            continue;
+        }
+        selected.insert(entity.id);
+        if selected.len() > limit.saturating_add(1) {
+            selected.pop_last();
+        }
+    }
+    let has_more = selected.len() > limit;
+    let ids: Vec<&'a str> = selected.into_iter().take(limit).collect();
     let next = if has_more { ids.last().copied() } else { None };
     SearchPage { ids, next }
 }
@@ -378,6 +389,92 @@ mod tests {
         let page = search_by_attribute(&entities, "tag", &string("alpha"), &window);
 
         assert_eq!(page.ids, ["e1"]);
+        assert_eq!(page.next, None);
+    }
+
+    /// Many matches with a small page return the first ids in id order.
+    #[test]
+    fn many_matches_with_a_small_page_return_the_first_ids() {
+        let ids: Vec<String> = (1..=50).rev().map(|n| format!("e{n:02}")).collect();
+        let attributes = [("tag", string("alpha"))];
+        let entities: Vec<SearchEntity<'_>> = ids
+            .iter()
+            .map(|id| SearchEntity {
+                id: id.as_str(),
+                attributes: &attributes,
+            })
+            .collect();
+        let window = QueryWindow::resolve(Some(3), None).expect("the window is valid");
+
+        let page = search_by_attribute(&entities, "tag", &string("alpha"), &window);
+
+        assert_eq!(page.ids, ["e01", "e02", "e03"]);
+        assert_eq!(page.next, Some("e03"));
+    }
+
+    /// A cursor in the middle returns the next ids in id order.
+    #[test]
+    fn a_cursor_in_the_middle_returns_the_next_ids() {
+        let ids: Vec<String> = (1..=10).rev().map(|n| format!("e{n:02}")).collect();
+        let attributes = [("tag", string("alpha"))];
+        let entities: Vec<SearchEntity<'_>> = ids
+            .iter()
+            .map(|id| SearchEntity {
+                id: id.as_str(),
+                attributes: &attributes,
+            })
+            .collect();
+        let window = QueryWindow::resolve(Some(3), Some("e04")).expect("the window is valid");
+
+        let page = search_by_attribute(&entities, "tag", &string("alpha"), &window);
+
+        assert_eq!(page.ids, ["e05", "e06", "e07"]);
+        assert_eq!(page.next, Some("e07"));
+    }
+
+    /// Repeated ids do not use page slots or count as more matches.
+    #[test]
+    fn repeated_ids_do_not_use_page_slots() {
+        let attributes = [("tag", string("alpha"))];
+        let ids = ["e1", "e1", "e2", "e2", "e3", "e3", "e4"];
+        let entities: Vec<SearchEntity<'_>> = ids
+            .iter()
+            .map(|id| SearchEntity {
+                id: *id,
+                attributes: &attributes,
+            })
+            .collect();
+        let window = QueryWindow::resolve(Some(2), None).expect("the window is valid");
+
+        let page = search_by_attribute(&entities, "tag", &string("alpha"), &window);
+
+        assert_eq!(page.ids, ["e1", "e2"]);
+        assert_eq!(page.next, Some("e2"));
+    }
+
+    /// A page larger than the match set has no cursor.
+    #[test]
+    fn a_page_larger_than_the_match_set_has_no_cursor() {
+        let attributes = [("tag", string("alpha"))];
+        let entities = [
+            SearchEntity {
+                id: "e1",
+                attributes: &attributes,
+            },
+            SearchEntity {
+                id: "e2",
+                attributes: &attributes,
+            },
+            SearchEntity {
+                id: "e3",
+                attributes: &attributes,
+            },
+        ];
+        let window = QueryWindow::resolve(Some(10), None).expect("the window is valid");
+
+        let page = search_by_attribute(&entities, "tag", &string("alpha"), &window);
+
+        assert_eq!(page.ids, ["e1", "e2", "e3"]);
         assert_eq!(page.next, None);
     }
 }
