@@ -9,6 +9,7 @@
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::Duration;
 
 use actix_web::web::{self, ServiceConfig};
 use base64::Engine as _;
@@ -35,6 +36,13 @@ pub mod entity;
 /// The value is fixed in v1. A stream reads the queue every 500 ms, so the cap
 /// also bounds the queue read rate to 64 reads a second.
 const DEFAULT_MAX_CONCURRENT_STREAMS: usize = 32;
+
+/// The default fallback for the longest time that one stream stays open.
+///
+/// A host sets the deployed value with
+/// [`JobsApiModule::with_stream_max_duration`]. This value applies only when
+/// the host does not call that method.
+const DEFAULT_STREAM_MAX_DURATION: Duration = Duration::from_secs(900);
 
 /// The poll routes for job submission and one job status.
 pub mod poll;
@@ -234,6 +242,7 @@ pub struct JobsApiModule {
     jwt: JwtClaimsMiddleware<Claims>,
     submittable: SubmittableKinds,
     stream_gate: ConcurrencyGate,
+    stream_max_duration: Duration,
 }
 
 impl JobsApiModule {
@@ -257,6 +266,7 @@ impl JobsApiModule {
             policy,
             submittable,
             stream_gate: ConcurrencyGate::new(DEFAULT_MAX_CONCURRENT_STREAMS),
+            stream_max_duration: DEFAULT_STREAM_MAX_DURATION,
         }
     }
 
@@ -266,6 +276,15 @@ impl JobsApiModule {
     /// cap in v1, so a host app calls this method only to change it.
     pub fn with_stream_gate(mut self, gate: ConcurrencyGate) -> Self {
         self.stream_gate = gate;
+        self
+    }
+
+    /// Replaces the longest time that one job status stream stays open.
+    ///
+    /// The stream also closes when the token expires. The deployed value comes
+    /// from `[limits].job_event_stream_max_secs`.
+    pub fn with_stream_max_duration(mut self, max_duration: Duration) -> Self {
+        self.stream_max_duration = max_duration;
         self
     }
 }
@@ -280,6 +299,7 @@ impl ApiModule for JobsApiModule {
         let policy = web::Data::new(self.policy.clone());
         let submittable = web::Data::new(self.submittable.clone());
         let gate = web::Data::new(self.stream_gate.clone());
+        let stream_max_duration = web::Data::new(self.stream_max_duration);
         let jwt = self.jwt.clone();
         cfg.service(
             web::scope("/jobs")
@@ -287,6 +307,7 @@ impl ApiModule for JobsApiModule {
                 .app_data(policy)
                 .app_data(submittable)
                 .app_data(gate)
+                .app_data(stream_max_duration)
                 .wrap(jwt)
                 .wrap(NoCache)
                 .route("", web::post().to(poll::create_job))

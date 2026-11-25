@@ -35,9 +35,6 @@ const POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// The interval between two heartbeat comments.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 
-/// The longest time that one stream stays open.
-const MAX_STREAM_DURATION: Duration = Duration::from_secs(900);
-
 /// The event name for a nonterminal status view.
 const STATUS_EVENT: &str = "status";
 
@@ -54,13 +51,18 @@ const HEARTBEAT_FRAME: &[u8] = b": heartbeat\n\n";
 /// allows that job. Any other subject gets `404`, the same answer as for a
 /// missing job.
 ///
+/// # Per-job grants
+///
+/// The grant rule has no TTL and no automatic cleanup. Remove the rule through
+/// the existing policy route `DELETE /policy/rules` when access must end.
+///
 /// The initial `status` event carries the current view. A `terminal` event
 /// for `succeeded`, `failed`, or `dead` closes the stream. An event carries
 /// no stored queue data and no internal error text.
 ///
-/// The stream closes when the token expires or after 15 minutes. A queue
-/// error also ends the stream. The server logs the error and sends no text
-/// for it.
+/// The stream closes when the token expires or at the configured stream time
+/// limit. A queue error also ends the stream. The server logs the error and
+/// sends no text for it.
 ///
 /// # Errors
 ///
@@ -87,6 +89,7 @@ pub async fn job_events(
     queue: web::Data<Arc<dyn JobQueue>>,
     policy: web::Data<Authorizer>,
     gate: web::Data<ConcurrencyGate>,
+    max_duration: web::Data<Duration>,
 ) -> Result<HttpResponse, ApiError> {
     let id = Uuid::parse_str(&id.into_inner()).map_err(|_| ApiError::BadRequest)?;
     // Read the status first: an expired lease updates the stored attempt, so
@@ -111,7 +114,11 @@ pub async fn job_events(
         return Ok(too_many("job status stream"));
     }
 
-    let duration = stream_duration(claims.exp, chrono::Utc::now().timestamp());
+    let duration = stream_duration(
+        claims.exp,
+        chrono::Utc::now().timestamp(),
+        *max_duration.get_ref(),
+    );
     let events = event_stream(queue.get_ref().clone(), job, view, duration, POLL_INTERVAL);
 
     Ok(HttpResponse::Ok()
@@ -121,11 +128,11 @@ pub async fn job_events(
 
 /// Returns the time that a stream may stay open.
 ///
-/// The value is the smaller of the time left on the token and the fixed cap.
+/// The value is the smaller of the time left on the token and `max_duration`.
 /// A token that already expired gives a zero duration.
-fn stream_duration(exp: u64, now: i64) -> Duration {
+fn stream_duration(exp: u64, now: i64, max_duration: Duration) -> Duration {
     let now = u64::try_from(now).unwrap_or(0);
-    Duration::from_secs(exp.saturating_sub(now)).min(MAX_STREAM_DURATION)
+    Duration::from_secs(exp.saturating_sub(now)).min(max_duration)
 }
 
 /// State of one event stream.
@@ -332,7 +339,7 @@ mod tests {
         let engine =
             PolicyEngine::init_s3(build_test_store(&test_prefix("jobs-sse-policy")).await).await?;
         let handlers: Vec<Arc<dyn JobHandler>> = vec![Arc::new(TestHandler("entity.create"))];
-        let kinds = JobKinds::from_handlers(&handlers);
+        let kinds = JobKinds::from_handlers(&handlers)?;
         Ok(Fixture {
             server,
             encoding_key,
@@ -441,10 +448,18 @@ mod tests {
         assert_eq!(events[0].1["id"], id.to_string());
         assert_eq!(events[0].1["state"], "succeeded");
         assert_eq!(events[0].1["commit_seq"], 9);
+        assert!(
+            events[0].1.get("result_base64").is_none(),
+            "the receipt bytes must not repeat in the view"
+        );
         assert_eq!(events[1].0, "terminal");
         assert_eq!(events[1].1["id"], id.to_string());
         assert_eq!(events[1].1["state"], "succeeded");
         assert_eq!(events[1].1["commit_seq"], 9);
+        assert!(
+            events[1].1.get("result_base64").is_none(),
+            "the receipt bytes must not repeat in the view"
+        );
         Ok(())
     }
 
@@ -564,13 +579,50 @@ mod tests {
         Ok(())
     }
 
+    #[actix_web::test]
+    async fn the_module_uses_the_configured_stream_duration() -> anyhow::Result<()> {
+        let fixture = fixture().await?;
+        let module = fixture
+            .module()
+            .await?
+            .with_stream_max_duration(Duration::from_millis(100));
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fixture.token("alice")?;
+        let job = sample_job("alice");
+        let id = job.id;
+        fixture.queue.enqueue(job).await?;
+
+        let request = auth(
+            actix_test::TestRequest::get().uri(&format!("/jobs/{id}/events")),
+            &token,
+        )
+        .to_request();
+        let response = actix_test::call_service(&app, request).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = String::from_utf8(actix_test::read_body(response).await.to_vec())?;
+        let events = parse_events(&body);
+        assert_eq!(
+            events.len(),
+            1,
+            "the configured duration closes the stream before a second tick"
+        );
+        assert_eq!(events[0].0, "status");
+        assert_eq!(events[0].1["state"], "queued");
+        Ok(())
+    }
+
     #[test]
     fn the_stream_duration_uses_the_earlier_of_the_token_and_the_cap() {
         let now: u64 = 1_700_000_000;
         let now = i64::try_from(now).expect("the test time fits in i64");
-        assert_eq!(stream_duration(1_700_000_060, now), Duration::from_secs(60));
-        assert_eq!(stream_duration(1_700_003_600, now), MAX_STREAM_DURATION);
-        assert_eq!(stream_duration(1_699_999_990, now), Duration::ZERO);
+        let cap = Duration::from_secs(120);
+        assert_eq!(
+            stream_duration(1_700_000_060, now, cap),
+            Duration::from_secs(60)
+        );
+        assert_eq!(stream_duration(1_700_003_600, now, cap), cap);
+        assert_eq!(stream_duration(1_699_999_990, now, cap), Duration::ZERO);
     }
 
     #[test]
@@ -705,18 +757,24 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_stream_with_no_time_left_ends_after_the_initial_status() -> anyhow::Result<()> {
+    async fn a_stream_ends_at_the_configured_duration() -> anyhow::Result<()> {
         let queue = Arc::new(MemoryQueue::new());
         let job = sample_job("alice");
         queue.enqueue(job.clone()).await?;
         let view = status_view(&job, &JobStatus::Queued)?;
-        let events = event_stream(queue, job, view, Duration::ZERO, Duration::from_millis(100));
+        let events = event_stream(
+            queue,
+            job,
+            view,
+            Duration::from_millis(300),
+            Duration::from_millis(100),
+        );
         tokio::pin!(events);
 
         assert!(events.next().await.is_some(), "the initial event arrives");
         assert!(
             events.next().await.is_none(),
-            "the deadline ends the stream"
+            "the configured duration ends the stream"
         );
         Ok(())
     }
