@@ -313,7 +313,7 @@ mod tests {
     use crate::http::ApiModule as _;
     use crate::http::middleware::jwks::test_support::{rsa_key, sign_rs256, spawn_jwks};
     use crate::http::middleware::jwt::JwtClaimsMiddleware;
-    use crate::jobs::{JobKinds, JobsApiModule, poll::job_object};
+    use crate::jobs::{JobsApiModule, SubmittableKinds, poll::job_object};
     use crate::policy::{Action, PolicyEngine};
     use crate::queue::{Job, JobStatus, MemoryQueue};
     use rust_api_model::wire::CommitReceipt;
@@ -353,7 +353,7 @@ mod tests {
                 self.queue.clone(),
                 middleware,
                 self.engine.authorizer(),
-                JobKinds::empty(),
+                SubmittableKinds::empty(),
             ))
         }
     }
