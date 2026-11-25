@@ -43,7 +43,15 @@ impl JobState {
 /// `_`. The server keeps the second allowlist of kinds that have a handler.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[cfg_attr(feature = "openapi", schema(value_type = String))]
+#[cfg_attr(
+    feature = "openapi",
+    schema(
+        value_type = String,
+        min_length = 1,
+        max_length = 64,
+        pattern = "^[a-z0-9._-]{1,64}$"
+    )
+)]
 #[serde(try_from = "String", into = "String")]
 pub struct CommandKind(String);
 

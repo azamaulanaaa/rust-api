@@ -291,6 +291,20 @@ mod tests {
         }
     }
 
+    /// The command kind schema carries the parser length limits and pattern.
+    #[test]
+    fn the_command_kind_schema_carries_the_parser_limits() {
+        let spec: Value =
+            serde_json::from_str(&ApiDoc::openapi().to_json().expect("spec serializes"))
+                .expect("spec is JSON");
+
+        let schema = &spec["components"]["schemas"]["CommandKind"];
+        assert_eq!(schema["type"], serde_json::json!("string"));
+        assert_eq!(schema["minLength"], serde_json::json!(1));
+        assert_eq!(schema["maxLength"], serde_json::json!(64));
+        assert_eq!(schema["pattern"], serde_json::json!("^[a-z0-9._-]{1,64}$"));
+    }
+
     /// Guards the PWA contract. Every served route that the SPA code generator
     /// uses must appear in the specification. Drift therefore breaks this
     /// test instead of the front end at run time.
