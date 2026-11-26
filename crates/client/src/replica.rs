@@ -296,3 +296,423 @@ fn hex_lower(bytes: &[u8]) -> String {
     }
     text
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::Response;
+    use std::collections::VecDeque;
+    use std::future::Future;
+    use std::pin::pin;
+    use std::rc::Rc;
+    use std::task::{Context, Poll, Waker};
+
+    /// One scripted transport answer.
+    #[derive(Clone, Debug)]
+    struct Reply {
+        /// The HTTP status code.
+        status: u16,
+        /// The response body.
+        body: Vec<u8>,
+    }
+
+    impl Reply {
+        /// Build a `200` answer with one body.
+        fn ok(body: Vec<u8>) -> Self {
+            Self { status: 200, body }
+        }
+
+        /// Build an answer with one status and no body.
+        fn status(status: u16) -> Self {
+            Self {
+                status,
+                body: Vec::new(),
+            }
+        }
+    }
+
+    /// The recorded requests of the fake transport.
+    type Requests = Rc<RefCell<Vec<Request>>>;
+
+    /// The scripted answers of the fake transport.
+    type Replies = Rc<RefCell<VecDeque<Reply>>>;
+
+    /// A transport that records requests and returns scripted answers.
+    struct FakeTransport {
+        requests: Requests,
+        replies: Replies,
+    }
+
+    impl FakeTransport {
+        /// Build a transport with no scripted answers.
+        fn new() -> (Requests, Replies, Self) {
+            let requests = Rc::new(RefCell::new(Vec::new()));
+            let replies = Rc::new(RefCell::new(VecDeque::new()));
+            (
+                Rc::clone(&requests),
+                Rc::clone(&replies),
+                Self { requests, replies },
+            )
+        }
+    }
+
+    impl Transport for FakeTransport {
+        async fn send(&self, request: Request) -> Result<Response, TransportError> {
+            self.requests.borrow_mut().push(request);
+            let reply = self
+                .replies
+                .borrow_mut()
+                .pop_front()
+                .expect("a scripted reply");
+            Ok(Response {
+                status: reply.status,
+                body: reply.body,
+            })
+        }
+    }
+
+    /// Run one future to completion. The fake transport is always ready.
+    fn block_on<F: Future>(future: F) -> F::Output {
+        let mut future = pin!(future);
+        let mut context = Context::from_waker(Waker::noop());
+        loop {
+            match future.as_mut().poll(&mut context) {
+                Poll::Ready(value) => return value,
+                Poll::Pending => std::thread::yield_now(),
+            }
+        }
+    }
+
+    /// Build one manifest object with the correct size and hash.
+    fn object(key: &str, bytes: &[u8]) -> ReplicaObject {
+        ReplicaObject {
+            key: key.to_owned(),
+            size: bytes.len() as u64,
+            sha256: hex_lower(&Sha256::digest(bytes)),
+        }
+    }
+
+    /// Serialize one manifest.
+    fn manifest_body(manifest: &ReplicaManifest) -> Vec<u8> {
+        serde_json::to_vec(manifest).expect("the manifest serializes")
+    }
+
+    /// Script one full load for a list of object bodies.
+    fn script_load(
+        replies: &Replies,
+        generation: u64,
+        head: u64,
+        objects: &[(&str, &[u8])],
+    ) -> ReplicaManifest {
+        let manifest = ReplicaManifest {
+            generation,
+            head,
+            objects: objects
+                .iter()
+                .map(|(key, bytes)| object(key, bytes))
+                .collect(),
+        };
+        replies
+            .borrow_mut()
+            .push_back(Reply::ok(manifest_body(&manifest)));
+        for (_, bytes) in objects {
+            replies.borrow_mut().push_back(Reply::ok((*bytes).to_vec()));
+        }
+        manifest
+    }
+
+    /// A load sends the manifest and object requests with cookie credentials.
+    #[test]
+    fn a_load_downloads_the_manifest_and_every_object() {
+        let (requests, replies, transport) = FakeTransport::new();
+        let client = ReplicaClient::new(transport);
+        script_load(
+            &replies,
+            7,
+            42,
+            &[("e0/sst/a.sst", b"alpha"), ("e0/wal/b.wal", b"bravo")],
+        );
+
+        let state = block_on(client.load()).expect("the load succeeds");
+
+        assert_eq!(
+            state,
+            ReplicaState {
+                generation: 7,
+                head: 42,
+                applied_seq: 42,
+            }
+        );
+        assert_eq!(client.state(), Some(state));
+        assert_eq!(client.object_count(), 2);
+        assert_eq!(client.object("e0/sst/a.sst"), Some(b"alpha".to_vec()));
+        assert_eq!(client.object("e0/wal/b.wal"), Some(b"bravo".to_vec()));
+
+        let requests = requests.borrow();
+        let paths: Vec<&str> = requests
+            .iter()
+            .map(|request| request.path.as_str())
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                "/sync/db/manifest.json",
+                "/sync/db/e0/sst/a.sst",
+                "/sync/db/e0/wal/b.wal",
+            ]
+        );
+        assert!(requests.iter().all(|request| {
+            request.method == Method::Get && request.credentials == Credentials::Include
+        }));
+    }
+
+    /// A mismatched hash is rejected and the old cache stays in place.
+    #[test]
+    fn a_tampered_hash_is_rejected_and_keeps_the_old_cache() {
+        let (requests, replies, transport) = FakeTransport::new();
+        let client = ReplicaClient::new(transport);
+        let old_state = {
+            script_load(&replies, 5, 10, &[("e0/sst/a.sst", b"old")]);
+            block_on(client.load()).expect("the first load succeeds")
+        };
+
+        let mut tampered = object("e0/sst/a.sst", b"new");
+        tampered.sha256 = hex_lower(&Sha256::digest(b"other"));
+        let manifest = ReplicaManifest {
+            generation: 6,
+            head: 11,
+            objects: vec![tampered],
+        };
+        replies
+            .borrow_mut()
+            .push_back(Reply::ok(manifest_body(&manifest)));
+        replies.borrow_mut().push_back(Reply::ok(b"new".to_vec()));
+
+        let error = block_on(client.load()).expect_err("the hash mismatch is rejected");
+        assert!(matches!(error, ReplicaError::Integrity { .. }));
+        assert_eq!(client.state(), Some(old_state));
+        assert_eq!(client.object("e0/sst/a.sst"), Some(b"old".to_vec()));
+        assert_eq!(requests.borrow().len(), 4);
+    }
+
+    /// A mismatched size is rejected and the old cache stays in place.
+    #[test]
+    fn a_wrong_size_is_rejected_and_keeps_the_old_cache() {
+        let (_, replies, transport) = FakeTransport::new();
+        let client = ReplicaClient::new(transport);
+        let old_state = {
+            script_load(&replies, 5, 10, &[("e0/sst/a.sst", b"old")]);
+            block_on(client.load()).expect("the first load succeeds")
+        };
+
+        let mut wrong_size = object("e0/sst/a.sst", b"new");
+        wrong_size.size += 1;
+        let manifest = ReplicaManifest {
+            generation: 6,
+            head: 11,
+            objects: vec![wrong_size],
+        };
+        replies
+            .borrow_mut()
+            .push_back(Reply::ok(manifest_body(&manifest)));
+        replies.borrow_mut().push_back(Reply::ok(b"new".to_vec()));
+
+        let error = block_on(client.load()).expect_err("the size mismatch is rejected");
+        assert!(matches!(error, ReplicaError::Integrity { .. }));
+        assert_eq!(client.state(), Some(old_state));
+        assert_eq!(client.object("e0/sst/a.sst"), Some(b"old".to_vec()));
+    }
+
+    /// An older manifest generation is rejected and the old cache stays.
+    #[test]
+    fn a_stale_generation_is_rejected_and_keeps_the_old_cache() {
+        let (requests, replies, transport) = FakeTransport::new();
+        let client = ReplicaClient::new(transport);
+        let old_state = {
+            script_load(&replies, 7, 10, &[("e0/sst/a.sst", b"old")]);
+            block_on(client.load()).expect("the first load succeeds")
+        };
+
+        let stale = ReplicaManifest {
+            generation: 6,
+            head: 20,
+            objects: vec![object("e0/sst/a.sst", b"new")],
+        };
+        replies
+            .borrow_mut()
+            .push_back(Reply::ok(manifest_body(&stale)));
+
+        let error = block_on(client.load()).expect_err("the stale generation is rejected");
+        match error {
+            ReplicaError::StaleGeneration { stored, manifest } => {
+                assert_eq!(stored, 7);
+                assert_eq!(manifest, 6);
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+        assert_eq!(client.state(), Some(old_state));
+        assert_eq!(client.object("e0/sst/a.sst"), Some(b"old".to_vec()));
+
+        // The stale load stopped after the manifest request.
+        assert_eq!(requests.borrow().len(), 3);
+    }
+
+    /// A `401` answer requires a login and clears the cache.
+    #[test]
+    fn a_401_answer_requires_a_login_and_clears_the_cache() {
+        let (_, replies, transport) = FakeTransport::new();
+        let client = ReplicaClient::new(transport);
+        script_load(&replies, 1, 5, &[("e0/sst/a.sst", b"old")]);
+        block_on(client.load()).expect("the first load succeeds");
+        assert_eq!(client.object_count(), 1);
+
+        replies.borrow_mut().push_back(Reply::status(401));
+
+        let error = block_on(client.load()).expect_err("the 401 is rejected");
+        assert!(matches!(error, ReplicaError::LoginRequired));
+        assert_eq!(error.status_name(), "login_required");
+        assert_eq!(client.state(), None);
+        assert_eq!(client.object_count(), 0);
+    }
+
+    /// A `403` answer is forbidden and clears the cache.
+    #[test]
+    fn a_403_answer_is_forbidden_and_clears_the_cache() {
+        let (_, replies, transport) = FakeTransport::new();
+        let client = ReplicaClient::new(transport);
+        script_load(&replies, 1, 5, &[("e0/sst/a.sst", b"old")]);
+        block_on(client.load()).expect("the first load succeeds");
+        assert_eq!(client.object_count(), 1);
+
+        replies.borrow_mut().push_back(Reply::status(403));
+
+        let error = block_on(client.load()).expect_err("the 403 is rejected");
+        assert!(matches!(error, ReplicaError::Forbidden));
+        assert_eq!(error.status_name(), "forbidden");
+        assert_eq!(client.state(), None);
+        assert_eq!(client.object_count(), 0);
+    }
+
+    /// A missing object keeps the old cache and reports its status.
+    #[test]
+    fn a_missing_object_is_rejected_and_keeps_the_old_cache() {
+        let (_, replies, transport) = FakeTransport::new();
+        let client = ReplicaClient::new(transport);
+        let old_state = {
+            script_load(&replies, 1, 5, &[("e0/old", b"old")]);
+            block_on(client.load()).expect("the first load succeeds")
+        };
+
+        let manifest = ReplicaManifest {
+            generation: 2,
+            head: 6,
+            objects: vec![
+                object("e0/sst/a.sst", b"alpha"),
+                object("e0/wal/b.wal", b"bravo"),
+            ],
+        };
+        replies
+            .borrow_mut()
+            .push_back(Reply::ok(manifest_body(&manifest)));
+        replies.borrow_mut().push_back(Reply::ok(b"alpha".to_vec()));
+        replies.borrow_mut().push_back(Reply::status(404));
+
+        let error = block_on(client.load()).expect_err("the missing object is rejected");
+        match error {
+            ReplicaError::Request { status } => assert_eq!(status, 404),
+            other => panic!("unexpected error: {other}"),
+        }
+        assert_eq!(client.state(), Some(old_state));
+        assert_eq!(client.object("e0/old"), Some(b"old".to_vec()));
+        assert_eq!(client.object("e0/sst/a.sst"), None);
+    }
+
+    /// A manifest that is not valid JSON is rejected.
+    #[test]
+    fn a_manifest_parse_error_is_rejected() {
+        let (_, replies, transport) = FakeTransport::new();
+        let client = ReplicaClient::new(transport);
+        replies
+            .borrow_mut()
+            .push_back(Reply::ok(b"not a manifest".to_vec()));
+
+        let error = block_on(client.load()).expect_err("the manifest is rejected");
+        assert!(matches!(error, ReplicaError::Manifest(_)));
+        assert_eq!(error.status_name(), "request");
+        assert_eq!(client.state(), None);
+    }
+
+    /// An unsafe object key is rejected before the client fetches it.
+    #[test]
+    fn an_unsafe_object_key_is_rejected() {
+        for key in ["e0/../secret", "/manifest.json", "e0//sst/a.sst", "e0/"] {
+            let (requests, replies, transport) = FakeTransport::new();
+            let client = ReplicaClient::new(transport);
+            let manifest = ReplicaManifest {
+                generation: 1,
+                head: 2,
+                objects: vec![object(key, b"secret")],
+            };
+            replies
+                .borrow_mut()
+                .push_back(Reply::ok(manifest_body(&manifest)));
+
+            let error = block_on(client.load()).expect_err("the key is rejected");
+            assert!(
+                matches!(error, ReplicaError::InvalidKey { .. }),
+                "the key {key} must be invalid"
+            );
+            assert_eq!(error.status_name(), "request");
+            assert_eq!(requests.borrow().len(), 1);
+            assert_eq!(client.state(), None);
+        }
+    }
+
+    /// The cache clears on request.
+    #[test]
+    fn a_clear_removes_the_stored_replica() {
+        let (_, replies, transport) = FakeTransport::new();
+        let client = ReplicaClient::new(transport);
+        script_load(&replies, 1, 5, &[("e0/old", b"old")]);
+        block_on(client.load()).expect("the load succeeds");
+
+        client.clear();
+
+        assert_eq!(client.state(), None);
+        assert_eq!(client.object_count(), 0);
+        assert_eq!(client.object("e0/old"), None);
+    }
+
+    /// The error status names are stable.
+    #[test]
+    fn the_replica_error_names_are_stable() {
+        assert_eq!(ReplicaError::LoginRequired.status_name(), "login_required");
+        assert_eq!(ReplicaError::Forbidden.status_name(), "forbidden");
+        assert_eq!(
+            ReplicaError::StaleGeneration {
+                stored: 2,
+                manifest: 1,
+            }
+            .status_name(),
+            "stale_generation"
+        );
+        assert_eq!(
+            ReplicaError::Integrity {
+                key: "e0/sst/a.sst".to_owned(),
+            }
+            .status_name(),
+            "integrity"
+        );
+        assert_eq!(
+            ReplicaError::Request { status: 500 }.status_name(),
+            "request"
+        );
+        assert_eq!(
+            ReplicaError::InvalidKey {
+                key: "../secret".to_owned(),
+            }
+            .status_name(),
+            "request"
+        );
+    }
+}
