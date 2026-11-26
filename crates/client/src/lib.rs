@@ -1,11 +1,15 @@
 //! The WASM client for the rust-api server.
 //!
 //! This crate builds as a `cdylib` for the browser and as an `rlib` for the
-//! native test target. The skeleton holds no browser code yet. Later work
-//! adds fetch, the replica cache, local reads, and job status.
+//! native test target. The `auth` module holds the session check and the
+//! transport seam. Later work adds the replica cache, local reads, and job
+//! status.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 use rust_api_model::wire::{ReplicaManifest, SyncCursor};
+
+/// The auth transport seam and the session check.
+pub mod auth;
 
 /// The client-side job status modules.
 ///
