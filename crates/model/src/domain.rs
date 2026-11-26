@@ -8,7 +8,10 @@ use serde::{Deserialize, Serialize};
 ///
 /// The wire form is a snake_case string. The stored queue status is a
 /// different type. Do not expose the stored status on the wire.
+///
+/// The type is non-exhaustive. A new state does not break a client build.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum JobState {
@@ -116,7 +119,10 @@ impl From<CommandKind> for String {
 }
 
 /// The reason that a command kind is not valid.
+///
+/// The type is non-exhaustive. A new parser error does not break a caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum CommandKindError {
     /// The value is empty.
     #[error("command kind is empty")]
