@@ -32,8 +32,10 @@
 //! `status` reads `job-state:{id}` and does not load the job row, so it does
 //! not decode the job payload. A store from before this row existed has no
 //! `job-state:` entry. The first `status` call for such a job reads the job
-//! row, writes the status row best-effort, and returns the status. The
-//! backfill also writes the status row for every row.
+//! row and writes the status row in one transaction. The transaction fails if
+//! the job row changes or a status row appears first, so the fallback does not
+//! overwrite a newer status. A purge that removes the job row leaves no status
+//! row behind. The backfill also writes the status row for every row.
 //!
 //! `status` loads the job row only when the status row shows a lease that is
 //! due. The expiry step changes the attempt in the job, so it needs the full
@@ -147,6 +149,8 @@ const LEASE_SWEEP_BATCH: usize = 256;
 const READY_SCAN_BATCH: usize = 256;
 /// Maximum number of queued markers that a depth fallback counts.
 const DEPTH_SCAN_MAX: usize = 100_000;
+/// Number of times the status fallback retries after a transaction conflict.
+const STATUS_BACKFILL_ATTEMPTS: usize = 3;
 
 /// Persisted envelope for one job.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -160,6 +164,16 @@ struct StoredJob {
     /// value. Rows written before this field existed decode with `0`.
     #[serde(default)]
     lease_generation: u64,
+}
+
+/// Result of one status fallback stage.
+enum BackfillStage {
+    /// The job row is gone. The caller must not write a status row.
+    Missing,
+    /// A status row already exists.
+    Existing(JobStatus),
+    /// The transaction staged the status row for this status.
+    Staged(JobStatus),
 }
 
 /// One ready index entry that `reserve` can use.
@@ -375,6 +389,24 @@ impl DurableQueue {
         tx.set_bytes(&Self::state_key(id), &value)
             .await
             .map(|_| ())
+            .map_err(QueueError::store)
+    }
+
+    /// Writes the status row inside a transaction when it is absent.
+    ///
+    /// The precondition makes the commit fail if another writer creates the
+    /// status row first.
+    async fn put_status_if_absent<T>(
+        tx: &T,
+        id: JobId,
+        status: &JobStatus,
+    ) -> Result<(), QueueError>
+    where
+        T: TxCas + Sync,
+    {
+        let value = serde_json::to_vec(status).map_err(QueueError::store)?;
+        tx.set_if_absent(&Self::state_key(id), &value)
+            .await
             .map_err(QueueError::store)
     }
 
@@ -1031,33 +1063,95 @@ impl DurableQueue {
     /// Reads the status row for one job.
     ///
     /// The function reads `job-state:{id}` and does not decode the job row.
-    /// When the row is absent, the function reads the job row, writes the
-    /// status row best-effort, and returns the status. An old store without a
-    /// status row thus stays readable.
+    /// When the row is absent, it backfills the row from the job row in one
+    /// transaction. An old store without a status row thus stays readable.
     async fn load_status(&self, id: JobId) -> Result<JobStatus, QueueError> {
+        if let Some(status) = self.read_status(id).await? {
+            return Ok(status);
+        }
+        self.backfill_status(id).await
+    }
+
+    /// Reads the status row for one job when it exists.
+    async fn read_status(&self, id: JobId) -> Result<Option<JobStatus>, QueueError> {
         let key = Self::state_key(id);
         let g = self.store.read().await;
         let bytes = g.get_bytes(&key).await.map_err(QueueError::store)?;
         drop(g);
-        if let Some(bytes) = bytes {
-            return serde_json::from_slice(&bytes).map_err(QueueError::store);
-        }
-        let sj = self.load(id).await?;
-        let _ = self.write_status(id, &sj.status).await;
-        Ok(sj.status)
+        bytes
+            .map(|bytes| serde_json::from_slice(&bytes).map_err(QueueError::store))
+            .transpose()
     }
 
-    /// Writes one status row outside a job row transaction.
+    /// Stages the status fallback on one transaction.
     ///
-    /// The function serves the fallback write only. Every status change uses
-    /// [`DurableQueue::put_status`] inside the job row transaction.
-    async fn write_status(&self, id: JobId, status: &JobStatus) -> Result<(), QueueError> {
-        let value = serde_json::to_vec(status).map_err(QueueError::store)?;
-        let g = self.store.write().await;
-        g.set_bytes(&Self::state_key(id), &value)
+    /// The function reads the job row and the status row in the transaction.
+    /// It stages a status row only when the job row is unchanged and the
+    /// status row is absent at commit time. A purge that removes the job row,
+    /// or a transition that writes a status row, makes the commit fail.
+    async fn stage_backfill<T>(tx: &T, id: JobId) -> Result<BackfillStage, QueueError>
+    where
+        T: TxCas + Sync,
+    {
+        let job_key = Self::job_key(id);
+        let Some(bytes) = tx.get_bytes(&job_key).await.map_err(QueueError::store)? else {
+            return Ok(BackfillStage::Missing);
+        };
+        let sj = serde_json::from_slice::<StoredJob>(&bytes).map_err(QueueError::store)?;
+        if let Some(existing) = tx
+            .get_bytes(&Self::state_key(id))
             .await
-            .map(|_| ())
-            .map_err(QueueError::store)
+            .map_err(QueueError::store)?
+        {
+            let status = serde_json::from_slice(&existing).map_err(QueueError::store)?;
+            return Ok(BackfillStage::Existing(status));
+        }
+        // The write fails at commit if a purge deletes the job row after this
+        // read. The status write fails if a transition or another fallback
+        // creates the status row first.
+        tx.compare_and_set(&job_key, Some(&bytes), &bytes)
+            .await
+            .map_err(QueueError::store)?;
+        Self::put_status_if_absent(tx, id, &sj.status).await?;
+        Ok(BackfillStage::Staged(sj.status))
+    }
+
+    /// Writes a missing status row from the job row in one transaction.
+    ///
+    /// The function retries a bounded number of times after a conflict. Each
+    /// conflict means that a transition, a purge, or another fallback changed
+    /// the job row or the status row. The function returns the current status
+    /// row when it exists. It returns [`QueueError::NotFound`] when the purge
+    /// removed the job row, so a purge leaves no status row behind.
+    async fn backfill_status(&self, id: JobId) -> Result<JobStatus, QueueError> {
+        for _ in 0..STATUS_BACKFILL_ATTEMPTS {
+            {
+                let g = self.store.write().await;
+                let tx = g.begin_tx().map_err(QueueError::store)?;
+                match Self::stage_backfill(&tx, id).await? {
+                    BackfillStage::Missing => {
+                        let _ = tx.rollback().await;
+                        return Err(QueueError::NotFound(id));
+                    }
+                    BackfillStage::Existing(status) => {
+                        let _ = tx.rollback().await;
+                        return Ok(status);
+                    }
+                    BackfillStage::Staged(status) => match tx.commit().await {
+                        Ok(()) => return Ok(status),
+                        Err(StoreError::TxConflict { .. }) => {}
+                        Err(error) => return Err(QueueError::store(error)),
+                    },
+                }
+            }
+            // The write guard is gone here. Return the status that another
+            // writer committed, or try the backfill again.
+            if let Some(status) = self.read_status(id).await? {
+                return Ok(status);
+            }
+        }
+        // A bounded number of conflicts. The job row is still the source.
+        self.load(id).await.map(|sj| sj.status)
     }
 
     /// Returns all dead-lettered jobs.
@@ -2391,6 +2485,90 @@ mod tests {
 
         assert!(has_key(&q, &DurableQueue::state_key(id)).await);
         assert_state_matches_row(&q, id).await;
+    }
+
+    #[tokio::test]
+    async fn a_staged_fallback_conflicts_with_a_newer_status_row() {
+        let q = queue().await;
+        let j = job("work");
+        let id = j.id;
+        put_job(&q, j, JobStatus::Queued).await;
+
+        let g = q.store.write().await;
+        let fallback = g.begin_tx().unwrap();
+        assert!(matches!(
+            DurableQueue::stage_backfill(&fallback, id).await.unwrap(),
+            BackfillStage::Staged(JobStatus::Queued)
+        ));
+
+        // A transition commits before the fallback. It changes the job row
+        // and writes a newer status row.
+        let newer = JobStatus::Succeeded {
+            result: Some(vec![1]),
+            finished_at: 10,
+        };
+        let job_bytes = g
+            .get_bytes(&DurableQueue::job_key(id))
+            .await
+            .unwrap()
+            .unwrap();
+        let mut row = serde_json::from_slice::<StoredJob>(&job_bytes).unwrap();
+        row.status = newer.clone();
+        let transition = g.begin_tx().unwrap();
+        transition
+            .set_bytes(
+                &DurableQueue::job_key(id),
+                &serde_json::to_vec(&row).unwrap(),
+            )
+            .await
+            .unwrap();
+        transition
+            .set_bytes(
+                &DurableQueue::state_key(id),
+                &serde_json::to_vec(&newer).unwrap(),
+            )
+            .await
+            .unwrap();
+        transition.commit().await.unwrap();
+
+        let error = fallback.commit().await.unwrap_err();
+        assert!(matches!(error, StoreError::TxConflict { .. }));
+        drop(g);
+
+        assert!(same_status(&state_row(&q, id).await.unwrap(), &newer));
+    }
+
+    #[tokio::test]
+    async fn a_staged_fallback_conflicts_with_a_purge() {
+        let q = queue().await;
+        let j = job("work");
+        let id = j.id;
+        put_job(&q, j, JobStatus::Queued).await;
+
+        let g = q.store.write().await;
+        let fallback = g.begin_tx().unwrap();
+        assert!(matches!(
+            DurableQueue::stage_backfill(&fallback, id).await.unwrap(),
+            BackfillStage::Staged(JobStatus::Queued)
+        ));
+
+        // The retention purge removes the job row and its status row before
+        // the fallback commits.
+        let purge = g.begin_tx().unwrap();
+        purge.delete(&DurableQueue::job_key(id)).await.unwrap();
+        purge.delete(&DurableQueue::state_key(id)).await.unwrap();
+        purge.commit().await.unwrap();
+
+        let error = fallback.commit().await.unwrap_err();
+        assert!(matches!(error, StoreError::TxConflict { .. }));
+        drop(g);
+
+        assert!(!has_key(&q, &DurableQueue::state_key(id)).await);
+        assert!(matches!(
+            q.status(id).await,
+            Err(QueueError::NotFound(missing)) if missing == id
+        ));
+        assert!(!has_key(&q, &DurableQueue::state_key(id)).await);
     }
 
     /// Replaces a job row with a value that does not decode.
