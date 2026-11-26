@@ -197,3 +197,145 @@ pub mod browser {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::future::Future;
+    use std::pin::pin;
+    use std::rc::Rc;
+    use std::task::{Context, Poll, Waker};
+
+    /// A transport that records every request and returns one answer.
+    struct FakeTransport {
+        requests: Rc<RefCell<Vec<Request>>>,
+        reply: Result<Response, TransportError>,
+    }
+
+    impl FakeTransport {
+        /// Build a transport that returns one status.
+        fn with_status(status: u16) -> (Rc<RefCell<Vec<Request>>>, Self) {
+            let requests = Rc::new(RefCell::new(Vec::new()));
+            (
+                Rc::clone(&requests),
+                Self {
+                    requests,
+                    reply: Ok(Response { status }),
+                },
+            )
+        }
+
+        /// Build a transport that fails.
+        fn with_error() -> (Rc<RefCell<Vec<Request>>>, Self) {
+            let requests = Rc::new(RefCell::new(Vec::new()));
+            (
+                Rc::clone(&requests),
+                Self {
+                    requests,
+                    reply: Err(TransportError),
+                },
+            )
+        }
+    }
+
+    impl Transport for FakeTransport {
+        async fn send(&self, request: Request) -> Result<Response, TransportError> {
+            self.requests.borrow_mut().push(request);
+            self.reply
+        }
+    }
+
+    /// Run one future to completion. The fake transport is always ready.
+    fn block_on<F: Future>(future: F) -> F::Output {
+        let mut future = pin!(future);
+        let mut context = Context::from_waker(Waker::noop());
+        loop {
+            match future.as_mut().poll(&mut context) {
+                Poll::Ready(value) => return value,
+                Poll::Pending => std::thread::yield_now(),
+            }
+        }
+    }
+
+    /// The client starts in the unknown state.
+    #[test]
+    fn the_client_starts_unknown() {
+        let (_, transport) = FakeTransport::with_status(200);
+        let client = AuthClient::new(transport);
+        assert_eq!(client.state(), AuthState::Unknown);
+    }
+
+    /// The session check sends `GET /auth/me` with cookie credentials.
+    #[test]
+    fn the_session_check_sends_a_get_request_with_cookie_credentials() {
+        let (requests, transport) = FakeTransport::with_status(200);
+        let client = AuthClient::new(transport);
+        block_on(client.check_session());
+
+        let requests = requests.borrow();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, Method::Get);
+        assert_eq!(requests[0].path, "/auth/me");
+        assert_eq!(requests[0].credentials, Credentials::Include);
+    }
+
+    /// A `200` answer authenticates the session.
+    #[test]
+    fn a_200_answer_authenticates_the_session() {
+        let (_, transport) = FakeTransport::with_status(200);
+        let client = AuthClient::new(transport);
+
+        assert_eq!(block_on(client.check_session()), AuthState::Authenticated);
+        assert_eq!(client.state(), AuthState::Authenticated);
+    }
+
+    /// A `401` answer requires a login.
+    #[test]
+    fn a_401_answer_requires_a_login() {
+        let (_, transport) = FakeTransport::with_status(401);
+        let client = AuthClient::new(transport);
+
+        assert_eq!(block_on(client.check_session()), AuthState::LoginRequired);
+        assert_eq!(client.state(), AuthState::LoginRequired);
+    }
+
+    /// A `500` answer sets the error state.
+    #[test]
+    fn a_500_answer_sets_the_error_state() {
+        let (_, transport) = FakeTransport::with_status(500);
+        let client = AuthClient::new(transport);
+
+        assert_eq!(block_on(client.check_session()), AuthState::Error);
+        assert_eq!(client.state(), AuthState::Error);
+    }
+
+    /// A transport failure sets the error state.
+    #[test]
+    fn a_transport_failure_sets_the_error_state() {
+        let (_, transport) = FakeTransport::with_error();
+        let client = AuthClient::new(transport);
+
+        assert_eq!(block_on(client.check_session()), AuthState::Error);
+        assert_eq!(client.state(), AuthState::Error);
+    }
+
+    /// The state names are stable.
+    #[test]
+    fn the_state_names_are_stable() {
+        assert_eq!(AuthState::Unknown.as_str(), "unknown");
+        assert_eq!(AuthState::Authenticated.as_str(), "authenticated");
+        assert_eq!(AuthState::LoginRequired.as_str(), "login_required");
+        assert_eq!(AuthState::Error.as_str(), "error");
+    }
+
+    /// The transport error has a display text and implements `Error`.
+    #[test]
+    fn the_transport_error_is_a_displayable_error() {
+        let error: &dyn std::error::Error = &TransportError;
+        assert_eq!(
+            error.to_string(),
+            "the transport failed to send the request"
+        );
+    }
+}
