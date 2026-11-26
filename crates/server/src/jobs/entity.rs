@@ -58,7 +58,10 @@ impl JobHandler for EntityCreateHandler {
             .head()
             .await
             .map_err(|error| JobError::retryable(error.to_string()))?;
-        self.entities.create(draft, &ctx).await.map_err(entity_error)?;
+        self.entities
+            .create(draft, &ctx)
+            .await
+            .map_err(entity_error)?;
         let after = self
             .wal
             .head()
@@ -191,7 +194,10 @@ mod tests {
         let mut job = job(&draft(), Some("alice"));
         job.payload = b"not json".to_vec();
 
-        let error = handler.handle(&job).await.expect_err("the payload must fail");
+        let error = handler
+            .handle(&job)
+            .await
+            .expect_err("the payload must fail");
         assert!(matches!(error.retry(), JobRetry::NoRetry));
         Ok(())
     }
