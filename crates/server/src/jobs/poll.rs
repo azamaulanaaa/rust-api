@@ -474,6 +474,36 @@ mod tests {
     }
 
     #[actix_web::test]
+    async fn an_entity_create_command_is_accepted() -> anyhow::Result<()> {
+        let fixture = fixture().await?;
+        let module = fixture.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+
+        let token = fixture.token("alice")?;
+        let body = json!({
+            "kind": "entity.create",
+            "payload": {
+                "id": "e1",
+                "schemas": ["task"],
+                "attributes": {
+                    "title": {"type": "string", "value": "hello"}
+                }
+            },
+            "idempotency_key": "key-1",
+        });
+        let request = auth(actix_test::TestRequest::post().uri("/jobs"), &token)
+            .insert_header(("Content-Type", "application/json"))
+            .set_payload(body.to_string())
+            .to_request();
+        let response = actix_test::call_service(&app, request).await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let view: Value = actix_test::read_body_json(response).await;
+        assert_eq!(view["kind"], "entity.create");
+        assert_eq!(view["state"], "queued");
+        Ok(())
+    }
+
+    #[actix_web::test]
     async fn an_unregistered_kind_is_400() -> anyhow::Result<()> {
         let fixture = fixture().await?;
         let module = fixture.module().await?;

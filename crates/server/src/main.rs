@@ -610,10 +610,10 @@ fn readiness_state(input: ReadinessInputs) -> bool {
 
 /// Returns the job kinds that a client may submit.
 ///
-/// No application handler accepts client commands yet, so the set is empty.
-/// The webhook delivery kind is a worker-only kind and stays private.
-fn submittable_kinds() -> rust_api::jobs::SubmittableKinds {
-    rust_api::jobs::SubmittableKinds::empty()
+/// Only `entity.create` is submittable. The webhook delivery kind is a
+/// worker-only kind and stays private.
+fn submittable_kinds() -> Result<rust_api::jobs::SubmittableKinds, rust_api::jobs::JobKindsError> {
+    rust_api::jobs::SubmittableKinds::from_names(["entity.create"])
 }
 
 /// Runs the HTTP listener until stopped.
@@ -755,23 +755,8 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
     let webhook = WebhookAction::new(config.eav.webhook_allowed_hosts.clone())
         .allow_private_hosts(webhook_allow_private_hosts)
         .with_queue(queue.clone(), signing_secret, webhook_max_attempts);
-    // The HTTP job routes share the queue with the worker, so clone it
-    // before the worker takes ownership. Build the handler list one time,
-    // then validate the worker kinds. The route uses a separate
-    // submittable set, so a worker-only kind stays private.
-    let handlers: Vec<Arc<dyn rust_api::queue::JobHandler>> = vec![Arc::new(webhook.job_handler())];
-    let worker_kinds = rust_api::jobs::WorkerKinds::from_handlers(&handlers)?;
-    let submittable = submittable_kinds();
-    submittable.ensure_subset_of(&worker_kinds)?;
-    let jobs_api_module = rust_api::jobs::JobsApiModule::new(
-        queue.clone(),
-        oidc_api_module.middleware(),
-        policy_engine.authorizer(),
-        submittable,
-    );
-    let worker = QueueWorker::new(queue, handlers, "eav-webhook".to_string());
-    let worker_cancel = cancel.clone();
-    let webhook_worker = tokio::spawn(async move { worker.run(worker_cancel).await });
+    // Capture the webhook handler before the runtime takes the action.
+    let webhook_handler: Arc<dyn rust_api::queue::JobHandler> = Arc::new(webhook.job_handler());
     let runtime = rust_api::eav::runtime::EavRuntime::build(
         &s3_client_config,
         &db_prefix,
@@ -792,6 +777,30 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
     .await
     .context("build the EAV runtime")?;
     let runtime = runtime.with_full_replica_limit(config.limits.max_full_replica_bytes);
+
+    // The HTTP job routes share the queue with the worker, so clone it
+    // before the worker takes ownership. Build the handler list one time,
+    // then validate the worker kinds. The route uses a separate
+    // submittable set, so a worker-only kind stays private.
+    let handlers: Vec<Arc<dyn rust_api::queue::JobHandler>> = vec![
+        webhook_handler,
+        Arc::new(rust_api::jobs::entity::EntityCreateHandler::new(
+            runtime.entities().clone(),
+            wal.clone(),
+        )),
+    ];
+    let worker_kinds = rust_api::jobs::WorkerKinds::from_handlers(&handlers)?;
+    let submittable = submittable_kinds()?;
+    submittable.ensure_subset_of(&worker_kinds)?;
+    let jobs_api_module = rust_api::jobs::JobsApiModule::new(
+        queue.clone(),
+        oidc_api_module.middleware(),
+        policy_engine.authorizer(),
+        submittable,
+    );
+    let worker = QueueWorker::new(queue, handlers, "eav-jobs".to_string());
+    let worker_cancel = cancel.clone();
+    let webhook_worker = tokio::spawn(async move { worker.run(worker_cancel).await });
     let eav_api_module = EavApiModule::new(
         runtime.clone(),
         policy_engine.authorizer(),
@@ -1160,10 +1169,15 @@ force_path_style = true
         assert_eq!(domain_prefix("oxkv", "wal"), "oxkv/wal");
     }
 
-    /// The served routes accept no client-submittable job kind yet.
+    /// The submittable set holds `entity.create` and not `webhook.deliver`.
     #[test]
-    fn the_submittable_kind_set_is_empty() {
-        assert!(submittable_kinds().is_empty());
+    fn the_submittable_kind_set_holds_entity_create_only() -> anyhow::Result<()> {
+        let submittable = submittable_kinds()?;
+        let create = rust_api_model::CommandKind::parse("entity.create")?;
+        let webhook = rust_api_model::CommandKind::parse("webhook.deliver")?;
+        assert!(submittable.contains(&create));
+        assert!(!submittable.contains(&webhook));
+        Ok(())
     }
 
     /// A failed EAV loop takes the instance out of the rotation.
