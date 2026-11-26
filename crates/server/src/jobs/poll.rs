@@ -88,7 +88,10 @@ pub async fn create_job(
         .map_err(|error| ApiError::Internal(Box::new(error)))?;
     let fingerprint = idempotency_fingerprint(envelope.kind.as_str(), &payload);
     let mut headers = BTreeMap::new();
-    headers.insert(IDEMPOTENCY_FINGERPRINT_HEADER.to_string(), fingerprint.clone());
+    headers.insert(
+        IDEMPOTENCY_FINGERPRINT_HEADER.to_string(),
+        fingerprint.clone(),
+    );
     let job = Job {
         id: Uuid::now_v7(),
         kind: envelope.kind.as_str().to_string(),
@@ -356,7 +359,10 @@ mod tests {
 
     /// Leases the one queued job and returns its lease token.
     async fn lease_one(fixture: &Fixture, id: Uuid) -> anyhow::Result<LeaseToken> {
-        let leased = fixture.queue.reserve("worker-1", 1, Duration::from_secs(30)).await?;
+        let leased = fixture
+            .queue
+            .reserve("worker-1", 1, Duration::from_secs(30))
+            .await?;
         let job = leased.into_iter().next().expect("a job is queued");
         assert_eq!(job.job.id, id);
         Ok(job.lease)
@@ -372,7 +378,10 @@ mod tests {
     /// Marks one job as failed with the given error text.
     async fn fail_with(fixture: &Fixture, id: Uuid, error: &str) -> anyhow::Result<()> {
         let lease = lease_one(fixture, id).await?;
-        fixture.queue.nack(id, &lease, error, RetryPolicy::NoRetry).await?;
+        fixture
+            .queue
+            .nack(id, &lease, error, RetryPolicy::NoRetry)
+            .await?;
         Ok(())
     }
 
