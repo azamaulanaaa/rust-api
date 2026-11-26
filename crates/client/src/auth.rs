@@ -109,11 +109,14 @@ pub trait Transport {
 /// Runs the session check over one transport.
 ///
 /// The client stores the last state in a [`Cell`], because `check_session`
-/// takes `&self`. The JavaScript client wraps this type.
+/// takes `&self`. Each check carries a generation. Only the newest check
+/// writes the state, so an older check that finishes later cannot overwrite
+/// a newer result. The JavaScript client wraps this type.
 #[derive(Debug)]
 pub struct AuthClient<T: Transport> {
     transport: T,
     state: Cell<AuthState>,
+    generation: Cell<u64>,
 }
 
 impl<T: Transport> AuthClient<T> {
@@ -124,10 +127,14 @@ impl<T: Transport> AuthClient<T> {
         Self {
             transport,
             state: Cell::new(AuthState::Unknown),
+            generation: Cell::new(0),
         }
     }
 
-    /// Return the state from the last check.
+    /// Return the stored state.
+    ///
+    /// The stored state changes only when the newest check completes. A
+    /// slower older check cannot overwrite the state of a newer check.
     pub fn state(&self) -> AuthState {
         self.state.get()
     }
@@ -139,7 +146,13 @@ impl<T: Transport> AuthClient<T> {
     /// [`AuthState::LoginRequired`]. Any other answer or a transport failure
     /// means [`AuthState::Error`]. The browser sends the cookie. The client
     /// does not read it.
+    ///
+    /// A check stores its state only while no later check has started. A
+    /// later check supersedes an earlier check. The return value is always
+    /// the state of this check.
     pub async fn check_session(&self) -> AuthState {
+        let generation = self.generation.get().wrapping_add(1);
+        self.generation.set(generation);
         let request = Request {
             method: Method::Get,
             path: SESSION_PATH.to_owned(),
@@ -153,7 +166,9 @@ impl<T: Transport> AuthClient<T> {
             },
             Err(_) => AuthState::Error,
         };
-        self.state.set(state);
+        if self.generation.get() == generation {
+            self.state.set(state);
+        }
         state
     }
 }
@@ -210,7 +225,7 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
     use std::future::Future;
-    use std::pin::pin;
+    use std::pin::{Pin, pin};
     use std::rc::Rc;
     use std::task::{Context, Poll, Waker};
 
@@ -262,6 +277,45 @@ mod tests {
                 Poll::Ready(value) => return value,
                 Poll::Pending => std::thread::yield_now(),
             }
+        }
+    }
+
+    /// A future that stays pending until its gate opens.
+    struct WaitForGate(Rc<Cell<bool>>);
+
+    impl Future for WaitForGate {
+        type Output = ();
+
+        fn poll(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<()> {
+            if self.get_mut().0.get() {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        }
+    }
+
+    /// A transport that answers each call after its own gate opens.
+    ///
+    /// The first call returns `200`. The second call returns `401`.
+    struct GatedTransport {
+        calls: Rc<Cell<usize>>,
+        first_gate: Rc<Cell<bool>>,
+        second_gate: Rc<Cell<bool>>,
+    }
+
+    impl Transport for GatedTransport {
+        async fn send(&self, _request: Request) -> Result<Response, TransportError> {
+            let call = self.calls.get();
+            self.calls.set(call + 1);
+            let gate = if call == 0 {
+                Rc::clone(&self.first_gate)
+            } else {
+                Rc::clone(&self.second_gate)
+            };
+            WaitForGate(gate).await;
+            let status = if call == 0 { 200 } else { 401 };
+            Ok(Response { status })
         }
     }
 
@@ -339,6 +393,42 @@ mod tests {
 
         assert_eq!(block_on(client.check_session()), AuthState::Error);
         assert_eq!(client.state(), AuthState::Error);
+    }
+
+    /// A slow older check cannot overwrite the state of a newer check.
+    #[test]
+    fn a_slow_older_check_cannot_overwrite_a_newer_state() {
+        let first_gate = Rc::new(Cell::new(false));
+        let second_gate = Rc::new(Cell::new(false));
+        let transport = GatedTransport {
+            calls: Rc::new(Cell::new(0)),
+            first_gate: Rc::clone(&first_gate),
+            second_gate: Rc::clone(&second_gate),
+        };
+        let client = AuthClient::new(transport);
+        let mut context = Context::from_waker(Waker::noop());
+
+        let mut older = pin!(client.check_session());
+        assert_eq!(older.as_mut().poll(&mut context), Poll::Pending);
+        let mut newer = pin!(client.check_session());
+        assert_eq!(newer.as_mut().poll(&mut context), Poll::Pending);
+
+        // The newer 401 check completes first and stores its state.
+        second_gate.set(true);
+        assert_eq!(
+            newer.as_mut().poll(&mut context),
+            Poll::Ready(AuthState::LoginRequired)
+        );
+        assert_eq!(client.state(), AuthState::LoginRequired);
+
+        // The older 200 check completes last. It returns its own state and
+        // does not overwrite the stored state.
+        first_gate.set(true);
+        assert_eq!(
+            older.as_mut().poll(&mut context),
+            Poll::Ready(AuthState::Authenticated)
+        );
+        assert_eq!(client.state(), AuthState::LoginRequired);
     }
 
     /// The state names are stable.
