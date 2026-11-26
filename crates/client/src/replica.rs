@@ -10,13 +10,18 @@
 //! passes. A failed load keeps the old cache, except for a `401` or `403`
 //! answer, which clears the cache.
 //!
+//! A load checks the stored generation before it downloads and again before
+//! it commits. A newer load or a clear replaces an older load that has not
+//! committed, so the older load cannot overwrite newer data or repopulate
+//! the cache after a logout.
+//!
 //! This version stores the raw object bytes in a `BTreeMap`. The plan
 //! names `oxkv-cached` for the local store. Its async oxkv record and
 //! snapshot API is a larger integration than this loader needs, so it is a
 //! later change.
 
 use core::fmt;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 
 use rust_api_model::wire::{ReplicaManifest, ReplicaObject};
@@ -66,6 +71,8 @@ pub enum ReplicaError {
         /// The generation of the manifest.
         manifest: u64,
     },
+    /// A newer load or a clear replaced this load before it could commit.
+    Superseded,
     /// An object does not match the size or the SHA-256 in the manifest.
     Integrity {
         /// The object key from the manifest.
@@ -89,6 +96,7 @@ impl ReplicaError {
             Self::LoginRequired => "login_required",
             Self::Forbidden => "forbidden",
             Self::StaleGeneration { .. } => "stale_generation",
+            Self::Superseded => "superseded",
             Self::Integrity { .. } => "integrity",
             _ => "request",
         }
@@ -106,6 +114,7 @@ impl fmt::Display for ReplicaError {
                 formatter,
                 "the manifest generation {manifest} is older than the stored generation {stored}"
             ),
+            Self::Superseded => formatter.write_str("a newer load or a clear replaced this load"),
             Self::Integrity { key } => {
                 write!(formatter, "the object {key} does not match the manifest")
             }
@@ -140,11 +149,18 @@ struct ReplicaCache {
 ///
 /// The client stores the last replica in memory. [`load`](Self::load)
 /// replaces the cache only when every object passes. A `401` or `403`
-/// answer clears the cache.
+/// answer clears the cache. A newer load or a clear replaces an older load
+/// that has not committed.
 #[derive(Debug)]
 pub struct ReplicaClient<T: Transport> {
     transport: T,
     cache: RefCell<ReplicaCache>,
+    /// The number of the newest load. A load that is not the newest one
+    /// cannot commit.
+    load_epoch: Cell<u64>,
+    /// The number of clears. A load that started before a clear cannot
+    /// commit.
+    clear_epoch: Cell<u64>,
 }
 
 impl<T: Transport> ReplicaClient<T> {
@@ -155,6 +171,8 @@ impl<T: Transport> ReplicaClient<T> {
         Self {
             transport,
             cache: RefCell::new(ReplicaCache::default()),
+            load_epoch: Cell::new(0),
+            clear_epoch: Cell::new(0),
         }
     }
 
@@ -178,7 +196,10 @@ impl<T: Transport> ReplicaClient<T> {
     }
 
     /// Remove the stored replica.
+    ///
+    /// A load that is in flight cannot repopulate the cache after a clear.
     pub fn clear(&self) {
+        self.clear_epoch.set(self.clear_epoch.get().wrapping_add(1));
         *self.cache.borrow_mut() = ReplicaCache::default();
     }
 
@@ -189,9 +210,16 @@ impl<T: Transport> ReplicaClient<T> {
     /// manifest generation that is older than the stored generation. It
     /// verifies the byte length and the SHA-256 of every object. The new
     /// objects replace the stored objects only after every check passes.
+    ///
+    /// A newer load or a clear replaces this load before it commits. In
+    /// that case the cache stays as it is.
     pub async fn load(&self) -> Result<ReplicaState, ReplicaError> {
-        // Copy the stored state before the first await. The borrow ends
-        // here, so state() and clear() keep working during the download.
+        // Capture the load and clear epochs before the first await. Copy
+        // the stored state too. The borrow ends here, so state() and
+        // clear() keep working during the download.
+        let load_epoch = self.load_epoch.get().wrapping_add(1);
+        self.load_epoch.set(load_epoch);
+        let clear_epoch = self.clear_epoch.get();
         let stored = self.cache.borrow().state;
 
         let manifest_body = self.get(MANIFEST_PATH).await?;
@@ -221,7 +249,20 @@ impl<T: Transport> ReplicaClient<T> {
             head: manifest.head,
             applied_seq: manifest.head,
         };
+        // Check the current cache and the epochs under the same borrow
+        // that commits. No await runs between the checks and the swap.
         let mut cache = self.cache.borrow_mut();
+        if let Some(current) = cache.state
+            && current.generation > state.generation
+        {
+            return Err(ReplicaError::StaleGeneration {
+                stored: current.generation,
+                manifest: state.generation,
+            });
+        }
+        if self.clear_epoch.get() != clear_epoch || self.load_epoch.get() != load_epoch {
+            return Err(ReplicaError::Superseded);
+        }
         cache.objects = objects;
         cache.state = Some(state);
         Ok(state)
@@ -311,7 +352,7 @@ mod tests {
     use crate::auth::Response;
     use std::collections::VecDeque;
     use std::future::Future;
-    use std::pin::pin;
+    use std::pin::{Pin, pin};
     use std::rc::Rc;
     use std::task::{Context, Poll, Waker};
 
@@ -376,6 +417,87 @@ mod tests {
                 status: reply.status,
                 body: reply.body,
             })
+        }
+    }
+
+    /// A gate that the test opens when its cell becomes true.
+    type Gate = Rc<Cell<bool>>;
+
+    /// A future that stays pending until its gate opens.
+    struct WaitForGate(Gate);
+
+    impl Future for WaitForGate {
+        type Output = ();
+
+        fn poll(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<()> {
+            if self.get_mut().0.get() {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        }
+    }
+
+    /// One scripted answer with an optional gate.
+    struct GatedReply {
+        /// The answer.
+        reply: Reply,
+        /// The gate that the transport waits on before it returns the answer.
+        gate: Option<Gate>,
+    }
+
+    /// The gated scripted answers of the gated transport.
+    type GatedReplies = Rc<RefCell<VecDeque<GatedReply>>>;
+
+    /// A transport that records requests and returns gated scripted answers.
+    struct GatedTransport {
+        requests: Requests,
+        replies: GatedReplies,
+    }
+
+    impl GatedTransport {
+        /// Build a transport with no scripted answers.
+        fn new() -> (Requests, GatedReplies, Self) {
+            let requests = Rc::new(RefCell::new(Vec::new()));
+            let replies = Rc::new(RefCell::new(VecDeque::new()));
+            (
+                Rc::clone(&requests),
+                Rc::clone(&replies),
+                Self { requests, replies },
+            )
+        }
+    }
+
+    impl Transport for GatedTransport {
+        async fn send(&self, request: Request) -> Result<Response, TransportError> {
+            self.requests.borrow_mut().push(request);
+            let GatedReply { reply, gate } = self
+                .replies
+                .borrow_mut()
+                .pop_front()
+                .expect("a scripted reply");
+            if let Some(gate) = gate {
+                WaitForGate(gate).await;
+            }
+            Ok(Response {
+                status: reply.status,
+                body: reply.body,
+            })
+        }
+    }
+
+    /// Build one gated scripted answer.
+    fn gated(reply: Reply, gate: Option<Gate>) -> GatedReply {
+        GatedReply { reply, gate }
+    }
+
+    /// Poll one future until it completes. Call it after the gate opens.
+    fn finish<F: Future>(future: &mut Pin<&mut F>, context: &mut Context<'_>) -> F::Output {
+        loop {
+            if let Poll::Ready(value) = future.as_mut().poll(context) {
+                return value;
+            }
+            std::thread::yield_now();
         }
     }
 
@@ -565,6 +687,141 @@ mod tests {
         assert_eq!(requests.borrow().len(), 3);
     }
 
+    /// A newer generation that commits first is not overwritten.
+    #[test]
+    fn an_older_load_cannot_overwrite_a_newer_generation() {
+        let older_gate = Rc::new(Cell::new(false));
+        let (_, replies, transport) = GatedTransport::new();
+        let client = ReplicaClient::new(transport);
+
+        let older_manifest = ReplicaManifest {
+            generation: 1,
+            head: 10,
+            objects: vec![object("e0/old", b"old")],
+        };
+        let newer_manifest = ReplicaManifest {
+            generation: 2,
+            head: 20,
+            objects: vec![object("e0/new", b"new")],
+        };
+        replies
+            .borrow_mut()
+            .push_back(gated(Reply::ok(manifest_body(&older_manifest)), None));
+        replies.borrow_mut().push_back(gated(
+            Reply::ok(b"old".to_vec()),
+            Some(Rc::clone(&older_gate)),
+        ));
+        replies
+            .borrow_mut()
+            .push_back(gated(Reply::ok(manifest_body(&newer_manifest)), None));
+        replies
+            .borrow_mut()
+            .push_back(gated(Reply::ok(b"new".to_vec()), None));
+
+        let mut context = Context::from_waker(Waker::noop());
+        let mut older = pin!(client.load());
+        assert!(matches!(older.as_mut().poll(&mut context), Poll::Pending));
+
+        let newer_state = block_on(client.load()).expect("the newer load commits");
+        assert_eq!(newer_state.generation, 2);
+
+        older_gate.set(true);
+        let error = finish(&mut older, &mut context).expect_err("the older load is rejected");
+        assert!(matches!(
+            error,
+            ReplicaError::StaleGeneration {
+                stored: 2,
+                manifest: 1,
+            }
+        ));
+        assert_eq!(client.state(), Some(newer_state));
+        assert_eq!(client.object("e0/new").as_deref(), Some(&b"new"[..]));
+        assert_eq!(client.object("e0/old"), None);
+    }
+
+    /// A newer load that has not committed still supersedes an older load.
+    #[test]
+    fn a_newer_load_supersedes_an_older_load_before_commit() {
+        let older_gate = Rc::new(Cell::new(false));
+        let newer_gate = Rc::new(Cell::new(false));
+        let (_, replies, transport) = GatedTransport::new();
+        let client = ReplicaClient::new(transport);
+
+        let older_manifest = ReplicaManifest {
+            generation: 1,
+            head: 10,
+            objects: vec![object("e0/old", b"old")],
+        };
+        let newer_manifest = ReplicaManifest {
+            generation: 2,
+            head: 20,
+            objects: vec![object("e0/new", b"new")],
+        };
+        replies
+            .borrow_mut()
+            .push_back(gated(Reply::ok(manifest_body(&older_manifest)), None));
+        replies.borrow_mut().push_back(gated(
+            Reply::ok(b"old".to_vec()),
+            Some(Rc::clone(&older_gate)),
+        ));
+        replies
+            .borrow_mut()
+            .push_back(gated(Reply::ok(manifest_body(&newer_manifest)), None));
+        replies.borrow_mut().push_back(gated(
+            Reply::ok(b"new".to_vec()),
+            Some(Rc::clone(&newer_gate)),
+        ));
+
+        let mut context = Context::from_waker(Waker::noop());
+        let mut older = pin!(client.load());
+        assert!(matches!(older.as_mut().poll(&mut context), Poll::Pending));
+        let mut newer = pin!(client.load());
+        assert!(matches!(newer.as_mut().poll(&mut context), Poll::Pending));
+
+        older_gate.set(true);
+        let error = finish(&mut older, &mut context).expect_err("the older load is superseded");
+        assert!(matches!(error, ReplicaError::Superseded));
+        assert_eq!(client.state(), None);
+
+        newer_gate.set(true);
+        let newer_state = finish(&mut newer, &mut context).expect("the newer load commits");
+        assert_eq!(newer_state.generation, 2);
+        assert_eq!(client.state(), Some(newer_state));
+    }
+
+    /// A clear during a load keeps the cache empty.
+    #[test]
+    fn a_clear_during_a_load_prevents_repopulation() {
+        let gate = Rc::new(Cell::new(false));
+        let (_, replies, transport) = GatedTransport::new();
+        let client = ReplicaClient::new(transport);
+
+        let manifest = ReplicaManifest {
+            generation: 1,
+            head: 10,
+            objects: vec![object("e0/old", b"old")],
+        };
+        replies
+            .borrow_mut()
+            .push_back(gated(Reply::ok(manifest_body(&manifest)), None));
+        replies
+            .borrow_mut()
+            .push_back(gated(Reply::ok(b"old".to_vec()), Some(Rc::clone(&gate))));
+
+        let mut context = Context::from_waker(Waker::noop());
+        let mut load = pin!(client.load());
+        assert!(matches!(load.as_mut().poll(&mut context), Poll::Pending));
+
+        client.clear();
+        gate.set(true);
+
+        let error = finish(&mut load, &mut context).expect_err("the load is superseded");
+        assert!(matches!(error, ReplicaError::Superseded));
+        assert_eq!(error.status_name(), "superseded");
+        assert_eq!(client.state(), None);
+        assert_eq!(client.object_count(), 0);
+    }
+
     /// A `401` answer requires a login and clears the cache.
     #[test]
     fn a_401_answer_requires_a_login_and_clears_the_cache() {
@@ -720,6 +977,7 @@ mod tests {
             .status_name(),
             "stale_generation"
         );
+        assert_eq!(ReplicaError::Superseded.status_name(), "superseded");
         assert_eq!(
             ReplicaError::Integrity {
                 key: "e0/sst/a.sst".to_owned(),

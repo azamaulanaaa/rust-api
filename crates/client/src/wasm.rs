@@ -71,6 +71,7 @@ impl Client {
     /// - `"login_required"`: the server answered `401` and cleared the cache.
     /// - `"forbidden"`: the server answered `403` and cleared the cache.
     /// - `"stale_generation"`: the manifest is older than the stored replica.
+    /// - `"superseded"`: a newer load or a clear replaced this load.
     /// - `"integrity"`: an object does not match its size or SHA-256.
     /// - `"request"`: a transport failure, a manifest parse error, an unsafe
     ///   object key, or an unexpected status.
