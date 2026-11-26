@@ -6,7 +6,8 @@
 use async_trait::async_trait;
 use rust_api_model::wire::CommitReceipt;
 
-use crate::eav::entity::{EntityDraft, EntityError, EntityStore, WriteContext};
+use crate::eav::entity::{EntityDraft, EntityStore, WriteContext};
+use crate::eav::entity_error::EntityError;
 use crate::queue::{Job, JobError, JobHandler};
 use crate::sync::wal::Wal;
 
