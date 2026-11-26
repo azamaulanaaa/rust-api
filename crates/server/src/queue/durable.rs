@@ -9,6 +9,7 @@
 //! | Key | Value |
 //! | --- | --- |
 //! | `job:{id}` | Job row. The value is a JSON `StoredJob`. |
+//! | `job-state:{id}` | Status row. The value is a JSON `JobStatus`. |
 //! | `job-status:queued:{id}` | Empty status marker. The job waits to run. |
 //! | `job-status:leased:{id}` | Empty status marker. A worker holds the job. |
 //! | `job-status:dead:{id}` | Empty status marker. The job has no retries left. |
@@ -22,9 +23,19 @@
 //! | `job-meta:lease-indexed` | Lease index marker. |
 //! | `job-meta:ready-indexed` | Ready index marker. |
 //!
-//! A job row has one status marker. The row and the marker change in one
-//! transaction. The queue lists one marker family. It does not scan the
-//! `job:` family after the backfill.
+//! A job row has one status marker and one status row. The job row, the
+//! marker, and the status row change in one transaction. The queue lists one
+//! marker family. It does not scan the `job:` family after the backfill.
+//!
+//! # Status row
+//!
+//! `status` reads `job-state:{id}` and does not load the job row, so it does
+//! not decode the job payload. A store from before this row existed has no
+//! `job-state:` entry. The first `status` call for such a job reads the job
+//! row, writes the status row best-effort, and returns the status. The
+//! backfill also writes the status row for every row.
+//!
+//! The status row is additive. The job row stays the source of the full job.
 //!
 //! # Ready index
 //!
@@ -98,6 +109,8 @@ use super::{Job, JobId, JobStatus, LeaseToken, LeasedJob, QueueError, QueueMetri
 
 /// Prefix of a job row.
 const JOB_PREFIX: &str = "job:";
+/// Prefix of a status row.
+const STATE_PREFIX: &str = "job-state:";
 /// Prefix of a queued status marker.
 const QUEUED_PREFIX: &str = "job-status:queued:";
 /// Prefix of a leased status marker.
@@ -161,22 +174,23 @@ struct ReadyCandidate {
 ///
 /// # Transitions
 ///
-/// | Operation | Job row | Status marker |
-/// | --- | --- | --- |
-/// | `enqueue` | Write | Write `queued` |
-/// | `reserve` | Update | Delete `queued`, write `leased` |
-/// | `ack` | Keep `Succeeded` | Delete the old marker, write `succeeded` |
-/// | `nack` (retry) | Update | Delete the old marker, write `queued` |
-/// | `nack` (dead) | Update | Delete the old marker, write `dead` |
-/// | `nack` (failed) | Keep `Failed` | Delete the old marker, write `failed` |
-/// | `sweep_expired` | Update | Delete `leased`, write `queued` |
-/// | `sweep_expired` retention | Delete the row | Delete the terminal marker |
+/// | Operation | Job row | Status marker | Status row |
+/// | --- | --- | --- | --- |
+/// | `enqueue` | Write | Write `queued` | Write `Queued` |
+/// | `reserve` | Update | Delete `queued`, write `leased` | Write `Leased` |
+/// | `ack` | Keep `Succeeded` | Delete the old marker, write `succeeded` | Write `Succeeded` |
+/// | `nack` (retry) | Update | Delete the old marker, write `queued` | Write `Queued` |
+/// | `nack` (dead) | Update | Delete the old marker, write `dead` | Write `Dead` |
+/// | `nack` (failed) | Keep `Failed` | Delete the old marker, write `failed` | Write `Failed` |
+/// | `sweep_expired` | Update | Delete `leased`, write `queued` | Write `Queued` |
+/// | `extend_lease` | Update | Keep `leased` | Write `Leased` |
+/// | `sweep_expired` retention | Delete the row | Delete the terminal marker | Delete the status row |
 ///
-/// Each transition writes the row and the marker in one transaction. A
-/// transition to `Queued` writes a `job-ready-due:` entry and adds one to the
-/// queued count. A transition away from `Queued` deletes the ready entry and
-/// subtracts one from the count. A failed read or write returns
-/// [`QueueError::Store`].
+/// Each transition writes the row, the marker, and the status row in one
+/// transaction. A transition to `Queued` writes a `job-ready-due:` entry and
+/// adds one to the queued count. A transition away from `Queued` deletes the
+/// ready entry and subtracts one from the count. A failed read or write
+/// returns [`QueueError::Store`].
 ///
 /// `ack`, `nack`, and `extend_lease` check the lease token under a
 /// compare-and-set on the job row. A stale token does not change the job.
@@ -211,6 +225,10 @@ impl DurableQueue {
 
     fn job_key(id: Uuid) -> String {
         format!("{JOB_PREFIX}{id}")
+    }
+
+    fn state_key(id: JobId) -> String {
+        format!("{STATE_PREFIX}{id}")
     }
 
     fn queued_key(id: Uuid) -> String {
@@ -341,6 +359,30 @@ impl DurableQueue {
         .map_err(QueueError::store)
     }
 
+    /// Writes the status row inside a transaction.
+    ///
+    /// The caller must also write the job row in the same transaction, so the
+    /// two rows cannot disagree.
+    async fn put_status<T>(tx: &T, id: JobId, status: &JobStatus) -> Result<(), QueueError>
+    where
+        T: TxCas + Sync,
+    {
+        let value = serde_json::to_vec(status).map_err(QueueError::store)?;
+        tx.set_bytes(&Self::state_key(id), &value)
+            .await
+            .map_err(QueueError::store)
+    }
+
+    /// Deletes the status row inside a transaction.
+    async fn delete_status<T>(tx: &T, id: JobId) -> Result<(), QueueError>
+    where
+        T: TxCas + Sync,
+    {
+        tx.delete(&Self::state_key(id))
+            .await
+            .map_err(QueueError::store)
+    }
+
     /// Counts one job row read for tests.
     fn count_row_read(&self) {
         #[cfg(test)]
@@ -402,9 +444,9 @@ impl DurableQueue {
     /// Applies one change to a leased job under a compare-and-set.
     ///
     /// The function reads the job row, checks the lease token, applies
-    /// `update`, and writes the row and its status marker in one transaction.
-    /// A token that does not match returns an error and changes nothing.
-    /// The function returns the updated row.
+    /// `update`, and writes the row, its status marker, and its status row in
+    /// one transaction. A token that does not match returns an error and
+    /// changes nothing. The function returns the updated row.
     async fn transition<F>(
         &self,
         job_id: JobId,
@@ -457,6 +499,7 @@ impl DurableQueue {
                 .await
                 .map_err(QueueError::store)?;
         }
+        Self::put_status(&tx, job_id, &sj.status).await?;
         if let Some(due) = Self::lease_due_key_for(&sj.status, job_id) {
             tx.set_bytes(&due, b"").await.map_err(QueueError::store)?;
         }
@@ -570,6 +613,7 @@ impl DurableQueue {
                             .await
                             .map_err(QueueError::store)?;
                     }
+                    Self::put_status(&tx, sj.job.id, &sj.status).await?;
                 }
                 Err(e) => {
                     debug!(key = %kv.key, error = %e, "skipping job row that does not decode");
@@ -866,6 +910,7 @@ impl DurableQueue {
         let ready = Self::ready_due_key_for(&new_sj, id);
         let val = serde_json::to_vec(&new_sj).map_err(QueueError::store)?;
         tx.set_bytes(&key, &val).await.map_err(QueueError::store)?;
+        Self::put_status(&tx, id, &new_sj.status).await?;
         tx.delete(&Self::leased_key(id))
             .await
             .map_err(QueueError::store)?;
@@ -931,6 +976,7 @@ impl DurableQueue {
             let bytes = tx.get_bytes(&key).await.map_err(QueueError::store)?;
             let Some(bytes) = bytes else {
                 tx.delete(&marker).await.map_err(QueueError::store)?;
+                Self::delete_status(&tx, id).await?;
                 tx.commit().await.map_err(QueueError::store)?;
                 continue;
             };
@@ -950,6 +996,7 @@ impl DurableQueue {
             if expired {
                 tx.delete(&key).await.map_err(QueueError::store)?;
                 tx.delete(&marker).await.map_err(QueueError::store)?;
+                Self::delete_status(&tx, id).await?;
                 if let Some(idempotency_key) = &sj.job.idempotency_key {
                     tx.delete(&Self::idempotency_key(idempotency_key))
                         .await
@@ -973,6 +1020,37 @@ impl DurableQueue {
         drop(g);
         let bytes = bytes.ok_or(QueueError::NotFound(id))?;
         serde_json::from_slice(&bytes).map_err(QueueError::store)
+    }
+
+    /// Reads the status row for one job.
+    ///
+    /// The function reads `job-state:{id}` and does not decode the job row.
+    /// When the row is absent, the function reads the job row, writes the
+    /// status row best-effort, and returns the status. An old store without a
+    /// status row thus stays readable.
+    async fn load_status(&self, id: JobId) -> Result<JobStatus, QueueError> {
+        let key = Self::state_key(id);
+        let g = self.store.read().await;
+        let bytes = g.get_bytes(&key).await.map_err(QueueError::store)?;
+        drop(g);
+        if let Some(bytes) = bytes {
+            return serde_json::from_slice(&bytes).map_err(QueueError::store);
+        }
+        let sj = self.load(id).await?;
+        let _ = self.write_status(id, &sj.status).await;
+        Ok(sj.status)
+    }
+
+    /// Writes one status row outside a job row transaction.
+    ///
+    /// The function serves the fallback write only. Every status change uses
+    /// [`DurableQueue::put_status`] inside the job row transaction.
+    async fn write_status(&self, id: JobId, status: &JobStatus) -> Result<(), QueueError> {
+        let value = serde_json::to_vec(status).map_err(QueueError::store)?;
+        let g = self.store.write().await;
+        g.set_bytes(&Self::state_key(id), &value)
+            .await
+            .map_err(QueueError::store)
     }
 
     /// Returns all dead-lettered jobs.
@@ -1041,6 +1119,7 @@ impl super::JobQueue for DurableQueue {
         tx.set_bytes(&Self::job_key(id), &val)
             .await
             .map_err(QueueError::store)?;
+        Self::put_status(&tx, id, &sj.status).await?;
         tx.set_bytes(&Self::queued_key(id), b"")
             .await
             .map_err(QueueError::store)?;
@@ -1138,6 +1217,7 @@ impl super::JobQueue for DurableQueue {
             };
             let val = serde_json::to_vec(&sj).map_err(QueueError::store)?;
             tx.set_bytes(&key, &val).await.map_err(QueueError::store)?;
+            Self::put_status(&tx, id, &sj.status).await?;
             tx.delete(&Self::queued_key(id))
                 .await
                 .map_err(QueueError::store)?;
@@ -1262,9 +1342,9 @@ impl super::JobQueue for DurableQueue {
     #[instrument(name = "queue.status", skip(self), fields(queue.backend = "durable", job.id = %job_id))]
     async fn status(&self, job_id: JobId) -> Result<JobStatus, QueueError> {
         self.expire_job(job_id).await?;
-        let sj = self.load(job_id).await?;
+        let status = self.load_status(job_id).await?;
         self.record_depth().await;
-        Ok(sj.status)
+        Ok(status)
     }
 }
 
@@ -2105,6 +2185,197 @@ mod tests {
         g.has(key).await.unwrap()
     }
 
+    /// Reads the status row for one job.
+    async fn state_row(q: &DurableQueue, id: JobId) -> Option<JobStatus> {
+        let g = q.store.read().await;
+        let bytes = g.get_bytes(&DurableQueue::state_key(id)).await.unwrap();
+        bytes.map(|bytes| serde_json::from_slice(&bytes).unwrap())
+    }
+
+    /// Checks two statuses for the same JSON value.
+    fn same_status(a: &JobStatus, b: &JobStatus) -> bool {
+        serde_json::to_vec(a).unwrap() == serde_json::to_vec(b).unwrap()
+    }
+
+    /// Checks that the status row and the job row agree.
+    async fn assert_state_matches_row(q: &DurableQueue, id: JobId) {
+        let row = q.load(id).await.unwrap();
+        let state = state_row(q, id)
+            .await
+            .expect("the job must have a status row");
+        assert!(
+            same_status(&state, &row.status),
+            "status row {state:?} differs from the job row {:?}",
+            row.status
+        );
+    }
+
+    #[tokio::test]
+    async fn enqueue_writes_the_job_row_and_the_status_row() {
+        let q = queue().await;
+        let j = job("work");
+        let id = j.id;
+        q.enqueue(j).await.unwrap();
+
+        assert!(has_key(&q, &DurableQueue::job_key(id)).await);
+        assert!(matches!(state_row(&q, id).await, Some(JobStatus::Queued)));
+        assert_state_matches_row(&q, id).await;
+    }
+
+    #[tokio::test]
+    async fn reserve_and_ack_update_the_status_row() {
+        let q = queue().await;
+        let j = job("work");
+        let id = j.id;
+        q.enqueue(j).await.unwrap();
+
+        let leased = q.reserve("w1", 10, Duration::from_secs(30)).await.unwrap();
+        assert!(matches!(
+            state_row(&q, id).await,
+            Some(JobStatus::Leased { .. })
+        ));
+        assert_state_matches_row(&q, id).await;
+
+        q.ack(id, &leased[0].lease, Some(vec![7])).await.unwrap();
+        match state_row(&q, id).await {
+            Some(JobStatus::Succeeded { result, .. }) => assert_eq!(result, Some(vec![7])),
+            other => panic!("expected a succeeded status row, got {:?}", other),
+        }
+        assert_state_matches_row(&q, id).await;
+    }
+
+    #[tokio::test]
+    async fn extend_lease_updates_the_status_row() {
+        let q = queue().await;
+        let j = job("work");
+        let id = j.id;
+        q.enqueue(j).await.unwrap();
+        let leased = q.reserve("w1", 10, Duration::from_secs(30)).await.unwrap();
+        let before = match state_row(&q, id).await {
+            Some(JobStatus::Leased { expires_at, .. }) => expires_at,
+            other => panic!("expected a leased status row, got {:?}", other),
+        };
+
+        q.extend_lease(id, &leased[0].lease, Duration::from_secs(60))
+            .await
+            .unwrap();
+
+        match state_row(&q, id).await {
+            Some(JobStatus::Leased { worker, expires_at }) => {
+                assert_eq!(worker, "w1");
+                assert!(expires_at > before);
+            }
+            other => panic!("expected a leased status row, got {:?}", other),
+        }
+        assert_state_matches_row(&q, id).await;
+    }
+
+    #[tokio::test]
+    async fn nack_with_retry_updates_the_status_row() {
+        let q = queue().await;
+        let j = job("work");
+        let id = j.id;
+        q.enqueue(j).await.unwrap();
+        let leased = q.reserve("w1", 10, Duration::from_secs(30)).await.unwrap();
+
+        q.nack(
+            id,
+            &leased[0].lease,
+            "boom",
+            RetryPolicy::Retry {
+                delay: Duration::ZERO,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(state_row(&q, id).await, Some(JobStatus::Queued)));
+        assert_state_matches_row(&q, id).await;
+    }
+
+    #[tokio::test]
+    async fn nack_without_retry_updates_the_status_row() {
+        let q = queue().await;
+        let j = job("work");
+        let id = j.id;
+        q.enqueue(j).await.unwrap();
+        let leased = q.reserve("w1", 10, Duration::from_secs(30)).await.unwrap();
+
+        q.nack(id, &leased[0].lease, "boom", RetryPolicy::NoRetry)
+            .await
+            .unwrap();
+
+        match state_row(&q, id).await {
+            Some(JobStatus::Failed { error, .. }) => assert_eq!(error, "boom"),
+            other => panic!("expected a failed status row, got {:?}", other),
+        }
+        assert_state_matches_row(&q, id).await;
+    }
+
+    #[tokio::test]
+    async fn nack_at_the_attempt_limit_updates_the_status_row() {
+        let q = queue().await;
+        let mut j = job("work");
+        j.max_attempts = 1;
+        let id = j.id;
+        q.enqueue(j).await.unwrap();
+        let leased = q.reserve("w1", 10, Duration::from_secs(30)).await.unwrap();
+
+        q.nack(
+            id,
+            &leased[0].lease,
+            "boom",
+            RetryPolicy::Retry {
+                delay: Duration::ZERO,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(state_row(&q, id).await, Some(JobStatus::Dead { .. })));
+        assert_state_matches_row(&q, id).await;
+    }
+
+    #[tokio::test]
+    async fn an_expired_lease_updates_the_status_row() {
+        let q = queue().await;
+        let j = job("work");
+        let id = j.id;
+        q.enqueue(j).await.unwrap();
+        let _ = q.reserve("w1", 10, Duration::from_secs(0)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let _ = q.status(id).await.unwrap();
+
+        assert!(matches!(state_row(&q, id).await, Some(JobStatus::Queued)));
+        assert_state_matches_row(&q, id).await;
+    }
+
+    #[tokio::test]
+    async fn status_falls_back_to_the_job_row_and_backfills() {
+        let q = queue().await;
+        let j = job("work");
+        let id = j.id;
+        put_job(
+            &q,
+            j,
+            JobStatus::Succeeded {
+                result: Some(vec![4]),
+                finished_at: 10,
+            },
+        )
+        .await;
+        assert!(!has_key(&q, &DurableQueue::state_key(id)).await);
+
+        match q.status(id).await.unwrap() {
+            JobStatus::Succeeded { result, .. } => assert_eq!(result, Some(vec![4])),
+            other => panic!("expected succeeded, got {:?}", other),
+        }
+
+        assert!(has_key(&q, &DurableQueue::state_key(id)).await);
+        assert_state_matches_row(&q, id).await;
+    }
+
     async fn put_indexed_job(q: &DurableQueue, job: Job, status: JobStatus) {
         use oxkv::{Store as _, Transaction as _};
         let id = job.id;
@@ -2466,6 +2737,13 @@ mod tests {
         assert!(has_key(&q, &DurableQueue::failed_key(failed_id)).await);
         assert!(!has_key(&q, &DurableQueue::dead_key(succeeded_id)).await);
         assert!(!has_key(&q, &DurableQueue::dead_key(failed_id)).await);
+        // The backfill writes the status row for every old job row.
+        assert!(has_key(&q, &DurableQueue::state_key(succeeded_id)).await);
+        assert!(has_key(&q, &DurableQueue::state_key(failed_id)).await);
+        assert!(has_key(&q, &DurableQueue::state_key(queued_id)).await);
+        assert_state_matches_row(&q, succeeded_id).await;
+        assert_state_matches_row(&q, failed_id).await;
+        assert_state_matches_row(&q, queued_id).await;
     }
 
     #[tokio::test]
@@ -2498,8 +2776,10 @@ mod tests {
         q.sweep_expired().await.unwrap();
         assert!(!has_key(&q, &DurableQueue::job_key(old_id)).await);
         assert!(!has_key(&q, &DurableQueue::dead_key(old_id)).await);
+        assert!(!has_key(&q, &DurableQueue::state_key(old_id)).await);
         assert!(has_key(&q, &DurableQueue::job_key(new_id)).await);
         assert!(has_key(&q, &DurableQueue::dead_key(new_id)).await);
+        assert!(has_key(&q, &DurableQueue::state_key(new_id)).await);
     }
 
     #[tokio::test]
