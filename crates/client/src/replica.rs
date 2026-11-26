@@ -59,6 +59,13 @@ pub enum ReplicaError {
     LoginRequired,
     /// The server denied the replica access.
     Forbidden,
+    /// The manifest generation is older than the stored generation.
+    StaleGeneration {
+        /// The generation of the stored replica.
+        stored: u64,
+        /// The generation of the manifest.
+        manifest: u64,
+    },
     /// An object does not match the size or the SHA-256 in the manifest.
     Integrity {
         /// The object key from the manifest.
@@ -80,6 +87,10 @@ impl fmt::Display for ReplicaError {
             Self::Request { status } => write!(formatter, "the server answered HTTP {status}"),
             Self::LoginRequired => formatter.write_str("a login is required"),
             Self::Forbidden => formatter.write_str("the server denied the replica access"),
+            Self::StaleGeneration { stored, manifest } => write!(
+                formatter,
+                "the manifest generation {manifest} is older than the stored generation {stored}"
+            ),
             Self::Integrity { key } => {
                 write!(formatter, "the object {key} does not match the manifest")
             }
@@ -159,13 +170,27 @@ impl<T: Transport> ReplicaClient<T> {
     /// Download the manifest and every object, then store the new replica.
     ///
     /// The load fetches `GET /sync/db/manifest.json` and then each object
-    /// from `GET /sync/db/{key}` with cookie credentials. It verifies the
-    /// byte length and the SHA-256 of every object. The new objects replace
-    /// the stored objects only after every check passes.
+    /// from `GET /sync/db/{key}` with cookie credentials. It rejects a
+    /// manifest generation that is older than the stored generation. It
+    /// verifies the byte length and the SHA-256 of every object. The new
+    /// objects replace the stored objects only after every check passes.
     pub async fn load(&self) -> Result<ReplicaState, ReplicaError> {
+        // Copy the stored state before the first await. The borrow ends
+        // here, so state() and clear() keep working during the download.
+        let stored = self.cache.borrow().state;
+
         let manifest_body = self.get(MANIFEST_PATH).await?;
         let manifest: ReplicaManifest =
             serde_json::from_slice(&manifest_body).map_err(ReplicaError::Manifest)?;
+
+        if let Some(stored) = stored
+            && stored.generation > manifest.generation
+        {
+            return Err(ReplicaError::StaleGeneration {
+                stored: stored.generation,
+                manifest: manifest.generation,
+            });
+        }
 
         let mut objects = BTreeMap::new();
         for object in &manifest.objects {
