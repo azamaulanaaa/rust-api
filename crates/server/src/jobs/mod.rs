@@ -360,6 +360,18 @@ pub(crate) fn status_view(
     Ok(view)
 }
 
+/// Hides the owner-only fields of a job view from a non-owner.
+///
+/// The function clears `result_base64` and `error` when `is_owner` is false.
+/// The rest of the view stays. Call this after the access check and before
+/// the response.
+pub(crate) fn redact_non_owner(view: &mut JobStatusView, is_owner: bool) {
+    if !is_owner {
+        view.result_base64 = None;
+        view.error = None;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -18,7 +18,7 @@ use crate::http::middleware::jwt::{Claims, Validated};
 use crate::policy::{Action, Authorizer, SUPERADMIN_ROLE};
 use crate::queue::{Job, JobQueue, QueueError};
 
-use super::{SubmittableKinds, status_view};
+use super::{SubmittableKinds, redact_non_owner, status_view};
 
 /// The queue priority of a job that an HTTP request enqueues.
 const JOB_PRIORITY: i32 = 0;
@@ -131,7 +131,8 @@ pub async fn create_job(
 /// allows that job. An administrator adds the rule through the existing
 /// policy routes. Any other subject gets `404`, the same answer as for a
 /// missing job, so the route does not show whether a job exists. The
-/// response carries `Cache-Control: no-store`.
+/// response carries `Cache-Control: no-store`. The result bytes and the
+/// error text are owner-only.
 ///
 /// # Per-job grants
 ///
@@ -177,10 +178,13 @@ pub async fn get_job(
         Err(QueueError::NotFound(_)) => return Ok(not_found()),
         Err(error) => return Err(queue_error(error)),
     };
+    let is_owner = job.owner_sub.as_deref() == Some(claims.sub.as_str());
     if !may_read(&job, &claims.sub, &policy).await {
         return Ok(not_found());
     }
-    let view = status_view(&job, &status).map_err(|error| ApiError::Internal(Box::new(error)))?;
+    let mut view =
+        status_view(&job, &status).map_err(|error| ApiError::Internal(Box::new(error)))?;
+    redact_non_owner(&mut view, is_owner);
 
     Ok(HttpResponse::Ok().json(view))
 }
@@ -288,7 +292,7 @@ mod tests {
     use crate::http::middleware::jwt::JwtClaimsMiddleware;
     use crate::jobs::{JobsApiModule, SubmittableKinds};
     use crate::policy::PolicyEngine;
-    use crate::queue::MemoryQueue;
+    use crate::queue::{LeaseToken, MemoryQueue, RetryPolicy};
 
     const KID: &str = "jobs-poll-test-kid";
     const AUD: &str = "test-aud";
@@ -348,6 +352,28 @@ mod tests {
 
     fn auth(req: actix_test::TestRequest, token: &str) -> actix_test::TestRequest {
         req.insert_header(("Cookie", format!("auth_token={token}")))
+    }
+
+    /// Leases the one queued job and returns its lease token.
+    async fn lease_one(fixture: &Fixture, id: Uuid) -> anyhow::Result<LeaseToken> {
+        let leased = fixture.queue.reserve("worker-1", 1, Duration::from_secs(30)).await?;
+        let job = leased.into_iter().next().expect("a job is queued");
+        assert_eq!(job.job.id, id);
+        Ok(job.lease)
+    }
+
+    /// Marks one job as succeeded with the given result bytes.
+    async fn succeed_with(fixture: &Fixture, id: Uuid, result: Vec<u8>) -> anyhow::Result<()> {
+        let lease = lease_one(fixture, id).await?;
+        fixture.queue.ack(id, &lease, Some(result)).await?;
+        Ok(())
+    }
+
+    /// Marks one job as failed with the given error text.
+    async fn fail_with(fixture: &Fixture, id: Uuid, error: &str) -> anyhow::Result<()> {
+        let lease = lease_one(fixture, id).await?;
+        fixture.queue.nack(id, &lease, error, RetryPolicy::NoRetry).await?;
+        Ok(())
     }
 
     fn command_body(key: &str) -> String {
@@ -815,6 +841,140 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let read: Value = actix_test::read_body_json(response).await;
         assert_eq!(read["id"], created["id"]);
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn the_owner_sees_the_result_and_error() -> anyhow::Result<()> {
+        let fixture = fixture().await?;
+        let module = fixture.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let alice_token = fixture.token("alice")?;
+
+        let succeeded = post_command!(app, alice_token, "key-1");
+        let succeeded_id = succeeded["id"]
+            .as_str()
+            .expect("the view has an id")
+            .to_string();
+        succeed_with(
+            &fixture,
+            Uuid::parse_str(&succeeded_id)?,
+            b"secret".to_vec(),
+        )
+        .await?;
+
+        let failed = post_command!(app, alice_token, "key-2");
+        let failed_id = failed["id"]
+            .as_str()
+            .expect("the view has an id")
+            .to_string();
+        fail_with(&fixture, Uuid::parse_str(&failed_id)?, "boom").await?;
+
+        let response = read_job!(app, alice_token, succeeded_id);
+        assert_eq!(response.status(), StatusCode::OK);
+        let view: Value = actix_test::read_body_json(response).await;
+        assert_eq!(view["result_base64"], "c2VjcmV0");
+        assert!(view.get("error").is_none());
+
+        let response = read_job!(app, alice_token, failed_id);
+        assert_eq!(response.status(), StatusCode::OK);
+        let view: Value = actix_test::read_body_json(response).await;
+        assert_eq!(view["error"], "boom");
+        assert!(view.get("result_base64").is_none());
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn a_superadmin_does_not_see_the_result_or_error() -> anyhow::Result<()> {
+        let fixture = fixture().await?;
+        assert!(fixture.engine.claim_superadmin("root").await?);
+        let module = fixture.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let alice_token = fixture.token("alice")?;
+
+        let succeeded = post_command!(app, alice_token, "key-1");
+        let succeeded_id = succeeded["id"]
+            .as_str()
+            .expect("the view has an id")
+            .to_string();
+        succeed_with(
+            &fixture,
+            Uuid::parse_str(&succeeded_id)?,
+            b"secret".to_vec(),
+        )
+        .await?;
+
+        let failed = post_command!(app, alice_token, "key-2");
+        let failed_id = failed["id"]
+            .as_str()
+            .expect("the view has an id")
+            .to_string();
+        fail_with(&fixture, Uuid::parse_str(&failed_id)?, "boom").await?;
+
+        let root_token = fixture.token("root")?;
+        let response = read_job!(app, root_token, succeeded_id);
+        assert_eq!(response.status(), StatusCode::OK);
+        let view: Value = actix_test::read_body_json(response).await;
+        assert!(view.get("result_base64").is_none());
+        assert!(view.get("error").is_none());
+
+        let response = read_job!(app, root_token, failed_id);
+        assert_eq!(response.status(), StatusCode::OK);
+        let view: Value = actix_test::read_body_json(response).await;
+        assert!(view.get("error").is_none());
+        assert!(view.get("result_base64").is_none());
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn a_grantee_does_not_see_the_result_or_error() -> anyhow::Result<()> {
+        let fixture = fixture().await?;
+        let module = fixture.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let alice_token = fixture.token("alice")?;
+
+        let succeeded = post_command!(app, alice_token, "key-1");
+        let succeeded_id = succeeded["id"]
+            .as_str()
+            .expect("the view has an id")
+            .to_string();
+        succeed_with(
+            &fixture,
+            Uuid::parse_str(&succeeded_id)?,
+            b"secret".to_vec(),
+        )
+        .await?;
+
+        let failed = post_command!(app, alice_token, "key-2");
+        let failed_id = failed["id"]
+            .as_str()
+            .expect("the view has an id")
+            .to_string();
+        fail_with(&fixture, Uuid::parse_str(&failed_id)?, "boom").await?;
+
+        let succeeded_object = job_object(Uuid::parse_str(&succeeded_id)?);
+        fixture
+            .engine
+            .add_rule("bob".into(), succeeded_object, Action::Read)
+            .await?;
+        let failed_object = job_object(Uuid::parse_str(&failed_id)?);
+        fixture
+            .engine
+            .add_rule("bob".into(), failed_object, Action::Read)
+            .await?;
+
+        let bob_token = fixture.token("bob")?;
+        let response = read_job!(app, bob_token, succeeded_id);
+        assert_eq!(response.status(), StatusCode::OK);
+        let view: Value = actix_test::read_body_json(response).await;
+        assert!(view.get("result_base64").is_none());
+        assert!(view.get("error").is_none());
+
+        let response = read_job!(app, bob_token, failed_id);
+        assert_eq!(response.status(), StatusCode::OK);
+        let view: Value = actix_test::read_body_json(response).await;
+        assert!(view.get("error").is_none());
+        assert!(view.get("result_base64").is_none());
         Ok(())
     }
 
