@@ -43,17 +43,24 @@ impl EntityCreateHandler {
 
     /// Returns the result for a repeated create of the same draft.
     ///
-    /// The function reads the stored entity. A version 1 entity with the same
-    /// content returns `None`, because the first attempt committed. A
-    /// different entity is a permanent failure. A read failure is retryable.
+    /// The function validates the draft and applies the schema defaults, so
+    /// an omitted default attribute still matches the stored entity. It
+    /// returns `None` when version 1 and the content match. A different
+    /// entity is a permanent failure. A read failure is retryable. A draft
+    /// that no longer validates is a permanent failure.
     async fn existing_entity(&self, draft: &EntityDraft) -> Result<Option<Vec<u8>>, JobError> {
+        let expected = self
+            .entities
+            .preview_create(draft)
+            .await
+            .map_err(entity_error)?;
         let entity = self
             .entities
             .get(&draft.id)
             .await
             .map_err(|error| JobError::retryable(error.to_string()))?;
         match entity {
-            Some(entity) if matches_draft(&entity, draft) => Ok(None),
+            Some(entity) if matches_entity(&entity, &expected) => Ok(None),
             Some(_) => Err(JobError::permanent(
                 "the entity exists with different content",
             )),
@@ -129,21 +136,26 @@ fn after_head(before: u64, after: Result<u64, FsError>) -> Result<Option<Vec<u8>
     Ok(None)
 }
 
-/// Reports whether a stored entity matches the draft that created it.
+/// Reports whether a stored entity matches the prepared initial entity.
 ///
 /// The store may assign schema versions, so the function compares schema ids
-/// only. The attribute maps must match exactly.
-fn matches_draft(entity: &Entity, draft: &EntityDraft) -> bool {
-    if entity.version != 1 || entity.attributes != draft.attributes {
+/// only. It ignores the created and updated times. The attribute maps must
+/// match exactly.
+fn matches_entity(stored: &Entity, expected: &Entity) -> bool {
+    if stored.version != 1 || stored.attributes != expected.attributes {
         return false;
     }
-    let stored: BTreeSet<&str> = entity
+    let stored_schemas: BTreeSet<&str> = stored
         .schemas
         .iter()
         .map(|schema| schema.id.as_str())
         .collect();
-    let wanted: BTreeSet<&str> = draft.schemas.iter().map(String::as_str).collect();
-    stored == wanted
+    let expected_schemas: BTreeSet<&str> = expected
+        .schemas
+        .iter()
+        .map(|schema| schema.id.as_str())
+        .collect();
+    stored_schemas == expected_schemas
 }
 
 /// Maps a policy failure to a job error.
@@ -186,6 +198,35 @@ mod tests {
     use crate::policy::PolicyEngine;
     use crate::queue::JobRetry;
 
+    /// Builds one `task` schema with a `title` string.
+    fn task_schema() -> SchemaDraft {
+        SchemaDraft {
+            id: "task".to_string(),
+            extends: Vec::new(),
+            attributes: BTreeMap::from([("title".to_string(), string_attr("title"))]),
+        }
+    }
+
+    /// Builds one string attribute with no default.
+    fn string_attr(name: &str) -> AttributeDef {
+        AttributeDef {
+            name: name.to_string(),
+            ty: AttributeType::String,
+            required: false,
+            indexed: false,
+            unique: false,
+            default: None,
+        }
+    }
+
+    /// Builds one string attribute with a default value.
+    fn default_attr(name: &str, value: &str) -> AttributeDef {
+        AttributeDef {
+            default: Some(serde_json::json!(value)),
+            ..string_attr(name)
+        }
+    }
+
     /// Builds a handler, a store, and one `task` schema.
     ///
     /// The store uses the handler feed only when `with_feed` is true. The
@@ -193,6 +234,18 @@ mod tests {
     async fn fixture(
         with_feed: bool,
         granted: bool,
+    ) -> anyhow::Result<(EntityCreateHandler, EntityStore)> {
+        fixture_with_schemas(with_feed, granted, vec![task_schema()]).await
+    }
+
+    /// Builds a handler, a store, and the given schemas.
+    ///
+    /// The store uses the handler feed only when `with_feed` is true. The
+    /// owner `alice` gets the entity write grant only when `granted` is true.
+    async fn fixture_with_schemas(
+        with_feed: bool,
+        granted: bool,
+        schemas: Vec<SchemaDraft>,
     ) -> anyhow::Result<(EntityCreateHandler, EntityStore)> {
         let wal = Wal::new(build_test_store(&test_prefix("jobs-entity-wal")).await);
         let registry =
@@ -204,23 +257,9 @@ mod tests {
         if with_feed {
             store = store.with_change_sink(Arc::new(wal.clone()));
         }
-        registry
-            .publish(SchemaDraft {
-                id: "task".to_string(),
-                extends: Vec::new(),
-                attributes: BTreeMap::from([(
-                    "title".to_string(),
-                    AttributeDef {
-                        name: "title".to_string(),
-                        ty: AttributeType::String,
-                        required: false,
-                        indexed: false,
-                        unique: false,
-                        default: None,
-                    },
-                )]),
-            })
-            .await?;
+        for schema in schemas {
+            registry.publish(schema).await?;
+        }
         let engine =
             PolicyEngine::init_s3(build_test_store(&test_prefix("jobs-entity-policy")).await)
                 .await?;
@@ -351,6 +390,54 @@ mod tests {
     #[tokio::test]
     async fn a_repeated_create_returns_ok_none() -> anyhow::Result<()> {
         let (handler, _) = fixture(true, true).await?;
+        let draft = draft();
+
+        let first = handler.handle(&job(&draft, Some("alice"))).await?;
+        assert!(first.is_some());
+
+        let second = handler.handle(&job(&draft, Some("alice"))).await?;
+        assert!(second.is_none());
+        Ok(())
+    }
+
+    /// A repeated create matches a direct schema default.
+    #[tokio::test]
+    async fn a_repeated_create_matches_a_direct_default() -> anyhow::Result<()> {
+        let schemas = vec![SchemaDraft {
+            id: "task".to_string(),
+            extends: Vec::new(),
+            attributes: BTreeMap::from([
+                ("title".to_string(), string_attr("title")),
+                ("status".to_string(), default_attr("status", "new")),
+            ]),
+        }];
+        let (handler, _) = fixture_with_schemas(true, true, schemas).await?;
+        let draft = draft();
+
+        let first = handler.handle(&job(&draft, Some("alice"))).await?;
+        assert!(first.is_some());
+
+        let second = handler.handle(&job(&draft, Some("alice"))).await?;
+        assert!(second.is_none());
+        Ok(())
+    }
+
+    /// A repeated create matches an inherited schema default.
+    #[tokio::test]
+    async fn a_repeated_create_matches_an_inherited_default() -> anyhow::Result<()> {
+        let schemas = vec![
+            SchemaDraft {
+                id: "base".to_string(),
+                extends: Vec::new(),
+                attributes: BTreeMap::from([("status".to_string(), default_attr("status", "new"))]),
+            },
+            SchemaDraft {
+                id: "task".to_string(),
+                extends: vec!["base".to_string()],
+                attributes: BTreeMap::from([("title".to_string(), string_attr("title"))]),
+            },
+        ];
+        let (handler, _) = fixture_with_schemas(true, true, schemas).await?;
         let draft = draft();
 
         let first = handler.handle(&job(&draft, Some("alice"))).await?;

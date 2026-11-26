@@ -1382,6 +1382,21 @@ impl EntityStore {
         result
     }
 
+    /// Validates one create and returns the entity that the write would store.
+    ///
+    /// The call resolves the schema versions, applies the schema defaults,
+    /// and checks every attribute. It writes no row. A caller uses the result
+    /// to compare a re-delivered create with the stored entity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EntityError`] when the draft is not valid against its
+    /// effective schemas. Returns [`EntityError::Store`] when a schema read
+    /// fails.
+    pub async fn preview_create(&self, draft: &EntityDraft) -> Result<Entity, EntityError> {
+        Ok(self.prepare_create(draft.clone()).await?.entity)
+    }
+
     /// Creates an entity and returns the change.
     async fn create_inner(
         &self,
