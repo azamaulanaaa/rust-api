@@ -7,6 +7,9 @@
 use core::cell::Cell;
 use core::fmt;
 
+/// The route that reports the current session.
+const SESSION_PATH: &str = "/auth/me";
+
 /// The session state of the client.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AuthState {
@@ -127,6 +130,31 @@ impl<T: Transport> AuthClient<T> {
     /// Return the state from the last check.
     pub fn state(&self) -> AuthState {
         self.state.get()
+    }
+
+    /// Ask the server for the current session and store the state.
+    ///
+    /// The request is `GET /auth/me` with cookie credentials. A `200` answer
+    /// means [`AuthState::Authenticated`]. A `401` answer means
+    /// [`AuthState::LoginRequired`]. Any other answer or a transport failure
+    /// means [`AuthState::Error`]. The browser sends the cookie. The client
+    /// does not read it.
+    pub async fn check_session(&self) -> AuthState {
+        let request = Request {
+            method: Method::Get,
+            path: SESSION_PATH.to_owned(),
+            credentials: Credentials::Include,
+        };
+        let state = match self.transport.send(request).await {
+            Ok(response) => match response.status {
+                200 => AuthState::Authenticated,
+                401 => AuthState::LoginRequired,
+                _ => AuthState::Error,
+            },
+            Err(_) => AuthState::Error,
+        };
+        self.state.set(state);
+        state
     }
 }
 
