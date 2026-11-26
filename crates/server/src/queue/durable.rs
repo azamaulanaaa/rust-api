@@ -35,6 +35,10 @@
 //! row, writes the status row best-effort, and returns the status. The
 //! backfill also writes the status row for every row.
 //!
+//! `status` loads the job row only when the status row shows a lease that is
+//! due. The expiry step changes the attempt in the job, so it needs the full
+//! row. A live lease and every terminal status need no job row read.
+//!
 //! The status row is additive. The job row stays the source of the full job.
 //!
 //! # Ready index
@@ -370,6 +374,7 @@ impl DurableQueue {
         let value = serde_json::to_vec(status).map_err(QueueError::store)?;
         tx.set_bytes(&Self::state_key(id), &value)
             .await
+            .map(|_| ())
             .map_err(QueueError::store)
     }
 
@@ -380,6 +385,7 @@ impl DurableQueue {
     {
         tx.delete(&Self::state_key(id))
             .await
+            .map(|_| ())
             .map_err(QueueError::store)
     }
 
@@ -1050,6 +1056,7 @@ impl DurableQueue {
         let g = self.store.write().await;
         g.set_bytes(&Self::state_key(id), &value)
             .await
+            .map(|_| ())
             .map_err(QueueError::store)
     }
 
@@ -1341,8 +1348,15 @@ impl super::JobQueue for DurableQueue {
 
     #[instrument(name = "queue.status", skip(self), fields(queue.backend = "durable", job.id = %job_id))]
     async fn status(&self, job_id: JobId) -> Result<JobStatus, QueueError> {
-        self.expire_job(job_id).await?;
-        let status = self.load_status(job_id).await?;
+        let mut status = self.load_status(job_id).await?;
+        let due = matches!(
+            &status,
+            JobStatus::Leased { expires_at, .. } if *expires_at <= Self::now_millis()
+        );
+        if due {
+            self.expire_job(job_id).await?;
+            status = self.load_status(job_id).await?;
+        }
         self.record_depth().await;
         Ok(status)
     }
@@ -2332,7 +2346,10 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(matches!(state_row(&q, id).await, Some(JobStatus::Dead { .. })));
+        assert!(matches!(
+            state_row(&q, id).await,
+            Some(JobStatus::Dead { .. })
+        ));
         assert_state_matches_row(&q, id).await;
     }
 
@@ -2374,6 +2391,43 @@ mod tests {
 
         assert!(has_key(&q, &DurableQueue::state_key(id)).await);
         assert_state_matches_row(&q, id).await;
+    }
+
+    /// Replaces a job row with a value that does not decode.
+    async fn break_job_row(q: &DurableQueue, id: JobId) {
+        let g = q.store.write().await;
+        let tx = g.begin_tx().unwrap();
+        tx.set_bytes(&DurableQueue::job_key(id), b"not json")
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn status_reads_a_queued_status_without_the_job_row() {
+        let q = queue().await;
+        let j = job("work");
+        let id = j.id;
+        q.enqueue(j).await.unwrap();
+        break_job_row(&q, id).await;
+
+        assert!(matches!(q.status(id).await.unwrap(), JobStatus::Queued));
+    }
+
+    #[tokio::test]
+    async fn status_reads_a_live_lease_without_the_job_row() {
+        let q = queue().await;
+        let j = job("work");
+        let id = j.id;
+        q.enqueue(j).await.unwrap();
+        let leased = q.reserve("w1", 10, Duration::from_secs(30)).await.unwrap();
+        assert_eq!(leased[0].job.id, id);
+        break_job_row(&q, id).await;
+
+        match q.status(id).await.unwrap() {
+            JobStatus::Leased { worker, .. } => assert_eq!(worker, "w1"),
+            other => panic!("expected leased, got {:?}", other),
+        }
     }
 
     async fn put_indexed_job(q: &DurableQueue, job: Job, status: JobStatus) {
