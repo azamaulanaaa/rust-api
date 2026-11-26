@@ -3,11 +3,14 @@
 //! The handler writes one entity through the EAV store and reports the new
 //! change-feed head as a [`CommitReceipt`].
 
+use std::collections::BTreeSet;
+
 use async_trait::async_trait;
 use rust_api_model::wire::CommitReceipt;
 
-use crate::eav::entity::{EntityDraft, EntityStore, WriteContext};
+use crate::eav::entity::{Entity, EntityDraft, EntityStore, WriteContext};
 use crate::eav::entity_error::EntityError;
+use crate::fs::error::FsError;
 use crate::policy::{Action, Authorizer, PolicyError};
 use crate::queue::{Job, JobError, JobHandler};
 use crate::sync::wal::Wal;
@@ -37,6 +40,28 @@ impl EntityCreateHandler {
             policy,
         }
     }
+
+    /// Returns the result for a repeated create of the same draft.
+    ///
+    /// The function reads the stored entity. A version 1 entity with the same
+    /// content returns `None`, because the first attempt committed. A
+    /// different entity is a permanent failure. A read failure is retryable.
+    async fn existing_entity(&self, draft: &EntityDraft) -> Result<Option<Vec<u8>>, JobError> {
+        let entity = self
+            .entities
+            .get(&draft.id)
+            .await
+            .map_err(|error| JobError::retryable(error.to_string()))?;
+        match entity {
+            Some(entity) if matches_draft(&entity, draft) => Ok(None),
+            Some(_) => Err(JobError::permanent(
+                "the entity exists with different content",
+            )),
+            None => Err(JobError::permanent(
+                "the entity is missing after a duplicate create",
+            )),
+        }
+    }
 }
 
 #[async_trait]
@@ -50,8 +75,9 @@ impl JobHandler for EntityCreateHandler {
     /// The call decodes the draft from the job payload and requires the
     /// `eav_entities` write grant for the owner. It reads the change feed head
     /// before the write, creates the entity, and reads the head again. A new
-    /// head returns a [`CommitReceipt`] as JSON bytes. An unchanged head
-    /// returns `None`, so the client falls back to polling.
+    /// head returns a [`CommitReceipt`] as JSON bytes. An unchanged head, or
+    /// a failed after-head read, returns `None` so the client falls back to
+    /// polling. A repeated create of the same draft also returns `None`.
     async fn handle(&self, job: &Job) -> Result<Option<Vec<u8>>, JobError> {
         let draft: EntityDraft = serde_json::from_slice(&job.payload).map_err(|error| {
             JobError::permanent(format!("the entity draft is not valid: {error}"))
@@ -71,25 +97,53 @@ impl JobHandler for EntityCreateHandler {
             .head()
             .await
             .map_err(|error| JobError::retryable(error.to_string()))?;
-        self.entities
-            .create(draft, &ctx)
-            .await
-            .map_err(entity_error)?;
-        let after = self
-            .wal
-            .head()
-            .await
-            .map_err(|error| JobError::retryable(error.to_string()))?;
-
-        if after > before {
-            let receipt = CommitReceipt { commit_seq: after };
-            let bytes = serde_json::to_vec(&receipt).map_err(|error| {
-                JobError::permanent(format!("the receipt does not encode: {error}"))
-            })?;
-            return Ok(Some(bytes));
+        match self.entities.create(draft.clone(), &ctx).await {
+            Ok(_) => {}
+            Err(EntityError::AlreadyExists(_)) => return self.existing_entity(&draft).await,
+            Err(error) => return Err(entity_error(error)),
         }
-        Ok(None)
+        after_head(before, self.wal.head().await)
     }
+}
+
+/// Builds the handler result from the head after the create.
+///
+/// A read failure means the create committed but the new head is unknown. The
+/// function logs the failure and returns `None`, so the client falls back to
+/// polling.
+fn after_head(before: u64, after: Result<u64, FsError>) -> Result<Option<Vec<u8>>, JobError> {
+    let after = match after {
+        Ok(after) => after,
+        Err(error) => {
+            tracing::warn!(%error, "the head read failed after the create");
+            return Ok(None);
+        }
+    };
+    if after > before {
+        let receipt = CommitReceipt { commit_seq: after };
+        let bytes = serde_json::to_vec(&receipt).map_err(|error| {
+            JobError::permanent(format!("the receipt does not encode: {error}"))
+        })?;
+        return Ok(Some(bytes));
+    }
+    Ok(None)
+}
+
+/// Reports whether a stored entity matches the draft that created it.
+///
+/// The store may assign schema versions, so the function compares schema ids
+/// only. The attribute maps must match exactly.
+fn matches_draft(entity: &Entity, draft: &EntityDraft) -> bool {
+    if entity.version != 1 || entity.attributes != draft.attributes {
+        return false;
+    }
+    let stored: BTreeSet<&str> = entity
+        .schemas
+        .iter()
+        .map(|schema| schema.id.as_str())
+        .collect();
+    let wanted: BTreeSet<&str> = draft.schemas.iter().map(String::as_str).collect();
+    stored == wanted
 }
 
 /// Maps a policy failure to a job error.
@@ -279,6 +333,44 @@ mod tests {
         let result = handler.handle(&job(&draft(), Some("alice"))).await?;
         assert!(result.is_none());
         assert!(store.get("e1").await?.is_some());
+        Ok(())
+    }
+
+    /// A failed after-head read returns no receipt.
+    #[test]
+    fn an_after_head_error_returns_no_receipt() {
+        let after = Err(FsError::Internal("injected head failure".to_string()));
+        let result = after_head(0, after).expect("the failure is not a job error");
+        assert!(result.is_none());
+    }
+
+    /// A repeated create of the same draft returns no receipt.
+    #[tokio::test]
+    async fn a_repeated_create_returns_ok_none() -> anyhow::Result<()> {
+        let (handler, _) = fixture(true, true).await?;
+        let draft = draft();
+
+        let first = handler.handle(&job(&draft, Some("alice"))).await?;
+        assert!(first.is_some());
+
+        let second = handler.handle(&job(&draft, Some("alice"))).await?;
+        assert!(second.is_none());
+        Ok(())
+    }
+
+    /// A repeated create with a different draft is a permanent failure.
+    #[tokio::test]
+    async fn a_repeated_create_with_a_different_draft_is_permanent() -> anyhow::Result<()> {
+        let (handler, _) = fixture(true, true).await?;
+
+        let first = handler.handle(&job(&draft_with("hello"), Some("alice"))).await?;
+        assert!(first.is_some());
+
+        let error = handler
+            .handle(&job(&draft_with("other"), Some("alice")))
+            .await
+            .expect_err("the different draft must fail");
+        assert!(matches!(error.retry(), JobRetry::NoRetry));
         Ok(())
     }
 }
