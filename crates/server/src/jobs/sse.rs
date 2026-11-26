@@ -910,7 +910,10 @@ mod tests {
     }
 
     /// A zero poll interval from the builder gets a finite timer.
-    #[tokio::test(start_paused = true)]
+    ///
+    /// The test fetches JWKS from a local server, so it uses real time.
+    /// Paused time can fire the fetch timeout.
+    #[tokio::test]
     async fn a_zero_stream_poll_interval_gets_a_finite_tick() -> anyhow::Result<()> {
         let fixture = fixture().await?;
         let module = fixture
