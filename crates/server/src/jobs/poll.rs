@@ -7,7 +7,10 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use actix_web::{HttpResponse, get, http::StatusCode, web};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use rust_api_model::wire::{CommandEnvelope, MAX_IDEMPOTENCY_KEY_LEN};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::http::error::ApiError;
@@ -21,15 +24,23 @@ use super::{SubmittableKinds, status_view};
 const JOB_PRIORITY: i32 = 0;
 /// The attempt budget of a job that an HTTP request enqueues.
 const MAX_ATTEMPTS: u32 = 5;
+/// The job header that holds the idempotency fingerprint.
+///
+/// The value is the base64 SHA-256 of the kind, a NUL byte, and the stored
+/// payload bytes. The route reserves this header name.
+const IDEMPOTENCY_FINGERPRINT_HEADER: &str = "x-idempotency-sha256";
 
 /// Enqueues one command for the authenticated subject.
 ///
 /// The server takes the owner from `Claims.sub`. A client cannot set the
 /// owner. The payload is stored as JSON bytes.
 ///
-/// A duplicate idempotency key returns the stored job, so a retry returns
-/// the same job id and the same view. The key is scoped to the owner, so two
-/// subjects can use the same key without seeing each other's jobs.
+/// A duplicate idempotency key returns the stored job only when the kind and
+/// payload match. An edited retry gets `409`. The key is scoped to the owner,
+/// so two subjects can use the same key without seeing each other's jobs.
+///
+/// The route stores a base64 SHA-256 fingerprint of the kind and the stored
+/// payload bytes under the reserved `x-idempotency-sha256` job header.
 ///
 /// # Errors
 ///
@@ -38,7 +49,8 @@ const MAX_ATTEMPTS: u32 = 5;
 /// idempotency key is empty or longer than [`MAX_IDEMPOTENCY_KEY_LEN`].
 /// Returns `401` when the request has no valid token.
 /// Returns `409` when the queue reports a duplicate key without the stored
-/// job id, because that error carries no id to read.
+/// job id, the stored job belongs to another subject, or the stored
+/// fingerprint does not match this body.
 /// Returns `500` when the queue fails.
 #[utoipa::path(
     post,
@@ -74,6 +86,9 @@ pub async fn create_job(
     let owner = claims.sub.clone();
     let payload = serde_json::to_vec(&envelope.payload)
         .map_err(|error| ApiError::Internal(Box::new(error)))?;
+    let fingerprint = idempotency_fingerprint(envelope.kind.as_str(), &payload);
+    let mut headers = BTreeMap::new();
+    headers.insert(IDEMPOTENCY_FINGERPRINT_HEADER.to_string(), fingerprint.clone());
     let job = Job {
         id: Uuid::now_v7(),
         kind: envelope.kind.as_str().to_string(),
@@ -85,7 +100,7 @@ pub async fn create_job(
         scheduled_at: now,
         idempotency_key: Some(owner_idempotency_key(&owner, key)),
         owner_sub: Some(owner.clone()),
-        headers: BTreeMap::new(),
+        headers,
     };
 
     let id = queue.enqueue(job).await.map_err(queue_error)?;
@@ -96,6 +111,11 @@ pub async fn create_job(
     // The queue keys are owner-scoped above. This check is defensive: a
     // backend that returns another owner's id must not answer with that job.
     if stored.owner_sub.as_deref() != Some(owner.as_str()) {
+        return Err(ApiError::Conflict);
+    }
+    // A duplicate key must come from the same command. The fingerprint
+    // covers the kind and payload, so an edited retry conflicts.
+    if stored.headers.get(IDEMPOTENCY_FINGERPRINT_HEADER) != Some(&fingerprint) {
         return Err(ApiError::Conflict);
     }
     let view =
@@ -239,6 +259,19 @@ fn owner_idempotency_key(owner: &str, key: &str) -> String {
     format!("{}:{}:{}", owner.len(), owner, key)
 }
 
+/// Returns the fingerprint of one command body.
+///
+/// The input is the kind, a NUL byte, and the exact payload bytes that the
+/// job stores. The owner is not part of the hash, because the queue key is
+/// already owner-scoped.
+fn idempotency_fingerprint(kind: &str, payload: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(kind.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(payload);
+    STANDARD.encode(hasher.finalize())
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -303,7 +336,7 @@ mod tests {
         let server = spawn_jwks(json!({ "keys": [key] })).await;
         let engine =
             PolicyEngine::init_s3(build_test_store(&test_prefix("jobs-poll-policy")).await).await?;
-        let submittable = SubmittableKinds::from_names(["entity.create"])?;
+        let submittable = SubmittableKinds::from_names(["entity.create", "entity.delete"])?;
         Ok(Fixture {
             server,
             encoding_key,
@@ -413,7 +446,7 @@ mod tests {
 
         let token = fixture.token("alice")?;
         let body = json!({
-            "kind": "entity.delete",
+            "kind": "entity.update",
             "payload": {"name": "alice"},
             "idempotency_key": "key-1",
         });
@@ -427,7 +460,7 @@ mod tests {
         assert_eq!(body["error"], "bad request");
         assert_eq!(body["code"], "invalid_request");
         assert!(
-            !body.to_string().contains("entity.delete"),
+            !body.to_string().contains("entity.update"),
             "the answer must not echo the kind"
         );
         Ok(())
@@ -696,6 +729,54 @@ mod tests {
         let second = post_command!(app, token, "key-1");
 
         assert_eq!(first["id"], second["id"]);
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn a_duplicate_key_with_a_different_body_is_409() -> anyhow::Result<()> {
+        let fixture = fixture().await?;
+        let module = fixture.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fixture.token("alice")?;
+
+        let _ = post_command!(app, token, "key-1");
+        let body = json!({
+            "kind": "entity.create",
+            "payload": {"name": "bob"},
+            "idempotency_key": "key-1",
+        });
+        let request = auth(actix_test::TestRequest::post().uri("/jobs"), &token)
+            .insert_header(("Content-Type", "application/json"))
+            .set_payload(body.to_string())
+            .to_request();
+        let response = actix_test::call_service(&app, request).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body: Value = actix_test::read_body_json(response).await;
+        assert_eq!(body["code"], "conflict");
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn a_duplicate_key_with_a_different_kind_is_409() -> anyhow::Result<()> {
+        let fixture = fixture().await?;
+        let module = fixture.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fixture.token("alice")?;
+
+        let _ = post_command!(app, token, "key-1");
+        let body = json!({
+            "kind": "entity.delete",
+            "payload": {"name": "alice"},
+            "idempotency_key": "key-1",
+        });
+        let request = auth(actix_test::TestRequest::post().uri("/jobs"), &token)
+            .insert_header(("Content-Type", "application/json"))
+            .set_payload(body.to_string())
+            .to_request();
+        let response = actix_test::call_service(&app, request).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body: Value = actix_test::read_body_json(response).await;
+        assert_eq!(body["code"], "conflict");
         Ok(())
     }
 
