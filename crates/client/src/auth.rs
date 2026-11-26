@@ -163,12 +163,13 @@ impl<T: Transport> AuthClient<T> {
 pub mod browser {
     use super::{Credentials, Method, Request, Response, Transport, TransportError};
     use gloo_net::http::Request as FetchRequest;
-    use web_sys::RequestCredentials;
+    use web_sys::{RequestCredentials, RequestRedirect};
 
     /// Sends one request through the browser `fetch` call.
     ///
     /// The transport uses a same-origin relative path. The browser adds the
-    /// cookies for the page origin.
+    /// cookies for the page origin. The transport does not follow a
+    /// redirect.
     #[derive(Clone, Copy, Debug, Default)]
     pub struct BrowserTransport;
 
@@ -180,7 +181,13 @@ pub mod browser {
                 Method::Put => FetchRequest::put(&request.path),
                 Method::Delete => FetchRequest::delete(&request.path),
             };
-            let builder = builder.credentials(map_credentials(request.credentials));
+            // Do not follow a redirect. A login page that answers 200 after a
+            // redirect must not look like an authenticated session. The fetch
+            // call fails on a redirect, and the client maps that failure to
+            // `AuthState::Error`.
+            let builder = builder
+                .credentials(map_credentials(request.credentials))
+                .redirect(RequestRedirect::Error);
             let response = builder.send().await.map_err(|_| TransportError)?;
             Ok(Response {
                 status: response.status(),
@@ -304,6 +311,20 @@ mod tests {
     #[test]
     fn a_500_answer_sets_the_error_state() {
         let (_, transport) = FakeTransport::with_status(500);
+        let client = AuthClient::new(transport);
+
+        assert_eq!(block_on(client.check_session()), AuthState::Error);
+        assert_eq!(client.state(), AuthState::Error);
+    }
+
+    /// A `302` answer sets the error state.
+    ///
+    /// The native test does not run the browser fetch call, so 302 is the
+    /// final status here. The browser redirect mode is compile-checked for
+    /// `wasm32` only.
+    #[test]
+    fn a_302_answer_sets_the_error_state() {
+        let (_, transport) = FakeTransport::with_status(302);
         let client = AuthClient::new(transport);
 
         assert_eq!(block_on(client.check_session()), AuthState::Error);

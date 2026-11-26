@@ -27,8 +27,9 @@ wasm-bindgen-futures = "0.4"
 # The HTTP feature adds the `fetch` wrapper only. The default features add
 # JSON, WebSocket, and EventSource support, which this client does not need.
 gloo-net = { version = "0.8", default-features = false, features = ["http"] }
-# The credential mode type is a `web-sys` type. Enable only that binding.
-web-sys = { version = "0.3", features = ["RequestCredentials"] }
+# The credential mode and redirect mode types are `web-sys` types. Enable
+# only those bindings.
+web-sys = { version = "0.3", features = ["RequestCredentials", "RequestRedirect"] }
 
 [lints]
 workspace = true
