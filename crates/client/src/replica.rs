@@ -258,11 +258,14 @@ impl<T: Transport> ReplicaClient<T> {
 
 /// Reject a key that can leave the replica prefix.
 ///
-/// A key must be relative. It must not hold an empty segment or a `..`
-/// segment.
+/// A key must be relative. It must hold only ASCII letters, digits, `/`,
+/// `.`, `_`, and `-`. It must not hold an empty segment or a `..` segment.
+/// The allowlist keeps URL syntax out of the request path. A backslash,
+/// `?`, `#`, `%`, whitespace, or a control byte would change the request.
 fn validate_key(key: &str) -> Result<(), ReplicaError> {
     let invalid = key.is_empty()
         || key.starts_with('/')
+        || !key.bytes().all(is_key_byte)
         || key
             .split('/')
             .any(|segment| segment.is_empty() || segment == "..");
@@ -273,6 +276,11 @@ fn validate_key(key: &str) -> Result<(), ReplicaError> {
     } else {
         Ok(())
     }
+}
+
+/// Return `true` when one key byte is in the replica key allowlist.
+fn is_key_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-')
 }
 
 /// Check the byte length and the SHA-256 of one object.
@@ -645,7 +653,20 @@ mod tests {
     /// An unsafe object key is rejected before the client fetches it.
     #[test]
     fn an_unsafe_object_key_is_rejected() {
-        for key in ["e0/../secret", "/manifest.json", "e0//sst/a.sst", "e0/"] {
+        for key in [
+            "e0/../secret",
+            "..",
+            "/manifest.json",
+            "e0//sst/a.sst",
+            "e0/",
+            r"..\..\auth/me",
+            "a?b",
+            "a#b",
+            "%2e%2e",
+            "a b",
+            "a\tb",
+            "e0/\u{0}name",
+        ] {
             let (requests, replies, transport) = FakeTransport::new();
             let client = ReplicaClient::new(transport);
             let manifest = ReplicaManifest {
@@ -666,6 +687,9 @@ mod tests {
             assert_eq!(requests.borrow().len(), 1);
             assert_eq!(client.state(), None);
         }
+
+        // A plain nested key stays valid.
+        assert!(validate_key("e0/sst/a.sst").is_ok());
     }
 
     /// The cache clears on request.
