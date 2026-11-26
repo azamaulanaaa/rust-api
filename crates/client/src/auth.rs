@@ -74,13 +74,19 @@ pub struct Request {
     pub credentials: Credentials,
 }
 
-/// The status of one response.
+/// The status and body of one response.
 ///
-/// The session check reads only the status. It does not read the body.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The session check reads only the status. The replica loader reads the
+/// body of a `200` answer.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Response {
     /// The HTTP status code.
     pub status: u16,
+    /// The raw response body bytes.
+    ///
+    /// A transport may leave the body empty for a non-`200` answer. The
+    /// replica loader reads a body only from a `200` answer.
+    pub body: Vec<u8>,
 }
 
 /// A failure to send a request or to read its answer.
@@ -114,7 +120,7 @@ impl fmt::Display for TransportError {
 
 impl std::error::Error for TransportError {}
 
-/// Sends one request and returns the response status.
+/// Sends one request and returns the response status and body.
 ///
 /// A transport is a seam for the browser and for tests.
 // The native async-in-trait form is enough here. The client runs on one
@@ -226,9 +232,19 @@ pub mod browser {
                 .send()
                 .await
                 .map_err(|error| TransportError::new(error.to_string()))?;
-            Ok(Response {
-                status: response.status(),
-            })
+            let status = response.status();
+            // Read the body of a successful answer only. A `401` or `403`
+            // answer needs no body, and a body read must not turn it into a
+            // transport failure that loses the status.
+            let body = if status == 200 {
+                response
+                    .binary()
+                    .await
+                    .map_err(|error| TransportError::new(error.to_string()))?
+            } else {
+                Vec::new()
+            };
+            Ok(Response { status, body })
         }
     }
 
@@ -265,7 +281,10 @@ mod tests {
                 Rc::clone(&requests),
                 Self {
                     requests,
-                    reply: Ok(Response { status }),
+                    reply: Ok(Response {
+                        status,
+                        body: Vec::new(),
+                    }),
                 },
             )
         }
@@ -337,7 +356,10 @@ mod tests {
             };
             WaitForGate(gate).await;
             let status = if call == 0 { 200 } else { 401 };
-            Ok(Response { status })
+            Ok(Response {
+                status,
+                body: Vec::new(),
+            })
         }
     }
 
