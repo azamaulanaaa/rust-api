@@ -2,7 +2,7 @@
 //!
 //! The client asks the server whether the browser has a session. The browser
 //! sends the `auth_token` cookie with the request. The client never reads the
-//! cookie value. A `401` answer turns into [`AuthState::LoginRequired`].
+//! cookie value. A `401` answer turns into `LoginRequired`.
 
 use core::cell::Cell;
 use core::fmt;
