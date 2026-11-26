@@ -84,12 +84,31 @@ pub struct Response {
 }
 
 /// A failure to send a request or to read its answer.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TransportError;
+///
+/// The error keeps the detail message from the transport. The message must
+/// not contain a cookie or a token.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TransportError {
+    message: String,
+}
+
+impl TransportError {
+    /// Build an error with one detail message.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+
+    /// Return the detail message.
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
 
 impl fmt::Display for TransportError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("the transport failed to send the request")
+        formatter.write_str(&self.message)
     }
 }
 
@@ -203,7 +222,10 @@ pub mod browser {
             let builder = builder
                 .credentials(map_credentials(request.credentials))
                 .redirect(RequestRedirect::Error);
-            let response = builder.send().await.map_err(|_| TransportError)?;
+            let response = builder
+                .send()
+                .await
+                .map_err(|error| TransportError::new(error.to_string()))?;
             Ok(Response {
                 status: response.status(),
             })
@@ -248,14 +270,14 @@ mod tests {
             )
         }
 
-        /// Build a transport that fails.
+        /// Build a transport that fails with one detail message.
         fn with_error() -> (Rc<RefCell<Vec<Request>>>, Self) {
             let requests = Rc::new(RefCell::new(Vec::new()));
             (
                 Rc::clone(&requests),
                 Self {
                     requests,
-                    reply: Err(TransportError),
+                    reply: Err(TransportError::new("the fake transport failed")),
                 },
             )
         }
@@ -264,7 +286,7 @@ mod tests {
     impl Transport for FakeTransport {
         async fn send(&self, request: Request) -> Result<Response, TransportError> {
             self.requests.borrow_mut().push(request);
-            self.reply
+            self.reply.clone()
         }
     }
 
@@ -440,13 +462,13 @@ mod tests {
         assert_eq!(AuthState::Error.as_str(), "error");
     }
 
-    /// The transport error has a display text and implements `Error`.
+    /// The transport error keeps its message and implements `Error`.
     #[test]
-    fn the_transport_error_is_a_displayable_error() {
-        let error: &dyn std::error::Error = &TransportError;
-        assert_eq!(
-            error.to_string(),
-            "the transport failed to send the request"
-        );
+    fn the_transport_error_keeps_its_message() {
+        let error = TransportError::new("the browser rejected the request");
+        assert_eq!(error.message(), "the browser rejected the request");
+
+        let error: &dyn std::error::Error = &error;
+        assert_eq!(error.to_string(), "the browser rejected the request");
     }
 }
