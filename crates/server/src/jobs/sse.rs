@@ -25,7 +25,7 @@ use uuid::Uuid;
 use super::{
     JobStreamTiming, SubjectGates,
     poll::{may_read, not_found},
-    status_view,
+    redact_non_owner, status_view,
 };
 use crate::http::{
     error::ApiError,
@@ -68,9 +68,10 @@ const HEARTBEAT_FRAME: &[u8] = b": heartbeat\n\n";
 /// The grant rule has no TTL and no automatic cleanup. Remove the rule through
 /// the existing policy route `DELETE /policy/rules` when access must end.
 ///
-/// Each `status` or `terminal` event carries the full [`JobStatusView`],
-/// including `worker`, `attempt`, the timestamps, and the stored handler
-/// error text in `error`. The server does not sanitize that error text.
+/// Each `status` or `terminal` event carries the [`JobStatusView`] for the
+/// subject. The owner also sees `result_base64` and the stored handler error
+/// text in `error`. A non-owner sees neither field. The server does not
+/// sanitize the owner's error text.
 ///
 /// An `error` event carries only a stable code. It never carries the stored
 /// view or internal error text. The client must fall back to polling after an
@@ -136,10 +137,13 @@ pub async fn job_events(
         Err(QueueError::NotFound(_)) => return Ok(not_found()),
         Err(error) => return Err(ApiError::Internal(Box::new(error))),
     };
+    let is_owner = job.owner_sub.as_deref() == Some(claims.sub.as_str());
     if !may_read(&job, &claims.sub, &policy).await {
         return Ok(not_found());
     }
-    let view = status_view(&job, &status).map_err(|error| ApiError::Internal(Box::new(error)))?;
+    let mut view =
+        status_view(&job, &status).map_err(|error| ApiError::Internal(Box::new(error)))?;
+    redact_non_owner(&mut view, is_owner);
 
     let permit = gate.acquire();
     if permit.is_none() && !gate.is_disabled() {
@@ -195,8 +199,9 @@ enum PollError {
 /// The function reads the status first, because an expired lease updates the
 /// stored attempt. It then reads the stored job, so the view carries the same
 /// attempt and run time as the status. It checks the shared read predicate
-/// after the job read. A missing job, a queue error, or a view error is
-/// unavailable. A lost grant is [`PollError::AccessRevoked`].
+/// after the job read. The view omits `result_base64` and `error` for a
+/// non-owner. A missing job, a queue error, or a view error is unavailable. A
+/// lost grant is [`PollError::AccessRevoked`].
 async fn current_view(
     queue: &Arc<dyn JobQueue>,
     job_id: Uuid,
@@ -219,11 +224,15 @@ async fn current_view(
             return Err(PollError::Unavailable);
         }
     };
+    let is_owner = job.owner_sub.as_deref() == Some(sub);
     if !may_read(&job, sub, policy).await {
         return Err(PollError::AccessRevoked);
     }
     match status_view(&job, &status) {
-        Ok(view) => Ok(view),
+        Ok(mut view) => {
+            redact_non_owner(&mut view, is_owner);
+            Ok(view)
+        }
         Err(error) => {
             tracing::warn!(
                 %error,
@@ -398,7 +407,7 @@ mod tests {
     use crate::http::middleware::jwt::JwtClaimsMiddleware;
     use crate::jobs::{JobsApiModule, SubmittableKinds, poll::job_object};
     use crate::policy::{Action, PolicyEngine};
-    use crate::queue::{Job, JobStatus, MemoryQueue};
+    use crate::queue::{Job, JobStatus, MemoryQueue, RetryPolicy};
     use rust_api_model::wire::CommitReceipt;
 
     const KID: &str = "jobs-sse-test-kid";
@@ -518,6 +527,23 @@ mod tests {
         Ok(id)
     }
 
+    /// Enqueues one job and marks it failed with `error`.
+    async fn failed_job(queue: &MemoryQueue, owner: &str, error: &str) -> anyhow::Result<Uuid> {
+        let job = sample_job(owner);
+        let id = job.id;
+        queue.enqueue(job).await?;
+        let mut leased = queue
+            .reserve("worker-1", 1, Duration::from_secs(30))
+            .await?;
+        let leased = leased
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("the job was not leased"))?;
+        queue
+            .nack(id, &leased.lease, error, RetryPolicy::NoRetry)
+            .await?;
+        Ok(id)
+    }
+
     /// Reads the event name and data of each event in a body.
     fn parse_events(body: &str) -> Vec<(String, Value)> {
         body.split("\n\n")
@@ -589,6 +615,110 @@ mod tests {
             events[1].1.get("result_base64").is_none(),
             "the receipt bytes must not repeat in the view"
         );
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn the_owner_receives_the_result_and_the_error() -> anyhow::Result<()> {
+        let fixture = fixture().await?;
+        let module = fixture.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fixture.token("alice")?;
+        let succeeded = finished_job(&fixture.queue, "alice", Some(b"secret".to_vec())).await?;
+        let failed = failed_job(&fixture.queue, "alice", "boom").await?;
+
+        for (id, field, value) in [
+            (succeeded, "result_base64", "c2VjcmV0"),
+            (failed, "error", "boom"),
+        ] {
+            let request = auth(
+                actix_test::TestRequest::get().uri(&format!("/jobs/{id}/events")),
+                &token,
+            )
+            .to_request();
+            let response = actix_test::call_service(&app, request).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = String::from_utf8(actix_test::read_body(response).await.to_vec())?;
+            let events = parse_events(&body);
+            assert_eq!(events.len(), 2, "one status event and one terminal event");
+            assert_eq!(events[0].0, "status");
+            assert_eq!(events[0].1[field], value);
+            assert_eq!(events[1].0, "terminal");
+            assert_eq!(events[1].1[field], value);
+        }
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn a_superadmin_receives_no_result_or_error_text() -> anyhow::Result<()> {
+        let fixture = fixture().await?;
+        assert!(fixture.engine.claim_superadmin("root").await?);
+        let module = fixture.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fixture.token("root")?;
+        let succeeded = finished_job(&fixture.queue, "alice", Some(b"secret".to_vec())).await?;
+        let failed = failed_job(&fixture.queue, "alice", "boom").await?;
+
+        for id in [succeeded, failed] {
+            let request = auth(
+                actix_test::TestRequest::get().uri(&format!("/jobs/{id}/events")),
+                &token,
+            )
+            .to_request();
+            let response = actix_test::call_service(&app, request).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = String::from_utf8(actix_test::read_body(response).await.to_vec())?;
+            let events = parse_events(&body);
+            assert_eq!(events.len(), 2, "one status event and one terminal event");
+            for (name, view) in &events {
+                assert!(
+                    view.get("result_base64").is_none(),
+                    "the {name} event must not show the result"
+                );
+                assert!(
+                    view.get("error").is_none(),
+                    "the {name} event must not show the error text"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn a_grantee_receives_no_result_or_error_text() -> anyhow::Result<()> {
+        let fixture = fixture().await?;
+        let module = fixture.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fixture.token("bob")?;
+        let succeeded = finished_job(&fixture.queue, "alice", Some(b"secret".to_vec())).await?;
+        let failed = failed_job(&fixture.queue, "alice", "boom").await?;
+
+        for id in [succeeded, failed] {
+            fixture
+                .engine
+                .add_rule("bob".into(), job_object(id), Action::Read)
+                .await?;
+            let request = auth(
+                actix_test::TestRequest::get().uri(&format!("/jobs/{id}/events")),
+                &token,
+            )
+            .to_request();
+            let response = actix_test::call_service(&app, request).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = String::from_utf8(actix_test::read_body(response).await.to_vec())?;
+            let events = parse_events(&body);
+            assert_eq!(events.len(), 2, "one status event and one terminal event");
+            for (name, view) in &events {
+                assert!(
+                    view.get("result_base64").is_none(),
+                    "the {name} event must not show the result"
+                );
+                assert!(
+                    view.get("error").is_none(),
+                    "the {name} event must not show the error text"
+                );
+            }
+        }
         Ok(())
     }
 
@@ -1129,6 +1259,40 @@ mod tests {
             events.next().await.is_none(),
             "the queue error ends the stream"
         );
+        Ok(())
+    }
+
+    /// An error event carries only the stable code.
+    #[tokio::test(start_paused = true)]
+    async fn an_error_event_carries_only_the_code() -> anyhow::Result<()> {
+        let queue = Arc::new(MemoryQueue::new());
+        let job = sample_job("alice");
+        let id = job.id;
+        let view = status_view(&job, &JobStatus::Queued)?;
+        let events = test_stream(
+            queue,
+            id,
+            view,
+            Duration::from_secs(60),
+            Duration::from_millis(100),
+        )
+        .await?;
+        tokio::pin!(events);
+
+        assert!(events.next().await.is_some(), "the initial event arrives");
+        let error = events
+            .next()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("the stream has no error event"))??;
+        let error = parse_events(&String::from_utf8_lossy(&error));
+        assert_eq!(error.len(), 1);
+        assert_eq!(error[0].0, "error");
+        assert_eq!(
+            error[0].1.as_object().map(|object| object.len()),
+            Some(1),
+            "the error event carries only the code"
+        );
+        assert_eq!(error[0].1["code"], "stream_unavailable");
         Ok(())
     }
 
