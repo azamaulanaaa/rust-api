@@ -787,6 +787,7 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
         Arc::new(rust_api::jobs::entity::EntityCreateHandler::new(
             runtime.entities().clone(),
             wal.clone(),
+            policy_engine.authorizer(),
         )),
     ];
     let worker_kinds = rust_api::jobs::WorkerKinds::from_handlers(&handlers)?;

@@ -8,6 +8,7 @@ use rust_api_model::wire::CommitReceipt;
 
 use crate::eav::entity::{EntityDraft, EntityStore, WriteContext};
 use crate::eav::entity_error::EntityError;
+use crate::policy::{Action, Authorizer, PolicyError};
 use crate::queue::{Job, JobError, JobHandler};
 use crate::sync::wal::Wal;
 
@@ -19,15 +20,22 @@ const JOB_KIND: &str = "entity.create";
 pub struct EntityCreateHandler {
     entities: EntityStore,
     wal: Wal,
+    policy: Authorizer,
 }
 
 impl EntityCreateHandler {
-    /// Builds a handler from the entity store and the change feed.
+    /// Builds a handler from the entity store, the change feed, and the
+    /// authorizer.
     ///
     /// The store and the feed must share the same prefix. The handler reads
-    /// the feed head before and after the write.
-    pub fn new(entities: EntityStore, wal: Wal) -> Self {
-        Self { entities, wal }
+    /// the feed head before and after the write. It requires the
+    /// `eav_entities` write grant for the job owner.
+    pub fn new(entities: EntityStore, wal: Wal, policy: Authorizer) -> Self {
+        Self {
+            entities,
+            wal,
+            policy,
+        }
     }
 }
 
@@ -39,10 +47,11 @@ impl JobHandler for EntityCreateHandler {
 
     /// Creates one entity with the job owner as the actor.
     ///
-    /// The call decodes the draft from the job payload. It reads the change
-    /// feed head before the write, creates the entity, and reads the head
-    /// again. A new head returns a [`CommitReceipt`] as JSON bytes. An
-    /// unchanged head returns `None`, so the client falls back to polling.
+    /// The call decodes the draft from the job payload and requires the
+    /// `eav_entities` write grant for the owner. It reads the change feed head
+    /// before the write, creates the entity, and reads the head again. A new
+    /// head returns a [`CommitReceipt`] as JSON bytes. An unchanged head
+    /// returns `None`, so the client falls back to polling.
     async fn handle(&self, job: &Job) -> Result<Option<Vec<u8>>, JobError> {
         let draft: EntityDraft = serde_json::from_slice(&job.payload).map_err(|error| {
             JobError::permanent(format!("the entity draft is not valid: {error}"))
@@ -51,6 +60,10 @@ impl JobHandler for EntityCreateHandler {
             .owner_sub
             .as_deref()
             .ok_or_else(|| JobError::permanent("the job has no owner"))?;
+        self.policy
+            .require(owner, crate::eav::route::ENTITIES, Action::Write)
+            .await
+            .map_err(policy_error)?;
         let ctx = WriteContext::new(owner);
 
         let before = self
@@ -76,6 +89,16 @@ impl JobHandler for EntityCreateHandler {
             return Ok(Some(bytes));
         }
         Ok(None)
+    }
+}
+
+/// Maps a policy failure to a job error.
+///
+/// A denied write is permanent. Any other policy failure is retryable.
+fn policy_error(error: PolicyError) -> JobError {
+    match error {
+        PolicyError::AccessDenied => JobError::permanent("not allowed to create entities"),
+        other => JobError::retryable(other.to_string()),
     }
 }
 
@@ -106,12 +129,17 @@ mod tests {
     use crate::db::{build_test_store, test_prefix};
     use crate::eav::entity::AttributeValue;
     use crate::eav::schema::{AttributeDef, AttributeType, SchemaDraft, SchemaRegistry};
+    use crate::policy::PolicyEngine;
     use crate::queue::JobRetry;
 
     /// Builds a handler, a store, and one `task` schema.
     ///
-    /// The store uses the handler feed only when `with_feed` is true.
-    async fn fixture(with_feed: bool) -> anyhow::Result<(EntityCreateHandler, EntityStore)> {
+    /// The store uses the handler feed only when `with_feed` is true. The
+    /// owner `alice` gets the entity write grant only when `granted` is true.
+    async fn fixture(
+        with_feed: bool,
+        granted: bool,
+    ) -> anyhow::Result<(EntityCreateHandler, EntityStore)> {
         let wal = Wal::new(build_test_store(&test_prefix("jobs-entity-wal")).await);
         let registry =
             SchemaRegistry::new(build_test_store(&test_prefix("jobs-entity-schema")).await);
@@ -139,20 +167,34 @@ mod tests {
                 )]),
             })
             .await?;
-        let handler = EntityCreateHandler::new(store.clone(), wal);
+        let engine = PolicyEngine::init_s3(
+            build_test_store(&test_prefix("jobs-entity-policy")).await,
+        )
+        .await?;
+        if granted {
+            engine
+                .add_rule("alice".into(), crate::eav::route::ENTITIES.into(), Action::Write)
+                .await?;
+        }
+        let handler = EntityCreateHandler::new(store.clone(), wal, engine.authorizer());
         Ok((handler, store))
     }
 
-    /// Builds one `task` draft.
-    fn draft() -> EntityDraft {
+    /// Builds one `task` draft with the given title.
+    fn draft_with(title: &str) -> EntityDraft {
         EntityDraft {
             id: "e1".to_string(),
             schemas: vec!["task".to_string()],
             attributes: BTreeMap::from([(
                 "title".to_string(),
-                AttributeValue::String("hello".to_string()),
+                AttributeValue::String(title.to_string()),
             )]),
         }
+    }
+
+    /// Builds the default `task` draft.
+    fn draft() -> EntityDraft {
+        draft_with("hello")
     }
 
     /// Builds one `entity.create` job.
@@ -175,7 +217,7 @@ mod tests {
     /// The handler creates the entity and returns a receipt.
     #[tokio::test]
     async fn the_handler_creates_the_entity_and_returns_the_receipt() -> anyhow::Result<()> {
-        let (handler, store) = fixture(true).await?;
+        let (handler, store) = fixture(true, true).await?;
 
         let result = handler.handle(&job(&draft(), Some("alice"))).await?;
         let bytes = result.expect("the feed head advances");
@@ -187,10 +229,24 @@ mod tests {
         Ok(())
     }
 
+    /// An owner without the write grant cannot create an entity.
+    #[tokio::test]
+    async fn an_owner_without_the_grant_cannot_create() -> anyhow::Result<()> {
+        let (handler, store) = fixture(false, false).await?;
+
+        let error = handler
+            .handle(&job(&draft(), Some("alice")))
+            .await
+            .expect_err("the write grant is required");
+        assert!(matches!(error.retry(), JobRetry::NoRetry));
+        assert!(store.get("e1").await?.is_none());
+        Ok(())
+    }
+
     /// A payload that is not a draft is a permanent failure.
     #[tokio::test]
     async fn a_payload_that_is_not_a_draft_is_a_permanent_error() -> anyhow::Result<()> {
-        let (handler, _) = fixture(false).await?;
+        let (handler, _) = fixture(false, false).await?;
         let mut job = job(&draft(), Some("alice"));
         job.payload = b"not json".to_vec();
 
@@ -205,7 +261,7 @@ mod tests {
     /// A job without an owner is a permanent failure.
     #[tokio::test]
     async fn a_job_without_an_owner_is_a_permanent_error() -> anyhow::Result<()> {
-        let (handler, _) = fixture(false).await?;
+        let (handler, _) = fixture(false, false).await?;
 
         let error = handler
             .handle(&job(&draft(), None))
@@ -218,7 +274,7 @@ mod tests {
     /// A create without a feed head returns no receipt.
     #[tokio::test]
     async fn a_create_without_a_feed_head_returns_no_receipt() -> anyhow::Result<()> {
-        let (handler, store) = fixture(false).await?;
+        let (handler, store) = fixture(false, true).await?;
 
         let result = handler.handle(&job(&draft(), Some("alice"))).await?;
         assert!(result.is_none());
