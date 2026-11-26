@@ -221,13 +221,16 @@ mod tests {
                 )]),
             })
             .await?;
-        let engine = PolicyEngine::init_s3(
-            build_test_store(&test_prefix("jobs-entity-policy")).await,
-        )
-        .await?;
+        let engine =
+            PolicyEngine::init_s3(build_test_store(&test_prefix("jobs-entity-policy")).await)
+                .await?;
         if granted {
             engine
-                .add_rule("alice".into(), crate::eav::route::ENTITIES.into(), Action::Write)
+                .add_rule(
+                    "alice".into(),
+                    crate::eav::route::ENTITIES.into(),
+                    Action::Write,
+                )
                 .await?;
         }
         let handler = EntityCreateHandler::new(store.clone(), wal, engine.authorizer());
@@ -363,7 +366,9 @@ mod tests {
     async fn a_repeated_create_with_a_different_draft_is_permanent() -> anyhow::Result<()> {
         let (handler, _) = fixture(true, true).await?;
 
-        let first = handler.handle(&job(&draft_with("hello"), Some("alice"))).await?;
+        let first = handler
+            .handle(&job(&draft_with("hello"), Some("alice")))
+            .await?;
         assert!(first.is_some());
 
         let error = handler
