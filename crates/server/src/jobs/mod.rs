@@ -32,6 +32,9 @@ use crate::http::{
 use crate::policy::Authorizer;
 use crate::queue::{Job, JobHandler, JobQueue, JobStatus};
 
+/// The `entity.create` job handler.
+pub mod entity;
+
 /// The poll routes for job submission and one job status.
 pub mod poll;
 
