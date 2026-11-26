@@ -15,14 +15,15 @@
 //! committed, so the older load cannot overwrite newer data or repopulate
 //! the cache after a logout.
 //!
-//! This version stores the raw object bytes in a `BTreeMap`. The plan
-//! names `oxkv-cached` for the local store. Its async oxkv record and
-//! snapshot API is a larger integration than this loader needs, so it is a
-//! later change.
+//! This version shares the raw object bytes through a `BTreeMap` of
+//! `Arc<[u8]>`. The plan names `oxkv-cached` for the local store. Its async
+//! oxkv record and snapshot API is a larger integration than this loader
+//! needs, so it is a later change.
 
 use core::fmt;
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use rust_api_model::wire::{ReplicaManifest, ReplicaObject};
 use sha2::{Digest, Sha256};
@@ -141,8 +142,8 @@ impl std::error::Error for ReplicaError {
 struct ReplicaCache {
     /// The state of the stored replica, if a load has succeeded.
     state: Option<ReplicaState>,
-    /// The raw object bytes, keyed by the manifest key.
-    objects: BTreeMap<String, Vec<u8>>,
+    /// The shared object bytes, keyed by the manifest key.
+    objects: BTreeMap<String, Arc<[u8]>>,
 }
 
 /// Downloads and stores the per-user replica over one transport.
@@ -183,10 +184,10 @@ impl<T: Transport> ReplicaClient<T> {
         self.cache.borrow().state
     }
 
-    /// Return the stored bytes of one object.
+    /// Return a shared handle to the bytes of one object.
     ///
     /// The value is `None` when no object has this key.
-    pub fn object(&self, key: &str) -> Option<Vec<u8>> {
+    pub fn object(&self, key: &str) -> Option<Arc<[u8]>> {
         self.cache.borrow().objects.get(key).cloned()
     }
 
@@ -241,7 +242,7 @@ impl<T: Transport> ReplicaClient<T> {
             let path = format!("{OBJECT_PREFIX}{}", object.key);
             let bytes = self.get(&path).await?;
             verify_object(object, &bytes)?;
-            objects.insert(object.key.clone(), bytes);
+            objects.insert(object.key.clone(), Arc::<[u8]>::from(bytes));
         }
 
         let state = ReplicaState {
@@ -575,8 +576,17 @@ mod tests {
         );
         assert_eq!(client.state(), Some(state));
         assert_eq!(client.object_count(), 2);
-        assert_eq!(client.object("e0/sst/a.sst"), Some(b"alpha".to_vec()));
-        assert_eq!(client.object("e0/wal/b.wal"), Some(b"bravo".to_vec()));
+        assert_eq!(
+            client.object("e0/sst/a.sst").as_deref(),
+            Some(&b"alpha"[..])
+        );
+        assert_eq!(
+            client.object("e0/wal/b.wal").as_deref(),
+            Some(&b"bravo"[..])
+        );
+        let first = client.object("e0/sst/a.sst").expect("the object is stored");
+        let second = client.object("e0/sst/a.sst").expect("the object is stored");
+        assert!(Arc::ptr_eq(&first, &second));
 
         let requests = requests.borrow();
         let paths: Vec<&str> = requests
@@ -621,7 +631,7 @@ mod tests {
         let error = block_on(client.load()).expect_err("the hash mismatch is rejected");
         assert!(matches!(error, ReplicaError::Integrity { .. }));
         assert_eq!(client.state(), Some(old_state));
-        assert_eq!(client.object("e0/sst/a.sst"), Some(b"old".to_vec()));
+        assert_eq!(client.object("e0/sst/a.sst").as_deref(), Some(&b"old"[..]));
         assert_eq!(requests.borrow().len(), 4);
     }
 
@@ -650,7 +660,7 @@ mod tests {
         let error = block_on(client.load()).expect_err("the size mismatch is rejected");
         assert!(matches!(error, ReplicaError::Integrity { .. }));
         assert_eq!(client.state(), Some(old_state));
-        assert_eq!(client.object("e0/sst/a.sst"), Some(b"old".to_vec()));
+        assert_eq!(client.object("e0/sst/a.sst").as_deref(), Some(&b"old"[..]));
     }
 
     /// An older manifest generation is rejected and the old cache stays.
@@ -681,7 +691,7 @@ mod tests {
             other => panic!("unexpected error: {other}"),
         }
         assert_eq!(client.state(), Some(old_state));
-        assert_eq!(client.object("e0/sst/a.sst"), Some(b"old".to_vec()));
+        assert_eq!(client.object("e0/sst/a.sst").as_deref(), Some(&b"old"[..]));
 
         // The stale load stopped after the manifest request.
         assert_eq!(requests.borrow().len(), 3);
@@ -888,7 +898,7 @@ mod tests {
             other => panic!("unexpected error: {other}"),
         }
         assert_eq!(client.state(), Some(old_state));
-        assert_eq!(client.object("e0/old"), Some(b"old".to_vec()));
+        assert_eq!(client.object("e0/old").as_deref(), Some(&b"old"[..]));
         assert_eq!(client.object("e0/sst/a.sst"), None);
     }
 
