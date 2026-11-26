@@ -80,6 +80,21 @@ pub enum ReplicaError {
     Manifest(serde_json::Error),
 }
 
+impl ReplicaError {
+    /// Return the stable JavaScript status name for this error.
+    ///
+    /// A name, once added, stays part of the stable surface.
+    pub fn status_name(&self) -> &'static str {
+        match self {
+            Self::LoginRequired => "login_required",
+            Self::Forbidden => "forbidden",
+            Self::StaleGeneration { .. } => "stale_generation",
+            Self::Integrity { .. } => "integrity",
+            _ => "request",
+        }
+    }
+}
+
 impl fmt::Display for ReplicaError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
