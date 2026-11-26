@@ -10,6 +10,7 @@ use rust_api_model::wire::CommitReceipt;
 
 use crate::eav::entity::{Entity, EntityDraft, EntityStore, WriteContext};
 use crate::eav::entity_error::EntityError;
+use crate::eav::schema::SchemaRef;
 use crate::fs::error::FsError;
 use crate::policy::{Action, Authorizer, PolicyError};
 use crate::queue::{Job, JobError, JobHandler};
@@ -43,30 +44,34 @@ impl EntityCreateHandler {
 
     /// Returns the result for a repeated create of the same draft.
     ///
-    /// The function validates the draft and applies the schema defaults, so
-    /// an omitted default attribute still matches the stored entity. It
-    /// returns `None` when version 1 and the content match. A different
-    /// entity is a permanent failure. A read failure is retryable. A draft
-    /// that no longer validates is a permanent failure.
+    /// The function reads the stored entity and checks its schema ids. It
+    /// then previews the create against the pinned schema versions, so a later
+    /// schema version does not change the expected defaults. A match returns
+    /// `None`. A different entity is a permanent failure. A read failure is
+    /// retryable. A draft that no longer validates is a permanent failure.
     async fn existing_entity(&self, draft: &EntityDraft) -> Result<Option<Vec<u8>>, JobError> {
-        let expected = self
-            .entities
-            .preview_create(draft)
-            .await
-            .map_err(entity_error)?;
-        let entity = self
+        let stored = self
             .entities
             .get(&draft.id)
             .await
-            .map_err(|error| JobError::retryable(error.to_string()))?;
-        match entity {
-            Some(entity) if matches_entity(&entity, &expected) => Ok(None),
-            Some(_) => Err(JobError::permanent(
+            .map_err(|error| JobError::retryable(error.to_string()))?
+            .ok_or_else(|| JobError::permanent("the entity is missing after a duplicate create"))?;
+        if !draft_schema_ids_match(&stored.schemas, &draft.schemas) {
+            return Err(JobError::permanent(
+                "the entity exists with different schema ids",
+            ));
+        }
+        let expected = self
+            .entities
+            .preview_create_at(draft, &stored.schemas)
+            .await
+            .map_err(entity_error)?;
+        if matches_entity(&stored, &expected) {
+            Ok(None)
+        } else {
+            Err(JobError::permanent(
                 "the entity exists with different content",
-            )),
-            None => Err(JobError::permanent(
-                "the entity is missing after a duplicate create",
-            )),
+            ))
         }
     }
 }
@@ -142,20 +147,23 @@ fn after_head(before: u64, after: Result<u64, FsError>) -> Result<Option<Vec<u8>
 /// only. It ignores the created and updated times. The attribute maps must
 /// match exactly.
 fn matches_entity(stored: &Entity, expected: &Entity) -> bool {
-    if stored.version != 1 || stored.attributes != expected.attributes {
-        return false;
-    }
-    let stored_schemas: BTreeSet<&str> = stored
-        .schemas
-        .iter()
-        .map(|schema| schema.id.as_str())
-        .collect();
-    let expected_schemas: BTreeSet<&str> = expected
-        .schemas
-        .iter()
-        .map(|schema| schema.id.as_str())
-        .collect();
-    stored_schemas == expected_schemas
+    stored.version == 1
+        && stored.attributes == expected.attributes
+        && same_schema_ids(&stored.schemas, &expected.schemas)
+}
+
+/// Reports whether the draft names the same schema ids as the stored entity.
+fn draft_schema_ids_match(stored: &[SchemaRef], draft: &[String]) -> bool {
+    let stored: BTreeSet<&str> = stored.iter().map(|schema| schema.id.as_str()).collect();
+    let draft: BTreeSet<&str> = draft.iter().map(String::as_str).collect();
+    stored == draft
+}
+
+/// Reports whether two schema reference lists name the same schema ids.
+fn same_schema_ids(left: &[SchemaRef], right: &[SchemaRef]) -> bool {
+    let left: BTreeSet<&str> = left.iter().map(|schema| schema.id.as_str()).collect();
+    let right: BTreeSet<&str> = right.iter().map(|schema| schema.id.as_str()).collect();
+    left == right
 }
 
 /// Maps a policy failure to a job error.
@@ -247,6 +255,19 @@ mod tests {
         granted: bool,
         schemas: Vec<SchemaDraft>,
     ) -> anyhow::Result<(EntityCreateHandler, EntityStore)> {
+        let (handler, store, _) = fixture_with_registry(with_feed, granted, schemas).await?;
+        Ok((handler, store))
+    }
+
+    /// Builds a handler, a store, the given schemas, and the schema registry.
+    ///
+    /// The store uses the handler feed only when `with_feed` is true. The
+    /// owner `alice` gets the entity write grant only when `granted` is true.
+    async fn fixture_with_registry(
+        with_feed: bool,
+        granted: bool,
+        schemas: Vec<SchemaDraft>,
+    ) -> anyhow::Result<(EntityCreateHandler, EntityStore, SchemaRegistry)> {
         let wal = Wal::new(build_test_store(&test_prefix("jobs-entity-wal")).await);
         let registry =
             SchemaRegistry::new(build_test_store(&test_prefix("jobs-entity-schema")).await);
@@ -273,19 +294,33 @@ mod tests {
                 .await?;
         }
         let handler = EntityCreateHandler::new(store.clone(), wal, engine.authorizer());
-        Ok((handler, store))
+        Ok((handler, store, registry))
     }
 
-    /// Builds one `task` draft with the given title.
-    fn draft_with(title: &str) -> EntityDraft {
+    /// Builds one `other` schema with a `title` string.
+    fn other_schema() -> SchemaDraft {
+        SchemaDraft {
+            id: "other".to_string(),
+            extends: Vec::new(),
+            attributes: BTreeMap::from([("title".to_string(), string_attr("title"))]),
+        }
+    }
+
+    /// Builds one draft with the given schema id and title.
+    fn draft_in(schema: &str, title: &str) -> EntityDraft {
         EntityDraft {
             id: "e1".to_string(),
-            schemas: vec!["task".to_string()],
+            schemas: vec![schema.to_string()],
             attributes: BTreeMap::from([(
                 "title".to_string(),
                 AttributeValue::String(title.to_string()),
             )]),
         }
+    }
+
+    /// Builds one `task` draft with the given title.
+    fn draft_with(title: &str) -> EntityDraft {
+        draft_in("task", title)
     }
 
     /// Builds the default `task` draft.
@@ -448,6 +483,41 @@ mod tests {
         Ok(())
     }
 
+    /// A retry previews against the schema versions pinned in the entity.
+    #[tokio::test]
+    async fn a_repeated_create_previews_the_pinned_schema_versions() -> anyhow::Result<()> {
+        let schemas = vec![SchemaDraft {
+            id: "task".to_string(),
+            extends: Vec::new(),
+            attributes: BTreeMap::from([
+                ("title".to_string(), string_attr("title")),
+                ("status".to_string(), default_attr("status", "new")),
+            ]),
+        }];
+        let (handler, _, registry) = fixture_with_registry(true, true, schemas).await?;
+        let draft = draft();
+
+        let first = handler.handle(&job(&draft, Some("alice"))).await?;
+        assert!(first.is_some());
+
+        // The new version changes the default. The stored entity keeps the
+        // version 1 refs, so the retry must use them.
+        registry
+            .publish(SchemaDraft {
+                id: "task".to_string(),
+                extends: Vec::new(),
+                attributes: BTreeMap::from([
+                    ("title".to_string(), string_attr("title")),
+                    ("status".to_string(), default_attr("status", "other")),
+                ]),
+            })
+            .await?;
+
+        let second = handler.handle(&job(&draft, Some("alice"))).await?;
+        assert!(second.is_none());
+        Ok(())
+    }
+
     /// A repeated create with a different draft is a permanent failure.
     #[tokio::test]
     async fn a_repeated_create_with_a_different_draft_is_permanent() -> anyhow::Result<()> {
@@ -462,6 +532,23 @@ mod tests {
             .handle(&job(&draft_with("other"), Some("alice")))
             .await
             .expect_err("the different draft must fail");
+        assert!(matches!(error.retry(), JobRetry::NoRetry));
+        Ok(())
+    }
+
+    /// A repeated create with a different schema id is a permanent failure.
+    #[tokio::test]
+    async fn a_repeated_create_with_a_different_schema_id_is_permanent() -> anyhow::Result<()> {
+        let (handler, _) =
+            fixture_with_schemas(true, true, vec![task_schema(), other_schema()]).await?;
+
+        let first = handler.handle(&job(&draft(), Some("alice"))).await?;
+        assert!(first.is_some());
+
+        let error = handler
+            .handle(&job(&draft_in("other", "hello"), Some("alice")))
+            .await
+            .expect_err("the different schema id must fail");
         assert!(matches!(error.retry(), JobRetry::NoRetry));
         Ok(())
     }
