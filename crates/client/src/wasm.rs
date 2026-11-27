@@ -15,8 +15,8 @@ use serde_json::json;
 use wasm_bindgen::prelude::*;
 
 use crate::auth::AuthClient;
-use crate::auth::browser::BrowserTransport;
 use crate::auth::TransportError;
+use crate::auth::browser::BrowserTransport;
 use crate::eav::{QueryError, ReplicaQuery};
 use crate::jobs::sse::browser::{BrowserDelay, BrowserEventSource};
 use crate::jobs::sse::{WatchOptions, watch};
