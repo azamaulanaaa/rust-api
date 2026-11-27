@@ -73,6 +73,10 @@ runs CI on a push.
 Run `make help` to list every target. The main targets are:
 
 - `make ci` runs `scripts/ci.sh`.
+- `make wasm` runs `scripts/wasm-check.sh`. It checks the client crate for
+  `wasm32-unknown-unknown`. See [the WASM check section](#wasm-check).
+- `make wasm-clippy` runs `scripts/wasm-clippy.sh`. It lints the client crate
+  for `wasm32-unknown-unknown`. See [the WASM check section](#wasm-check).
 - `make smolvm` runs the checks in a smolvm microVM, local or remote.
 - `make smolvm-exec ARGS='...'` runs one command in the microVM, local or
   remote.
@@ -88,11 +92,43 @@ Run `make help` to list every target. The main targets are:
 The template also provides the `make smolvm-pack`, `make smolvm-preflight`, and
 `make smolvm-verify` targets. See [the smolvm document](smolvm.md).
 
+## WASM check
+
+`make wasm` runs one command:
+
+```bash
+cargo check -p rust-api-client \
+  --target wasm32-unknown-unknown --locked
+```
+
+`make wasm-clippy` runs one command:
+
+```bash
+cargo clippy -p rust-api-client \
+  --target wasm32-unknown-unknown --locked -- -D warnings
+```
+
+Neither check is part of `make ci`. The remote guest does not install the
+`wasm32-unknown-unknown` target. Install the target in a disposable guest,
+then run both checks in the same guest:
+
+```bash
+make smolvm-exec ARGS="rustup target add wasm32-unknown-unknown \
+  && make wasm && make wasm-clippy"
+```
+
+The GitHub Actions `wasm` job installs the target and runs `make wasm` and
+`make wasm-clippy`, so the local and CI commands match.
+
+`scripts/wasm-check.sh` and `scripts/wasm-clippy.sh` ask `rustc` for the
+target library directory before they call `cargo`. When the target is absent,
+each script prints a clear error and stops. Neither script installs a target.
+
 ## GitHub Actions
 
 The workflow [`ci.yml`](../.github/workflows/ci.yml) runs on each pull
 request, each push to `main` and `feature/**`, a manual dispatch, and a weekly
-schedule. It has one matrix job and these extra jobs: `pr-title`,
+schedule. It has one matrix job and these extra jobs: `wasm`, `pr-title`,
 `gitleaks`, `editorconfig`, and `dependency-review`.
 
 The matrix runs one check per entry. The feature/rust entries are `mise`,

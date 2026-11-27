@@ -1,7 +1,7 @@
 SHELL := bash
 .DEFAULT_GOAL := help
 
-.PHONY: help ci smolvm smolvm-pack smolvm-clean smolvm-exec smolvm-preflight smolvm-verify check-jactionlint check-bash check-cargo check-clippy check-coverage check-msrv check-no-default-features check-doc check-release-config check-cargo-deny-advisories check-cargo-deny-bans check-cargo-deny-licenses check-cargo-deny-sources check-commits check-dclint check-dockerfmt check-editorconfig check-gitleaks check-hadolint check-markdown check-mise check-rustfmt check-shfmt check-zizmor format format-rustfmt format-shfmt format-dockerfmt format-dclint hooks release
+.PHONY: help ci wasm wasm-clippy smolvm smolvm-pack smolvm-clean smolvm-exec smolvm-preflight smolvm-verify check-jactionlint check-bash check-cargo check-clippy check-coverage check-msrv check-no-default-features check-doc check-release-config check-cargo-deny-advisories check-cargo-deny-bans check-cargo-deny-licenses check-cargo-deny-sources check-commits check-dclint check-dockerfmt check-editorconfig check-gitleaks check-hadolint check-markdown check-mise check-rustfmt check-shfmt check-zizmor format format-rustfmt format-shfmt format-dockerfmt format-dclint hooks release
 
 help: ## Show this help.
 	@echo "Targets:"
@@ -9,6 +9,12 @@ help: ## Show this help.
 
 ci: ## Run every check.
 	scripts/ci.sh
+
+wasm: ## Check the WASM client build for wasm32-unknown-unknown.
+	scripts/wasm-check.sh
+
+wasm-clippy: ## Lint the WASM client build for wasm32-unknown-unknown.
+	scripts/wasm-clippy.sh
 
 smolvm: ## Run the checks inside a smolvm microVM, local or remote.
 	scripts/smolvm.sh

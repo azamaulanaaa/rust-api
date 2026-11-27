@@ -12,6 +12,17 @@ use rust_api_model::wire::{ReplicaManifest, SyncCursor};
 /// The poll and SSE transports live in the `poll` and `sse` submodules.
 pub mod jobs;
 
+#[cfg(target_arch = "wasm32")]
+mod wasm;
+
+/// The JavaScript-facing client type.
+///
+/// This type builds only for `wasm32`, because it carries the
+/// `wasm-bindgen` binding for JavaScript. Native builds of this crate do not
+/// include it.
+#[cfg(target_arch = "wasm32")]
+pub use wasm::Client;
+
 /// Returns `true` when a replica has applied the full change feed.
 pub fn replica_is_current(cursor: SyncCursor, manifest: &ReplicaManifest) -> bool {
     rust_api_core::replica_is_current(cursor, manifest)
