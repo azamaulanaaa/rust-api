@@ -17,10 +17,19 @@ crate-type = ["cdylib", "rlib"]
 rust-api-model.workspace = true
 rust-api-core.workspace = true
 
-# The JS binding is a WebAssembly-only dependency. The native test target
-# does not build it. Keep this target-specific: do not add a Cargo feature.
+# The JS binding and the browser transport are WebAssembly-only
+# dependencies. The native test target does not build them. Keep this
+# target-specific: do not add a Cargo feature.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2"
+# The generated async binding runs the checked future on the browser loop.
+wasm-bindgen-futures = "0.4"
+# The HTTP feature adds the `fetch` wrapper only. The default features add
+# JSON, WebSocket, and EventSource support, which this client does not need.
+gloo-net = { version = "0.8", default-features = false, features = ["http"] }
+# The credential mode and redirect mode types are `web-sys` types. Enable
+# only those bindings.
+web-sys = { version = "0.3", features = ["RequestCredentials", "RequestRedirect"] }
 
 [lints]
 workspace = true
