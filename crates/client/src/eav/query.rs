@@ -1,8 +1,9 @@
 //! Local entity queries over one EAV oxkv replica.
 //!
-//! [`ReplicaQuery`] owns the replica loader. The first query of a generation
+//! [`ReplicaQuery`] owns the replica loader. The first query of an object map
 //! opens the entity view and caches it. A later query reuses the view while
-//! the replica generation stays the same. A new generation rebuilds the view.
+//! the loaded object map stays the same. A new load, even at the same
+//! generation, rebuilds the view.
 //!
 //! The query calls the shared `search_by_attribute` function, so the
 //! client and the server use one search rule. The client makes no
@@ -10,7 +11,9 @@
 //! the authenticated subject.
 
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::Arc;
 
 use rust_api_core::eav::{QueryWindow, SearchValue};
 use serde_json::Value;
@@ -79,22 +82,31 @@ impl From<ViewError> for QueryError {
     }
 }
 
-/// The cached view of one replica generation.
+/// The cached view of one replica object map.
 #[derive(Debug)]
 struct CachedView {
     /// The replica generation of the view.
     generation: u64,
+    /// The object map that the view decodes.
+    objects: Arc<BTreeMap<String, Arc<[u8]>>>,
     /// The decoded entities.
     view: EntityView,
 }
+
+/// A test hook that runs after the view open and before the commit.
+#[cfg(test)]
+type AfterOpen<T> = fn(&ReplicaQuery<T>);
 
 /// Runs local entity queries over one EAV oxkv replica.
 #[derive(Debug)]
 pub struct ReplicaQuery<T: Transport> {
     /// The EAV replica loader.
     replica: ReplicaClient<T>,
-    /// The entity view of the last query generation.
+    /// The entity view of the last queried object map.
     cache: RefCell<Option<CachedView>>,
+    /// A test hook that runs after the view open and before the commit.
+    #[cfg(test)]
+    after_open: RefCell<Option<AfterOpen<T>>>,
 }
 
 impl<T: Transport> ReplicaQuery<T> {
@@ -112,6 +124,8 @@ impl<T: Transport> ReplicaQuery<T> {
         Self {
             replica: ReplicaClient::with_source(transport, source),
             cache: RefCell::new(None),
+            #[cfg(test)]
+            after_open: RefCell::new(None),
         }
     }
 
@@ -123,7 +137,7 @@ impl<T: Transport> ReplicaQuery<T> {
     /// Download the EAV replica and return its state.
     ///
     /// The call keeps the cached view. The next query rebuilds the view when
-    /// the generation changes.
+    /// the loaded object map changes.
     pub async fn load(&self) -> Result<ReplicaState, ReplicaError> {
         self.replica.load().await
     }
@@ -139,7 +153,11 @@ impl<T: Transport> ReplicaQuery<T> {
     /// The call resolves the page window, then converts the JSON value to a
     /// search value. A JSON `null`, array, or object has no search value and
     /// returns [`QueryError::UnsupportedValue`]. The call opens the entity
-    /// view on the first query of a generation and caches it.
+    /// view on the first query of an object map and caches it.
+    ///
+    /// The cache key is the generation and the object map. A load at an equal
+    /// generation replaces the map, so the old view cannot serve the new
+    /// bytes. A clear or a newer load during the open aborts the query.
     pub async fn query_attribute(
         &self,
         attribute: &str,
@@ -157,13 +175,27 @@ impl<T: Transport> ReplicaQuery<T> {
         };
         if let Some(cached) = self.cache.borrow().as_ref()
             && cached.generation == state.generation
+            && Arc::ptr_eq(&cached.objects, &objects)
         {
             return Ok(cached.view.query(attribute, &value, &window));
         }
         let view = EntityView::open(&objects, state.generation).await?;
+        #[cfg(test)]
+        if let Some(hook) = self.after_open.borrow_mut().take() {
+            hook(self);
+        }
+        // A clear or a newer load can finish during the open. Cache and
+        // return only the view of the object map that is still stored.
+        let Some(current) = self.replica.objects() else {
+            return Err(QueryError::NotLoaded);
+        };
+        if !Arc::ptr_eq(&current, &objects) {
+            return Err(QueryError::NotLoaded);
+        }
         let page = view.query(attribute, &value, &window);
         *self.cache.borrow_mut() = Some(CachedView {
             generation: state.generation,
+            objects,
             view,
         });
         Ok(page)
@@ -190,6 +222,7 @@ fn search_value(value: &Value) -> Result<SearchValue, QueryError> {
 mod tests {
     use super::*;
     use crate::auth::{Request, Response, TransportError};
+    use crate::eav::test_support::{ScriptedTransport, build_objects, entity_rows, script_replica};
     use std::future::Future;
     use std::pin::pin;
     use std::task::{Context, Poll, Waker};
@@ -417,6 +450,35 @@ mod tests {
         );
     }
 
+    /// A clear during a query cannot commit a stale view.
+    #[test]
+    fn a_clear_during_a_query_cannot_commit_a_stale_view() {
+        let objects = build_objects(entity_rows("e1", false));
+        let (replies, transport) = ScriptedTransport::new();
+        script_replica(&replies, &objects, 1, 1);
+        let query = ReplicaQuery::new(transport);
+        block_on(query.load()).expect("the replica loads");
+
+        *query.after_open.borrow_mut() =
+            Some(|query: &ReplicaQuery<ScriptedTransport>| query.clear());
+        let error =
+            block_on(query.query_attribute("tag", &Value::String("alpha".into()), None, None))
+                .expect_err("the clear aborts the query");
+
+        assert_eq!(error, QueryError::NotLoaded);
+        assert!(query.cache.borrow().is_none());
+
+        // A later map at the same generation serves only the new bytes.
+        let next = build_objects(entity_rows("e2", false));
+        script_replica(&replies, &next, 1, 1);
+        block_on(query.load()).expect("the new replica loads");
+        let page =
+            block_on(query.query_attribute("tag", &Value::String("alpha".into()), None, None))
+                .expect("the query succeeds");
+        assert_eq!(page.items, ["e2"]);
+    }
+
+    /// The error names are stable.
     #[test]
     fn the_query_error_names_are_stable() {
         assert_eq!(QueryError::NotLoaded.status_name(), "not_loaded");

@@ -242,3 +242,25 @@ fn a_new_generation_rebuilds_the_cached_view() {
         .expect("the second query succeeds");
     assert_eq!(page.items, ["e2"]);
 }
+
+/// An equal generation with a new object map rebuilds the cached view.
+#[test]
+fn an_equal_generation_rebuilds_the_cached_view() {
+    let first = build_objects(entity_rows("e1", false));
+    let second = build_objects(entity_rows("e2", false));
+    let (replies, transport) = FakeTransport::new();
+    script_replica(&replies, &first, 1, 1);
+    script_replica(&replies, &second, 1, 1);
+    let query = ReplicaQuery::new(transport);
+
+    block_on(query.load()).expect("the first replica loads");
+    let page = block_on(query.query_attribute("tag", &Value::String("alpha".into()), None, None))
+        .expect("the first query succeeds");
+    assert_eq!(page.items, ["e1"]);
+
+    let state = block_on(query.load()).expect("the equal generation loads");
+    assert_eq!(state.generation, 1);
+    let page = block_on(query.query_attribute("tag", &Value::String("alpha".into()), None, None))
+        .expect("the second query succeeds");
+    assert_eq!(page.items, ["e2"]);
+}

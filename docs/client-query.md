@@ -71,8 +71,10 @@ value has no exact search form. A corrupt metadata or attribute row returns
 `rust_api_core::eav::search_by_attribute`. The result is in id order and the
 cursor is the last id of the page.
 
-The view is cached by replica generation. A later query reuses the view while
-the generation stays the same. A new generation rebuilds the view.
+The view is cached by the loaded object map and its generation. A later query
+reuses the view while the same object map stays stored. A new load rebuilds
+the view, even when the generation does not change. A clear or a newer load
+during the view open aborts the query.
 
 Typed errors:
 
