@@ -168,8 +168,11 @@ A later build reconciles the wrapper to the current JSON generation and head.
 A lower head never replaces a higher wrapper.
 A rebuild keeps the current generation and the one before it.
 It removes older generations after the new wrapper is visible.
-A client that holds an old wrapper can still fetch the previous generation
-until the next rebuild.
+The object route serves only the current wrapper.
+The previous generation stays in storage as a safety net.
+The route does not serve the previous generation.
+A client that holds an old wrapper must re-read the manifest after the
+wrapper changes.
 A client must compare `generation` and `head` with its stored values and
 restart a multi-object download when the wrapper changes.
 
