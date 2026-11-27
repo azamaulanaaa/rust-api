@@ -594,6 +594,16 @@ mod tests {
         .expect("the job body serializes")
     }
 
+    /// Build one job status body for the watched job.
+    fn job_body(
+        state: &str,
+        attempt: u32,
+        error: Option<&str>,
+        commit_seq: Option<u64>,
+    ) -> Vec<u8> {
+        job_body_for(JOB_ID, state, attempt, error, commit_seq)
+    }
+
     /// Build one job status view for one id.
     fn view_for(id: &str, state: &str, attempt: u32, commit_seq: Option<u64>) -> JobStatusView {
         serde_json::from_slice(&job_body_for(id, state, attempt, None, commit_seq))
