@@ -257,6 +257,9 @@ pub struct OxkvReplicaStore {
     /// True when a test hides the wrapper object version.
     #[cfg(test)]
     strip_wrapper_version: Arc<std::sync::atomic::AtomicBool>,
+    /// The number of test versionless wrapper creates that must fail.
+    #[cfg(test)]
+    wrapper_create_failures: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl OxkvReplicaStore {
@@ -280,6 +283,8 @@ impl OxkvReplicaStore {
             generation_conflicts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
             strip_wrapper_version: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(test)]
+            wrapper_create_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
     }
 
@@ -302,6 +307,13 @@ impl OxkvReplicaStore {
     pub(crate) fn strip_wrapper_version_for_test(&self, strip: bool) {
         self.strip_wrapper_version
             .store(strip, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Makes the next versionless wrapper create fail in a test.
+    #[cfg(test)]
+    pub(crate) fn fail_next_wrapper_create(&self) {
+        self.wrapper_create_failures
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Locks one subject for a build in this process.
@@ -344,8 +356,7 @@ impl OxkvReplicaStore {
         sub: &str,
         generation: u64,
     ) -> Result<Option<String>, EntityError> {
-        self.read_build_pointer(&sub_hash(sub), generation)
-            .await
+        self.read_build_pointer(&sub_hash(sub), generation).await
     }
 
     /// Returns the raw objects of one generation in a test.
@@ -479,24 +490,74 @@ impl OxkvReplicaStore {
                     incoming: prepared.head,
                 });
             }
-            let mode = match &existing {
-                Some((_, Some(version))) => PutMode::Update(version.clone()),
+            let wrapper_path = ObjectPath::from("manifest.json");
+            let result = match &existing {
+                Some((_, Some(version))) => {
+                    storage
+                        .put_opts(
+                            &wrapper_path,
+                            payload.clone(),
+                            PutMode::Update(version.clone()),
+                        )
+                        .await
+                }
                 Some((_, None)) => {
                     // A versionless backend cannot compare the old row.
-                    // Remove the row, then create it. A racing create returns
-                    // a retryable conflict on the next loop.
+                    // Save the old bytes, then remove the row and create it.
+                    // A failed create restores the old wrapper.
+                    let previous = storage
+                        .get(&wrapper_path)
+                        .await
+                        .map_err(EntityError::Store)?
+                        .bytes;
                     storage
-                        .delete(&ObjectPath::from("manifest.json"))
+                        .delete(&wrapper_path)
                         .await
                         .map_err(EntityError::Store)?;
-                    PutMode::Create
+                    #[cfg(test)]
+                    let created = if self
+                        .wrapper_create_failures
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                        > 0
+                    {
+                        self.wrapper_create_failures
+                            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                        Err(StoreError::Other(
+                            "test versionless wrapper create failure".to_string(),
+                        ))
+                    } else {
+                        storage
+                            .put_opts(&wrapper_path, payload.clone(), PutMode::Create)
+                            .await
+                    };
+                    #[cfg(not(test))]
+                    let created = storage
+                        .put_opts(&wrapper_path, payload.clone(), PutMode::Create)
+                        .await;
+                    match created {
+                        Ok(outcome) => Ok(outcome),
+                        Err(error) => {
+                            let restored = storage
+                                .put_opts(&wrapper_path, previous, PutMode::Create)
+                                .await;
+                            if let Err(restore_error) = restored {
+                                tracing::warn!(
+                                    %restore_error,
+                                    subject = %sub,
+                                    "versionless wrapper restore failed"
+                                );
+                            }
+                            Err(error)
+                        }
+                    }
                 }
-                None => PutMode::Create,
+                None => {
+                    storage
+                        .put_opts(&wrapper_path, payload.clone(), PutMode::Create)
+                        .await
+                }
             };
-            match storage
-                .put_opts(&ObjectPath::from("manifest.json"), payload.clone(), mode)
-                .await
-            {
+            match result {
                 Ok(_) => {
                     if let Err(error) = self.cleanup_generations(&hash, prepared.generation).await {
                         tracing::warn!(

@@ -113,6 +113,10 @@ A generation that the wrapper already names returns a retryable `409`.
 The OxKV replica relies on the single-writer lease for cross-process
 exclusion.
 The server does not add a distributed lock.
+A versionless backend can return a transient `404` while the server replaces a
+wrapper.
+The client must retry the manifest read.
+The server restores the old wrapper when the replace fails.
 
 ## Read-only client use
 
