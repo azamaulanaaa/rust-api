@@ -134,7 +134,9 @@ pub struct QueryPage {
 /// A failure to read the entity view.
 ///
 /// The query layer maps this error to a stable query error.
+/// The enum is non-exhaustive. A caller must treat a new variant as an error.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum ViewError {
     /// The replica holds a row that is not valid.
     Corrupt,

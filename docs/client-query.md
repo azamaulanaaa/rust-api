@@ -97,7 +97,7 @@ Typed errors:
 | `CorruptReplica` | A stored row is not valid. |
 | `UnsupportedValue` | The query value has no exact search form. |
 | `InvalidQuery` | The page window is not valid. |
-| `Replica` | The oxkv reader failed. |
+| `Replica` | The oxkv reader failed. The error keeps the reader cause. |
 
 ## JavaScript shape
 

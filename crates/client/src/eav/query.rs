@@ -15,6 +15,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 
+use oxkv::StoreError;
 use rust_api_core::eav::{QueryWindow, SearchValue};
 use serde_json::Value;
 
@@ -25,7 +26,7 @@ use crate::replica::{ReplicaClient, ReplicaError, ReplicaSource, ReplicaState};
 /// A failure to run one local query.
 ///
 /// The enum is non-exhaustive. A caller must treat a new variant as an error.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum QueryError {
     /// No replica load has succeeded, or a clear removed the replica.
@@ -36,21 +37,21 @@ pub enum QueryError {
     UnsupportedValue,
     /// The page window is not valid.
     InvalidQuery,
-    /// The oxkv reader failed.
-    Replica,
+    /// The oxkv reader failed. The value keeps the reader cause.
+    Replica(StoreError),
 }
 
 impl QueryError {
     /// Return the stable JavaScript error name.
     ///
     /// A name, once added, stays part of the stable surface.
-    pub fn status_name(self) -> &'static str {
+    pub fn status_name(&self) -> &'static str {
         match self {
             Self::NotLoaded => "not_loaded",
             Self::CorruptReplica => "corrupt_replica",
             Self::UnsupportedValue => "unsupported_value",
             Self::InvalidQuery => "invalid_query",
-            Self::Replica => "replica",
+            Self::Replica(_) => "replica",
         }
     }
 }
@@ -66,18 +67,25 @@ impl fmt::Display for QueryError {
                 formatter.write_str("the query value must be a scalar or a tagged attribute value")
             }
             Self::InvalidQuery => formatter.write_str("the query window is not valid"),
-            Self::Replica => formatter.write_str("the replica read failed"),
+            Self::Replica(error) => write!(formatter, "the replica read failed: {error}"),
         }
     }
 }
 
-impl std::error::Error for QueryError {}
+impl std::error::Error for QueryError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Replica(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 impl From<ViewError> for QueryError {
     fn from(error: ViewError) -> Self {
         match error {
             ViewError::Corrupt => Self::CorruptReplica,
-            ViewError::Replica(_) => Self::Replica,
+            ViewError::Replica(error) => Self::Replica(error),
         }
     }
 }
@@ -514,6 +522,21 @@ mod tests {
             "unsupported_value"
         );
         assert_eq!(QueryError::InvalidQuery.status_name(), "invalid_query");
-        assert_eq!(QueryError::Replica.status_name(), "replica");
+        assert_eq!(
+            QueryError::Replica(StoreError::Other("reader failed".to_string())).status_name(),
+            "replica"
+        );
+    }
+
+    /// The replica query error keeps its source.
+    #[test]
+    fn the_replica_error_keeps_its_source() {
+        let error = QueryError::from(ViewError::Replica(StoreError::Other(
+            "reader failed".to_string(),
+        )));
+
+        assert_eq!(error.status_name(), "replica");
+        assert_eq!(error.to_string(), "the replica read failed: reader failed");
+        assert!(std::error::Error::source(&error).is_some());
     }
 }
