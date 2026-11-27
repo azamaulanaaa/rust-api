@@ -1,23 +1,24 @@
-//! The client server-sent event transport for one job status.
+//! The client server-sent event transport and the job watcher.
 //!
 //! `GET /jobs/{id}/events` sends one `status` event at connect time, a
 //! `status` event on each change, a `: heartbeat` comment every 15 seconds,
 //! and one `terminal` event. An `error` event carries only a stable code. A
 //! terminal event ends the stream.
 //!
-//! `JobEventSource` yields one event at a time. A native test implements the
-//! trait with a scripted source. `browser::BrowserEventSource` wraps the
-//! browser `EventSource` API.
-//!
-//! [`watch`] applies each status view to the pending job and stops at a
-//! terminal state. The watcher never changes the replica or the query view.
+//! The watcher applies each status view to the pending job. It stops at a
+//! terminal state. When the stream fails, closes without a terminal event, or
+//! sends an `error` event, the watcher falls back to `GET /jobs/{id}` at a
+//! bounded interval for a bounded number of polls. Polling is the guaranteed
+//! transport. The watcher never changes the replica or the query view.
 //!
 //! The route has no `Last-Event-ID` support. A reconnect receives the current
 //! status. The server route answers `400`, `401`, `404`, or `429` before the
 //! stream starts. The browser `EventSource` API does not show that status, so
-//! a failed connection has no status.
+//! a failed connection falls back to polling and the poll maps the status. A
+//! native event source can report the status directly.
 
 use core::fmt;
+use std::time::Duration;
 
 use rust_api_model::wire::JobStatusView;
 
@@ -136,39 +137,84 @@ pub trait JobEventSource {
     async fn next_event(&mut self) -> Option<Result<JobEvent, StreamFailure>>;
 }
 
-/// Watch one job over an event source.
+/// Waits between two fallback polls.
+///
+/// The watcher takes one delay value. A native test uses an immediate delay.
+/// The browser uses a timer.
+#[allow(async_fn_in_trait)]
+pub trait PollDelay {
+    /// Wait for one interval.
+    async fn wait(&self, duration: Duration);
+}
+
+/// The limits of the poll fallback.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WatchOptions {
+    /// The wait between two fallback polls.
+    pub poll_interval: Duration,
+    /// The maximum number of fallback polls.
+    ///
+    /// A value of `0` disables the fallback. The watch then returns a
+    /// `request` error when the stream fails.
+    pub max_polls: u32,
+}
+
+impl Default for WatchOptions {
+    fn default() -> Self {
+        Self {
+            poll_interval: Duration::from_secs(1),
+            max_polls: 60,
+        }
+    }
+}
+
+/// Watch one job over an event source and fall back to polling.
 ///
 /// The function reads one event at a time. A `status` or `terminal` view is
 /// stored in the [`JobClient`] pending state and passed to `on_event`. A
 /// terminal state stops the watch and returns the final pending job. A
 /// heartbeat is ignored.
 ///
-/// A view for another job ends the watch. The function never changes the
-/// replica or the query view. An unsafe id returns [`JobError::NotFound`]
-/// before the source is read.
+/// An `error` event, a stream failure, or a stream that closes without a
+/// terminal event starts the poll fallback. The fallback calls
+/// [`JobClient::poll`] up to [`WatchOptions::max_polls`] times and waits
+/// [`WatchOptions::poll_interval`] between two polls. A terminal poll stops
+/// the fallback.
 ///
-/// A stream failure or an `error` event returns a `request` error. This
-/// feature does not implement the poll fallback yet.
+/// A `401`, `403`, or `404` that the source reports before the stream starts
+/// maps to [`JobError::LoginRequired`], [`JobError::Forbidden`], or
+/// [`JobError::NotFound`]. A `429` from the stream gate is a stream failure
+/// and falls back to polling. An error from a fallback poll maps through
+/// [`JobClient::poll`].
+///
+/// A view for another job ends the stream read and starts the fallback. The
+/// function never changes the replica or the query view. An unsafe id returns
+/// [`JobError::NotFound`] before the source is read.
 ///
 /// # Errors
 ///
-/// Returns [`JobError::NotFound`] for an unsafe id. Returns a `request` error
-/// for a stream failure or an `error` event.
-pub async fn watch<T, S, F>(
+/// Returns a [`JobError`] when a stream status maps to one, a poll fails, or
+/// the fallback reaches [`WatchOptions::max_polls`] before a terminal state.
+/// The last case is a `request` error.
+pub async fn watch<T, S, D, F>(
     jobs: &JobClient<T>,
     id: &str,
     mut source: S,
+    delay: D,
+    options: WatchOptions,
     mut on_event: F,
 ) -> Result<PendingJob, JobError>
 where
     T: Transport,
     S: JobEventSource,
+    D: PollDelay,
     F: FnMut(&PendingJob),
 {
     if !is_safe_job_id(id) {
         return Err(JobError::NotFound);
     }
 
+    let mut failure_status = None;
     loop {
         match source.next_event().await {
             Some(Ok(JobEvent::Status(view) | JobEvent::Terminal(view))) => {
@@ -181,24 +227,59 @@ where
                 }
             }
             Some(Ok(JobEvent::Heartbeat)) => {}
-            Some(Ok(JobEvent::Error(code))) => {
-                return Err(stream_error(format!(
-                    "the stream sent the {} error",
-                    code.as_str()
-                )));
+            Some(Ok(JobEvent::Error(_code))) => {
+                // Both codes mean the stream cannot continue. Polling is the
+                // guaranteed transport, so the watcher does not stop here.
+                break;
             }
-            Some(Err(failure)) => return Err(stream_error(failure.to_string())),
+            Some(Err(failure)) => {
+                failure_status = failure.status();
+                break;
+            }
             None => break,
         }
     }
-    Err(stream_error(
-        "the stream closed before the job reached a terminal state",
-    ))
+    // Drop the stream before the fallback. A browser source must not
+    // reconnect while the watcher polls.
+    drop(source);
+
+    match failure_status {
+        Some(401) => return Err(JobError::LoginRequired),
+        Some(403) => return Err(JobError::Forbidden),
+        Some(404) => return Err(JobError::NotFound),
+        _ => {}
+    }
+
+    fallback(jobs, id, delay, options, on_event).await
 }
 
-/// Build the request error of one stream failure.
-fn stream_error(detail: impl Into<String>) -> JobError {
-    JobError::Transport(TransportError::new(detail))
+/// Poll one job until a terminal state or the poll bound.
+async fn fallback<T, D, F>(
+    jobs: &JobClient<T>,
+    id: &str,
+    delay: D,
+    options: WatchOptions,
+    mut on_event: F,
+) -> Result<PendingJob, JobError>
+where
+    T: Transport,
+    D: PollDelay,
+    F: FnMut(&PendingJob),
+{
+    for poll in 0..options.max_polls {
+        let job = jobs.poll(id).await?;
+        on_event(&job);
+        if job.is_terminal() {
+            return Ok(job);
+        }
+        let more_polls = poll + 1 < options.max_polls;
+        if more_polls && !options.poll_interval.is_zero() {
+            delay.wait(options.poll_interval).await;
+        }
+    }
+    Err(JobError::Transport(TransportError::new(
+        "the job watch ended before the job reached a terminal state",
+    )))
 }
 
 /// Parse one event name and data pair from a stream.
@@ -238,13 +319,15 @@ fn parse_view(data: &str) -> Result<JobStatusView, StreamFailure> {
     })
 }
 
-/// The browser event source.
+/// The browser event source and fallback delay.
 #[cfg(target_arch = "wasm32")]
 pub mod browser {
+    use std::time::Duration;
+
     use futures_util::stream::{SelectAll, StreamExt as _};
     use gloo_net::eventsource::futures::{EventSource, EventSourceBuilder, EventSourceSubscription};
 
-    use super::{JobEvent, JobEventSource, StreamFailure, parse_event};
+    use super::{JobEvent, JobEventSource, PollDelay, StreamFailure, parse_event};
 
     /// The event names of the job status route.
     const EVENT_NAMES: [&str; 3] = ["status", "terminal", "error"];
@@ -310,6 +393,18 @@ pub mod browser {
                     Err(failure) => return Some(Err(failure)),
                 }
             }
+        }
+    }
+
+    /// Waits between two fallback polls with a browser timer.
+    #[derive(Clone, Copy, Debug, Default)]
+    pub struct BrowserDelay;
+
+    impl PollDelay for BrowserDelay {
+        async fn wait(&self, duration: Duration) {
+            let millis = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
+            let millis = u32::try_from(millis).unwrap_or(u32::MAX);
+            gloo_timers::future::TimeoutFuture::new(millis).await;
         }
     }
 }

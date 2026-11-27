@@ -38,6 +38,8 @@ wasm-bindgen-futures = "0.4"
 # the `EventSource` wrapper. The default features add JSON and WebSocket,
 # which this client does not need.
 gloo-net = { version = "0.8", default-features = false, features = ["http", "eventsource"] }
+# The fallback wait uses a browser timer.
+gloo-timers = { version = "0.4", features = ["futures"] }
 # `StreamExt` reads the gloo `EventSource` subscriptions.
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 # The credential mode and redirect mode types are `web-sys` types. Enable
