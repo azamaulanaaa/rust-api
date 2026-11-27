@@ -21,6 +21,9 @@
 //! `GET /eav/sync/replica?chunk=N` returns one page of the stored snapshot.
 //! `GET /eav/sync/replica/status` reports the log head and the stored head.
 //! `DELETE /eav/sync/replica` removes the stored replica of the caller.
+//! The same build also writes a per-user OxKV mirror for the WASM client.
+//! `GET /eav/sync/oxkv/manifest.json` returns the mirror wrapper manifest.
+//! `GET /eav/sync/oxkv/objects/{object}` returns one raw OxKV object.
 //! The client applies the events after the stored head.
 //! The replica is a head-anchored snapshot, not an incremental store.
 //! The build reads the feed head first, then pages the entities.
@@ -90,6 +93,7 @@ use crate::http::middleware::jwt::{Claims, Validated};
 use crate::policy::row::RowAuthorizer;
 use crate::policy::{Action, Authorizer};
 use crate::records::{EntityEvent, WalEntry, WalOp};
+use rust_api_model::wire::ReplicaManifest;
 
 /// The default number of events in one page.
 const DEFAULT_LIMIT: usize = 100;
@@ -630,6 +634,18 @@ impl std::fmt::Display for MissingReplica {
 
 impl std::error::Error for MissingReplica {}
 
+/// The source of a missing raw OxKV replica object.
+#[derive(Debug)]
+struct MissingOxkvObject;
+
+impl std::fmt::Display for MissingOxkvObject {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("oxkv replica object does not exist")
+    }
+}
+
+impl std::error::Error for MissingOxkvObject {}
+
 /// The source of a replica build that exceeds a size limit.
 #[derive(Debug)]
 struct ReplicaBuildTooLarge(&'static str);
@@ -922,13 +938,63 @@ pub(crate) async fn replica_status(
     Ok(HttpResponse::Ok().json(ReplicaStatusResponse { head, built_head }))
 }
 
+/// Returns the OxKV replica wrapper manifest of the caller.
+///
+/// The caller needs a valid session and no management grant.
+/// A missing replica returns `404`.
+/// The body is a [`ReplicaManifest`] with the generation, the head, and every
+/// raw object relative to the replica root.
+/// The object keys are exactly the keys that the client stores in its
+/// read-only `OxKvReader` map with an empty prefix.
+/// The route sets `X-Replica-Generation` and `X-Replica-Head`.
+/// The route sets no `ETag`, because the wrapper changes only on a rebuild.
+#[utoipa::path(get, path = "/eav/sync/oxkv/manifest.json", tag = "eav", responses((status = 200, body = ReplicaManifest), (status = 401, body = crate::http::error::ErrorBody), (status = 404, body = crate::http::error::ErrorBody), (status = 500, body = crate::http::error::ErrorBody)))]
+#[get("/sync/oxkv/manifest.json")]
+pub(crate) async fn oxkv_manifest(
+    runtime: web::Data<EavRuntime>,
+    claims: Validated<Claims>,
+) -> Result<HttpResponse, EavApiError> {
+    let Some(manifest) = runtime.oxkv().manifest(&claims.sub).await? else {
+        return Err(EavApiError::NotFound(Box::new(MissingReplica)));
+    };
+    Ok(HttpResponse::Ok()
+        .insert_header(("X-Replica-Generation", manifest.generation.to_string()))
+        .insert_header(("X-Replica-Head", manifest.head.to_string()))
+        .json(manifest))
+}
+
+/// Returns one raw OxKV object of the caller.
+///
+/// The caller needs a valid session and no management grant.
+/// The route resolves the object only through the wrapper of the caller.
+/// A key that the wrapper does not list returns `404`, so one subject cannot
+/// read the object of another subject.
+/// A missing replica returns `404`.
+/// The body is `application/octet-stream`.
+#[utoipa::path(get, path = "/eav/sync/oxkv/objects/{object}", tag = "eav", params(("object" = String, Path, description = "Object key relative to the replica root")), responses((status = 200, description = "raw OxKV object bytes"), (status = 401, body = crate::http::error::ErrorBody), (status = 404, body = crate::http::error::ErrorBody), (status = 500, body = crate::http::error::ErrorBody)))]
+#[get("/sync/oxkv/objects/{object:.*}")]
+pub(crate) async fn oxkv_object(
+    runtime: web::Data<EavRuntime>,
+    claims: Validated<Claims>,
+    object: web::Path<String>,
+) -> Result<HttpResponse, EavApiError> {
+    let Some(bytes) = runtime.oxkv().object(&claims.sub, &object).await? else {
+        return Err(EavApiError::NotFound(Box::new(MissingOxkvObject)));
+    };
+    Ok(HttpResponse::Ok()
+        .insert_header((CONTENT_TYPE, "application/octet-stream"))
+        .body(bytes))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
     use actix_web::{App, http, test as actix_test};
     use jsonwebtoken::EncodingKey;
+    use oxkv::{Direction, KeyPrefix, MemStorage, ObjectPath, OxKvStore, PutMode, Storage as _};
     use serde_json::{Value, json};
+    use sha2::{Digest, Sha256};
     use utoipa::OpenApi as _;
 
     use super::*;

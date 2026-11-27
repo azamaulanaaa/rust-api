@@ -140,7 +140,9 @@ impl ApiModule for EavApiModule {
             .service(crate::eav::sync::build_replica)
             .service(crate::eav::sync::replica)
             .service(crate::eav::sync::reset_replica)
-            .service(crate::eav::sync::replica_status);
+            .service(crate::eav::sync::replica_status)
+            .service(crate::eav::sync::oxkv_manifest)
+            .service(crate::eav::sync::oxkv_object);
         cfg.service(scope);
     }
 }
@@ -1666,6 +1668,8 @@ mod tests {
         "/eav/sync/snapshot",
         "/eav/sync/replica",
         "/eav/sync/replica/status",
+        "/eav/sync/oxkv/manifest.json",
+        "/eav/sync/oxkv/objects/{object}",
     ];
 
     /// The list routes that read [`PageQuery`].
