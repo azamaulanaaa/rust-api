@@ -34,7 +34,7 @@
 //! It does not read the change feed.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use async_trait::async_trait;
 use oxkv::{
@@ -244,8 +244,10 @@ pub struct OxkvReplicaStore {
     root: String,
     /// True for the in-memory backend, which has no conditional-write probe.
     skip_probe: bool,
-    /// One build lock for each subject hash.
-    builds: Arc<std::sync::Mutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
+    /// One weak build lock for each subject hash.
+    ///
+    /// An entry whose build ended is pruned on the next lookup.
+    builds: Arc<std::sync::Mutex<HashMap<String, Weak<AsyncMutex<()>>>>>,
     /// The number of test publishes that must fail before the wrapper write.
     #[cfg(test)]
     publish_failures: Arc<std::sync::atomic::AtomicUsize>,
@@ -293,6 +295,7 @@ impl OxkvReplicaStore {
     /// Locks one subject for a build in this process.
     ///
     /// The caller holds the guard until the build commits or aborts.
+    /// The call prunes an entry whose last build ended.
     pub(crate) async fn lock_subject(&self, sub: &str) -> OwnedMutexGuard<()> {
         let hash = sub_hash(sub);
         let lock = {
@@ -300,12 +303,26 @@ impl OxkvReplicaStore {
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            builds
-                .entry(hash)
-                .or_insert_with(|| Arc::new(AsyncMutex::new(())))
-                .clone()
+            builds.retain(|_, lock| lock.strong_count() > 0);
+            match builds.get(&hash).and_then(Weak::upgrade) {
+                Some(lock) => lock,
+                None => {
+                    let lock = Arc::new(AsyncMutex::new(()));
+                    builds.insert(hash, Arc::downgrade(&lock));
+                    lock
+                }
+            }
         };
         lock.lock_owned().await
+    }
+
+    /// Returns the number of build-lock entries in a test.
+    #[cfg(test)]
+    pub(crate) fn build_lock_count(&self) -> usize {
+        match self.builds.lock() {
+            Ok(builds) => builds.len(),
+            Err(poisoned) => poisoned.into_inner().len(),
+        }
     }
 
     /// Starts one generation at `generation` for `sub`.
@@ -736,6 +753,23 @@ mod tests {
             "the loser build prefix remains"
         );
         store.publish("alice", &prepared).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_idle_build_lock_is_pruned_on_the_next_lookup() -> anyhow::Result<()> {
+        let store = store();
+        let guard = store.lock_subject("alice").await;
+        assert_eq!(store.build_lock_count(), 1);
+        drop(guard);
+
+        let guard = store.lock_subject("bob").await;
+        assert_eq!(
+            store.build_lock_count(),
+            1,
+            "the idle alice entry must be pruned"
+        );
+        drop(guard);
         Ok(())
     }
 
