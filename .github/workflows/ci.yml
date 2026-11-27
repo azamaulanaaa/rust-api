@@ -25,7 +25,9 @@ jobs:
     runs-on: ubuntu-24.04
     container:
       image: jdxcode/mise@sha256:05360b08fb68ace24d4814adaa6f36371584f6931782ead4891872049667af5a # jdxcode/mise:2026.11.8-debian
-    timeout-minutes: 10
+    # The Rust checks build the full workspace from a cold cache. The
+    # coverage job compiles with instrumentation, so it needs the most time.
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -142,7 +144,8 @@ jobs:
     runs-on: ubuntu-24.04
     container:
       image: jdxcode/mise@sha256:05360b08fb68ace24d4814adaa6f36371584f6931782ead4891872049667af5a # jdxcode/mise:2026.11.8-debian
-    timeout-minutes: 10
+    # The WASM target and the client dependency graph build from cold.
+    timeout-minutes: 20
     steps:
       - name: Check out the repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
