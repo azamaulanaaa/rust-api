@@ -42,6 +42,9 @@ pub mod error;
 /// Metrics helpers for the EAV runtime.
 pub mod metrics;
 
+/// Per-user, generation-scoped OxKV replicas for the WASM client.
+pub mod oxkv_replica;
+
 /// Portable export, import, index rebuild, and restore checks.
 pub mod portable;
 

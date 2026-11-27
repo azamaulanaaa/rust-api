@@ -5073,6 +5073,23 @@ fn meta_bytes(entity: &Entity) -> Result<Vec<u8>, EntityError> {
     serde_json::to_vec(&meta).map_err(|e| EntityError::Internal(e.to_string()))
 }
 
+/// Returns the stored rows of one entity for a read-only replica.
+///
+/// The rows use the same key family as the entity store:
+/// `entity:{id}:meta` and `entity:{id}:attr:{name}`.
+/// The values use the same JSON encoding as the entity store.
+/// The rows hold no index, outbox, timer, or reverse-reference key.
+/// The result is in key order, so a writer gets a stable order.
+pub(crate) fn replica_rows(entity: &Entity) -> Result<Vec<(String, Vec<u8>)>, EntityError> {
+    let mut rows = Vec::with_capacity(entity.attributes.len() + 1);
+    rows.push((meta_key(&entity.id), meta_bytes(entity)?));
+    for (name, value) in &entity.attributes {
+        let bytes = serde_json::to_vec(value).map_err(|e| EntityError::Internal(e.to_string()))?;
+        rows.push((attr_key(&entity.id, name), bytes));
+    }
+    Ok(rows)
+}
+
 /// Replaces the metadata row of one entity with a compare-and-set.
 ///
 /// The expected value is the metadata row of `before`.

@@ -55,6 +55,19 @@ pub enum EntityError {
         /// The head of the rejected build.
         incoming: u64,
     },
+    /// The OxKV wrapper publish did not complete.
+    ///
+    /// The JSON replica can already hold the new generation.
+    /// The old wrapper and its objects stay readable.
+    /// A later build reconciles the wrapper to the JSON replica.
+    #[error("oxkv replica publish conflict")]
+    PublishConflict,
+    /// The wrapper already names the generation of this build.
+    ///
+    /// Another build published the generation first.
+    /// The caller can read the new generation and try again.
+    #[error("oxkv replica generation is already published")]
+    GenerationTaken,
     /// An `EntityRef` attribute names an entity that does not exist.
     ///
     /// The first field is the attribute name.

@@ -21,6 +21,9 @@
 //! `GET /eav/sync/replica?chunk=N` returns one page of the stored snapshot.
 //! `GET /eav/sync/replica/status` reports the log head and the stored head.
 //! `DELETE /eav/sync/replica` removes the stored replica of the caller.
+//! The same build also writes a per-user OxKV mirror for the WASM client.
+//! `GET /eav/sync/oxkv/manifest.json` returns the mirror wrapper manifest.
+//! `GET /eav/sync/oxkv/objects/{object}` returns one raw OxKV object.
 //! The client applies the events after the stored head.
 //! The replica is a head-anchored snapshot, not an incremental store.
 //! The build reads the feed head first, then pages the entities.
@@ -34,6 +37,16 @@
 //! An apply must be idempotent and version-aware.
 //! The full read is for compatibility.
 //! Use the chunk read to page a large replica.
+//!
+//! The OxKV mirror holds only the `entity:{id}:meta` and
+//! `entity:{id}:attr:{name}` rows that the caller can read.
+//! It holds no index, outbox, timer, or reverse-reference row.
+//! The wrapper names each raw OxKV object with its size and SHA-256.
+//! The wrapper generation and head equal the JSON replica generation and head.
+//! The build publishes the wrapper only after every object is written.
+//! A lower head never replaces a higher head.
+//! A rebuild keeps the current and the previous generation.
+//! A failed build leaves the old wrapper and the old generation readable.
 //!
 //! A reset removes the snapshot, the chunks, the manifest, the generation, and
 //! the head.
@@ -80,6 +93,7 @@ use std::time::Instant;
 
 use crate::eav::entity::Entity;
 use crate::eav::entity_error::EntityError;
+use crate::eav::oxkv_replica::OxkvGeneration;
 use crate::eav::route::{
     ENTITIES, ENTITY_ROW, EavApiError, PageMode, PageQuery, can_read_entity, page_next_offset,
     visible_cursor_page,
@@ -90,6 +104,7 @@ use crate::http::middleware::jwt::{Claims, Validated};
 use crate::policy::row::RowAuthorizer;
 use crate::policy::{Action, Authorizer};
 use crate::records::{EntityEvent, WalEntry, WalOp};
+use rust_api_model::wire::ReplicaManifest;
 
 /// The default number of events in one page.
 const DEFAULT_LIMIT: usize = 100;
@@ -630,6 +645,30 @@ impl std::fmt::Display for MissingReplica {
 
 impl std::error::Error for MissingReplica {}
 
+/// The source of a missing raw OxKV replica object.
+#[derive(Debug)]
+struct MissingOxkvObject;
+
+impl std::fmt::Display for MissingOxkvObject {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("oxkv replica object does not exist")
+    }
+}
+
+impl std::error::Error for MissingOxkvObject {}
+
+/// The source of a build that lost a concurrent generation race.
+#[derive(Debug)]
+struct ReplicaBuildRestarted;
+
+impl std::fmt::Display for ReplicaBuildRestarted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("replica build lost a generation race")
+    }
+}
+
+impl std::error::Error for ReplicaBuildRestarted {}
+
 /// The source of a replica build that exceeds a size limit.
 #[derive(Debug)]
 struct ReplicaBuildTooLarge(&'static str);
@@ -702,6 +741,14 @@ pub(crate) async fn build_replica(
 }
 
 /// Builds a stored replica for the caller.
+///
+/// The build holds the subject lock while it writes the OxKV mirror.
+/// It reads the planned generation, writes the mirror, then commits the JSON
+/// replica.
+/// It publishes the wrapper only when the committed generation matches the
+/// planned generation.
+/// A failed mirror write and a rejected JSON commit leave the old wrapper and
+/// the old generation readable.
 async fn build_replica_inner(
     runtime: web::Data<EavRuntime>,
     policy: web::Data<Authorizer>,
@@ -713,90 +760,180 @@ async fn build_replica_inner(
     let mut attempt = 0;
     loop {
         attempt += 1;
+        let _guard = runtime.oxkv().lock_subject(&claims.sub).await;
         let head = runtime.wal().head().await.map_err(internal)?;
-        let mut chunks: Vec<Vec<u8>> = Vec::new();
-        let mut chunk_bytes = 0usize;
-        let mut pending: Vec<Entity> = Vec::new();
-        let mut count = 0;
-        let mut scanned: usize = 0;
-        let mut after: Option<String> = None;
-        loop {
-            let (page, next) = runtime
-                .entities()
-                .list_after(REPLICA_PAGE, after.as_deref())
-                .await?;
-            for entity in page {
-                scanned = scanned.saturating_add(1);
-                #[cfg(test)]
-                runtime.replica_test().count_read();
-                if scanned > MAX_REPLICA_SCAN_ENTITIES {
-                    return Err(EavApiError::Invalid(Box::new(ReplicaBuildTooLarge(
-                        "replica build exceeds the scan limit",
-                    ))));
+        let planned = runtime.replicas().next_generation(&claims.sub).await?;
+        let generation = match runtime
+            .oxkv()
+            .begin_generation(&claims.sub, planned, head)
+            .await
+        {
+            Ok(generation) => generation,
+            Err(EntityError::GenerationTaken) if attempt < REPLICA_BUILD_ATTEMPTS => continue,
+            Err(error) => return Err(EavApiError::from(error)),
+        };
+        let build_id = generation.build_id().to_string();
+        let (count, chunks) =
+            match scan_replica(&runtime, &policy, &claims.sub, &generation, entity_limit).await {
+                Ok(result) => result,
+                Err(error) => {
+                    let _ = generation.abort().await;
+                    return Err(error);
                 }
-                if can_read_entity(&policy, &claims.sub, &entity.id).await? {
-                    count += 1;
-                    if count > entity_limit {
-                        return Err(EavApiError::Invalid(Box::new(ReplicaBuildTooLarge(
-                            "replica build exceeds the entity limit",
-                        ))));
-                    }
-                    pending.push(entity);
-                    if pending.len() == REPLICA_CHUNK_ENTITIES {
-                        let chunk = serde_json::to_vec(&pending)
-                            .map_err(|e| EavApiError::Internal(Box::new(e)))?;
-                        chunk_bytes = chunk_bytes.saturating_add(chunk.len());
-                        if chunk_bytes > REPLICA_BUILD_MAX_BYTES {
-                            return Err(EavApiError::Invalid(Box::new(ReplicaBuildTooLarge(
-                                "replica build exceeds the byte limit",
-                            ))));
-                        }
-                        chunks.push(chunk);
-                        pending.clear();
-                    }
-                }
-            }
-            match next {
-                Some(cursor) => after = Some(cursor),
-                None => break,
-            }
-        }
-        if !pending.is_empty() {
-            let chunk =
-                serde_json::to_vec(&pending).map_err(|e| EavApiError::Internal(Box::new(e)))?;
-            chunk_bytes = chunk_bytes.saturating_add(chunk.len());
-            if chunk_bytes > REPLICA_BUILD_MAX_BYTES {
-                return Err(EavApiError::Invalid(Box::new(ReplicaBuildTooLarge(
-                    "replica build exceeds the byte limit",
-                ))));
-            }
-            chunks.push(chunk);
-        }
+            };
         let chunk_count = chunks.len();
+        let prepared = match generation.finish().await {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let _ = runtime
+                    .oxkv()
+                    .discard_generation(&claims.sub, planned, &build_id)
+                    .await;
+                return Err(error.into());
+            }
+        };
         match runtime.replicas().put(&claims.sub, head, chunks).await {
-            Ok(generation) => {
+            Ok(actual) if actual == planned => {
+                if let Err(error) = runtime.oxkv().publish(&claims.sub, &prepared).await {
+                    tracing::warn!(
+                        %error,
+                        subject = %claims.sub,
+                        "oxkv replica wrapper publish failed after the JSON commit"
+                    );
+                    let _ = runtime
+                        .oxkv()
+                        .discard_generation(&claims.sub, planned, prepared.build_id())
+                        .await;
+                    if matches!(
+                        error,
+                        EntityError::GenerationTaken | EntityError::PublishConflict
+                    ) && attempt < REPLICA_BUILD_ATTEMPTS
+                    {
+                        continue;
+                    }
+                    return Err(EavApiError::Conflict(Box::new(ReplicaBuildRestarted)));
+                }
                 return Ok(HttpResponse::Ok().json(ReplicaBuildResponse {
                     head,
-                    generation,
+                    generation: actual,
                     count,
                     chunks: chunk_count,
                 }));
             }
-            Err(EntityError::StaleHead { .. }) if attempt < REPLICA_BUILD_ATTEMPTS => continue,
-            Err(error) => return Err(EavApiError::from(error)),
+            Ok(_) => {
+                let _ = runtime
+                    .oxkv()
+                    .discard_generation(&claims.sub, planned, &build_id)
+                    .await;
+                if attempt < REPLICA_BUILD_ATTEMPTS {
+                    continue;
+                }
+                return Err(EavApiError::Conflict(Box::new(ReplicaBuildRestarted)));
+            }
+            Err(EntityError::StaleHead { .. }) if attempt < REPLICA_BUILD_ATTEMPTS => {
+                let _ = runtime
+                    .oxkv()
+                    .discard_generation(&claims.sub, planned, &build_id)
+                    .await;
+                continue;
+            }
+            Err(error) => {
+                let _ = runtime
+                    .oxkv()
+                    .discard_generation(&claims.sub, planned, &build_id)
+                    .await;
+                return Err(EavApiError::from(error));
+            }
         }
     }
 }
 
-/// Removes the stored replica of the caller.
+/// Scans the visible entities and fills one OxKV generation.
+///
+/// The scan stops at `entity_limit` visible entities or at the scan cap.
+/// It serializes the same ordered JSON chunks as the JSON replica.
+/// A row is staged before its chunk can fail, so the caller must abort the
+/// generation on an error.
+async fn scan_replica(
+    runtime: &EavRuntime,
+    policy: &Authorizer,
+    sub: &str,
+    generation: &OxkvGeneration,
+    entity_limit: usize,
+) -> Result<(usize, Vec<Vec<u8>>), EavApiError> {
+    let mut chunks: Vec<Vec<u8>> = Vec::new();
+    let mut chunk_bytes = 0usize;
+    let mut pending: Vec<Entity> = Vec::new();
+    let mut count = 0;
+    let mut scanned: usize = 0;
+    let mut after: Option<String> = None;
+    loop {
+        let (page, next) = runtime
+            .entities()
+            .list_after(REPLICA_PAGE, after.as_deref())
+            .await?;
+        for entity in page {
+            scanned = scanned.saturating_add(1);
+            #[cfg(test)]
+            runtime.replica_test().count_read();
+            if scanned > MAX_REPLICA_SCAN_ENTITIES {
+                return Err(EavApiError::Invalid(Box::new(ReplicaBuildTooLarge(
+                    "replica build exceeds the scan limit",
+                ))));
+            }
+            if can_read_entity(policy, sub, &entity.id).await? {
+                count += 1;
+                if count > entity_limit {
+                    return Err(EavApiError::Invalid(Box::new(ReplicaBuildTooLarge(
+                        "replica build exceeds the entity limit",
+                    ))));
+                }
+                generation.add_entity(&entity).await?;
+                pending.push(entity);
+                if pending.len() == REPLICA_CHUNK_ENTITIES {
+                    let chunk = serde_json::to_vec(&pending)
+                        .map_err(|e| EavApiError::Internal(Box::new(e)))?;
+                    chunk_bytes = chunk_bytes.saturating_add(chunk.len());
+                    if chunk_bytes > REPLICA_BUILD_MAX_BYTES {
+                        return Err(EavApiError::Invalid(Box::new(ReplicaBuildTooLarge(
+                            "replica build exceeds the byte limit",
+                        ))));
+                    }
+                    chunks.push(chunk);
+                    pending.clear();
+                }
+            }
+        }
+        match next {
+            Some(cursor) => after = Some(cursor),
+            None => break,
+        }
+    }
+    if !pending.is_empty() {
+        let chunk = serde_json::to_vec(&pending).map_err(|e| EavApiError::Internal(Box::new(e)))?;
+        chunk_bytes = chunk_bytes.saturating_add(chunk.len());
+        if chunk_bytes > REPLICA_BUILD_MAX_BYTES {
+            return Err(EavApiError::Invalid(Box::new(ReplicaBuildTooLarge(
+                "replica build exceeds the byte limit",
+            ))));
+        }
+        chunks.push(chunk);
+    }
+    Ok((count, chunks))
+}
+
+/// Removes both stored replicas of the caller.
 ///
 /// The caller needs a valid session.
 /// The route needs no management grant, because a caller owns its replica.
 /// The route removes only the replica of the caller.
-/// A reset removes the snapshot, the chunks, the manifest, the generation, and
-/// the head in one transaction.
-/// A reset returns `204` when a replica existed and was removed.
-/// A reset returns `404` when the caller has no replica.
+/// The route takes the subject build lock before it clears either store.
+/// A build that waits for the lock cannot repopulate the mirror after the
+/// reset.
+/// A reset removes the JSON snapshot, the chunks, the manifest, the
+/// generation, the head, the OxKV wrapper, and every OxKV generation.
+/// A reset returns `204` when the JSON replica or the OxKV replica existed.
+/// A reset returns `404` only when neither replica existed.
 /// After a WAL reset, call the reset route, then build a new replica.
 /// The next build starts at generation 1.
 #[utoipa::path(delete, path = "/eav/sync/replica", tag = "eav", responses((status = 204, description = "replica removed"), (status = 401, body = crate::http::error::ErrorBody), (status = 404, body = crate::http::error::ErrorBody), (status = 500, body = crate::http::error::ErrorBody)))]
@@ -805,7 +942,10 @@ pub(crate) async fn reset_replica(
     runtime: web::Data<EavRuntime>,
     claims: Validated<Claims>,
 ) -> Result<HttpResponse, EavApiError> {
-    if runtime.replicas().clear(&claims.sub).await? {
+    let _guard = runtime.oxkv().lock_subject(&claims.sub).await;
+    let json = runtime.replicas().clear(&claims.sub).await?;
+    let oxkv = runtime.oxkv().clear(&claims.sub).await?;
+    if json || oxkv {
         return Ok(HttpResponse::NoContent().finish());
     }
     Err(EavApiError::NotFound(Box::new(MissingReplica)))
@@ -922,13 +1062,64 @@ pub(crate) async fn replica_status(
     Ok(HttpResponse::Ok().json(ReplicaStatusResponse { head, built_head }))
 }
 
+/// Returns the OxKV replica wrapper manifest of the caller.
+///
+/// The caller needs a valid session and no management grant.
+/// A missing replica returns `404`.
+/// The body is a [`ReplicaManifest`] with the generation, the head, and every
+/// raw object relative to the replica root.
+/// The object keys are exactly the keys that the client stores in its
+/// read-only `OxKvReader` map with an empty prefix.
+/// The route sets `X-Replica-Generation` and `X-Replica-Head`.
+/// The route sets no `ETag`, because the wrapper changes only on a rebuild.
+#[utoipa::path(get, path = "/eav/sync/oxkv/manifest.json", tag = "eav", responses((status = 200, body = ReplicaManifest), (status = 401, body = crate::http::error::ErrorBody), (status = 404, body = crate::http::error::ErrorBody), (status = 500, body = crate::http::error::ErrorBody)))]
+#[get("/sync/oxkv/manifest.json")]
+pub(crate) async fn oxkv_manifest(
+    runtime: web::Data<EavRuntime>,
+    claims: Validated<Claims>,
+) -> Result<HttpResponse, EavApiError> {
+    let Some(manifest) = runtime.oxkv().manifest(&claims.sub).await? else {
+        return Err(EavApiError::NotFound(Box::new(MissingReplica)));
+    };
+    Ok(HttpResponse::Ok()
+        .insert_header(("X-Replica-Generation", manifest.generation.to_string()))
+        .insert_header(("X-Replica-Head", manifest.head.to_string()))
+        .json(manifest))
+}
+
+/// Returns one raw OxKV object of the caller.
+///
+/// The caller needs a valid session and no management grant.
+/// The route resolves the object only through the wrapper of the caller.
+/// A key that the wrapper does not list returns `404`, so one subject cannot
+/// read the object of another subject.
+/// A missing replica returns `404`.
+/// The body is `application/octet-stream`.
+#[utoipa::path(get, path = "/eav/sync/oxkv/objects/{object}", tag = "eav", params(("object" = String, Path, description = "Object key relative to the replica root")), responses((status = 200, description = "raw OxKV object bytes"), (status = 401, body = crate::http::error::ErrorBody), (status = 404, body = crate::http::error::ErrorBody), (status = 500, body = crate::http::error::ErrorBody)))]
+#[get("/sync/oxkv/objects/{object:.*}")]
+pub(crate) async fn oxkv_object(
+    runtime: web::Data<EavRuntime>,
+    claims: Validated<Claims>,
+    object: web::Path<String>,
+) -> Result<HttpResponse, EavApiError> {
+    let Some(bytes) = runtime.oxkv().object(&claims.sub, &object).await? else {
+        return Err(EavApiError::NotFound(Box::new(MissingOxkvObject)));
+    };
+    Ok(HttpResponse::Ok()
+        .insert_header((CONTENT_TYPE, "application/octet-stream"))
+        .body(bytes))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::time::Duration;
 
     use actix_web::{App, http, test as actix_test};
     use jsonwebtoken::EncodingKey;
+    use oxkv::{Direction, KeyPrefix, MemStorage, ObjectPath, OxKvStore, PutMode, Storage as _};
     use serde_json::{Value, json};
+    use sha2::{Digest, Sha256};
     use utoipa::OpenApi as _;
 
     use super::*;
@@ -1147,6 +1338,24 @@ mod tests {
         Ok(())
     }
 
+    /// Grants one row read to one subject with a private group.
+    ///
+    /// Two subjects that share a group also share every row rule in it.
+    async fn grant_private_row_read(
+        fx: &Fixture,
+        sub: &str,
+        entity_id: &str,
+    ) -> anyhow::Result<()> {
+        let group = format!("row-readers-{sub}");
+        fx.engine
+            .assign_group(sub.to_string(), group.clone())
+            .await?;
+        fx.engine
+            .add_rule(group, format!("entity:{entity_id}"), Action::Read)
+            .await?;
+        Ok(())
+    }
+
     async fn revoke_collection_read(fx: &Fixture) -> anyhow::Result<()> {
         fx.engine
             .remove_rule(
@@ -1203,6 +1412,84 @@ mod tests {
                 .to_request(),
             )
         };
+    }
+
+    macro_rules! get_oxkv_manifest {
+        ($app:expr, $token:expr) => {{
+            let res = get_route!($app, "/eav/sync/oxkv/manifest.json", $token).await;
+            assert_eq!(res.status(), http::StatusCode::OK);
+            let body: ReplicaManifest = actix_test::read_body_json(res).await;
+            body
+        }};
+    }
+
+    macro_rules! get_oxkv_object {
+        ($app:expr, $token:expr, $key:expr) => {{
+            let uri = format!("/eav/sync/oxkv/objects/{}", $key);
+            let res = get_route!($app, &uri, $token).await;
+            assert_eq!(res.status(), http::StatusCode::OK, "{uri}");
+            assert_eq!(
+                res.headers()
+                    .get(CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok()),
+                Some("application/octet-stream"),
+                "{uri}"
+            );
+            actix_test::read_body(res).await.to_vec()
+        }};
+    }
+
+    /// Fetches every object of a wrapper and checks its size and SHA-256.
+    macro_rules! fetch_oxkv_objects {
+        ($app:expr, $token:expr, $manifest:expr) => {{
+            let mut objects = Vec::with_capacity($manifest.objects.len());
+            for object in &$manifest.objects {
+                let bytes = get_oxkv_object!($app, $token, &object.key);
+                assert_eq!(
+                    bytes.len() as u64,
+                    object.size,
+                    "size mismatch for {}",
+                    object.key
+                );
+                let hash: String = Sha256::digest(&bytes)
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect();
+                assert_eq!(hash, object.sha256, "hash mismatch for {}", object.key);
+                objects.push((object.key.clone(), bytes));
+            }
+            objects
+        }};
+    }
+
+    /// Opens a replica the way the WASM client does.
+    async fn open_oxkv_reader(objects: Vec<(String, Vec<u8>)>) -> anyhow::Result<oxkv::OxKvReader> {
+        let storage = Arc::new(MemStorage::new());
+        for (key, bytes) in objects {
+            storage
+                .put_opts(&ObjectPath::from(key.as_str()), bytes, PutMode::Create)
+                .await?;
+        }
+        Ok(OxKvStore::builder()
+            .with_store(storage)
+            .with_prefix(ObjectPath::default())
+            .build_reader()
+            .await?)
+    }
+
+    /// Returns every key under `prefix` in a reader.
+    async fn reader_keys(reader: &oxkv::OxKvReader, prefix: &str) -> anyhow::Result<Vec<String>> {
+        let rows = reader
+            .gets_bytes(
+                Some(1000),
+                Direction::Next,
+                (
+                    Some(prefix.to_string()),
+                    KeyPrefix::new(prefix).upper_bound(),
+                ),
+            )
+            .await?;
+        Ok(rows.into_iter().map(|row| row.key).collect())
     }
 
     #[actix_web::test]
@@ -3374,6 +3661,529 @@ mod tests {
         Ok(())
     }
 
+    #[actix_web::test]
+    async fn the_oxkv_manifest_lists_only_the_objects_of_the_caller() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        publish_task_schema(&fx).await?;
+        create_entity(&fx, "e1").await?;
+        create_entity(&fx, "e2").await?;
+        grant_private_row_read(&fx, "alice", "e1").await?;
+        grant_private_row_read(&fx, "bob", "e2").await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let alice = fx.token("alice")?;
+        let bob = fx.token("bob")?;
+
+        for token in [&alice, &bob] {
+            let res = post_replica!(&app, token).await;
+            assert_eq!(res.status(), http::StatusCode::OK);
+        }
+
+        let alice_manifest = get_oxkv_manifest!(&app, &alice);
+        let bob_manifest = get_oxkv_manifest!(&app, &bob);
+        assert_eq!(alice_manifest.generation, 1);
+        assert_eq!(bob_manifest.generation, 1);
+        assert_eq!(alice_manifest.head, fx.runtime.wal().head().await?);
+        assert!(!alice_manifest.objects.is_empty());
+        for key in ["manifest.json", "ownership.json"] {
+            assert!(
+                alice_manifest
+                    .objects
+                    .iter()
+                    .any(|object| object.key == key),
+                "the wrapper must list {key}"
+            );
+        }
+
+        let alice_objects = fetch_oxkv_objects!(&app, &alice, alice_manifest);
+        let bob_objects = fetch_oxkv_objects!(&app, &bob, bob_manifest);
+        assert!(
+            alice_objects
+                .iter()
+                .zip(&bob_objects)
+                .any(|(left, right)| left.1 != right.1),
+            "two users with different entities must get different objects"
+        );
+
+        let alice_reader = open_oxkv_reader(alice_objects).await?;
+        assert!(
+            alice_reader.get_bytes("entity:e1:meta").await?.is_some(),
+            "alice must see her own entity"
+        );
+        assert!(
+            alice_reader.get_bytes("entity:e2:meta").await?.is_none(),
+            "alice must not see bob's entity"
+        );
+        assert_eq!(
+            reader_keys(&alice_reader, "entity:").await?,
+            vec!["entity:e1:meta".to_string()]
+        );
+
+        let bob_reader = open_oxkv_reader(bob_objects).await?;
+        assert!(
+            bob_reader.get_bytes("entity:e2:meta").await?.is_some(),
+            "bob must see his own entity"
+        );
+        assert_eq!(
+            reader_keys(&bob_reader, "entity:").await?,
+            vec!["entity:e2:meta".to_string()]
+        );
+
+        for key in ["missing.json", "0/manifest.json", "../manifest.json"] {
+            let uri = format!("/eav/sync/oxkv/objects/{key}");
+            let res = get_route!(&app, &uri, &alice).await;
+            assert_eq!(
+                res.status(),
+                http::StatusCode::NOT_FOUND,
+                "a key outside the wrapper must be 404: {uri}"
+            );
+        }
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn an_oxkv_rebuild_increments_the_generation_and_keeps_the_old_manifest()
+    -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        publish_task_schema(&fx).await?;
+        create_entity(&fx, "e1").await?;
+        grant_collection_read(&fx, "alice").await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+
+        let res = post_replica!(&app, &token).await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let first = get_oxkv_manifest!(&app, &token);
+        let first_objects = fetch_oxkv_objects!(&app, &token, first);
+
+        create_entity(&fx, "e2").await?;
+        let res = post_replica!(&app, &token).await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let second = get_oxkv_manifest!(&app, &token);
+        assert!(
+            second.generation > first.generation,
+            "a rebuild must increment the generation"
+        );
+        assert!(second.head > first.head, "a rebuild must raise the head");
+
+        create_entity(&fx, "e3").await?;
+        let res = post_replica!(&app, &token).await;
+        assert_eq!(res.status(), http::StatusCode::BAD_REQUEST);
+        let after_failure = get_oxkv_manifest!(&app, &token);
+        assert_eq!(
+            after_failure, second,
+            "a failed build must keep the old wrapper"
+        );
+        let old = fetch_oxkv_objects!(&app, &token, second);
+        assert!(
+            old.iter().any(|(key, bytes)| first_objects
+                .iter()
+                .any(|(old_key, old_bytes)| old_key == key && old_bytes != bytes)),
+            "a rebuild must replace at least one old object"
+        );
+
+        let future = second.head + 100;
+        raise_replica_limit(&fx);
+        fx.runtime
+            .replicas()
+            .put("alice", future, vec![b"[]".to_vec()])
+            .await?;
+        let res = post_replica!(&app, &token).await;
+        assert_eq!(res.status(), http::StatusCode::CONFLICT);
+        let after_stale = get_oxkv_manifest!(&app, &token);
+        assert_eq!(
+            after_stale, second,
+            "a stale head must not replace the wrapper"
+        );
+        let still_readable = fetch_oxkv_objects!(&app, &token, second);
+        assert_eq!(still_readable, old, "the old objects must stay readable");
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn an_empty_oxkv_replica_has_no_entity_rows_and_opens() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        publish_task_schema(&fx).await?;
+        create_entity(&fx, "e1").await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("bob")?;
+
+        let res = post_replica!(&app, &token).await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let body: Value = actix_test::read_body_json(res).await;
+        assert_eq!(body["count"], 0);
+
+        let manifest = get_oxkv_manifest!(&app, &token);
+        assert!(!manifest.objects.is_empty());
+        let objects = fetch_oxkv_objects!(&app, &token, manifest);
+        let reader = open_oxkv_reader(objects).await?;
+        assert!(
+            reader_keys(&reader, "entity:").await?.is_empty(),
+            "an empty user must have no entity row"
+        );
+        assert!(
+            reader.get_bytes("replica:meta").await?.is_some(),
+            "the empty store still has its own marker row"
+        );
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn oxkv_routes_require_a_session_and_a_replica() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+
+        for uri in [
+            "/eav/sync/oxkv/manifest.json",
+            "/eav/sync/oxkv/objects/manifest.json",
+        ] {
+            let res = actix_test::call_service(
+                &app,
+                actix_test::TestRequest::get().uri(uri).to_request(),
+            )
+            .await;
+            assert_eq!(res.status(), http::StatusCode::UNAUTHORIZED, "{uri}");
+        }
+
+        let token = fx.token("alice")?;
+        for uri in [
+            "/eav/sync/oxkv/manifest.json",
+            "/eav/sync/oxkv/objects/manifest.json",
+        ] {
+            let res = get_route!(&app, uri, &token).await;
+            assert_eq!(res.status(), http::StatusCode::NOT_FOUND, "{uri}");
+        }
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn an_oxkv_reset_removes_the_manifest_and_the_objects() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        publish_task_schema(&fx).await?;
+        create_entity(&fx, "e1").await?;
+        grant_collection_read(&fx, "alice").await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+
+        let res = post_replica!(&app, &token).await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let manifest = get_oxkv_manifest!(&app, &token);
+        let key = manifest
+            .objects
+            .first()
+            .expect("the wrapper lists an object")
+            .key
+            .clone();
+
+        let res = delete_route!(&app, "/eav/sync/replica", &token).await;
+        assert_eq!(res.status(), http::StatusCode::NO_CONTENT);
+
+        let res = get_route!(&app, "/eav/sync/oxkv/manifest.json", &token).await;
+        assert_eq!(res.status(), http::StatusCode::NOT_FOUND);
+        let uri = format!("/eav/sync/oxkv/objects/{key}");
+        let res = get_route!(&app, &uri, &token).await;
+        assert_eq!(res.status(), http::StatusCode::NOT_FOUND);
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn a_reset_clears_an_oxkv_only_replica() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        publish_task_schema(&fx).await?;
+        create_entity(&fx, "e1").await?;
+        grant_collection_read(&fx, "alice").await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+
+        let res = post_replica!(&app, &token).await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        assert!(fx.runtime.replicas().clear("alice").await?);
+        assert!(fx.runtime.replicas().status("alice").await?.is_none());
+        assert!(fx.runtime.oxkv().manifest("alice").await?.is_some());
+
+        let res = delete_route!(&app, "/eav/sync/replica", &token).await;
+        assert_eq!(res.status(), http::StatusCode::NO_CONTENT);
+        assert!(fx.runtime.replicas().status("alice").await?.is_none());
+        assert!(fx.runtime.oxkv().manifest("alice").await?.is_none());
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn a_reset_clears_a_json_only_replica() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        publish_task_schema(&fx).await?;
+        create_entity(&fx, "e1").await?;
+        grant_collection_read(&fx, "alice").await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+
+        let res = post_replica!(&app, &token).await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        assert!(fx.runtime.oxkv().clear("alice").await?);
+        assert!(fx.runtime.oxkv().manifest("alice").await?.is_none());
+        assert!(fx.runtime.replicas().status("alice").await?.is_some());
+
+        let res = delete_route!(&app, "/eav/sync/replica", &token).await;
+        assert_eq!(res.status(), http::StatusCode::NO_CONTENT);
+        assert!(fx.runtime.replicas().status("alice").await?.is_none());
+        assert!(fx.runtime.oxkv().manifest("alice").await?.is_none());
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn a_reset_waits_for_a_build_and_leaves_neither_replica() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        publish_task_schema(&fx).await?;
+        create_entity(&fx, "e1").await?;
+        grant_collection_read(&fx, "alice").await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+
+        let guard = fx.runtime.oxkv().lock_subject("alice").await;
+        let build = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::post().uri("/eav/sync/replica"),
+                &token,
+            )
+            .to_request(),
+        );
+        let reset = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::delete().uri("/eav/sync/replica"),
+                &token,
+            )
+            .to_request(),
+        );
+        let release = async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            drop(guard);
+        };
+        let (build_res, reset_res, ()) = tokio::join!(build, reset, release);
+
+        assert_eq!(build_res.status(), http::StatusCode::OK);
+        assert_eq!(reset_res.status(), http::StatusCode::NO_CONTENT);
+        assert!(fx.runtime.replicas().status("alice").await?.is_none());
+        assert!(fx.runtime.oxkv().manifest("alice").await?.is_none());
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn a_failed_oxkv_publish_keeps_the_old_wrapper_and_the_next_build_reconciles()
+    -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        publish_task_schema(&fx).await?;
+        create_entity(&fx, "e1").await?;
+        grant_collection_read(&fx, "alice").await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+
+        let res = post_replica!(&app, &token).await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let first = get_oxkv_manifest!(&app, &token);
+        let first_objects = fetch_oxkv_objects!(&app, &token, first);
+
+        fx.runtime.oxkv().fail_next_publish();
+        fx.runtime.oxkv().fail_next_publish();
+        let res = post_replica!(&app, &token).await;
+        assert_eq!(res.status(), http::StatusCode::CONFLICT);
+        let after_failure = get_oxkv_manifest!(&app, &token);
+        assert_eq!(
+            after_failure, first,
+            "a failed publish must keep the old wrapper"
+        );
+        assert_eq!(
+            fetch_oxkv_objects!(&app, &token, first),
+            first_objects,
+            "a failed publish must keep the old objects readable"
+        );
+
+        let stored = fx
+            .runtime
+            .replicas()
+            .get("alice")
+            .await?
+            .expect("the JSON replica committed");
+        assert!(
+            stored.generation > first.generation,
+            "the JSON replica advanced before the failed publish"
+        );
+
+        let res = post_replica!(&app, &token).await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let built: Value = actix_test::read_body_json(res).await;
+        let reconciled = get_oxkv_manifest!(&app, &token);
+        assert_eq!(built["generation"], reconciled.generation);
+        assert_eq!(built["head"], reconciled.head);
+        assert!(
+            reconciled.generation > stored.generation,
+            "the next build must reconcile to a newer generation"
+        );
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn a_generation_collision_is_retried() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        publish_task_schema(&fx).await?;
+        create_entity(&fx, "e1").await?;
+        grant_collection_read(&fx, "alice").await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+
+        fx.runtime.oxkv().fail_next_generation();
+        let res = post_replica!(&app, &token).await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let built: Value = actix_test::read_body_json(res).await;
+        assert_eq!(built["generation"], 1);
+        let manifest = get_oxkv_manifest!(&app, &token);
+        assert_eq!(manifest.generation, 1);
+        assert_eq!(manifest.head, built["head"]);
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn a_failed_build_keeps_the_previous_published_generation() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        publish_task_schema(&fx).await?;
+        create_entity(&fx, "e1").await?;
+        grant_collection_read(&fx, "alice").await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+
+        let res = post_replica!(&app, &token).await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let first = get_oxkv_manifest!(&app, &token);
+
+        fx.runtime.oxkv().fail_next_publish();
+        fx.runtime.oxkv().fail_next_publish();
+        let res = post_replica!(&app, &token).await;
+        assert_eq!(res.status(), http::StatusCode::CONFLICT);
+        let stored = fx
+            .runtime
+            .replicas()
+            .get("alice")
+            .await?
+            .expect("the JSON replica committed");
+        for generation in (first.generation + 1)..=stored.generation {
+            assert!(
+                fx.runtime
+                    .oxkv()
+                    .build_pointer_for_test("alice", generation)
+                    .await?
+                    .is_none(),
+                "the failed generation {generation} kept its pointer"
+            );
+            assert!(
+                fx.runtime
+                    .oxkv()
+                    .generation_objects_for_test("alice", generation)
+                    .await?
+                    .is_empty(),
+                "the failed generation {generation} kept its objects"
+            );
+        }
+
+        let res = post_replica!(&app, &token).await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let reconciled = get_oxkv_manifest!(&app, &token);
+        assert!(reconciled.generation > stored.generation);
+        assert_eq!(
+            fx.runtime
+                .oxkv()
+                .generation_objects_for_test("alice", first.generation)
+                .await?,
+            first.objects,
+            "the previous published objects must stay readable"
+        );
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn a_versionless_wrapper_is_replaced() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        publish_task_schema(&fx).await?;
+        create_entity(&fx, "e1").await?;
+        grant_collection_read(&fx, "alice").await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+
+        let res = post_replica!(&app, &token).await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let first = get_oxkv_manifest!(&app, &token);
+
+        fx.runtime.oxkv().strip_wrapper_version_for_test(true);
+        let res = post_replica!(&app, &token).await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let second = get_oxkv_manifest!(&app, &token);
+        assert!(
+            second.generation > first.generation,
+            "a rebuild must replace a versionless wrapper"
+        );
+        fetch_oxkv_objects!(&app, &token, second);
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn a_failed_versionless_replace_keeps_the_old_wrapper() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        publish_task_schema(&fx).await?;
+        create_entity(&fx, "e1").await?;
+        grant_collection_read(&fx, "alice").await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+
+        let res = post_replica!(&app, &token).await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let first = get_oxkv_manifest!(&app, &token);
+
+        fx.runtime.oxkv().strip_wrapper_version_for_test(true);
+        fx.runtime.oxkv().fail_next_wrapper_create();
+        let res = post_replica!(&app, &token).await;
+        assert_eq!(res.status(), http::StatusCode::CONFLICT);
+        let after_failure = get_oxkv_manifest!(&app, &token);
+        assert_eq!(
+            after_failure, first,
+            "a failed versionless replace must restore the old wrapper"
+        );
+        fetch_oxkv_objects!(&app, &token, first);
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn the_oxkv_wrapper_matches_the_json_replica_generation_and_head() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        publish_task_schema(&fx).await?;
+        create_entity(&fx, "e1").await?;
+        grant_collection_read(&fx, "alice").await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+
+        let res = post_replica!(&app, &token).await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let built: Value = actix_test::read_body_json(res).await;
+        let manifest = get_oxkv_manifest!(&app, &token);
+
+        assert_eq!(built["generation"], manifest.generation);
+        assert_eq!(built["head"], manifest.head);
+        assert_eq!(manifest.generation, 1);
+        Ok(())
+    }
+
     #[test]
     fn openapi_includes_sync_paths_and_schemas() {
         let spec: Value =
@@ -3389,6 +4199,8 @@ mod tests {
             "spec missing DELETE /eav/sync/replica"
         );
         assert!(paths.contains_key("/eav/sync/replica/status"));
+        assert!(paths.contains_key("/eav/sync/oxkv/manifest.json"));
+        assert!(paths.contains_key("/eav/sync/oxkv/objects/{object}"));
         let schemas = spec["components"]["schemas"]
             .as_object()
             .expect("component schemas");
@@ -3402,6 +4214,8 @@ mod tests {
             "ReplicaChunkQuery",
             "ReplicaChunkResponse",
             "ReplicaStatusResponse",
+            "ReplicaManifest",
+            "ReplicaObject",
             "EntityEvent",
             "AttributeChange",
         ] {
