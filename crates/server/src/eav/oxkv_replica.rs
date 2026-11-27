@@ -213,6 +213,9 @@ pub struct OxkvReplicaStore {
     skip_probe: bool,
     /// One build lock for each subject hash.
     builds: Arc<std::sync::Mutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
+    /// The number of test publishes that must fail before the wrapper write.
+    #[cfg(test)]
+    publish_failures: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl OxkvReplicaStore {
@@ -230,7 +233,16 @@ impl OxkvReplicaStore {
             root: root.trim_matches('/').to_string(),
             skip_probe: cfg.backend == S3Backend::Memory,
             builds: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            #[cfg(test)]
+            publish_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
+    }
+
+    /// Makes the next wrapper publish fail in a test.
+    #[cfg(test)]
+    pub(crate) fn fail_next_publish(&self) {
+        self.publish_failures
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Locks one subject for a build in this process.
@@ -308,6 +320,16 @@ impl OxkvReplicaStore {
         sub: &str,
         prepared: &PreparedGeneration,
     ) -> Result<(), EntityError> {
+        #[cfg(test)]
+        if self
+            .publish_failures
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > 0
+        {
+            self.publish_failures
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            return Err(EntityError::PublishConflict);
+        }
         let hash = sub_hash(sub);
         let storage = self.storage_at(&hash);
         let manifest = ReplicaManifest {
@@ -318,7 +340,11 @@ impl OxkvReplicaStore {
         let payload = serde_json::to_vec(&manifest)
             .map_err(|error| EntityError::Internal(error.to_string()))?;
         for _attempt in 0..WRAPPER_PUT_ATTEMPTS {
-            let existing = self.read_wrapper(&hash).await?;
+            let existing = match self.read_wrapper(&hash).await {
+                Ok(existing) => existing,
+                Err(EntityError::Store(error)) if error.is_retryable() => continue,
+                Err(error) => return Err(error),
+            };
             if let Some((stored, _)) = &existing
                 && prepared.head < stored.head
             {
@@ -346,13 +372,11 @@ impl OxkvReplicaStore {
                     }
                     return Ok(());
                 }
-                Err(StoreError::CasConflict(_)) => continue,
+                Err(error) if error.is_retryable() => continue,
                 Err(error) => return Err(EntityError::Store(error)),
             }
         }
-        Err(EntityError::Internal(
-            "oxkv replica wrapper publish conflicted with another writer".to_string(),
-        ))
+        Err(EntityError::PublishConflict)
     }
 
     /// Removes one unpublished generation.

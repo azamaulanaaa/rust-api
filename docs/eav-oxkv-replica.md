@@ -60,8 +60,12 @@ replica.
 Each build increments it, including a build at an equal head.
 `head` is the change-feed sequence of the build.
 The client applies the events after `head`.
-The wrapper generation and head equal the JSON replica generation and head for
-the same build.
+The wrapper generation and head equal the JSON replica generation and head
+after a successful build.
+A failed wrapper publish can leave the JSON replica at a newer generation.
+The server then returns `409`.
+The old wrapper and the old objects stay readable.
+The next successful build reconciles the wrapper to the JSON replica.
 
 `objects` lists every raw OxKV object of the replica.
 `key` is relative to the replica root.
@@ -139,6 +143,8 @@ This replica is read-only, so the client never writes through it.
 A build writes every object first.
 It publishes the wrapper last.
 A build that fails partway leaves the old wrapper and the old objects readable.
+A failed wrapper publish returns `409` and keeps the old wrapper.
+A later build reconciles the wrapper to the current JSON generation and head.
 A lower head never replaces a higher wrapper.
 A rebuild keeps the current generation and the one before it.
 It removes older generations after the new wrapper is visible.

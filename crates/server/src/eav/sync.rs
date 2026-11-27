@@ -788,7 +788,18 @@ async fn build_replica_inner(
         };
         match runtime.replicas().put(&claims.sub, head, chunks).await {
             Ok(actual) if actual == planned => {
-                runtime.oxkv().publish(&claims.sub, &prepared).await?;
+                if let Err(error) = runtime.oxkv().publish(&claims.sub, &prepared).await {
+                    tracing::warn!(
+                        %error,
+                        subject = %claims.sub,
+                        "oxkv replica wrapper publish failed after the JSON commit"
+                    );
+                    let _ = runtime
+                        .oxkv()
+                        .discard_generation(&claims.sub, planned)
+                        .await;
+                    return Err(EavApiError::Conflict(Box::new(ReplicaBuildRestarted)));
+                }
                 return Ok(HttpResponse::Ok().json(ReplicaBuildResponse {
                     head,
                     generation: actual,
@@ -3949,6 +3960,60 @@ mod tests {
         assert_eq!(reset_res.status(), http::StatusCode::NO_CONTENT);
         assert!(fx.runtime.replicas().status("alice").await?.is_none());
         assert!(fx.runtime.oxkv().manifest("alice").await?.is_none());
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn a_failed_oxkv_publish_keeps_the_old_wrapper_and_the_next_build_reconciles()
+    -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        publish_task_schema(&fx).await?;
+        create_entity(&fx, "e1").await?;
+        grant_collection_read(&fx, "alice").await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+
+        let res = post_replica!(&app, &token).await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let first = get_oxkv_manifest!(&app, &token);
+        let first_objects = fetch_oxkv_objects!(&app, &token, first);
+
+        fx.runtime.oxkv().fail_next_publish();
+        let res = post_replica!(&app, &token).await;
+        assert_eq!(res.status(), http::StatusCode::CONFLICT);
+        let after_failure = get_oxkv_manifest!(&app, &token);
+        assert_eq!(
+            after_failure, first,
+            "a failed publish must keep the old wrapper"
+        );
+        assert_eq!(
+            fetch_oxkv_objects!(&app, &token, first),
+            first_objects,
+            "a failed publish must keep the old objects readable"
+        );
+
+        let stored = fx
+            .runtime
+            .replicas()
+            .get("alice")
+            .await?
+            .expect("the JSON replica committed");
+        assert!(
+            stored.generation > first.generation,
+            "the JSON replica advanced before the failed publish"
+        );
+
+        let res = post_replica!(&app, &token).await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let built: Value = actix_test::read_body_json(res).await;
+        let reconciled = get_oxkv_manifest!(&app, &token);
+        assert_eq!(built["generation"], reconciled.generation);
+        assert_eq!(built["head"], reconciled.head);
+        assert!(
+            reconciled.generation > stored.generation,
+            "the next build must reconcile to a newer generation"
+        );
         Ok(())
     }
 
