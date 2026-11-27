@@ -254,24 +254,34 @@ impl<T: Transport> JobClient<T> {
 
     /// Apply one event view to the stored pending job.
     ///
-    /// The view is stored when its id matches `expected_id`. A terminal stored
-    /// job with the same id does not change. The method returns `None` when
-    /// the view names another job. The watcher uses this method for the
-    /// initial, status, and terminal events.
+    /// The view is stored when its id matches `expected_id`. A stored job
+    /// with another id is replaced. A terminal stored job with the same id
+    /// does not change. The method returns `None` when the view names another
+    /// job. The watcher uses this method for the initial, status, and terminal
+    /// events.
     pub(crate) fn apply_view(&self, expected_id: &str, view: JobStatusView) -> Option<PendingJob> {
         let job = PendingJob::from_view(view);
         if job.id != expected_id {
             return None;
         }
+        Some(self.apply_pending(job))
+    }
+
+    /// Store one job in the pending slot and return the stored value.
+    ///
+    /// The call stores the job when the slot is empty or holds another job. A
+    /// terminal stored job with the same id does not change. The watcher uses
+    /// this method for a fallback poll.
+    pub(crate) fn apply_pending(&self, job: PendingJob) -> PendingJob {
         let current = self.pending.borrow().clone();
         if let Some(current) = current
             && current.id == job.id
             && current.is_terminal()
         {
-            return Some(current);
+            return current;
         }
         self.pending.replace(Some(job.clone()));
-        Some(job)
+        job
     }
 
     /// Read the status of one job and update the stored pending job.

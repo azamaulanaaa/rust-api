@@ -106,8 +106,9 @@ The watcher drops the stream and polls `GET /jobs/{id}` when:
 - a view names another job.
 
 The fallback polls at most 60 times, one second apart. It does not busy-loop.
-A zero interval skips the wait. A terminal poll stops the fallback. A watch
-that reaches the poll bound returns the `request` error. The stream is
+A zero interval skips the wait. Each poll updates the pending job. A terminal
+poll stops the fallback. A watch that reaches the poll bound returns the
+`request` error. The stream is
 dropped before the first poll, so a browser source cannot reconnect during
 the fallback.
 

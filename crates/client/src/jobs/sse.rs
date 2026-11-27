@@ -178,8 +178,8 @@ impl Default for WatchOptions {
 /// An `error` event, a stream failure, or a stream that closes without a
 /// terminal event starts the poll fallback. The fallback calls
 /// [`JobClient::poll`] up to [`WatchOptions::max_polls`] times and waits
-/// [`WatchOptions::poll_interval`] between two polls. A terminal poll stops
-/// the fallback.
+/// [`WatchOptions::poll_interval`] between two polls. Each poll updates the
+/// pending job. A terminal poll stops the fallback.
 ///
 /// A `401`, `403`, or `404` that the source reports before the stream starts
 /// maps to [`JobError::LoginRequired`], [`JobError::Forbidden`], or
@@ -268,6 +268,9 @@ where
 {
     for poll in 0..options.max_polls {
         let job = jobs.poll(id).await?;
+        // A poll does not store a job when the slot is empty. The watcher
+        // stores the answer, so `pending_job()` reflects the fallback.
+        let job = jobs.apply_pending(job);
         on_event(&job);
         if job.is_terminal() {
             return Ok(job);
