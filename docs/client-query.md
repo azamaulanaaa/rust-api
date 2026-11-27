@@ -27,6 +27,8 @@ The client keeps the two sources apart with `ReplicaSource`:
 - `ReplicaSource::EAV_OXKV`: manifest `/eav/sync/oxkv/manifest.json`,
   objects `/eav/sync/oxkv/objects/{key}`.
 
+The source fields are private. Use the two constants to select a source.
+
 Both sources use the `auth_token` cookie. Both reject an older generation,
 check every object size and SHA-256, and clear the cache on `401` or `403`.
 

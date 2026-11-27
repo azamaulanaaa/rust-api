@@ -50,13 +50,14 @@ const EAV_OBJECT_PREFIX: &str = "/eav/sync/oxkv/objects/";
 /// The two routes that serve one replica.
 ///
 /// The source keeps the manifest path and the object path prefix together,
-/// so one client cannot mix the routes of two replicas.
+/// so one client cannot mix the routes of two replicas. The fields are
+/// private. Use [`ReplicaSource::FILE`] or [`ReplicaSource::EAV_OXKV`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReplicaSource {
     /// The route that returns the replica manifest.
-    pub manifest_path: &'static str,
+    manifest_path: &'static str,
     /// The route prefix for one replica object.
-    pub object_prefix: &'static str,
+    object_prefix: &'static str,
 }
 
 impl ReplicaSource {
@@ -75,6 +76,16 @@ impl ReplicaSource {
         manifest_path: EAV_MANIFEST_PATH,
         object_prefix: EAV_OBJECT_PREFIX,
     };
+
+    /// Return the manifest route of this source.
+    pub const fn manifest_path(&self) -> &'static str {
+        self.manifest_path
+    }
+
+    /// Return the object route prefix of this source.
+    pub const fn object_prefix(&self) -> &'static str {
+        self.object_prefix
+    }
 }
 
 /// The generation and the sync position of the stored replica.
@@ -289,7 +300,7 @@ impl<T: Transport> ReplicaClient<T> {
         let clear_epoch = self.clear_epoch.get();
         let stored = self.cache.borrow().state;
 
-        let manifest_body = self.get(self.source.manifest_path).await?;
+        let manifest_body = self.get(self.source.manifest_path()).await?;
         let manifest: ReplicaManifest =
             serde_json::from_slice(&manifest_body).map_err(ReplicaError::Manifest)?;
 
@@ -305,7 +316,7 @@ impl<T: Transport> ReplicaClient<T> {
         let mut objects = BTreeMap::new();
         for object in &manifest.objects {
             validate_key(&object.key)?;
-            let path = format!("{}{}", self.source.object_prefix, object.key);
+            let path = format!("{}{}", self.source.object_prefix(), object.key);
             let bytes = self.get(&path).await?;
             verify_object(object, &bytes)?;
             objects.insert(object.key.clone(), Arc::<[u8]>::from(bytes));
@@ -692,6 +703,14 @@ mod tests {
                 "/eav/sync/oxkv/manifest.json",
                 "/eav/sync/oxkv/objects/manifest.json",
             ]
+        );
+        assert_eq!(
+            ReplicaSource::EAV_OXKV.manifest_path(),
+            "/eav/sync/oxkv/manifest.json"
+        );
+        assert_eq!(
+            ReplicaSource::EAV_OXKV.object_prefix(),
+            "/eav/sync/oxkv/objects/"
         );
         assert_eq!(client.source(), ReplicaSource::EAV_OXKV);
     }
