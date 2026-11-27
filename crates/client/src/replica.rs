@@ -1,9 +1,14 @@
 //! The replica loader and its in-memory cache.
 //!
-//! The client downloads the per-user replica that the server built. The
-//! server filters the replica for the authenticated subject. The client
-//! downloads `GET /sync/db/manifest.json` and then every object that the
-//! manifest names.
+//! The client downloads a per-user replica that the server built. The server
+//! filters the replica for the authenticated subject.
+//!
+//! A [`ReplicaSource`] names the manifest path and the object path prefix.
+//! The file replica uses `/sync/db/`. The EAV oxkv replica uses
+//! `/eav/sync/oxkv/`.
+//!
+//! The client downloads the manifest and then every object that the manifest
+//! names.
 //!
 //! The loader verifies the size and the SHA-256 of every object. It builds
 //! the new cache in a temporary map and swaps it in only after every object
@@ -30,11 +35,47 @@ use sha2::{Digest, Sha256};
 
 use crate::auth::{Credentials, Method, Request, Transport, TransportError};
 
-/// The route that serves the replica manifest.
-const MANIFEST_PATH: &str = "/sync/db/manifest.json";
+/// The route that serves the file replica manifest.
+const FILE_MANIFEST_PATH: &str = "/sync/db/manifest.json";
 
-/// The prefix of the route that serves one replica object.
-const OBJECT_PREFIX: &str = "/sync/db/";
+/// The prefix of the route that serves one file replica object.
+const FILE_OBJECT_PREFIX: &str = "/sync/db/";
+
+/// The route that serves the EAV oxkv replica manifest.
+const EAV_MANIFEST_PATH: &str = "/eav/sync/oxkv/manifest.json";
+
+/// The prefix of the route that serves one EAV oxkv replica object.
+const EAV_OBJECT_PREFIX: &str = "/eav/sync/oxkv/objects/";
+
+/// The two routes that serve one replica.
+///
+/// The source keeps the manifest path and the object path prefix together,
+/// so one client cannot mix the routes of two replicas.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReplicaSource {
+    /// The route that returns the replica manifest.
+    pub manifest_path: &'static str,
+    /// The route prefix for one replica object.
+    pub object_prefix: &'static str,
+}
+
+impl ReplicaSource {
+    /// The file replica under `/sync/db/`.
+    ///
+    /// The file replica holds no EAV entity row.
+    pub const FILE: Self = Self {
+        manifest_path: FILE_MANIFEST_PATH,
+        object_prefix: FILE_OBJECT_PREFIX,
+    };
+
+    /// The per-user EAV oxkv replica under `/eav/sync/oxkv/`.
+    ///
+    /// The object keys are relative to the replica root.
+    pub const EAV_OXKV: Self = Self {
+        manifest_path: EAV_MANIFEST_PATH,
+        object_prefix: EAV_OBJECT_PREFIX,
+    };
+}
 
 /// The generation and the sync position of the stored replica.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -143,7 +184,9 @@ struct ReplicaCache {
     /// The state of the stored replica, if a load has succeeded.
     state: Option<ReplicaState>,
     /// The shared object bytes, keyed by the manifest key.
-    objects: BTreeMap<String, Arc<[u8]>>,
+    ///
+    /// One `Arc` lets a reader keep the map after the cache changes.
+    objects: Arc<BTreeMap<String, Arc<[u8]>>>,
 }
 
 /// Downloads and stores the per-user replica over one transport.
@@ -155,6 +198,7 @@ struct ReplicaCache {
 #[derive(Debug)]
 pub struct ReplicaClient<T: Transport> {
     transport: T,
+    source: ReplicaSource,
     cache: RefCell<ReplicaCache>,
     /// The number of the newest load. A load that is not the newest one
     /// cannot commit.
@@ -165,16 +209,29 @@ pub struct ReplicaClient<T: Transport> {
 }
 
 impl<T: Transport> ReplicaClient<T> {
-    /// Build a client over one transport.
+    /// Build a client over one transport for the file replica.
     ///
     /// This constructor does no network work.
     pub fn new(transport: T) -> Self {
+        Self::with_source(transport, ReplicaSource::FILE)
+    }
+
+    /// Build a client over one transport for one replica source.
+    ///
+    /// This constructor does no network work.
+    pub fn with_source(transport: T, source: ReplicaSource) -> Self {
         Self {
             transport,
+            source,
             cache: RefCell::new(ReplicaCache::default()),
             load_epoch: Cell::new(0),
             clear_epoch: Cell::new(0),
         }
+    }
+
+    /// Return the route source of this client.
+    pub fn source(&self) -> ReplicaSource {
+        self.source
     }
 
     /// Return the state of the stored replica.
@@ -196,6 +253,15 @@ impl<T: Transport> ReplicaClient<T> {
         self.cache.borrow().objects.len()
     }
 
+    /// Return the stored object map, if a load has succeeded.
+    ///
+    /// The caller can keep the map while a later load replaces the cache.
+    /// The map holds the bytes of one generation only.
+    pub fn objects(&self) -> Option<Arc<BTreeMap<String, Arc<[u8]>>>> {
+        let cache = self.cache.borrow();
+        cache.state.map(|_| Arc::clone(&cache.objects))
+    }
+
     /// Remove the stored replica.
     ///
     /// A load that is in flight cannot repopulate the cache after a clear.
@@ -206,8 +272,8 @@ impl<T: Transport> ReplicaClient<T> {
 
     /// Download the manifest and every object, then store the new replica.
     ///
-    /// The load fetches `GET /sync/db/manifest.json` and then each object
-    /// from `GET /sync/db/{key}` with cookie credentials. It rejects a
+    /// The load fetches the manifest of the source and then each object from
+    /// the object prefix of the source with cookie credentials. It rejects a
     /// manifest generation that is older than the stored generation. It
     /// verifies the byte length and the SHA-256 of every object. The new
     /// objects replace the stored objects only after every check passes.
@@ -223,7 +289,7 @@ impl<T: Transport> ReplicaClient<T> {
         let clear_epoch = self.clear_epoch.get();
         let stored = self.cache.borrow().state;
 
-        let manifest_body = self.get(MANIFEST_PATH).await?;
+        let manifest_body = self.get(self.source.manifest_path).await?;
         let manifest: ReplicaManifest =
             serde_json::from_slice(&manifest_body).map_err(ReplicaError::Manifest)?;
 
@@ -239,7 +305,7 @@ impl<T: Transport> ReplicaClient<T> {
         let mut objects = BTreeMap::new();
         for object in &manifest.objects {
             validate_key(&object.key)?;
-            let path = format!("{OBJECT_PREFIX}{}", object.key);
+            let path = format!("{}{}", self.source.object_prefix, object.key);
             let bytes = self.get(&path).await?;
             verify_object(object, &bytes)?;
             objects.insert(object.key.clone(), Arc::<[u8]>::from(bytes));
@@ -264,7 +330,7 @@ impl<T: Transport> ReplicaClient<T> {
         if self.clear_epoch.get() != clear_epoch || self.load_epoch.get() != load_epoch {
             return Err(ReplicaError::Superseded);
         }
-        cache.objects = objects;
+        cache.objects = Arc::new(objects);
         cache.state = Some(state);
         Ok(state)
     }
@@ -604,6 +670,47 @@ mod tests {
         assert!(requests.iter().all(|request| {
             request.method == Method::Get && request.credentials == Credentials::Include
         }));
+    }
+
+    /// The EAV source uses the EAV manifest and object routes.
+    #[test]
+    fn the_eav_source_uses_the_eav_routes() {
+        let (requests, replies, transport) = FakeTransport::new();
+        let client = ReplicaClient::with_source(transport, ReplicaSource::EAV_OXKV);
+        script_load(&replies, 3, 9, &[("manifest.json", b"{}")]);
+
+        block_on(client.load()).expect("the load succeeds");
+
+        let requests = requests.borrow();
+        let paths: Vec<&str> = requests
+            .iter()
+            .map(|request| request.path.as_str())
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                "/eav/sync/oxkv/manifest.json",
+                "/eav/sync/oxkv/objects/manifest.json",
+            ]
+        );
+        assert_eq!(client.source(), ReplicaSource::EAV_OXKV);
+    }
+
+    /// The stored map keeps one generation after a later load.
+    #[test]
+    fn a_stored_map_keeps_its_bytes_after_a_later_load() {
+        let (_, replies, transport) = FakeTransport::new();
+        let client = ReplicaClient::new(transport);
+        script_load(&replies, 1, 5, &[("e0/old", b"old")]);
+        block_on(client.load()).expect("the first load succeeds");
+        let stored = client.objects().expect("the map is stored");
+
+        script_load(&replies, 2, 6, &[("e0/new", b"new")]);
+        block_on(client.load()).expect("the second load succeeds");
+
+        assert_eq!(stored.get("e0/old").map(AsRef::as_ref), Some(&b"old"[..]));
+        assert!(!stored.contains_key("e0/new"));
+        assert_eq!(client.objects().as_deref().map(BTreeMap::len), Some(1));
     }
 
     /// A mismatched hash is rejected and the old cache stays in place.
