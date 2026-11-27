@@ -3993,6 +3993,7 @@ mod tests {
         let first_objects = fetch_oxkv_objects!(&app, &token, first);
 
         fx.runtime.oxkv().fail_next_publish();
+        fx.runtime.oxkv().fail_next_publish();
         let res = post_replica!(&app, &token).await;
         assert_eq!(res.status(), http::StatusCode::CONFLICT);
         let after_failure = get_oxkv_manifest!(&app, &token);
