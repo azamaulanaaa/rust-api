@@ -254,6 +254,9 @@ pub struct OxkvReplicaStore {
     /// The number of test builds that must see a generation conflict.
     #[cfg(test)]
     generation_conflicts: Arc<std::sync::atomic::AtomicUsize>,
+    /// True when a test hides the wrapper object version.
+    #[cfg(test)]
+    strip_wrapper_version: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl OxkvReplicaStore {
@@ -275,6 +278,8 @@ impl OxkvReplicaStore {
             publish_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
             generation_conflicts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            strip_wrapper_version: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 
@@ -290,6 +295,13 @@ impl OxkvReplicaStore {
     pub(crate) fn fail_next_generation(&self) {
         self.generation_conflicts
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Hides the wrapper object version in a test.
+    #[cfg(test)]
+    pub(crate) fn strip_wrapper_version_for_test(&self, strip: bool) {
+        self.strip_wrapper_version
+            .store(strip, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Locks one subject for a build in this process.
@@ -429,7 +441,16 @@ impl OxkvReplicaStore {
             }
             let mode = match &existing {
                 Some((_, Some(version))) => PutMode::Update(version.clone()),
-                Some((_, None)) => PutMode::Create,
+                Some((_, None)) => {
+                    // A versionless backend cannot compare the old row.
+                    // Remove the row, then create it. A racing create returns
+                    // a retryable conflict on the next loop.
+                    storage
+                        .delete(&ObjectPath::from("manifest.json"))
+                        .await
+                        .map_err(EntityError::Store)?;
+                    PutMode::Create
+                }
                 None => PutMode::Create,
             };
             match storage
@@ -553,7 +574,10 @@ impl OxkvReplicaStore {
         generation: u64,
     ) -> Result<Arc<dyn Storage>, EntityError> {
         let generation_storage = self.storage_at(&format!("{hash}/{generation}"));
-        let output = match generation_storage.get(&ObjectPath::from("build.json")).await {
+        let output = match generation_storage
+            .get(&ObjectPath::from("build.json"))
+            .await
+        {
             Ok(output) => output,
             Err(error) if is_not_found(&error) => return Ok(generation_storage),
             Err(error) => return Err(EntityError::Store(error)),
@@ -590,7 +614,10 @@ impl OxkvReplicaStore {
                     return Err(EntityError::GenerationTaken);
                 }
                 Err(error) if is_not_found(&error) => {
-                    match storage.put_opts(&path, payload.clone(), PutMode::Create).await {
+                    match storage
+                        .put_opts(&path, payload.clone(), PutMode::Create)
+                        .await
+                    {
                         Ok(_) => return Ok(()),
                         Err(error) if error.is_retryable() => continue,
                         Err(error) => return Err(EntityError::Store(error)),
@@ -621,6 +648,15 @@ impl OxkvReplicaStore {
         let version = match (output.e_tag, output.version) {
             (None, None) => None,
             (e_tag, version) => Some(ObjectVersion { e_tag, version }),
+        };
+        #[cfg(test)]
+        let version = if self
+            .strip_wrapper_version
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            None
+        } else {
+            version
         };
         Ok(Some((manifest, version)))
     }
@@ -746,10 +782,7 @@ mod tests {
         );
         let loser_storage = store.storage_at(&format!("{hash}/1/{loser_id}"));
         assert!(
-            loser_storage
-                .list(&ObjectPath::default())
-                .await?
-                .is_empty(),
+            loser_storage.list(&ObjectPath::default()).await?.is_empty(),
             "the loser build prefix remains"
         );
         store.publish("alice", &prepared).await?;

@@ -4052,6 +4052,32 @@ mod tests {
     }
 
     #[actix_web::test]
+    async fn a_versionless_wrapper_is_replaced() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        publish_task_schema(&fx).await?;
+        create_entity(&fx, "e1").await?;
+        grant_collection_read(&fx, "alice").await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+
+        let res = post_replica!(&app, &token).await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let first = get_oxkv_manifest!(&app, &token);
+
+        fx.runtime.oxkv().strip_wrapper_version_for_test(true);
+        let res = post_replica!(&app, &token).await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let second = get_oxkv_manifest!(&app, &token);
+        assert!(
+            second.generation > first.generation,
+            "a rebuild must replace a versionless wrapper"
+        );
+        fetch_oxkv_objects!(&app, &token, second);
+        Ok(())
+    }
+
+    #[actix_web::test]
     async fn the_oxkv_wrapper_matches_the_json_replica_generation_and_head() -> anyhow::Result<()> {
         let fx = fixture().await?;
         publish_task_schema(&fx).await?;
