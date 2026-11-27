@@ -224,7 +224,7 @@ impl<T: Transport> JobClient<T> {
                 self.pending.replace(Some(job.clone()));
                 Ok(job)
             }
-            status => Err(JobError::from_status(status)),
+            status => Err(JobError::from_submit_status(status)),
         }
     }
 
@@ -264,20 +264,29 @@ impl<T: Transport> JobClient<T> {
                 }
                 Ok(job)
             }
-            status => Err(JobError::from_status(status)),
+            status => Err(JobError::from_poll_status(status)),
         }
     }
 }
 
 impl JobError {
-    /// Map one unexpected HTTP status to a stable error.
-    const fn from_status(status: u16) -> Self {
+    /// Map one unexpected submit status to a stable error.
+    const fn from_submit_status(status: u16) -> Self {
         match status {
             400 => Self::InvalidCommand,
             401 => Self::LoginRequired,
             403 => Self::Forbidden,
-            404 => Self::NotFound,
             409 => Self::Conflict,
+            _ => Self::Request,
+        }
+    }
+
+    /// Map one unexpected poll status to a stable error.
+    const fn from_poll_status(status: u16) -> Self {
+        match status {
+            401 => Self::LoginRequired,
+            403 => Self::Forbidden,
+            404 => Self::NotFound,
             _ => Self::Request,
         }
     }
@@ -561,10 +570,15 @@ mod tests {
         assert_eq!(client.pending(), Some(done));
     }
 
-    /// A conflict and an invalid command map to stable errors.
+    /// Submit maps a conflict, an invalid command, and other statuses.
     #[test]
-    fn submit_maps_conflict_and_bad_request() {
-        for (status, expected) in [(409, JobError::Conflict), (400, JobError::InvalidCommand)] {
+    fn submit_maps_conflict_and_invalid_statuses() {
+        for (status, expected) in [
+            (409, JobError::Conflict),
+            (400, JobError::InvalidCommand),
+            (403, JobError::Forbidden),
+            (404, JobError::Request),
+        ] {
             let (requests, replies, transport) = FakeTransport::new();
             replies.borrow_mut().push_back(Reply::status(status));
             let client = JobClient::new(transport);
