@@ -38,6 +38,16 @@
 //! The full read is for compatibility.
 //! Use the chunk read to page a large replica.
 //!
+//! The OxKV mirror holds only the `entity:{id}:meta` and
+//! `entity:{id}:attr:{name}` rows that the caller can read.
+//! It holds no index, outbox, timer, or reverse-reference row.
+//! The wrapper names each raw OxKV object with its size and SHA-256.
+//! The wrapper generation and head equal the JSON replica generation and head.
+//! The build publishes the wrapper only after every object is written.
+//! A lower head never replaces a higher head.
+//! A rebuild keeps the current and the previous generation.
+//! A failed build leaves the old wrapper and the old generation readable.
+//!
 //! A reset removes the snapshot, the chunks, the manifest, the generation, and
 //! the head.
 //! The caller needs a valid session and no management grant.
@@ -83,6 +93,7 @@ use std::time::Instant;
 
 use crate::eav::entity::Entity;
 use crate::eav::entity_error::EntityError;
+use crate::eav::oxkv_replica::OxkvGeneration;
 use crate::eav::route::{
     ENTITIES, ENTITY_ROW, EavApiError, PageMode, PageQuery, can_read_entity, page_next_offset,
     visible_cursor_page,
@@ -646,6 +657,18 @@ impl std::fmt::Display for MissingOxkvObject {
 
 impl std::error::Error for MissingOxkvObject {}
 
+/// The source of a build that lost a concurrent generation race.
+#[derive(Debug)]
+struct ReplicaBuildRestarted;
+
+impl std::fmt::Display for ReplicaBuildRestarted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("replica build lost a generation race")
+    }
+}
+
+impl std::error::Error for ReplicaBuildRestarted {}
+
 /// The source of a replica build that exceeds a size limit.
 #[derive(Debug)]
 struct ReplicaBuildTooLarge(&'static str);
@@ -718,6 +741,14 @@ pub(crate) async fn build_replica(
 }
 
 /// Builds a stored replica for the caller.
+///
+/// The build holds the subject lock while it writes the OxKV mirror.
+/// It reads the planned generation, writes the mirror, then commits the JSON
+/// replica.
+/// It publishes the wrapper only when the committed generation matches the
+/// planned generation.
+/// A failed mirror write and a rejected JSON commit leave the old wrapper and
+/// the old generation readable.
 async fn build_replica_inner(
     runtime: web::Data<EavRuntime>,
     policy: web::Data<Authorizer>,
@@ -730,78 +761,141 @@ async fn build_replica_inner(
     loop {
         attempt += 1;
         let head = runtime.wal().head().await.map_err(internal)?;
-        let mut chunks: Vec<Vec<u8>> = Vec::new();
-        let mut chunk_bytes = 0usize;
-        let mut pending: Vec<Entity> = Vec::new();
-        let mut count = 0;
-        let mut scanned: usize = 0;
-        let mut after: Option<String> = None;
-        loop {
-            let (page, next) = runtime
-                .entities()
-                .list_after(REPLICA_PAGE, after.as_deref())
-                .await?;
-            for entity in page {
-                scanned = scanned.saturating_add(1);
-                #[cfg(test)]
-                runtime.replica_test().count_read();
-                if scanned > MAX_REPLICA_SCAN_ENTITIES {
-                    return Err(EavApiError::Invalid(Box::new(ReplicaBuildTooLarge(
-                        "replica build exceeds the scan limit",
-                    ))));
+        let _guard = runtime.oxkv().lock_subject(&claims.sub).await;
+        let planned = runtime.replicas().next_generation(&claims.sub).await?;
+        let generation = runtime
+            .oxkv()
+            .begin_generation(&claims.sub, planned, head)
+            .await?;
+        let (count, chunks) =
+            match scan_replica(&runtime, &policy, &claims.sub, &generation, entity_limit).await {
+                Ok(result) => result,
+                Err(error) => {
+                    let _ = generation.abort().await;
+                    return Err(error);
                 }
-                if can_read_entity(&policy, &claims.sub, &entity.id).await? {
-                    count += 1;
-                    if count > entity_limit {
-                        return Err(EavApiError::Invalid(Box::new(ReplicaBuildTooLarge(
-                            "replica build exceeds the entity limit",
-                        ))));
-                    }
-                    pending.push(entity);
-                    if pending.len() == REPLICA_CHUNK_ENTITIES {
-                        let chunk = serde_json::to_vec(&pending)
-                            .map_err(|e| EavApiError::Internal(Box::new(e)))?;
-                        chunk_bytes = chunk_bytes.saturating_add(chunk.len());
-                        if chunk_bytes > REPLICA_BUILD_MAX_BYTES {
-                            return Err(EavApiError::Invalid(Box::new(ReplicaBuildTooLarge(
-                                "replica build exceeds the byte limit",
-                            ))));
-                        }
-                        chunks.push(chunk);
-                        pending.clear();
-                    }
-                }
-            }
-            match next {
-                Some(cursor) => after = Some(cursor),
-                None => break,
-            }
-        }
-        if !pending.is_empty() {
-            let chunk =
-                serde_json::to_vec(&pending).map_err(|e| EavApiError::Internal(Box::new(e)))?;
-            chunk_bytes = chunk_bytes.saturating_add(chunk.len());
-            if chunk_bytes > REPLICA_BUILD_MAX_BYTES {
-                return Err(EavApiError::Invalid(Box::new(ReplicaBuildTooLarge(
-                    "replica build exceeds the byte limit",
-                ))));
-            }
-            chunks.push(chunk);
-        }
+            };
         let chunk_count = chunks.len();
+        let prepared = match generation.finish().await {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let _ = runtime
+                    .oxkv()
+                    .discard_generation(&claims.sub, planned)
+                    .await;
+                return Err(error.into());
+            }
+        };
         match runtime.replicas().put(&claims.sub, head, chunks).await {
-            Ok(generation) => {
+            Ok(actual) if actual == planned => {
+                runtime.oxkv().publish(&claims.sub, &prepared).await?;
                 return Ok(HttpResponse::Ok().json(ReplicaBuildResponse {
                     head,
-                    generation,
+                    generation: actual,
                     count,
                     chunks: chunk_count,
                 }));
             }
-            Err(EntityError::StaleHead { .. }) if attempt < REPLICA_BUILD_ATTEMPTS => continue,
-            Err(error) => return Err(EavApiError::from(error)),
+            Ok(_) => {
+                let _ = runtime
+                    .oxkv()
+                    .discard_generation(&claims.sub, planned)
+                    .await;
+                if attempt < REPLICA_BUILD_ATTEMPTS {
+                    continue;
+                }
+                return Err(EavApiError::Conflict(Box::new(ReplicaBuildRestarted)));
+            }
+            Err(EntityError::StaleHead { .. }) if attempt < REPLICA_BUILD_ATTEMPTS => {
+                let _ = runtime
+                    .oxkv()
+                    .discard_generation(&claims.sub, planned)
+                    .await;
+                continue;
+            }
+            Err(error) => {
+                let _ = runtime
+                    .oxkv()
+                    .discard_generation(&claims.sub, planned)
+                    .await;
+                return Err(EavApiError::from(error));
+            }
         }
     }
+}
+
+/// Scans the visible entities and fills one OxKV generation.
+///
+/// The scan stops at `entity_limit` visible entities or at the scan cap.
+/// It serializes the same ordered JSON chunks as the JSON replica.
+/// A row is staged before its chunk can fail, so the caller must abort the
+/// generation on an error.
+async fn scan_replica(
+    runtime: &EavRuntime,
+    policy: &Authorizer,
+    sub: &str,
+    generation: &OxkvGeneration,
+    entity_limit: usize,
+) -> Result<(usize, Vec<Vec<u8>>), EavApiError> {
+    let mut chunks: Vec<Vec<u8>> = Vec::new();
+    let mut chunk_bytes = 0usize;
+    let mut pending: Vec<Entity> = Vec::new();
+    let mut count = 0;
+    let mut scanned: usize = 0;
+    let mut after: Option<String> = None;
+    loop {
+        let (page, next) = runtime
+            .entities()
+            .list_after(REPLICA_PAGE, after.as_deref())
+            .await?;
+        for entity in page {
+            scanned = scanned.saturating_add(1);
+            #[cfg(test)]
+            runtime.replica_test().count_read();
+            if scanned > MAX_REPLICA_SCAN_ENTITIES {
+                return Err(EavApiError::Invalid(Box::new(ReplicaBuildTooLarge(
+                    "replica build exceeds the scan limit",
+                ))));
+            }
+            if can_read_entity(policy, sub, &entity.id).await? {
+                count += 1;
+                if count > entity_limit {
+                    return Err(EavApiError::Invalid(Box::new(ReplicaBuildTooLarge(
+                        "replica build exceeds the entity limit",
+                    ))));
+                }
+                generation.add_entity(&entity).await?;
+                pending.push(entity);
+                if pending.len() == REPLICA_CHUNK_ENTITIES {
+                    let chunk = serde_json::to_vec(&pending)
+                        .map_err(|e| EavApiError::Internal(Box::new(e)))?;
+                    chunk_bytes = chunk_bytes.saturating_add(chunk.len());
+                    if chunk_bytes > REPLICA_BUILD_MAX_BYTES {
+                        return Err(EavApiError::Invalid(Box::new(ReplicaBuildTooLarge(
+                            "replica build exceeds the byte limit",
+                        ))));
+                    }
+                    chunks.push(chunk);
+                    pending.clear();
+                }
+            }
+        }
+        match next {
+            Some(cursor) => after = Some(cursor),
+            None => break,
+        }
+    }
+    if !pending.is_empty() {
+        let chunk = serde_json::to_vec(&pending).map_err(|e| EavApiError::Internal(Box::new(e)))?;
+        chunk_bytes = chunk_bytes.saturating_add(chunk.len());
+        if chunk_bytes > REPLICA_BUILD_MAX_BYTES {
+            return Err(EavApiError::Invalid(Box::new(ReplicaBuildTooLarge(
+                "replica build exceeds the byte limit",
+            ))));
+        }
+        chunks.push(chunk);
+    }
+    Ok((count, chunks))
 }
 
 /// Removes the stored replica of the caller.
@@ -822,6 +916,7 @@ pub(crate) async fn reset_replica(
     claims: Validated<Claims>,
 ) -> Result<HttpResponse, EavApiError> {
     if runtime.replicas().clear(&claims.sub).await? {
+        runtime.oxkv().clear(&claims.sub).await?;
         return Ok(HttpResponse::NoContent().finish());
     }
     Err(EavApiError::NotFound(Box::new(MissingReplica)))
