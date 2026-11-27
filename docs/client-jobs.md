@@ -1,7 +1,7 @@
 # The client job client
 
-Status: client-jobs feature
-Branch: `issue/client-jobs`
+Status: client-jobs and client-sse features
+Branch: `issue/client-jobs`, then `issue/client-sse`
 
 The client submits a command as a job and then polls the job status. The
 client never applies the command to the replica view. It shows the committed
@@ -68,8 +68,10 @@ exists. A `401` answer means the session ended.
 The client stores one pending job. A poll updates the stored job only when the
 id matches. A job in a terminal state does not change again.
 
-Polling is the guaranteed status transport. The client does not implement
-server-sent events in this feature.
+Polling is the guaranteed status transport. The client also watches the job
+over server-sent events and falls back to polling when the stream fails. See
+[the client job watch](client-sse.md) for the stream, the event shapes, and
+the fallback.
 
 ## No optimistic write
 
@@ -146,6 +148,10 @@ When the EAV replica is not loaded, `committed` is false.
 
 `Client::pending_job()` returns the same shape for the stored job, or `null`
 when no job is stored. It does no network work.
+
+`Client::watch_job(id, on_event)` watches `GET /jobs/{id}/events` and calls
+`on_event` with the same JSON on each event. It falls back to polling when
+the stream fails. See [the client job watch](client-sse.md).
 
 A failed call returns one stable error name:
 
