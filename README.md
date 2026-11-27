@@ -1885,7 +1885,8 @@ cargo bench --bench eav -- --quick
 
 Build, test, lint, documentation, and commit rules are in
 [CONTRIBUTING.md](CONTRIBUTING.md). This section covers the test suites and
-releases. See [Performance](#performance) for the benchmark suite.
+releases. See [Performance](#performance) for the benchmark suite. Client
+build and usage are in [the WASM client guide](docs/client-wasm.md).
 
 ### Checks
 
