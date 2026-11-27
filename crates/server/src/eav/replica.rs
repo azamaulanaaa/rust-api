@@ -452,6 +452,22 @@ impl ReplicaStore {
         ))
     }
 
+    /// Returns the generation that the next put for `sub` will write.
+    ///
+    /// A missing generation row counts as `0`, so the first call returns `1`.
+    /// A concurrent put can take the value before the caller uses it.
+    /// The caller must compare the value with the generation that
+    /// [`ReplicaStore::put`] returns and must discard a mismatched build.
+    pub async fn next_generation(&self, sub: &str) -> Result<u64, EntityError> {
+        let hash = sub_hash(sub);
+        let g = self.store.read().await;
+        read_generation(&*g, &hash)
+            .await?
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| EntityError::Internal("replica generation is exhausted".to_string()))
+    }
+
     /// Returns the stored head for `sub`, or `None` when no replica exists.
     pub async fn status(&self, sub: &str) -> Result<Option<u64>, EntityError> {
         let hash = sub_hash(sub);
@@ -466,7 +482,7 @@ fn decode_chunk_count(meta: ReplicaMeta) -> Result<usize, EntityError> {
 }
 
 /// Returns the lowercase SHA-256 hex of `sub`.
-fn sub_hash(sub: &str) -> String {
+pub(crate) fn sub_hash(sub: &str) -> String {
     Sha256::digest(sub.as_bytes())
         .iter()
         .map(|byte| format!("{byte:02x}"))

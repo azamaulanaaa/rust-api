@@ -45,6 +45,7 @@ use crate::CancelToken;
 use crate::db::build_s3_store;
 use crate::eav::entity::{AttributeValue, EntityStore};
 use crate::eav::metrics::EavMetrics;
+use crate::eav::oxkv_replica::OxkvReplicaStore;
 use crate::eav::replica::ReplicaStore;
 use crate::eav::schema::SchemaRegistry;
 use crate::fs::s3::S3ClientConfig;
@@ -290,6 +291,8 @@ pub struct EavRuntime {
     rules: RuleStore,
     /// The stored per-user entity replicas.
     replicas: ReplicaStore,
+    /// The per-user OxKV replicas for the WASM client.
+    oxkv: OxkvReplicaStore,
     /// The rule runner.
     engine: RuleEngine,
     /// The shared change feed.
@@ -350,6 +353,8 @@ impl EavRuntime {
         let replica_store = build_s3_store(s3, &domain_prefix(db_prefix, "replica"))
             .await
             .context("build the EAV replica store")?;
+        let oxkv = OxkvReplicaStore::new(s3, &domain_prefix(db_prefix, "eav-oxkv"))
+            .context("build the EAV oxkv replica store")?;
 
         let schemas = SchemaRegistry::new(schema_store);
         let entities = EntityStore::new(entity_store, schemas.clone())
@@ -369,6 +374,7 @@ impl EavRuntime {
             entities,
             rules,
             replicas,
+            oxkv,
             engine,
             wal,
             metrics,
@@ -399,6 +405,11 @@ impl EavRuntime {
     /// Returns the stored per-user entity replicas.
     pub fn replicas(&self) -> &ReplicaStore {
         &self.replicas
+    }
+
+    /// Returns the per-user OxKV replicas for the WASM client.
+    pub fn oxkv(&self) -> &OxkvReplicaStore {
+        &self.oxkv
     }
 
     /// Returns the test-only controls for a replica build.

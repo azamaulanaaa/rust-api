@@ -68,6 +68,8 @@ use utoipa::OpenApi;
         crate::eav::sync::replica,
         crate::eav::sync::reset_replica,
         crate::eav::sync::replica_status,
+        crate::eav::sync::oxkv_manifest,
+        crate::eav::sync::oxkv_object,
         crate::jobs::poll::get_job,
         crate::jobs::poll::create_job,
         crate::jobs::sse::job_events,
