@@ -104,16 +104,19 @@ generation. The `is_committed` helper stays `false` in this case.
 
 Typed errors:
 
-| Error | JS name | Meaning |
-| --- | --- | --- |
-| `LoginRequired` | `login_required` | A submit or a poll answered `401`. |
-| `Forbidden` | `forbidden` | The server answered `403` on submit or poll. |
-| `NotFound` | `not_found` | A poll answered `404`, or the job id is not a safe path. |
-| `Conflict` | `conflict` | A submit answered `409`. |
-| `InvalidCommand` | `invalid_command` | The kind, payload, or key is not valid. |
-| `Transport` | `request` | The request failed before the server answered. |
-| `InvalidBody` | `request` | The status body is not a valid `JobStatusView`. |
-| `UnexpectedStatus` | `request` | An unexpected status, such as a submit `404` or a poll `409`. |
+| Error | Meaning |
+| --- | --- |
+| `LoginRequired` | A submit or a poll answered `401`. |
+| `Forbidden` | The server answered `403` on submit or poll. |
+| `NotFound` | A poll `404`, or an unsafe id. |
+| `Conflict` | A submit `409`. |
+| `InvalidCommand` | A bad kind, payload, or key. |
+| `Transport` | The request failed before an answer. |
+| `InvalidBody` | The status body is not valid. |
+| `UnexpectedStatus` | Any other status, such as a submit `404`. |
+
+`UnexpectedStatus` also covers a poll `409`. These three errors use the
+stable JavaScript name `request`.
 
 ## JavaScript shape
 
