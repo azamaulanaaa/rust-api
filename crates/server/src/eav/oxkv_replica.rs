@@ -488,6 +488,7 @@ impl OxkvReplicaStore {
         let hash = sub_hash(sub);
         if let Some((manifest, _)) = self.read_wrapper(&hash).await?
             && manifest.generation == generation
+            && self.read_build_pointer(&hash, generation).await?.as_deref() == Some(build_id)
         {
             return Ok(());
         }
@@ -573,18 +574,27 @@ impl OxkvReplicaStore {
         hash: &str,
         generation: u64,
     ) -> Result<Arc<dyn Storage>, EntityError> {
-        let generation_storage = self.storage_at(&format!("{hash}/{generation}"));
-        let output = match generation_storage
-            .get(&ObjectPath::from("build.json"))
-            .await
-        {
+        let Some(build_id) = self.read_build_pointer(hash, generation).await? else {
+            return Ok(self.storage_at(&format!("{hash}/{generation}")));
+        };
+        Ok(self.storage_at(&format!("{hash}/{generation}/{build_id}")))
+    }
+
+    /// Returns the build id of one generation, or `None` when no pointer exists.
+    async fn read_build_pointer(
+        &self,
+        hash: &str,
+        generation: u64,
+    ) -> Result<Option<String>, EntityError> {
+        let storage = self.storage_at(&format!("{hash}/{generation}"));
+        let output = match storage.get(&ObjectPath::from("build.json")).await {
             Ok(output) => output,
-            Err(error) if is_not_found(&error) => return Ok(generation_storage),
+            Err(error) if is_not_found(&error) => return Ok(None),
             Err(error) => return Err(EntityError::Store(error)),
         };
         let pointer: BuildPointer = serde_json::from_slice(&output.bytes)
             .map_err(|error| EntityError::Internal(error.to_string()))?;
-        Ok(self.storage_at(&format!("{hash}/{generation}/{}", pointer.build)))
+        Ok(Some(pointer.build))
     }
 
     /// Writes the build pointer of one generation.
@@ -772,6 +782,7 @@ mod tests {
         let winner_storage = store.storage_at(&format!("{hash}/1/{winner_id}"));
         let before = winner_storage.list(&ObjectPath::default()).await?;
         assert!(!before.is_empty(), "the winner wrote no object");
+        store.publish("alice", &prepared).await?;
 
         store.discard_generation("alice", 1, &loser_id).await?;
 
@@ -785,7 +796,6 @@ mod tests {
             loser_storage.list(&ObjectPath::default()).await?.is_empty(),
             "the loser build prefix remains"
         );
-        store.publish("alice", &prepared).await?;
         Ok(())
     }
 
