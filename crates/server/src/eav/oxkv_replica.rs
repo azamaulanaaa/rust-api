@@ -928,6 +928,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_failed_build_removes_its_pointer_and_retains_the_published_generation()
+    -> anyhow::Result<()> {
+        let store = store();
+        let first = store.begin_generation("alice", 1, 7).await?;
+        let published = first.finish().await?;
+        store.publish("alice", &published).await?;
+
+        let failed = store.begin_generation("alice", 2, 8).await?;
+        let failed_id = failed.build_id().to_string();
+        let prepared = failed.finish().await?;
+        store
+            .write_build_pointer(&sub_hash("alice"), &prepared)
+            .await?;
+        assert_eq!(
+            store.build_pointer_for_test("alice", 2).await?,
+            Some(failed_id.clone()),
+            "the failed build must write its pointer first"
+        );
+
+        store.discard_generation("alice", 2, &failed_id).await?;
+
+        assert!(
+            store.build_pointer_for_test("alice", 2).await?.is_none(),
+            "the failed build kept its pointer"
+        );
+        assert!(
+            store
+                .generation_objects_for_test("alice", 2)
+                .await?
+                .is_empty(),
+            "the failed build kept its objects"
+        );
+
+        let third = store.begin_generation("alice", 3, 9).await?;
+        let prepared = third.finish().await?;
+        store.publish("alice", &prepared).await?;
+
+        assert_eq!(
+            store.generation_objects_for_test("alice", 1).await?,
+            published.objects,
+            "the next build deleted the previous published generation"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn a_published_generation_returns_a_typed_conflict() -> anyhow::Result<()> {
         let store = store();
         let generation = store.begin_generation("alice", 1, 7).await?;
