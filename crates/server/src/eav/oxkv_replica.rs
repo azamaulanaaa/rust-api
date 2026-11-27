@@ -412,12 +412,19 @@ impl OxkvReplicaStore {
 
     /// Removes the wrapper and every generation of `sub`.
     ///
-    /// The call returns `true` when a wrapper existed.
+    /// The call returns `true` when the wrapper or any generation existed.
+    /// A failed generation with no wrapper also counts as an existing replica.
     pub(crate) async fn clear(&self, sub: &str) -> Result<bool, EntityError> {
         let hash = sub_hash(sub);
-        let existed = self.read_wrapper(&hash).await?.is_some();
         let storage = self.storage_at(&hash);
-        delete_all(&storage, &ObjectPath::default()).await?;
+        let keys = storage
+            .list(&ObjectPath::default())
+            .await
+            .map_err(EntityError::Store)?;
+        let existed = !keys.is_empty();
+        for key in keys {
+            storage.delete(&key).await.map_err(EntityError::Store)?;
+        }
         Ok(existed)
     }
 

@@ -760,8 +760,8 @@ async fn build_replica_inner(
     let mut attempt = 0;
     loop {
         attempt += 1;
-        let head = runtime.wal().head().await.map_err(internal)?;
         let _guard = runtime.oxkv().lock_subject(&claims.sub).await;
+        let head = runtime.wal().head().await.map_err(internal)?;
         let planned = runtime.replicas().next_generation(&claims.sub).await?;
         let generation = runtime
             .oxkv()
@@ -898,15 +898,18 @@ async fn scan_replica(
     Ok((count, chunks))
 }
 
-/// Removes the stored replica of the caller.
+/// Removes both stored replicas of the caller.
 ///
 /// The caller needs a valid session.
 /// The route needs no management grant, because a caller owns its replica.
 /// The route removes only the replica of the caller.
-/// A reset removes the snapshot, the chunks, the manifest, the generation, and
-/// the head in one transaction.
-/// A reset returns `204` when a replica existed and was removed.
-/// A reset returns `404` when the caller has no replica.
+/// The route takes the subject build lock before it clears either store.
+/// A build that waits for the lock cannot repopulate the mirror after the
+/// reset.
+/// A reset removes the JSON snapshot, the chunks, the manifest, the
+/// generation, the head, the OxKV wrapper, and every OxKV generation.
+/// A reset returns `204` when the JSON replica or the OxKV replica existed.
+/// A reset returns `404` only when neither replica existed.
 /// After a WAL reset, call the reset route, then build a new replica.
 /// The next build starts at generation 1.
 #[utoipa::path(delete, path = "/eav/sync/replica", tag = "eav", responses((status = 204, description = "replica removed"), (status = 401, body = crate::http::error::ErrorBody), (status = 404, body = crate::http::error::ErrorBody), (status = 500, body = crate::http::error::ErrorBody)))]
@@ -915,8 +918,10 @@ pub(crate) async fn reset_replica(
     runtime: web::Data<EavRuntime>,
     claims: Validated<Claims>,
 ) -> Result<HttpResponse, EavApiError> {
-    if runtime.replicas().clear(&claims.sub).await? {
-        runtime.oxkv().clear(&claims.sub).await?;
+    let _guard = runtime.oxkv().lock_subject(&claims.sub).await;
+    let json = runtime.replicas().clear(&claims.sub).await?;
+    let oxkv = runtime.oxkv().clear(&claims.sub).await?;
+    if json || oxkv {
         return Ok(HttpResponse::NoContent().finish());
     }
     Err(EavApiError::NotFound(Box::new(MissingReplica)))
@@ -1084,6 +1089,7 @@ pub(crate) async fn oxkv_object(
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::time::Duration;
 
     use actix_web::{App, http, test as actix_test};
     use jsonwebtoken::EncodingKey;
@@ -3857,6 +3863,92 @@ mod tests {
         let uri = format!("/eav/sync/oxkv/objects/{key}");
         let res = get_route!(&app, &uri, &token).await;
         assert_eq!(res.status(), http::StatusCode::NOT_FOUND);
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn a_reset_clears_an_oxkv_only_replica() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        publish_task_schema(&fx).await?;
+        create_entity(&fx, "e1").await?;
+        grant_collection_read(&fx, "alice").await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+
+        let res = post_replica!(&app, &token).await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        assert!(fx.runtime.replicas().clear("alice").await?);
+        assert!(fx.runtime.replicas().status("alice").await?.is_none());
+        assert!(fx.runtime.oxkv().manifest("alice").await?.is_some());
+
+        let res = delete_route!(&app, "/eav/sync/replica", &token).await;
+        assert_eq!(res.status(), http::StatusCode::NO_CONTENT);
+        assert!(fx.runtime.replicas().status("alice").await?.is_none());
+        assert!(fx.runtime.oxkv().manifest("alice").await?.is_none());
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn a_reset_clears_a_json_only_replica() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        publish_task_schema(&fx).await?;
+        create_entity(&fx, "e1").await?;
+        grant_collection_read(&fx, "alice").await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+
+        let res = post_replica!(&app, &token).await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        assert!(fx.runtime.oxkv().clear("alice").await?);
+        assert!(fx.runtime.oxkv().manifest("alice").await?.is_none());
+        assert!(fx.runtime.replicas().status("alice").await?.is_some());
+
+        let res = delete_route!(&app, "/eav/sync/replica", &token).await;
+        assert_eq!(res.status(), http::StatusCode::NO_CONTENT);
+        assert!(fx.runtime.replicas().status("alice").await?.is_none());
+        assert!(fx.runtime.oxkv().manifest("alice").await?.is_none());
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn a_reset_waits_for_a_build_and_leaves_neither_replica() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        publish_task_schema(&fx).await?;
+        create_entity(&fx, "e1").await?;
+        grant_collection_read(&fx, "alice").await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+
+        let guard = fx.runtime.oxkv().lock_subject("alice").await;
+        let build = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::post().uri("/eav/sync/replica"),
+                &token,
+            )
+            .to_request(),
+        );
+        let reset = actix_test::call_service(
+            &app,
+            auth(
+                actix_test::TestRequest::delete().uri("/eav/sync/replica"),
+                &token,
+            )
+            .to_request(),
+        );
+        let release = async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            drop(guard);
+        };
+        let (build_res, reset_res, ()) = tokio::join!(build, reset, release);
+
+        assert_eq!(build_res.status(), http::StatusCode::OK);
+        assert_eq!(reset_res.status(), http::StatusCode::NO_CONTENT);
+        assert!(fx.runtime.replicas().status("alice").await?.is_none());
+        assert!(fx.runtime.oxkv().manifest("alice").await?.is_none());
         Ok(())
     }
 

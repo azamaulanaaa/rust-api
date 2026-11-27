@@ -147,6 +147,11 @@ until the next rebuild.
 A client must compare `generation` and `head` with its stored values and
 restart a multi-object download when the wrapper changes.
 
-A reset removes the wrapper, every generation, the JSON chunks, the JSON
+A reset takes the subject build lock.
+The reset clears the JSON replica and the OxKV replica under that lock.
+The reset returns `204` when either replica existed.
+The reset returns `404` only when neither replica existed.
+The reset removes the wrapper, every generation, the JSON chunks, the JSON
 generation, and the head.
+A build that waits for the lock cannot repopulate the mirror after the reset.
 The next build starts at generation `1`.
