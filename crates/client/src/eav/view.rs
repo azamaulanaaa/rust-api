@@ -40,10 +40,11 @@ struct EntityMeta {
 /// The stored value of one attribute row.
 ///
 /// The serde form matches the adjacent tagged form of the server
-/// `AttributeValue`.
+/// `AttributeValue`. The query layer also parses a tagged query value with
+/// this type.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
-enum StoredAttributeValue {
+pub(crate) enum StoredAttributeValue {
     /// A UTF-8 string.
     String(String),
     /// A signed 64-bit integer.
@@ -68,7 +69,7 @@ impl StoredAttributeValue {
     ///
     /// The call returns `None` for a JSON value. A JSON value has no exact
     /// search form, so the view skips it.
-    fn into_search(self) -> Option<SearchValue> {
+    pub(crate) fn into_search(self) -> Option<SearchValue> {
         match self {
             Self::String(value) => Some(SearchValue::String(value)),
             Self::Integer(value) => Some(SearchValue::Integer(value)),

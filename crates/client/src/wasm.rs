@@ -134,8 +134,10 @@ impl Client {
 
     /// Run one local query for an exact EAV attribute value.
     ///
-    /// `value_json` is a JSON string. It must hold a JSON string, number, or
-    /// boolean. A JSON `null`, array, or object is not a valid query value.
+    /// `value_json` is a JSON string. A scalar keeps its JSON type. A tagged
+    /// value keeps the server attribute type, for example
+    /// `{"type":"timestamp","value":1700}`. A JSON `null`, array, untagged
+    /// object, or tagged `json` value is not a valid query value.
     /// `limit` is the page size. The default is 50 and the maximum is 200.
     /// `after` is the last id of the previous page.
     ///

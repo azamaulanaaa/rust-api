@@ -71,6 +71,17 @@ value has no exact search form. A corrupt metadata or attribute row returns
 `rust_api_core::eav::search_by_attribute`. The result is in id order and the
 cursor is the last id of the page.
 
+A plain JSON value keeps its JSON type. A tagged value keeps the server
+attribute type:
+
+```json
+{"type":"timestamp","value":1700}
+{"type":"entity_ref","value":"e2"}
+```
+
+The tagged form also accepts `string`, `integer`, `float`, and `boolean`. It
+rejects `json`. A JSON null, array, or untagged object is not a query value.
+
 The view is cached by the loaded object map and its generation. A later query
 reuses the view while the same object map stays stored. A new load rebuilds
 the view, even when the generation does not change. A clear or a newer load
@@ -82,7 +93,7 @@ Typed errors:
 | --- | --- |
 | `NotLoaded` | No replica load has succeeded, or a clear removed it. |
 | `CorruptReplica` | A stored row is not valid. |
-| `UnsupportedValue` | The query value is a JSON null, array, or object. |
+| `UnsupportedValue` | The query value has no exact search form. |
 | `InvalidQuery` | The page window is not valid. |
 | `Replica` | The oxkv reader failed. |
 
@@ -110,15 +121,18 @@ matches `load_replica`:
 The error names are `not_loaded`, `corrupt_replica`, `unsupported_value`,
 `invalid_query`, and `replica`. The shape and the names are stable.
 
+`value_json` accepts a plain scalar or a tagged attribute value. See
+[Query](#query).
+
 ## Limits
 
 - A page size is 1 to 200. The default is 50.
-- A JSON query value is not supported.
+- A tagged `json` query value is not supported.
 - A JSON attribute is not part of the view.
-- A timestamp attribute needs a typed search value. A JSON number becomes an
-  integer, so a query cannot match a timestamp attribute.
+- A timestamp needs the tagged `timestamp` form. A plain JSON number is an
+  integer and does not match a timestamp value.
 - A float compares with exact equality.
-- The client keeps one replica generation in memory. It has no persistent
+- The client keeps one replica object map in memory. It has no persistent
   storage.
 - The client reads the replica that the server built. The next server build
   applies a new grant. The client-side query is not a security boundary.

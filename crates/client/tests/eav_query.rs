@@ -264,3 +264,63 @@ fn an_equal_generation_rebuilds_the_cached_view() {
         .expect("the second query succeeds");
     assert_eq!(page.items, ["e2"]);
 }
+
+/// A tagged timestamp and a tagged entity reference match their rows.
+#[test]
+fn a_tagged_value_matches_a_typed_attribute() {
+    let meta = json!({
+        "id": "e1",
+        "version": 1,
+        "schemas": [],
+        "created_at": 0,
+        "updated_at": 0,
+    });
+    let when = json!({"type": "timestamp", "value": 1700});
+    let link = json!({"type": "entity_ref", "value": "e2"});
+    let objects = build_objects(vec![
+        (
+            "entity:e1:meta".to_string(),
+            serde_json::to_vec(&meta).expect("the meta serializes"),
+        ),
+        (
+            "entity:e1:attr:when".to_string(),
+            serde_json::to_vec(&when).expect("the timestamp serializes"),
+        ),
+        (
+            "entity:e1:attr:link".to_string(),
+            serde_json::to_vec(&link).expect("the reference serializes"),
+        ),
+    ]);
+    let (replies, transport) = FakeTransport::new();
+    script_replica(&replies, &objects, 1, 1);
+    let query = ReplicaQuery::new(transport);
+    block_on(query.load()).expect("the replica loads");
+
+    let page = block_on(query.query_attribute(
+        "when",
+        &json!({"type": "timestamp", "value": 1700}),
+        None,
+        None,
+    ))
+    .expect("the timestamp query succeeds");
+    assert_eq!(page.items, ["e1"]);
+
+    let page = block_on(query.query_attribute(
+        "link",
+        &json!({"type": "entity_ref", "value": "e2"}),
+        None,
+        None,
+    ))
+    .expect("the reference query succeeds");
+    assert_eq!(page.items, ["e1"]);
+
+    // A plain number is an integer, not a timestamp.
+    let page = block_on(query.query_attribute("when", &json!(1700), None, None))
+        .expect("the integer query succeeds");
+    assert!(page.items.is_empty());
+
+    let error =
+        block_on(query.query_attribute("when", &json!({"type": "json", "value": 1}), None, None))
+            .expect_err("a tagged JSON value is rejected");
+    assert_eq!(error, QueryError::UnsupportedValue);
+}

@@ -19,7 +19,7 @@ use rust_api_core::eav::{QueryWindow, SearchValue};
 use serde_json::Value;
 
 use crate::auth::Transport;
-use crate::eav::view::{EntityView, QueryPage, ViewError};
+use crate::eav::view::{EntityView, QueryPage, StoredAttributeValue, ViewError};
 use crate::replica::{ReplicaClient, ReplicaError, ReplicaSource, ReplicaState};
 
 /// A failure to run one local query.
@@ -32,7 +32,7 @@ pub enum QueryError {
     NotLoaded,
     /// The replica holds a row that is not valid.
     CorruptReplica,
-    /// The query value is a JSON `null`, array, or object.
+    /// The query value is not a scalar or a tagged attribute value.
     UnsupportedValue,
     /// The page window is not valid.
     InvalidQuery,
@@ -63,7 +63,7 @@ impl fmt::Display for QueryError {
                 formatter.write_str("the replica holds a row that is not valid")
             }
             Self::UnsupportedValue => {
-                formatter.write_str("the query value must be a string, a number, or a boolean")
+                formatter.write_str("the query value must be a scalar or a tagged attribute value")
             }
             Self::InvalidQuery => formatter.write_str("the query window is not valid"),
             Self::Replica => formatter.write_str("the replica read failed"),
@@ -151,7 +151,9 @@ impl<T: Transport> ReplicaQuery<T> {
     /// Run one local query for an exact attribute value.
     ///
     /// The call resolves the page window, then converts the JSON value to a
-    /// search value. A JSON `null`, array, or object has no search value and
+    /// search value. A scalar keeps its JSON type. A tagged value such as
+    /// `{"type":"timestamp","value":1700}` keeps the server attribute type.
+    /// A JSON `null`, array, or untagged object has no search value and
     /// returns [`QueryError::UnsupportedValue`]. The call opens the entity
     /// view on the first query of an object map and caches it.
     ///
@@ -204,7 +206,10 @@ impl<T: Transport> ReplicaQuery<T> {
 
 /// Convert one JSON query value to a search value.
 ///
-/// A JSON `null`, array, or object has no exact search form.
+/// A plain JSON scalar keeps its JSON type. A tagged object uses the server
+/// attribute form, for example a timestamp or an entity reference. A JSON
+/// `null`, array, untagged object, or tagged `json` value has no exact search
+/// form.
 fn search_value(value: &Value) -> Result<SearchValue, QueryError> {
     match value {
         Value::String(value) => Ok(SearchValue::String(value.clone())),
@@ -214,7 +219,11 @@ fn search_value(value: &Value) -> Result<SearchValue, QueryError> {
             _ => Err(QueryError::UnsupportedValue),
         },
         Value::Bool(value) => Ok(SearchValue::Boolean(*value)),
-        Value::Null | Value::Array(_) | Value::Object(_) => Err(QueryError::UnsupportedValue),
+        Value::Object(_) => serde_json::from_value::<StoredAttributeValue>(value.clone())
+            .ok()
+            .and_then(StoredAttributeValue::into_search)
+            .ok_or(QueryError::UnsupportedValue),
+        Value::Null | Value::Array(_) => Err(QueryError::UnsupportedValue),
     }
 }
 
@@ -397,13 +406,14 @@ mod tests {
         assert_eq!(error.status_name(), "not_loaded");
     }
 
-    /// A JSON null, array, or object is an unsupported value.
+    /// A JSON null, array, or untagged object is an unsupported value.
     #[test]
-    fn a_json_collection_is_an_unsupported_value() {
+    fn an_unsupported_value_is_rejected() {
         for value in [
             Value::Null,
             serde_json::json!(["alpha"]),
             serde_json::json!({"key": "value"}),
+            serde_json::json!({"type": "json", "value": {"key": "value"}}),
         ] {
             let error = search_value(&value).expect_err("the value has no search form");
             assert_eq!(error, QueryError::UnsupportedValue);
@@ -446,6 +456,22 @@ mod tests {
         );
         assert_eq!(
             search_value(&Value::Bool(true)),
+            Ok(SearchValue::Boolean(true))
+        );
+        assert_eq!(
+            search_value(&serde_json::json!({"type": "timestamp", "value": 1700})),
+            Ok(SearchValue::Timestamp(1700))
+        );
+        assert_eq!(
+            search_value(&serde_json::json!({"type": "entity_ref", "value": "e2"})),
+            Ok(SearchValue::EntityRef("e2".to_string()))
+        );
+        assert_eq!(
+            search_value(&serde_json::json!({"type": "string", "value": "alpha"})),
+            Ok(SearchValue::String("alpha".to_string()))
+        );
+        assert_eq!(
+            search_value(&serde_json::json!({"type": "boolean", "value": true})),
             Ok(SearchValue::Boolean(true))
         );
     }
