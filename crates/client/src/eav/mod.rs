@@ -2,10 +2,14 @@
 //!
 //! The `storage` module adapts the replica object map to the read-only oxkv
 //! `Storage` trait. The `view` module decodes the `entity:` rows into the
-//! shared search entity type. Later work adds the query.
+//! shared search entity type. The `query` module caches one view for each
+//! replica generation and runs the shared core query.
 //!
 //! The client reads only the replica that the server built. It makes no
 //! authorization decision.
+
+/// The local entity query and its view cache.
+pub mod query;
 
 /// The read-only oxkv storage adapter.
 pub mod storage;
@@ -13,5 +17,6 @@ pub mod storage;
 /// The decoded entity view.
 pub mod view;
 
+pub use query::{QueryError, ReplicaQuery};
 pub use storage::ReplicaStorage;
 pub use view::{EntityView, QueryPage, ViewError};
