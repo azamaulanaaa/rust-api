@@ -623,9 +623,10 @@ mod tests {
         attempt: u32,
         commit_seq: Option<u64>,
     ) {
-        replies
-            .borrow_mut()
-            .push_back(Reply::json(200, job_body_for(id, state, attempt, None, commit_seq)));
+        replies.borrow_mut().push_back(Reply::json(
+            200,
+            job_body_for(id, state, attempt, None, commit_seq),
+        ));
     }
 
     /// Script one `200` poll answer for the watched job.
