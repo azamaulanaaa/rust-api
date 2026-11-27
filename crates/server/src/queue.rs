@@ -343,6 +343,9 @@ pub trait JobQueue: Send + Sync {
 
     /// Returns the status of a job.
     ///
+    /// A backend can read a status record that does not carry the job
+    /// payload. A status call then does not decode the payload.
+    ///
     /// # Errors
     ///
     /// Returns [`QueueError::NotFound`] when the job does not exist.
