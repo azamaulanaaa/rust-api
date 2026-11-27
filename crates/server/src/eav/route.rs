@@ -442,13 +442,12 @@ pub struct EntityQueryRequest {
 
 impl EntityQueryRequest {
     /// Resolves the page window and checks the limit.
+    ///
+    /// The shared core crate checks the window.
     fn resolve(&self) -> Result<(usize, Option<String>), EavApiError> {
-        let limit = self.limit.unwrap_or(DEFAULT_PAGE_LIMIT);
-        if limit == 0 || limit > MAX_PAGE_LIMIT {
-            return Err(EavApiError::Invalid(Box::new(InvalidPageLimit)));
-        }
-        let after = self.after.clone().filter(|cursor| !cursor.is_empty());
-        Ok((limit, after))
+        let window = crate::core::eav::QueryWindow::resolve(self.limit, self.after.as_deref())
+            .map_err(|error| EavApiError::Invalid(Box::new(error)))?;
+        Ok((window.limit(), window.after().map(str::to_owned)))
     }
 }
 
