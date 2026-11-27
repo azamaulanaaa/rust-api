@@ -16,6 +16,13 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 rust-api-model.workspace = true
 rust-api-core.workspace = true
+# The client reads the replica objects through the read-only oxkv reader.
+# Default features only: do not add `oxkv-s3` or `object_store` to WASM.
+oxkv = "0.12"
+# The read-only storage adapter implements the oxkv `Storage` trait.
+async-trait = "0.1"
+# The entity view decodes the stored rows and builds the query result.
+serde.workspace = true
 # The replica loader parses the manifest and verifies each object.
 serde_json.workspace = true
 sha2.workspace = true

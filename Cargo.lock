@@ -3075,9 +3075,12 @@ dependencies = [
 name = "rust-api-client"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "gloo-net",
+ "oxkv",
  "rust-api-core",
  "rust-api-model",
+ "serde",
  "serde_json",
  "sha2",
  "wasm-bindgen",

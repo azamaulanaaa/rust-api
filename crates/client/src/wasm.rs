@@ -1,14 +1,19 @@
 //! The JavaScript-facing client surface.
 //!
 //! This module builds only for `wasm32`. The surface is small on purpose.
-//! Later features add methods for local reads and jobs. This version sends
-//! the session probe and downloads the per-user replica. It has no
-//! persistent storage.
+//! This version sends the session probe, downloads the per-user file replica,
+//! downloads the per-user EAV oxkv replica, and answers one local entity
+//! query. It has no persistent storage.
+//!
+//! The string shapes and the status names are stable. A name, once added,
+//! stays part of the stable surface.
 
+use serde_json::json;
 use wasm_bindgen::prelude::*;
 
 use crate::auth::AuthClient;
 use crate::auth::browser::BrowserTransport;
+use crate::eav::{QueryError, ReplicaQuery};
 use crate::replica::ReplicaClient;
 
 /// The JavaScript-facing client for the rust-api server.
@@ -21,6 +26,7 @@ use crate::replica::ReplicaClient;
 pub struct Client {
     auth: AuthClient<BrowserTransport>,
     replica: ReplicaClient<BrowserTransport>,
+    query: ReplicaQuery<BrowserTransport>,
 }
 
 impl Default for Client {
@@ -40,6 +46,7 @@ impl Client {
         Self {
             auth: AuthClient::new(BrowserTransport),
             replica: ReplicaClient::new(BrowserTransport),
+            query: ReplicaQuery::new(BrowserTransport),
         }
     }
 
@@ -53,7 +60,7 @@ impl Client {
         self.auth.check_session().await.as_str().to_owned()
     }
 
-    /// Download the per-user replica and return its state or an error name.
+    /// Download the per-user file replica and return its state or an error name.
     ///
     /// The method downloads `GET /sync/db/manifest.json` and then every
     /// object that the manifest names, with the `auth_token` cookie. It
@@ -91,4 +98,97 @@ impl Client {
             Err(error) => error.status_name().to_owned(),
         }
     }
+
+    /// Download the per-user EAV oxkv replica and return its state or an error name.
+    ///
+    /// The method downloads `GET /eav/sync/oxkv/manifest.json` and then
+    /// every object that the manifest names. It uses the same cookie
+    /// credentials, size check, SHA-256 check, and generation rule as
+    /// [`load_replica`](Self::load_replica).
+    ///
+    /// A successful load returns a JSON string:
+    ///
+    /// ```text
+    /// {"generation":7,"head":42,"applied_seq":42,"objects":3}
+    /// ```
+    ///
+    /// A failed load returns one stable status string:
+    /// `"login_required"`, `"forbidden"`, `"stale_generation"`,
+    /// `"superseded"`, `"integrity"`, or `"request"`.
+    ///
+    /// The file replica and the EAV replica have separate caches. A
+    /// successful EAV load makes [`query_replica`](Self::query_replica)
+    /// ready. A method once added stays part of the stable surface.
+    pub async fn load_eav_replica(&self) -> String {
+        match self.query.load().await {
+            Ok(state) => format!(
+                "{{\"generation\":{},\"head\":{},\"applied_seq\":{},\"objects\":{}}}",
+                state.generation,
+                state.head,
+                state.applied_seq,
+                self.query.replica().object_count()
+            ),
+            Err(error) => error.status_name().to_owned(),
+        }
+    }
+
+    /// Run one local query for an exact EAV attribute value.
+    ///
+    /// `value_json` is a JSON string. A scalar keeps its JSON type. A tagged
+    /// value keeps the server attribute type, for example
+    /// `{"type":"timestamp","value":1700}`. A JSON `null`, array, untagged
+    /// object, or tagged `json` value is not a valid query value.
+    /// `limit` is the page size. The default is 50 and the maximum is 200.
+    /// `after` is the last id of the previous page.
+    ///
+    /// A successful query returns a JSON string:
+    ///
+    /// ```text
+    /// {"items":["e1"],"next":"e2"}
+    /// ```
+    ///
+    /// The `next` field is `null` when no match remains. A failed query
+    /// returns one stable error name:
+    ///
+    /// ```text
+    /// {"error":"not_loaded"}
+    /// ```
+    ///
+    /// The error names are `not_loaded`, `corrupt_replica`,
+    /// `unsupported_value`, `invalid_query`, and `replica`.
+    ///
+    /// The query reads only the replica that the server built for this
+    /// subject. It makes no authorization decision. A JSON attribute row is
+    /// not part of the view. A method once added stays part of the stable
+    /// surface.
+    pub async fn query_replica(
+        &self,
+        attribute: &str,
+        value_json: &str,
+        limit: Option<u32>,
+        after: Option<String>,
+    ) -> String {
+        let value: serde_json::Value = match serde_json::from_str(value_json) {
+            Ok(value) => value,
+            Err(_) => return error_json(QueryError::InvalidQuery),
+        };
+        match self
+            .query
+            .query_attribute(
+                attribute,
+                &value,
+                limit.map(|value| value as usize),
+                after.as_deref(),
+            )
+            .await
+        {
+            Ok(page) => json!({"items": page.items, "next": page.next}).to_string(),
+            Err(error) => error_json(error),
+        }
+    }
+}
+
+/// Return the stable JSON body of one query error.
+fn error_json(error: QueryError) -> String {
+    json!({"error": error.status_name()}).to_string()
 }
