@@ -35,8 +35,8 @@ The route answers before the stream starts:
 
 The browser `EventSource` API does not show the HTTP status of a refused
 connection. A browser source reports a connection failure with no status and
-the watcher polls. The poll maps `401` and `404`. A `429` is a stream failure
-and falls back to polling.
+the watcher polls. The poll maps `401` and `404`. A `400` or `429` is a stream
+failure and falls back to polling. A `400` poll answer is `request`.
 
 ## Event shapes
 
@@ -115,10 +115,12 @@ Status mapping:
 
 | Situation | Result |
 | --- | --- |
+| Pre-stream `400` | `request` (fallback poll) |
 | Pre-stream `401` | `login_required` |
 | Pre-stream `403` | `forbidden` |
 | Pre-stream `404` | `not_found` |
 | Pre-stream `429` | Poll fallback |
+| Fallback `400` | `request` |
 | Fallback `401` | `login_required` |
 | Fallback `403` | `forbidden` |
 | Fallback `404` | `not_found` |

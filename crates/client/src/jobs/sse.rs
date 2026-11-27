@@ -183,8 +183,9 @@ impl Default for WatchOptions {
 ///
 /// A `401`, `403`, or `404` that the source reports before the stream starts
 /// maps to [`JobError::LoginRequired`], [`JobError::Forbidden`], or
-/// [`JobError::NotFound`]. A `429` from the stream gate is a stream failure
-/// and falls back to polling. An error from a fallback poll maps through
+/// [`JobError::NotFound`]. A `400` or `429` from the stream route is a stream
+/// failure and falls back to polling. The fallback poll then reports
+/// `request` for a `400`. An error from a fallback poll maps through
 /// [`JobClient::poll`].
 ///
 /// A view for another job ends the stream read and starts the fallback. The

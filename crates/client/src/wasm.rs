@@ -285,8 +285,9 @@ impl Client {
     ///
     /// The server route answers `400`, `401`, `404`, or `429` before the
     /// stream starts. The browser `EventSource` API does not show that
-    /// status, so a refused connection falls back to polling and the poll
-    /// maps the status.
+    /// status, so a refused connection falls back to polling. The poll maps
+    /// `401` and `404`, and a `400` poll answer is `request`. A pre-stream
+    /// `429` is a stream gate answer, so the fallback poll runs.
     ///
     /// The promise resolves with the final pending-job JSON:
     ///
