@@ -3079,6 +3079,7 @@ dependencies = [
  "futures-util",
  "gloo-net",
  "gloo-timers",
+ "js-sys",
  "oxkv",
  "rust-api-core",
  "rust-api-model",

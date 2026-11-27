@@ -42,6 +42,8 @@ gloo-net = { version = "0.8", default-features = false, features = ["http", "eve
 gloo-timers = { version = "0.4", features = ["futures"] }
 # `StreamExt` reads the gloo `EventSource` subscriptions.
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
+# The JS callback of `watch_job` is a `js_sys::Function`.
+js-sys = "0.3"
 # The credential mode and redirect mode types are `web-sys` types. Enable
 # only those bindings.
 web-sys = { version = "0.3", features = ["RequestCredentials", "RequestRedirect"] }

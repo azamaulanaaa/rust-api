@@ -3,8 +3,8 @@
 //! This module builds only for `wasm32`. The surface is small on purpose.
 //! This version sends the session probe, downloads the per-user file replica,
 //! downloads the per-user EAV oxkv replica, answers one local entity query,
-//! and submits and polls jobs. It has no persistent storage. The client never
-//! applies a pending command to the replica view.
+//! and submits, polls, and watches jobs. It has no persistent storage. The
+//! client never applies a pending command to the replica view.
 //!
 //! The string shapes and the status names are stable. A name, once added,
 //! stays part of the stable surface.
@@ -16,7 +16,10 @@ use wasm_bindgen::prelude::*;
 
 use crate::auth::AuthClient;
 use crate::auth::browser::BrowserTransport;
+use crate::auth::TransportError;
 use crate::eav::{QueryError, ReplicaQuery};
+use crate::jobs::sse::browser::{BrowserDelay, BrowserEventSource};
+use crate::jobs::sse::{WatchOptions, watch};
 use crate::jobs::{JobClient, JobError, PendingJob};
 use crate::replica::ReplicaClient;
 
@@ -258,6 +261,82 @@ impl Client {
     /// surface.
     pub async fn poll_job(&self, id: &str) -> String {
         match self.jobs.poll(id).await {
+            Ok(job) => self.pending_json(&job),
+            Err(error) => self.job_failure(error),
+        }
+    }
+
+    /// Watch one job over server-sent events and fall back to polling.
+    ///
+    /// The method opens `GET /jobs/{id}/events` with the `auth_token` cookie
+    /// and same-origin credentials. `on_event` is a JavaScript function. The
+    /// client calls it with one JSON string on each initial, status, and
+    /// terminal event. The string is the same pending-job shape as
+    /// [`submit_job`](Self::submit_job). The fallback poll calls the function
+    /// on each poll. The function never changes the replica or the query
+    /// view.
+    ///
+    /// The server sends `event: status` and `event: terminal` with a
+    /// `JobStatusView` JSON body. It sends `event: error` with only
+    /// `{"code":"access_revoked"}` or `{"code":"stream_unavailable"}`. A
+    /// `: heartbeat` comment arrives every 15 seconds. A terminal event ends
+    /// the stream. The client does not support `Last-Event-ID`; a reconnect
+    /// receives the current status.
+    ///
+    /// The server route answers `400`, `401`, `404`, or `429` before the
+    /// stream starts. The browser `EventSource` API does not show that
+    /// status, so a refused connection falls back to polling and the poll
+    /// maps the status.
+    ///
+    /// The promise resolves with the final pending-job JSON:
+    ///
+    /// ```text
+    /// {"id":"...","state":"succeeded","attempt":1,"error":null,
+    ///  "commit_seq":5,"terminal":true,"committed":false}
+    /// ```
+    ///
+    /// A stream `error` event, a closed stream, or a connection failure falls
+    /// back to `GET /jobs/{id}` at a bounded interval for a bounded number of
+    /// polls. A terminal poll ends the watch. No poll runs after a terminal
+    /// event.
+    ///
+    /// A failed watch returns one stable error name, the same shape and names
+    /// as [`poll_job`](Self::poll_job):
+    ///
+    /// ```text
+    /// {"error":"login_required"}
+    /// ```
+    ///
+    /// The error names are `login_required`, `forbidden`, `not_found`,
+    /// `conflict`, `invalid_command`, and `request`. A fallback that reaches
+    /// its poll bound returns `request`. A `401` during the fallback also sets
+    /// the session state to login-required. A callback that throws does not
+    /// stop the watch. A method once added stays part of the stable surface.
+    pub async fn watch_job(&self, id: &str, on_event: js_sys::Function) -> String {
+        if !crate::jobs::is_safe_job_id(id) {
+            return self.job_failure(JobError::NotFound);
+        }
+        let source = match BrowserEventSource::open(id) {
+            Ok(source) => source,
+            Err(error) => {
+                return self.job_failure(JobError::Transport(TransportError::new(
+                    error.to_string(),
+                )));
+            }
+        };
+        let result = watch(
+            &self.jobs,
+            id,
+            source,
+            BrowserDelay,
+            WatchOptions::default(),
+            |job| {
+                let json = self.pending_json(job);
+                let _ = on_event.call1(&JsValue::NULL, &JsValue::from_str(&json));
+            },
+        )
+        .await;
+        match result {
             Ok(job) => self.pending_json(&job),
             Err(error) => self.job_failure(error),
         }
