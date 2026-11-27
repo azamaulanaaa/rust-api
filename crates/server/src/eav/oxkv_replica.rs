@@ -337,6 +337,46 @@ impl OxkvReplicaStore {
         }
     }
 
+    /// Returns the build pointer of one generation in a test.
+    #[cfg(test)]
+    pub(crate) async fn build_pointer_for_test(
+        &self,
+        sub: &str,
+        generation: u64,
+    ) -> Result<Option<String>, EntityError> {
+        self.read_build_pointer(&sub_hash(sub), generation)
+            .await
+    }
+
+    /// Returns the raw objects of one generation in a test.
+    #[cfg(test)]
+    pub(crate) async fn generation_objects_for_test(
+        &self,
+        sub: &str,
+        generation: u64,
+    ) -> Result<Vec<ReplicaObject>, EntityError> {
+        let hash = sub_hash(sub);
+        let storage = match self.read_build_pointer(&hash, generation).await? {
+            Some(build_id) => self.storage_at(&format!("{hash}/{generation}/{build_id}")),
+            None => self.storage_at(&format!("{hash}/{generation}")),
+        };
+        let keys = storage
+            .list(&ObjectPath::default())
+            .await
+            .map_err(EntityError::Store)?;
+        let mut objects = Vec::with_capacity(keys.len());
+        for key in keys {
+            let output = storage.get(&key).await.map_err(EntityError::Store)?;
+            objects.push(ReplicaObject {
+                key: key.as_str().to_string(),
+                size: output.bytes.len() as u64,
+                sha256: sha256_hex(&output.bytes),
+            });
+        }
+        objects.sort_by(|left, right| left.key.cmp(&right.key));
+        Ok(objects)
+    }
+
     /// Starts one generation at `generation` for `sub`.
     ///
     /// The call writes a unique build prefix, so two builds at one generation
@@ -477,7 +517,9 @@ impl OxkvReplicaStore {
     /// Removes one unpublished build.
     ///
     /// The call removes only the build prefix of `build_id`.
-    /// It does nothing when the wrapper already names the generation, so a
+    /// It also removes the build pointer when the pointer names this build.
+    /// A failed build then cannot become the retained previous generation.
+    /// It does nothing when the wrapper and the pointer name this build, so a
     /// lost publish race cannot delete a live replica.
     pub(crate) async fn discard_generation(
         &self,
@@ -486,14 +528,22 @@ impl OxkvReplicaStore {
         build_id: &str,
     ) -> Result<(), EntityError> {
         let hash = sub_hash(sub);
+        let published = self.read_build_pointer(&hash, generation).await?;
         if let Some((manifest, _)) = self.read_wrapper(&hash).await?
             && manifest.generation == generation
-            && self.read_build_pointer(&hash, generation).await?.as_deref() == Some(build_id)
+            && published.as_deref() == Some(build_id)
         {
             return Ok(());
         }
         let storage = self.storage_at(&format!("{hash}/{generation}/{build_id}"));
-        delete_all(&storage, &ObjectPath::default()).await
+        delete_all(&storage, &ObjectPath::default()).await?;
+        if published.as_deref() == Some(build_id) {
+            self.storage_at(&format!("{hash}/{generation}"))
+                .delete(&ObjectPath::from("build.json"))
+                .await
+                .map_err(EntityError::Store)?;
+        }
+        Ok(())
     }
 
     /// Returns the wrapper manifest of `sub`, or `None` when no replica exists.

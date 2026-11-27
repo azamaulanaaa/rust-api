@@ -4053,6 +4053,64 @@ mod tests {
     }
 
     #[actix_web::test]
+    async fn a_failed_build_keeps_the_previous_published_generation() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        publish_task_schema(&fx).await?;
+        create_entity(&fx, "e1").await?;
+        grant_collection_read(&fx, "alice").await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+
+        let res = post_replica!(&app, &token).await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let first = get_oxkv_manifest!(&app, &token);
+
+        fx.runtime.oxkv().fail_next_publish();
+        fx.runtime.oxkv().fail_next_publish();
+        let res = post_replica!(&app, &token).await;
+        assert_eq!(res.status(), http::StatusCode::CONFLICT);
+        let stored = fx
+            .runtime
+            .replicas()
+            .get("alice")
+            .await?
+            .expect("the JSON replica committed");
+        for generation in (first.generation + 1)..=stored.generation {
+            assert!(
+                fx.runtime
+                    .oxkv()
+                    .build_pointer_for_test("alice", generation)
+                    .await?
+                    .is_none(),
+                "the failed generation {generation} kept its pointer"
+            );
+            assert!(
+                fx.runtime
+                    .oxkv()
+                    .generation_objects_for_test("alice", generation)
+                    .await?
+                    .is_empty(),
+                "the failed generation {generation} kept its objects"
+            );
+        }
+
+        let res = post_replica!(&app, &token).await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let reconciled = get_oxkv_manifest!(&app, &token);
+        assert!(reconciled.generation > stored.generation);
+        assert_eq!(
+            fx.runtime
+                .oxkv()
+                .generation_objects_for_test("alice", first.generation)
+                .await?,
+            first.objects,
+            "the previous published objects must stay readable"
+        );
+        Ok(())
+    }
+
+    #[actix_web::test]
     async fn a_versionless_wrapper_is_replaced() -> anyhow::Result<()> {
         let fx = fixture().await?;
         publish_task_schema(&fx).await?;
