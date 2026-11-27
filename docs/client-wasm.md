@@ -194,7 +194,7 @@ A `202` answer stores the pending job and returns JSON:
 
 ```json
 {"id":"...","state":"queued","attempt":0,"error":null,
- "commit_seq":null,"terminal":false,"committed":false}
+  "commit_seq":null,"terminal":false,"committed":false}
 ```
 
 A failure returns JSON with one name: `login_required`, `forbidden`,
