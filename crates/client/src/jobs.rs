@@ -1,15 +1,15 @@
-//! The client job client: submit a command and poll its status.
+//! The client job client: submit a command and follow its status.
 //!
 //! A write is a job. The client sends `POST /jobs` with a
-//! [`CommandEnvelope`](rust_api_model::wire::CommandEnvelope) and then polls
-//! `GET /jobs/{id}`. The client never changes the replica view on submit. It
-//! shows the committed replica data plus the
+//! [`CommandEnvelope`](rust_api_model::wire::CommandEnvelope) and then follows
+//! `GET /jobs/{id}` or `GET /jobs/{id}/events`. The client never changes the
+//! replica view on submit. It shows the committed replica data plus the
 //! [`PendingJob`](crate::jobs::PendingJob) until the server
 //! reports `succeeded` and the replica applied the commit sequence.
 //!
 //! The `poll` module names the guaranteed fallback transport. The `sse`
-//! module names the stream transport. This feature implements polling only;
-//! it does not implement SSE.
+//! module holds the event-source seam and the watcher. The watcher uses the
+//! stream and falls back to polling when the stream fails.
 
 pub mod poll;
 pub mod sse;
@@ -52,6 +52,8 @@ pub enum JobError {
     Transport(TransportError),
     /// The status body is not a valid [`JobStatusView`].
     InvalidBody(serde_json::Error),
+    /// The status body names another job.
+    MismatchedJob,
     /// The server answered with a status that the route does not define.
     UnexpectedStatus(u16),
 }
@@ -60,7 +62,7 @@ impl JobError {
     /// Return the stable JavaScript error name.
     ///
     /// A name, once added, stays part of the stable surface. The transport,
-    /// body, and unexpected-status errors all use `request`.
+    /// body, mismatched-job, and unexpected-status errors all use `request`.
     pub const fn status_name(&self) -> &'static str {
         match self {
             Self::LoginRequired => "login_required",
@@ -68,7 +70,10 @@ impl JobError {
             Self::NotFound => "not_found",
             Self::Conflict => "conflict",
             Self::InvalidCommand => "invalid_command",
-            Self::Transport(_) | Self::InvalidBody(_) | Self::UnexpectedStatus(_) => "request",
+            Self::Transport(_)
+            | Self::InvalidBody(_)
+            | Self::MismatchedJob
+            | Self::UnexpectedStatus(_) => "request",
         }
     }
 
@@ -92,6 +97,7 @@ impl fmt::Display for JobError {
             Self::InvalidBody(error) => {
                 write!(formatter, "the job status body is not valid: {error}")
             }
+            Self::MismatchedJob => formatter.write_str("the status body names another job"),
             Self::UnexpectedStatus(status) => {
                 write!(formatter, "the server answered HTTP {status}")
             }
@@ -252,14 +258,49 @@ impl<T: Transport> JobClient<T> {
         }
     }
 
+    /// Apply one event view to the stored pending job.
+    ///
+    /// The view is stored when its id matches `expected_id` without ASCII
+    /// case. A UUID has no case, and the view carries the canonical lowercase
+    /// form. A stored job with another id is replaced. A terminal stored job
+    /// with the same id does not change. The method returns `None` when the
+    /// view names another job. The watcher uses this method for the initial,
+    /// status, and terminal events.
+    pub(crate) fn apply_view(&self, expected_id: &str, view: JobStatusView) -> Option<PendingJob> {
+        let job = PendingJob::from_view(view);
+        if !job_ids_match(&job.id, expected_id) {
+            return None;
+        }
+        Some(self.apply_pending(job))
+    }
+
+    /// Store one job in the pending slot and return the stored value.
+    ///
+    /// The call stores the job when the slot is empty or holds another job. A
+    /// terminal stored job with the same id does not change. The watcher uses
+    /// this method for a fallback poll.
+    pub(crate) fn apply_pending(&self, job: PendingJob) -> PendingJob {
+        let current = self.pending.borrow().clone();
+        if let Some(current) = current
+            && job_ids_match(&current.id, &job.id)
+            && current.is_terminal()
+        {
+            return current;
+        }
+        self.pending.replace(Some(job.clone()));
+        job
+    }
+
     /// Read the status of one job and update the stored pending job.
     ///
     /// The request is `GET /jobs/{id}` with cookie credentials. A `200`
     /// answer returns the job. The call updates the stored pending job when
-    /// the id matches. A job in a terminal state does not change again. A
-    /// `404` answer returns [`JobError::NotFound`]. A `401` answer returns
-    /// [`JobError::LoginRequired`]. Any other answer returns
-    /// [`JobError::UnexpectedStatus`]. A transport failure returns
+    /// the id matches without ASCII case. A UUID has no case. A job in a
+    /// terminal state does not change again. A body for another id returns
+    /// [`JobError::MismatchedJob`] and does not change the stored job. A
+    /// `404` answer returns [`JobError::NotFound`].
+    /// A `401` answer returns [`JobError::LoginRequired`]. Any other answer
+    /// returns [`JobError::UnexpectedStatus`]. A transport failure returns
     /// [`JobError::Transport`]. A body that is not a [`JobStatusView`]
     /// returns [`JobError::InvalidBody`].
     ///
@@ -278,10 +319,13 @@ impl<T: Transport> JobClient<T> {
             200 => {
                 let view: JobStatusView =
                     serde_json::from_slice(&response.body).map_err(JobError::InvalidBody)?;
+                if !job_ids_match(&view.id.to_string(), id) {
+                    return Err(JobError::MismatchedJob);
+                }
                 let job = PendingJob::from_view(view);
                 let current = self.pending.borrow().clone();
                 if let Some(current) = current
-                    && current.id == job.id
+                    && job_ids_match(&current.id, &job.id)
                 {
                     if current.is_terminal() {
                         return Ok(current);
@@ -323,11 +367,20 @@ fn valid_idempotency_key(key: &str) -> bool {
     !key.is_empty() && key.len() <= MAX_IDEMPOTENCY_KEY_LEN
 }
 
+/// Return `true` when two job id strings name the same job.
+///
+/// A UUID has no case. The server writes the canonical lowercase form, and a
+/// caller can pass any accepted form. The comparison ignores ASCII case, so
+/// an uppercase caller id matches the lowercase view id.
+fn job_ids_match(left: &str, right: &str) -> bool {
+    left.eq_ignore_ascii_case(right)
+}
+
 /// Return `true` when one job id is a safe request path segment.
 ///
 /// The allowlist keeps URL syntax out of the request path. A client can call
 /// [`JobClient::poll`] with any string, so the check runs before the request.
-fn is_safe_job_id(id: &str) -> bool {
+pub(crate) fn is_safe_job_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= MAX_JOB_ID_LEN
         && id
@@ -350,6 +403,9 @@ mod tests {
 
     /// One job id that is a valid request path segment.
     const JOB_ID: &str = "0190a5c2-7f3a-7c2b-8e4d-0123456789ab";
+
+    /// Another job id that is a valid request path segment.
+    const OTHER_JOB_ID: &str = "0190a5c2-7f3a-7c2b-8e4d-0123456789ac";
 
     /// One scripted transport answer.
     #[derive(Clone, Debug)]
@@ -441,15 +497,16 @@ mod tests {
         }
     }
 
-    /// Build one job status body.
-    fn job_body(
+    /// Build one job status body for one id.
+    fn job_body_for(
+        id: &str,
         state: &str,
         attempt: u32,
         error: Option<&str>,
         commit_seq: Option<u64>,
     ) -> Vec<u8> {
         serde_json::to_vec(&json!({
-            "id": JOB_ID,
+            "id": id,
             "kind": "entity.create",
             "state": state,
             "attempt": attempt,
@@ -460,6 +517,16 @@ mod tests {
             "commit_seq": commit_seq,
         }))
         .expect("the job body serializes")
+    }
+
+    /// Build one job status body for the watched job.
+    fn job_body(
+        state: &str,
+        attempt: u32,
+        error: Option<&str>,
+        commit_seq: Option<u64>,
+    ) -> Vec<u8> {
+        job_body_for(JOB_ID, state, attempt, error, commit_seq)
     }
 
     /// Script one `202` queued answer.
@@ -594,6 +661,121 @@ mod tests {
         let job = block_on(client.poll(JOB_ID)).expect("the poll succeeds");
         assert_eq!(job, done);
         assert_eq!(client.pending(), Some(done));
+    }
+
+    /// A status body for another job is rejected and does not replace the
+    /// pending job.
+    #[test]
+    fn poll_rejects_a_status_body_for_another_job() {
+        let (requests, replies, transport) = FakeTransport::new();
+        let client = JobClient::new(transport);
+        let stored = PendingJob {
+            id: OTHER_JOB_ID.to_owned(),
+            state: JobState::Queued,
+            attempt: 0,
+            error: None,
+            commit_seq: None,
+        };
+        client.apply_pending(stored.clone());
+        let body = job_body_for(OTHER_JOB_ID, "succeeded", 1, None, Some(5));
+        replies.borrow_mut().push_back(Reply::json(200, body));
+
+        let error = block_on(client.poll(JOB_ID)).expect_err("the body names another job");
+
+        assert!(matches!(error, JobError::MismatchedJob));
+        assert_eq!(error.status_name(), "request");
+        assert_eq!(error.to_string(), "the status body names another job");
+        assert_eq!(client.pending(), Some(stored));
+        assert_eq!(requests.borrow().len(), 1);
+        assert_eq!(requests.borrow()[0].path, format!("/jobs/{JOB_ID}"));
+    }
+
+    /// A poll matches the same job id without ASCII case.
+    #[test]
+    fn poll_matches_a_job_id_without_case() {
+        for (request_id, response_id) in [
+            (JOB_ID.to_uppercase(), JOB_ID.to_owned()),
+            (JOB_ID.to_owned(), JOB_ID.to_uppercase()),
+        ] {
+            let (requests, replies, transport) = FakeTransport::new();
+            let client = JobClient::new(transport);
+            client.apply_pending(pending(JobState::Queued, None));
+            let body = job_body_for(&response_id, "succeeded", 1, None, Some(5));
+            replies.borrow_mut().push_back(Reply::json(200, body));
+
+            let job = block_on(client.poll(&request_id)).expect("the same job matches");
+
+            assert_eq!(job.id, JOB_ID);
+            assert_eq!(job.state, JobState::Succeeded);
+            assert_eq!(client.pending(), Some(job));
+            assert_eq!(requests.borrow().len(), 1);
+        }
+    }
+
+    /// An event view matches the same job id without ASCII case.
+    #[test]
+    fn apply_view_matches_a_job_id_without_case() {
+        let (_, _, transport) = FakeTransport::new();
+        let client = JobClient::new(transport);
+        for expected_id in [JOB_ID.to_owned(), JOB_ID.to_uppercase()] {
+            let body = job_body_for(&JOB_ID.to_uppercase(), "queued", 0, None, None);
+            let view: JobStatusView = serde_json::from_slice(&body).expect("the view parses");
+
+            let job = client
+                .apply_view(&expected_id, view)
+                .expect("the same job matches");
+
+            assert_eq!(job.id, JOB_ID);
+            assert_eq!(client.pending(), Some(job));
+        }
+    }
+
+    /// A stream view for another job is not applied.
+    #[test]
+    fn apply_view_rejects_a_view_for_another_job() {
+        let (_, _, transport) = FakeTransport::new();
+        let client = JobClient::new(transport);
+        let stored = pending(JobState::Queued, None);
+        client.apply_pending(stored.clone());
+        let body = job_body_for(OTHER_JOB_ID, "succeeded", 1, None, Some(5));
+        let view: JobStatusView = serde_json::from_slice(&body).expect("the view parses");
+
+        assert_eq!(client.apply_view(JOB_ID, view), None);
+        assert_eq!(client.pending(), Some(stored));
+    }
+
+    /// A terminal pending job does not change on an apply.
+    #[test]
+    fn apply_pending_keeps_a_terminal_job() {
+        let (_, _, transport) = FakeTransport::new();
+        let client = JobClient::new(transport);
+        let done = pending(JobState::Succeeded, Some(5));
+        client.apply_pending(done.clone());
+
+        let stored = client.apply_pending(pending(JobState::Leased, None));
+
+        assert_eq!(stored, done);
+        assert_eq!(client.pending(), Some(done));
+    }
+
+    /// An apply replaces a job with another id after the caller checks it.
+    #[test]
+    fn apply_pending_replaces_a_job_with_another_id() {
+        let (_, _, transport) = FakeTransport::new();
+        let client = JobClient::new(transport);
+        client.apply_pending(pending(JobState::Queued, None));
+        let other = PendingJob {
+            id: OTHER_JOB_ID.to_owned(),
+            state: JobState::Leased,
+            attempt: 1,
+            error: None,
+            commit_seq: None,
+        };
+
+        let stored = client.apply_pending(other.clone());
+
+        assert_eq!(stored, other);
+        assert_eq!(client.pending(), Some(other));
     }
 
     /// Submit maps a conflict, an invalid command, and other statuses.
@@ -796,6 +978,7 @@ mod tests {
         );
         let body = serde_json::from_str::<Value>("{").expect_err("the body is not valid");
         assert_eq!(JobError::InvalidBody(body).status_name(), "request");
+        assert_eq!(JobError::MismatchedJob.status_name(), "request");
         assert_eq!(JobError::UnexpectedStatus(404).status_name(), "request");
     }
 
