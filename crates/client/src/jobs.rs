@@ -260,14 +260,15 @@ impl<T: Transport> JobClient<T> {
 
     /// Apply one event view to the stored pending job.
     ///
-    /// The view is stored when its id matches `expected_id`. A stored job
-    /// with another id is replaced. A terminal stored job with the same id
-    /// does not change. The method returns `None` when the view names another
-    /// job. The watcher uses this method for the initial, status, and terminal
-    /// events.
+    /// The view is stored when its id matches `expected_id` without ASCII
+    /// case. A UUID has no case, and the view carries the canonical lowercase
+    /// form. A stored job with another id is replaced. A terminal stored job
+    /// with the same id does not change. The method returns `None` when the
+    /// view names another job. The watcher uses this method for the initial,
+    /// status, and terminal events.
     pub(crate) fn apply_view(&self, expected_id: &str, view: JobStatusView) -> Option<PendingJob> {
         let job = PendingJob::from_view(view);
-        if job.id != expected_id {
+        if !job_ids_match(&job.id, expected_id) {
             return None;
         }
         Some(self.apply_pending(job))
@@ -281,7 +282,7 @@ impl<T: Transport> JobClient<T> {
     pub(crate) fn apply_pending(&self, job: PendingJob) -> PendingJob {
         let current = self.pending.borrow().clone();
         if let Some(current) = current
-            && current.id == job.id
+            && job_ids_match(&current.id, &job.id)
             && current.is_terminal()
         {
             return current;
@@ -294,9 +295,10 @@ impl<T: Transport> JobClient<T> {
     ///
     /// The request is `GET /jobs/{id}` with cookie credentials. A `200`
     /// answer returns the job. The call updates the stored pending job when
-    /// the id matches. A job in a terminal state does not change again. A
-    /// body for another id returns [`JobError::MismatchedJob`] and does not
-    /// change the stored job. A `404` answer returns [`JobError::NotFound`].
+    /// the id matches without ASCII case. A UUID has no case. A job in a
+    /// terminal state does not change again. A body for another id returns
+    /// [`JobError::MismatchedJob`] and does not change the stored job. A
+    /// `404` answer returns [`JobError::NotFound`].
     /// A `401` answer returns [`JobError::LoginRequired`]. Any other answer
     /// returns [`JobError::UnexpectedStatus`]. A transport failure returns
     /// [`JobError::Transport`]. A body that is not a [`JobStatusView`]
@@ -317,13 +319,13 @@ impl<T: Transport> JobClient<T> {
             200 => {
                 let view: JobStatusView =
                     serde_json::from_slice(&response.body).map_err(JobError::InvalidBody)?;
-                if view.id.to_string() != id {
+                if !job_ids_match(&view.id.to_string(), id) {
                     return Err(JobError::MismatchedJob);
                 }
                 let job = PendingJob::from_view(view);
                 let current = self.pending.borrow().clone();
                 if let Some(current) = current
-                    && current.id == job.id
+                    && job_ids_match(&current.id, &job.id)
                 {
                     if current.is_terminal() {
                         return Ok(current);
@@ -363,6 +365,15 @@ impl JobError {
 /// Return `true` when one idempotency key has a valid byte length.
 fn valid_idempotency_key(key: &str) -> bool {
     !key.is_empty() && key.len() <= MAX_IDEMPOTENCY_KEY_LEN
+}
+
+/// Return `true` when two job id strings name the same job.
+///
+/// A UUID has no case. The server writes the canonical lowercase form, and a
+/// caller can pass any accepted form. The comparison ignores ASCII case, so
+/// an uppercase caller id matches the lowercase view id.
+fn job_ids_match(left: &str, right: &str) -> bool {
+    left.eq_ignore_ascii_case(right)
 }
 
 /// Return `true` when one job id is a safe request path segment.
@@ -677,6 +688,46 @@ mod tests {
         assert_eq!(client.pending(), Some(stored));
         assert_eq!(requests.borrow().len(), 1);
         assert_eq!(requests.borrow()[0].path, format!("/jobs/{JOB_ID}"));
+    }
+
+    /// A poll matches the same job id without ASCII case.
+    #[test]
+    fn poll_matches_a_job_id_without_case() {
+        for (request_id, response_id) in [
+            (JOB_ID.to_uppercase(), JOB_ID.to_owned()),
+            (JOB_ID.to_owned(), JOB_ID.to_uppercase()),
+        ] {
+            let (requests, replies, transport) = FakeTransport::new();
+            let client = JobClient::new(transport);
+            client.apply_pending(pending(JobState::Queued, None));
+            let body = job_body_for(&response_id, "succeeded", 1, None, Some(5));
+            replies.borrow_mut().push_back(Reply::json(200, body));
+
+            let job = block_on(client.poll(&request_id)).expect("the same job matches");
+
+            assert_eq!(job.id, JOB_ID);
+            assert_eq!(job.state, JobState::Succeeded);
+            assert_eq!(client.pending(), Some(job));
+            assert_eq!(requests.borrow().len(), 1);
+        }
+    }
+
+    /// An event view matches the same job id without ASCII case.
+    #[test]
+    fn apply_view_matches_a_job_id_without_case() {
+        let (_, _, transport) = FakeTransport::new();
+        let client = JobClient::new(transport);
+        for expected_id in [JOB_ID.to_owned(), JOB_ID.to_uppercase()] {
+            let body = job_body_for(&JOB_ID.to_uppercase(), "queued", 0, None, None);
+            let view: JobStatusView = serde_json::from_slice(&body).expect("the view parses");
+
+            let job = client
+                .apply_view(&expected_id, view)
+                .expect("the same job matches");
+
+            assert_eq!(job.id, JOB_ID);
+            assert_eq!(client.pending(), Some(job));
+        }
     }
 
     /// A stream view for another job is not applied.

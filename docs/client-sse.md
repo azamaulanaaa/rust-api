@@ -128,6 +128,7 @@ Status mapping:
 | Poll bound reached | `request` |
 
 A successful watch returns the final pending job. The job client stores it.
+The id match ignores ASCII case, so an uppercase UUID reaches the same job.
 A fallback poll does not change the shape of the pending job.
 
 ## JavaScript

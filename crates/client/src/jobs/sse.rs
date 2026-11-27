@@ -854,6 +854,38 @@ mod tests {
         assert_eq!(requests.borrow().len(), 1);
     }
 
+    /// A fallback poll matches the same job id without ASCII case.
+    #[test]
+    fn a_fallback_poll_matches_a_job_id_without_case() {
+        for (request_id, response_id) in [
+            (JOB_ID.to_uppercase(), JOB_ID.to_owned()),
+            (JOB_ID.to_owned(), JOB_ID.to_uppercase()),
+        ] {
+            let (source, _) =
+                ScriptedSource::new(vec![Err(StreamFailure::new("the stream ended"))]);
+            let (requests, replies, transport) = FakeTransport::new();
+            script_poll_for(&replies, &response_id, "succeeded", 1, Some(5));
+            let jobs = JobClient::new(transport);
+            let (seen, record) = recorder();
+
+            let job = block_on(watch(
+                &jobs,
+                &request_id,
+                source,
+                RecordingDelay::new(),
+                WatchOptions::default(),
+                record,
+            ))
+            .expect("the fallback matches");
+
+            assert_eq!(job.id, JOB_ID);
+            assert_eq!(job.state, JobState::Succeeded);
+            assert_eq!(jobs.pending(), Some(job));
+            assert_eq!(requests.borrow().len(), 1);
+            assert_eq!(seen.borrow().len(), 1);
+        }
+    }
+
     /// A terminal first event stops without polling.
     #[test]
     fn a_terminal_first_event_stops_without_polling() {

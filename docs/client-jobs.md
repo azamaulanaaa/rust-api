@@ -66,7 +66,9 @@ visible. A non-owner gets `404`, so the route does not show whether the job
 exists. A `401` answer means the session ended.
 
 The client stores one pending job. A poll updates the stored job only when the
-id matches. A job in a terminal state does not change again.
+id matches. The id match ignores ASCII case: a UUID has no case, and the
+server writes the canonical lowercase form. A job in a terminal state does
+not change again.
 
 Polling is the guaranteed status transport. The client also watches the job
 over server-sent events and falls back to polling when the stream fails. See
