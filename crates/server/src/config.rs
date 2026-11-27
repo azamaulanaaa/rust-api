@@ -1131,7 +1131,7 @@ mod tests {
     fn the_example_config_parses() {
         // The README tells an operator to copy this file. A copy must parse
         // and pass validation, or the first start fails.
-        let cfg = parse(include_str!("../config.example.toml"))
+        let cfg = parse(include_str!("../../../config.example.toml"))
             .expect("config.example.toml must parse and validate");
         assert_eq!(cfg.public_address, "https://example.com");
         assert_eq!(cfg.listen_port, 8080);
@@ -2164,7 +2164,7 @@ mod tests {
     /// agree with the default that [`EavConfig::default`] returns.
     #[test]
     fn the_example_config_carries_the_default_max_causation_depth() {
-        let cfg = parse(include_str!("../config.example.toml"))
+        let cfg = parse(include_str!("../../../config.example.toml"))
             .expect("config.example.toml must parse and validate");
         assert_eq!(cfg.eav.max_causation_depth, 8);
         assert_eq!(

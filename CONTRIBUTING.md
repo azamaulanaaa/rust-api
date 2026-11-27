@@ -37,8 +37,8 @@ cargo build --all-targets --all-features
 ```bash
 mise run test
 # or
-cargo test --all-targets --all-features
-cargo test --doc
+cargo test --workspace --all-targets --all-features
+cargo test --doc --workspace
 ```
 
 Integration tests use wiremock. FsEngine and PolicyEngine tests use an
@@ -121,9 +121,10 @@ must provide Rust, cargo, and `cargo-deny`. For a local microVM,
 
 ## Documentation
 
-Every public item must carry rustdoc. `Cargo.toml` sets `missing_docs = "deny"`.
-The compiler enforces this at build time. CI also runs `cargo doc --no-deps
---all-features` with `RUSTDOCFLAGS="-D warnings"`.
+Every public item must carry rustdoc. The root `Cargo.toml` sets
+`missing_docs = "deny"`. The compiler enforces this at build time. CI also runs
+`cargo doc --workspace --no-deps --all-features` with
+`RUSTDOCFLAGS="-D warnings"`.
 
 Write doc comments in STE style. Keep sentences short. Use active voice. Put one
 idea in each sentence.

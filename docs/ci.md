@@ -103,10 +103,11 @@ The matrix runs one check per entry. The feature/rust entries are `mise`,
 
 The project entries are `coverage`, `msrv`, `no-default-features`, `doc`, and
 `release-config`. The `msrv` entry uses Rust 1.89. That version must match
-`rust-version` in `Cargo.toml`. The `coverage` entry runs `cargo llvm-cov`
-with a 90% line floor and uploads the HTML report as the `coverage-html`
-artifact. `release-config` checks that the release workflow still gates
-publishing on CI.
+`rust-version` in the root `Cargo.toml`. The Rust check scripts use
+`--workspace`, so they cover all four crates. The `coverage` entry runs
+`cargo llvm-cov --workspace` with a 90% line floor and uploads the HTML report
+as the `coverage-html` artifact. `release-config` checks that the release
+workflow still gates publishing on CI.
 
 Set these job names as required status checks on the default branch. Do this
 in the repository settings on GitHub, not in the repository files.

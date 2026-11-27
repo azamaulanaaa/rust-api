@@ -596,6 +596,7 @@ mod tests {
             created_at: 0,
             scheduled_at: 0,
             idempotency_key: None,
+            owner_sub: None,
             headers: BTreeMap::new(),
         }
     }

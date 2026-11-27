@@ -1,0 +1,290 @@
+//! Job submission and status routes.
+//!
+//! This module owns the `/jobs` prefix. The poll route and the server-sent
+//! event route live in the `poll` and `sse` submodules. The foundation
+//! registers the prefix one time, so a feature branch changes only its
+//! handler module.
+//!
+//! Polling is the guaranteed fallback. The SSE route is an optimization.
+//! Both routes answer 501 until their feature branch lands.
+
+use actix_web::{
+    HttpResponse,
+    http::StatusCode,
+    web::{self, ServiceConfig},
+};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
+use rust_api_model::{CommandKind, CommandKindError, JobState, JobStatusView};
+
+use crate::http::{ApiModule, error::ApiError};
+use crate::queue::{Job, JobStatus};
+
+/// The poll route for one job status.
+pub mod poll;
+
+/// The server-sent event route for one job status.
+pub mod sse;
+
+/// The module that owns the `/jobs` route prefix.
+#[derive(Default)]
+pub struct JobsApiModule;
+
+impl JobsApiModule {
+    /// Creates the module. The module holds no state yet.
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl ApiModule for JobsApiModule {
+    fn prefix(&self) -> &str {
+        "/jobs"
+    }
+
+    fn configure(&self, cfg: &mut ServiceConfig) {
+        cfg.service(
+            web::scope("/jobs")
+                .service(poll::get_job)
+                .service(sse::job_events),
+        );
+    }
+}
+
+/// Builds the not-implemented answer for one route.
+///
+/// The answer uses the shared error envelope and a message that names the
+/// missing behavior. A caller therefore learns that the route exists and
+/// that the server has no implementation yet.
+pub(crate) fn not_implemented(route: &str) -> HttpResponse {
+    ApiError::envelope(
+        StatusCode::NOT_IMPLEMENTED,
+        &format!("{route} is not implemented"),
+        Some("not_implemented"),
+        None,
+    )
+}
+
+/// Builds the API view of one stored job status.
+///
+/// The function maps the stored status to [`JobStatusView`]. The stored
+/// status never goes on the wire. The poll handler can set `commit_seq`
+/// after this call when it has a source for the value.
+///
+/// The function returns [`CommandKindError`] when the stored kind is not a
+/// valid command kind.
+// The poll and SSE feature branches call this helper. The foundation has no
+// caller yet.
+#[allow(dead_code)]
+pub(crate) fn status_view(
+    job: &Job,
+    status: &JobStatus,
+) -> Result<JobStatusView, CommandKindError> {
+    let kind = CommandKind::parse(job.kind.clone())?;
+    let mut view = JobStatusView {
+        id: job.id,
+        kind,
+        state: JobState::Queued,
+        attempt: job.attempt,
+        max_attempts: job.max_attempts,
+        created_at: job.created_at,
+        scheduled_at: job.scheduled_at,
+        lease_expires_at: None,
+        finished_at: None,
+        worker: None,
+        error: None,
+        result_base64: None,
+        commit_seq: None,
+    };
+
+    match status {
+        JobStatus::Queued => {}
+        JobStatus::Leased { worker, expires_at } => {
+            view.state = JobState::Leased;
+            view.worker = Some(worker.clone());
+            view.lease_expires_at = Some(*expires_at);
+        }
+        JobStatus::Succeeded {
+            result,
+            finished_at,
+        } => {
+            view.state = JobState::Succeeded;
+            view.finished_at = Some(*finished_at);
+            if let Some(bytes) = result {
+                view.result_base64 = Some(STANDARD.encode(bytes));
+            }
+        }
+        JobStatus::Failed { error, finished_at } => {
+            view.state = JobState::Failed;
+            view.finished_at = Some(*finished_at);
+            view.error = Some(error.clone());
+        }
+        JobStatus::Dead { error, finished_at } => {
+            view.state = JobState::Dead;
+            view.finished_at = Some(*finished_at);
+            view.error = Some(error.clone());
+        }
+    }
+
+    Ok(view)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use actix_web::test as actix_test;
+    use actix_web::{App, http::StatusCode};
+    use serde_json::Value;
+    use std::collections::BTreeMap;
+    use uuid::Uuid;
+
+    /// Builds one stored job for the status view tests.
+    fn sample_job() -> Job {
+        Job {
+            id: Uuid::nil(),
+            kind: "entity.create".to_string(),
+            payload: b"input".to_vec(),
+            priority: 0,
+            attempt: 2,
+            max_attempts: 5,
+            created_at: 1_700_000_000,
+            scheduled_at: 1_700_000_010,
+            idempotency_key: Some("key-1".to_string()),
+            owner_sub: None,
+            headers: BTreeMap::new(),
+        }
+    }
+
+    /// The module claims only the `/jobs` prefix.
+    #[test]
+    fn the_module_claims_the_jobs_prefix() {
+        assert_eq!(JobsApiModule::new().prefix(), "/jobs");
+    }
+
+    /// Both stub routes answer 501 with the shared error envelope.
+    #[actix_web::test]
+    async fn both_stub_routes_answer_not_implemented() {
+        let module = JobsApiModule::new();
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+
+        let cases = [
+            ("/jobs/one", "job status polling is not implemented"),
+            (
+                "/jobs/one/events",
+                "job status streaming is not implemented",
+            ),
+        ];
+        for (uri, message) in cases {
+            let request = actix_test::TestRequest::get().uri(uri).to_request();
+            let response = actix_test::call_service(&app, request).await;
+            assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED, "{uri}");
+            let body: Value = actix_test::read_body_json(response).await;
+            assert_eq!(body["error"], message, "{uri}");
+            assert_eq!(body["code"], "not_implemented", "{uri}");
+        }
+    }
+
+    /// A stored job from before the owner field decodes without an owner.
+    #[test]
+    fn a_stored_job_without_the_owner_decodes_with_no_owner() {
+        let mut value = serde_json::to_value(sample_job()).expect("the job serializes");
+        let object = value.as_object_mut().expect("the job is an object");
+        assert!(object.remove("owner_sub").is_some());
+        let job: Job = serde_json::from_value(value).expect("the stored job parses");
+        assert_eq!(job.owner_sub, None);
+    }
+
+    /// `status_view` maps the queued and leased states and their fields.
+    #[test]
+    fn status_view_maps_the_queued_and_leased_states() {
+        let job = sample_job();
+
+        let queued = status_view(&job, &JobStatus::Queued).expect("the queued status maps");
+        assert_eq!(queued.id, job.id);
+        assert_eq!(queued.kind.as_str(), "entity.create");
+        assert_eq!(queued.state, JobState::Queued);
+        assert_eq!(queued.attempt, job.attempt);
+        assert_eq!(queued.max_attempts, job.max_attempts);
+        assert_eq!(queued.created_at, job.created_at);
+        assert_eq!(queued.scheduled_at, job.scheduled_at);
+        assert_eq!(queued.lease_expires_at, None);
+        assert_eq!(queued.finished_at, None);
+        assert_eq!(queued.worker, None);
+        assert_eq!(queued.error, None);
+        assert_eq!(queued.result_base64, None);
+        assert_eq!(queued.commit_seq, None);
+
+        let leased = status_view(
+            &job,
+            &JobStatus::Leased {
+                worker: "worker-7".to_string(),
+                expires_at: 1_700_000_000_123,
+            },
+        )
+        .expect("the leased status maps");
+        assert_eq!(leased.state, JobState::Leased);
+        assert_eq!(leased.worker.as_deref(), Some("worker-7"));
+        assert_eq!(leased.lease_expires_at, Some(1_700_000_000_123));
+        assert_eq!(leased.finished_at, None);
+        assert_eq!(leased.commit_seq, None);
+    }
+
+    /// `status_view` maps the terminal states and encodes the result bytes.
+    #[test]
+    fn status_view_maps_the_terminal_states() {
+        let job = sample_job();
+
+        let succeeded = status_view(
+            &job,
+            &JobStatus::Succeeded {
+                result: Some(b"done".to_vec()),
+                finished_at: 1_700_000_020,
+            },
+        )
+        .expect("the succeeded status maps");
+        assert_eq!(succeeded.state, JobState::Succeeded);
+        assert_eq!(succeeded.finished_at, Some(1_700_000_020));
+        assert_eq!(succeeded.result_base64.as_deref(), Some("ZG9uZQ=="));
+        assert_eq!(succeeded.error, None);
+        assert_eq!(succeeded.commit_seq, None);
+
+        let empty = status_view(
+            &job,
+            &JobStatus::Succeeded {
+                result: None,
+                finished_at: 1_700_000_021,
+            },
+        )
+        .expect("the empty succeeded status maps");
+        assert_eq!(empty.result_base64, None);
+
+        for (status, state, error, finished_at) in [
+            (
+                JobStatus::Failed {
+                    error: "the handler failed".to_string(),
+                    finished_at: 1_700_000_030,
+                },
+                JobState::Failed,
+                "the handler failed",
+                1_700_000_030,
+            ),
+            (
+                JobStatus::Dead {
+                    error: "the attempts ran out".to_string(),
+                    finished_at: 1_700_000_040,
+                },
+                JobState::Dead,
+                "the attempts ran out",
+                1_700_000_040,
+            ),
+        ] {
+            let view = status_view(&job, &status).expect("the terminal status maps");
+            assert_eq!(view.state, state);
+            assert_eq!(view.error.as_deref(), Some(error));
+            assert_eq!(view.finished_at, Some(finished_at));
+            assert_eq!(view.worker, None);
+            assert_eq!(view.result_base64, None);
+            assert_eq!(view.commit_seq, None);
+        }
+    }
+}

@@ -7,8 +7,9 @@
 //! JSON, for backups and migrations. The `eav reset-cursor` subcommand
 //! rewinds the durable rule cursor, for operator recovery.
 
-// Cargo.toml sets the deny level through [lints.clippy]. The level applies to
-// this target too. This attribute only opens the test escape hatch.
+// The root Cargo.toml sets the deny level through [workspace.lints.clippy].
+// The level applies to this target too. This attribute only opens the test
+// escape hatch.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 use std::{
@@ -923,7 +924,8 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
         .register_module(Box::new(policy_api_module))
         .register_module(Box::new(fs_api_module))
         .register_module(Box::new(sync_api_module))
-        .register_module(Box::new(eav_api_module));
+        .register_module(Box::new(eav_api_module))
+        .register_module(Box::new(rust_api::jobs::JobsApiModule::new()));
     let served = service.start(listen_addr.into()).await;
 
     // This is the orderly release, and the code awaits it. `start` returns

@@ -255,6 +255,7 @@ impl RuleAction for WebhookAction {
             created_at: now,
             scheduled_at: now,
             idempotency_key: Some(format!("webhook:{}:{}", ctx.rule.id, ctx.event.event_id)),
+            owner_sub: None,
             headers: BTreeMap::new(),
         };
         queue.enqueue(job).await.map_err(|_| failed())?;
@@ -1116,6 +1117,7 @@ mod tests {
             created_at: 0,
             scheduled_at: 0,
             idempotency_key: None,
+            owner_sub: None,
             headers: BTreeMap::new(),
         }
     }

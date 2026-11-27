@@ -19,5 +19,5 @@ if [[ ! -f Cargo.toml ]]; then
   exit 0
 fi
 
-cargo clippy --all-targets --all-features --locked -- -D warnings
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 echo "checked Rust code with clippy"

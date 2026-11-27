@@ -6,14 +6,17 @@
 //! [`http::ApiModule`] implementations onto an [`http::ApiService`] to build
 //! its own API surface on the shared auth and policy plumbing.
 
-// Cargo.toml denies `unwrap_used` and `expect_used` for the whole package
-// through [lints.clippy], so the level is set once and covers every target.
-// This attribute only opens the test escape hatch. Each `#[cfg(test)]` module
-// therefore needs no `#[allow]` of its own.
+// The root Cargo.toml denies `unwrap_used` and `expect_used` for the whole
+// workspace through [workspace.lints.clippy], so the level is set once and
+// covers every target. This attribute only opens the test escape hatch. Each
+// `#[cfg(test)]` module therefore needs no `#[allow]` of its own.
 //
-// Every public item needs a rustdoc comment. Cargo.toml enforces this rule
-// in the same way, through [lints.rust].
+// Every public item needs a rustdoc comment. The root Cargo.toml enforces
+// this rule in the same way, through [workspace.lints.rust].
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
+/// Shared pure behavior for the server and the WASM client.
+pub use rust_api_core as core;
 
 /// HTTP server scaffolding. It has a service registry for modules and
 /// request middleware. The middleware extracts the bearer token and
@@ -39,6 +42,11 @@ pub mod fs;
 
 /// Generic job queue traits, backends, and worker runtime.
 pub mod queue;
+
+/// Job submission and status routes. The module owns the `/jobs` prefix.
+/// Poll and SSE are stubs until their feature branches land.
+pub mod jobs;
+
 /// Reactive scaffolding: a business-logic-free extension point for
 /// applications to attach `oxkv` hooks and run background systems.
 pub mod reactive;
@@ -179,7 +187,8 @@ mod tests {
     /// prose is good. The test only makes the additions legible.
     #[test]
     fn every_ignore_is_justified() {
-        let deny = std::fs::read_to_string("deny.toml").expect("deny.toml is readable");
+        let deny_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deny.toml");
+        let deny = std::fs::read_to_string(deny_path).expect("deny.toml is readable");
 
         /// Splits `deny.toml` into `(id, reason)` pairs.
         ///

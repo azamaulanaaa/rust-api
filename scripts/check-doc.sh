@@ -13,5 +13,5 @@ if ! command -v cargo >/dev/null 2>&1; then
   exit 1
 fi
 
-RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features --locked
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features --locked
 echo "checked Rust docs"

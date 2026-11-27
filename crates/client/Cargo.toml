@@ -1,0 +1,21 @@
+[package]
+name = "rust-api-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "WASM client for the rust-api server"
+
+[lib]
+# The cdylib is the browser artifact. The rlib keeps the crate testable
+# and usable from a native test target.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+rust-api-model.workspace = true
+rust-api-core.workspace = true
+
+[lints]
+workspace = true

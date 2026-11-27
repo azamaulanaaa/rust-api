@@ -35,6 +35,7 @@ async fn main() -> anyhow::Result<()> {
         created_at: 0,
         scheduled_at: 0,
         idempotency_key: None,
+        owner_sub: None,
         headers: std::collections::BTreeMap::new(),
     };
     queue
