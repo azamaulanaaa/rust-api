@@ -563,4 +563,42 @@ mod tests {
         assert_eq!(view.len(), 0);
         assert_eq!(view.generation(), 4);
     }
+
+    /// A scan above one page finds every entity exactly one time.
+    #[test]
+    fn a_multi_page_scan_finds_every_entity() {
+        use crate::eav::test_support::{block_on, build_objects};
+
+        // Two rows per entity, so this needs more than two scan pages.
+        let count = SCAN_PAGE + 1;
+        let mut rows = Vec::with_capacity(count * 2);
+        for n in 0..count {
+            let id = format!("e{n:04}");
+            let meta = serde_json::json!({"id": id.clone()});
+            let tag = serde_json::json!({"type": "string", "value": "alpha"});
+            rows.push((
+                format!("entity:{id}:meta"),
+                serde_json::to_vec(&meta).expect("the meta serializes"),
+            ));
+            rows.push((
+                format!("entity:{id}:attr:tag"),
+                serde_json::to_vec(&tag).expect("the tag serializes"),
+            ));
+        }
+        let objects = std::sync::Arc::new(build_objects(rows));
+
+        let view = block_on(EntityView::open(&objects, 1)).expect("the view opens");
+
+        assert_eq!(view.len(), count);
+        let mut seen = std::collections::BTreeSet::new();
+        for n in 0..count {
+            let id = format!("e{n:04}");
+            assert_eq!(
+                view.attribute(&id, "tag"),
+                Some(&string("alpha")),
+                "the view is missing {id}"
+            );
+            assert!(seen.insert(id), "the view repeats one id");
+        }
+    }
 }
