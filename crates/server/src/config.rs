@@ -12,6 +12,10 @@ use anyhow::Context;
 use serde::Deserialize;
 
 pub use rust_api::fs::s3::S3Backend;
+pub use rust_api::jobs::{
+    DEFAULT_JOB_EVENT_STREAM_MAX_SECS, DEFAULT_JOB_EVENT_STREAM_POLL_MS,
+    DEFAULT_MAX_JOB_EVENT_STREAMS, DEFAULT_MAX_JOB_EVENT_STREAMS_PER_SUBJECT,
+};
 
 /// Top-level server configuration. The server loads it from the path that
 /// `--config` gives.
@@ -40,7 +44,7 @@ pub struct Config {
     /// omitted.
     #[serde(default)]
     pub http: HttpConfig,
-    /// Cost limits. Each limit is off by default. See [`LimitsConfig`].
+    /// Cost limits. Most limits are off by default. See [`LimitsConfig`].
     #[serde(default)]
     pub limits: LimitsConfig,
     /// EAV background runtime settings. The runtime is always on.
@@ -423,6 +427,37 @@ impl Config {
                 );
             }
         }
+        if self.limits.max_job_event_streams() > MAX_JOB_EVENT_STREAMS {
+            anyhow::bail!(
+                "limits.max_job_event_streams is {}, which is above the maximum of \
+                 {MAX_JOB_EVENT_STREAMS}. A larger cap lets one process hold too many \
+                 open streams.",
+                self.limits.max_job_event_streams()
+            );
+        }
+        if self.limits.job_event_stream_max_secs() > MAX_JOB_EVENT_STREAM_SECS {
+            anyhow::bail!(
+                "limits.job_event_stream_max_secs is {}, which is above the maximum of \
+                 {MAX_JOB_EVENT_STREAM_SECS} seconds (24 hours).",
+                self.limits.job_event_stream_max_secs()
+            );
+        }
+        if self.limits.max_job_event_streams_per_subject() > MAX_JOB_EVENT_STREAMS_PER_SUBJECT {
+            anyhow::bail!(
+                "limits.max_job_event_streams_per_subject is {}, which is above the \
+                 maximum of {MAX_JOB_EVENT_STREAMS_PER_SUBJECT}.",
+                self.limits.max_job_event_streams_per_subject()
+            );
+        }
+        if !(MIN_JOB_EVENT_STREAM_POLL_MS..=MAX_JOB_EVENT_STREAM_POLL_MS)
+            .contains(&self.limits.job_event_stream_poll_ms())
+        {
+            anyhow::bail!(
+                "limits.job_event_stream_poll_ms is {}, which is outside \
+                 {MIN_JOB_EVENT_STREAM_POLL_MS}..={MAX_JOB_EVENT_STREAM_POLL_MS}.",
+                self.limits.job_event_stream_poll_ms()
+            );
+        }
         if self.eav.outbox_interval_ms == 0 {
             anyhow::bail!("eav.outbox_interval_ms must be greater than 0");
         }
@@ -679,12 +714,12 @@ pub struct HttpConfig {
 
 /// Cost limits for requests whose work a single request does not bound.
 ///
-/// Every limit defaults to off, which means `0`, not to a number that the
-/// crate guesses. A default limit is a default outage. If the limit is too
-/// low, a valid burst gets 429 responses. If the limit is too high, it does
-/// not limit anything. The values that a deployment needs depend on its
-/// egress budget and its client poll interval. This crate knows neither.
-#[derive(Deserialize, Debug, Default, Clone)]
+/// Most limits default to off, which means `0`, not to a number that the
+/// crate guesses. The job event stream limits are the exception: they default
+/// on, because a stream that has no cap holds a slot and a connection for as
+/// long as the client waits. A value of `0` for either job event stream limit
+/// selects the built-in default. It does not disable the control.
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct LimitsConfig {
     /// Requests per minute for each peer address, after an initial burst of the
@@ -716,6 +751,73 @@ pub struct LimitsConfig {
     /// `?chunk=N`.
     #[serde(default)]
     pub max_full_replica_bytes: usize,
+
+    /// Job status streams that may run at the same time. The default is 32.
+    ///
+    /// The route `/jobs/{id}/events` holds one slot for each open stream. A
+    /// value of `0` selects the default. It does not disable the gate.
+    #[serde(default = "default_max_job_event_streams")]
+    pub max_job_event_streams: usize,
+
+    /// Longest time that one job status stream stays open, in seconds. The
+    /// default is 900.
+    ///
+    /// The stream also closes when the token expires. A value of `0` selects
+    /// the default. It does not remove the cap.
+    #[serde(default = "default_job_event_stream_max_secs")]
+    pub job_event_stream_max_secs: u64,
+
+    /// Job status streams that one subject may hold at the same time. The
+    /// default is 8.
+    ///
+    /// The value caps one subject, so no single subject can hold every
+    /// process-wide stream slot. A value of `0` selects the default. It does
+    /// not disable the gate.
+    #[serde(default = "default_max_job_event_streams_per_subject")]
+    pub max_job_event_streams_per_subject: usize,
+
+    /// Milliseconds between two job status stream polls. The default is 1000.
+    ///
+    /// A shorter interval sends a status change sooner and reads the full job
+    /// row more often. A value of `0` selects the default.
+    #[serde(default = "default_job_event_stream_poll_ms")]
+    pub job_event_stream_poll_ms: u64,
+}
+
+/// The serde default of [`LimitsConfig::max_job_event_streams`].
+fn default_max_job_event_streams() -> usize {
+    DEFAULT_MAX_JOB_EVENT_STREAMS
+}
+
+/// The serde default of [`LimitsConfig::job_event_stream_max_secs`].
+fn default_job_event_stream_max_secs() -> u64 {
+    DEFAULT_JOB_EVENT_STREAM_MAX_SECS
+}
+
+/// The serde default of [`LimitsConfig::max_job_event_streams_per_subject`].
+fn default_max_job_event_streams_per_subject() -> usize {
+    DEFAULT_MAX_JOB_EVENT_STREAMS_PER_SUBJECT
+}
+
+/// The serde default of [`LimitsConfig::job_event_stream_poll_ms`].
+fn default_job_event_stream_poll_ms() -> u64 {
+    DEFAULT_JOB_EVENT_STREAM_POLL_MS
+}
+
+impl Default for LimitsConfig {
+    /// Built-in defaults. A config that omits the section gets these values.
+    fn default() -> Self {
+        Self {
+            rate_per_minute: 0,
+            rate_burst: 0,
+            max_concurrent_downloads: 0,
+            max_full_replica_bytes: 0,
+            max_job_event_streams: DEFAULT_MAX_JOB_EVENT_STREAMS,
+            job_event_stream_max_secs: DEFAULT_JOB_EVENT_STREAM_MAX_SECS,
+            max_job_event_streams_per_subject: DEFAULT_MAX_JOB_EVENT_STREAMS_PER_SUBJECT,
+            job_event_stream_poll_ms: DEFAULT_JOB_EVENT_STREAM_POLL_MS,
+        }
+    }
 }
 
 impl LimitsConfig {
@@ -727,7 +829,70 @@ impl LimitsConfig {
             self.rate_burst
         }
     }
+
+    /// Concurrent job status streams to use when the config sets none.
+    ///
+    /// A value of `0` selects the built-in default. It does not disable the
+    /// gate.
+    pub fn max_job_event_streams(&self) -> usize {
+        if self.max_job_event_streams == 0 {
+            DEFAULT_MAX_JOB_EVENT_STREAMS
+        } else {
+            self.max_job_event_streams
+        }
+    }
+
+    /// Job status stream lifetime to use when the config sets none.
+    ///
+    /// A value of `0` selects the built-in default. It does not remove the
+    /// cap.
+    pub fn job_event_stream_max_secs(&self) -> u64 {
+        if self.job_event_stream_max_secs == 0 {
+            DEFAULT_JOB_EVENT_STREAM_MAX_SECS
+        } else {
+            self.job_event_stream_max_secs
+        }
+    }
+
+    /// Job status streams per subject to use when the config sets none.
+    ///
+    /// A value of `0` selects the built-in default. It does not disable the
+    /// gate.
+    pub fn max_job_event_streams_per_subject(&self) -> usize {
+        if self.max_job_event_streams_per_subject == 0 {
+            DEFAULT_MAX_JOB_EVENT_STREAMS_PER_SUBJECT
+        } else {
+            self.max_job_event_streams_per_subject
+        }
+    }
+
+    /// Job status stream poll interval to use when the config sets none.
+    ///
+    /// A value of `0` selects the built-in default.
+    pub fn job_event_stream_poll_ms(&self) -> u64 {
+        if self.job_event_stream_poll_ms == 0 {
+            DEFAULT_JOB_EVENT_STREAM_POLL_MS
+        } else {
+            self.job_event_stream_poll_ms
+        }
+    }
 }
+
+/// Highest number of job event streams that one process may serve at the
+/// same time.
+const MAX_JOB_EVENT_STREAMS: usize = 4_096;
+
+/// Longest job event stream, in seconds, that the config may set.
+const MAX_JOB_EVENT_STREAM_SECS: u64 = 86_400;
+
+/// Highest number of job event streams that one subject may hold.
+const MAX_JOB_EVENT_STREAMS_PER_SUBJECT: usize = 1_024;
+
+/// Shortest job event stream poll interval, in milliseconds.
+const MIN_JOB_EVENT_STREAM_POLL_MS: u64 = 100;
+
+/// Longest job event stream poll interval, in milliseconds.
+const MAX_JOB_EVENT_STREAM_POLL_MS: u64 = 60_000;
 
 /// Minimum safe retention for execution markers, in seconds.
 ///
@@ -1173,6 +1338,113 @@ mod tests {
         assert_eq!(cfg.observability.service_name, "rust-api");
         assert!(cfg.observability.otlp_endpoint.is_none());
         assert_eq!(cfg.observability.sample_ratio, 1.0);
+    }
+
+    /// The job event stream limits default on, unlike every other limit.
+    #[test]
+    fn job_event_stream_limits_default_to_32_and_900() {
+        let cfg = parse(&minimal_toml()).expect("the limits section is optional");
+
+        assert_eq!(cfg.limits.max_job_event_streams, 32);
+        assert_eq!(cfg.limits.job_event_stream_max_secs, 900);
+        assert_eq!(cfg.limits.max_job_event_streams_per_subject, 8);
+        assert_eq!(cfg.limits.job_event_stream_poll_ms, 1000);
+        assert_eq!(cfg.limits, LimitsConfig::default());
+        assert_eq!(cfg.limits.max_job_event_streams(), 32);
+        assert_eq!(cfg.limits.job_event_stream_max_secs(), 900);
+        assert_eq!(cfg.limits.max_job_event_streams_per_subject(), 8);
+        assert_eq!(cfg.limits.job_event_stream_poll_ms(), 1000);
+    }
+
+    /// Explicit job event stream limits reach the accessors.
+    #[test]
+    fn job_event_stream_limits_parse_explicit_values() {
+        let toml = minimal_toml().replace(
+            "region = \"us-east-1\"",
+            "region = \"us-east-1\"\n[limits]\nmax_job_event_streams = 7\njob_event_stream_max_secs = 120\nmax_job_event_streams_per_subject = 3\njob_event_stream_poll_ms = 250",
+        );
+        let cfg = parse(&toml).expect("explicit stream limits must parse");
+
+        assert_eq!(cfg.limits.max_job_event_streams, 7);
+        assert_eq!(cfg.limits.job_event_stream_max_secs, 120);
+        assert_eq!(cfg.limits.max_job_event_streams_per_subject, 3);
+        assert_eq!(cfg.limits.job_event_stream_poll_ms, 250);
+        assert_eq!(cfg.limits.max_job_event_streams(), 7);
+        assert_eq!(cfg.limits.job_event_stream_max_secs(), 120);
+        assert_eq!(cfg.limits.max_job_event_streams_per_subject(), 3);
+        assert_eq!(cfg.limits.job_event_stream_poll_ms(), 250);
+    }
+
+    /// A zero job event stream limit selects the default, not "off".
+    #[test]
+    fn zero_job_event_stream_limits_select_the_defaults() {
+        let toml = minimal_toml().replace(
+            "region = \"us-east-1\"",
+            "region = \"us-east-1\"\n[limits]\nmax_job_event_streams = 0\njob_event_stream_max_secs = 0\nmax_job_event_streams_per_subject = 0\njob_event_stream_poll_ms = 0",
+        );
+        let cfg = parse(&toml).expect("zero stream limits must parse");
+
+        assert_eq!(cfg.limits.max_job_event_streams, 0);
+        assert_eq!(cfg.limits.job_event_stream_max_secs, 0);
+        assert_eq!(cfg.limits.max_job_event_streams_per_subject, 0);
+        assert_eq!(cfg.limits.job_event_stream_poll_ms, 0);
+        assert_eq!(cfg.limits.max_job_event_streams(), 32);
+        assert_eq!(cfg.limits.job_event_stream_max_secs(), 900);
+        assert_eq!(cfg.limits.max_job_event_streams_per_subject(), 8);
+        assert_eq!(cfg.limits.job_event_stream_poll_ms(), 1000);
+    }
+
+    /// A job event stream limit above its bound fails validation.
+    #[test]
+    fn job_event_stream_limits_reject_values_above_the_bounds() {
+        for (field, value) in [
+            ("max_job_event_streams", "4097"),
+            ("job_event_stream_max_secs", "86401"),
+            ("max_job_event_streams_per_subject", "1025"),
+        ] {
+            let toml = minimal_toml().replace(
+                "region = \"us-east-1\"",
+                &format!("region = \"us-east-1\"\n[limits]\n{field} = {value}"),
+            );
+            let error = parse(&toml).expect_err("a value above the bound must fail");
+            let message = format!("{error:#}");
+            assert!(
+                message.contains(field),
+                "the error must name {field}: {message}"
+            );
+        }
+    }
+
+    /// A job event stream poll interval outside its bounds fails validation.
+    #[test]
+    fn job_event_stream_poll_interval_rejects_values_outside_the_bounds() {
+        for value in ["99", "60001"] {
+            let toml = minimal_toml().replace(
+                "region = \"us-east-1\"",
+                &format!("region = \"us-east-1\"\n[limits]\njob_event_stream_poll_ms = {value}"),
+            );
+            let error = parse(&toml).expect_err("a value outside the bounds must fail");
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("job_event_stream_poll_ms"),
+                "the error must name the field: {message}"
+            );
+        }
+    }
+
+    /// A job event stream limit at its bound passes validation.
+    #[test]
+    fn job_event_stream_limits_accept_the_bounds() {
+        let toml = minimal_toml().replace(
+            "region = \"us-east-1\"",
+            "region = \"us-east-1\"\n[limits]\nmax_job_event_streams = 4096\njob_event_stream_max_secs = 86400\nmax_job_event_streams_per_subject = 1024\njob_event_stream_poll_ms = 100",
+        );
+        let cfg = parse(&toml).expect("a value at the bound must pass");
+
+        assert_eq!(cfg.limits.max_job_event_streams(), 4096);
+        assert_eq!(cfg.limits.job_event_stream_max_secs(), 86_400);
+        assert_eq!(cfg.limits.max_job_event_streams_per_subject(), 1_024);
+        assert_eq!(cfg.limits.job_event_stream_poll_ms(), 100);
     }
 
     #[test]

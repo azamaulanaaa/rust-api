@@ -147,6 +147,25 @@ sample_ratio = 1.0
 # allowed. 0 disables the gate. Default: 0.
 # max_full_replica_bytes = 0
 
+# Concurrent job status streams. 0 selects the built-in default, 32. It does
+# not disable the gate. Default: 32.
+# max_job_event_streams = 32
+
+# Longest job status stream, in seconds. The stream also closes when the
+# token expires. 0 selects the built-in default, 900. It does not remove the
+# cap. Default: 900.
+# job_event_stream_max_secs = 900
+
+# Job status streams that one subject may hold at the same time. The
+# process-wide cap still applies. 0 selects the built-in default, 8. It does
+# not disable the gate. Default: 8.
+# max_job_event_streams_per_subject = 8
+
+# Milliseconds between job status stream polls. The value must be within
+# 100..=60000. A shorter interval sends changes sooner and reads the full job
+# row more often. 0 selects the built-in default, 1000. Default: 1000.
+# job_event_stream_poll_ms = 1000
+
 [eav]
 # Pause in milliseconds between outbox flushes. Must be above 0.
 # Default: 1000.

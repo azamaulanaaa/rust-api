@@ -793,12 +793,24 @@ async fn serve(config_path: &Path, verbose: bool) -> anyhow::Result<()> {
     let worker_kinds = rust_api::jobs::WorkerKinds::from_handlers(&handlers)?;
     let submittable = submittable_kinds()?;
     submittable.ensure_subset_of(&worker_kinds)?;
+    let job_stream_gate =
+        rust_api::limits::ConcurrencyGate::new(config.limits.max_job_event_streams());
+    let job_subject_gates =
+        rust_api::jobs::SubjectGates::new(config.limits.max_job_event_streams_per_subject());
+    let job_stream_max_duration =
+        std::time::Duration::from_secs(config.limits.job_event_stream_max_secs());
+    let job_stream_poll_interval =
+        std::time::Duration::from_millis(config.limits.job_event_stream_poll_ms());
     let jobs_api_module = rust_api::jobs::JobsApiModule::new(
         queue.clone(),
         oidc_api_module.middleware(),
         policy_engine.authorizer(),
         submittable,
-    );
+    )
+    .with_stream_gate(job_stream_gate)
+    .with_subject_gate(job_subject_gates)
+    .with_stream_max_duration(job_stream_max_duration)
+    .with_stream_poll_interval(job_stream_poll_interval);
     let worker = QueueWorker::new(queue, handlers, "eav-jobs".to_string());
     let worker_cancel = cancel.clone();
     let webhook_worker = tokio::spawn(async move { worker.run(worker_cancel).await });

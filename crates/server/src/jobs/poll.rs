@@ -199,7 +199,7 @@ pub async fn get_job(
 /// action also allows that job. An administrator adds the rule through the
 /// existing policy routes. A policy error denies the read and stays in the
 /// log, so a failure does not change the answer from `404` to `500`.
-async fn may_read(job: &Job, sub: &str, policy: &Authorizer) -> bool {
+pub(crate) async fn may_read(job: &Job, sub: &str, policy: &Authorizer) -> bool {
     if job.owner_sub.as_deref() == Some(sub) {
         return true;
     }
@@ -223,7 +223,7 @@ async fn may_read(job: &Job, sub: &str, policy: &Authorizer) -> bool {
 ///
 /// The form is `job:<uuid>` and the action is `read`. An administrator
 /// grants one subject access to one job with these values.
-fn job_object(id: Uuid) -> String {
+pub(crate) fn job_object(id: Uuid) -> String {
     format!("job:{id}")
 }
 
@@ -232,7 +232,7 @@ fn job_object(id: Uuid) -> String {
 ///
 /// Both cases return the same answer, so the route does not show whether a
 /// job exists.
-fn not_found() -> HttpResponse {
+pub(crate) fn not_found() -> HttpResponse {
     ApiError::envelope(
         StatusCode::NOT_FOUND,
         "job not found",

@@ -6,34 +6,73 @@
 //! handler module.
 //!
 //! Polling is the guaranteed fallback. The SSE route is an optimization.
-//! The poll route is live. The SSE route answers 501 until its feature
-//! branch lands.
 
-use std::collections::BTreeSet;
-use std::sync::Arc;
+use std::collections::{BTreeSet, HashMap};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
+use std::time::Duration;
 
-use actix_web::{
-    HttpResponse,
-    http::StatusCode,
-    web::{self, ServiceConfig},
-};
+use actix_web::web::{self, ServiceConfig};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use rust_api_model::{CommandKind, CommandKindError, JobState, JobStatusView, wire::CommitReceipt};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::http::{
     ApiModule,
-    error::ApiError,
     middleware::{
         jwt::{Claims, JwtClaimsMiddleware},
         no_cache::NoCache,
     },
 };
+use crate::limits::ConcurrencyGate;
 use crate::policy::Authorizer;
 use crate::queue::{Job, JobHandler, JobQueue, JobStatus};
 
 /// The `entity.create` job handler.
 pub mod entity;
+
+/// The default number of job event streams that one process serves at the
+/// same time.
+///
+/// A stream reads the queue at the configured poll interval. The cap bounds
+/// the number of concurrent queue reads.
+pub const DEFAULT_MAX_JOB_EVENT_STREAMS: usize = 32;
+
+/// The default longest time that one job event stream stays open, in seconds.
+pub const DEFAULT_JOB_EVENT_STREAM_MAX_SECS: u64 = 900;
+
+/// The default number of job event streams that one subject may hold at the
+/// same time.
+pub const DEFAULT_MAX_JOB_EVENT_STREAMS_PER_SUBJECT: usize = 8;
+
+/// The default interval between two job event stream polls, in milliseconds.
+pub const DEFAULT_JOB_EVENT_STREAM_POLL_MS: u64 = 1_000;
+
+/// The shortest interval that one job event stream poll accepts.
+///
+/// The stream timer panics on a zero interval, so the builder clamps to this
+/// value. It matches the worker poll floor.
+const MIN_STREAM_POLL_INTERVAL: Duration = Duration::from_millis(1);
+
+/// The longest interval that one job event stream poll accepts.
+///
+/// The value matches the upper bound of `[limits].job_event_stream_poll_ms`.
+/// A larger value could overflow the stream timer deadline.
+const MAX_STREAM_POLL_INTERVAL: Duration = Duration::from_millis(60_000);
+
+/// The highest per-subject stream cap that [`SubjectGates::new`] accepts.
+///
+/// The constructor clamps a larger value to this cap, so a direct caller
+/// cannot exceed the safe permit range of [`Semaphore`].
+const MAX_SUBJECT_STREAM_CAP: usize = 1_024;
+
+/// The default fallback for the longest time that one stream stays open.
+///
+/// A host sets the deployed value with
+/// [`JobsApiModule::with_stream_max_duration`]. This value applies only when
+/// the host does not call that method.
+const DEFAULT_STREAM_MAX_DURATION: Duration =
+    Duration::from_secs(DEFAULT_JOB_EVENT_STREAM_MAX_SECS);
 
 /// The poll routes for job submission and one job status.
 pub mod poll;
@@ -226,12 +265,72 @@ pub enum JobKindsError {
     },
 }
 
+/// Caps the job event streams that one subject may hold.
+///
+/// The helper keeps one weak reference for each subject that opened a stream.
+/// The map drops an entry after the last stream for that subject ends, on the
+/// next acquire call. The map therefore holds no idle subject forever.
+#[derive(Clone, Debug)]
+pub struct SubjectGates {
+    max: usize,
+    gates: Arc<Mutex<HashMap<String, Weak<Semaphore>>>>,
+}
+
+impl SubjectGates {
+    /// Builds a gate that allows `max` streams for each subject.
+    ///
+    /// The constructor clamps `max` to `MAX_SUBJECT_STREAM_CAP`, so a huge
+    /// value cannot panic. A value of `0` refuses every stream. The config
+    /// maps `0` to [`DEFAULT_MAX_JOB_EVENT_STREAMS_PER_SUBJECT`] before this
+    /// call.
+    pub fn new(max: usize) -> Self {
+        Self {
+            max: max.min(MAX_SUBJECT_STREAM_CAP),
+            gates: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Takes one stream permit for `subject`.
+    ///
+    /// The function returns `None` when the subject already holds `max`
+    /// streams. It prunes entries whose last stream ended, then clones the
+    /// semaphore and releases the map lock before the acquire. No lock is held
+    /// across an await point.
+    pub fn acquire(&self, subject: &str) -> Option<OwnedSemaphorePermit> {
+        let gate = {
+            let mut gates = self.gates.lock().unwrap_or_else(PoisonError::into_inner);
+            gates.retain(|_, gate| gate.strong_count() > 0);
+            match gates.get(subject).and_then(Weak::upgrade) {
+                Some(gate) => gate,
+                None => {
+                    let gate = Arc::new(Semaphore::new(self.max));
+                    gates.insert(subject.to_string(), Arc::downgrade(&gate));
+                    gate
+                }
+            }
+        };
+        gate.try_acquire_owned().ok()
+    }
+}
+
+/// The timing limits of one job event stream.
+#[derive(Clone, Copy, Debug)]
+pub struct JobStreamTiming {
+    /// The longest time that one stream stays open.
+    pub max_duration: Duration,
+    /// The interval between two queue status reads.
+    pub poll_interval: Duration,
+}
+
 /// The module that owns the `/jobs` route prefix.
 pub struct JobsApiModule {
     queue: Arc<dyn JobQueue>,
     policy: Authorizer,
     jwt: JwtClaimsMiddleware<Claims>,
     submittable: SubmittableKinds,
+    stream_gate: ConcurrencyGate,
+    subject_gates: SubjectGates,
+    stream_timing: JobStreamTiming,
 }
 
 impl JobsApiModule {
@@ -254,7 +353,52 @@ impl JobsApiModule {
             jwt,
             policy,
             submittable,
+            stream_gate: ConcurrencyGate::new(DEFAULT_MAX_JOB_EVENT_STREAMS),
+            subject_gates: SubjectGates::new(DEFAULT_MAX_JOB_EVENT_STREAMS_PER_SUBJECT),
+            stream_timing: JobStreamTiming {
+                max_duration: DEFAULT_STREAM_MAX_DURATION,
+                poll_interval: Duration::from_millis(DEFAULT_JOB_EVENT_STREAM_POLL_MS),
+            },
         }
+    }
+
+    /// Replaces the gate that caps concurrent job status streams.
+    ///
+    /// A gate with a limit of `0` disables the cap. The module uses a fixed
+    /// cap in v1, so a host app calls this method only to change it.
+    pub fn with_stream_gate(mut self, gate: ConcurrencyGate) -> Self {
+        self.stream_gate = gate;
+        self
+    }
+
+    /// Replaces the longest time that one job status stream stays open.
+    ///
+    /// The stream also closes when the token expires. The deployed value comes
+    /// from `[limits].job_event_stream_max_secs`.
+    pub fn with_stream_max_duration(mut self, max_duration: Duration) -> Self {
+        self.stream_timing.max_duration = max_duration;
+        self
+    }
+
+    /// Replaces the interval between two job status stream polls.
+    ///
+    /// The call clamps the value to 1..=60_000 ms. A zero value would panic
+    /// in the stream timer, and a larger value could overflow it. A shorter
+    /// interval sends a status change sooner and reads the full job row more
+    /// often. The deployed value comes from
+    /// `[limits].job_event_stream_poll_ms`.
+    pub fn with_stream_poll_interval(mut self, poll_interval: Duration) -> Self {
+        self.stream_timing.poll_interval =
+            poll_interval.clamp(MIN_STREAM_POLL_INTERVAL, MAX_STREAM_POLL_INTERVAL);
+        self
+    }
+
+    /// Replaces the gate that caps the job streams of one subject.
+    ///
+    /// The deployed value comes from `[limits].max_job_event_streams_per_subject`.
+    pub fn with_subject_gate(mut self, subject_gates: SubjectGates) -> Self {
+        self.subject_gates = subject_gates;
+        self
     }
 }
 
@@ -267,12 +411,18 @@ impl ApiModule for JobsApiModule {
         let queue = web::Data::new(self.queue.clone());
         let policy = web::Data::new(self.policy.clone());
         let submittable = web::Data::new(self.submittable.clone());
+        let gate = web::Data::new(self.stream_gate.clone());
+        let subject_gates = web::Data::new(self.subject_gates.clone());
+        let stream_timing = web::Data::new(self.stream_timing);
         let jwt = self.jwt.clone();
         cfg.service(
             web::scope("/jobs")
                 .app_data(queue)
                 .app_data(policy)
                 .app_data(submittable)
+                .app_data(gate)
+                .app_data(subject_gates)
+                .app_data(stream_timing)
                 .wrap(jwt)
                 .wrap(NoCache)
                 .route("", web::post().to(poll::create_job))
@@ -280,20 +430,6 @@ impl ApiModule for JobsApiModule {
                 .service(sse::job_events),
         );
     }
-}
-
-/// Builds the not-implemented answer for one route.
-///
-/// The answer uses the shared error envelope and a message that names the
-/// missing behavior. A caller therefore learns that the route exists and
-/// that the server has no implementation yet.
-pub(crate) fn not_implemented(route: &str) -> HttpResponse {
-    ApiError::envelope(
-        StatusCode::NOT_IMPLEMENTED,
-        &format!("{route} is not implemented"),
-        Some("not_implemented"),
-        None,
-    )
 }
 
 /// Builds the API view of one stored job status.
@@ -629,5 +765,46 @@ mod tests {
 
         assert_eq!(view.commit_seq, None);
         assert_eq!(view.result_base64, Some(STANDARD.encode(result)));
+    }
+
+    /// A huge subject limit is clamped, and the gate still refuses past it.
+    #[test]
+    fn a_subject_gate_clamps_a_huge_limit() {
+        let gates = SubjectGates::new(usize::MAX);
+        let permits: Vec<_> = (0..MAX_SUBJECT_STREAM_CAP)
+            .map(|_| gates.acquire("alice").expect("the clamped gate has a slot"))
+            .collect();
+
+        assert!(gates.acquire("alice").is_none(), "the gate is finite");
+        drop(permits);
+        assert!(
+            gates.acquire("alice").is_some(),
+            "a released slot is reusable"
+        );
+    }
+
+    /// An idle subject entry is pruned on the next acquire call.
+    #[test]
+    fn a_subject_gate_prunes_an_idle_subject() {
+        let gates = SubjectGates::new(1);
+        let alice = gates.acquire("alice").expect("alice has a slot");
+        assert_eq!(gates.gates.lock().unwrap().len(), 1);
+
+        drop(alice);
+        let bob = gates.acquire("bob").expect("bob has a slot");
+        {
+            let map = gates.gates.lock().unwrap();
+            assert_eq!(map.len(), 1, "the idle alice entry must be pruned");
+            assert!(map.contains_key("bob"));
+            assert!(!map.contains_key("alice"));
+        }
+        drop(bob);
+
+        let alice = gates.acquire("alice").expect("alice can connect again");
+        assert!(
+            gates.acquire("alice").is_none(),
+            "the reused entry keeps the cap"
+        );
+        drop(alice);
     }
 }
