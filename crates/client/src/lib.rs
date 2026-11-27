@@ -2,14 +2,18 @@
 //!
 //! This crate builds as a `cdylib` for the browser and as an `rlib` for the
 //! native test target. The `auth` module holds the session check and the
-//! transport seam. The `replica` module downloads, verifies, and stores the
-//! per-user replica. Later work adds local reads and job status.
+//! transport seam. The `replica` module downloads, verifies, and stores a
+//! per-user replica. The `eav` module reads the local entity view and runs
+//! the shared core query. Later work adds job status.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 use rust_api_model::wire::{ReplicaManifest, SyncCursor};
 
 /// The auth transport seam and the session check.
 pub mod auth;
+
+/// Local entity-attribute-value queries over a replica.
+pub mod eav;
 
 /// The client-side job status modules.
 ///
