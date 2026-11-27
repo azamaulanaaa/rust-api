@@ -63,6 +63,9 @@ pub enum Method {
     Delete,
 }
 
+/// The media type of a JSON request body.
+pub const JSON_CONTENT_TYPE: &str = "application/json";
+
 /// One request for a transport.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Request {
@@ -72,20 +75,55 @@ pub struct Request {
     pub path: String,
     /// The browser credential mode.
     pub credentials: Credentials,
+    /// The request body text, if the request has one.
+    pub body: Option<String>,
+    /// The media type of the body, if the request has one.
+    ///
+    /// A transport sends this value as the `Content-Type` header.
+    pub content_type: Option<String>,
+}
+
+impl Request {
+    /// Build a request with no body.
+    pub fn get(path: impl Into<String>, credentials: Credentials) -> Self {
+        Self {
+            method: Method::Get,
+            path: path.into(),
+            credentials,
+            body: None,
+            content_type: None,
+        }
+    }
+
+    /// Build a `POST` request with a JSON body.
+    pub fn json_post(
+        path: impl Into<String>,
+        credentials: Credentials,
+        body: impl Into<String>,
+    ) -> Self {
+        Self {
+            method: Method::Post,
+            path: path.into(),
+            credentials,
+            body: Some(body.into()),
+            content_type: Some(JSON_CONTENT_TYPE.to_owned()),
+        }
+    }
 }
 
 /// The status and body of one response.
 ///
 /// The session check reads only the status. The replica loader reads the
-/// body of a `200` answer.
+/// body of a successful (`2xx`) answer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Response {
     /// The HTTP status code.
     pub status: u16,
     /// The raw response body bytes.
     ///
-    /// A transport may leave the body empty for a non-`200` answer. The
-    /// replica loader reads a body only from a `200` answer.
+    /// A transport may leave the body empty for a non-successful answer. The
+    /// replica loader and the job client read a body only from a successful
+    /// (`2xx`) answer.
     pub body: Vec<u8>,
 }
 
@@ -178,11 +216,7 @@ impl<T: Transport> AuthClient<T> {
     pub async fn check_session(&self) -> AuthState {
         let generation = self.generation.get().wrapping_add(1);
         self.generation.set(generation);
-        let request = Request {
-            method: Method::Get,
-            path: SESSION_PATH.to_owned(),
-            credentials: Credentials::Include,
-        };
+        let request = Request::get(SESSION_PATH, Credentials::Include);
         let state = match self.transport.send(request).await {
             Ok(response) => match response.status {
                 200 => AuthState::Authenticated,
@@ -228,15 +262,28 @@ pub mod browser {
             let builder = builder
                 .credentials(map_credentials(request.credentials))
                 .redirect(RequestRedirect::Error);
-            let response = builder
-                .send()
-                .await
-                .map_err(|error| TransportError::new(error.to_string()))?;
+            let builder = match request.content_type {
+                Some(content_type) => builder.header("Content-Type", &content_type),
+                None => builder,
+            };
+            let response = match request.body {
+                Some(body) => builder
+                    .body(body)
+                    .map_err(|error| TransportError::new(error.to_string()))?
+                    .send()
+                    .await
+                    .map_err(|error| TransportError::new(error.to_string()))?,
+                None => builder
+                    .send()
+                    .await
+                    .map_err(|error| TransportError::new(error.to_string()))?,
+            };
             let status = response.status();
             // Read the body of a successful answer only. A `401` or `403`
             // answer needs no body, and a body read must not turn it into a
-            // transport failure that loses the status.
-            let body = if status == 200 {
+            // transport failure that loses the status. The job submit route
+            // answers `202` with a body, so every `2xx` answer is read.
+            let body = if (200..300).contains(&status) {
                 response
                     .binary()
                     .await
@@ -383,6 +430,27 @@ mod tests {
         assert_eq!(requests[0].method, Method::Get);
         assert_eq!(requests[0].path, "/auth/me");
         assert_eq!(requests[0].credentials, Credentials::Include);
+        assert_eq!(requests[0].body, None);
+        assert_eq!(requests[0].content_type, None);
+    }
+
+    /// A JSON post carries its body and its content type.
+    #[test]
+    fn a_json_post_carries_its_body_and_content_type() {
+        let request = Request::json_post(
+            "/jobs",
+            Credentials::Include,
+            "{\"kind\":\"entity.create\"}",
+        );
+
+        assert_eq!(request.method, Method::Post);
+        assert_eq!(request.path, "/jobs");
+        assert_eq!(request.credentials, Credentials::Include);
+        assert_eq!(
+            request.body.as_deref(),
+            Some("{\"kind\":\"entity.create\"}")
+        );
+        assert_eq!(request.content_type.as_deref(), Some(JSON_CONTENT_TYPE));
     }
 
     /// A `200` answer authenticates the session.
