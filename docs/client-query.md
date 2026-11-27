@@ -1,6 +1,6 @@
 # The local client query
 
-Status: client-query feature  
+Status: client-query feature
 Branch: `issue/client-query`
 
 The client runs the same entity query as the server. The server builds a
