@@ -285,6 +285,18 @@ where
     )))
 }
 
+/// Validate one job id and return its event stream path.
+///
+/// The browser `EventSource` call normalizes a relative URL. The check runs
+/// before the path is built, so an unsafe id cannot reach another route.
+#[cfg(any(target_arch = "wasm32", test))]
+fn event_path(id: &str) -> Result<String, StreamFailure> {
+    if !is_safe_job_id(id) {
+        return Err(StreamFailure::new("the job id is not a safe request path"));
+    }
+    Ok(format!("/jobs/{id}/events"))
+}
+
 /// Parse one event name and data pair from a stream.
 ///
 /// An unknown event name returns `None`, so a newer server event does not
@@ -353,18 +365,20 @@ pub mod browser {
     impl BrowserEventSource {
         /// Open the event stream for one job.
         ///
-        /// The path is `/jobs/{id}/events` on the page origin. An invalid URL
-        /// or a failed listener setup returns a stream failure. The browser
-        /// does not show the HTTP status of a refused connection.
+        /// The path is `/jobs/{id}/events` on the page origin. An unsafe id,
+        /// an invalid URL, or a failed listener setup returns a stream
+        /// failure. The browser does not show the HTTP status of a refused
+        /// connection.
         ///
         /// # Errors
         ///
-        /// Returns a [`StreamFailure`] when the browser cannot create the
-        /// connection or a listener.
+        /// Returns a [`StreamFailure`] when the id is not a safe request path,
+        /// or when the browser cannot create the connection or a listener.
         pub fn open(id: &str) -> Result<Self, StreamFailure> {
+            let path = super::event_path(id)?;
             let mut connection = EventSourceBuilder::new()
                 .with_credentials(true)
-                .build(&format!("/jobs/{id}/events"))
+                .build(&path)
                 .map_err(|error| StreamFailure::new(error.to_string()))?;
             let mut events = SelectAll::new();
             for name in EVENT_NAMES {
@@ -1020,6 +1034,21 @@ mod tests {
             block_on(query.query_attribute("tag", &Value::String("alpha".into()), None, None))
                 .expect("the query still succeeds");
         assert_eq!(page.items, ["e1"]);
+    }
+
+    /// The browser event path accepts a safe id and rejects an unsafe id.
+    #[test]
+    fn the_browser_event_path_rejects_an_unsafe_id() {
+        assert_eq!(
+            event_path(JOB_ID).expect("the id is safe"),
+            format!("/jobs/{JOB_ID}/events")
+        );
+        let long_id = "a".repeat(65);
+        for id in ["../auth/me", "a/b", "a?b", "a#b", "", long_id.as_str()] {
+            let error = event_path(id).expect_err("the id is not safe");
+            assert_eq!(error.detail(), "the job id is not a safe request path");
+            assert_eq!(error.status(), None);
+        }
     }
 
     /// The event parser reads the server event names and bodies.

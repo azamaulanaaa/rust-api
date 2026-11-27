@@ -201,6 +201,7 @@ The native tests cover:
 - An unsafe id. It is rejected before the source is read.
 - A stream view and a fallback poll for another id. Both are rejected and
   do not replace the pending job.
+- The browser event path. It rejects an unsafe id.
 - A loaded replica and query view that do not change.
 - The event parser, the stable stream names, and the default options.
 
