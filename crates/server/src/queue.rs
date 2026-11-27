@@ -329,6 +329,18 @@ pub trait JobQueue: Send + Sync {
         extend: Duration,
     ) -> Result<LeaseToken, QueueError>;
 
+    /// Returns one stored job.
+    ///
+    /// The function reads the job row. It does not change the job and it
+    /// does not expire a lease. Use [`JobQueue::status`] for the current
+    /// status.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`QueueError::NotFound`] when the job does not exist.
+    /// Returns [`QueueError::Store`] when a backend read fails.
+    async fn get(&self, job_id: JobId) -> Result<Job, QueueError>;
+
     /// Returns the status of a job.
     ///
     /// # Errors

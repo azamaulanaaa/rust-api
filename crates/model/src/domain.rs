@@ -8,7 +8,10 @@ use serde::{Deserialize, Serialize};
 ///
 /// The wire form is a snake_case string. The stored queue status is a
 /// different type. Do not expose the stored status on the wire.
+///
+/// The type is non-exhaustive. A new state does not break a client build.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum JobState {
@@ -41,7 +44,17 @@ impl JobState {
 /// becoming an unchecked `String`. The parse rules are an allowlist: the
 /// value is 1 to 64 ASCII bytes of lowercase letters, digits, `.`, `-`, and
 /// `_`. The server keeps the second allowlist of kinds that have a handler.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[cfg_attr(
+    feature = "openapi",
+    schema(
+        value_type = String,
+        min_length = 1,
+        max_length = 64,
+        pattern = "^[a-z0-9._-]{1,64}$"
+    )
+)]
 #[serde(try_from = "String", into = "String")]
 pub struct CommandKind(String);
 
@@ -91,6 +104,14 @@ impl TryFrom<String> for CommandKind {
     }
 }
 
+impl std::str::FromStr for CommandKind {
+    type Err = CommandKindError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::parse(value)
+    }
+}
+
 impl From<CommandKind> for String {
     fn from(kind: CommandKind) -> Self {
         kind.0
@@ -98,7 +119,10 @@ impl From<CommandKind> for String {
 }
 
 /// The reason that a command kind is not valid.
+///
+/// The type is non-exhaustive. A new parser error does not break a caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum CommandKindError {
     /// The value is empty.
     #[error("command kind is empty")]
@@ -177,6 +201,21 @@ mod tests {
             );
         }
         assert!(CommandKind::parse("a.b-c_9").is_ok());
+    }
+
+    /// `FromStr` uses the command kind parser.
+    #[test]
+    fn command_kind_from_str_uses_the_parser() {
+        let kind: CommandKind = "entity.create".parse().expect("the kind parses");
+        assert_eq!(
+            kind,
+            CommandKind::parse("entity.create").expect("the kind parses")
+        );
+
+        let error = "Bad Kind"
+            .parse::<CommandKind>()
+            .expect_err("the kind must fail");
+        assert_eq!(error, CommandKindError::InvalidByte);
     }
 
     /// Serde uses the parser and the string form of the type.

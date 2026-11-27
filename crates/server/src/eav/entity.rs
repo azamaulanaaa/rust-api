@@ -1021,8 +1021,20 @@ impl EntityStore {
     /// It applies the schema defaults and checks every attribute.
     /// The call writes no row.
     async fn prepare_create(&self, draft: EntityDraft) -> Result<PreparedCreate, EntityError> {
-        validate_name("entity id", &draft.id)?;
         let effective = self.resolve_schemas(&draft.schemas).await?;
+        Self::prepare_create_with(draft, effective)
+    }
+
+    /// Validates one create against effective schemas.
+    ///
+    /// The call applies the schema defaults and checks every attribute. The
+    /// caller supplies the effective schemas, so the latest and pinned
+    /// previews share one preparation.
+    fn prepare_create_with(
+        draft: EntityDraft,
+        effective: Vec<EffectiveSchema>,
+    ) -> Result<PreparedCreate, EntityError> {
+        validate_name("entity id", &draft.id)?;
         let merged = merge_schemas(&effective)?;
         let mut attributes = draft.attributes;
         check_known(&attributes, &merged.attributes)?;
@@ -1377,6 +1389,42 @@ impl EntityStore {
             Err(error) => self.record_failure(error),
         }
         result
+    }
+
+    /// Validates one create and returns the entity that the write would store.
+    ///
+    /// The call resolves the schema versions, applies the schema defaults,
+    /// and checks every attribute. It writes no row. A caller uses the result
+    /// to compare a re-delivered create with the stored entity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EntityError`] when the draft is not valid against its
+    /// effective schemas. Returns [`EntityError::Store`] when a schema read
+    /// fails.
+    pub async fn preview_create(&self, draft: &EntityDraft) -> Result<Entity, EntityError> {
+        Ok(self.prepare_create(draft.clone()).await?.entity)
+    }
+
+    /// Validates one create against the schema versions pinned in a stored
+    /// entity.
+    ///
+    /// The call applies the defaults of the pinned versions and writes no
+    /// row. A re-delivered create uses this form, so a later schema version
+    /// does not change the expected entity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EntityError`] when the draft is not valid against the pinned
+    /// schemas. Returns [`EntityError::Store`] when a schema read fails.
+    /// Returns [`EntityError::Internal`] when a pinned version is missing.
+    pub async fn preview_create_at(
+        &self,
+        draft: &EntityDraft,
+        schemas: &[SchemaRef],
+    ) -> Result<Entity, EntityError> {
+        let effective = self.resolve_refs(schemas).await?;
+        Ok(Self::prepare_create_with(draft.clone(), effective)?.entity)
     }
 
     /// Creates an entity and returns the change.

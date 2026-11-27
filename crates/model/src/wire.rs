@@ -10,8 +10,10 @@ use crate::domain::{CommandKind, JobState};
 /// The server builds this view from the stored queue status. The stored
 /// status is part of the durable queue format and never goes on the wire.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct JobStatusView {
     /// The job identifier.
+    #[cfg_attr(feature = "openapi", schema(value_type = String))]
     pub id: Uuid,
     /// The command kind of the job.
     pub kind: CommandKind,
@@ -29,7 +31,7 @@ pub struct JobStatusView {
     ///
     /// The field is present only while a worker holds the job.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub lease_expires_at: Option<i64>,
+    pub lease_expires_at_ms: Option<i64>,
     /// The finish time in unix seconds.
     ///
     /// The field is present only in a terminal state.
@@ -49,25 +51,37 @@ pub struct JobStatusView {
     pub commit_seq: Option<u64>,
 }
 
+/// The maximum length of an idempotency key in bytes.
+pub const MAX_IDEMPOTENCY_KEY_LEN: usize = 128;
+
 /// One write command from a client.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct CommandEnvelope {
-    /// The command kind. The server rejects a kind without a handler.
+    /// The command kind. The server rejects a kind that a client cannot
+    /// submit.
     pub kind: CommandKind,
     /// The command data in JSON form.
     pub payload: serde_json::Value,
     /// The client key that makes the enqueue idempotent.
+    ///
+    /// The key must hold 1 to [`MAX_IDEMPOTENCY_KEY_LEN`] bytes. The server
+    /// rejects an empty key or a key above the limit with `400`.
+    // Keep this value equal to `MAX_IDEMPOTENCY_KEY_LEN`. The schema
+    // attribute accepts a number literal only.
+    #[cfg_attr(feature = "openapi", schema(min_length = 1, max_length = 128))]
     pub idempotency_key: String,
     /// The entity version that the client read.
     ///
-    /// The server rejects the command when the current version is not the
-    /// same value.
+    /// No job handler enforces this precondition yet. The server rejects the
+    /// request with `400` when the field is present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_version: Option<u64>,
 }
 
 /// The result of one applied job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct CommitReceipt {
     /// The change feed sequence that the write advanced to.
@@ -122,7 +136,7 @@ mod tests {
             max_attempts: 5,
             created_at: 1_700_000_000,
             scheduled_at: 1_700_000_001,
-            lease_expires_at: None,
+            lease_expires_at_ms: None,
             finished_at: None,
             worker: None,
             error: None,
@@ -136,7 +150,7 @@ mod tests {
     fn a_queued_job_omits_the_optional_fields() {
         let value = serde_json::to_value(job_view()).expect("job view serializes");
         for field in [
-            "lease_expires_at",
+            "lease_expires_at_ms",
             "finished_at",
             "worker",
             "error",
@@ -198,6 +212,13 @@ mod tests {
         assert_eq!(value, serde_json::json!({"commit_seq": 9}));
         let back: CommitReceipt = serde_json::from_value(value).expect("receipt parses");
         assert_eq!(back, receipt);
+    }
+
+    /// A commit receipt rejects an unknown field.
+    #[test]
+    fn a_commit_receipt_rejects_an_unknown_field() {
+        let value = serde_json::json!({"commit_seq": 9, "detail": "x"});
+        assert!(serde_json::from_value::<CommitReceipt>(value).is_err());
     }
 
     /// A sync cursor starts at zero and keeps its sequence.

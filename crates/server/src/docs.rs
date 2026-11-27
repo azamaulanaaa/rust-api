@@ -69,6 +69,7 @@ use utoipa::OpenApi;
         crate::eav::sync::reset_replica,
         crate::eav::sync::replica_status,
         crate::jobs::poll::get_job,
+        crate::jobs::poll::create_job,
         crate::jobs::sse::job_events,
     ),
     components(schemas(
@@ -141,8 +142,11 @@ use utoipa::OpenApi;
         crate::policy::Action,
         crate::sync::route::SyncStatusResponse,
         crate::sync::route::SyncAdvanceResponse,
+        rust_api_model::domain::CommandKind,
+        rust_api_model::wire::CommandEnvelope,
+        rust_api_model::wire::JobStatusView,
     )),
-    tags((name = "health"), (name = "auth"), (name = "setup"), (name = "fs"), (name = "policy"), (name = "sync"), (name = "eav"))
+    tags((name = "health"), (name = "auth"), (name = "setup"), (name = "fs"), (name = "policy"), (name = "sync"), (name = "eav"), (name = "jobs"))
 )]
 pub struct ApiDoc;
 
@@ -260,6 +264,65 @@ mod tests {
         );
     }
 
+    /// The job submission route documents its request body and accepted view.
+    #[test]
+    fn the_job_submission_route_documents_the_body_and_view() {
+        let spec: Value =
+            serde_json::from_str(&ApiDoc::openapi().to_json().expect("spec serializes"))
+                .expect("spec is JSON");
+
+        let post = &spec["paths"]["/jobs"]["post"];
+        assert_eq!(
+            post["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/CommandEnvelope",
+            "the request body must name the command envelope"
+        );
+        assert_eq!(
+            post["responses"]["202"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/JobStatusView",
+            "the accepted response must name the job view"
+        );
+
+        let schemas = spec["components"]["schemas"]
+            .as_object()
+            .expect("component schemas");
+        for name in ["CommandEnvelope", "CommandKind", "JobStatusView"] {
+            assert!(schemas.contains_key(name), "spec missing {name}");
+        }
+    }
+
+    /// The command kind schema carries the parser length limits and pattern.
+    #[test]
+    fn the_command_kind_schema_carries_the_parser_limits() {
+        let spec: Value =
+            serde_json::from_str(&ApiDoc::openapi().to_json().expect("spec serializes"))
+                .expect("spec is JSON");
+
+        let schema = &spec["components"]["schemas"]["CommandKind"];
+        assert_eq!(schema["type"], serde_json::json!("string"));
+        assert_eq!(schema["minLength"], serde_json::json!(1));
+        assert_eq!(schema["maxLength"], serde_json::json!(64));
+        assert_eq!(schema["pattern"], serde_json::json!("^[a-z0-9._-]{1,64}$"));
+    }
+
+    /// The command envelope schema carries the idempotency key bounds.
+    #[test]
+    fn the_command_envelope_schema_carries_the_idempotency_key_bounds() {
+        let spec: Value =
+            serde_json::from_str(&ApiDoc::openapi().to_json().expect("spec serializes"))
+                .expect("spec is JSON");
+
+        let key =
+            &spec["components"]["schemas"]["CommandEnvelope"]["properties"]["idempotency_key"];
+        assert_eq!(key["type"], serde_json::json!("string"));
+        assert_eq!(key["minLength"], serde_json::json!(1));
+        assert_eq!(key["maxLength"], serde_json::json!(128));
+        assert_eq!(
+            key["maxLength"],
+            serde_json::json!(rust_api_model::wire::MAX_IDEMPOTENCY_KEY_LEN)
+        );
+    }
+
     /// Guards the PWA contract. Every served route that the SPA code generator
     /// uses must appear in the specification. Drift therefore breaks this
     /// test instead of the front end at run time.
@@ -344,6 +407,9 @@ mod tests {
             ("/eav/sync/replica", "get"),
             ("/eav/sync/replica", "delete"),
             ("/eav/sync/replica/status", "get"),
+            ("/jobs", "post"),
+            ("/jobs/{id}", "get"),
+            ("/jobs/{id}/events", "get"),
         ];
         for (path, method) in routes {
             let item = paths
