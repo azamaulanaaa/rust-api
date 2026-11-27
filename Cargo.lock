@@ -3076,6 +3076,7 @@ name = "rust-api-client"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "futures-util",
  "gloo-net",
  "oxkv",
  "rust-api-core",
