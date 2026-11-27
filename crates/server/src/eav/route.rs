@@ -699,7 +699,8 @@ impl From<EntityError> for EavApiError {
             | EntityError::AlreadyExists(_)
             | EntityError::Referenced { .. }
             | EntityError::StaleHead { .. }
-            | EntityError::PublishConflict => Kind::Conflict,
+            | EntityError::PublishConflict
+            | EntityError::GenerationTaken => Kind::Conflict,
             EntityError::Store(_) | EntityError::Internal(_) | EntityError::Feed(_) => {
                 Kind::Internal
             }

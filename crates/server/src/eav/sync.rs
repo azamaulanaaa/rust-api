@@ -763,10 +763,16 @@ async fn build_replica_inner(
         let _guard = runtime.oxkv().lock_subject(&claims.sub).await;
         let head = runtime.wal().head().await.map_err(internal)?;
         let planned = runtime.replicas().next_generation(&claims.sub).await?;
-        let generation = runtime
+        let generation = match runtime
             .oxkv()
             .begin_generation(&claims.sub, planned, head)
-            .await?;
+            .await
+        {
+            Ok(generation) => generation,
+            Err(EntityError::GenerationTaken) if attempt < REPLICA_BUILD_ATTEMPTS => continue,
+            Err(error) => return Err(EavApiError::from(error)),
+        };
+        let build_id = generation.build_id().to_string();
         let (count, chunks) =
             match scan_replica(&runtime, &policy, &claims.sub, &generation, entity_limit).await {
                 Ok(result) => result,
@@ -781,7 +787,7 @@ async fn build_replica_inner(
             Err(error) => {
                 let _ = runtime
                     .oxkv()
-                    .discard_generation(&claims.sub, planned)
+                    .discard_generation(&claims.sub, planned, &build_id)
                     .await;
                 return Err(error.into());
             }
@@ -796,8 +802,15 @@ async fn build_replica_inner(
                     );
                     let _ = runtime
                         .oxkv()
-                        .discard_generation(&claims.sub, planned)
+                        .discard_generation(&claims.sub, planned, prepared.build_id())
                         .await;
+                    if matches!(
+                        error,
+                        EntityError::GenerationTaken | EntityError::PublishConflict
+                    ) && attempt < REPLICA_BUILD_ATTEMPTS
+                    {
+                        continue;
+                    }
                     return Err(EavApiError::Conflict(Box::new(ReplicaBuildRestarted)));
                 }
                 return Ok(HttpResponse::Ok().json(ReplicaBuildResponse {
@@ -810,7 +823,7 @@ async fn build_replica_inner(
             Ok(_) => {
                 let _ = runtime
                     .oxkv()
-                    .discard_generation(&claims.sub, planned)
+                    .discard_generation(&claims.sub, planned, &build_id)
                     .await;
                 if attempt < REPLICA_BUILD_ATTEMPTS {
                     continue;
@@ -820,14 +833,14 @@ async fn build_replica_inner(
             Err(EntityError::StaleHead { .. }) if attempt < REPLICA_BUILD_ATTEMPTS => {
                 let _ = runtime
                     .oxkv()
-                    .discard_generation(&claims.sub, planned)
+                    .discard_generation(&claims.sub, planned, &build_id)
                     .await;
                 continue;
             }
             Err(error) => {
                 let _ = runtime
                     .oxkv()
-                    .discard_generation(&claims.sub, planned)
+                    .discard_generation(&claims.sub, planned, &build_id)
                     .await;
                 return Err(EavApiError::from(error));
             }
@@ -4014,6 +4027,27 @@ mod tests {
             reconciled.generation > stored.generation,
             "the next build must reconcile to a newer generation"
         );
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn a_generation_collision_is_retried() -> anyhow::Result<()> {
+        let fx = fixture().await?;
+        publish_task_schema(&fx).await?;
+        create_entity(&fx, "e1").await?;
+        grant_collection_read(&fx, "alice").await?;
+        let module = fx.module().await?;
+        let app = actix_test::init_service(App::new().configure(|cfg| module.configure(cfg))).await;
+        let token = fx.token("alice")?;
+
+        fx.runtime.oxkv().fail_next_generation();
+        let res = post_replica!(&app, &token).await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        let built: Value = actix_test::read_body_json(res).await;
+        assert_eq!(built["generation"], 1);
+        let manifest = get_oxkv_manifest!(&app, &token);
+        assert_eq!(manifest.generation, 1);
+        assert_eq!(manifest.head, built["head"]);
         Ok(())
     }
 

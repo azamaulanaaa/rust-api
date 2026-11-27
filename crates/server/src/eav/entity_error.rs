@@ -62,6 +62,12 @@ pub enum EntityError {
     /// A later build reconciles the wrapper to the JSON replica.
     #[error("oxkv replica publish conflict")]
     PublishConflict,
+    /// The wrapper already names the generation of this build.
+    ///
+    /// Another build published the generation first.
+    /// The caller can read the new generation and try again.
+    #[error("oxkv replica generation is already published")]
+    GenerationTaken,
     /// An `EntityRef` attribute names an entity that does not exist.
     ///
     /// The first field is the attribute name.

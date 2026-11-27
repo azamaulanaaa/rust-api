@@ -1,12 +1,18 @@
 //! Per-user, generation-scoped OxKV replicas for the WASM client.
 //!
-//! Each build writes one filtered `OxKvStore` under `{root}/{sub_hash}/{generation}`.
+//! Each build writes one filtered `OxKvStore` under a unique build prefix
+//! `{root}/{sub_hash}/{generation}/{build_id}`.
 //! The store holds only the `entity:{id}:meta` and `entity:{id}:attr:{name}`
 //! rows that the caller can read.
 //! The client scans that key family through a read-only `OxKvReader`.
 //!
+//! A `{root}/{sub_hash}/{generation}/build.json` pointer names the build
+//! prefix that the wrapper uses.
+//! The pointer makes two builds at one generation independent.
+//! A build cannot delete the objects of another build.
+//!
 //! The store is built at an empty virtual prefix over a storage adapter that
-//! maps every path into the generation prefix.
+//! maps every path into the build prefix.
 //! The objects in `manifest.json` therefore name keys relative to the replica
 //! root, and the client opens the reader with an empty prefix.
 //!
@@ -19,7 +25,10 @@
 //! generations after the new wrapper is visible.
 //!
 //! A failed build leaves the old wrapper and the old generation readable.
-//! A failed generation is removed on the next build of the same subject.
+//! A failed build removes only its own build prefix.
+//!
+//! The single-writer lease is the cross-process guarantee.
+//! The build lock is only a process-local gate.
 //!
 //! The module adds no client query and no business rule.
 //! It does not read the change feed.
@@ -50,6 +59,13 @@ const WRAPPER_PUT_ATTEMPTS: u32 = 8;
 /// The current generation and the one before it stay readable.
 /// An older generation is removed after the new wrapper is visible.
 const RETAINED_GENERATIONS: usize = 2;
+
+/// The pointer that names the build prefix of one generation.
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+struct BuildPointer {
+    /// The unique build id.
+    build: String,
+}
 
 /// A storage view that maps every path under one root prefix.
 ///
@@ -127,16 +143,27 @@ pub(crate) struct PreparedGeneration {
     generation: u64,
     /// The change-feed head of the build.
     head: u64,
+    /// The unique build id.
+    build_id: String,
     /// The raw OxKV objects relative to the replica root.
     objects: Vec<ReplicaObject>,
+}
+
+impl PreparedGeneration {
+    /// Returns the unique build id.
+    pub(crate) fn build_id(&self) -> &str {
+        &self.build_id
+    }
 }
 
 /// A generation that a build is still filling.
 pub(crate) struct OxkvGeneration {
     /// The writer for the generation.
     store: OxKvStore,
-    /// The generation-rooted storage view.
+    /// The build-rooted storage view.
     storage: Arc<dyn Storage>,
+    /// The unique build id.
+    build_id: String,
     /// The replica generation.
     generation: u64,
     /// The change-feed head of the build.
@@ -144,6 +171,11 @@ pub(crate) struct OxkvGeneration {
 }
 
 impl OxkvGeneration {
+    /// Returns the unique build id.
+    pub(crate) fn build_id(&self) -> &str {
+        &self.build_id
+    }
+
     /// Stages the rows of one entity into the generation.
     ///
     /// The rows use the `entity:` key family and the entity store encoding.
@@ -186,14 +218,15 @@ impl OxkvGeneration {
         Ok(PreparedGeneration {
             generation: self.generation,
             head: self.head,
+            build_id: self.build_id,
             objects,
         })
     }
 
-    /// Removes every object of this generation.
+    /// Removes every object of this build.
     ///
-    /// The call is best effort at the caller. It never touches the wrapper or
-    /// another generation.
+    /// The call is best effort at the caller.
+    /// It never touches the wrapper, the build pointer, or another build.
     pub(crate) async fn abort(self) -> Result<(), EntityError> {
         delete_all(&self.storage, &ObjectPath::default()).await
     }
@@ -216,6 +249,9 @@ pub struct OxkvReplicaStore {
     /// The number of test publishes that must fail before the wrapper write.
     #[cfg(test)]
     publish_failures: Arc<std::sync::atomic::AtomicUsize>,
+    /// The number of test builds that must see a generation conflict.
+    #[cfg(test)]
+    generation_conflicts: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl OxkvReplicaStore {
@@ -235,6 +271,8 @@ impl OxkvReplicaStore {
             builds: Arc::new(std::sync::Mutex::new(HashMap::new())),
             #[cfg(test)]
             publish_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            generation_conflicts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
     }
 
@@ -242,6 +280,13 @@ impl OxkvReplicaStore {
     #[cfg(test)]
     pub(crate) fn fail_next_publish(&self) {
         self.publish_failures
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Makes the next build see a generation conflict in a test.
+    #[cfg(test)]
+    pub(crate) fn fail_next_generation(&self) {
+        self.generation_conflicts
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 
@@ -265,27 +310,37 @@ impl OxkvReplicaStore {
 
     /// Starts one generation at `generation` for `sub`.
     ///
-    /// The call removes every old object under the generation prefix first, so
-    /// a failed earlier attempt cannot leave a row behind.
+    /// The call writes a unique build prefix, so two builds at one generation
+    /// do not share objects.
     /// It writes no wrapper, so the old replica stays visible.
     /// The caller must hold the subject build lock.
+    /// A wrapper that already names `generation` returns
+    /// [`EntityError::GenerationTaken`], and the caller can retry.
     pub(crate) async fn begin_generation(
         &self,
         sub: &str,
         generation: u64,
         head: u64,
     ) -> Result<OxkvGeneration, EntityError> {
+        #[cfg(test)]
+        if self
+            .generation_conflicts
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > 0
+        {
+            self.generation_conflicts
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            return Err(EntityError::GenerationTaken);
+        }
         let hash = sub_hash(sub);
         if let Some((manifest, _version)) = self.read_wrapper(&hash).await?
             && manifest.generation == generation
         {
-            return Err(EntityError::Internal(
-                "oxkv replica generation is already published".to_string(),
-            ));
+            return Err(EntityError::GenerationTaken);
         }
-        let path = format!("{hash}/{generation}");
+        let build_id = new_build_id();
+        let path = format!("{hash}/{generation}/{build_id}");
         let storage = self.storage_at(&path);
-        delete_all(&storage, &ObjectPath::default()).await?;
         let mut builder = OxKvStore::builder()
             .with_store(Arc::clone(&storage))
             .with_prefix(ObjectPath::default());
@@ -303,6 +358,7 @@ impl OxkvReplicaStore {
         Ok(OxkvGeneration {
             store,
             storage,
+            build_id,
             generation,
             head,
         })
@@ -331,6 +387,7 @@ impl OxkvReplicaStore {
             return Err(EntityError::PublishConflict);
         }
         let hash = sub_hash(sub);
+        self.write_build_pointer(&hash, prepared).await?;
         let storage = self.storage_at(&hash);
         let manifest = ReplicaManifest {
             generation: prepared.generation,
@@ -379,14 +436,16 @@ impl OxkvReplicaStore {
         Err(EntityError::PublishConflict)
     }
 
-    /// Removes one unpublished generation.
+    /// Removes one unpublished build.
     ///
-    /// The call does nothing when the wrapper already names the generation, so
-    /// a lost publish race cannot delete a live replica.
+    /// The call removes only the build prefix of `build_id`.
+    /// It does nothing when the wrapper already names the generation, so a
+    /// lost publish race cannot delete a live replica.
     pub(crate) async fn discard_generation(
         &self,
         sub: &str,
         generation: u64,
+        build_id: &str,
     ) -> Result<(), EntityError> {
         let hash = sub_hash(sub);
         if let Some((manifest, _)) = self.read_wrapper(&hash).await?
@@ -394,7 +453,7 @@ impl OxkvReplicaStore {
         {
             return Ok(());
         }
-        let storage = self.storage_at(&format!("{hash}/{generation}"));
+        let storage = self.storage_at(&format!("{hash}/{generation}/{build_id}"));
         delete_all(&storage, &ObjectPath::default()).await
     }
 
@@ -426,7 +485,7 @@ impl OxkvReplicaStore {
             return Ok(None);
         }
         let hash = sub_hash(sub);
-        let storage = self.storage_at(&format!("{hash}/{}", manifest.generation));
+        let storage = self.build_storage(&hash, manifest.generation).await?;
         match storage.get(&ObjectPath::from(key)).await {
             Ok(output) => Ok(Some(output.bytes)),
             Err(error) if is_not_found(&error) => Ok(None),
@@ -465,6 +524,66 @@ impl OxkvReplicaStore {
             inner: Arc::clone(&self.inner),
             root: ObjectPath::from(root),
         })
+    }
+
+    /// Returns the build storage of one published generation.
+    ///
+    /// A generation with no pointer uses the generation root.
+    /// That fallback reads a replica from before build ids existed.
+    async fn build_storage(
+        &self,
+        hash: &str,
+        generation: u64,
+    ) -> Result<Arc<dyn Storage>, EntityError> {
+        let generation_storage = self.storage_at(&format!("{hash}/{generation}"));
+        let output = match generation_storage.get(&ObjectPath::from("build.json")).await {
+            Ok(output) => output,
+            Err(error) if is_not_found(&error) => return Ok(generation_storage),
+            Err(error) => return Err(EntityError::Store(error)),
+        };
+        let pointer: BuildPointer = serde_json::from_slice(&output.bytes)
+            .map_err(|error| EntityError::Internal(error.to_string()))?;
+        Ok(self.storage_at(&format!("{hash}/{generation}/{}", pointer.build)))
+    }
+
+    /// Writes the build pointer of one generation.
+    ///
+    /// The first pointer wins.
+    /// A pointer to another build returns [`EntityError::GenerationTaken`].
+    /// The call is idempotent for the same build id.
+    async fn write_build_pointer(
+        &self,
+        hash: &str,
+        prepared: &PreparedGeneration,
+    ) -> Result<(), EntityError> {
+        let storage = self.storage_at(&format!("{hash}/{}", prepared.generation));
+        let path = ObjectPath::from("build.json");
+        let payload = serde_json::to_vec(&BuildPointer {
+            build: prepared.build_id.clone(),
+        })
+        .map_err(|error| EntityError::Internal(error.to_string()))?;
+        for _attempt in 0..WRAPPER_PUT_ATTEMPTS {
+            match storage.get(&path).await {
+                Ok(output) => {
+                    let pointer: BuildPointer = serde_json::from_slice(&output.bytes)
+                        .map_err(|error| EntityError::Internal(error.to_string()))?;
+                    if pointer.build == prepared.build_id {
+                        return Ok(());
+                    }
+                    return Err(EntityError::GenerationTaken);
+                }
+                Err(error) if is_not_found(&error) => {
+                    match storage.put_opts(&path, payload.clone(), PutMode::Create).await {
+                        Ok(_) => return Ok(()),
+                        Err(error) if error.is_retryable() => continue,
+                        Err(error) => return Err(EntityError::Store(error)),
+                    }
+                }
+                Err(error) if error.is_retryable() => continue,
+                Err(error) => return Err(EntityError::Store(error)),
+            }
+        }
+        Err(EntityError::PublishConflict)
     }
 
     /// Reads and parses the wrapper of one subject hash.
@@ -553,4 +672,89 @@ fn sha256_hex(bytes: &[u8]) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+/// Returns a random build id.
+///
+/// The id keeps two builds at one generation in different prefixes.
+fn new_build_id() -> String {
+    rand::random::<[u8; 16]>()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::test_prefix;
+    use crate::fs::s3::S3Backend;
+
+    fn memory_s3() -> S3ClientConfig {
+        S3ClientConfig {
+            bucket: "eav-oxkv-replica-test".to_string(),
+            region: "us-east-1".to_string(),
+            endpoint_url: None,
+            force_path_style: false,
+            access_key_id: None,
+            secret_access_key: None,
+            backend: S3Backend::Memory,
+        }
+    }
+
+    fn store() -> OxkvReplicaStore {
+        OxkvReplicaStore::new(&memory_s3(), &test_prefix("eav-oxkv-unit"))
+            .expect("the test store must build")
+    }
+
+    #[tokio::test]
+    async fn a_loser_cannot_delete_the_build_prefix_of_a_winner() -> anyhow::Result<()> {
+        let store = store();
+        let winner = store.begin_generation("alice", 1, 7).await?;
+        let winner_id = winner.build_id().to_string();
+        let loser = store.begin_generation("alice", 1, 7).await?;
+        let loser_id = loser.build_id().to_string();
+        let prepared = winner.finish().await?;
+        let hash = sub_hash("alice");
+        let winner_storage = store.storage_at(&format!("{hash}/1/{winner_id}"));
+        let before = winner_storage.list(&ObjectPath::default()).await?;
+        assert!(!before.is_empty(), "the winner wrote no object");
+
+        store.discard_generation("alice", 1, &loser_id).await?;
+
+        assert_eq!(
+            winner_storage.list(&ObjectPath::default()).await?,
+            before,
+            "the loser deleted an object of the winner"
+        );
+        let loser_storage = store.storage_at(&format!("{hash}/1/{loser_id}"));
+        assert!(
+            loser_storage
+                .list(&ObjectPath::default())
+                .await?
+                .is_empty(),
+            "the loser build prefix remains"
+        );
+        store.publish("alice", &prepared).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_published_generation_returns_a_typed_conflict() -> anyhow::Result<()> {
+        let store = store();
+        let generation = store.begin_generation("alice", 1, 7).await?;
+        let prepared = generation.finish().await?;
+        store.publish("alice", &prepared).await?;
+
+        let error = match store.begin_generation("alice", 1, 7).await {
+            Ok(_) => panic!("the published generation must conflict"),
+            Err(error) => error,
+        };
+
+        assert!(
+            matches!(error, EntityError::GenerationTaken),
+            "unexpected error: {error}"
+        );
+        Ok(())
+    }
 }

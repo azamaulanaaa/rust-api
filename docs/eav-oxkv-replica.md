@@ -98,6 +98,22 @@ The store holds no index, outbox, timer, or reverse-reference row.
 The store also holds one `replica:meta` row with the generation and the head.
 A client query scans the `entity:` prefix.
 
+## Server storage layout
+
+The server stores one build under
+`{db}/eav-oxkv/{sub_hash}/{generation}/{build_id}/`.
+A `build.json` pointer under `{db}/eav-oxkv/{sub_hash}/{generation}/` names the
+build id that the wrapper uses.
+The client does not send these paths.
+The object route resolves them from the wrapper and the pointer.
+
+The unique build id keeps two builds at one generation independent.
+A build cannot delete the objects of another build.
+A generation that the wrapper already names returns a retryable `409`.
+The OxKV replica relies on the single-writer lease for cross-process
+exclusion.
+The server does not add a distributed lock.
+
 ## Read-only client use
 
 The client downloads the wrapper and every object, then builds a storage map
