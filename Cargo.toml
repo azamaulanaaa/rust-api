@@ -26,6 +26,7 @@ rust-api-model = { version = "0.1.0", path = "crates/model" }
 rust-api-core = { version = "0.1.0", path = "crates/core" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+sha2 = "0.10"
 thiserror = "2.0"
 uuid = { version = "1.18", features = ["serde"] }
 

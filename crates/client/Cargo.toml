@@ -16,6 +16,9 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 rust-api-model.workspace = true
 rust-api-core.workspace = true
+# The replica loader parses the manifest and verifies each object.
+serde_json.workspace = true
+sha2.workspace = true
 
 # The JS binding and the browser transport are WebAssembly-only
 # dependencies. The native test target does not build them. Keep this

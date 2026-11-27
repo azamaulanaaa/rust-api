@@ -2,8 +2,8 @@
 //!
 //! This crate builds as a `cdylib` for the browser and as an `rlib` for the
 //! native test target. The `auth` module holds the session check and the
-//! transport seam. Later work adds the replica cache, local reads, and job
-//! status.
+//! transport seam. The `replica` module downloads, verifies, and stores the
+//! per-user replica. Later work adds local reads and job status.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 use rust_api_model::wire::{ReplicaManifest, SyncCursor};
@@ -15,6 +15,9 @@ pub mod auth;
 ///
 /// The poll and SSE transports live in the `poll` and `sse` submodules.
 pub mod jobs;
+
+/// The replica loader and its in-memory cache.
+pub mod replica;
 
 #[cfg(target_arch = "wasm32")]
 mod wasm;
