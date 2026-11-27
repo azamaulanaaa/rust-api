@@ -21,7 +21,7 @@ use rust_api_model::domain::{CommandKind, JobState};
 use rust_api_model::wire::{CommandEnvelope, JobStatusView, MAX_IDEMPOTENCY_KEY_LEN};
 use serde_json::Value;
 
-use crate::auth::{Credentials, Request, Transport};
+use crate::auth::{Credentials, Request, Transport, TransportError};
 
 /// The route that accepts one command.
 const JOBS_PATH: &str = "/jobs";
@@ -35,7 +35,7 @@ const MAX_JOB_ID_LEN: usize = 64;
 /// A failure to submit or poll one job.
 ///
 /// The enum is non-exhaustive. A caller must treat a new variant as an error.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 #[non_exhaustive]
 pub enum JobError {
     /// The server has no valid session for this browser.
@@ -48,29 +48,34 @@ pub enum JobError {
     Conflict,
     /// The kind, the payload, or the idempotency key is not valid.
     InvalidCommand,
-    /// The request failed, or the server answered with an unexpected status.
-    Request,
+    /// The transport failed before the client read an answer.
+    Transport(TransportError),
+    /// The status body is not a valid [`JobStatusView`].
+    InvalidBody(serde_json::Error),
+    /// The server answered with a status that the route does not define.
+    UnexpectedStatus(u16),
 }
 
 impl JobError {
     /// Return the stable JavaScript error name.
     ///
-    /// A name, once added, stays part of the stable surface.
-    pub const fn status_name(self) -> &'static str {
+    /// A name, once added, stays part of the stable surface. The transport,
+    /// body, and unexpected-status errors all use `request`.
+    pub const fn status_name(&self) -> &'static str {
         match self {
             Self::LoginRequired => "login_required",
             Self::Forbidden => "forbidden",
             Self::NotFound => "not_found",
             Self::Conflict => "conflict",
             Self::InvalidCommand => "invalid_command",
-            Self::Request => "request",
+            Self::Transport(_) | Self::InvalidBody(_) | Self::UnexpectedStatus(_) => "request",
         }
     }
 
     /// Return `true` when the failure means the session ended.
     ///
     /// A caller sets the session state to login-required for this error.
-    pub const fn requires_login(self) -> bool {
+    pub const fn requires_login(&self) -> bool {
         matches!(self, Self::LoginRequired)
     }
 }
@@ -83,12 +88,26 @@ impl fmt::Display for JobError {
             Self::NotFound => formatter.write_str("the job is absent or not visible"),
             Self::Conflict => formatter.write_str("the idempotency key names a different command"),
             Self::InvalidCommand => formatter.write_str("the command is not valid"),
-            Self::Request => formatter.write_str("the job request failed"),
+            Self::Transport(error) => write!(formatter, "the job request failed: {error}"),
+            Self::InvalidBody(error) => {
+                write!(formatter, "the job status body is not valid: {error}")
+            }
+            Self::UnexpectedStatus(status) => {
+                write!(formatter, "the server answered HTTP {status}")
+            }
         }
     }
 }
 
-impl std::error::Error for JobError {}
+impl std::error::Error for JobError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Transport(error) => Some(error),
+            Self::InvalidBody(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 /// One submitted job as the client tracks it.
 ///
@@ -194,8 +213,10 @@ impl<T: Transport> JobClient<T> {
     /// A `202` answer stores and returns the pending job. A `401` answer
     /// returns [`JobError::LoginRequired`]. A `409` answer returns
     /// [`JobError::Conflict`]. A `400` answer returns
-    /// [`JobError::InvalidCommand`]. Any other answer or a transport failure
-    /// returns [`JobError::Request`].
+    /// [`JobError::InvalidCommand`]. Any other answer returns
+    /// [`JobError::UnexpectedStatus`]. A transport failure returns
+    /// [`JobError::Transport`]. A body that is not a [`JobStatusView`]
+    /// returns [`JobError::InvalidBody`].
     pub async fn submit(
         &self,
         kind: &str,
@@ -212,17 +233,17 @@ impl<T: Transport> JobClient<T> {
             idempotency_key: idempotency_key.to_owned(),
             expected_version: None,
         };
-        let body = serde_json::to_string(&envelope).map_err(|_| JobError::Request)?;
+        let body = serde_json::to_string(&envelope).map_err(|_| JobError::InvalidCommand)?;
         let request = Request::json_post(JOBS_PATH, Credentials::Include, body);
         let response = self
             .transport
             .send(request)
             .await
-            .map_err(|_| JobError::Request)?;
+            .map_err(JobError::Transport)?;
         match response.status {
             202 => {
                 let view: JobStatusView =
-                    serde_json::from_slice(&response.body).map_err(|_| JobError::Request)?;
+                    serde_json::from_slice(&response.body).map_err(JobError::InvalidBody)?;
                 let job = PendingJob::from_view(view);
                 self.pending.replace(Some(job.clone()));
                 Ok(job)
@@ -237,8 +258,10 @@ impl<T: Transport> JobClient<T> {
     /// answer returns the job. The call updates the stored pending job when
     /// the id matches. A job in a terminal state does not change again. A
     /// `404` answer returns [`JobError::NotFound`]. A `401` answer returns
-    /// [`JobError::LoginRequired`]. Any other answer or a transport failure
-    /// returns [`JobError::Request`].
+    /// [`JobError::LoginRequired`]. Any other answer returns
+    /// [`JobError::UnexpectedStatus`]. A transport failure returns
+    /// [`JobError::Transport`]. A body that is not a [`JobStatusView`]
+    /// returns [`JobError::InvalidBody`].
     ///
     /// The call does not change the replica or query view.
     pub async fn poll(&self, id: &str) -> Result<PendingJob, JobError> {
@@ -250,11 +273,11 @@ impl<T: Transport> JobClient<T> {
             .transport
             .send(request)
             .await
-            .map_err(|_| JobError::Request)?;
+            .map_err(JobError::Transport)?;
         match response.status {
             200 => {
                 let view: JobStatusView =
-                    serde_json::from_slice(&response.body).map_err(|_| JobError::Request)?;
+                    serde_json::from_slice(&response.body).map_err(JobError::InvalidBody)?;
                 let job = PendingJob::from_view(view);
                 let current = self.pending.borrow().clone();
                 if let Some(current) = current
@@ -280,7 +303,7 @@ impl JobError {
             401 => Self::LoginRequired,
             403 => Self::Forbidden,
             409 => Self::Conflict,
-            _ => Self::Request,
+            _ => Self::UnexpectedStatus(status),
         }
     }
 
@@ -290,7 +313,7 @@ impl JobError {
             401 => Self::LoginRequired,
             403 => Self::Forbidden,
             404 => Self::NotFound,
-            _ => Self::Request,
+            _ => Self::UnexpectedStatus(status),
         }
     }
 }
@@ -315,7 +338,7 @@ fn is_safe_job_id(id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::{AuthClient, AuthState, JSON_CONTENT_TYPE, Method, Response, TransportError};
+    use crate::auth::{AuthClient, AuthState, JSON_CONTENT_TYPE, Method, Response};
     use crate::eav::ReplicaQuery;
     use crate::eav::test_support::{ScriptedTransport, build_objects, entity_rows, script_replica};
     use serde_json::json;
@@ -576,11 +599,11 @@ mod tests {
     /// Submit maps a conflict, an invalid command, and other statuses.
     #[test]
     fn submit_maps_conflict_and_invalid_statuses() {
-        for (status, expected) in [
-            (409, JobError::Conflict),
-            (400, JobError::InvalidCommand),
-            (403, JobError::Forbidden),
-            (404, JobError::Request),
+        for (status, expected_name) in [
+            (409, "conflict"),
+            (400, "invalid_command"),
+            (403, "forbidden"),
+            (404, "request"),
         ] {
             let (requests, replies, transport) = FakeTransport::new();
             replies.borrow_mut().push_back(Reply::status(status));
@@ -589,8 +612,15 @@ mod tests {
             let error = block_on(client.submit("entity.create", json!({}), "key-1"))
                 .expect_err("the submit fails");
 
-            assert_eq!(error, expected);
-            assert_eq!(error.status_name(), expected.status_name());
+            assert_eq!(error.status_name(), expected_name);
+            let matched = match &error {
+                JobError::Conflict => status == 409,
+                JobError::InvalidCommand => status == 400,
+                JobError::Forbidden => status == 403,
+                JobError::UnexpectedStatus(code) => *code == status,
+                _ => false,
+            };
+            assert!(matched, "unexpected error for status {status}: {error}");
             assert_eq!(requests.borrow().len(), 1);
             assert_eq!(client.pending(), None);
         }
@@ -605,35 +635,42 @@ mod tests {
 
         let error = block_on(client.submit("entity.create", json!({}), "key-1"))
             .expect_err("the submit fails");
-        assert_eq!(error, JobError::LoginRequired);
         assert_eq!(error.status_name(), "login_required");
         assert!(error.requires_login());
+        assert!(matches!(error, JobError::LoginRequired));
 
         let (_, replies, transport) = FakeTransport::new();
         replies.borrow_mut().push_back(Reply::status(404));
         let client = JobClient::new(transport);
 
         let error = block_on(client.poll(JOB_ID)).expect_err("the poll fails");
-        assert_eq!(error, JobError::NotFound);
         assert_eq!(error.status_name(), "not_found");
         assert!(!error.requires_login());
+        assert!(matches!(error, JobError::NotFound));
     }
 
     /// A `403` and an unexpected status map to stable errors.
     #[test]
-    fn poll_maps_forbidden_and_request_errors() {
-        for (status, expected) in [
-            (403, JobError::Forbidden),
-            (500, JobError::Request),
-            (202, JobError::Request),
-        ] {
+    fn poll_maps_forbidden_and_unexpected_statuses() {
+        for status in [403, 500, 202, 409] {
             let (_, replies, transport) = FakeTransport::new();
             replies.borrow_mut().push_back(Reply::status(status));
             let client = JobClient::new(transport);
 
             let error = block_on(client.poll(JOB_ID)).expect_err("the poll fails");
 
-            assert_eq!(error, expected);
+            let expected_name = if status == 403 {
+                "forbidden"
+            } else {
+                "request"
+            };
+            assert_eq!(error.status_name(), expected_name);
+            let matched = match &error {
+                JobError::Forbidden => status == 403,
+                JobError::UnexpectedStatus(code) => *code == status,
+                _ => false,
+            };
+            assert!(matched, "unexpected error for status {status}: {error}");
         }
     }
 
@@ -646,11 +683,11 @@ mod tests {
         for key in [String::new(), "k".repeat(MAX_IDEMPOTENCY_KEY_LEN + 1)] {
             let error = block_on(client.submit("entity.create", json!({}), &key))
                 .expect_err("the key is not valid");
-            assert_eq!(error, JobError::InvalidCommand);
+            assert!(matches!(error, JobError::InvalidCommand));
         }
         let error = block_on(client.submit("Bad Kind", json!({}), "key-1"))
             .expect_err("the kind is not valid");
-        assert_eq!(error, JobError::InvalidCommand);
+        assert!(matches!(error, JobError::InvalidCommand));
 
         assert_eq!(requests.borrow().len(), 0);
     }
@@ -664,7 +701,7 @@ mod tests {
 
         for id in ["../auth/me", "a/b", "a?b", "", long_id.as_str()] {
             let error = block_on(client.poll(id)).expect_err("the id is not safe");
-            assert_eq!(error, JobError::NotFound);
+            assert!(matches!(error, JobError::NotFound));
         }
 
         assert_eq!(requests.borrow().len(), 0);
@@ -753,6 +790,41 @@ mod tests {
         assert_eq!(JobError::NotFound.status_name(), "not_found");
         assert_eq!(JobError::Conflict.status_name(), "conflict");
         assert_eq!(JobError::InvalidCommand.status_name(), "invalid_command");
-        assert_eq!(JobError::Request.status_name(), "request");
+        assert_eq!(
+            JobError::Transport(TransportError::new("the browser failed")).status_name(),
+            "request"
+        );
+        let body = serde_json::from_str::<Value>("{").expect_err("the body is not valid");
+        assert_eq!(JobError::InvalidBody(body).status_name(), "request");
+        assert_eq!(JobError::UnexpectedStatus(404).status_name(), "request");
+    }
+
+    /// A request error keeps its transport or body cause.
+    #[test]
+    fn a_request_error_keeps_its_cause() {
+        let error = JobError::Transport(TransportError::new("the browser rejected the request"));
+        assert_eq!(error.status_name(), "request");
+        let source = std::error::Error::source(&error).expect("the transport error has a source");
+        assert_eq!(source.to_string(), "the browser rejected the request");
+        assert_eq!(
+            error.to_string(),
+            "the job request failed: the browser rejected the request"
+        );
+
+        let body = serde_json::from_str::<Value>("{").expect_err("the body is not valid");
+        let error = JobError::InvalidBody(body);
+        assert_eq!(error.status_name(), "request");
+        assert!(std::error::Error::source(&error).is_some());
+        assert!(
+            error
+                .to_string()
+                .starts_with("the job status body is not valid:"),
+            "{error}"
+        );
+
+        let error = JobError::UnexpectedStatus(409);
+        assert_eq!(error.status_name(), "request");
+        assert!(std::error::Error::source(&error).is_none());
+        assert_eq!(error.to_string(), "the server answered HTTP 409");
     }
 }

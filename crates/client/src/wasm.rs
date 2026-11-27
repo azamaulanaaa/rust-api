@@ -290,7 +290,7 @@ impl Client {
             terminal: job.is_terminal(),
             committed,
         };
-        serde_json::to_string(&body).unwrap_or_else(|_| job_error_json(JobError::Request))
+        serde_json::to_string(&body).unwrap_or_else(|_| "{\"error\":\"request\"}".to_owned())
     }
 
     /// Return the stable JSON body of one job error.
