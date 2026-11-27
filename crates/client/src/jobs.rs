@@ -1,15 +1,15 @@
-//! The client job client: submit a command and poll its status.
+//! The client job client: submit a command and follow its status.
 //!
 //! A write is a job. The client sends `POST /jobs` with a
-//! [`CommandEnvelope`](rust_api_model::wire::CommandEnvelope) and then polls
-//! `GET /jobs/{id}`. The client never changes the replica view on submit. It
-//! shows the committed replica data plus the
+//! [`CommandEnvelope`](rust_api_model::wire::CommandEnvelope) and then follows
+//! `GET /jobs/{id}` or `GET /jobs/{id}/events`. The client never changes the
+//! replica view on submit. It shows the committed replica data plus the
 //! [`PendingJob`](crate::jobs::PendingJob) until the server
 //! reports `succeeded` and the replica applied the commit sequence.
 //!
 //! The `poll` module names the guaranteed fallback transport. The `sse`
-//! module names the stream transport. This feature implements polling only;
-//! it does not implement SSE.
+//! module holds the event-source seam and the watcher. The watcher uses the
+//! stream and falls back to polling when the stream fails.
 
 pub mod poll;
 pub mod sse;
@@ -252,6 +252,28 @@ impl<T: Transport> JobClient<T> {
         }
     }
 
+    /// Apply one event view to the stored pending job.
+    ///
+    /// The view is stored when its id matches `expected_id`. A terminal stored
+    /// job with the same id does not change. The method returns `None` when
+    /// the view names another job. The watcher uses this method for the
+    /// initial, status, and terminal events.
+    pub(crate) fn apply_view(&self, expected_id: &str, view: JobStatusView) -> Option<PendingJob> {
+        let job = PendingJob::from_view(view);
+        if job.id != expected_id {
+            return None;
+        }
+        let current = self.pending.borrow().clone();
+        if let Some(current) = current
+            && current.id == job.id
+            && current.is_terminal()
+        {
+            return Some(current);
+        }
+        self.pending.replace(Some(job.clone()));
+        Some(job)
+    }
+
     /// Read the status of one job and update the stored pending job.
     ///
     /// The request is `GET /jobs/{id}` with cookie credentials. A `200`
@@ -327,7 +349,7 @@ fn valid_idempotency_key(key: &str) -> bool {
 ///
 /// The allowlist keeps URL syntax out of the request path. A client can call
 /// [`JobClient::poll`] with any string, so the check runs before the request.
-fn is_safe_job_id(id: &str) -> bool {
+pub(crate) fn is_safe_job_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= MAX_JOB_ID_LEN
         && id

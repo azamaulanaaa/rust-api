@@ -9,6 +9,9 @@
 //! trait with a scripted source. `browser::BrowserEventSource` wraps the
 //! browser `EventSource` API.
 //!
+//! [`watch`] applies each status view to the pending job and stops at a
+//! terminal state. The watcher never changes the replica or the query view.
+//!
 //! The route has no `Last-Event-ID` support. A reconnect receives the current
 //! status. The server route answers `400`, `401`, `404`, or `429` before the
 //! stream starts. The browser `EventSource` API does not show that status, so
@@ -17,6 +20,9 @@
 use core::fmt;
 
 use rust_api_model::wire::JobStatusView;
+
+use super::{JobClient, JobError, PendingJob, is_safe_job_id};
+use crate::auth::{Transport, TransportError};
 
 /// One event from a job status stream.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -128,6 +134,71 @@ pub trait JobEventSource {
     /// The call returns `None` when the stream ends. The watcher then falls
     /// back to polling.
     async fn next_event(&mut self) -> Option<Result<JobEvent, StreamFailure>>;
+}
+
+/// Watch one job over an event source.
+///
+/// The function reads one event at a time. A `status` or `terminal` view is
+/// stored in the [`JobClient`] pending state and passed to `on_event`. A
+/// terminal state stops the watch and returns the final pending job. A
+/// heartbeat is ignored.
+///
+/// A view for another job ends the watch. The function never changes the
+/// replica or the query view. An unsafe id returns [`JobError::NotFound`]
+/// before the source is read.
+///
+/// A stream failure or an `error` event returns a `request` error. This
+/// feature does not implement the poll fallback yet.
+///
+/// # Errors
+///
+/// Returns [`JobError::NotFound`] for an unsafe id. Returns a `request` error
+/// for a stream failure or an `error` event.
+pub async fn watch<T, S, F>(
+    jobs: &JobClient<T>,
+    id: &str,
+    mut source: S,
+    mut on_event: F,
+) -> Result<PendingJob, JobError>
+where
+    T: Transport,
+    S: JobEventSource,
+    F: FnMut(&PendingJob),
+{
+    if !is_safe_job_id(id) {
+        return Err(JobError::NotFound);
+    }
+
+    loop {
+        match source.next_event().await {
+            Some(Ok(JobEvent::Status(view) | JobEvent::Terminal(view))) => {
+                let Some(job) = jobs.apply_view(id, view) else {
+                    break;
+                };
+                on_event(&job);
+                if job.is_terminal() {
+                    return Ok(job);
+                }
+            }
+            Some(Ok(JobEvent::Heartbeat)) => {}
+            Some(Ok(JobEvent::Error(code))) => {
+                return Err(stream_error(format!(
+                    "the stream sent the {} error",
+                    code.as_str()
+                )));
+            }
+            Some(Err(failure)) => return Err(stream_error(failure.to_string())),
+            None => break,
+        }
+    }
+    Err(stream_error(
+        "the stream closed before the job reached a terminal state",
+    ))
+}
+
+/// Build the request error of one stream failure.
+fn stream_error(detail: impl Into<String>) -> JobError {
+    JobError::Transport(TransportError::new(detail))
 }
 
 /// Parse one event name and data pair from a stream.
