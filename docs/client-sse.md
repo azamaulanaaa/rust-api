@@ -108,9 +108,8 @@ The watcher drops the stream and polls `GET /jobs/{id}` when:
 The fallback polls at most 60 times, one second apart. It does not busy-loop.
 A zero interval skips the wait. Each poll updates the pending job. A terminal
 poll stops the fallback. A watch that reaches the poll bound returns the
-`request` error. The stream is
-dropped before the first poll, so a browser source cannot reconnect during
-the fallback.
+`request` error. The stream is dropped before the first poll, so a browser
+source cannot reconnect during the fallback.
 
 Status mapping:
 
@@ -165,8 +164,9 @@ with one stable error name, the same names as `poll_job`:
 
 The error names are `login_required`, `forbidden`, `not_found`, `conflict`,
 `invalid_command`, and `request`. A `401` from the fallback also sets the
-session state to login-required. A callback that throws does not stop the
-watch; the promise still resolves.
+session state to login-required. A fallback poll body for another job is
+`request`. A callback that throws does not stop the watch; the promise still
+resolves.
 
 `Client::pending_job()` returns the final stored job after the promise
 resolves. It is `null` when no job is stored.
@@ -199,6 +199,8 @@ The native tests cover:
 - A terminal first event. It stops without polling.
 - The poll bound and the `request` result.
 - An unsafe id. It is rejected before the source is read.
+- A stream view and a fallback poll for another id. Both are rejected and
+  do not replace the pending job.
 - A loaded replica and query view that do not change.
 - The event parser, the stable stream names, and the default options.
 

@@ -430,6 +430,9 @@ mod tests {
     /// One job id that is a valid request path segment.
     const JOB_ID: &str = "0190a5c2-7f3a-7c2b-8e4d-0123456789ab";
 
+    /// Another job id that is a valid request path segment.
+    const OTHER_JOB_ID: &str = "0190a5c2-7f3a-7c2b-8e4d-0123456789ac";
+
     /// One scripted transport answer.
     #[derive(Clone, Debug)]
     struct Reply {
@@ -554,15 +557,16 @@ mod tests {
         }
     }
 
-    /// Build one job status body.
-    fn job_body(
+    /// Build one job status body for one id.
+    fn job_body_for(
+        id: &str,
         state: &str,
         attempt: u32,
         error: Option<&str>,
         commit_seq: Option<u64>,
     ) -> Vec<u8> {
         serde_json::to_vec(&json!({
-            "id": JOB_ID,
+            "id": id,
             "kind": "entity.create",
             "state": state,
             "attempt": attempt,
@@ -575,22 +579,38 @@ mod tests {
         .expect("the job body serializes")
     }
 
-    /// Build one job status view.
-    fn view(state: &str, attempt: u32, commit_seq: Option<u64>) -> JobStatusView {
-        serde_json::from_slice(&job_body(state, attempt, None, commit_seq))
+    /// Build one job status view for one id.
+    fn view_for(id: &str, state: &str, attempt: u32, commit_seq: Option<u64>) -> JobStatusView {
+        serde_json::from_slice(&job_body_for(id, state, attempt, None, commit_seq))
             .expect("the view parses")
     }
 
-    /// Script one `200` poll answer.
-    fn script_poll(
+    /// Build one job status view for the watched job.
+    fn view(state: &str, attempt: u32, commit_seq: Option<u64>) -> JobStatusView {
+        view_for(JOB_ID, state, attempt, commit_seq)
+    }
+
+    /// Script one `200` poll answer for one id.
+    fn script_poll_for(
         replies: &Rc<RefCell<VecDeque<Reply>>>,
+        id: &str,
         state: &str,
         attempt: u32,
         commit_seq: Option<u64>,
     ) {
         replies
             .borrow_mut()
-            .push_back(Reply::json(200, job_body(state, attempt, None, commit_seq)));
+            .push_back(Reply::json(200, job_body_for(id, state, attempt, None, commit_seq)));
+    }
+
+    /// Script one `200` poll answer for the watched job.
+    fn script_poll(
+        replies: &Rc<RefCell<VecDeque<Reply>>>,
+        state: &str,
+        attempt: u32,
+        commit_seq: Option<u64>,
+    ) {
+        script_poll_for(replies, JOB_ID, state, attempt, commit_seq);
     }
 
     /// Build one event recorder.
@@ -739,6 +759,72 @@ mod tests {
 
         assert_eq!(job.state, JobState::Succeeded);
         assert_eq!(states(&seen), [JobState::Succeeded]);
+        assert_eq!(requests.borrow().len(), 1);
+    }
+
+    /// A stream view and a fallback poll for another job are rejected and do
+    /// not replace the pending job or reach the callback.
+    #[test]
+    fn a_mismatched_stream_and_poll_do_not_replace_the_pending_job() {
+        let other = view_for(OTHER_JOB_ID, "queued", 0, None);
+        let (source, _) = ScriptedSource::new(vec![Ok(JobEvent::Status(other))]);
+        let (requests, replies, transport) = FakeTransport::new();
+        script_poll_for(&replies, OTHER_JOB_ID, "succeeded", 1, Some(5));
+        let jobs = JobClient::new(transport);
+        let stored = PendingJob {
+            id: OTHER_JOB_ID.to_owned(),
+            state: JobState::Queued,
+            attempt: 0,
+            error: None,
+            commit_seq: None,
+        };
+        jobs.apply_pending(stored.clone());
+        let (seen, record) = recorder();
+
+        let error = block_on(watch(
+            &jobs,
+            JOB_ID,
+            source,
+            RecordingDelay::new(),
+            WatchOptions::default(),
+            record,
+        ))
+        .expect_err("both events name another job");
+
+        assert!(matches!(error, JobError::MismatchedJob));
+        assert_eq!(error.status_name(), "request");
+        assert_eq!(jobs.pending(), Some(stored));
+        assert!(
+            seen.borrow().is_empty(),
+            "the mismatched view must not reach the callback"
+        );
+        assert_eq!(requests.borrow().len(), 1, "the fallback polls once");
+    }
+
+    /// A fallback poll for another job is rejected and does not fill the
+    /// pending slot.
+    #[test]
+    fn a_mismatched_fallback_poll_is_not_applied() {
+        let (source, _) = ScriptedSource::new(vec![Err(StreamFailure::new("the stream ended"))]);
+        let (requests, replies, transport) = FakeTransport::new();
+        script_poll_for(&replies, OTHER_JOB_ID, "succeeded", 1, Some(5));
+        let jobs = JobClient::new(transport);
+        let (seen, record) = recorder();
+
+        let error = block_on(watch(
+            &jobs,
+            JOB_ID,
+            source,
+            RecordingDelay::new(),
+            WatchOptions::default(),
+            record,
+        ))
+        .expect_err("the poll names another job");
+
+        assert!(matches!(error, JobError::MismatchedJob));
+        assert_eq!(error.status_name(), "request");
+        assert_eq!(jobs.pending(), None);
+        assert!(seen.borrow().is_empty());
         assert_eq!(requests.borrow().len(), 1);
     }
 

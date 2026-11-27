@@ -115,10 +115,12 @@ Typed errors:
 | `InvalidCommand` | A bad kind, payload, or key. |
 | `Transport` | The request failed before an answer. |
 | `InvalidBody` | The status body is not valid. |
+| `MismatchedJob` | A poll body names another job. |
 | `UnexpectedStatus` | Any other status, such as a submit `404`. |
 
-`UnexpectedStatus` also covers a poll `409`. These three errors use the
-stable JavaScript name `request`.
+`UnexpectedStatus` also covers a poll `409`. `Transport`, `InvalidBody`,
+`MismatchedJob`, and `UnexpectedStatus` use the stable JavaScript name
+`request`.
 
 ## JavaScript shape
 
