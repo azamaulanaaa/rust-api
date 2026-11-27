@@ -328,7 +328,9 @@ pub mod browser {
     use std::time::Duration;
 
     use futures_util::stream::{SelectAll, StreamExt as _};
-    use gloo_net::eventsource::futures::{EventSource, EventSourceBuilder, EventSourceSubscription};
+    use gloo_net::eventsource::futures::{
+        EventSource, EventSourceBuilder, EventSourceSubscription,
+    };
 
     use super::{JobEvent, JobEventSource, PollDelay, StreamFailure, parse_event};
 
@@ -386,9 +388,7 @@ pub mod browser {
                     Err(error) => return Some(Err(StreamFailure::new(error.to_string()))),
                 };
                 let Some(data) = message.data().as_string() else {
-                    return Some(Err(StreamFailure::new(
-                        "the stream event data is not text",
-                    )));
+                    return Some(Err(StreamFailure::new("the stream event data is not text")));
                 };
                 match parse_event(&name, &data) {
                     Ok(Some(event)) => return Some(Ok(event)),
@@ -641,7 +641,10 @@ mod tests {
         assert_eq!(job.commit_seq, Some(5));
         assert!(job.is_terminal());
         assert_eq!(jobs.pending(), Some(job));
-        assert!(requests.borrow().is_empty(), "no poll after a terminal event");
+        assert!(
+            requests.borrow().is_empty(),
+            "no poll after a terminal event"
+        );
         assert!(delay.waits.borrow().is_empty(), "no fallback wait");
         assert_eq!(reads.get(), 4);
     }

@@ -319,9 +319,8 @@ impl Client {
         let source = match BrowserEventSource::open(id) {
             Ok(source) => source,
             Err(error) => {
-                return self.job_failure(JobError::Transport(TransportError::new(
-                    error.to_string(),
-                )));
+                return self
+                    .job_failure(JobError::Transport(TransportError::new(error.to_string())));
             }
         };
         let result = watch(
