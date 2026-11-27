@@ -33,7 +33,7 @@ use std::sync::Arc;
 use rust_api_model::wire::{ReplicaManifest, ReplicaObject};
 use sha2::{Digest, Sha256};
 
-use crate::auth::{Credentials, Method, Request, Transport, TransportError};
+use crate::auth::{Credentials, Request, Transport, TransportError};
 
 /// The route that serves the file replica manifest.
 const FILE_MANIFEST_PATH: &str = "/sync/db/manifest.json";
@@ -350,11 +350,7 @@ impl<T: Transport> ReplicaClient<T> {
     ///
     /// A `401` or `403` answer clears the cache.
     async fn get(&self, path: &str) -> Result<Vec<u8>, ReplicaError> {
-        let request = Request {
-            method: Method::Get,
-            path: path.to_owned(),
-            credentials: Credentials::Include,
-        };
+        let request = Request::get(path, Credentials::Include);
         let response = self
             .transport
             .send(request)
@@ -427,7 +423,7 @@ fn hex_lower(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::Response;
+    use crate::auth::{Method, Response};
     use std::collections::VecDeque;
     use std::future::Future;
     use std::pin::{Pin, pin};

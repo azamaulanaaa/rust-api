@@ -4,7 +4,8 @@
 //! native test target. The `auth` module holds the session check and the
 //! transport seam. The `replica` module downloads, verifies, and stores a
 //! per-user replica. The `eav` module reads the local entity view and runs
-//! the shared core query. Later work adds job status.
+//! the shared core query. The `jobs` module submits a command and polls its
+//! status. The client never applies a pending command to the replica view.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 use rust_api_model::wire::{ReplicaManifest, SyncCursor};

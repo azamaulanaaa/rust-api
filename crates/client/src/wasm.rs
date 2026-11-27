@@ -2,18 +2,22 @@
 //!
 //! This module builds only for `wasm32`. The surface is small on purpose.
 //! This version sends the session probe, downloads the per-user file replica,
-//! downloads the per-user EAV oxkv replica, and answers one local entity
-//! query. It has no persistent storage.
+//! downloads the per-user EAV oxkv replica, answers one local entity query,
+//! and submits and polls jobs. It has no persistent storage. The client never
+//! applies a pending command to the replica view.
 //!
 //! The string shapes and the status names are stable. A name, once added,
 //! stays part of the stable surface.
 
+use rust_api_model::domain::JobState;
+use serde::Serialize;
 use serde_json::json;
 use wasm_bindgen::prelude::*;
 
 use crate::auth::AuthClient;
 use crate::auth::browser::BrowserTransport;
 use crate::eav::{QueryError, ReplicaQuery};
+use crate::jobs::{JobClient, JobError, PendingJob};
 use crate::replica::ReplicaClient;
 
 /// The JavaScript-facing client for the rust-api server.
@@ -27,6 +31,7 @@ pub struct Client {
     auth: AuthClient<BrowserTransport>,
     replica: ReplicaClient<BrowserTransport>,
     query: ReplicaQuery<BrowserTransport>,
+    jobs: JobClient<BrowserTransport>,
 }
 
 impl Default for Client {
@@ -47,6 +52,7 @@ impl Client {
             auth: AuthClient::new(BrowserTransport),
             replica: ReplicaClient::new(BrowserTransport),
             query: ReplicaQuery::new(BrowserTransport),
+            jobs: JobClient::new(BrowserTransport),
         }
     }
 
@@ -186,9 +192,157 @@ impl Client {
             Err(error) => error_json(error),
         }
     }
+
+    /// Submit one command and return the pending job or an error name.
+    ///
+    /// `kind` is the command kind. Only `entity.create` is submittable today;
+    /// the server rejects any other kind with `400`. `payload_json` is the
+    /// command payload as a JSON string. The client does not decode the
+    /// `entity.create` payload; it forwards the parsed JSON value.
+    /// `idempotency_key` makes the enqueue idempotent. It must hold 1 to 128
+    /// bytes.
+    ///
+    /// The request is `POST /jobs` with the `auth_token` cookie and
+    /// `Content-Type: application/json`. A `202` answer stores the pending
+    /// job. The client does not change the replica or the query view.
+    ///
+    /// A successful submit returns a JSON string:
+    ///
+    /// ```text
+    /// {"id":"...","state":"queued","attempt":0,"error":null,
+    ///  "commit_seq":null,"terminal":false,"committed":false}
+    /// ```
+    ///
+    /// The `committed` field is true only when the EAV replica is loaded and
+    /// its applied sequence covers the job commit sequence. The method does
+    /// not load a replica.
+    ///
+    /// A failed submit returns one stable error name:
+    ///
+    /// ```text
+    /// {"error":"invalid_command"}
+    /// ```
+    ///
+    /// The error names are `login_required`, `forbidden`, `not_found`,
+    /// `conflict`, `invalid_command`, and `request`. A `401` answer also sets
+    /// the session state to login-required. A method once added stays part of
+    /// the stable surface.
+    pub async fn submit_job(
+        &self,
+        kind: &str,
+        payload_json: &str,
+        idempotency_key: &str,
+    ) -> String {
+        let payload = match serde_json::from_str(payload_json) {
+            Ok(payload) => payload,
+            Err(_) => return job_error_json(JobError::InvalidCommand),
+        };
+        match self.jobs.submit(kind, payload, idempotency_key).await {
+            Ok(job) => self.pending_json(&job),
+            Err(error) => self.job_failure(error),
+        }
+    }
+
+    /// Read the status of one job and return the pending job or an error name.
+    ///
+    /// The request is `GET /jobs/{id}` with the `auth_token` cookie. The call
+    /// updates the stored pending job when the id matches. A terminal job
+    /// does not change again. The method does not change the replica or the
+    /// query view.
+    ///
+    /// A successful poll returns the same JSON shape as
+    /// [`submit_job`](Self::submit_job). A failed poll returns one stable
+    /// error name: `login_required`, `forbidden`, `not_found`, `conflict`,
+    /// `invalid_command`, or `request`. A `401` answer also sets the session
+    /// state to login-required. A method once added stays part of the stable
+    /// surface.
+    pub async fn poll_job(&self, id: &str) -> String {
+        match self.jobs.poll(id).await {
+            Ok(job) => self.pending_json(&job),
+            Err(error) => self.job_failure(error),
+        }
+    }
+
+    /// Return the stored pending job, or `null` when there is none.
+    ///
+    /// The method does no network work. It returns the JSON shape of
+    /// [`submit_job`](Self::submit_job). The `committed` field uses the EAV
+    /// replica applied sequence when the EAV replica is loaded. Otherwise it
+    /// is false. The method does not load a replica. A method once added stays
+    /// part of the stable surface.
+    pub fn pending_job(&self) -> String {
+        match self.jobs.pending() {
+            Some(job) => self.pending_json(&job),
+            None => "null".to_owned(),
+        }
+    }
+
+    /// Return the stable JSON body of one pending job.
+    fn pending_json(&self, job: &PendingJob) -> String {
+        let applied_seq = self.query.replica().state().map(|state| state.applied_seq);
+        let committed = applied_seq.is_some_and(|head| job.is_committed(head));
+        let body = PendingJobJson {
+            id: &job.id,
+            state: state_name(job.state),
+            attempt: job.attempt,
+            error: job.error.as_deref(),
+            commit_seq: job.commit_seq,
+            terminal: job.is_terminal(),
+            committed,
+        };
+        serde_json::to_string(&body).unwrap_or_else(|_| "{\"error\":\"request\"}".to_owned())
+    }
+
+    /// Return the stable JSON body of one job error.
+    ///
+    /// A `401` answer also sets the session state to login-required.
+    fn job_failure(&self, error: JobError) -> String {
+        if error.requires_login() {
+            self.auth.set_login_required();
+        }
+        job_error_json(error)
+    }
+}
+
+/// The stable JSON body of one pending job.
+///
+/// The field order is part of the stable shape.
+#[derive(Serialize)]
+struct PendingJobJson<'a> {
+    /// The job identifier.
+    id: &'a str,
+    /// The lifecycle state name.
+    state: &'static str,
+    /// The number of attempts that the queue started.
+    attempt: u32,
+    /// The failure text, or `null`.
+    error: Option<&'a str>,
+    /// The commit sequence, or `null`.
+    commit_seq: Option<u64>,
+    /// Whether the job is terminal.
+    terminal: bool,
+    /// Whether the replica applied the commit.
+    committed: bool,
+}
+
+/// Return the stable JavaScript name of one job state.
+fn state_name(state: JobState) -> &'static str {
+    match state {
+        JobState::Queued => "queued",
+        JobState::Leased => "leased",
+        JobState::Succeeded => "succeeded",
+        JobState::Failed => "failed",
+        JobState::Dead => "dead",
+        _ => "unknown",
+    }
 }
 
 /// Return the stable JSON body of one query error.
 fn error_json(error: QueryError) -> String {
+    json!({"error": error.status_name()}).to_string()
+}
+
+/// Return the stable JSON body of one job error.
+fn job_error_json(error: JobError) -> String {
     json!({"error": error.status_name()}).to_string()
 }
