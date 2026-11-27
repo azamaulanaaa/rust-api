@@ -202,6 +202,17 @@ impl<T: Transport> AuthClient<T> {
         self.state.get()
     }
 
+    /// Set the stored state to [`AuthState::LoginRequired`].
+    ///
+    /// The job client calls this method when a submit or a poll answers
+    /// `401`. The call starts a new generation, so an older session check
+    /// that finishes later cannot overwrite this state.
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    pub(crate) fn set_login_required(&self) {
+        self.generation.set(self.generation.get().wrapping_add(1));
+        self.state.set(AuthState::LoginRequired);
+    }
+
     /// Ask the server for the current session and store the state.
     ///
     /// The request is `GET /auth/me` with cookie credentials. A `200` answer
@@ -540,6 +551,17 @@ mod tests {
             older.as_mut().poll(&mut context),
             Poll::Ready(AuthState::Authenticated)
         );
+        assert_eq!(client.state(), AuthState::LoginRequired);
+    }
+
+    /// A job `401` can set the session to login-required.
+    #[test]
+    fn the_login_required_setter_stores_the_state() {
+        let (_, transport) = FakeTransport::with_status(200);
+        let client = AuthClient::new(transport);
+
+        client.set_login_required();
+
         assert_eq!(client.state(), AuthState::LoginRequired);
     }
 
