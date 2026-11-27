@@ -88,7 +88,7 @@ jobs:
             install_args: "rust cargo-deny"
             script: scripts/check-cargo-deny-sources.sh
           - name: coverage
-            install_args: "rust cargo-llvm-cov"
+            install_args: "rust cargo:cargo-llvm-cov"
             script: scripts/check-coverage.sh
           # The msrv version must match rust-version in Cargo.toml.
           - name: msrv
