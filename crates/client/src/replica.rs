@@ -3,7 +3,7 @@
 //! The client downloads a per-user replica that the server built. The server
 //! filters the replica for the authenticated subject.
 //!
-//! A [`ReplicaSource`] names the manifest path and the object path prefix.
+//! A `ReplicaSource` names the manifest path and the object path prefix.
 //! The file replica uses `/sync/db/`. The EAV oxkv replica uses
 //! `/eav/sync/oxkv/`.
 //!

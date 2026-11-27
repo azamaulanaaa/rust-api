@@ -2,14 +2,14 @@
 //!
 //! The view scans the `entity:` key family one time. It decodes the metadata
 //! row and the attribute rows of every entity. It builds the shared
-//! [`SearchEntity`] values, so a query calls the same core function as the
+//! `SearchEntity` values, so a query calls the same core function as the
 //! server.
 //!
 //! The server materializes every schema default in the stored attribute
 //! rows. The view therefore needs no schema and no default rule.
 //!
 //! The view holds no JSON attribute value. A query cannot match a JSON value
-//! and a JSON value has no [`SearchValue`] form.
+//! and a JSON value has no `SearchValue` form.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;

@@ -4,7 +4,7 @@
 //! opens the entity view and caches it. A later query reuses the view while
 //! the replica generation stays the same. A new generation rebuilds the view.
 //!
-//! The query calls the shared [`search_by_attribute`] function, so the
+//! The query calls the shared `search_by_attribute` function, so the
 //! client and the server use one search rule. The client makes no
 //! authorization decision. It reads the replica that the server built for
 //! the authenticated subject.
