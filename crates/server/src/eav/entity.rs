@@ -330,9 +330,6 @@ const REBUILD_PAGE: usize = 200;
 #[cfg(test)]
 const REBUILD_PAGE: usize = 2;
 
-/// Maximum size of an entity id or an attribute name, in bytes.
-const MAX_NAME_BYTES: usize = 128;
-
 /// One typed attribute value.
 ///
 /// The serde form is adjacent and tagged.
@@ -6013,12 +6010,10 @@ fn map_schema_error(error: SchemaError) -> EntityError {
 /// Checks the id and the patch of one update.
 ///
 /// The call rejects an invalid id and an empty patch.
+/// The shared core crate implements the rule.
 fn validate_update_input(id: &str, patch: &EntityPatch) -> Result<(), EntityError> {
-    validate_name("entity id", id)?;
-    if patch.attributes.is_empty() {
-        return Err(EntityError::Invalid("patch is empty".to_string()));
-    }
-    Ok(())
+    crate::core::eav::validate_update_input(id, patch.attributes.len())
+        .map_err(|error| EntityError::Invalid(error.to_string()))
 }
 
 /// Checks an id or a name against the storage key rules.
@@ -6026,24 +6021,10 @@ fn validate_update_input(id: &str, patch: &EntityPatch) -> Result<(), EntityErro
 /// The value must be 1 to 128 bytes.
 /// It may contain only lowercase ASCII letters, digits, `_`, and `-`.
 /// These rules reject `:` and `/`, so a value cannot inject a key.
+/// The shared core crate implements the rule.
 pub(crate) fn validate_name(kind: &str, value: &str) -> Result<(), EntityError> {
-    if value.is_empty() {
-        return Err(EntityError::Invalid(format!("{kind} is empty")));
-    }
-    if value.len() > MAX_NAME_BYTES {
-        return Err(EntityError::Invalid(format!(
-            "{kind} is longer than 128 bytes"
-        )));
-    }
-    if !value
-        .bytes()
-        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
-    {
-        return Err(EntityError::Invalid(format!(
-            "{kind} has an invalid character"
-        )));
-    }
-    Ok(())
+    crate::core::eav::validate_name(kind, value)
+        .map_err(|error| EntityError::Invalid(error.to_string()))
 }
 
 #[cfg(test)]
@@ -8701,7 +8682,7 @@ mod tests {
             "a/b".to_string(),
             "a b".to_string(),
         ];
-        ids.push("a".repeat(MAX_NAME_BYTES + 1));
+        ids.push("a".repeat(crate::core::eav::MAX_NAME_BYTES + 1));
 
         for id in ids {
             let result = store.create(draft(&id, &["person"], vec![]), &ctx()).await;

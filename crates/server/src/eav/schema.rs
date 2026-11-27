@@ -54,9 +54,6 @@ const CHILD_PREFIX: &str = "schema:child:";
 /// Number of times a publish retries after a head conflict.
 const PUBLISH_ATTEMPTS: usize = 4;
 
-/// Maximum size of a schema id or an attribute name, in bytes.
-const MAX_NAME_BYTES: usize = 128;
-
 /// Maximum number of schemas on one inheritance path.
 const MAX_DEPTH: usize = 16;
 
@@ -1121,24 +1118,10 @@ fn default_matches_type(value: &serde_json::Value, ty: AttributeType) -> bool {
 /// The value must be 1 to 128 bytes.
 /// It may contain only lowercase ASCII letters, digits, `_`, and `-`.
 /// These rules reject `:` and `/`, so a value cannot inject a key.
+/// The shared core crate implements the rule.
 fn validate_name(kind: &str, value: &str) -> Result<(), SchemaError> {
-    if value.is_empty() {
-        return Err(SchemaError::Invalid(format!("{kind} is empty")));
-    }
-    if value.len() > MAX_NAME_BYTES {
-        return Err(SchemaError::Invalid(format!(
-            "{kind} is longer than 128 bytes"
-        )));
-    }
-    if !value
-        .bytes()
-        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
-    {
-        return Err(SchemaError::Invalid(format!(
-            "{kind} has an invalid character"
-        )));
-    }
-    Ok(())
+    crate::core::eav::validate_name(kind, value)
+        .map_err(|error| SchemaError::Invalid(error.to_string()))
 }
 
 #[cfg(test)]
@@ -1655,7 +1638,7 @@ mod tests {
             "a/b".to_string(),
             "a b".to_string(),
         ];
-        ids.push("a".repeat(MAX_NAME_BYTES + 1));
+        ids.push("a".repeat(crate::core::eav::MAX_NAME_BYTES + 1));
 
         for id in ids {
             let result = reg.publish(draft(&id, &[], vec![])).await;
@@ -1676,7 +1659,7 @@ mod tests {
             "a/b".to_string(),
             "a b".to_string(),
         ];
-        names.push("a".repeat(MAX_NAME_BYTES + 1));
+        names.push("a".repeat(crate::core::eav::MAX_NAME_BYTES + 1));
 
         for name in names {
             let result = reg
