@@ -11,6 +11,9 @@
 //! module names the stream transport. This feature implements polling only;
 //! it does not implement SSE.
 
+pub mod poll;
+pub mod sse;
+
 use core::fmt;
 use std::cell::RefCell;
 
